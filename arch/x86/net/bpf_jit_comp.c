@@ -1384,15 +1384,28 @@ static int emit_atomic_ld_st_index(u8 **pprog, u32 atomic_op, u32 size,
 }
 
 #define DONT_CLEAR 1
+#define ARENA_FAULT (1 << 8)
 
 bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 {
-	u32 reg = x->fixup >> 8;
+	u32 arena_reg = (x->fixup >> 8) & 0xff;
+	bool is_arena = !!arena_reg;
+	u32 reg = x->fixup >> 16;
+	int off = x->data >> 8;
+	unsigned long addr;
+
+	/* Read here, if src_reg is dst_reg for load, we'll write 0 to it. */
+	if (is_arena)
+		addr = *(unsigned long *)((void *)regs + arena_reg);
 
 	/* jump over faulting load and clear dest register */
 	if (reg != DONT_CLEAR)
 		*(unsigned long *)((void *)regs + reg) = 0;
 	regs->ip += x->fixup & 0xff;
+
+	if (is_arena)
+		bpf_prog_report_arena_violation(reg == DONT_CLEAR, addr + off);
+
 	return true;
 }
 
@@ -2023,6 +2036,7 @@ populate_extable:
 			{
 				struct exception_table_entry *ex;
 				u8 *_insn = image + proglen + (start_of_ldx - temp);
+				int off = insn->off;
 				s64 delta;
 
 				if (!bpf_prog->aux->extable)
@@ -2040,10 +2054,27 @@ populate_extable:
 
 				ex->insn = delta;
 
-				ex->data = EX_TYPE_BPF;
+				/* For ex_handler_bpf, the other bits of data
+				 * except the lowest byte are meaningless,
+				 * encode the s16 offset into it and make sure
+				 * it won't conflict with the mask of the
+				 * exception entry type.
+				 */
+				ex->data = EX_TYPE_BPF | (off << 8);
+				BUILD_BUG_ON(EX_DATA_TYPE_MASK != 0xFF);
 
+				/* The field fixup encodes the number of bytes
+				 * we need to skip when the exception happens,
+				 * and is supposed to fit in 1 byte. The rest of
+				 * the bytes are used to encode dst and src
+				 * registers, so we can identify addresses of
+				 * arena page faults.
+				 */
 				ex->fixup = (prog - start_of_ldx) |
-					((BPF_CLASS(insn->code) == BPF_LDX ? reg2pt_regs[dst_reg] : DONT_CLEAR) << 8);
+					((BPF_CLASS(insn->code) == BPF_LDX ? reg2pt_regs[dst_reg] : DONT_CLEAR) << 16)
+					| ((BPF_CLASS(insn->code) == BPF_LDX ? reg2pt_regs[src_reg] : reg2pt_regs[dst_reg])<< 8);
+				/* Ensure src_reg offset fits in 1 byte. */
+				BUILD_BUG_ON(sizeof(struct pt_regs) > U8_MAX);
 			}
 			break;
 
@@ -2161,7 +2192,7 @@ populate_extable:
 				 * End result: x86 insn "mov rbx, qword ptr [rax+0x14]"
 				 * of 4 bytes will be ignored and rbx will be zero inited.
 				 */
-				ex->fixup = (prog - start_of_ldx) | (reg2pt_regs[dst_reg] << 8);
+				ex->fixup = (prog - start_of_ldx) | (reg2pt_regs[dst_reg] << 16);
 			}
 			break;
 
