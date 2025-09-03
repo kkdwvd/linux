@@ -303,6 +303,9 @@ out:
 }
 EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
 
+// TODO(kkd): Must be replaced with u64 (seq++ << 1 | 1) to prevent ABA
+#define RES_NODE_NEXT(lock) ((struct mcs_spinlock *)(lock))
+
 #ifdef CONFIG_QUEUED_SPINLOCKS
 
 /*
@@ -499,7 +502,7 @@ queue:
 	barrier();
 
 	node->locked = 0;
-	node->next = NULL;
+	node->next = RES_NODE_NEXT(lock);
 
 	/*
 	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
@@ -524,7 +527,7 @@ queue:
 	 * p,*,* -> n,*,*
 	 */
 	old = xchg_tail(lock, tail);
-	next = NULL;
+	next = RES_NODE_NEXT(lock);
 
 	/*
 	 * if there was a previous node; link it and wait until reaching the
@@ -535,11 +538,15 @@ queue:
 
 		prev = decode_tail(old, rqnodes);
 
-		/* Link @node into the waitqueue. */
-		WRITE_ONCE(prev->next, node);
+		if (!try_cmpxchg_relaxed(&prev->next, RES_NODE_NEXT(lock), node)) {
+			ret = -ETIMEDOUT;
+			goto waitq_timeout;
+		}
 
-		val = arch_mcs_spin_lock_contended(&node->locked);
-		if (val == RES_TIMEOUT_VAL) {
+		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
+		/* The mask passed is 0, since we don't poll the locked bit here. */
+		val = res_smp_cond_load_acquire(&node->locked, VAL || RES_CHECK_TIMEOUT(ts, ret, 0U));
+		if (ret || val == RES_TIMEOUT_VAL) {
 			ret = -EDEADLK;
 			goto waitq_timeout;
 		}
@@ -602,8 +609,9 @@ waitq_timeout:
 		 * order, prev's next pointer needs to be fixed up etc.
 		 */
 		if (!try_cmpxchg_tail(lock, tail, 0)) {
-			next = smp_cond_load_relaxed(&node->next, VAL);
-			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
+			next = xchg_relaxed(&node->next, NULL);
+			if (next != RES_NODE_NEXT(lock))
+				WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
 		}
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_node;
@@ -640,10 +648,16 @@ waitq_timeout:
 	/*
 	 * contended path; wait for next if not observed yet, release.
 	 */
-	if (!next)
-		next = smp_cond_load_relaxed(&node->next, (VAL));
+	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
+	if (next == RES_NODE_NEXT(lock))
+		next = smp_cond_load_relaxed(&node->next, (VAL) || RES_CHECK_TIMEOUT(ts, ret, 0U));
 
-	arch_mcs_spin_unlock_contended(&next->locked);
+	/* We don't need to error out, just not signal next. */
+	if (ret || next == RES_NODE_NEXT(lock))
+		next = xchg_relaxed(&node->next, NULL);
+
+	if (next != RES_NODE_NEXT(lock))
+		arch_mcs_spin_unlock_contended(&next->locked);
 
 release:
 	trace_contention_end(lock, 0);
