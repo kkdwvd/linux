@@ -108,7 +108,7 @@ static noinline int check_deadlock_AA(rqspinlock_t *lock, u32 mask,
 	 */
 	for (int i = 0; i < cnt - 1; i++) {
 		if (rqh->locks[i] == lock)
-			return -EDEADLK;
+			return -EBUSY;
 	}
 	return 0;
 }
@@ -574,6 +574,26 @@ queue:
 	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
 	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
 					   RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_PENDING_MASK));
+
+	/*
+	 * We observed an AA deadlock as head, do not signal our successors.
+	 *
+	 * TODO(kkd): This will need adjustment once we have deadlock checks
+	 * happening for non-head waiters in the queue as well.
+	 */
+	if (ret && ret == -EBUSY) {
+		/* Keep user-visible error code the same. */
+		ret = -EDEADLK;
+		/*
+		 * Do not attempt to take the lock, just mark next waiter as
+		 * head and leave the queue.
+		 */
+		if (!next)
+			next = smp_cond_load_relaxed(&node->next, (VAL));
+
+		arch_mcs_spin_unlock_contended(&next->locked);
+		goto err_release_node;
+	}
 
 waitq_timeout:
 	if (ret) {
