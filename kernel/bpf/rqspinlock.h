@@ -10,6 +10,16 @@
 #define __LINUX_RQSPINLOCK_H
 
 #include "../locking/qspinlock.h"
+#include <asm-generic/mcs_spinlock.h>
+
+struct res_mcs_spinlock {
+	struct mcs_spinlock mcs;
+	int next_node_seq;
+};
+
+struct rqnode {
+	struct res_mcs_spinlock res_mcs;
+};
 
 /*
  * try_cmpxchg_tail - Return result of cmpxchg of tail word with a new value
@@ -43,6 +53,31 @@ static __always_inline bool try_cmpxchg_tail(struct qspinlock *lock, u32 tail, u
 	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
 
 	return true;
+}
+
+/*
+ * We must be able to distinguish between no-tail, the tail at 0:0,
+ * and the sentinel value 1:0, therefore increment the cpu number
+ * by two.
+ */
+
+static inline __pure u32 encode_tail_rqnode(int cpu, int idx)
+{
+	u32 tail;
+
+	tail  = (cpu + 2) << _Q_TAIL_CPU_OFFSET;
+	tail |= idx << _Q_TAIL_IDX_OFFSET; /* assume < 4 */
+
+	return tail;
+}
+
+static inline __pure struct mcs_spinlock *decode_tail_rqnode(u32 tail,
+							     struct rqnode __percpu *qnodes)
+{
+	int cpu = (tail >> _Q_TAIL_CPU_OFFSET) - 1;
+	int idx = (tail &  _Q_TAIL_IDX_MASK) >> _Q_TAIL_IDX_OFFSET;
+
+	return per_cpu_ptr(&qnodes[idx].res_mcs.mcs, cpu);
 }
 
 #endif /* __LINUX_RQSPINLOCK_H */

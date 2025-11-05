@@ -308,7 +308,7 @@ EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
  *
  * Exactly fits one 64-byte cacheline on a 64-bit architecture.
  */
-static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+static DEFINE_PER_CPU_ALIGNED(struct rqnode, rqnodes[_Q_MAX_NODES]);
 
 #ifndef res_smp_cond_load_acquire
 #define res_smp_cond_load_acquire(v, c) smp_cond_load_acquire(v, c)
@@ -453,9 +453,9 @@ queue:
 	 */
 	grab_held_lock_entry(lock);
 
-	node = this_cpu_ptr(&rqnodes[0].mcs);
+	node = this_cpu_ptr(&rqnodes[0].res_mcs.mcs);
 	idx = node->count++;
-	tail = encode_tail(smp_processor_id(), idx);
+	tail = encode_tail_rqnode(smp_processor_id(), idx);
 
 	trace_contention_begin(lock, LCB_F_SPIN);
 
@@ -530,7 +530,7 @@ queue:
 	if (old & _Q_TAIL_MASK) {
 		int val;
 
-		prev = decode_tail(old, rqnodes);
+		prev = decode_tail_rqnode(old, rqnodes);
 
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
@@ -656,11 +656,11 @@ release:
 	/*
 	 * release the node
 	 */
-	__this_cpu_dec(rqnodes[0].mcs.count);
+	__this_cpu_dec(rqnodes[0].res_mcs.mcs.count);
 	return ret;
 err_release_node:
 	trace_contention_end(lock, ret);
-	__this_cpu_dec(rqnodes[0].mcs.count);
+	__this_cpu_dec(rqnodes[0].res_mcs.mcs.count);
 err_release_entry:
 	release_held_lock_entry();
 	return ret;
