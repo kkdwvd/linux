@@ -55,6 +55,12 @@ static __always_inline bool try_cmpxchg_tail(struct qspinlock *lock, u32 tail, u
 	return true;
 }
 
+static inline __pure
+struct mcs_spinlock *grab_res_mcs_node(struct mcs_spinlock *base, int idx)
+{
+	return &((struct rqnode *)base + idx)->res_mcs.mcs;
+}
+
 /*
  * We must be able to distinguish between no-tail, the tail at 0:0,
  * and the sentinel value 1:0, therefore increment the cpu number

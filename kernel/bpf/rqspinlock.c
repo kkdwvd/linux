@@ -84,7 +84,7 @@ struct rqspinlock_timeout {
 	u16 spin;
 };
 
-#define RES_TIMEOUT_VAL	2
+#define RES_TIMEOUT_VAL(seq) (-(seq))
 
 DEFINE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
 EXPORT_SYMBOL_GPL(rqspinlock_held_locks);
@@ -310,6 +310,22 @@ EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
  */
 static DEFINE_PER_CPU_ALIGNED(struct rqnode, rqnodes[_Q_MAX_NODES]);
 
+/*
+ * Per-CPU 32-bit sequence number.
+ */
+static DEFINE_PER_CPU(int, rqnode_seq);
+
+static inline int get_node_seq(void)
+{
+	int seq = this_cpu_inc_return(rqnode_seq);
+
+	/* Skip [-INT_MIN, 0] */
+	if (unlikely(seq == INT_MAX))
+		this_cpu_write(rqnode_seq, 0);
+
+	return seq;
+}
+
 #ifndef res_smp_cond_load_acquire
 #define res_smp_cond_load_acquire(v, c) smp_cond_load_acquire(v, c)
 #endif
@@ -481,7 +497,7 @@ queue:
 		goto release;
 	}
 
-	node = grab_mcs_node(node, idx);
+	node = grab_res_mcs_node(node, idx);
 
 	/*
 	 * Keep counts of non-zero index values:
@@ -523,23 +539,44 @@ queue:
 	old = xchg_tail(lock, tail);
 	next = NULL;
 
+	prev = NULL;
 	/*
 	 * if there was a previous node; link it and wait until reaching the
 	 * head of the waitqueue.
 	 */
 	if (old & _Q_TAIL_MASK) {
-		int val;
+		struct res_mcs_spinlock *prev_rmcs;
+		int seq, val;
 
-		prev = decode_tail_rqnode(old, rqnodes);
-
-		/* Link @node into the waitqueue. */
-		WRITE_ONCE(prev->next, node);
-
-		val = arch_mcs_spin_lock_contended(&node->locked);
-		if (val == RES_TIMEOUT_VAL) {
+		if (old == encode_tail_rqnode(-1, 0)) {
 			ret = -ETIMEDOUT;
 			goto waitq_timeout;
 		}
+
+		prev = decode_tail_rqnode(old, rqnodes);
+		prev_rmcs = (struct res_mcs_spinlock *)prev;
+
+		seq = get_node_seq();
+
+		WRITE_ONCE(prev_rmcs->next_node_seq, seq);
+		/* Link @node into the waitqueue, use release to order seq. */
+		smp_store_release(&prev->next, node);
+
+		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
+		/* Mask is 0, since MCS spinners don't poll the lock. */
+		val = res_smp_cond_load_acquire(&node->locked,
+						VAL && (VAL == seq || RES_TIMEOUT_VAL(-seq)) ||
+						RES_CHECK_TIMEOUT(ts, ret, 0U));
+		if (ret || val == RES_TIMEOUT_VAL(seq)) {
+			ret = -ETIMEDOUT;
+			goto waitq_timeout;
+		}
+
+		// TODO(kkd): Just for debugging/testing, remove later after
+		// adding a test for this race, since it can happen for real.
+		// When we hit such a case, we must keep waiting instead of
+		// breaking the waiting loop.
+		BUG_ON(val != seq);
 
 		/*
 		 * While waiting for the MCS lock, the next pointer may have
@@ -606,10 +643,18 @@ waitq_timeout:
 		 * complicated synchronization, because when not leaving in FIFO
 		 * order, prev's next pointer needs to be fixed up etc.
 		 */
-		if (!try_cmpxchg_tail(lock, tail, 0)) {
-			next = smp_cond_load_relaxed(&node->next, VAL);
-			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
+		if (!try_cmpxchg_tail(lock, tail, encode_tail_rqnode(-1, 0))) {
+			struct res_mcs_spinlock *node_rmcs = (struct res_mcs_spinlock *)node;
+			/*
+			 * This load needs to be acquire to observe
+			 * next_node_seq written by the next waiter.
+			 */
+			next = smp_cond_load_acquire(&node->next, VAL);
+			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL(node_rmcs->next_node_seq));
 		}
+		/* Reset queue head. */
+		if (!prev)
+			xchg_tail(lock, 0);
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_node;
 	}
@@ -644,11 +689,12 @@ waitq_timeout:
 
 	/*
 	 * contended path; wait for next if not observed yet, release.
+	 * Needs to be acquire to correctly observe next_node_seq.
 	 */
 	if (!next)
-		next = smp_cond_load_relaxed(&node->next, (VAL));
+		next = smp_cond_load_acquire(&node->next, (VAL));
 
-	arch_mcs_spin_unlock_contended(&next->locked);
+	smp_store_release(&node->locked, ((struct res_mcs_spinlock *)node)->next_node_seq);
 
 release:
 	trace_contention_end(lock, 0);
