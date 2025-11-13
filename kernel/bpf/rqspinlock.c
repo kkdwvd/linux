@@ -535,21 +535,14 @@ queue:
 		struct mcs_spinlock *val;
 
 		/*
-		 * The tail of the queue has already expired, so until the
-		 * designated head of the queue resets the tail, we cannot join
-		 * it.
-		 *
-		 * Note that for this case, prev == NULL, so we will have to set
-		 * prev to something so that it's not detected as head.
+		 * The tail of the queue has already expired. This means that we
+		 * must consider ourselves as the head of the queue.
 		 */
 		if (old == encode_tail_rqnode(-1, 0)) {
-			/* Don't reset queue in recovery. */
-			prev = ERR_PTR(-ETIMEDOUT);
-			ret = -ETIMEDOUT;
-			goto waitq_timeout;
+			prev = NULL;
+		} else {
+			prev = decode_tail_rqnode(old, rqnodes);
 		}
-
-		prev = decode_tail_rqnode(old, rqnodes);
 
 		/* Link @node into the waitqueue. */
 		res_mcs(node)->locked = prev;
@@ -660,27 +653,6 @@ waitq_timeout:
 		 * Use a SAT solver to find unsat conditions.
 		 */
 		if (!try_cmpxchg_tail(lock, tail, encode_tail_rqnode(-1, 0))) {
-			/*
-			 * Potential BUG: Can this stall? Say if our head or
-			 * tail succeeded in resetting the tail to 0 or
-			 * sentinel, before we could try, and then we keep
-			 * waiting for next in vain.  It seems so, and it is not
-			 * clear what the fix would be. Maybe this should be a
-			 * bit in the lock word? There is no guarantee here that
-			 * if we fail to reset the tail, someone may be linked
-			 * to us. This is a problem for the tail, since it's
-			 * next will be NULL, so if head wins against it, and
-			 * resets things to 0, we'll keep waiting, while no one
-			 * links to us anymore.
-			 *
-			 * It is likely to be rare and unlikely, since head is
-			 * basically stuck if tail is having to recover, but it
-			 * is not impossible.
-			 *
-			 * We probably cannot even apply a timeout here,
-			 * otherwise we'd have people overwriting our next
-			 * pointer later on.
-			 */
 			next = smp_cond_load_acquire(&node->next, VAL);
 			/*
 			 * Tell our successor to go away, they should then
@@ -698,21 +670,6 @@ waitq_timeout:
 			 * manages to reset the queue.
 			 */
 		}
-
-		/*
-		 * If we are the head, then we should be resetting the queue
-		 * back to 0.
-		 *
-		 * TODO: Should we wait to see sentinel before the reset, to
-		 * address the problem with tail spinning forever in next
-		 * population? That can work, but we will need a convincing
-		 * argument that the tail will always make progress (acyclicity
-		 * of dependencies in waits is one), it's always predecessors
-		 * waiting for successors to move ahead. Can be strenghened
-		 * using formalization of some sort.
-		 */
-		if (head)
-			xchg_tail(lock, 0);
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_node;
 	}
@@ -755,13 +712,14 @@ waitq_timeout:
 	if (!try_cmpxchg(&res_mcs(next)->locked, &node, NULL)) {
 		/*
 		 * Our successor departed the queue, this is the synchronization
-		 * point where we either reset the queue as the current head, or
+		 * point where we either fail to make our successor next head or
 		 * just leave and run our CS and let our successor deal with it.
 		 * Crucially, this cmpxchg must succeed set_locked(), otherwise
 		 * as soon as we reset the tail, a new waiter can attempt to
 		 * acquire the lock and enter the CS, breaking exclusion.
+		 *
+		 * We must do nothing to the tail here.
 		 */
-		xchg_tail(lock, 0);
 	}
 
 release:
