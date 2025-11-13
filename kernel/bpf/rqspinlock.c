@@ -316,6 +316,8 @@ static DEFINE_PER_CPU_ALIGNED(struct rqnode, rqnodes[_Q_MAX_NODES]);
 
 #define res_atomic_cond_read_acquire(v, c) res_smp_cond_load_acquire(&(v)->counter, (c))
 
+#define res_mcs(node) ((struct res_mcs_spinlock *)(node))
+
 /**
  * resilient_queued_spin_lock_slowpath - acquire the queued spinlock
  * @lock: Pointer to queued spinlock structure
@@ -523,20 +525,40 @@ queue:
 	old = xchg_tail(lock, tail);
 	next = NULL;
 
+	prev = NULL;
+
 	/*
 	 * if there was a previous node; link it and wait until reaching the
 	 * head of the waitqueue.
 	 */
 	if (old & _Q_TAIL_MASK) {
-		int val;
+		struct mcs_spinlock *val;
+
+		/*
+		 * The tail of the queue has already expired, so until the
+		 * designated head of the queue resets the tail, we cannot join
+		 * it.
+		 *
+		 * Note that for this case, prev == NULL, so we will have to set
+		 * prev to something so that it's not detected as head.
+		 */
+		if (old == encode_tail_rqnode(-1, 0)) {
+			/* Don't reset queue in recovery. */
+			prev = ERR_PTR(-ETIMEDOUT);
+			ret = -ETIMEDOUT;
+			goto waitq_timeout;
+		}
 
 		prev = decode_tail_rqnode(old, rqnodes);
 
 		/* Link @node into the waitqueue. */
-		WRITE_ONCE(prev->next, node);
+		res_mcs(node)->locked = prev;
+		/* Make the previous write visible. */
+		smp_store_release(&prev->next, node);
 
-		val = arch_mcs_spin_lock_contended(&node->locked);
-		if (val == RES_TIMEOUT_VAL) {
+		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
+		val = res_smp_cond_load_acquire(&res_mcs(node)->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, 0U));
+		if (ret || val == ERR_PTR(-ETIMEDOUT)) {
 			ret = -ETIMEDOUT;
 			goto waitq_timeout;
 		}
@@ -548,8 +570,11 @@ queue:
 		 * to reduce latency in the upcoming MCS unlock operation.
 		 */
 		next = READ_ONCE(node->next);
-		if (next)
+		if (next) {
+			/* Need acquire if next is non-NULL. */
+			smp_acquire__after_ctrl_dep();
 			prefetchw(next);
+		}
 	}
 
 	/*
@@ -575,21 +600,18 @@ queue:
 	/* Disable queue destruction when we detect deadlocks. */
 	if (ret == -EDEADLK) {
 		if (!next)
-			next = smp_cond_load_relaxed(&node->next, (VAL));
-		arch_mcs_spin_unlock_contended(&next->locked);
+			next = smp_cond_load_acquire(&node->next, (VAL));
+		if (!try_cmpxchg(&res_mcs(next)->locked, &node, NULL)) {
+			/* See later comments on node unlock. */
+			xchg_tail(lock, 0);
+		}
 		goto err_release_node;
 	}
 
 waitq_timeout:
 	if (ret) {
+		bool head = prev == NULL;
 		/*
-		 * If the tail is still pointing to us, then we are the final waiter,
-		 * and are responsible for resetting the tail back to 0. Otherwise, if
-		 * the cmpxchg operation fails, we signal the next waiter to take exit
-		 * and try the same. For a waiter with tail node 'n':
-		 *
-		 * n,*,* -> 0,*,*
-		 *
 		 * When performing cmpxchg for the whole word (NR_CPUS > 16k), it is
 		 * possible locked/pending bits keep changing and we see failures even
 		 * when we remain the head of wait queue. However, eventually,
@@ -597,19 +619,100 @@ waitq_timeout:
 		 * will queue behind us. This will leave the lock owner in
 		 * charge, and it will eventually either set locked bit to 0, or
 		 * leave it as 1, allowing us to make progress.
-		 *
-		 * We terminate the whole wait queue for two reasons. Firstly,
-		 * we eschew per-waiter timeouts with one applied at the head of
-		 * the wait queue.  This allows everyone to break out faster
-		 * once we've seen the owner / pending waiter not responding for
-		 * the timeout duration from the head.  Secondly, it avoids
-		 * complicated synchronization, because when not leaving in FIFO
-		 * order, prev's next pointer needs to be fixed up etc.
 		 */
-		if (!try_cmpxchg_tail(lock, tail, 0)) {
-			next = smp_cond_load_relaxed(&node->next, VAL);
-			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
+
+		/* Attempt to unlink ourselves from prev, only need to be done
+		 * if we are not head.
+		 */
+		if (!head && !try_cmpxchg(&res_mcs(node)->locked, &prev, NULL)) {
+			/*
+			 * Signalled by prev, which will either be NULL or
+			 * ERR_PTR(-ETIMEDOUT). Only the head as prev will
+			 * signal us NULL, which means we're the new head and
+			 * responsible for resetting the queue.
+			 */
+			if (!READ_ONCE(res_mcs(node)->locked))
+				head = true;
 		}
+
+
+		/*
+		 * We are no longer bothered by the state of prev, shifting
+		 * focus to our successor. There are two cases to handle. Either
+		 * we are the tail waiter, which has nothing linked to it, or
+		 * we are the non-tail waiter, and thus must propagate an error
+		 * to next.
+		 *
+		 * If we are the tail, which we detect by the result of the
+		 * cmpxchg below, we set the tail value to a sentinel, since
+		 * we will no longer accept successor linkages to our node. This
+		 * frees us up and allows us to exit the queue. Once this occurs,
+		 * future linkers will notice the sentinel value and enter the
+		 * timeout path.
+		 *
+		 * If we are not the tail, then we will wait for next to be
+		 * populated, and signal next to timeout. We can wait for next
+		 * to populate without worry since the linking path is bound to
+		 * make forward progress (and at least one CPU has tail at the
+		 * top of the stack of waiters per cpu, hence things should make
+		 * progress eventually populating our next pointer).
+		 * TODO(kkd): Can we sketch a proof for the above assumption?
+		 * Use a SAT solver to find unsat conditions.
+		 */
+		if (!try_cmpxchg_tail(lock, tail, encode_tail_rqnode(-1, 0))) {
+			/*
+			 * Potential BUG: Can this stall? Say if our head or
+			 * tail succeeded in resetting the tail to 0 or
+			 * sentinel, before we could try, and then we keep
+			 * waiting for next in vain.  It seems so, and it is not
+			 * clear what the fix would be. Maybe this should be a
+			 * bit in the lock word? There is no guarantee here that
+			 * if we fail to reset the tail, someone may be linked
+			 * to us. This is a problem for the tail, since it's
+			 * next will be NULL, so if head wins against it, and
+			 * resets things to 0, we'll keep waiting, while no one
+			 * links to us anymore.
+			 *
+			 * It is likely to be rare and unlikely, since head is
+			 * basically stuck if tail is having to recover, but it
+			 * is not impossible.
+			 *
+			 * We probably cannot even apply a timeout here,
+			 * otherwise we'd have people overwriting our next
+			 * pointer later on.
+			 */
+			next = smp_cond_load_acquire(&node->next, VAL);
+			/*
+			 * Tell our successor to go away, they should then
+			 * attempt to reset the tail to sentinel. We don't
+			 * care about the result, if this fails, the next
+			 * waiter already departed the queue.
+			 */
+			try_cmpxchg(&res_mcs(next)->locked, &node, ERR_PTR(-ETIMEDOUT));
+		} else {
+			/*
+			 * We were the tail, we succeeded in setting the tail to
+			 * sentinel, which disables queue admission. New
+			 * entrants will either fail, or link to the new tail
+			 * and things will keep timing out until our head
+			 * manages to reset the queue.
+			 */
+		}
+
+		/*
+		 * If we are the head, then we should be resetting the queue
+		 * back to 0.
+		 *
+		 * TODO: Should we wait to see sentinel before the reset, to
+		 * address the problem with tail spinning forever in next
+		 * population? That can work, but we will need a convincing
+		 * argument that the tail will always make progress (acyclicity
+		 * of dependencies in waits is one), it's always predecessors
+		 * waiting for successors to move ahead. Can be strenghened
+		 * using formalization of some sort.
+		 */
+		if (head)
+			xchg_tail(lock, 0);
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_node;
 	}
@@ -644,11 +747,22 @@ waitq_timeout:
 
 	/*
 	 * contended path; wait for next if not observed yet, release.
+	 * Needs to be acquire to observed locked value correctly.
 	 */
 	if (!next)
-		next = smp_cond_load_relaxed(&node->next, (VAL));
+		next = smp_cond_load_acquire(&node->next, (VAL));
 
-	arch_mcs_spin_unlock_contended(&next->locked);
+	if (!try_cmpxchg(&res_mcs(next)->locked, &node, NULL)) {
+		/*
+		 * Our successor departed the queue, this is the synchronization
+		 * point where we either reset the queue as the current head, or
+		 * just leave and run our CS and let our successor deal with it.
+		 * Crucially, this cmpxchg must succeed set_locked(), otherwise
+		 * as soon as we reset the tail, a new waiter can attempt to
+		 * acquire the lock and enter the CS, breaking exclusion.
+		 */
+		xchg_tail(lock, 0);
+	}
 
 release:
 	trace_contention_end(lock, 0);

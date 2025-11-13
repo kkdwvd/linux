@@ -14,6 +14,7 @@
 
 struct res_mcs_spinlock {
 	struct mcs_spinlock mcs;
+	struct mcs_spinlock *locked;
 };
 
 struct rqnode {
