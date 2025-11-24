@@ -474,8 +474,12 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 
 	cons_pos = smp_load_acquire(&rb->consumer_pos);
 
-	if (raw_res_spin_lock_irqsave(&rb->spinlock, flags))
+	if (in_nmi()) {
+		if (!raw_res_spin_trylock_irqsave(&rb->spinlock, flags))
+			return NULL;
+	} else if (raw_res_spin_lock_irqsave(&rb->spinlock, flags)) {
 		return NULL;
+	}
 
 	pend_pos = rb->pending_pos;
 	prod_pos = rb->producer_pos;
