@@ -85,6 +85,7 @@ struct rqspinlock_timeout {
 };
 
 #define RES_TIMEOUT_VAL	2
+#define RES_HUNG_VAL 3
 
 DEFINE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
 EXPORT_SYMBOL_GPL(rqspinlock_held_locks);
@@ -197,14 +198,24 @@ static noinline int check_deadlock_ABBA(rqspinlock_t *lock, u32 mask)
 }
 
 static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
-				  struct rqspinlock_timeout *ts)
+				  struct rqspinlock_timeout *ts,
+				  struct mcs_spinlock *node)
 {
 	u64 prev = ts->cur;
 	u64 time;
+	int ret;
 
 	if (!ts->timeout_end) {
 		if (check_deadlock_AA(lock))
 			return -EDEADLK;
+		/*
+		 * Is the successor indicating to us that they have a deadlock?
+		 */
+		if (node && READ_ONCE(node->next)) {
+			if (node->next->locked != RES_HUNG_VAL)
+				return 0;
+			return -ETIMEDOUT;
+		}
 		ts->cur = ktime_get_mono_fast_ns();
 		ts->timeout_end = ts->cur + ts->duration;
 		return 0;
@@ -220,7 +231,17 @@ static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
 	 */
 	if (prev + NSEC_PER_MSEC < time) {
 		ts->cur = time;
-		return check_deadlock_ABBA(lock, mask);
+		ret = check_deadlock_ABBA(lock, mask);
+		if (ret)
+			return ret;
+		/*
+		 * Is the successor indicating to us that they have a deadlock?
+		 */
+		if (node && READ_ONCE(node->next)) {
+			if (node->next->locked != RES_HUNG_VAL)
+				return 0;
+			return -ETIMEDOUT;
+		}
 	}
 
 	return 0;
@@ -231,10 +252,10 @@ static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
  * as the macro does internal amortization for us.
  */
 #ifndef res_smp_cond_load_acquire
-#define RES_CHECK_TIMEOUT(ts, ret, mask)                              \
+#define RES_CHECK_TIMEOUT(ts, ret, mask, node)                              \
 	({                                                            \
 		if (!(ts).spin++)                                     \
-			(ret) = check_timeout((lock), (mask), &(ts)); \
+			(ret) = check_timeout((lock), (mask), &(ts), (node)); \
 		(ret);                                                \
 	})
 #else
@@ -280,7 +301,7 @@ retry:
 	val = atomic_read(&lock->val);
 
 	if (val || !atomic_try_cmpxchg(&lock->val, &val, 1)) {
-		if (RES_CHECK_TIMEOUT(ts, ret, ~0u))
+		if (RES_CHECK_TIMEOUT(ts, ret, ~0u, NULL))
 			goto out;
 		cpu_relax();
 		goto retry;
@@ -405,7 +426,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 */
 	if (val & _Q_LOCKED_MASK) {
 		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
-		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_MASK));
+		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_MASK, NULL));
 	}
 
 	if (ret) {
@@ -532,10 +553,26 @@ queue:
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
 
-		val = arch_mcs_spin_lock_contended(&node->locked);
+	retry:
+		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
+		val = res_smp_cond_load_acquire(&node->locked, (VAL && VAL < RES_HUNG_VAL) ||
+						(VAL != RES_HUNG_VAL && RES_CHECK_TIMEOUT(ts, ret, ~0u, node)));
+
 		if (val == RES_TIMEOUT_VAL) {
 			ret = -ETIMEDOUT;
 			goto waitq_timeout;
+		}
+
+		/*
+		 * If we detected a deadlock or timeout, publish it in our node
+		 * and keep waiting to become head.
+		 */
+		if (ret) {
+			int val = 0;
+
+			try_cmpxchg_relaxed(&node->locked, &val, RES_HUNG_VAL);
+			ret = 0;
+			goto retry;
 		}
 
 		/*
@@ -567,7 +604,7 @@ queue:
 	 */
 	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
 	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
-					   RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_PENDING_MASK));
+					   RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_PENDING_MASK, node));
 
 	/* Disable queue destruction when we detect deadlocks. */
 	if (ret == -EDEADLK) {
