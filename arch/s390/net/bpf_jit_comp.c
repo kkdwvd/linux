@@ -1792,7 +1792,8 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 						  tail_call_cnt)));
 
 		/* Sign-extend the kfunc arguments. */
-		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		    insn->src_reg == BPF_PSEUDO_CORO_CALL) {
 			m = bpf_jit_find_kfunc_model(fp, insn);
 			if (!m)
 				return -1;

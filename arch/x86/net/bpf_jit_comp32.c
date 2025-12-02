@@ -2091,7 +2091,8 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				goto notyet;
 
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+			    insn->src_reg == BPF_PSEUDO_CORO_CALL) {
 				int err;
 
 				err = emit_kfunc_call(bpf_prog,

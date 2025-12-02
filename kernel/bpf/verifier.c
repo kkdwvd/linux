@@ -266,10 +266,17 @@ static bool bpf_pseudo_call(const struct bpf_insn *insn)
 	       insn->src_reg == BPF_PSEUDO_CALL;
 }
 
+static bool bpf_pseudo_coro_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_CORO_CALL;
+}
+
 static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
+	       (insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		insn->src_reg == BPF_PSEUDO_CORO_CALL);
 }
 
 struct bpf_call_arg_meta {
@@ -4020,7 +4027,7 @@ static const char *disasm_kfunc_name(void *data, const struct bpf_insn *insn)
 	const struct btf_type *func;
 	struct btf *desc_btf;
 
-	if (insn->src_reg != BPF_PSEUDO_KFUNC_CALL)
+	if (!bpf_pseudo_kfunc_call(insn))
 		return NULL;
 
 	desc_btf = find_kfunc_desc_btf(data, insn->off);
@@ -4430,7 +4437,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			 * catch this error later. Make backtracking conservative
 			 * with ENOTSUPP.
 			 */
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL && insn->imm == 0)
+			if (bpf_pseudo_kfunc_call(insn) && insn->imm == 0)
 				return -ENOTSUPP;
 			/* regular helper call sets R0 */
 			bt_clear_reg(bt, BPF_REG_0);
@@ -13921,6 +13928,7 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
+	bool coro_call = bpf_pseudo_coro_call(insn);
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
 	u32 i, nargs, ptr_type_id, release_ref_obj_id;
 	struct bpf_reg_state *regs = cur_regs(env);
@@ -13941,6 +13949,14 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		verbose(env, "calling kernel function %s is not allowed\n", func_name);
 	if (err)
 		return err;
+	if (coro_call && !(meta.kfunc_flags & KF_CORO)) {
+		verbose(env, "kfunc %s is not coroutine-callable\n", func_name);
+		return -EINVAL;
+	}
+	if (!coro_call && (meta.kfunc_flags & KF_CORO)) {
+		verbose(env, "kfunc %s must be invoked with coroutine call encoding\n", func_name);
+		return -EINVAL;
+	}
 	desc_btf = meta.btf;
 	insn_aux = &env->insn_aux_data[insn_idx];
 
@@ -17170,6 +17186,12 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		return 0;
 	}
 
+	if (insn->src_reg == BPF_PSEUDO_CORO_CTX) {
+		dst_reg->type = PTR_TO_MEM | PTR_TRUSTED;
+		dst_reg->mem_size = BPF_MAX_VAR_OFF;
+		return 0;
+	}
+
 	map = env->used_maps[aux->map_index];
 	dst_reg->map_ptr = map;
 
@@ -18237,7 +18259,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 				mark_subprog_changes_pkt_data(env, t);
 			if (insn->imm == BPF_FUNC_tail_call)
 				visit_tailcall_insn(env, t);
-		} else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+		} else if (bpf_pseudo_kfunc_call(insn)) {
 			struct bpf_kfunc_call_arg_meta meta;
 
 			ret = fetch_kfunc_meta(env, insn, &meta, NULL);
@@ -20369,12 +20391,13 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		env->jmps_processed++;
 		if (opcode == BPF_CALL) {
+			bool kfunc_call = bpf_pseudo_kfunc_call(insn);
+
 			if (BPF_SRC(insn->code) != BPF_K ||
-			    (insn->src_reg != BPF_PSEUDO_KFUNC_CALL &&
-			     insn->off != 0) ||
+			    (!kfunc_call && insn->off != 0) ||
 			    (insn->src_reg != BPF_REG_0 &&
 			     insn->src_reg != BPF_PSEUDO_CALL &&
-			     insn->src_reg != BPF_PSEUDO_KFUNC_CALL) ||
+			     !kfunc_call) ||
 			    insn->dst_reg != BPF_REG_0 || class == BPF_JMP32) {
 				verbose(env, "BPF_CALL uses reserved fields\n");
 				return -EINVAL;
@@ -20383,7 +20406,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			if (env->cur_state->active_locks) {
 				if ((insn->src_reg == BPF_REG_0 &&
 				     insn->imm != BPF_FUNC_spin_unlock) ||
-				    (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
+				    (kfunc_call &&
 				     (insn->off != 0 || !kfunc_spin_allowed(insn->imm)))) {
 					verbose(env,
 						"function calls are not allowed while holding a lock\n");
@@ -20392,7 +20415,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			}
 			if (insn->src_reg == BPF_PSEUDO_CALL) {
 				err = check_func_call(env, insn, &env->insn_idx);
-			} else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+			} else if (kfunc_call) {
 				err = check_kfunc_call(env, insn, &env->insn_idx);
 				if (!err && is_bpf_throw_kfunc(insn))
 					return process_bpf_exit_full(env, do_print_state, true);
@@ -22949,7 +22972,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_CALL)
 			goto next_insn;
-		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+		if (bpf_pseudo_kfunc_call(insn)) {
 			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
 			if (ret)
 				return ret;

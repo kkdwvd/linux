@@ -1333,6 +1333,7 @@ enum {
  */
 #define BPF_PSEUDO_MAP_FD	1
 #define BPF_PSEUDO_MAP_IDX	5
+#define BPF_PSEUDO_CORO_CTX	7
 
 /* insn[0].src_reg:  BPF_PSEUDO_MAP_[IDX_]VALUE
  * insn[0].imm:      map fd or fd_idx
@@ -1373,6 +1374,8 @@ enum {
  * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
  */
 #define BPF_PSEUDO_KFUNC_CALL	2
+/* coroutine-specific kfunc call */
+#define BPF_PSEUDO_CORO_CALL	3
 
 enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,

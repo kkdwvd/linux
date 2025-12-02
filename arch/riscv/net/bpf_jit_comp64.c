@@ -1764,7 +1764,8 @@ int bpf_jit_emit_insn(const struct bpf_insn *insn, struct rv_jit_context *ctx,
 		if (ret < 0)
 			return ret;
 
-		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		    insn->src_reg == BPF_PSEUDO_CORO_CALL) {
 			const struct btf_func_model *fm;
 			int idx;
 

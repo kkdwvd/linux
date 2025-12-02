@@ -1249,7 +1249,8 @@ int bpf_jit_get_func_addr(const struct bpf_prog *prog,
 			addr = (u8 *)prog->aux->func[off]->bpf_func;
 		else
 			return -EINVAL;
-	} else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
+	} else if ((insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		    insn->src_reg == BPF_PSEUDO_CORO_CALL) &&
 		   bpf_jit_supports_far_kfunc_call()) {
 		err = bpf_get_kfunc_addr(prog, insn->imm, insn->off, &addr);
 		if (err)

@@ -492,6 +492,7 @@ struct bpf_program {
 	bool autoattach;
 	bool sym_global;
 	bool mark_btf_static;
+	bool coro_transformed;
 	enum bpf_prog_type type;
 	enum bpf_attach_type expected_attach_type;
 	int exception_cb_idx;
@@ -6411,7 +6412,15 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 			break;
 		case RELO_EXTERN_CALL:
 			ext = &obj->externs[relo->ext_idx];
-			insn[0].src_reg = BPF_PSEUDO_KFUNC_CALL;
+			if (insn[0].src_reg &&
+			    insn[0].src_reg != BPF_PSEUDO_KFUNC_CALL &&
+			    insn[0].src_reg != BPF_PSEUDO_CORO_CALL) {
+				pr_warn("prog '%s': relo #%d: unsupported src_reg %d for extern call\n",
+					prog->name, i, insn[0].src_reg);
+				return -EINVAL;
+			}
+			insn[0].src_reg = insn[0].src_reg == BPF_PSEUDO_CORO_CALL ?
+					  BPF_PSEUDO_CORO_CALL : BPF_PSEUDO_KFUNC_CALL;
 			if (ext->is_set) {
 				insn[0].imm = ext->ksym.kernel_btf_id;
 				insn[0].off = ext->ksym.btf_fd_idx;
@@ -7760,6 +7769,527 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog,
 		opts->attach_btf_id = btf_type_id;
 	}
 	return 0;
+}
+
+static bool prog_is_coro(const struct bpf_program *prog)
+{
+	return prog->sec_name && str_has_pfx(prog->sec_name, "coro/");
+}
+
+static bool insn_is_coro_await(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_CORO_CALL;
+}
+
+static int append_insn(struct bpf_insn **insns, size_t *cnt, size_t *cap,
+		       struct bpf_insn insn)
+{
+	size_t new_cap;
+	struct bpf_insn *tmp;
+
+	if (*cnt < *cap) {
+		(*insns)[(*cnt)++] = insn;
+		return 0;
+	}
+
+	new_cap = max_t(size_t, *cap ? *cap * 2 : 128, *cnt + 1);
+	tmp = libbpf_reallocarray(*insns, new_cap, sizeof(*tmp));
+	if (!tmp)
+		return -ENOMEM;
+
+	*insns = tmp;
+	*cap = new_cap;
+	(*insns)[(*cnt)++] = insn;
+	return 0;
+}
+
+static int append_insns(struct bpf_insn **insns, size_t *cnt, size_t *cap,
+			const struct bpf_insn *add, size_t add_cnt)
+{
+	size_t i;
+	int err;
+
+	for (i = 0; i < add_cnt; i++) {
+		err = append_insn(insns, cnt, cap, add[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+#define CORO_CTX_R6_OFF		0
+#define CORO_CTX_R7_OFF		(CORO_CTX_R6_OFF + 8)
+#define CORO_CTX_R8_OFF		(CORO_CTX_R7_OFF + 8)
+#define CORO_CTX_R9_OFF		(CORO_CTX_R8_OFF + 8)
+#define CORO_CTX_STACK_OFF	(CORO_CTX_R9_OFF + 8)
+#define CORO_STACK_SLOTS	(MAX_BPF_STACK / 8)
+#define CORO_SLOT_SIZE		8
+
+struct coro_live {
+	__u8 regs;		/* bits for R6-R9 */
+	__u64 stack_mask;	/* bit per 8-byte slot */
+	bool stack_full;	/* true if offsets were not resolvable */
+};
+
+struct coro_point {
+	size_t insn_idx;
+	struct coro_live live;
+};
+
+static inline __u8 coro_reg_bit(int reg)
+{
+	return BIT(reg - BPF_REG_6);
+}
+
+static int popcnt64(__u64 v)
+{
+	return __builtin_popcountll(v);
+}
+
+static void coro_stack_slot(int off, int size, struct coro_live *live)
+{
+	int slot;
+
+	/* Stack accesses must be negative offsets from fp. */
+	if (off >= 0 || off < -MAX_BPF_STACK) {
+		live->stack_full = true;
+		return;
+	}
+	if (size != BPF_DW || off % CORO_SLOT_SIZE != 0) {
+		live->stack_full = true;
+		return;
+	}
+
+	slot = (-off / CORO_SLOT_SIZE) - 1;
+	if (slot < 0 || slot >= CORO_STACK_SLOTS) {
+		live->stack_full = true;
+		return;
+	}
+
+	live->stack_mask |= BIT_ULL(slot);
+}
+
+static void coro_liveness_insn(const struct bpf_insn *insn, struct coro_live *live)
+{
+	__u8 class = BPF_CLASS(insn->code);
+	__u8 op = BPF_OP(insn->code);
+	int dreg = insn->dst_reg;
+	int sreg = insn->src_reg;
+	bool src_is_x = BPF_SRC(insn->code) == BPF_X;
+
+	if (insn->code == 0)
+		return;
+
+	if (class == BPF_ALU || class == BPF_ALU64) {
+		bool uses_dst = op != BPF_MOV && op != BPF_XCHG && op != BPF_CMPXCHG;
+
+		/* Def: dst_reg */
+		if (dreg >= BPF_REG_6 && dreg <= BPF_REG_9)
+			live->regs &= ~coro_reg_bit(dreg);
+
+		/* Use: dst_reg (if operation uses old value) */
+		if (uses_dst && dreg >= BPF_REG_6 && dreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(dreg);
+
+		/* Use: src_reg */
+		if (src_is_x && sreg >= BPF_REG_6 && sreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(sreg);
+	} else if (class == BPF_LDX) {
+		/* Def: dst_reg */
+		if (dreg >= BPF_REG_6 && dreg <= BPF_REG_9)
+			live->regs &= ~coro_reg_bit(dreg);
+
+		/* Use: src_reg */
+		if (sreg >= BPF_REG_6 && sreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(sreg);
+
+		/* Use: stack slot if fp-relative */
+		if (sreg == BPF_REG_FP)
+			coro_stack_slot(insn->off, BPF_SIZE(insn->code), live);
+	} else if (class == BPF_STX) {
+		/* Use: src_reg */
+		if (sreg >= BPF_REG_6 && sreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(sreg);
+
+		/* Def: stack slot if fp-relative */
+		if (dreg == BPF_REG_FP) {
+			if (live->stack_full)
+				return;
+			if (insn->off % CORO_SLOT_SIZE || insn->off > -CORO_SLOT_SIZE ||
+			    insn->off < -MAX_BPF_STACK) {
+				live->stack_full = true;
+				return;
+			}
+			if (!live->stack_full) {
+				int slot = (-insn->off / CORO_SLOT_SIZE) - 1;
+
+				if (slot < 0 || slot >= CORO_STACK_SLOTS) {
+					live->stack_full = true;
+					return;
+				}
+				live->stack_mask &= ~BIT_ULL(slot);
+			}
+		}
+	} else if (class == BPF_ST) {
+		/* Def: stack slot if fp-relative */
+		if (dreg == BPF_REG_FP) {
+			if (live->stack_full)
+				return;
+			if (insn->off % CORO_SLOT_SIZE || insn->off > -CORO_SLOT_SIZE ||
+			    insn->off < -MAX_BPF_STACK) {
+				live->stack_full = true;
+				return;
+			}
+			if (!live->stack_full) {
+				int slot = (-insn->off / CORO_SLOT_SIZE) - 1;
+
+				if (slot < 0 || slot >= CORO_STACK_SLOTS) {
+					live->stack_full = true;
+					return;
+				}
+				live->stack_mask &= ~BIT_ULL(slot);
+			}
+		}
+	} else if (class == BPF_JMP || class == BPF_JMP32) {
+		if (op == BPF_CALL) {
+			/* Calls don't clobber callee-saved regs. */
+			return;
+		}
+
+		/* Conditional jumps use dst/src regs. */
+		if (dreg >= BPF_REG_6 && dreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(dreg);
+		if (src_is_x && sreg >= BPF_REG_6 && sreg <= BPF_REG_9)
+			live->regs |= coro_reg_bit(sreg);
+	} else if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM) {
+		if (dreg >= BPF_REG_6 && dreg <= BPF_REG_9)
+			live->regs &= ~coro_reg_bit(dreg);
+	}
+}
+
+
+static int append_coro_ctx_load(struct bpf_insn **insns, size_t *cnt,
+				size_t *cap, __u8 dst_reg)
+{
+	struct bpf_insn ld_ctx[] = { BPF_LD_IMM64(dst_reg, 0) };
+
+	ld_ctx[0].src_reg = BPF_PSEUDO_CORO_CTX;
+
+	return append_insns(insns, cnt, cap, ld_ctx, ARRAY_SIZE(ld_ctx));
+}
+
+static int append_coro_save(struct bpf_insn **insns, size_t *cnt, size_t *cap,
+			    const struct coro_live *live)
+{
+	__u64 stack_mask;
+	int err, reg, slot;
+
+	stack_mask = live->stack_full ? (CORO_STACK_SLOTS == 64 ? ~0ULL :
+					 (1ULL << CORO_STACK_SLOTS) - 1)
+				      : live->stack_mask;
+
+	if (!live->regs && !stack_mask)
+		return 0;
+
+	err = append_coro_ctx_load(insns, cnt, cap, BPF_REG_0);
+	if (err)
+		return err;
+
+	for (reg = BPF_REG_6; reg <= BPF_REG_9; reg++) {
+		if (!(live->regs & coro_reg_bit(reg)))
+			continue;
+		err = append_insn(insns, cnt, cap,
+				  BPF_STX_MEM(BPF_DW, BPF_REG_0, reg,
+					      CORO_CTX_R6_OFF + (reg - BPF_REG_6) * 8));
+		if (err)
+			return err;
+	}
+
+	for (slot = 0; slot < CORO_STACK_SLOTS; slot++) {
+		if (!(stack_mask & BIT_ULL(slot)))
+			continue;
+		int stack_off = -(int)(CORO_SLOT_SIZE * (slot + 1));
+		size_t ctx_off = CORO_CTX_STACK_OFF + slot * CORO_SLOT_SIZE;
+		struct bpf_insn spill[] = {
+			BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_10, stack_off),
+			BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_AX, ctx_off),
+		};
+
+		err = append_insns(insns, cnt, cap, spill, ARRAY_SIZE(spill));
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int append_coro_restore(struct bpf_insn **insns, size_t *cnt, size_t *cap,
+			       const struct coro_live *live)
+{
+	__u64 stack_mask;
+	int err, reg, slot;
+
+	stack_mask = live->stack_full ? (CORO_STACK_SLOTS == 64 ? ~0ULL :
+					 (1ULL << CORO_STACK_SLOTS) - 1)
+				      : live->stack_mask;
+
+	if (!live->regs && !stack_mask)
+		return 0;
+
+	err = append_coro_ctx_load(insns, cnt, cap, BPF_REG_0);
+	if (err)
+		return err;
+
+	for (slot = 0; slot < CORO_STACK_SLOTS; slot++) {
+		if (!(stack_mask & BIT_ULL(slot)))
+			continue;
+		int stack_off = -(int)(CORO_SLOT_SIZE * (slot + 1));
+		size_t ctx_off = CORO_CTX_STACK_OFF + slot * CORO_SLOT_SIZE;
+		struct bpf_insn fill[] = {
+			BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_0, ctx_off),
+			BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_AX, stack_off),
+		};
+
+		err = append_insns(insns, cnt, cap, fill, ARRAY_SIZE(fill));
+		if (err)
+			return err;
+	}
+
+	for (reg = BPF_REG_6; reg <= BPF_REG_9; reg++) {
+		if (!(live->regs & coro_reg_bit(reg)))
+			continue;
+		err = append_insn(insns, cnt, cap,
+				  BPF_LDX_MEM(BPF_DW, reg, BPF_REG_0,
+					      CORO_CTX_R6_OFF + (reg - BPF_REG_6) * 8));
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int bpf_program_transform_coro(struct bpf_program *prog)
+{
+	struct bpf_insn *insns = prog->insns, *new_insns = NULL;
+	size_t *orig_start = NULL, *orig_loc = NULL;
+	struct coro_point *points = NULL;
+	struct coro_live live = {};
+	size_t new_cnt = 0, new_cap, orig_cnt = prog->insns_cnt;
+	size_t i, coro_points = 0;
+	int err = 0;
+
+	if (!prog_is_coro(prog))
+		return 0;
+	if (prog->coro_transformed)
+		return 0;
+	if (prog->type != BPF_PROG_TYPE_XDP) {
+		pr_warn("prog '%s': coroutine sec only supported for XDP\n", prog->name);
+		return -EINVAL;
+	}
+
+	/* Backward liveness to find what crosses each await. */
+	for (i = orig_cnt; i-- > 0; ) {
+		if (insn_is_coro_await(&insns[i])) {
+			if (coro_points % 8 == 0) {
+				size_t new_sz = coro_points + 8;
+				struct coro_point *tmp;
+
+				tmp = libbpf_reallocarray(points, new_sz, sizeof(*points));
+				if (!tmp) {
+					err = -ENOMEM;
+					goto out;
+				}
+				points = tmp;
+			}
+			points[coro_points].insn_idx = i;
+			points[coro_points].live = live;
+			coro_points++;
+		}
+		coro_liveness_insn(&insns[i], &live);
+	}
+	if (!coro_points) {
+		pr_warn("prog '%s': coroutine section has no await points\n", prog->name);
+		err = -EINVAL;
+		goto out;
+	}
+
+	/* reverse to get ascending order */
+	for (i = 0; i < coro_points / 2; i++) {
+		struct coro_point tmp = points[i];
+
+		points[i] = points[coro_points - 1 - i];
+		points[coro_points - 1 - i] = tmp;
+	}
+
+	/* Estimate capacity based on actual liveness per suspension point. */
+	new_cap = orig_cnt;
+	for (i = 0; i < coro_points; i++) {
+		const struct coro_live *lv = &points[i].live;
+		__u64 stack_mask = lv->stack_full ? (CORO_STACK_SLOTS == 64 ? ~0ULL :
+						     (1ULL << CORO_STACK_SLOTS) - 1)
+						  : lv->stack_mask;
+		int regs = popcnt64(lv->regs);
+		int slots = popcnt64(stack_mask);
+
+		if (!regs && !slots)
+			continue;
+		new_cap += 2 + regs + slots * 2; /* save */
+		new_cap += 2 + regs + slots * 2; /* restore */
+	}
+	new_cap = max_t(size_t, new_cap, orig_cnt);
+
+	new_insns = calloc(new_cap, sizeof(*new_insns));
+	orig_start = calloc(orig_cnt, sizeof(*orig_start));
+	orig_loc = calloc(orig_cnt, sizeof(*orig_loc));
+	if (!new_insns || !orig_start || !orig_loc) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	size_t point_idx = 0;
+
+	for (i = 0; i < orig_cnt; i++) {
+		struct bpf_insn insn = insns[i];
+		const struct coro_live *live_at = NULL;
+
+		if (point_idx < coro_points && points[point_idx].insn_idx == i)
+			live_at = &points[point_idx].live;
+		else if (insn_is_coro_await(&insn)) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		orig_start[i] = new_cnt;
+
+		if (live_at) {
+			err = append_coro_save(&new_insns, &new_cnt, &new_cap, live_at);
+			if (err)
+				goto out;
+		}
+
+		orig_loc[i] = new_cnt;
+		err = append_insn(&new_insns, &new_cnt, &new_cap, insn);
+		if (err)
+			goto out;
+
+		if (live_at) {
+			err = append_coro_restore(&new_insns, &new_cnt, &new_cap, live_at);
+			if (err)
+				goto out;
+			point_idx++;
+		}
+	}
+
+	if (point_idx != coro_points) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	for (i = 0; i < orig_cnt; i++) {
+		struct bpf_insn *new_insn = &new_insns[orig_loc[i]];
+		struct bpf_insn *orig_insn = &insns[i];
+		u8 class = BPF_CLASS(orig_insn->code);
+		u8 opcode = BPF_OP(orig_insn->code);
+		s64 new_off, target;
+
+		if (class != BPF_JMP && class != BPF_JMP32)
+			continue;
+
+		if (opcode == BPF_CALL) {
+			if (orig_insn->src_reg != BPF_PSEUDO_CALL)
+				continue;
+			target = (s64)i + orig_insn->imm + 1;
+			if (target < 0 || target >= orig_cnt) {
+				err = -EINVAL;
+				goto out;
+			}
+			new_off = (s64)orig_start[target] - (s64)orig_loc[i] - 1;
+			new_insn->imm = new_off;
+			continue;
+		}
+
+		if (opcode == BPF_EXIT)
+			continue;
+
+		target = (s64)i + orig_insn->off + 1;
+		if (target < 0 || target >= orig_cnt) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		new_off = (s64)orig_start[target] - (s64)orig_loc[i] - 1;
+		if (new_off < SHRT_MIN || new_off > SHRT_MAX) {
+			err = -ERANGE;
+			goto out;
+		}
+		new_insn->off = new_off;
+	}
+
+	if (prog->func_info && prog->func_info_rec_size == sizeof(struct bpf_func_info)) {
+		struct bpf_func_info *info = prog->func_info;
+
+		for (i = 0; i < prog->func_info_cnt; i++) {
+			if (info[i].insn_off >= orig_cnt) {
+				err = -EINVAL;
+				goto out;
+			}
+			info[i].insn_off = orig_start[info[i].insn_off];
+		}
+	}
+
+	if (prog->line_info && prog->line_info_rec_size == sizeof(struct bpf_line_info)) {
+		struct bpf_line_info *info = prog->line_info;
+
+		for (i = 0; i < prog->line_info_cnt; i++) {
+			if (info[i].insn_off >= orig_cnt) {
+				err = -EINVAL;
+				goto out;
+			}
+			info[i].insn_off = orig_start[info[i].insn_off];
+		}
+	}
+
+	for (i = 0; i < prog->subprog_cnt; i++) {
+		if (prog->subprogs[i].sub_insn_off >= orig_cnt) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (prog->subprogs[i].sub_insn_off)
+			prog->subprogs[i].sub_insn_off = orig_start[prog->subprogs[i].sub_insn_off];
+	}
+	if (prog->sub_insn_off) {
+		if (prog->sub_insn_off >= orig_cnt) {
+			err = -EINVAL;
+			goto out;
+		}
+		prog->sub_insn_off = orig_start[prog->sub_insn_off];
+	}
+
+	free(prog->insns);
+	prog->insns = new_insns;
+	prog->insns_cnt = new_cnt;
+	prog->coro_transformed = true;
+	new_insns = NULL;
+
+out:
+	free(new_insns);
+	free(orig_start);
+	free(orig_loc);
+	free(points);
+	return err;
+}
+
+static int coro_prepare_prog_load(struct bpf_program *prog,
+				  struct bpf_prog_load_opts *opts, long cookie)
+{
+	int err;
+
+	err = libbpf_prepare_prog_load(prog, opts, cookie);
+	if (err)
+		return err;
+
+	return bpf_program_transform_coro(prog);
 }
 
 static void fixup_verifier_log(struct bpf_program *prog, char *buf, size_t buf_sz);
@@ -9860,6 +10390,7 @@ static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("iter+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF, attach_iter),
 	SEC_DEF("iter.s+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_iter),
 	SEC_DEF("syscall",		SYSCALL, 0, SEC_SLEEPABLE),
+	SEC_DEF("coro/xdp",		XDP, BPF_XDP, SEC_ATTACHABLE_OPT, .prog_prepare_load_fn = coro_prepare_prog_load),
 	SEC_DEF("xdp.frags/devmap",	XDP, BPF_XDP_DEVMAP, SEC_XDP_FRAGS),
 	SEC_DEF("xdp/devmap",		XDP, BPF_XDP_DEVMAP, SEC_ATTACHABLE),
 	SEC_DEF("xdp.frags/cpumap",	XDP, BPF_XDP_CPUMAP, SEC_XDP_FRAGS),

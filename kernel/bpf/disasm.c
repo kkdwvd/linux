@@ -36,6 +36,8 @@ static const char *__func_get_name(const struct bpf_insn_cbs *cbs,
 		snprintf(buff, len, "%+d", insn->imm);
 	else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
 		snprintf(buff, len, "kernel-function");
+	else if (insn->src_reg == BPF_PSEUDO_CORO_CALL)
+		snprintf(buff, len, "coro-function");
 
 	return buff;
 }
