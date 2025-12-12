@@ -1645,6 +1645,152 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
 	return 0;
 }
 
+static void emit_coro_stack_save_rsp_to_r11(u8 **pprog, bool check_overflow)
+{
+	u8 *prog = *pprog;
+	if (check_overflow) {
+		EMIT3(0x48, 0x89, 0xE3);
+		EMIT3(0x48, 0x81, 0xE3);
+		EMIT(0xFFFFF000, 4);
+		EMIT3(0x48, 0x8B, 0x1B);
+		EMIT3(0x48, 0x81, 0xFB);
+		EMIT((u32)PRIV_STACK_GUARD_VAL, 4);
+		EMIT2(0x75, 0x02);
+		EMIT2(0xEB, 0x01);
+		EMIT1(0xCC);
+	}
+	EMIT3(0x49, 0x89, 0xE3);
+	*pprog = prog;
+}
+
+static void emit_coro_stack_restore_rsp_from_r11(u8 **pprog, bool check_underflow)
+{
+	u8 *prog = *pprog;
+	if (check_underflow) {
+		EMIT3(0x4C, 0x89, 0xDB);
+		EMIT3(0x48, 0x81, 0xE3);
+		EMIT(0xFFFFF000, 4);
+		EMIT3(0x48, 0x8B, 0x1B);
+		EMIT3(0x48, 0x81, 0xFB);
+		EMIT((u32)PRIV_STACK_GUARD_VAL, 4);
+		EMIT2(0x75, 0x02);
+		EMIT2(0xEB, 0x01);
+		EMIT1(0xCC);
+	}
+	EMIT3(0x4C, 0x89, 0xDC);
+	*pprog = prog;
+}
+
+static void emit_coro_switch_stack_to_ctx(u8 **pprog, u8 ctx_reg)
+{
+	u8 *prog = *pprog;
+	u8 ctx_reg_enc;
+	ctx_reg_enc = reg2hex[ctx_reg];
+	EMIT3(0x49, 0x89, 0xE3);
+	if (ctx_reg_enc >= 8) {
+		EMIT3(add_2mod(0x48, BPF_REG_FP, ctx_reg), 0x8D, add_2reg(0x80, BPF_REG_FP, ctx_reg));
+	} else {
+		EMIT3(0x48, 0x8D, add_1reg(0x80, ctx_reg_enc));
+	}
+	EMIT(0x2000, 4);
+	if (ctx_reg_enc >= 8) {
+		EMIT3(add_2mod(0x48, BPF_REG_FP, ctx_reg), 0x89, add_2reg(0xC0, BPF_REG_FP, ctx_reg));
+	} else {
+		EMIT3(0x48, 0x89, add_1reg(0xC0 + (reg2hex[BPF_REG_FP] << 3), ctx_reg_enc));
+	}
+	*pprog = prog;
+}
+
+static void emit_coro_restore_stack_from_r11(u8 **pprog)
+{
+	u8 *prog = *pprog;
+	EMIT3(0x4C, 0x89, 0xDC);
+	EMIT3(0x4C, 0x89, 0xDD);
+	*pprog = prog;
+}
+
+static int emit_kfunc_call_x64(const struct bpf_prog *bpf_prog, u8 *image,
+			       int insn_idx, const struct bpf_insn *insn,
+			       u8 **pprog, bool is_coro)
+{
+	const struct btf_func_model *fm;
+	u8 *func_addr = NULL;
+	u8 *prog = *pprog;
+	u8 *ip;
+	int err;
+	int arg_idx;
+	s64 jmp_offset;
+
+	fm = bpf_jit_find_kfunc_model(bpf_prog, insn);
+	if (!fm)
+		return -EINVAL;
+
+	err = bpf_get_kfunc_addr(bpf_prog, insn->imm, insn->off, &func_addr);
+	if (err)
+		return err;
+
+	ip = image ? (image + insn_idx) : NULL;
+
+	if (is_coro) {
+		emit_coro_stack_save_rsp_to_r11(&prog, true);
+	}
+
+	for (arg_idx = 0; arg_idx < fm->nr_args; arg_idx++) {
+		int arg_reg_idx;
+		u8 arg_reg;
+		u8 bpf_arg_reg;
+		arg_reg_idx = arg_idx;
+		bpf_arg_reg = BPF_REG_1 + arg_idx;
+		if (arg_reg_idx >= 6) {
+			break;
+		}
+		arg_reg = arg_reg_idx == 0 ? 7 : (arg_reg_idx == 1 ? 6 : (arg_reg_idx == 2 ? 2 : (arg_reg_idx == 3 ? 1 : (arg_reg_idx == 4 ? 0 : 1))));
+		if (fm->arg_size[arg_idx] == sizeof(int)) {
+			u8 dst_reg_enc;
+			u8 src_reg_enc;
+			dst_reg_enc = arg_reg;
+			src_reg_enc = reg2hex[bpf_arg_reg];
+			if (dst_reg_enc != src_reg_enc) {
+				if (src_reg_enc >= 8 || dst_reg_enc >= 8) {
+					u8 mod_byte;
+					mod_byte = 0x40;
+					if (dst_reg_enc >= 8)
+						mod_byte |= 0x04;
+					if (src_reg_enc >= 8)
+						mod_byte |= 0x01;
+					EMIT3(mod_byte, 0x63, 0xC0 + ((dst_reg_enc & 7) << 3) + (src_reg_enc & 7));
+				} else {
+					EMIT3(0x48, 0x63, 0xC0 + (dst_reg_enc << 3) + src_reg_enc);
+				}
+			} else {
+				if (src_reg_enc >= 8) {
+					EMIT3(0x45, 0x63, 0xC0 + ((src_reg_enc & 7) << 3) + (src_reg_enc & 7));
+				} else {
+					EMIT3(0x48, 0x63, 0xC0 + (src_reg_enc << 3) + src_reg_enc);
+				}
+			}
+		}
+	}
+
+	if (ip)
+		ip += (prog - *pprog);
+	if (ip)
+		ip += x86_call_depth_emit_accounting(&prog, func_addr, ip);
+	jmp_offset = func_addr - (ip ? (ip + 5) : prog + 5);
+	if (!is_simm32(jmp_offset)) {
+		pr_err("kfunc call offset overflow\n");
+		return -ERANGE;
+	}
+	EMIT1_off32(0xE8, jmp_offset);
+
+	if (is_coro) {
+		emit_coro_restore_stack_from_r11(&prog);
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -1863,7 +2009,20 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 			break;
 
 		case BPF_LD | BPF_IMM | BPF_DW:
-			emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
+			if (insn[0].src_reg == BPF_PSEUDO_CORO_CTX) {
+				u64 coro_ctx_addr_placeholder;
+				u8 dst_reg_enc;
+				coro_ctx_addr_placeholder = 0xDEADBEEFCAFEBABEULL;
+				dst_reg_enc = reg2hex[dst_reg];
+				if (dst_reg_enc >= 8) {
+					EMIT2(0x49, 0xB8 + (dst_reg_enc & 7));
+				} else {
+					EMIT2(0x48, 0xB8 + dst_reg_enc);
+				}
+				EMIT(coro_ctx_addr_placeholder, 8);
+			} else {
+				emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
+			}
 			insn++;
 			i++;
 			break;
@@ -2433,8 +2592,20 @@ populate_extable:
 
 			/* call */
 		case BPF_JMP | BPF_CALL: {
+			int kfunc_err;
+			bool kfunc_or_coro;
 			u8 *ip = image + addrs[i - 1];
 
+			kfunc_or_coro = (src_reg == BPF_PSEUDO_KFUNC_CALL || src_reg == BPF_PSEUDO_CORO_CALL);
+			if (kfunc_or_coro) {
+				bool is_coro_call;
+				is_coro_call = (src_reg == BPF_PSEUDO_CORO_CALL);
+				kfunc_err = emit_kfunc_call_x64(bpf_prog, image, addrs[i - 1], insn, &prog, is_coro_call);
+				if (kfunc_err) {
+					return kfunc_err;
+				}
+				break;
+			}
 			func = (u8 *) __bpf_call_base + imm32;
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
 				LOAD_TAIL_CALL_CNT_PTR(stack_depth);
