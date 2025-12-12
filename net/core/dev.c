@@ -6371,6 +6371,12 @@ void netif_receive_skb_list_internal(struct list_head *head)
 	rcu_read_unlock();
 }
 
+noinline int __netif_receive_skb_hook(struct sk_buff *skb)
+{
+	return 0;
+}
+ALLOW_ERROR_INJECTION(__netif_receive_skb_hook, ERRNO);
+
 /**
  *	netif_receive_skb - process receive buffer from network
  *	@skb: buffer to process
@@ -6386,11 +6392,26 @@ void netif_receive_skb_list_internal(struct list_head *head)
  *	NET_RX_SUCCESS: no congestion
  *	NET_RX_DROP: packet was dropped
  */
-int netif_receive_skb(struct sk_buff *skb)
+noinline int netif_receive_skb(struct sk_buff *skb)
 {
 	int ret;
+	struct sk_buff *skb_copy;
+	int hook_result;
 
 	trace_netif_receive_skb_entry(skb);
+
+	skb_copy = skb_clone(skb, GFP_ATOMIC); // Avoid this by teaching the
+					       // verifier ownership of the
+					       // incoming packet --- KKD
+	if (skb_copy) {
+		hook_result = __netif_receive_skb_hook(skb_copy);
+		if (hook_result < 0) {
+			if (hook_result == -1) {
+				kfree_skb(skb_copy);
+				return NET_RX_DROP;
+			}
+		}
+	}
 
 	ret = netif_receive_skb_internal(skb);
 	trace_netif_receive_skb_exit(ret);

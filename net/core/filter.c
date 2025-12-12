@@ -12420,6 +12420,125 @@ __bpf_kfunc int bpf_xdp_pull_data(struct xdp_md *x, u32 len)
 	return 0;
 }
 
+__bpf_kfunc int bpf_coro_tcp_rcv(struct sk_buff *skb)
+{
+	int result_code;
+	int (*tcp_rcv_func_ptr)(struct sk_buff *);
+	struct sk_buff *skb_iter;
+	skb_iter = skb;
+	if (!skb_iter) {
+		return -22;
+	}
+	if (skb_iter->protocol != htons(0x0800)) {
+		return -22;
+	}
+	tcp_rcv_func_ptr = tcp_v4_rcv;
+	if (!tcp_rcv_func_ptr) {
+		return -2;
+	}
+	result_code = tcp_rcv_func_ptr(skb_iter);
+	return result_code;
+}
+
+__bpf_kfunc int bpf_coro_ip_rcv(struct sk_buff *skb, struct net_device *dev)
+{
+	int result_code;
+	int (*ip_rcv_func_ptr)(struct sk_buff *, struct net_device *, struct packet_type *, struct net_device *);
+	struct sk_buff *skb_iter;
+	struct net_device *dev_iter;
+	struct net_device *orig_dev_iter;
+	skb_iter = skb;
+	dev_iter = dev;
+	orig_dev_iter = dev;
+	if (!skb_iter) {
+		return -22;
+	}
+	if (!dev_iter) {
+		return -22;
+	}
+	ip_rcv_func_ptr = ip_rcv;
+	if (!ip_rcv_func_ptr) {
+		return -2;
+	}
+	result_code = ip_rcv_func_ptr(skb_iter, dev_iter, NULL, orig_dev_iter);
+	return result_code;
+}
+
+__bpf_kfunc int bpf_coro_udp_rcv(struct sk_buff *skb)
+{
+	int result_code;
+	int (*udp_rcv_func_ptr)(struct sk_buff *);
+	struct sk_buff *skb_iter;
+	struct sk_buff *skb_dup;
+	skb_iter = skb;
+	if (!skb_iter) {
+		return -22;
+	}
+	skb_dup = skb_clone(skb_iter, GFP_ATOMIC);
+	if (!skb_dup) {
+		return -12;
+	}
+	udp_rcv_func_ptr = __udp4_lib_rcv;
+	if (!udp_rcv_func_ptr) {
+		kfree_skb(skb_dup);
+		return -2;
+	}
+	result_code = udp_rcv_func_ptr(skb_dup);
+	return result_code;
+}
+
+__bpf_kfunc int bpf_coro_icmp_rcv(struct sk_buff *skb)
+{
+	int result_code;
+	int (*icmp_rcv_func_ptr)(struct sk_buff *);
+	struct sk_buff *skb_iter;
+	struct sk_buff *skb_dup;
+	skb_iter = skb;
+	if (!skb_iter) {
+		return -22;
+	}
+	skb_dup = skb_clone(skb_iter, GFP_ATOMIC);
+	if (!skb_dup) {
+		return -12;
+	}
+	icmp_rcv_func_ptr = icmp_rcv;
+	if (!icmp_rcv_func_ptr) {
+		kfree_skb(skb_dup);
+		return -2;
+	}
+	result_code = icmp_rcv_func_ptr(skb_dup);
+	return result_code;
+}
+
+__bpf_kfunc void bpf_coro_skb_free(struct sk_buff *skb)
+{
+	struct sk_buff *skb_iter;
+	struct sk_buff *skb_next;
+	skb_iter = skb;
+	while (skb_iter) {
+		skb_next = skb_iter->next;
+		kfree_skb(skb_iter);
+		skb_iter = skb_next;
+	}
+}
+
+__bpf_kfunc struct sk_buff *bpf_coro_skb_alloc(unsigned int size)
+{
+	struct sk_buff *skb_result;
+	unsigned int size_iter;
+	unsigned int size_with_headroom;
+	size_iter = size;
+	if (size_iter > 8192) {
+		return NULL;
+	}
+	size_with_headroom = size_iter + 128;
+	skb_result = alloc_skb(size_with_headroom, GFP_ATOMIC);
+	if (skb_result) {
+		skb_reserve(skb_result, 128);
+	}
+	return skb_result;
+}
+
 __bpf_kfunc_end_defs();
 
 int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
@@ -12462,6 +12581,15 @@ BTF_KFUNCS_START(bpf_kfunc_check_set_sock_ops)
 BTF_ID_FLAGS(func, bpf_sock_ops_enable_tx_tstamp, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(bpf_kfunc_check_set_sock_ops)
 
+BTF_KFUNCS_START(bpf_kfunc_check_set_coro)
+BTF_ID_FLAGS(func, bpf_coro_tcp_rcv, KF_CORO)
+BTF_ID_FLAGS(func, bpf_coro_ip_rcv, KF_CORO)
+BTF_ID_FLAGS(func, bpf_coro_udp_rcv, KF_CORO)
+BTF_ID_FLAGS(func, bpf_coro_icmp_rcv, KF_CORO)
+BTF_ID_FLAGS(func, bpf_coro_skb_free, KF_CORO)
+BTF_ID_FLAGS(func, bpf_coro_skb_alloc, KF_CORO)
+BTF_KFUNCS_END(bpf_kfunc_check_set_coro)
+
 static const struct btf_kfunc_id_set bpf_kfunc_set_skb = {
 	.owner = THIS_MODULE,
 	.set = &bpf_kfunc_check_set_skb,
@@ -12492,6 +12620,11 @@ static const struct btf_kfunc_id_set bpf_kfunc_set_sock_ops = {
 	.set = &bpf_kfunc_check_set_sock_ops,
 };
 
+static const struct btf_kfunc_id_set bpf_kfunc_set_coro = {
+	.owner = THIS_MODULE,
+	.set = &bpf_kfunc_check_set_coro,
+};
+
 static int __init bpf_kfunc_init(void)
 {
 	int ret;
@@ -12513,7 +12646,9 @@ static int __init bpf_kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
 					       &bpf_kfunc_set_sock_addr);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &bpf_kfunc_set_tcp_reqsk);
-	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SOCK_OPS, &bpf_kfunc_set_sock_ops);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SOCK_OPS, &bpf_kfunc_set_sock_ops);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_kfunc_set_coro);
+	return ret;
 }
 late_initcall(bpf_kfunc_init);
 
