@@ -444,8 +444,10 @@ struct bpf_light_subprog {
 struct bpf_program {
 	char *name;
 	char *sec_name;
+	char *sec_name_raw;
 	size_t sec_idx;
 	const struct bpf_sec_def *sec_def;
+	bool is_coro;
 	/* this program's instruction offset (in number of instructions)
 	 * within its containing ELF section
 	 */
@@ -806,6 +808,7 @@ static void bpf_program__exit(struct bpf_program *prog)
 	bpf_program__unload(prog);
 	zfree(&prog->name);
 	zfree(&prog->sec_name);
+	zfree(&prog->sec_name_raw);
 	zfree(&prog->insns);
 	zfree(&prog->reloc_desc);
 
@@ -868,6 +871,14 @@ bpf_object__init_prog(struct bpf_object *obj, struct bpf_program *prog,
 		sec_name++;
 	} else {
 		prog->autoload = true;
+	}
+
+	if (str_has_pfx(sec_name, "coro/")) {
+		prog->is_coro = true;
+		prog->sec_name_raw = strdup(sec_name);
+		if (!prog->sec_name_raw)
+			goto errout;
+		sec_name += sizeof("coro/") - 1;
 	}
 
 	prog->autoattach = true;
@@ -7699,6 +7710,912 @@ static int bpf_object__sanitize_prog(struct bpf_object *obj, struct bpf_program 
 	return 0;
 }
 
+/* Temporary coroutine markers: replace with dedicated instructions later. */
+#define CORO_HELPER_AWAIT BPF_FUNC_get_prandom_u32
+#define CORO_HELPER_YIELD BPF_FUNC_get_current_pid_tgid
+
+#define CORO_REG_SIZE 8
+#define CORO_STACK_SLOT_SIZE 8
+#define CORO_REG_AREA_SIZE (MAX_BPF_REG * CORO_REG_SIZE)
+#define CORO_STACK_SLOTS (MAX_BPF_STACK / CORO_STACK_SLOT_SIZE)
+#define CORO_STACK_AREA_OFF CORO_REG_AREA_SIZE
+/* Heap layout: registers + stack slots within the emulated heap region. */
+#define CORO_HEAP_MIN_SIZE (CORO_REG_AREA_SIZE + MAX_BPF_STACK)
+/* Temporary heap emulation uses lower half of stack (r10-512..r10-257). */
+#define CORO_HEAP_STACK_SIZE (MAX_BPF_STACK / 2)
+#define CORO_HEAP_STACK_OFF (-MAX_BPF_STACK)
+/* Await/yield follow call ABI: r0 is scratch pre-call, r1 post-call. */
+#define CORO_PRE_HEAP_REG BPF_REG_0
+#define CORO_POST_HEAP_REG BPF_REG_1
+#define CORO_PRE_STACK_SCRATCH BPF_REG_5
+#define CORO_POST_STACK_SCRATCH BPF_REG_5
+
+/*
+ * Coroutine transform overview:
+ *  - identify suspension points via temporary helper markers;
+ *  - build a CFG and compute register/stack liveness (stack at 8-byte slots);
+ *  - conservatively spill entire stack on variable offset accesses;
+ *  - inject pseudo heap loads and spill/restore code around suspends.
+ * Heap access is emulated with a pointer into the lower half of the stack.
+ */
+struct coro_succ {
+	int s[2];
+	int cnt;
+};
+
+enum coro_stack_state_kind {
+	CORO_STACK_NONE,
+	CORO_STACK_CONST,
+	CORO_STACK_VAR,
+};
+
+struct coro_stack_state {
+	enum coro_stack_state_kind kind;
+	int off;
+};
+
+struct coro_spill {
+	__u64 regs;
+	__u64 stack_slots;
+	bool save_r5;
+	bool r5_live_out;
+};
+
+static bool coro_insn_is_suspend(struct bpf_insn *insn)
+{
+	enum bpf_func_id func_id;
+
+	if (!insn_is_helper_call(insn, &func_id))
+		return false;
+
+	return func_id == CORO_HELPER_AWAIT || func_id == CORO_HELPER_YIELD;
+}
+
+static bool coro_insn_is_jmp(const struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_JMP ||
+	       BPF_CLASS(insn->code) == BPF_JMP32;
+}
+
+static bool coro_insn_is_exit(const struct bpf_insn *insn)
+{
+	return coro_insn_is_jmp(insn) && BPF_OP(insn->code) == BPF_EXIT;
+}
+
+static bool coro_suspend_uses_arg5(struct bpf_insn *insn)
+{
+	enum bpf_func_id func_id;
+
+	if (!insn_is_helper_call(insn, &func_id))
+		return false;
+
+	/* TODO(kkd): use helper prototypes / kfunc BTF to detect arg count. */
+	switch (func_id) {
+	case CORO_HELPER_AWAIT:
+	case CORO_HELPER_YIELD:
+	default:
+		return false;
+	}
+}
+
+static __u64 coro_suspend_arg_mask(struct bpf_insn *insn)
+{
+	__u64 mask = 0;
+
+	/* TODO(kkd): use helper prototypes / kfunc BTF to detect arg count. */
+	if (coro_suspend_uses_arg5(insn))
+		mask |= 1ULL << BPF_REG_5;
+
+	return mask;
+}
+
+static int coro_insn_mem_size(const struct bpf_insn *insn)
+{
+	switch (BPF_SIZE(insn->code)) {
+	case BPF_B:
+		return 1;
+	case BPF_H:
+		return 2;
+	case BPF_W:
+		return 4;
+	case BPF_DW:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+static void coro_insn_reg_use_def(const struct bpf_insn *insn, __u64 *use, __u64 *def)
+{
+	__u64 u = 0, d = 0;
+
+	if (insn->code == 0)
+		goto out;
+
+	switch (BPF_CLASS(insn->code)) {
+	case BPF_ALU:
+	case BPF_ALU64:
+		d |= 1ULL << insn->dst_reg;
+		if (BPF_OP(insn->code) == BPF_MOV) {
+			if (BPF_SRC(insn->code) == BPF_X)
+				u |= 1ULL << insn->src_reg;
+			break;
+		}
+		u |= 1ULL << insn->dst_reg;
+		if (BPF_SRC(insn->code) == BPF_X)
+			u |= 1ULL << insn->src_reg;
+		break;
+	case BPF_LDX:
+		d |= 1ULL << insn->dst_reg;
+		u |= 1ULL << insn->src_reg;
+		break;
+	case BPF_STX:
+		u |= 1ULL << insn->dst_reg;
+		u |= 1ULL << insn->src_reg;
+		break;
+	case BPF_ST:
+		u |= 1ULL << insn->dst_reg;
+		break;
+	case BPF_LD:
+		if (is_ldimm64_insn((struct bpf_insn *)insn))
+			d |= 1ULL << insn->dst_reg;
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (BPF_OP(insn->code) == BPF_CALL) {
+			if (coro_insn_is_suspend((struct bpf_insn *)insn))
+				u |= coro_suspend_arg_mask((struct bpf_insn *)insn);
+			else
+				u |= (1ULL << BPF_REG_1) | (1ULL << BPF_REG_2) |
+				     (1ULL << BPF_REG_3) | (1ULL << BPF_REG_4) |
+				     (1ULL << BPF_REG_5);
+
+			d |= 1ULL << BPF_REG_0;
+			d |= 1ULL << BPF_REG_1;
+			d |= 1ULL << BPF_REG_2;
+			d |= 1ULL << BPF_REG_3;
+			d |= 1ULL << BPF_REG_4;
+			d |= 1ULL << BPF_REG_5;
+		} else if (BPF_OP(insn->code) != BPF_EXIT &&
+			   BPF_OP(insn->code) != BPF_JA) {
+			u |= 1ULL << insn->dst_reg;
+			if (BPF_SRC(insn->code) == BPF_X)
+				u |= 1ULL << insn->src_reg;
+		}
+		break;
+	default:
+		break;
+	}
+
+out:
+	u &= ~(1ULL << BPF_REG_10);
+	d &= ~(1ULL << BPF_REG_10);
+	if (use)
+		*use = u;
+	if (def)
+		*def = d;
+}
+
+
+static struct coro_stack_state coro_stack_state_merge(struct coro_stack_state a,
+						      struct coro_stack_state b)
+{
+	struct coro_stack_state out = a;
+
+	if (a.kind == CORO_STACK_NONE && b.kind == CORO_STACK_NONE)
+		return a;
+	if (a.kind == CORO_STACK_NONE || b.kind == CORO_STACK_NONE)
+		goto unknown;
+
+	if (a.kind == CORO_STACK_CONST && b.kind == CORO_STACK_CONST && a.off == b.off)
+		return a;
+
+unknown:
+	out.kind = CORO_STACK_VAR;
+	out.off = 0;
+	return out;
+}
+
+static bool coro_stack_state_merge_into(struct coro_stack_state *dst,
+					const struct coro_stack_state *src)
+{
+	struct coro_stack_state merged;
+	bool changed = false;
+	int r;
+
+	for (r = 0; r < MAX_BPF_REG; r++) {
+		merged = coro_stack_state_merge(dst[r], src[r]);
+		if (merged.kind != dst[r].kind || merged.off != dst[r].off) {
+			dst[r] = merged;
+			changed = true;
+		}
+	}
+
+	dst[BPF_REG_10].kind = CORO_STACK_CONST;
+	dst[BPF_REG_10].off = 0;
+	return changed;
+}
+
+static void coro_stack_state_transfer(const struct bpf_insn *insn,
+				      struct coro_stack_state *state)
+{
+	int dst, src;
+
+	if (insn->code == 0)
+		return;
+
+	dst = insn->dst_reg;
+	src = insn->src_reg;
+
+	switch (BPF_CLASS(insn->code)) {
+	case BPF_ALU:
+	case BPF_ALU64:
+		if (dst == BPF_REG_10)
+			break;
+		if (BPF_OP(insn->code) == BPF_MOV) {
+			if (BPF_SRC(insn->code) == BPF_X)
+				state[dst] = state[src];
+			else
+				state[dst].kind = CORO_STACK_NONE;
+			break;
+		}
+		if (BPF_OP(insn->code) == BPF_ADD || BPF_OP(insn->code) == BPF_SUB) {
+			if (BPF_SRC(insn->code) == BPF_X) {
+				if (state[dst].kind != CORO_STACK_NONE ||
+				    state[src].kind != CORO_STACK_NONE)
+					state[dst].kind = CORO_STACK_VAR;
+			} else if (state[dst].kind == CORO_STACK_CONST) {
+				if (BPF_OP(insn->code) == BPF_ADD)
+					state[dst].off += insn->imm;
+				else
+					state[dst].off -= insn->imm;
+			}
+			break;
+		}
+
+		if (state[dst].kind != CORO_STACK_NONE ||
+		    (BPF_SRC(insn->code) == BPF_X && state[src].kind != CORO_STACK_NONE))
+			state[dst].kind = CORO_STACK_VAR;
+		else
+			state[dst].kind = CORO_STACK_NONE;
+		break;
+	case BPF_LDX:
+	case BPF_LD:
+		if (dst != BPF_REG_10)
+			state[dst].kind = CORO_STACK_NONE;
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (BPF_OP(insn->code) == BPF_CALL) {
+			state[BPF_REG_0].kind = CORO_STACK_NONE;
+			state[BPF_REG_1].kind = CORO_STACK_NONE;
+			state[BPF_REG_2].kind = CORO_STACK_NONE;
+			state[BPF_REG_3].kind = CORO_STACK_NONE;
+			state[BPF_REG_4].kind = CORO_STACK_NONE;
+			state[BPF_REG_5].kind = CORO_STACK_NONE;
+		}
+		break;
+	default:
+		break;
+	}
+
+	state[BPF_REG_10].kind = CORO_STACK_CONST;
+	state[BPF_REG_10].off = 0;
+}
+
+static void coro_build_succs(const struct bpf_program *prog, struct coro_succ *succs)
+{
+	struct bpf_insn *insns = prog->insns;
+	int i;
+
+	for (i = 0; i < prog->insns_cnt; i++) {
+		struct coro_succ *s = &succs[i];
+
+		s->cnt = 0;
+		if (coro_insn_is_exit(&insns[i]))
+			continue;
+
+		if (coro_insn_is_jmp(&insns[i]) &&
+		    BPF_OP(insns[i].code) != BPF_CALL &&
+		    BPF_OP(insns[i].code) != BPF_EXIT) {
+			int target = i + 1 + insns[i].off;
+
+			if (target >= 0 && target < prog->insns_cnt)
+				s->s[s->cnt++] = target;
+			if (BPF_OP(insns[i].code) != BPF_JA) {
+				if (i + 1 < prog->insns_cnt)
+					s->s[s->cnt++] = i + 1;
+			}
+			continue;
+		}
+
+		if (i + 1 < prog->insns_cnt)
+			s->s[s->cnt++] = i + 1;
+	}
+}
+
+static int coro_compute_stack_state(const struct bpf_program *prog,
+				    const struct coro_succ *succs,
+				    struct coro_stack_state **state_in_out)
+{
+	struct coro_stack_state *state_in;
+	struct coro_stack_state state_out[MAX_BPF_REG];
+	bool changed;
+	size_t cnt;
+	int i;
+
+	cnt = prog->insns_cnt;
+	state_in = calloc(cnt * MAX_BPF_REG, sizeof(*state_in));
+	if (!state_in)
+		return -ENOMEM;
+
+	/* This is a 2D array, we're writing state_in[insn_idx][r10]. */
+	for (i = 0; i < cnt; i++) {
+		state_in[i * MAX_BPF_REG + BPF_REG_10].kind = CORO_STACK_CONST;
+		state_in[i * MAX_BPF_REG + BPF_REG_10].off = 0;
+	}
+
+	do {
+		changed = false;
+		for (i = 0; i < cnt; i++) {
+			const struct coro_succ *s = &succs[i];
+			struct coro_stack_state *in = &state_in[i * MAX_BPF_REG];
+			int j;
+
+			memcpy(state_out, in, sizeof(state_out));
+			coro_stack_state_transfer(&prog->insns[i], state_out);
+
+			for (j = 0; j < s->cnt; j++) {
+				struct coro_stack_state *succ_in =
+					&state_in[s->s[j] * MAX_BPF_REG];
+
+				if (coro_stack_state_merge_into(succ_in, state_out))
+					changed = true;
+			}
+		}
+	} while (changed);
+
+	*state_in_out = state_in;
+	return 0;
+}
+
+static __u64 coro_stack_slot_mask(int eff_off, int size)
+{
+	int start_idx, end_idx, start_slot, end_slot, slot;
+	__u64 mask = 0;
+
+	/* Track stack liveness at 8-byte granularity, similar to verifier slots. */
+	if (size <= 0 || eff_off >= 0)
+		return 0;
+	start_idx = -eff_off - size;
+	end_idx = -eff_off - 1;
+	if (start_idx < 0 || end_idx >= MAX_BPF_STACK)
+		return 0;
+
+	start_slot = start_idx / CORO_STACK_SLOT_SIZE;
+	end_slot = end_idx / CORO_STACK_SLOT_SIZE;
+	for (slot = start_slot; slot <= end_slot; slot++)
+		mask |= 1ULL << slot;
+	return mask;
+}
+
+static __u64 coro_stack_all_mask(void)
+{
+#if CORO_STACK_SLOTS >= 64
+	return ~0ULL;
+#else
+	return (1ULL << CORO_STACK_SLOTS) - 1;
+#endif
+}
+
+static void coro_compute_use_def(const struct bpf_program *prog,
+				 const struct coro_stack_state *stack_state_in,
+				 __u64 *reg_use, __u64 *reg_def,
+				 __u64 *stack_use, __u64 *stack_def,
+				 bool *stack_ambiguous)
+{
+	const struct bpf_insn *insns = prog->insns;
+	int i;
+
+	/* Variable stack offsets are conservatively treated as unknown. */
+	*stack_ambiguous = false;
+
+	for (i = 0; i < prog->insns_cnt; i++) {
+		const struct bpf_insn *insn = &insns[i];
+		const struct coro_stack_state *in =
+			&stack_state_in[i * MAX_BPF_REG];
+		__u64 mask = 0;
+
+		coro_insn_reg_use_def(insn, &reg_use[i], &reg_def[i]);
+
+		stack_use[i] = 0;
+		stack_def[i] = 0;
+
+		if ((BPF_MODE(insn->code) == BPF_MEM ||
+		     BPF_MODE(insn->code) == BPF_ATOMIC) &&
+		    (BPF_CLASS(insn->code) == BPF_LDX ||
+		     BPF_CLASS(insn->code) == BPF_STX ||
+		     BPF_CLASS(insn->code) == BPF_ST)) {
+			int size = coro_insn_mem_size(insn);
+			int base_reg = BPF_CLASS(insn->code) == BPF_LDX ?
+				       insn->src_reg : insn->dst_reg;
+
+			if (in[base_reg].kind == CORO_STACK_CONST) {
+				int eff_off = in[base_reg].off + insn->off;
+
+				mask = coro_stack_slot_mask(eff_off, size);
+				if (!mask) {
+					*stack_ambiguous = true;
+					continue;
+				}
+				if (BPF_CLASS(insn->code) == BPF_LDX)
+					stack_use[i] |= mask;
+				else if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+					stack_use[i] |= mask;
+					stack_def[i] |= mask;
+				} else
+					stack_def[i] |= mask;
+			} else if (in[base_reg].kind == CORO_STACK_VAR) {
+				*stack_ambiguous = true;
+			}
+		}
+	}
+}
+
+static void coro_compute_liveness(const struct bpf_program *prog,
+				  const struct coro_succ *succs,
+				  const __u64 *reg_use, const __u64 *reg_def,
+				  const __u64 *stack_use, const __u64 *stack_def,
+				  __u64 *reg_in, __u64 *reg_out,
+				  __u64 *stack_in, __u64 *stack_out)
+{
+	bool changed;
+	int i;
+
+	do {
+		changed = false;
+		for (i = prog->insns_cnt - 1; i >= 0; i--) {
+			const struct coro_succ *s = &succs[i];
+			__u64 new_reg_out = 0, new_reg_in;
+			__u64 new_stack_out = 0, new_stack_in;
+			int j;
+
+			for (j = 0; j < s->cnt; j++) {
+				new_reg_out |= reg_in[s->s[j]];
+				new_stack_out |= stack_in[s->s[j]];
+			}
+
+			new_reg_in = reg_use[i] | (new_reg_out & ~reg_def[i]);
+			new_stack_in = stack_use[i] | (new_stack_out & ~stack_def[i]);
+
+			if (new_reg_out != reg_out[i] || new_reg_in != reg_in[i]) {
+				reg_out[i] = new_reg_out;
+				reg_in[i] = new_reg_in;
+				changed = true;
+			}
+			if (new_stack_out != stack_out[i] || new_stack_in != stack_in[i]) {
+				stack_out[i] = new_stack_out;
+				stack_in[i] = new_stack_in;
+				changed = true;
+			}
+		}
+	} while (changed);
+}
+
+static int coro_emit_reg_spills(struct bpf_insn *dst, int idx, int heap_reg,
+				int heap_base_off, __u64 regs)
+{
+	int reg;
+	int off = heap_base_off;
+
+	for (reg = 0; reg < MAX_BPF_REG; reg++) {
+		if (!(regs & (1ULL << reg)))
+			continue;
+		dst[idx++] = BPF_STX_MEM(BPF_DW, heap_reg, reg,
+					 off);
+		off += CORO_REG_SIZE;
+	}
+	return idx;
+}
+
+static int coro_emit_reg_restores(struct bpf_insn *dst, int idx, int heap_reg,
+				  int heap_base_off, __u64 regs)
+{
+	int reg;
+	int off = heap_base_off;
+	int heap_off = -1;
+
+	/* Restore all regs except heap base first to keep heap ptr alive. */
+	for (reg = 0; reg < MAX_BPF_REG; reg++) {
+		if (reg == heap_reg || !(regs & (1ULL << reg)))
+			goto next;
+		dst[idx++] = BPF_LDX_MEM(BPF_DW, reg, heap_reg, off);
+next:
+		if (regs & (1ULL << reg))
+			off += CORO_REG_SIZE;
+	}
+
+	/* Restore heap base register last (self-base load is fine). */
+	if (regs & (1ULL << heap_reg)) {
+		off = heap_base_off;
+		for (reg = 0; reg < MAX_BPF_REG; reg++) {
+			if (!(regs & (1ULL << reg)))
+				continue;
+			if (reg == heap_reg) {
+				heap_off = off;
+				break;
+			}
+			off += CORO_REG_SIZE;
+		}
+		if (heap_off >= 0)
+			dst[idx++] = BPF_LDX_MEM(BPF_DW, heap_reg, heap_reg, heap_off);
+	}
+	return idx;
+}
+
+static int coro_emit_stack_spills(struct bpf_insn *dst, int idx, int heap_reg,
+				  int heap_base_off, __u64 slots, int scratch_reg,
+				  bool restore)
+{
+	int slot;
+	int off = heap_base_off;
+
+	/* Use scratch_reg for staging stack values to/from heap. */
+	for (slot = 0; slot < CORO_STACK_SLOTS; slot++) {
+		int stack_off = -(slot + 1) * CORO_STACK_SLOT_SIZE;
+		int heap_off = off;
+
+		if (!(slots & (1ULL << slot)))
+			continue;
+
+		if (restore) {
+			dst[idx++] = BPF_LDX_MEM(BPF_DW, scratch_reg, heap_reg, heap_off);
+			dst[idx++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, scratch_reg, stack_off);
+		} else {
+			dst[idx++] = BPF_LDX_MEM(BPF_DW, scratch_reg, BPF_REG_10, stack_off);
+			dst[idx++] = BPF_STX_MEM(BPF_DW, heap_reg, scratch_reg, heap_off);
+		}
+		off += CORO_STACK_SLOT_SIZE;
+	}
+	return idx;
+}
+
+static int coro_emit_heap_load(struct bpf_insn *dst, int idx, int heap_reg)
+{
+	dst[idx++] = BPF_MOV64_REG(heap_reg, BPF_REG_10);
+	dst[idx++] = BPF_ALU64_IMM(BPF_ADD, heap_reg, CORO_HEAP_STACK_OFF);
+	return idx;
+}
+
+static void coro_adjust_btf_info(struct bpf_program *prog, const int *new_idx)
+{
+	__u32 i;
+
+	if (prog->func_info) {
+		for (i = 0; i < prog->func_info_cnt; i++) {
+			__u32 *off = prog->func_info + prog->func_info_rec_size * i;
+
+			if (*off < prog->insns_cnt)
+				*off = new_idx[*off];
+		}
+	}
+
+	if (!prog->line_info)
+		return;
+
+	for (i = 0; i < prog->line_info_cnt; i++) {
+		__u32 *off = prog->line_info + prog->line_info_rec_size * i;
+
+		if (*off < prog->insns_cnt)
+			*off = new_idx[*off];
+	}
+}
+
+static int bpf_program__coro_transform(struct bpf_program *prog)
+{
+	struct bpf_insn *insns = prog->insns, *new_insns;
+	struct coro_stack_state *stack_state_in = NULL;
+	struct coro_spill *spills = NULL;
+	struct coro_succ *succs = NULL;
+	__u64 *reg_use = NULL, *reg_def = NULL;
+	__u64 *stack_use = NULL, *stack_def = NULL;
+	__u64 *reg_in = NULL, *reg_out = NULL;
+	__u64 *stack_in = NULL, *stack_out = NULL;
+	int *pre_cnt = NULL, *post_cnt = NULL;
+	int *insn_new_idx = NULL, *insn_new_start = NULL;
+	__u64 stack_mask_all = coro_stack_all_mask();
+	bool stack_ambiguous;
+	bool has_spills = false;
+	/* Heap base offset within the stack-backed heap region. */
+	int heap_value_off = 0;
+	__u64 reg_exclude;
+	int i, err, new_cnt = 0;
+	int max_spill_bytes = 0;
+
+	if (!prog->is_coro)
+		return 0;
+
+	/*
+	 * Coroutine transformation:
+	 * - treat await/yield helper calls as suspension points (call ABI);
+	 * - insert heap base loads into a reserved stack region;
+	 * - spill/restore live regs and stack slots into the coroutine heap;
+	 * - track stack at 8-byte granularity; variable offsets are unknown;
+	 * - update jumps, subprog offsets, relocations, and BTF.ext info.
+	 */
+
+	/* Quick scan to skip non-coroutine programs with no suspend sites. */
+	for (i = 0; i < prog->insns_cnt; i++) {
+		if (coro_insn_is_suspend(&insns[i]))
+			break;
+	}
+	if (i == prog->insns_cnt)
+		return 0;
+
+	for (i = 0; i < prog->nr_reloc; i++) {
+		if (prog->reloc_desc[i].type == RELO_INSN_ARRAY ||
+		    prog->reloc_desc[i].type == RELO_SUBPROG_ADDR) {
+			pr_warn("prog '%s': coroutine transform doesn't support jump tables or subprog addrs yet\n",
+				prog->name);
+			return -EOPNOTSUPP;
+		}
+	}
+
+	succs = calloc(prog->insns_cnt, sizeof(*succs));
+	reg_use = calloc(prog->insns_cnt, sizeof(*reg_use));
+	reg_def = calloc(prog->insns_cnt, sizeof(*reg_def));
+	stack_use = calloc(prog->insns_cnt, sizeof(*stack_use));
+	stack_def = calloc(prog->insns_cnt, sizeof(*stack_def));
+	reg_in = calloc(prog->insns_cnt, sizeof(*reg_in));
+	reg_out = calloc(prog->insns_cnt, sizeof(*reg_out));
+	stack_in = calloc(prog->insns_cnt, sizeof(*stack_in));
+	stack_out = calloc(prog->insns_cnt, sizeof(*stack_out));
+	pre_cnt = calloc(prog->insns_cnt, sizeof(*pre_cnt));
+	post_cnt = calloc(prog->insns_cnt, sizeof(*post_cnt));
+	spills = calloc(prog->insns_cnt, sizeof(*spills));
+	if (!succs || !reg_use || !reg_def || !stack_use || !stack_def ||
+	    !reg_in || !reg_out || !stack_in || !stack_out || !pre_cnt ||
+	    !post_cnt || !spills) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	/* Build a simple CFG (fallthrough + branches) for liveness. */
+	coro_build_succs(prog, succs);
+
+	/* Forward pass to approximate stack pointer offsets per register. */
+	err = coro_compute_stack_state(prog, succs, &stack_state_in);
+	if (err)
+		goto out;
+
+	/* Identify register and stack use/def; mark ambiguous stack accesses. */
+	coro_compute_use_def(prog, stack_state_in, reg_use, reg_def,
+			     stack_use, stack_def, &stack_ambiguous);
+
+	/* Backward liveness for regs and stack slots across suspension points. */
+	coro_compute_liveness(prog, succs, reg_use, reg_def, stack_use, stack_def,
+			      reg_in, reg_out, stack_in, stack_out);
+
+	/*
+	 * Await/yield follow helper call ABI: r0-r5 are caller-saved and
+	 * may be clobbered, r10 is the frame pointer. Spill all regs that
+	 * are live across the suspension (including r1-r5) except r0/r10.
+	 * r5 is reserved as a stack spill scratch register.
+	 */
+	reg_exclude = (1ULL << BPF_REG_0) | (1ULL << BPF_REG_10);
+
+	for (i = 0; i < prog->insns_cnt; i++) {
+		__u64 regs, slots;
+		int reg_cnt, slot_cnt;
+
+		if (!coro_insn_is_suspend(&insns[i]))
+			continue;
+
+		regs = reg_out[i] & ~reg_exclude;
+		/* Unknown stack offsets force spilling all stack slots. */
+		slots = stack_ambiguous ? stack_mask_all : stack_out[i];
+
+		if (!regs && !slots)
+			continue;
+
+		spills[i].save_r5 = slots && coro_suspend_uses_arg5(&insns[i]);
+		spills[i].r5_live_out = regs & (1ULL << BPF_REG_5);
+		if (spills[i].save_r5)
+			regs &= ~(1ULL << BPF_REG_5);
+
+		spills[i].regs = regs;
+		spills[i].stack_slots = slots;
+		has_spills = true;
+
+		reg_cnt = __builtin_popcountll(regs);
+		slot_cnt = __builtin_popcountll(slots);
+		/*
+		 * Each suspension point gets:
+		 *  - a heap base load (mov+add, two insns);
+		 *  - register spills/restores (one insn per register);
+		 *  - stack spills/restores (two insns per 8-byte slot);
+		 *  - optional r5 save/restore if it carries the 5th arg.
+		 */
+		pre_cnt[i] = 2 + reg_cnt + slot_cnt * 2 +
+			     (spills[i].save_r5 ? 2 : 0);
+		post_cnt[i] = 2 + slot_cnt * 2 + reg_cnt +
+			      (spills[i].r5_live_out && spills[i].save_r5 ? 1 : 0);
+		if ((reg_cnt + slot_cnt + (spills[i].save_r5 ? 1 : 0)) *
+		    CORO_REG_SIZE > max_spill_bytes) {
+			max_spill_bytes = (reg_cnt + slot_cnt +
+					   (spills[i].save_r5 ? 1 : 0)) *
+					  CORO_REG_SIZE;
+		}
+	}
+
+	if (!has_spills) {
+		err = 0;
+		goto out;
+	}
+
+	if (max_spill_bytes > CORO_HEAP_STACK_SIZE) {
+		pr_warn("prog '%s': coroutine heap needs %d bytes, exceeds stack heap size %d\n",
+			prog->name, max_spill_bytes, CORO_HEAP_STACK_SIZE);
+		err = -E2BIG;
+		goto out;
+	}
+
+	insn_new_idx = calloc(prog->insns_cnt, sizeof(*insn_new_idx));
+	insn_new_start = calloc(prog->insns_cnt, sizeof(*insn_new_start));
+	if (!insn_new_idx || !insn_new_start) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < prog->insns_cnt; i++) {
+		insn_new_start[i] = i + new_cnt;
+		new_cnt += pre_cnt[i];
+		insn_new_idx[i] = i + new_cnt;
+		new_cnt += post_cnt[i];
+	}
+	new_cnt += prog->insns_cnt;
+
+	new_insns = libbpf_reallocarray(NULL, new_cnt, sizeof(*new_insns));
+	if (!new_insns) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	{
+		int idx = 0;
+
+		for (i = 0; i < prog->insns_cnt; i++) {
+			struct bpf_insn insn = insns[i];
+			int new_i = insn_new_idx[i];
+
+			if (pre_cnt[i]) {
+				int reg_cnt = __builtin_popcountll(spills[i].regs);
+				int slot_cnt = __builtin_popcountll(spills[i].stack_slots);
+				int r5_off;
+				int reg_base = heap_value_off;
+				int stack_base;
+
+				stack_base = reg_base + reg_cnt * CORO_REG_SIZE;
+				r5_off = stack_base + slot_cnt * CORO_REG_SIZE;
+
+				/* Load heap base into r0, then spill regs and stack. */
+				idx = coro_emit_heap_load(new_insns, idx, CORO_PRE_HEAP_REG);
+				if (spills[i].save_r5)
+					new_insns[idx++] =
+						BPF_STX_MEM(BPF_DW, CORO_PRE_HEAP_REG, BPF_REG_5,
+							    r5_off);
+				idx = coro_emit_reg_spills(new_insns, idx, CORO_PRE_HEAP_REG,
+							   reg_base, spills[i].regs);
+				idx = coro_emit_stack_spills(new_insns, idx, CORO_PRE_HEAP_REG,
+							     stack_base, spills[i].stack_slots,
+							     CORO_PRE_STACK_SCRATCH, false);
+				if (spills[i].save_r5)
+					new_insns[idx++] =
+						BPF_LDX_MEM(BPF_DW, BPF_REG_5, CORO_PRE_HEAP_REG,
+							    r5_off);
+			}
+
+			if (coro_insn_is_jmp(&insn) &&
+			    BPF_OP(insn.code) != BPF_CALL &&
+			    BPF_OP(insn.code) != BPF_EXIT) {
+				int old_target = i + 1 + insn.off;
+				int new_target;
+
+				if (old_target < 0 || old_target >= prog->insns_cnt) {
+					err = -EINVAL;
+					goto out_free_new;
+				}
+				new_target = insn_new_start[old_target];
+				insn.off = new_target - (new_i + 1);
+				if (insn.off > SHRT_MAX || insn.off < SHRT_MIN) {
+					err = -ERANGE;
+					goto out_free_new;
+				}
+			} else if (insn_is_subprog_call(&insn)) {
+				int old_target = i + 1 + insn.imm;
+				int new_target;
+
+				if (old_target < 0 || old_target >= prog->insns_cnt) {
+					err = -EINVAL;
+					goto out_free_new;
+				}
+				new_target = insn_new_start[old_target];
+				insn.imm = new_target - (new_i + 1);
+			}
+
+			new_insns[idx++] = insn;
+
+			if (post_cnt[i]) {
+				int reg_cnt = __builtin_popcountll(spills[i].regs);
+				int r5_off;
+				int reg_base = heap_value_off;
+				int stack_base;
+
+				stack_base = reg_base + reg_cnt * CORO_REG_SIZE;
+				r5_off = stack_base +
+					 __builtin_popcountll(spills[i].stack_slots) *
+					 CORO_REG_SIZE;
+
+				/* Reload heap base into r1, restore stack then regs. */
+				idx = coro_emit_heap_load(new_insns, idx, CORO_POST_HEAP_REG);
+				idx = coro_emit_stack_spills(new_insns, idx, CORO_POST_HEAP_REG,
+							     stack_base, spills[i].stack_slots,
+							     CORO_POST_STACK_SCRATCH, true);
+				idx = coro_emit_reg_restores(new_insns, idx, CORO_POST_HEAP_REG,
+							     reg_base, spills[i].regs);
+				if (spills[i].save_r5 && spills[i].r5_live_out)
+					new_insns[idx++] =
+						BPF_LDX_MEM(BPF_DW, BPF_REG_5, CORO_POST_HEAP_REG,
+							    r5_off);
+			}
+		}
+	}
+
+	for (i = 0; i < prog->nr_reloc; i++) {
+		if (prog->reloc_desc[i].insn_idx < 0 ||
+		    prog->reloc_desc[i].insn_idx >= prog->insns_cnt)
+			continue;
+		prog->reloc_desc[i].insn_idx =
+			insn_new_idx[prog->reloc_desc[i].insn_idx];
+	}
+
+	for (i = 0; i < prog->subprog_cnt; i++) {
+		if (prog->subprogs[i].sub_insn_off >= prog->insns_cnt)
+			continue;
+		prog->subprogs[i].sub_insn_off =
+			insn_new_idx[prog->subprogs[i].sub_insn_off];
+	}
+
+	coro_adjust_btf_info(prog, insn_new_idx);
+
+	free(insns);
+	prog->insns = new_insns;
+	prog->insns_cnt = new_cnt;
+
+	err = 0;
+	goto out;
+
+out_free_new:
+	free(new_insns);
+out:
+	free(stack_state_in);
+	free(succs);
+	free(reg_use);
+	free(reg_def);
+	free(stack_use);
+	free(stack_def);
+	free(reg_in);
+	free(reg_out);
+	free(stack_in);
+	free(stack_out);
+	free(pre_cnt);
+	free(post_cnt);
+	free(spills);
+	free(insn_new_idx);
+	free(insn_new_start);
+	return err;
+}
+
 static int libbpf_find_attach_btf_id(struct bpf_program *prog, const char *attach_name,
 				     int *btf_obj_fd, int *btf_type_id);
 
@@ -8239,6 +9156,9 @@ static int bpf_object_prepare_progs(struct bpf_object *obj)
 	for (i = 0; i < obj->nr_programs; i++) {
 		prog = &obj->programs[i];
 		err = bpf_object__sanitize_prog(obj, prog);
+		if (err)
+			return err;
+		err = bpf_program__coro_transform(prog);
 		if (err)
 			return err;
 	}
@@ -9597,7 +10517,7 @@ const char *bpf_program__name(const struct bpf_program *prog)
 
 const char *bpf_program__section_name(const struct bpf_program *prog)
 {
-	return prog->sec_name;
+	return prog->sec_name_raw ? prog->sec_name_raw : prog->sec_name;
 }
 
 bool bpf_program__autoload(const struct bpf_program *prog)
@@ -10105,6 +11025,9 @@ int libbpf_prog_type_by_name(const char *name, enum bpf_prog_type *prog_type,
 
 	if (!name)
 		return libbpf_err(-EINVAL);
+
+	if (str_has_pfx(name, "coro/"))
+		name += sizeof("coro/") - 1;
 
 	sec_def = find_sec_def(name);
 	if (sec_def) {
