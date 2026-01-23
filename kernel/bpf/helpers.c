@@ -1417,12 +1417,39 @@ static int bpf_async_update_prog_callback(struct bpf_async_cb *cb,
 	return 0;
 }
 
+/* Debug: one-shot latency reporter for cancel_async */
+static atomic_t bpf_async_latency_reported = ATOMIC_INIT(0);
+#define BPF_ASYNC_LATENCY_THRESH_NS (10 * NSEC_PER_MSEC) /* 10ms */
+
+static void bpf_async_check_latency(const char *step, u64 start_ns, bool is_cancel)
+{
+	u64 duration = ktime_get_mono_fast_ns() - start_ns;
+
+	if (!is_cancel || duration < BPF_ASYNC_LATENCY_THRESH_NS)
+		return;
+
+	if (atomic_cmpxchg(&bpf_async_latency_reported, 0, 1) == 0) {
+		pr_err("bpf_timer_cancel_async: step '%s' took %llu ns (>10ms)\n",
+		       step, duration);
+		dump_stack();
+	}
+}
+
 static int bpf_async_schedule_op(struct bpf_async_cb *cb, enum bpf_async_op op,
 				 u64 nsec, u32 timer_mode)
 {
+	bool is_cancel = (op == BPF_ASYNC_CANCEL);
+	u64 step_start;
+	int ret;
+
+	step_start = ktime_get_mono_fast_ns();
+
 	/* Acquire active writer */
 	if (atomic_cmpxchg_acquire(&cb->writer, 0, 1))
 		return -EBUSY;
+
+	bpf_async_check_latency("cmpxchg_acquire", step_start, is_cancel);
+	step_start = ktime_get_mono_fast_ns();
 
 	write_seqcount_latch_begin(&cb->latch);
 	cb->cmd[0].nsec = nsec;
@@ -1434,17 +1461,31 @@ static int bpf_async_schedule_op(struct bpf_async_cb *cb, enum bpf_async_op op,
 	cb->cmd[1].op = op;
 	write_seqcount_latch_end(&cb->latch);
 
+	bpf_async_check_latency("seqcount_latch", step_start, is_cancel);
+	step_start = ktime_get_mono_fast_ns();
+
 	atomic_set_release(&cb->writer, 0);
 
-	if (!in_nmi())
-		return bpf_async_process(cb);
+	bpf_async_check_latency("set_release", step_start, is_cancel);
+	step_start = ktime_get_mono_fast_ns();
+
+	if (!in_nmi()) {
+		ret = bpf_async_process(cb);
+		bpf_async_check_latency("bpf_async_process", step_start, is_cancel);
+		return ret;
+	}
 
 	/* NMI path: defer to irq_work with refcount protection */
 	if (!refcount_inc_not_zero(&cb->refcnt))
 		return -EBUSY;
 
+	bpf_async_check_latency("refcount_inc", step_start, is_cancel);
+	step_start = ktime_get_mono_fast_ns();
+
 	if (!irq_work_queue(&cb->worker))
 		bpf_async_refcount_put(cb);
+
+	bpf_async_check_latency("irq_work_queue", step_start, is_cancel);
 
 	return 0;
 }
@@ -1540,7 +1581,10 @@ BPF_CALL_3(bpf_timer_start, struct bpf_async_kern *, async, u64, nsecs, u64, fla
 	if (flags & BPF_F_TIMER_CPU_PIN)
 		mode |= HRTIMER_MODE_PINNED;
 
-	return bpf_async_schedule_op(&t->cb, BPF_ASYNC_START, nsecs, mode);
+	u64 step_start = ktime_get_mono_fast_ns();
+	int ret = bpf_async_schedule_op(&t->cb, BPF_ASYNC_START, nsecs, mode);
+	bpf_async_check_latency("bpf_timer_start", step_start, 1);
+	return ret;
 }
 
 static const struct bpf_func_proto bpf_timer_start_proto = {
@@ -1646,6 +1690,9 @@ static void __bpf_async_cancel_and_free(struct bpf_async_kern *async)
 static void bpf_async_process_op(struct bpf_async_cb *cb, u32 op,
 				 u64 timer_nsec, u32 timer_mode)
 {
+	bool is_cancel = (op == BPF_ASYNC_CANCEL);
+	u64 step_start;
+
 	switch (cb->type) {
 	case BPF_ASYNC_TYPE_TIMER: {
 		struct bpf_hrtimer *t = container_of(cb, struct bpf_hrtimer, cb);
@@ -1655,7 +1702,9 @@ static void bpf_async_process_op(struct bpf_async_cb *cb, u32 op,
 			hrtimer_start(&t->timer, ns_to_ktime(timer_nsec), timer_mode);
 			break;
 		case BPF_ASYNC_CANCEL:
+			step_start = ktime_get_mono_fast_ns();
 			hrtimer_try_to_cancel(&t->timer);
+			bpf_async_check_latency("hrtimer_try_to_cancel", step_start, is_cancel);
 			break;
 		}
 		break;
@@ -1671,7 +1720,9 @@ static void bpf_async_process_op(struct bpf_async_cb *cb, u32 op,
 			/* Use non-blocking cancel, safe in irq_work context.
 			 * RCU grace period ensures callback completes before free.
 			 */
+			step_start = ktime_get_mono_fast_ns();
 			cancel_work(&w->work);
+			bpf_async_check_latency("cancel_work", step_start, is_cancel);
 			break;
 		}
 		break;
@@ -1682,10 +1733,12 @@ static void bpf_async_process_op(struct bpf_async_cb *cb, u32 op,
 static int bpf_async_process(struct bpf_async_cb *cb)
 {
 	u32 op, timer_mode;
-	u64 nsec;
+	u64 nsec, step_start;
 	int err;
 
+	step_start = ktime_get_mono_fast_ns();
 	err = bpf_async_read_op(cb, &op, &nsec, &timer_mode);
+	bpf_async_check_latency("bpf_async_read_op", step_start, (op == BPF_ASYNC_CANCEL));
 	if (err)
 		return err;
 
