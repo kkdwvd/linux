@@ -195,8 +195,8 @@ static int timer_callback(void *map, int *key, struct timer_elem *val)
 	record_timing(&stats->callback_timing, duration);
 
 	/* Restart timer immediately with CPU pinning */
-	if (restart_timer) {
-		int ret = bpf_timer_start(&val->timer, 0, BPF_F_TIMER_CPU_PIN);
+	if (restart_timer && 0) {
+		int ret = bpf_timer_start(&val->timer, 10000000, BPF_F_TIMER_CPU_PIN);
 		if (ret == 0)
 			__sync_fetch_and_add(&stats->callback_restarts, 1);
 	}
@@ -260,7 +260,7 @@ int do_start(void *ctx)
 	smp_mb();
 
 	start_time = bpf_ktime_get_ns();
-	ret = bpf_timer_start(&elem->timer, 0, BPF_F_TIMER_CPU_PIN);
+	ret = bpf_timer_start(&elem->timer, 10000000, BPF_F_TIMER_CPU_PIN);
 	duration = bpf_ktime_get_ns() - start_time;
 
 	in_start = 0;
