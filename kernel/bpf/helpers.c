@@ -1528,8 +1528,7 @@ static int bpf_async_read_op(struct bpf_async_cb *cb, enum bpf_async_op *op,
 			continue;
 
 		/* Commit read sequence number, own snapshot exclusively */
-		if (atomic64_try_cmpxchg_release(&cb->last_seq, &last_seq, seq))
-			break;
+		return atomic64_try_cmpxchg_release(&cb->last_seq, &last_seq, seq) ? 0 : -EBUSY;
 	}
 
 	return 0;
