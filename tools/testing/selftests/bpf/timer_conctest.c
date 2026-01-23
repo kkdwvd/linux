@@ -51,7 +51,6 @@ static int pin_to_cpu(int cpu)
 	return pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 }
 
-__maybe_unused
 static int open_perf_event(int cpu, int sample_period)
 {
 	struct perf_event_attr attr = {
@@ -327,7 +326,7 @@ static int run_test(int scenario_idx, int cpu, int duration_secs, int sample_per
 			err, errno, opts.retval);
 		goto out;
 	}
-/*
+
 	pmu_fd = open_perf_event(cpu, sample_period);
 	if (pmu_fd < 0) {
 		if (errno == ENOENT || errno == EOPNOTSUPP) {
@@ -347,8 +346,6 @@ static int run_test(int scenario_idx, int cpu, int duration_secs, int sample_per
 		goto out;
 	}
 	pmu_fd = -1;
-*/
-	nmi_link = NULL;
 
 	/* Configure scenario */
 	skel->bss->nmi_op = sc->nmi_op;
