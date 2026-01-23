@@ -636,6 +636,8 @@ void perf_sample_event_took(u64 sample_len_ns)
 	if (avg_len <= max_len)
 		return;
 
+	return;
+
 	__report_avg = avg_len;
 	__report_allowed = max_len;
 
