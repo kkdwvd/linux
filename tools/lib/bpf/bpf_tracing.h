@@ -2,6 +2,10 @@
 #ifndef __BPF_TRACING_H__
 #define __BPF_TRACING_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "bpf_helpers.h"
 
 /* Scan the ARCH passed in from ARCH env variable (see Makefile) */
@@ -925,5 +929,9 @@ ____##name(struct pt_regs *ctx, ##args)
  */
 #define BPF_UPROBE(name, args...)  BPF_KPROBE(name, ##args)
 #define BPF_URETPROBE(name, args...)  BPF_KRETPROBE(name, ##args)
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif
