@@ -157,10 +157,10 @@ enum bpf_enum_value_kind {
  * information in the builtin expansion.
  */
 #ifdef __clang__
-#define ___bpf_typeof(type) ((typeof(type) *) 0)
+#define ___bpf_typeof(type) ((__typeof__(type) *) 0)
 #else
 #define ___bpf_typeof1(type, NR) ({					    \
-	extern typeof(type) *___concat(bpf_type_tmp_, NR);		    \
+	extern __typeof__(type) *___concat(bpf_type_tmp_, NR);		    \
 	___concat(bpf_type_tmp_, NR);					    \
 })
 #define ___bpf_typeof(type) ___bpf_typeof1(type, __COUNTER__)
@@ -274,7 +274,7 @@ enum bpf_enum_value_kind {
  */
 #ifdef __clang__
 #define bpf_core_enum_value_exists(enum_type, enum_value)		    \
-	__builtin_preserve_enum_value(*(typeof(enum_type) *)enum_value, BPF_ENUMVAL_EXISTS)
+	__builtin_preserve_enum_value(*(__typeof__(enum_type) *)enum_value, BPF_ENUMVAL_EXISTS)
 #else
 #define bpf_core_enum_value_exists(enum_type, enum_value)		    \
 	__builtin_preserve_enum_value(___bpf_typeof(enum_type), enum_value, BPF_ENUMVAL_EXISTS)
@@ -290,7 +290,7 @@ enum bpf_enum_value_kind {
  */
 #ifdef __clang__
 #define bpf_core_enum_value(enum_type, enum_value)			    \
-	__builtin_preserve_enum_value(*(typeof(enum_type) *)enum_value, BPF_ENUMVAL_VALUE)
+	__builtin_preserve_enum_value(*(__typeof__(enum_type) *)enum_value, BPF_ENUMVAL_VALUE)
 #else
 #define bpf_core_enum_value(enum_type, enum_value)			    \
 	__builtin_preserve_enum_value(___bpf_typeof(enum_type), enum_value, BPF_ENUMVAL_VALUE)
@@ -339,7 +339,7 @@ extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
  * need to use BPF_CORE_READ() macros.
  */
 #define bpf_core_cast(ptr, type)					    \
-	((typeof(type) *)bpf_rdonly_cast((ptr), bpf_core_type_id_kernel(type)))
+	((__typeof__(type) *)bpf_rdonly_cast((ptr), bpf_core_type_id_kernel(type)))
 
 #define ___concat(a, b) a ## b
 #define ___apply(fn, n) ___concat(fn, n)
@@ -397,7 +397,7 @@ extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 #elif defined(__GNUC__) && (__GNUC__ >= 14)
 #define ___type(...) __typeof_unqual__(___arrow(__VA_ARGS__))
 #else
-#define ___type(...) typeof(___arrow(__VA_ARGS__))
+#define ___type(...) __typeof__(___arrow(__VA_ARGS__))
 #endif
 
 #define ___read(read_fn, dst, src_type, src, accessor)			    \
