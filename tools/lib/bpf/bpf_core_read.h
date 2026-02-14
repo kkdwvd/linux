@@ -2,6 +2,10 @@
 #ifndef __BPF_CORE_READ_H__
 #define __BPF_CORE_READ_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "bpf_helpers.h"
 
 /*
@@ -562,6 +566,10 @@ extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 	BPF_PROBE_READ_USER_INTO(&__r, (src), a, ##__VA_ARGS__);	    \
 	__r;								    \
 })
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif
 
