@@ -2,6 +2,10 @@
 #ifndef __BPF_HELPERS__
 #define __BPF_HELPERS__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Note that bpf programs need to include either
  * vmlinux.h (auto-generated from BTF) or linux/types.h
@@ -454,5 +458,9 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 	/* nothing here  */									\
 )
 #endif /* bpf_repeat */
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif
