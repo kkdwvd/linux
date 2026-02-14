@@ -76,7 +76,11 @@
  * them on their own. So as a convenience, provide such definitions here.
  */
 #ifndef NULL
+#ifdef __cplusplus
+#define NULL nullptr
+#else
 #define NULL ((void *)0)
+#endif
 #endif
 
 #ifndef KERNEL_VERSION
