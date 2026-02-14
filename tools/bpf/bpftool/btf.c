@@ -1272,6 +1272,9 @@ static int dump_btf_c(struct btf *btf,
 	printf("#ifndef __bpf_arena\n");
 	printf("#define __bpf_arena __attribute__((address_space(1))) __attribute__((btf_type_tag(\"arena\")))\n");
 	printf("#endif\n\n");
+	printf("#ifdef __cplusplus\n");
+	printf("extern \"C\" {\n");
+	printf("#endif\n\n");
 	printf("#ifndef __ksym\n");
 	printf("#define __ksym __attribute__((section(\".ksyms\")))\n");
 	printf("#endif\n\n");
@@ -1314,6 +1317,9 @@ static int dump_btf_c(struct btf *btf,
 			goto done;
 	}
 
+	printf("#ifdef __cplusplus\n");
+	printf("} /* extern \"C\" */\n");
+	printf("#endif\n\n");
 	printf("#endif /* __VMLINUX_H__ */\n");
 
 done:
