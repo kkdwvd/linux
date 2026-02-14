@@ -10,6 +10,11 @@
  */
 #include "bpf_helper_defs.h"
 
+/* _Static_assert is a C11 keyword, C++ uses static_assert */
+#if defined(__cplusplus) && !defined(_Static_assert)
+#define _Static_assert static_assert
+#endif
+
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) __typeof__(val) *name
 #define __array(name, val) __typeof__(val) *name[]
