@@ -477,6 +477,27 @@ recur:
  * 0 is returned if no compatible field is found.
  * <0 is returned on error.
  */
+/*
+ * Match local member name against target member name, stripping the ___cpp
+ * suffix from the local name if present.  btf_dump appends ___cpp to struct
+ * member names that collide with C++ keywords (e.g., private -> private___cpp)
+ * so that vmlinux.h can be included from C++ source files.  The target
+ * (kernel) BTF retains the original C name, so we strip the suffix before
+ * comparing.  bpf_core_essential_name_len() already handles the generic
+ * ___<flavor> suffix stripping.
+ */
+static bool bpf_core_member_names_match(const char *local_name,
+					const char *targ_name)
+{
+	size_t local_len, targ_len;
+
+	local_len = bpf_core_essential_name_len(local_name);
+	targ_len = strlen(targ_name);
+
+	return local_len == targ_len &&
+	       strncmp(local_name, targ_name, local_len) == 0;
+}
+
 static int bpf_core_match_member(const struct btf *local_btf,
 				 const struct bpf_core_accessor *local_acc,
 				 const struct btf *targ_btf,
@@ -524,7 +545,7 @@ static int bpf_core_match_member(const struct btf *local_btf,
 						      spec, next_targ_id);
 			if (found) /* either found or error */
 				return found;
-		} else if (strcmp(local_name, targ_name) == 0) {
+		} else if (bpf_core_member_names_match(local_name, targ_name)) {
 			/* matching named field */
 			struct bpf_core_accessor *targ_acc;
 

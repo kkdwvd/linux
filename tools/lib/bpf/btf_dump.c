@@ -86,6 +86,9 @@ struct btf_dump {
 	bool skip_anon_defs;
 	int last_id;
 
+	/* enclosing named struct/union for C++ member name collision check */
+	const char *enclosing_name;
+
 	/* per-type auxiliary state */
 	struct btf_dump_type_aux_state *type_states;
 	size_t type_states_cap;
@@ -633,7 +636,7 @@ static void btf_dump_emit_enum_def(struct btf_dump *d, __u32 id,
 static void btf_dump_emit_fwd_def(struct btf_dump *d, __u32 id,
 				  const struct btf_type *t);
 
-static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
+static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 				      const struct btf_type *t, int lvl);
 
 /* a local view into a shared stack */
@@ -666,6 +669,78 @@ static bool btf_dump_is_blacklisted(struct btf_dump *d, __u32 id)
 	if (t->name_off == 0)
 		return false;
 	return strcmp(btf_name_of(d, t->name_off), "__builtin_va_list") == 0;
+}
+
+/*
+ * C++ keywords that are valid C identifiers. When these appear as struct/union
+ * member names or enum values in BTF (which is generated from C code), they
+ * need to be suffixed to avoid clashing with C++ reserved words.
+ */
+static bool btf_is_cpp_keyword(const char *name)
+{
+	static const char * const cpp_kws[] = {
+		"alignas", "alignof", "and", "and_eq", "asm", "auto",
+		"bitand", "bitor", "catch", "class", "compl",
+		"consteval", "constexpr", "constinit", "const_cast",
+		"co_await", "co_return", "co_yield",
+		"decltype", "delete", "dynamic_cast",
+		"explicit", "export",
+		"friend",
+		"mutable",
+		"namespace", "new", "noexcept", "not", "not_eq",
+		"operator", "or", "or_eq",
+		"private", "protected", "public",
+		"reinterpret_cast", "requires",
+		"static_assert", "static_cast",
+		"template", "this", "throw", "try", "typeid", "typename",
+		"using",
+		"virtual",
+		"xor", "xor_eq",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cpp_kws); i++) {
+		if (strcmp(name, cpp_kws[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Typedef names and enum values that are C++ built-in types or keywords.
+ * These definitions must be guarded with #ifndef __cplusplus.
+ */
+static bool btf_is_cpp_builtin_type(const char *name)
+{
+	return strcmp(name, "bool") == 0 ||
+	       strcmp(name, "wchar_t") == 0;
+}
+
+/*
+ * Check if an anonymous enum contains only C++ keyword values (true/false).
+ * Such enums define the C boolean type and are redundant in C++.
+ */
+static bool btf_dump_is_cpp_bool_enum(struct btf_dump *d,
+				      const struct btf_type *t)
+{
+	const struct btf_enum *v;
+	__u16 vlen;
+	int i;
+
+	if (t->name_off != 0)
+		return false;
+	if (!btf_is_enum(t))
+		return false;
+
+	vlen = btf_vlen(t);
+	v = btf_enum(t);
+	for (i = 0; i < vlen; i++, v++) {
+		const char *name = btf_name_of(d, v->name_off);
+
+		if (strcmp(name, "true") != 0 && strcmp(name, "false") != 0)
+			return false;
+	}
+	return vlen > 0;
 }
 
 /*
@@ -728,8 +803,12 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 			 * references through pointer only, not for embedding
 			 */
 			if (!btf_dump_is_blacklisted(d, id)) {
-				btf_dump_emit_typedef_def(d, id, t, 0);
-				btf_dump_printf(d, ";\n\n");
+				bool g = btf_dump_emit_typedef_def(d, id, t, 0);
+
+				btf_dump_printf(d, ";\n");
+				if (g)
+					btf_dump_printf(d, "#endif /* __cplusplus */\n");
+				btf_dump_printf(d, "\n");
 			}
 			tstate->fwd_emitted = 1;
 			break;
@@ -750,8 +829,29 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 	case BTF_KIND_ENUM:
 	case BTF_KIND_ENUM64:
 		if (top_level_def) {
-			btf_dump_emit_enum_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			bool is_bool_enum = btf_dump_is_cpp_bool_enum(d, t);
+			bool is_fwd_enum = btf_vlen(t) == 0 && t->name_off != 0;
+
+			if (is_fwd_enum) {
+				/* C++ forbids forward-declared enums without
+				 * an underlying type; provide one.
+				 */
+				btf_dump_printf(d, "#ifdef __cplusplus\n");
+				btf_dump_printf(d, "enum %s : unsigned int;\n",
+						btf_dump_type_name(d, id));
+				btf_dump_printf(d, "#else\n");
+				btf_dump_emit_enum_def(d, id, t, 0);
+				btf_dump_printf(d, ";\n");
+				btf_dump_printf(d, "#endif\n\n");
+			} else {
+				if (is_bool_enum)
+					btf_dump_printf(d, "#ifndef __cplusplus\n");
+				btf_dump_emit_enum_def(d, id, t, 0);
+				btf_dump_printf(d, ";\n");
+				if (is_bool_enum)
+					btf_dump_printf(d, "#endif /* __cplusplus */\n");
+				btf_dump_printf(d, "\n");
+			}
 		}
 		tstate->emit_state = EMITTED;
 		break;
@@ -781,8 +881,12 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 		 * emit typedef as a forward declaration
 		 */
 		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id)) {
-			btf_dump_emit_typedef_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			bool g = btf_dump_emit_typedef_def(d, id, t, 0);
+
+			btf_dump_printf(d, ";\n");
+			if (g)
+				btf_dump_printf(d, "#endif /* __cplusplus */\n");
+			btf_dump_printf(d, "\n");
 		}
 		tstate->emit_state = EMITTED;
 		break;
@@ -971,12 +1075,24 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 {
 	const struct btf_member *m = btf_members(t);
 	bool is_struct = btf_is_struct(t);
+	const char *struct_name, *saved_enclosing;
 	bool packed, prev_bitfield = false;
 	int align, i, off = 0;
 	__u16 vlen = btf_vlen(t);
 
 	align = btf__align_of(d->btf, id);
 	packed = is_struct ? btf_is_struct_packed(d->btf, id, t) : 0;
+	struct_name = t->name_off ? btf_name_of(d, t->name_off) : "";
+
+	/*
+	 * Track the enclosing named struct/union so that members of
+	 * nested anonymous structs/unions can be checked for name
+	 * collisions with the outer type (C++ injects anonymous
+	 * members into the enclosing scope).
+	 */
+	saved_enclosing = d->enclosing_name;
+	if (struct_name[0])
+		d->enclosing_name = struct_name;
 
 	btf_dump_printf(d, "%s%s%s {",
 			is_struct ? "struct" : "union",
@@ -989,6 +1105,22 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		bool in_bitfield;
 
 		fname = btf_name_of(d, m->name_off);
+		/*
+		 * In C++, a member name that matches the enclosing
+		 * struct/union name causes a redeclaration error since
+		 * the struct tag is injected into the declaration scope.
+		 * This also applies to members of nested anonymous
+		 * structs/unions which are injected into the enclosing
+		 * named scope.  Suffix such members with ___cpp.
+		 */
+		if (fname[0] && d->enclosing_name &&
+		    d->enclosing_name[0] &&
+		    strcmp(fname, d->enclosing_name) == 0) {
+			static char buf[256];
+
+			snprintf(buf, sizeof(buf), "%s___cpp", fname);
+			fname = buf;
+		}
 		m_sz = btf_member_bitfield_size(t, i);
 		m_off = btf_member_bit_offset(t, i);
 		m_align = packed ? 1 : btf__align_of(d->btf, m->type);
@@ -1028,6 +1160,8 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	}
 	if (packed)
 		btf_dump_printf(d, " __attribute__((packed))");
+
+	d->enclosing_name = saved_enclosing;
 }
 
 static const char *missing_base_types[][2] = {
@@ -1187,10 +1321,11 @@ static void btf_dump_emit_fwd_def(struct btf_dump *d, __u32 id,
 		btf_dump_printf(d, "struct %s", name);
 }
 
-static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
+static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 				     const struct btf_type *t, int lvl)
 {
 	const char *name = btf_dump_ident_name(d, id);
+	bool cpp_guard = false;
 
 	/*
 	 * Old GCC versions are emitting invalid typedef for __gnuc_va_list
@@ -1200,11 +1335,22 @@ static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 	 */
 	if (t->type == 0 && strcmp(name, "__gnuc_va_list") == 0) {
 		btf_dump_printf(d, "typedef __builtin_va_list __gnuc_va_list");
-		return;
+		return false;
+	}
+
+	/*
+	 * bool and wchar_t are built-in types in C++, so their typedefs
+	 * from the kernel (typedef _Bool bool, typedef u16 wchar_t) must
+	 * be guarded.
+	 */
+	if (btf_is_cpp_builtin_type(name)) {
+		btf_dump_printf(d, "#ifndef __cplusplus\n");
+		cpp_guard = true;
 	}
 
 	btf_dump_printf(d, "typedef ");
 	btf_dump_emit_type_decl(d, t->type, name, lvl);
+	return cpp_guard;
 }
 
 static int btf_dump_push_decl_stack_id(struct btf_dump *d, __u32 id)
@@ -1415,6 +1561,13 @@ static void btf_dump_emit_name(const struct btf_dump *d,
 	bool separate = name[0] && !last_was_ptr;
 
 	btf_dump_printf(d, "%s%s", separate ? " " : "", name);
+	/* Suffix C++ keywords used as identifiers so the generated header
+	 * compiles under both C and C++.  The ___cpp suffix is recognized
+	 * by CO-RE relocation logic which strips it when matching against
+	 * kernel BTF, similar to the existing ___N flavour suffix.
+	 */
+	if (name[0] && btf_is_cpp_keyword(name))
+		btf_dump_printf(d, "___cpp");
 }
 
 static void btf_dump_emit_type_chain(struct btf_dump *d,
@@ -1678,7 +1831,15 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 
 	if (btf_is_fwd(t) || (btf_is_enum(t) && btf_vlen(t) == 0)) {
 		s->name_resolved = 1;
-		return orig_name;
+		/* C++ keyword type names need suffixing even for fwd decls */
+		if (btf_is_cpp_keyword(orig_name)) {
+			const size_t max_len = 256;
+			char new_name[max_len];
+
+			snprintf(new_name, max_len, "%s___cpp", orig_name);
+			*cached_name = strdup(new_name);
+		}
+		return *cached_name ? *cached_name : orig_name;
 	}
 
 	dup_cnt = btf_dump_name_dups(d, name_map, orig_name);
@@ -1687,6 +1848,12 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 		char new_name[max_len];
 
 		snprintf(new_name, max_len, "%s___%zu", orig_name, dup_cnt);
+		*cached_name = strdup(new_name);
+	} else if (btf_is_cpp_keyword(orig_name)) {
+		const size_t max_len = 256;
+		char new_name[max_len];
+
+		snprintf(new_name, max_len, "%s___cpp", orig_name);
 		*cached_name = strdup(new_name);
 	}
 

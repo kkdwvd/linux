@@ -785,6 +785,9 @@ static int dump_btf_c(const struct btf *btf,
 	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
 	printf("#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)\n");
 	printf("#endif\n\n");
+	printf("#ifdef __cplusplus\n");
+	printf("extern \"C\" {\n");
+	printf("#endif\n\n");
 	printf("#ifndef __ksym\n");
 	printf("#define __ksym __attribute__((section(\".ksyms\")))\n");
 	printf("#endif\n\n");
@@ -823,6 +826,9 @@ static int dump_btf_c(const struct btf *btf,
 			goto done;
 	}
 
+	printf("#ifdef __cplusplus\n");
+	printf("} /* extern \"C\" */\n");
+	printf("#endif\n\n");
 	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
 	printf("#pragma clang attribute pop\n");
 	printf("#endif\n");
