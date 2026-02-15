@@ -12477,6 +12477,7 @@ enum special_kfunc_type {
 	KF_bpf_session_is_return,
 	KF_bpf_stream_vprintk,
 	KF_bpf_stream_print_stack,
+	KF_bpf_heap_alloc,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -12557,6 +12558,7 @@ BTF_ID(func, bpf_arena_reserve_pages)
 BTF_ID(func, bpf_session_is_return)
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
+BTF_ID(func, bpf_heap_alloc)
 
 static bool is_task_work_add_kfunc(u32 func_id)
 {
@@ -14278,7 +14280,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (meta.btf != btf_vmlinux ||
 		    (meta.func_id != special_kfunc_list[KF_bpf_obj_new_impl] &&
 		     meta.func_id != special_kfunc_list[KF_bpf_percpu_obj_new_impl] &&
-		     meta.func_id != special_kfunc_list[KF_bpf_refcount_acquire_impl])) {
+		     meta.func_id != special_kfunc_list[KF_bpf_refcount_acquire_impl] &&
+		     meta.func_id != special_kfunc_list[KF_bpf_heap_alloc])) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}

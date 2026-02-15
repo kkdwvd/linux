@@ -2324,6 +2324,16 @@ __bpf_kfunc void *bpf_percpu_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 	return bpf_mem_alloc(&bpf_global_percpu_ma, size);
 }
 
+__bpf_kfunc void *bpf_coro_frame_alloc(u64 size__k, void *ctx__ign, struct bpf_prog_aux *aux)
+{
+	return kmalloc_nolock(size__k, 0, NUMA_NO_NODE);
+}
+
+__bpf_kfunc void bpf_coro_frame_free(void *p, u64 size__k)
+{
+	kfree_nolock(p);
+}
+
 /* Must be called under migrate_disable(), as required by bpf_mem_free */
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu)
 {
@@ -4685,6 +4695,8 @@ BTF_ID_FLAGS(func, bpf_task_work_schedule_resume, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_coro_frame_free, KF_RELEASE)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
