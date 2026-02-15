@@ -2940,6 +2940,12 @@ populate_extable:
 				emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_3);
 			break;
 		}
+		case BPF_JMP | BPF_CALL | BPF_X:
+			if (is_ereg(dst_reg))
+				EMIT3(add_1mod(0x40, dst_reg), 0xff, add_1reg(0xD0, dst_reg));
+			else
+				EMIT2(0xff, add_1reg(0xD0, dst_reg));
+			break;
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)

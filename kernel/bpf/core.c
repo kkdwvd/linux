@@ -1823,6 +1823,7 @@ bool bpf_opcode_in_insntable(u8 code)
 		[0 ... 255] = false,
 		/* Now overwrite non-defaults ... */
 		BPF_INSN_MAP(BPF_INSN_2_TBL, BPF_INSN_3_TBL),
+		[BPF_JMP | BPF_CALL | BPF_X] = true,
 		/* UAPI exposed, but rewritten opcodes. cBPF carry-over. */
 		[BPF_LD | BPF_ABS | BPF_B] = true,
 		[BPF_LD | BPF_ABS | BPF_H] = true,
