@@ -247,6 +247,7 @@ struct bpf_reference_state {
 		REF_TYPE_LOCK		= (1 << 3),
 		REF_TYPE_RES_LOCK 	= (1 << 4),
 		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
+		REF_TYPE_CORO_FRAME	= (1 << 6),
 		REF_TYPE_LOCK_MASK	= REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
 	} type;
 	/* Track each reference created with a unique id, even if the same
@@ -261,6 +262,9 @@ struct bpf_reference_state {
 	 * it matches on unlock.
 	 */
 	void *ptr;
+	/* For REF_TYPE_CORO_FRAME: per-byte slot tracking, like stack */
+	struct bpf_stack_state *coro_frame_slots;
+	u32 coro_frame_size; /* allocation size in bytes */
 };
 
 struct bpf_retval_range {

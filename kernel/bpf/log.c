@@ -463,6 +463,7 @@ const char *reg_type_str(struct bpf_verifier_env *env, enum bpf_reg_type type)
 		[PTR_TO_FUNC]		= "func",
 		[PTR_TO_INSN]		= "insn",
 		[PTR_TO_MAP_KEY]	= "map_key",
+		[PTR_TO_CORO_FRAME]	= "coro_frame",
 		[CONST_PTR_TO_DYNPTR]	= "dynptr_ptr",
 	};
 
