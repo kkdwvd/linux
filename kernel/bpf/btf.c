@@ -877,14 +877,37 @@ static bool btf_name_offset_valid(const struct btf *btf, u32 offset)
 	return offset < btf->hdr.str_len;
 }
 
-static bool __btf_name_char_ok(char c, bool first)
+static bool __btf_name_char_ok(char c, bool first, bool cpp_ok)
 {
 	if ((first ? !isalpha(c) :
 		     !isalnum(c)) &&
 	    c != '_' &&
 	    c != '.')
-		return false;
+		goto check_cpp;
 	return true;
+
+check_cpp:
+	if (cpp_ok) {
+		switch (c) {
+		/* template: vector<int>, Task<unsigned long long> */
+		case '<':
+		case '>':
+		case ',':
+		/* template args with spaces: Task<unsigned long long> */
+		case ' ':
+		/* namespace / nested: std::coroutine_handle, promise_type::operator new */
+		case ':':
+		/* pointer/reference in template args: vector<int *>, map<int, int &> */
+		case '*':
+		case '&':
+		/* operator names: operator new, operator(), operator~ */
+		case '(':
+		case ')':
+		case '~':
+			return true;
+		}
+	}
+	return false;
 }
 
 const char *btf_str_by_offset(const struct btf *btf, u32 offset)
@@ -904,16 +927,39 @@ static bool btf_name_valid_identifier(const struct btf *btf, u32 offset)
 	/* offset must be valid */
 	const char *src = btf_str_by_offset(btf, offset);
 	const char *src_limit;
+	bool cpp_ok = false;
 
-	if (!__btf_name_char_ok(*src, true))
+	if (!__btf_name_char_ok(*src, true, false)) {
+		/* C++ names like 'operator new' start with a valid alpha char,
+		 * so a first-char failure here is fatal regardless.
+		 */
 		return false;
+	}
 
 	/* set a limit on identifier length */
 	src_limit = src + KSYM_NAME_LEN;
 	src++;
 	while (*src && src < src_limit) {
-		if (!__btf_name_char_ok(*src, false))
+		if (!__btf_name_char_ok(*src, false, cpp_ok)) {
+			if (!cpp_ok) {
+				/* Only C++ structural characters can establish
+				 * C++ context: '<' for templates, ':' for
+				 * namespaces, '(' ')' '~' for operator names.
+				 * Other C++ chars like '*', '&', ' ', ',' are
+				 * only valid after context is established.
+				 */
+				switch (*src) {
+				case '<':
+				case ':':
+				case '(':
+				case ')':
+				case '~':
+					cpp_ok = true;
+					continue;
+				}
+			}
 			return false;
+		}
 		src++;
 	}
 
