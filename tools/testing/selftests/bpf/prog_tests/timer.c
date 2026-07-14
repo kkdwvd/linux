@@ -320,7 +320,7 @@ void serial_test_timer_stress_nmi_cancel(void)
 void test_timer_interrupt(void)
 {
 	struct timer_interrupt *skel = NULL;
-	int err, prog_fd;
+	int err, i, prog_fd;
 	LIBBPF_OPTS(bpf_test_run_opts, opts);
 
 	skel = timer_interrupt__open_and_load();
@@ -340,11 +340,27 @@ void test_timer_interrupt(void)
 	if (!ASSERT_OK(err, "bpf_prog_test_run_opts"))
 		goto out;
 
-	usleep(50);
+	for (i = 0; i < 100; i++) {
+		if (READ_ONCE(skel->bss->soft_fired) &&
+		    READ_ONCE(skel->bss->hard_fired))
+			break;
+		usleep(1000);
+	}
 
+	ASSERT_OK(skel->bss->timer_err, "timer_err");
 	ASSERT_EQ(skel->bss->in_interrupt, 0, "in_interrupt");
-	if (skel->bss->preempt_count)
-		ASSERT_NEQ(skel->bss->in_interrupt_cb, 0, "in_interrupt_cb");
+	ASSERT_TRUE(skel->bss->soft_fired, "soft_fired");
+	ASSERT_TRUE(skel->bss->hard_fired, "hard_fired");
+	ASSERT_EQ(skel->bss->soft_in_hardirq, 0, "soft_in_hardirq");
+	if (skel->bss->soft_preempt_count)
+		ASSERT_NEQ(skel->bss->soft_in_interrupt, 0,
+			   "soft_in_interrupt");
+	if (skel->bss->hard_preempt_count) {
+		ASSERT_NEQ(skel->bss->hard_in_interrupt, 0,
+			   "hard_in_interrupt");
+		ASSERT_NEQ(skel->bss->hard_in_hardirq, 0,
+			   "hard_in_hardirq");
+	}
 
 out:
 	timer_interrupt__destroy(skel);
