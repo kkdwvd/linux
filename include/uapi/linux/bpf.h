@@ -5393,6 +5393,12 @@ union bpf_attr {
  *		Initialize the timer.
  *		First 4 bits of *flags* specify clockid.
  *		Only CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_BOOTTIME are allowed.
+ *		The following flag may be ORed with the clockid:
+ *
+ *		**BPF_F_TIMER_HARDIRQ**
+ *			Run the callback in hard irq context instead of the default
+ *			soft irq context.
+ *
  *		All other bits of *flags* are reserved.
  *		The verifier will reject the program if *timer* is not from
  *		the same *map*.
@@ -5419,8 +5425,10 @@ union bpf_attr {
  * long bpf_timer_start(struct bpf_timer *timer, u64 nsecs, u64 flags)
  *	Description
  *		Set timer expiration N nanoseconds from the current time. The
- *		configured callback will be invoked in soft irq context on some cpu
- *		and will not repeat unless another bpf_timer_start() is made.
+ *		configured callback will be invoked on some cpu and will not repeat
+ *		unless another bpf_timer_start() is made. The callback runs in soft
+ *		irq context by default, or in hard irq context if the timer was
+ *		initialized with **BPF_F_TIMER_HARDIRQ**.
  *		In such case the next invocation can migrate to a different cpu.
  *		Since struct bpf_timer is a field inside map element the map
  *		owns the timer. The bpf_timer_set_callback() will increment refcnt
@@ -7775,6 +7783,11 @@ struct bpf_core_relo {
 	__u32 type_id;
 	__u32 access_str_off;
 	enum bpf_core_relo_kind kind;
+};
+
+/* Flags to control bpf_timer_init() behaviour. */
+enum {
+	BPF_F_TIMER_HARDIRQ = (1ULL << 4),
 };
 
 /*

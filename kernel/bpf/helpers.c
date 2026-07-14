@@ -1184,6 +1184,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 {
 	struct bpf_hrtimer *t = container_of(hrtimer, struct bpf_hrtimer, timer);
 	struct bpf_map *map = t->cb.map;
+	struct bpf_hrtimer *prev_t;
 	void *value = t->cb.value;
 	bpf_callback_t callback_fn;
 	void *key;
@@ -1194,12 +1195,12 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 	if (!callback_fn)
 		goto out;
 
-	/* bpf_timer_cb() runs in hrtimer_run_softirq. It doesn't migrate and
-	 * cannot be preempted by another bpf_timer_cb() on the same cpu.
-	 * Remember the timer this callback is servicing to prevent
-	 * deadlock if callback_fn() calls bpf_timer_cancel() or
-	 * bpf_map_delete_elem() on the same timer.
+	/* Remember the timer this callback is servicing to prevent deadlock if
+	 * callback_fn() calls bpf_timer_cancel() or bpf_map_delete_elem() on the
+	 * same timer. A hard timer callback can preempt a soft timer callback on
+	 * the same CPU, so preserve the outer callback's timer.
 	 */
+	prev_t = this_cpu_read(hrtimer_running);
 	this_cpu_write(hrtimer_running, t);
 
 	key = map_key_from_value(map, value, &idx);
@@ -1207,7 +1208,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
 	/* The verifier checked that return value is zero. */
 
-	this_cpu_write(hrtimer_running, NULL);
+	this_cpu_write(hrtimer_running, prev_t);
 out:
 	return HRTIMER_NORESTART;
 }
@@ -1321,6 +1322,7 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
 	struct bpf_hrtimer *t;
 	struct bpf_work *w;
 	clockid_t clockid;
+	enum hrtimer_mode timer_mode;
 	size_t size;
 
 	switch (type) {
@@ -1348,7 +1350,9 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
 		t = (struct bpf_hrtimer *)cb;
 
 		atomic_set(&t->cancelling, 0);
-		hrtimer_setup(&t->timer, bpf_timer_cb, clockid, HRTIMER_MODE_REL_SOFT);
+		timer_mode = flags & BPF_F_TIMER_HARDIRQ ?
+			HRTIMER_MODE_REL_HARD : HRTIMER_MODE_REL_SOFT;
+		hrtimer_setup(&t->timer, bpf_timer_cb, clockid, timer_mode);
 		cb->value = (void *)async - map->record->timer_off;
 		break;
 	case BPF_ASYNC_TYPE_WQ:
@@ -1399,7 +1403,7 @@ BPF_CALL_3(bpf_timer_init, struct bpf_async_kern *, timer, struct bpf_map *, map
 	BUILD_BUG_ON(sizeof(struct bpf_async_kern) > sizeof(struct bpf_timer));
 	BUILD_BUG_ON(__alignof__(struct bpf_async_kern) != __alignof__(struct bpf_timer));
 
-	if (flags >= MAX_CLOCKS ||
+	if (flags & ~((MAX_CLOCKS - 1) | BPF_F_TIMER_HARDIRQ) ||
 	    /* similar to timerfd except _ALARM variants are not supported */
 	    (clockid != CLOCK_MONOTONIC &&
 	     clockid != CLOCK_REALTIME &&
@@ -1531,9 +1535,14 @@ BPF_CALL_3(bpf_timer_start, struct bpf_async_kern *, async, u64, nsecs, u64, fla
 		return -EINVAL;
 
 	if (flags & BPF_F_TIMER_ABS)
-		mode = HRTIMER_MODE_ABS_SOFT;
+		mode = HRTIMER_MODE_ABS;
 	else
-		mode = HRTIMER_MODE_REL_SOFT;
+		mode = HRTIMER_MODE_REL;
+
+	if (t->cb.flags & BPF_F_TIMER_HARDIRQ)
+		mode |= HRTIMER_MODE_HARD;
+	else
+		mode |= HRTIMER_MODE_SOFT;
 
 	if (flags & BPF_F_TIMER_CPU_PIN)
 		mode |= HRTIMER_MODE_PINNED;
