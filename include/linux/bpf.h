@@ -957,6 +957,7 @@ enum bpf_arg_type {
 	ARG_PTR_TO_WORKQUEUE,	/* pointer to bpf_wq */
 	ARG_PTR_TO_TASK_WORK,	/* pointer to bpf_task_work */
 	ARG_PTR_TO_RCU_HEAD,	/* pointer to bpf_rcu_head */
+	ARG_PTR_TO_WAITQUEUE,	/* pointer to bpf_waitq */
 	ARG_PTR_TO_IRQ_FLAG,	/* pointer to saved IRQ flags on the stack */
 	ARG_PTR_TO_RES_SPIN_LOCK,	/* pointer to bpf_res_spin_lock */
 	ARG_PTR_TO_CTX_OUT,	/* hook output argument passed through from ctx */

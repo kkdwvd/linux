@@ -541,6 +541,7 @@ static bool is_call_rcu_kfunc(u32 btf_id);
 static bool is_callback_calling_kfunc(u32 btf_id);
 
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id);
+static bool is_bpf_waitq_wait_kfunc(u32 btf_id);
 static bool is_task_work_add_kfunc(u32 func_id);
 
 static bool is_sync_callback_calling_function(enum bpf_func_id func_id)
@@ -8282,6 +8283,9 @@ static int check_map_field_pointer(struct bpf_verifier_env *env, struct bpf_reg_
 	case BPF_WORKQUEUE:
 		field_off = map->record->wq_off;
 		break;
+	case BPF_WAITQUEUE:
+		field_off = map->record->waitq_off;
+		break;
 	default:
 		verifier_bug(env, "unsupported BTF field type: %s\n", struct_name);
 		return -EINVAL;
@@ -9134,6 +9138,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_WORKQUEUE]		= &map_value_types,
 	[ARG_PTR_TO_TASK_WORK]		= &map_value_types,
 	[ARG_PTR_TO_RCU_HEAD]		= &map_value_types,
+	[ARG_PTR_TO_WAITQUEUE]		= &map_value_types,
 	[ARG_PTR_TO_IRQ_FLAG]		= &stack_ptr_types,
 	[ARG_PTR_TO_ARENA]		= &arena_types,
 	[ARG_PTR_TO_CTX_OUT]		= &ctx_out_types,
@@ -10155,6 +10160,11 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 		if (err < 0)
 			return err;
 		break;
+	case ARG_PTR_TO_WAITQUEUE:
+		err = check_map_field_pointer(env, reg, argno, BPF_WAITQUEUE, &meta->map);
+		if (err < 0)
+			return err;
+		break;
 	case ARG_PTR_TO_IRQ_FLAG:
 		err = process_irq_flag(env, reg, argno, meta);
 		if (err < 0)
@@ -10946,6 +10956,42 @@ static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
 			reg->type |= PTR_UNTRUSTED;
 			bpf_diag_mod_end(env);
 		}
+	}));
+}
+
+/*
+ * bpf_waitq_wait() drops the Tasks Trace RCU read section which normally
+ * protects a sleepable BPF program. Keep only pointers whose lifetime does
+ * not depend on that section, or whose lifetime is backed by an explicit
+ * verifier-tracked reference. A map the program references directly is
+ * held by the program; an inner map found through a map-in-map lookup is
+ * held by the outer map's element alone, whose deletion frees it after a
+ * grace period the sleeping program no longer delays.
+ */
+static void invalidate_trace_rcu_ptrs(struct bpf_verifier_env *env)
+{
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *state;
+	struct bpf_reg_state *reg;
+	u32 clear_mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR) | (1 << STACK_ITER);
+
+	bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, stack, clear_mask, ({
+		enum bpf_reg_type type = base_type(reg->type);
+
+		if (!is_pointer_regtype(reg->type))
+			continue;
+		if (stack && stack->slot_type[BPF_REG_SIZE - 1] != STACK_SPILL) {
+			mark_reg_invalid(env, reg);
+			continue;
+		}
+		if ((reg->id && find_reference_state(env->cur_state, reg->id)) ||
+		    (reg->parent_id && find_reference_state(env->cur_state, reg->parent_id)))
+			continue;
+		if (type == CONST_PTR_TO_MAP && !reg->map_uid)
+			continue;
+		if (type == PTR_TO_STACK || type == PTR_TO_FUNC || type == PTR_TO_INSN)
+			continue;
+		mark_reg_invalid(env, reg);
 	}));
 }
 
@@ -13021,7 +13067,8 @@ enum {
 	KF_ARG_TASK_WORK_ID,
 	KF_ARG_PROG_AUX_ID,
 	KF_ARG_TIMER_ID,
-	KF_ARG_RCU_HEAD_ID
+	KF_ARG_RCU_HEAD_ID,
+	KF_ARG_WAITQUEUE_ID,
 };
 
 BTF_ID_LIST(kf_arg_btf_ids)
@@ -13036,6 +13083,7 @@ BTF_ID(struct, bpf_task_work)
 BTF_ID(struct, bpf_prog_aux)
 BTF_ID(struct, bpf_timer)
 BTF_ID(struct, bpf_rcu_head)
+BTF_ID(struct, bpf_waitq)
 
 static bool __is_kfunc_ptr_arg_type(const struct btf *btf,
 				    const struct btf_param *arg, int type)
@@ -13097,6 +13145,11 @@ static bool is_kfunc_arg_task_work(const struct btf *btf, const struct btf_param
 static bool is_kfunc_arg_rcu_head(const struct btf *btf, const struct btf_param *arg)
 {
 	return __is_kfunc_ptr_arg_type(btf, arg, KF_ARG_RCU_HEAD_ID);
+}
+
+static bool is_kfunc_arg_waitq(const struct btf *btf, const struct btf_param *arg)
+{
+	return __is_kfunc_ptr_arg_type(btf, arg, KF_ARG_WAITQUEUE_ID);
 }
 
 static bool is_kfunc_arg_res_spin_lock(const struct btf *btf, const struct btf_param *arg)
@@ -13390,6 +13443,7 @@ enum special_kfunc_type {
 	KF_bpf_session_is_return,
 	KF_bpf_stream_vprintk,
 	KF_bpf_stream_print_stack,
+	KF_bpf_waitq_wait,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -13489,6 +13543,7 @@ BTF_ID_UNUSED
 #endif
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
+BTF_ID(func, bpf_waitq_wait)
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -13764,6 +13819,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		arg_type = ARG_PTR_TO_TASK_WORK;
 	else if (is_kfunc_arg_rcu_head(meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_RCU_HEAD;
+	else if (is_kfunc_arg_waitq(meta->btf, &args[arg]))
+		arg_type = ARG_PTR_TO_WAITQUEUE;
 	else if (is_kfunc_arg_irq_flag(meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_IRQ_FLAG;
 	else if (is_kfunc_arg_res_spin_lock(meta->btf, &args[arg]))
@@ -14327,6 +14384,11 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
+}
+
+static bool is_bpf_waitq_wait_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_waitq_wait];
 }
 
 static bool is_callback_calling_kfunc(u32 btf_id)
@@ -15333,6 +15395,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				return err;
 		}
 	}
+
+	if (is_bpf_waitq_wait_kfunc(meta.func_id))
+		invalidate_trace_rcu_ptrs(env);
 
 	bpf_diag_record_caller_saved(env, regs);
 	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
