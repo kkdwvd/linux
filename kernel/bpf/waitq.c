@@ -4,6 +4,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/cgroup.h>
 #include <linux/hrtimer.h>
 #include <linux/kthread.h>
 #include <linux/rcupdate_trace.h>
@@ -23,11 +24,14 @@ struct bpf_kthread_kern {
 	struct task_struct *task;
 	struct bpf_map *map;
 	struct bpf_prog *prog;
+	struct cgroup *cgrp;
 	void *callback_fn;
 	void *value;
+	struct completion initialized;
 	spinlock_t lock;
 	struct work_struct stop_work;
 	struct rcu_head rcu;
+	bool start_requested;
 	bool stopping;
 };
 
@@ -85,6 +89,12 @@ static int bpf_kthread_stop_one(struct bpf_kthread_kern *kthread)
 	spin_lock_irqsave(&kthread->lock, flags);
 	kthread->task = NULL;
 	spin_unlock_irqrestore(&kthread->lock, flags);
+#ifdef CONFIG_CGROUPS
+	if (kthread->cgrp) {
+		cgroup_put(kthread->cgrp);
+		kthread->cgrp = NULL;
+	}
+#endif
 
 	call_rcu_tasks_trace(&kthread->rcu, bpf_kthread_free_rcu);
 	return ret;
@@ -134,6 +144,15 @@ static int bpf_kthread_run(void *data)
 	struct bpf_kthread_kern *kthread = data;
 	bpf_callback_t callback_fn = READ_ONCE(kthread->callback_fn);
 	int ret = 0;
+
+	set_current_state(TASK_UNINTERRUPTIBLE);
+	complete(&kthread->initialized);
+	while (!READ_ONCE(kthread->start_requested) &&
+	       !kthread_should_stop() && !READ_ONCE(kthread->stopping)) {
+		schedule();
+		set_current_state(TASK_UNINTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
 
 	while (!kthread_should_stop() && !READ_ONCE(kthread->stopping)) {
 		void *key;
@@ -291,20 +310,21 @@ __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 }
 
 __bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_map,
+				   u64 cgroup_id,
 				   int (callback_fn)(void *map, int *key, void *value),
-				   u64 flags, struct bpf_prog_aux *aux)
+				   struct bpf_prog_aux *aux)
 {
 	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
 	struct bpf_map *map = p__const_map;
 	struct bpf_kthread_kern *new_kthread;
 	struct bpf_prog *prog;
 	struct task_struct *task;
+	struct cgroup *cgrp = NULL;
+	int err;
 
 	BUILD_BUG_ON(sizeof(struct bpf_kthread_opaque) > sizeof(struct bpf_kthread));
 	BUILD_BUG_ON(__alignof__(struct bpf_kthread_opaque) != __alignof__(struct bpf_kthread));
 
-	if (flags)
-		return -EINVAL;
 	if (READ_ONCE(opaque->kthread))
 		return -EBUSY;
 
@@ -322,25 +342,42 @@ __bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_m
 	new_kthread->prog = prog;
 	new_kthread->callback_fn = callback_fn;
 	new_kthread->value = (void *)opaque - map->record->kthread_off;
+	init_completion(&new_kthread->initialized);
 	spin_lock_init(&new_kthread->lock);
 	INIT_WORK(&new_kthread->stop_work, bpf_kthread_stop_work);
 
+	if (cgroup_id) {
+#ifdef CONFIG_CGROUPS
+		cgrp = cgroup_get_from_id(cgroup_id);
+		if (IS_ERR(cgrp)) {
+			err = PTR_ERR(cgrp);
+			goto free_kthread;
+		}
+		new_kthread->cgrp = cgrp;
+#else
+		err = -EOPNOTSUPP;
+		goto free_kthread;
+#endif
+	}
+
 	task = kthread_create(bpf_kthread_run, new_kthread, "bpf_kthread/%u", map->id);
 	if (IS_ERR(task)) {
-		int err = PTR_ERR(task);
-
-		bpf_prog_put(prog);
-		kfree(new_kthread);
-		return err;
+		err = PTR_ERR(task);
+		goto put_cgroup;
 	}
 	get_task_struct(task);
 	new_kthread->task = task;
+	if (cgrp) {
+		wake_up_process(task);
+		wait_for_completion(&new_kthread->initialized);
+		err = cgroup_kthread_attach(cgrp, task);
+		if (err)
+			goto stop_task;
+	}
 
 	if (cmpxchg(&opaque->kthread, NULL, new_kthread)) {
-		kthread_stop_put(task);
-		bpf_prog_put(prog);
-		kfree(new_kthread);
-		return -EBUSY;
+		err = -EBUSY;
+		goto stop_task;
 	}
 
 	/*
@@ -354,6 +391,16 @@ __bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_m
 	}
 
 	return 0;
+
+stop_task:
+	kthread_stop_put(task);
+put_cgroup:
+	if (cgrp)
+		cgroup_put(cgrp);
+free_kthread:
+	bpf_prog_put(prog);
+	kfree(new_kthread);
+	return err;
 }
 
 __bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
@@ -372,6 +419,7 @@ __bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
 
 	spin_lock_irqsave(&kthread_kern->lock, irq_flags);
 	if (!kthread_kern->stopping && kthread_kern->task) {
+		kthread_kern->start_requested = true;
 		task = kthread_kern->task;
 		get_task_struct(task);
 	}

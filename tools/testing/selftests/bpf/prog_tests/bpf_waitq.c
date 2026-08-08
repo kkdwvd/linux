@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <test_progs.h>
+#include "cgroup_helpers.h"
 #include "bpf_waitq_success.skel.h"
 #include "bpf_waitq_failures.skel.h"
 
@@ -30,6 +31,8 @@ static bool wait_for_counter(__u32 *counter)
 void test_bpf_waitq(void)
 {
 	struct bpf_waitq_success *skel;
+	const char *cgroup_path = "/bpf_waitq_kthread";
+	int cgroup_fd = -1;
 	__u32 retval;
 	int err;
 
@@ -72,6 +75,33 @@ void test_bpf_waitq(void)
 	err = run_syscall_prog(skel->progs.wait_timeout, &retval);
 	ASSERT_OK(err, "wait_timeout");
 	ASSERT_EQ((__s32)retval, -ETIMEDOUT, "timeout_ret");
+
+	err = setup_cgroup_environment();
+	if (!ASSERT_OK(err, "setup_cgroup_environment"))
+		goto out;
+	cgroup_fd = create_and_get_cgroup(cgroup_path);
+	if (!ASSERT_GE(cgroup_fd, 0, "create_and_get_cgroup"))
+		goto cleanup_cgroup;
+	skel->bss->target_cgroup_id = get_cgroup_id(cgroup_path);
+	if (!ASSERT_GT(skel->bss->target_cgroup_id, 0, "target_cgroup_id"))
+		goto cleanup_cgroup;
+	err = run_syscall_prog(skel->progs.start_cgroup_case, &retval);
+	if (!ASSERT_OK(err, "start_cgroup_case") ||
+	    !ASSERT_EQ(retval, 0, "cgroup_start_ret"))
+		goto cleanup_cgroup;
+	if (!ASSERT_TRUE(wait_for_counter(&skel->bss->callback_runs[2]),
+			 "cgroup_thread_started"))
+		goto cleanup_cgroup;
+	ASSERT_EQ(skel->bss->callback_cgroup_ids[2], skel->bss->target_cgroup_id,
+		  "callback_cgroup_id");
+	err = run_syscall_prog(skel->progs.stop_cgroup_thread, &retval);
+	ASSERT_OK(err, "stop_cgroup_thread");
+	ASSERT_EQ(retval, 0, "cgroup_stop_ret");
+
+cleanup_cgroup:
+	if (cgroup_fd >= 0)
+		close(cgroup_fd);
+	cleanup_cgroup_environment();
 out:
 	bpf_waitq_success__destroy(skel);
 }
