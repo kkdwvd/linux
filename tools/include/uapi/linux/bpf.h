@@ -7677,6 +7677,14 @@ struct bpf_wq {
 	__u64 __opaque[2];
 } __attribute__((aligned(8)));
 
+struct bpf_waitq {
+	__u64 __opaque[2];
+} __attribute__((aligned(8)));
+
+struct bpf_kthread {
+	__u64 __opaque[2];
+} __attribute__((aligned(8)));
+
 struct bpf_dynptr {
 	__u64 __opaque[2];
 } __attribute__((aligned(8)));
