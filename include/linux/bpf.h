@@ -72,6 +72,7 @@ extern struct bpf_mem_alloc bpf_global_ma, bpf_global_percpu_ma;
 extern bool bpf_global_ma_set;
 
 typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
+void *bpf_map_key_from_value(struct bpf_map *map, void *value, u32 *arr_idx);
 typedef int (*bpf_iter_init_seq_priv_t)(void *private_data,
 					struct bpf_iter_aux_info *aux);
 typedef void (*bpf_iter_fini_seq_priv_t)(void *private_data);
@@ -194,8 +195,8 @@ struct bpf_map_ops {
 };
 
 enum {
-	/* Support at most 11 fields in a BTF type */
-	BTF_FIELDS_MAX	   = 11,
+	/* Support at most 13 fields in a BTF type */
+	BTF_FIELDS_MAX	   = 13,
 };
 
 enum btf_field_type {
@@ -217,6 +218,8 @@ enum btf_field_type {
 	BPF_RES_SPIN_LOCK = (1 << 12),
 	BPF_TASK_WORK  = (1 << 13),
 	BPF_RCU_HEAD   = (1 << 14),
+	BPF_WAITQUEUE  = (1 << 15),
+	BPF_KTHREAD    = (1 << 16),
 };
 
 enum bpf_cgroup_storage_type {
@@ -269,6 +272,8 @@ struct btf_record {
 	int res_spin_lock_off;
 	int timer_off;
 	int wq_off;
+	int waitq_off;
+	int kthread_off;
 	int refcount_off;
 	int task_work_off;
 	int rcu_head_off;
@@ -368,6 +373,10 @@ static inline const char *btf_field_type_name(enum btf_field_type type)
 		return "bpf_timer";
 	case BPF_WORKQUEUE:
 		return "bpf_wq";
+	case BPF_WAITQUEUE:
+		return "bpf_waitq";
+	case BPF_KTHREAD:
+		return "bpf_kthread";
 	case BPF_KPTR_UNREF:
 	case BPF_KPTR_REF:
 		return "kptr";
@@ -412,6 +421,10 @@ static inline u32 btf_field_type_size(enum btf_field_type type)
 		return sizeof(struct bpf_timer);
 	case BPF_WORKQUEUE:
 		return sizeof(struct bpf_wq);
+	case BPF_WAITQUEUE:
+		return sizeof(struct bpf_waitq);
+	case BPF_KTHREAD:
+		return sizeof(struct bpf_kthread);
 	case BPF_KPTR_UNREF:
 	case BPF_KPTR_REF:
 	case BPF_KPTR_PERCPU:
@@ -448,6 +461,10 @@ static inline u32 btf_field_type_align(enum btf_field_type type)
 		return __alignof__(struct bpf_timer);
 	case BPF_WORKQUEUE:
 		return __alignof__(struct bpf_wq);
+	case BPF_WAITQUEUE:
+		return __alignof__(struct bpf_waitq);
+	case BPF_KTHREAD:
+		return __alignof__(struct bpf_kthread);
 	case BPF_KPTR_UNREF:
 	case BPF_KPTR_REF:
 	case BPF_KPTR_PERCPU:
@@ -494,6 +511,8 @@ static inline void bpf_obj_init_field(const struct btf_field *field, void *addr)
 	case BPF_RES_SPIN_LOCK:
 	case BPF_TIMER:
 	case BPF_WORKQUEUE:
+	case BPF_WAITQUEUE:
+	case BPF_KTHREAD:
 	case BPF_KPTR_UNREF:
 	case BPF_KPTR_REF:
 	case BPF_KPTR_PERCPU:
@@ -581,7 +600,7 @@ static inline void bpf_long_memcpy(void *dst, const void *src, u32 size)
 		data_race(*ldst++ = *lsrc++);
 }
 
-/* copy everything but bpf_spin_lock, bpf_timer, and kptrs. There could be one of each. */
+/* Copy everything except special fields described by the BTF record. */
 static inline void bpf_obj_memcpy(struct btf_record *rec,
 				  void *dst, void *src, u32 size,
 				  bool long_memcpy)
@@ -665,6 +684,8 @@ void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
 			   bool lock_src);
 void bpf_timer_cancel_and_free(void *timer);
 void bpf_wq_cancel_and_free(void *timer);
+void bpf_waitq_cancel_and_free(void *waitq);
+void bpf_kthread_cancel_and_free(void *kthread);
 void bpf_task_work_cancel_and_free(void *timer);
 void bpf_list_head_free(const struct btf_field *field, void *list_head,
 			struct bpf_spin_lock *spin_lock);
@@ -723,7 +744,8 @@ bool bpf_map_meta_equal(const struct bpf_map *meta0,
 
 static inline bool bpf_map_has_internal_structs(struct bpf_map *map)
 {
-	return btf_record_has_field(map->record, BPF_TIMER | BPF_WORKQUEUE | BPF_TASK_WORK);
+	return btf_record_has_field(map->record, BPF_TIMER | BPF_WORKQUEUE | BPF_TASK_WORK |
+					       BPF_WAITQUEUE | BPF_KTHREAD);
 }
 
 void bpf_map_free_internal_structs(struct bpf_map *map, void *obj);
@@ -947,6 +969,8 @@ enum bpf_arg_type {
 	ARG_PTR_TO_WORKQUEUE,	/* pointer to bpf_wq */
 	ARG_PTR_TO_TASK_WORK,	/* pointer to bpf_task_work */
 	ARG_PTR_TO_RCU_HEAD,	/* pointer to bpf_rcu_head */
+	ARG_PTR_TO_WAITQUEUE,	/* pointer to bpf_waitq */
+	ARG_PTR_TO_KTHREAD,	/* pointer to bpf_kthread */
 	ARG_PTR_TO_IRQ_FLAG,	/* pointer to saved IRQ flags on the stack */
 	ARG_PTR_TO_RES_SPIN_LOCK,	/* pointer to bpf_res_spin_lock */
 	ARG_PTR_TO_CTX_OUT,	/* hook output argument passed through from ctx */
@@ -2846,6 +2870,8 @@ struct btf_record *btf_record_dup(const struct btf_record *rec);
 bool btf_record_equal(const struct btf_record *rec_a, const struct btf_record *rec_b);
 void bpf_obj_free_timer(const struct btf_record *rec, void *obj);
 void bpf_obj_free_workqueue(const struct btf_record *rec, void *obj);
+void bpf_obj_free_waitqueue(const struct btf_record *rec, void *obj);
+void bpf_obj_free_kthread(const struct btf_record *rec, void *obj);
 void bpf_obj_free_task_work(const struct btf_record *rec, void *obj);
 void bpf_obj_cancel_fields(struct bpf_map *map, void *obj);
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj);

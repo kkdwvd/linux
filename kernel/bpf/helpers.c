@@ -1137,7 +1137,7 @@ const struct bpf_func_proto bpf_snprintf_proto = {
 	.arg5_type	= ARG_MEM_SIZE_OR_ZERO,
 };
 
-static void *map_key_from_value(struct bpf_map *map, void *value, u32 *arr_idx)
+void *bpf_map_key_from_value(struct bpf_map *map, void *value, u32 *arr_idx)
 {
 	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
 		struct bpf_array *array = container_of(map, struct bpf_array, map);
@@ -1241,7 +1241,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 	prev_t = this_cpu_read(hrtimer_running);
 	this_cpu_write(hrtimer_running, t);
 
-	key = map_key_from_value(map, value, &idx);
+	key = bpf_map_key_from_value(map, value, &idx);
 
 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
 	/* The verifier checked that return value is zero. */
@@ -1267,7 +1267,7 @@ static void bpf_wq_work(struct work_struct *work)
 	if (!callback_fn)
 		return;
 
-	key = map_key_from_value(map, value, &idx);
+	key = bpf_map_key_from_value(map, value, &idx);
 
         rcu_read_lock_trace();
         migrate_disable();
@@ -4627,7 +4627,7 @@ static void bpf_task_work_callback(struct callback_head *cb)
 		return;
 	}
 
-	key = (void *)map_key_from_value(ctx->map, ctx->map_val, &idx);
+	key = (void *)bpf_map_key_from_value(ctx->map, ctx->map_val, &idx);
 
 	migrate_disable();
 	ctx->callback_fn((u64)(long)ctx->map, (u64)(long)key,
@@ -4854,7 +4854,7 @@ static void bpf_rcu_run_callback(struct rcu_head *rcu)
 	u32 idx;
 
 	value = (void *)rh - map->record->rcu_head_off;
-	key = map_key_from_value(map, value, &idx);
+	key = bpf_map_key_from_value(map, value, &idx);
 
 	/* Pairs with the arming cmpxchg(): rh may be re-armed as soon as this store lands. */
 	smp_store_release(&rh->armed, 0);
@@ -5300,6 +5300,10 @@ void bpf_map_free_internal_structs(struct bpf_map *map, void *val)
 		bpf_obj_free_timer(map->record, val);
 	if (btf_record_has_field(map->record, BPF_WORKQUEUE))
 		bpf_obj_free_workqueue(map->record, val);
+	if (btf_record_has_field(map->record, BPF_WAITQUEUE))
+		bpf_obj_free_waitqueue(map->record, val);
+	if (btf_record_has_field(map->record, BPF_KTHREAD))
+		bpf_obj_free_kthread(map->record, val);
 	if (btf_record_has_field(map->record, BPF_TASK_WORK))
 		bpf_obj_free_task_work(map->record, val);
 }
