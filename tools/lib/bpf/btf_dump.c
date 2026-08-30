@@ -687,7 +687,7 @@ static void btf_dump_emit_enum_def(struct btf_dump *d, __u32 id,
 static void btf_dump_emit_fwd_def(struct btf_dump *d, __u32 id,
 				  const struct btf_type *t);
 
-static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
+static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 				      const struct btf_type *t, int lvl);
 
 /* a local view into a shared stack */
@@ -720,6 +720,43 @@ static bool btf_dump_is_blacklisted(struct btf_dump *d, __u32 id)
 	if (t->name_off == 0)
 		return false;
 	return strcmp(btf_name_of(d, t->name_off), "__builtin_va_list") == 0;
+}
+
+/*
+ * Typedef names and enum values that are C++ built-in types or keywords.
+ * These definitions must be guarded with #ifndef __cplusplus.
+ */
+static bool btf_is_cpp_builtin_type(const char *name)
+{
+	return strcmp(name, "bool") == 0 ||
+	       strcmp(name, "wchar_t") == 0;
+}
+
+/*
+ * Check if an anonymous enum contains only C++ keyword values (true/false).
+ * Such enums define the C boolean type and are redundant in C++.
+ */
+static bool btf_dump_is_cpp_bool_enum(struct btf_dump *d,
+				      const struct btf_type *t)
+{
+	const struct btf_enum *v;
+	__u16 vlen;
+	int i;
+
+	if (t->name_off != 0)
+		return false;
+	if (!btf_is_enum(t))
+		return false;
+
+	vlen = btf_vlen(t);
+	v = btf_enum(t);
+	for (i = 0; i < vlen; i++, v++) {
+		const char *name = btf_name_of(d, v->name_off);
+
+		if (strcmp(name, "true") != 0 && strcmp(name, "false") != 0)
+			return false;
+	}
+	return vlen > 0;
 }
 
 /*
@@ -782,8 +819,12 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 			 * references through pointer only, not for embedding
 			 */
 			if (!btf_dump_is_blacklisted(d, id)) {
-				btf_dump_emit_typedef_def(d, id, t, 0);
-				btf_dump_printf(d, ";\n\n");
+				bool g = btf_dump_emit_typedef_def(d, id, t, 0);
+
+				btf_dump_printf(d, ";\n");
+				if (g)
+					btf_dump_printf(d, "#endif /* __cplusplus */\n");
+				btf_dump_printf(d, "\n");
 			}
 			tstate->fwd_emitted = 1;
 			break;
@@ -804,8 +845,15 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 	case BTF_KIND_ENUM:
 	case BTF_KIND_ENUM64:
 		if (top_level_def) {
+			bool is_bool_enum = btf_dump_is_cpp_bool_enum(d, t);
+
+			if (is_bool_enum)
+				btf_dump_printf(d, "#ifndef __cplusplus\n");
 			btf_dump_emit_enum_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			btf_dump_printf(d, ";\n");
+			if (is_bool_enum)
+				btf_dump_printf(d, "#endif /* __cplusplus */\n");
+			btf_dump_printf(d, "\n");
 		}
 		tstate->emit_state = EMITTED;
 		break;
@@ -835,8 +883,12 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 		 * emit typedef as a forward declaration
 		 */
 		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id)) {
-			btf_dump_emit_typedef_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			bool g = btf_dump_emit_typedef_def(d, id, t, 0);
+
+			btf_dump_printf(d, ";\n");
+			if (g)
+				btf_dump_printf(d, "#endif /* __cplusplus */\n");
+			btf_dump_printf(d, "\n");
 		}
 		tstate->emit_state = EMITTED;
 		break;
@@ -1282,10 +1334,11 @@ static void btf_dump_emit_fwd_def(struct btf_dump *d, __u32 id,
 		btf_dump_printf(d, "struct %s", name);
 }
 
-static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
+static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 				     const struct btf_type *t, int lvl)
 {
 	const char *name = btf_dump_ident_name(d, id);
+	bool cpp_guard = false;
 
 	/*
 	 * Old GCC versions are emitting invalid typedef for __gnuc_va_list
@@ -1295,12 +1348,23 @@ static void btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 	 */
 	if (t->type == 0 && strcmp(name, "__gnuc_va_list") == 0) {
 		btf_dump_printf(d, "typedef __builtin_va_list __gnuc_va_list");
-		return;
+		return false;
+	}
+
+	/*
+	 * bool and wchar_t are built-in types in C++, so their typedefs
+	 * from the kernel (typedef _Bool bool, typedef u16 wchar_t) must
+	 * be guarded.
+	 */
+	if (btf_is_cpp_builtin_type(name)) {
+		btf_dump_printf(d, "#ifndef __cplusplus\n");
+		cpp_guard = true;
 	}
 
 	btf_dump_printf(d, "typedef ");
 	btf_dump_emit_type_decl(d, t->type, name, lvl);
 	btf_dump_emit_decl_tags(d, id, -1);
+	return cpp_guard;
 }
 
 static int btf_dump_push_decl_stack_id(struct btf_dump *d, __u32 id)
