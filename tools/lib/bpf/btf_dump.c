@@ -91,6 +91,9 @@ struct btf_dump {
 	bool skip_anon_defs;
 	int last_id;
 
+	/* enclosing named struct/union for C++ member name collision check */
+	const char *enclosing_name;
+
 	/* per-type auxiliary state */
 	struct btf_dump_type_aux_state *type_states;
 	size_t type_states_cap;
@@ -1164,12 +1167,24 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 {
 	const struct btf_member *m = btf_members(t);
 	bool is_struct = btf_is_struct(t);
+	const char *struct_name, *saved_enclosing;
 	bool packed, prev_bitfield = false;
 	int align, i, off = 0;
 	__u32 vlen = btf_vlen(t);
 
 	align = btf__align_of(d->btf, id);
 	packed = is_struct ? btf_is_struct_packed(d->btf, id, t) : 0;
+	struct_name = btf_dump_type_name(d, id);
+
+	/*
+	 * Track the enclosing named struct/union so that members of
+	 * nested anonymous structs/unions can be checked for name
+	 * collisions with the outer type (C++ injects anonymous
+	 * members into the enclosing scope).
+	 */
+	saved_enclosing = d->enclosing_name;
+	if (struct_name[0])
+		d->enclosing_name = struct_name;
 
 	btf_dump_printf(d, "%s%s%s {",
 			is_struct ? "struct" : "union",
@@ -1180,8 +1195,22 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		const char *fname;
 		int m_off, m_sz, m_align;
 		bool in_bitfield;
+		bool needs_cpp_guard;
 
 		fname = btf_name_of(d, m->name_off);
+		/*
+		 * In C++, a member name that matches the enclosing
+		 * struct/union name causes a redeclaration error since
+		 * the struct tag is injected into the declaration scope.
+		 * This also applies to members of nested anonymous
+		 * structs/unions which are injected into the enclosing
+		 * named scope.  Emit both variants guarded by
+		 * __cplusplus.
+		 */
+		needs_cpp_guard = fname[0] && d->enclosing_name &&
+				  d->enclosing_name[0] &&
+				  strcmp(fname, d->enclosing_name) == 0;
+
 		m_sz = btf_member_bitfield_size(t, i);
 		m_off = btf_member_bit_offset(t, i);
 		m_align = packed ? 1 : btf__align_of(d->btf, m->type);
@@ -1189,6 +1218,20 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		in_bitfield = prev_bitfield && m_sz != 0;
 
 		btf_dump_emit_bit_padding(d, off, m_off, m_align, in_bitfield, lvl + 1);
+
+		if (needs_cpp_guard) {
+			static char buf[256];
+
+			snprintf(buf, sizeof(buf), "%s___cpp", fname);
+			btf_dump_printf(d, "\n#ifdef __cplusplus");
+			btf_dump_printf(d, "\n%s", pfx(lvl + 1));
+			btf_dump_emit_type_decl(d, m->type, buf, lvl + 1);
+			if (m_sz)
+				btf_dump_printf(d, ": %d", m_sz);
+			btf_dump_printf(d, ";");
+			btf_dump_printf(d, "\n#else");
+		}
+
 		btf_dump_printf(d, "\n%s", pfx(lvl + 1));
 		btf_dump_emit_type_decl(d, m->type, fname, lvl + 1);
 
@@ -1205,6 +1248,9 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		/* after the bit-field width */
 		btf_dump_emit_decl_tags(d, id, i);
 		btf_dump_printf(d, ";");
+
+		if (needs_cpp_guard)
+			btf_dump_printf(d, "\n#endif");
 	}
 
 	/* pad at the end, if necessary */
@@ -1224,6 +1270,8 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	if (packed)
 		btf_dump_printf(d, " __attribute__((packed))");
 	btf_dump_emit_decl_tags(d, id, -1);
+
+	d->enclosing_name = saved_enclosing;
 }
 
 static const char *missing_base_types[][2] = {
