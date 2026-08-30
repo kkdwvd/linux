@@ -723,6 +723,41 @@ static bool btf_dump_is_blacklisted(struct btf_dump *d, __u32 id)
 }
 
 /*
+ * C++ keywords that are valid C identifiers. When these appear as struct/union
+ * member names or enum values in BTF (which is generated from C code), they
+ * need to be suffixed to avoid clashing with C++ reserved words.
+ */
+static bool btf_is_cpp_keyword(const char *name)
+{
+	static const char * const cpp_kws[] = {
+		"alignas", "alignof", "and", "and_eq", "asm", "auto",
+		"bitand", "bitor", "catch", "class", "compl",
+		"consteval", "constexpr", "constinit", "const_cast",
+		"co_await", "co_return", "co_yield",
+		"decltype", "delete", "dynamic_cast",
+		"explicit", "export",
+		"friend",
+		"mutable",
+		"namespace", "new", "noexcept", "not", "not_eq",
+		"operator", "or", "or_eq",
+		"private", "protected", "public",
+		"reinterpret_cast", "requires",
+		"static_assert", "static_cast",
+		"template", "this", "throw", "try", "typeid", "typename",
+		"using",
+		"virtual",
+		"xor", "xor_eq",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cpp_kws); i++) {
+		if (strcmp(name, cpp_kws[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Typedef names and enum values that are C++ built-in types or keywords.
  * These definitions must be guarded with #ifndef __cplusplus.
  */
@@ -1589,6 +1624,13 @@ static void btf_dump_emit_name(const struct btf_dump *d,
 	bool separate = name[0] && !last_was_ptr;
 
 	btf_dump_printf(d, "%s%s", separate ? " " : "", name);
+	/* Suffix C++ keywords used as identifiers so the generated header
+	 * compiles under both C and C++.  The ___cpp suffix is recognized
+	 * by CO-RE relocation logic which strips it when matching against
+	 * kernel BTF, similar to the existing ___N flavour suffix.
+	 */
+	if (name[0] && btf_is_cpp_keyword(name))
+		btf_dump_printf(d, "___cpp");
 }
 
 static void btf_dump_emit_type_chain(struct btf_dump *d,
@@ -1855,7 +1897,15 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 
 	if (btf_is_fwd(t) || (btf_is_enum(t) && btf_vlen(t) == 0)) {
 		s->name_resolved = 1;
-		return orig_name;
+		/* C++ keyword type names need suffixing even for fwd decls */
+		if (btf_is_cpp_keyword(orig_name)) {
+			const size_t max_len = 256;
+			char new_name[max_len];
+
+			snprintf(new_name, max_len, "%s___cpp", orig_name);
+			*cached_name = strdup(new_name);
+		}
+		return *cached_name ? *cached_name : orig_name;
 	}
 
 	dup_cnt = btf_dump_name_dups(d, name_map, orig_name);
@@ -1864,6 +1914,12 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 		char new_name[max_len];
 
 		snprintf(new_name, max_len, "%s___%zu", orig_name, dup_cnt);
+		*cached_name = strdup(new_name);
+	} else if (btf_is_cpp_keyword(orig_name)) {
+		const size_t max_len = 256;
+		char new_name[max_len];
+
+		snprintf(new_name, max_len, "%s___cpp", orig_name);
 		*cached_name = strdup(new_name);
 	}
 
