@@ -846,14 +846,28 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 	case BTF_KIND_ENUM64:
 		if (top_level_def) {
 			bool is_bool_enum = btf_dump_is_cpp_bool_enum(d, t);
+			bool is_fwd_enum = btf_vlen(t) == 0 && t->name_off != 0;
 
-			if (is_bool_enum)
-				btf_dump_printf(d, "#ifndef __cplusplus\n");
-			btf_dump_emit_enum_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n");
-			if (is_bool_enum)
-				btf_dump_printf(d, "#endif /* __cplusplus */\n");
-			btf_dump_printf(d, "\n");
+			if (is_fwd_enum) {
+				/* C++ forbids forward-declared enums without
+				 * an underlying type; provide one.
+				 */
+				btf_dump_printf(d, "#ifdef __cplusplus\n");
+				btf_dump_printf(d, "enum %s : unsigned int;\n",
+						btf_dump_type_name(d, id));
+				btf_dump_printf(d, "#else\n");
+				btf_dump_emit_enum_def(d, id, t, 0);
+				btf_dump_printf(d, ";\n");
+				btf_dump_printf(d, "#endif\n\n");
+			} else {
+				if (is_bool_enum)
+					btf_dump_printf(d, "#ifndef __cplusplus\n");
+				btf_dump_emit_enum_def(d, id, t, 0);
+				btf_dump_printf(d, ";\n");
+				if (is_bool_enum)
+					btf_dump_printf(d, "#endif /* __cplusplus */\n");
+				btf_dump_printf(d, "\n");
+			}
 		}
 		tstate->emit_state = EMITTED;
 		break;

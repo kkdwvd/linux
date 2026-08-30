@@ -41,7 +41,11 @@ struct X {};
 
 union Y {};
 
+#ifdef __cplusplus
+enum Z : unsigned int;
+#else
 enum Z;
+#endif
 
 typedef int X;
 
