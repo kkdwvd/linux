@@ -88,6 +88,8 @@ struct btf_dump {
 
 	/* enclosing named struct/union for C++ member name collision check */
 	const char *enclosing_name;
+	/* emit next struct/union definition without its tag name (one-shot) */
+	bool skip_anon_tag;
 
 	/* per-type auxiliary state */
 	struct btf_dump_type_aux_state *type_states;
@@ -1077,9 +1079,11 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	bool is_struct = btf_is_struct(t);
 	const char *struct_name, *saved_enclosing;
 	bool packed, prev_bitfield = false;
+	bool skip_tag = d->skip_anon_tag;
 	int align, i, off = 0;
 	__u32 vlen = btf_vlen(t);
 
+	d->skip_anon_tag = false;
 	align = btf__align_of(d->btf, id);
 	packed = is_struct ? btf_is_struct_packed(d->btf, id, t) : 0;
 	struct_name = btf_dump_type_name(d, id);
@@ -1091,19 +1095,22 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	 * members into the enclosing scope).
 	 */
 	saved_enclosing = d->enclosing_name;
-	if (struct_name[0])
+	if (struct_name[0] && !skip_tag)
 		d->enclosing_name = struct_name;
 
 	btf_dump_printf(d, "%s%s%s {",
 			is_struct ? "struct" : "union",
-			t->name_off ? " " : "",
-			btf_dump_type_name(d, id));
+			(t->name_off && !skip_tag) ? " " : "",
+			skip_tag ? "" : btf_dump_type_name(d, id));
 
 	for (i = 0; i < vlen; i++, m++) {
+		const struct btf_type *mt;
 		const char *fname;
 		int m_off, m_sz, m_align;
 		bool in_bitfield;
 		bool needs_cpp_guard;
+		bool anon_named = false;
+		__u32 mt_id;
 
 		fname = btf_name_of(d, m->name_off);
 		/*
@@ -1123,9 +1130,37 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		m_off = btf_member_bit_offset(t, i);
 		m_align = packed ? 1 : btf__align_of(d->btf, m->type);
 
+		/*
+		 * C accepts an anonymous member of a previously defined named
+		 * struct/union (an ms/plan9-style extension), emitted as a
+		 * bare tag reference; C++ rejects that as a type declaration
+		 * inside an anonymous aggregate. Emit an equivalent unnamed
+		 * inline definition for C++, which preserves the layout and
+		 * the flattened member access paths, and keep the bare tag
+		 * reference for C.
+		 */
+		if (!fname[0] && !m_sz) {
+			mt_id = m->type;
+			mt = btf__type_by_id(d->btf, mt_id);
+			while (btf_is_mod(mt) || btf_is_typedef(mt)) {
+				mt_id = mt->type;
+				mt = btf__type_by_id(d->btf, mt_id);
+			}
+			anon_named = btf_is_composite(mt) && mt->name_off;
+		}
+
 		in_bitfield = prev_bitfield && m_sz != 0;
 
 		btf_dump_emit_bit_padding(d, off, m_off, m_align, in_bitfield, lvl + 1);
+
+		if (anon_named) {
+			btf_dump_printf(d, "\n#ifdef __cplusplus");
+			btf_dump_printf(d, "\n%s", pfx(lvl + 1));
+			d->skip_anon_tag = true;
+			btf_dump_emit_struct_def(d, mt_id, mt, lvl + 1);
+			btf_dump_printf(d, ";");
+			btf_dump_printf(d, "\n#else");
+		}
 
 		if (needs_cpp_guard) {
 			static char buf[256];
@@ -1155,7 +1190,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 
 		btf_dump_printf(d, ";");
 
-		if (needs_cpp_guard)
+		if (needs_cpp_guard || anon_named)
 			btf_dump_printf(d, "\n#endif");
 	}
 
