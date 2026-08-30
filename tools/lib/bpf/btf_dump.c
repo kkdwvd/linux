@@ -1206,7 +1206,17 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		btf_dump_printf(d, "\n");
 		btf_dump_printf(d, "%s}", pfx(lvl));
 	} else {
-		btf_dump_printf(d, "}");
+		/*
+		 * An empty struct has size 0 in C but size 1 in C++, which
+		 * would shift the offset of every subsequent member in any
+		 * aggregate embedding it. A zero-length array member keeps
+		 * sizeof at 0 in C++ under the GNU extension; ___cpp has an
+		 * empty essential name, so CO-RE treats it as anonymous.
+		 */
+		btf_dump_printf(d, "\n#ifdef __cplusplus");
+		btf_dump_printf(d, "\n%schar ___cpp[0];", pfx(lvl + 1));
+		btf_dump_printf(d, "\n#endif");
+		btf_dump_printf(d, "\n%s}", pfx(lvl));
 	}
 	if (packed)
 		btf_dump_printf(d, " __attribute__((packed))");
