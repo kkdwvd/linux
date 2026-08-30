@@ -6,7 +6,11 @@
  * Copyright (c) 2019 Facebook
  */
 /* ----- START-EXPECTED-OUTPUT ----- */
-struct s1 {};
+struct s1 {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
 struct s3;
 
