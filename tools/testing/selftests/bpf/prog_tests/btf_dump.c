@@ -275,7 +275,11 @@ static void test_btf_dump_incremental(void)
 	ASSERT_OK(err, "field_ok");
 
 	test_ctx__dump_and_compare(&t,
+"#ifdef __cplusplus\n"
+"enum x : unsigned int;\n"
+"#else\n"
 "enum x;\n"
+"#endif\n"
 "\n"
 "enum x {\n"
 "	X = 1,\n"
