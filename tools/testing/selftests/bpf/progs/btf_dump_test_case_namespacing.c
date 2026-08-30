@@ -8,7 +8,11 @@
  */
 /* ----- START-EXPECTED-OUTPUT ----- */
 struct S {
+#ifdef __cplusplus
+	int S___cpp;
+#else
 	int S;
+#endif
 	int U;
 };
 
@@ -16,7 +20,11 @@ typedef struct S S;
 
 union U {
 	int S;
+#ifdef __cplusplus
+	int U___cpp;
+#else
 	int U;
+#endif
 };
 
 typedef union U U;
@@ -41,7 +49,11 @@ struct X {};
 
 union Y {};
 
+#ifdef __cplusplus
+enum Z : unsigned int;
+#else
 enum Z;
+#endif
 
 typedef int X;
 
