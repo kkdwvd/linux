@@ -675,6 +675,11 @@ void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
 void bpf_timer_cancel_and_free(void *timer);
 void bpf_wq_cancel_and_free(void *timer);
 void bpf_waitq_cancel_and_free(void *waitq);
+struct bpf_waitq_kern;
+/* Call get under Tasks Trace RCU; the returned endpoint survives map teardown. */
+struct bpf_waitq_kern *bpf_waitq_get(struct bpf_waitq *waitq);
+void bpf_waitq_put(struct bpf_waitq_kern *waitq);
+int bpf_waitq_signal(struct bpf_waitq_kern *waitq, u32 nr);
 void bpf_task_work_cancel_and_free(void *timer);
 void bpf_list_head_free(const struct btf_field *field, void *list_head,
 			struct bpf_spin_lock *spin_lock);
