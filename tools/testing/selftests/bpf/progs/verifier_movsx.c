@@ -204,7 +204,7 @@ l0_%=:							\
 
 SEC("socket")
 __description("MOV64SX, S16, R10 Sign Extension")
-__failure __msg("R1 type=scalar expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, trusted_ptr_")
+__failure __msg("R1 type=scalar expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, coro_frame, trusted_ptr_")
 __failure_unpriv __msg_unpriv("R10 sign-extension part of pointer")
 __naked void mov64sx_s16_r10(void)
 {
