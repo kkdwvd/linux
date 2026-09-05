@@ -12,6 +12,7 @@ struct bpf_waitq_kern {
 	wait_queue_head_t waitq;
 	struct rcu_head rcu;
 	refcount_t refs;
+	u32 sequence;
 	bool draining;
 };
 
@@ -47,6 +48,7 @@ int bpf_waitq_signal(struct bpf_waitq_kern *waitq, u32 nr)
 
 	spin_lock_irqsave(&waitq->waitq.lock, flags);
 	if (!waitq->draining) {
+		smp_store_release(&waitq->sequence, waitq->sequence + 1);
 		__wake_up_locked(&waitq->waitq, TASK_NORMAL,
 				 nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX));
 		ret = 0;
@@ -118,8 +120,8 @@ __bpf_kfunc int bpf_waitq_init(struct bpf_waitq *waitq, void *p__const_map,
 	return 0;
 }
 
-__bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
-			       u32 expected, u64 timeout_ns, u64 flags)
+static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
+			   u32 expected, u64 timeout_ns, u64 flags)
 {
 	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
 	struct bpf_waitq_kern *waitq_kern;
@@ -136,6 +138,8 @@ __bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	waitq_kern = READ_ONCE(opaque->waitq);
 	if (!waitq_kern)
 		return -EINVAL;
+	if (!word)
+		word = &waitq_kern->sequence;
 
 	/* A waker unlinks the entry, which tells a wakeup from a timeout below. */
 	init_wait_entry(&entry, WQ_FLAG_EXCLUSIVE);
@@ -191,11 +195,32 @@ unlock:
 	return ret;
 }
 
+__bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
+			     u32 expected, u64 timeout_ns, u64 flags)
+{
+	return __bpf_waitq_wait(waitq, word, expected, timeout_ns, flags);
+}
+
+/* Sample before checking readiness, then wait using the sampled sequence. */
+__bpf_kfunc u32 bpf_waitq_sequence(struct bpf_waitq *waitq)
+{
+	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
+	struct bpf_waitq_kern *kern = READ_ONCE(opaque->waitq);
+
+	return kern ? smp_load_acquire(&kern->sequence) : 0;
+}
+
+__bpf_kfunc int bpf_waitq_wait_event(struct bpf_waitq *waitq, u32 expected,
+				   u64 timeout_ns)
+{
+	return __bpf_waitq_wait(waitq, NULL, expected, timeout_ns, 0);
+}
+
 __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 {
 	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
 	struct bpf_waitq_kern *waitq_kern;
-	int nr_exclusive;
+	unsigned long irq_flags;
 
 	if (flags)
 		return -EINVAL;
@@ -206,10 +231,11 @@ __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 	if (!waitq_kern)
 		return -EINVAL;
 
-	nr_exclusive = nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX);
-	/* Publish BPF-side condition updates before waking a queued waiter. */
-	smp_mb();
-	return __wake_up(&waitq_kern->waitq, TASK_NORMAL, nr_exclusive, NULL);
+	spin_lock_irqsave(&waitq_kern->waitq.lock, irq_flags);
+	smp_store_release(&waitq_kern->sequence, waitq_kern->sequence + 1);
+	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
+	return __wake_up(&waitq_kern->waitq, TASK_NORMAL,
+			 nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX), NULL);
 }
 
 __bpf_kfunc_end_defs();
@@ -217,6 +243,8 @@ __bpf_kfunc_end_defs();
 BTF_KFUNCS_START(bpf_waitq_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_waitq_init, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wait, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_waitq_sequence)
+BTF_ID_FLAGS(func, bpf_waitq_wait_event, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wake)
 BTF_KFUNCS_END(bpf_waitq_kfunc_ids)
 

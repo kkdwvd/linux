@@ -13444,6 +13444,7 @@ enum special_kfunc_type {
 	KF_bpf_stream_vprintk,
 	KF_bpf_stream_print_stack,
 	KF_bpf_waitq_wait,
+	KF_bpf_waitq_wait_event,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -13544,6 +13545,7 @@ BTF_ID_UNUSED
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
 BTF_ID(func, bpf_waitq_wait)
+BTF_ID(func, bpf_waitq_wait_event)
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -14388,7 +14390,8 @@ static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 
 static bool is_bpf_waitq_wait_kfunc(u32 btf_id)
 {
-	return btf_id == special_kfunc_list[KF_bpf_waitq_wait];
+	return btf_id == special_kfunc_list[KF_bpf_waitq_wait] ||
+	       btf_id == special_kfunc_list[KF_bpf_waitq_wait_event];
 }
 
 static bool is_callback_calling_kfunc(u32 btf_id)
