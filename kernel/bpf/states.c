@@ -362,95 +362,87 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 	return NULL;
 }
 
-static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
-		      struct bpf_func_state *cur)
+/*
+ * Compare one slot of the old state against the current state.
+ * @cur is NULL when the current state does not have the slot at all.
+ */
+static bool slot_safe(struct bpf_verifier_env *env, struct bpf_stack_state *old,
+		      struct bpf_stack_state *cur)
 {
-	int i, spi;
+	struct bpf_reg_state *old_reg, *cur_reg;
+	int i;
 
-	/*
-	 * walk slots of the old stack and ignore any additional
-	 * slots in the current stack, since the old state
-	 * can't use them
-	 */
-	for (i = 0; i < old->allocated_stack; i++) {
-		struct bpf_stack_state *old_slot, *cur_slot;
-		struct bpf_reg_state *old_reg, *cur_reg;
-		int im = i % BPF_REG_SIZE;
-		u8 old_type;
+	for (i = 0; i < BPF_REG_SIZE; i++) {
+		u8 old_type = old->slot_type[i];
 
 		bpf_add_cost(env, 1, BPF_COST_SCAN);
-		spi = i / BPF_REG_SIZE;
-		old_slot = bpf_stack_slot(old, spi);
-		old_type = old_slot->slot_type[im];
-		cur_slot = i < cur->allocated_stack ? bpf_stack_slot(cur, spi) : NULL;
 
 		if (old_type == STACK_INVALID || old_type == STACK_POISON)
 			continue;
 
 		/* it can be filled into a register that is unreadable */
-		if (old_type == STACK_SPILL && old_slot->spilled_ptr.type == NOT_INIT &&
+		if (old_type == STACK_SPILL && old->spilled_ptr.type == NOT_INIT &&
 		    (env->allow_uninit_stack ||
-		     (cur_slot && cur_slot->slot_type[im] != STACK_INVALID &&
-		      cur_slot->slot_type[im] != STACK_POISON)))
+		     (cur && cur->slot_type[i] != STACK_INVALID &&
+		      cur->slot_type[i] != STACK_POISON)))
 			continue;
 
 		if (env->allow_uninit_stack && old_type == STACK_MISC)
 			continue;
 
-		/* old stack has more populated slots than current stack */
-		if (!cur_slot)
+		/* old slot is populated, but the current state does not have it */
+		if (!cur)
 			return false;
 
 		/*
 		 * The old spill is the first bytes of a wider spill. On big endian
 		 * these are not the low bytes of the value.
 		 */
-		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur_slot) &&
-		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old_slot),
-						bpf_spill_size(cur_slot)))
+		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur) &&
+		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old), bpf_spill_size(cur)))
 			return false;
 
 		/*
 		 * 64 and 32-bit scalar spills vs MISC/INVALID slots and vice versa.
 		 * Load from MISC/INVALID slots produces unbound scalar.
-		 * Construct a fake register for such stack and call regsafe().
+		 * Construct a fake register for such slot and call regsafe().
 		 */
-		if (im == 0 || im == 4) {
-			old_reg = scalar_reg_for_stack(env, old_slot, im);
-			cur_reg = scalar_reg_for_stack(env, cur_slot, im);
+		if (i == 0 || i == 4) {
+			old_reg = scalar_reg_for_stack(env, old, i);
+			cur_reg = scalar_reg_for_stack(env, cur, i);
 			if (old_reg && cur_reg) {
 				if (!regsafe(env, old_reg, cur_reg))
 					return false;
-				i += (im == 0 ? BPF_REG_SIZE - 1 : 3);
+				i += (i == 0 ? BPF_REG_SIZE - 1 : 3);
 				continue;
 			}
 		}
 
-		/* if old state was safe with misc data in the stack
-		 * it will be safe with zero-initialized stack.
+		/*
+		 * if old state was safe with misc data in the slot
+		 * it will be safe with zero-initialized slot.
 		 * The opposite is not true
 		 */
 		if (old_type == STACK_MISC &&
-		    (cur_slot->slot_type[im] == STACK_ZERO ||
-		     is_spilled_scalar_after(cur_slot, im)))
+		    (cur->slot_type[i] == STACK_ZERO || is_spilled_scalar_after(cur, i)))
 			continue;
-		if (old_type == STACK_ZERO && is_spilled_scalar_after(cur_slot, im) &&
-		    bpf_register_is_null(&cur_slot->spilled_ptr))
+		if (old_type == STACK_ZERO && is_spilled_scalar_after(cur, i) &&
+		    bpf_register_is_null(&cur->spilled_ptr))
 			continue;
-		if (old_type != cur_slot->slot_type[im])
+		if (old_type != cur->slot_type[i])
 			/*
 			 * Ex: old state has STACK_SPILL in
-			 * this stack slot, but current has STACK_MISC ->
+			 * this slot, but current has STACK_MISC ->
 			 * this verifier states are not equivalent
 			 */
 			return false;
-		if (im != BPF_REG_SIZE - 1)
+		if (i != BPF_REG_SIZE - 1)
 			continue;
 		/* Both old and cur are having same slot_type */
 		switch (old_type) {
 		case STACK_SPILL:
 			/*
-			 * when old and current stack slot are both storing
+			 * when old and current slot are both storing
 			 * spilled registers, check that stored pointers types
 			 * are the same as well.
 			 * Ex: old state could have stored
@@ -459,13 +451,13 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 * (bpf_reg_state) {.type = PTR_TO_STACK, .off = -16}
 			 * such verifier states are not equivalent.
 			 */
-			if (!regsafe(env, &old_slot->spilled_ptr, &cur_slot->spilled_ptr))
+			if (!regsafe(env, &old->spilled_ptr, &cur->spilled_ptr))
 				return false;
 			break;
 		case STACK_DYNPTR:
 		case STACK_ITER:
 		case STACK_IRQ_FLAG:
-			if (!reg_object_equal(&old_slot->spilled_ptr, &cur_slot->spilled_ptr))
+			if (!reg_object_equal(&old->spilled_ptr, &cur->spilled_ptr))
 				return false;
 			break;
 		case STACK_MISC:
@@ -478,6 +470,23 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	return true;
+}
+
+static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+		      struct bpf_func_state *cur)
+{
+	u32 spi;
+
+	/*
+	 * walk slots of the old stack and ignore any additional
+	 * slots in the current stack, since the old state
+	 * can't use them
+	 */
+	for (spi = 0; spi < bpf_stack_nr_slots(old); spi++)
+		if (!slot_safe(env, bpf_stack_slot(old, spi),
+			       spi < bpf_stack_nr_slots(cur) ? bpf_stack_slot(cur, spi) : NULL))
+			return false;
 	return true;
 }
 
