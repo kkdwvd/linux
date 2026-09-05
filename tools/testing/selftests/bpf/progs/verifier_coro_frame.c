@@ -1014,4 +1014,221 @@ __naked void coro_frame_ref_leaked_in_frame(void)
 	: __clobber_all);
 }
 
+/* Helper memory argument tests. */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} map_ringbuf SEC(".maps");
+
+/* bpf_ringbuf_output(&map_ringbuf, from, size, 0): reads 'size' bytes */
+#define RINGBUF_OUTPUT_FROM(from_reg, size)	\
+	"r1 = %[map_ringbuf] ll;"		\
+	"r2 = " #from_reg ";"			\
+	"r3 = " #size ";"			\
+	"r4 = 0;"				\
+	"call %[bpf_ringbuf_output];"
+
+/* bpf_skb_load_bytes(ctx, 0, to, size): writes 'size' bytes */
+#define SKB_LOAD_BYTES_TO(ctx_reg, to_reg, size)	\
+	"r1 = " #ctx_reg ";"				\
+	"r2 = 0;"					\
+	"r3 = " #to_reg ";"				\
+	"r4 = " #size ";"				\
+	"call %[bpf_skb_load_bytes];"
+
+SEC("socket")
+__description("coro_frame: helper reads initialized frame bytes")
+__success __retval(0)
+__naked void coro_frame_helper_read_init(void)
+{
+	asm volatile (
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"r1 = 1;"
+	"*(u64 *)(r6 + 0) = r1;"
+	"*(u64 *)(r6 + 8) = r1;"
+	RINGBUF_OUTPUT_FROM(r6, 16)
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_ringbuf_output), __imm_addr(map_ringbuf)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper read of uninitialized bytes rejected without CAP_PERFMON")
+__failure_unpriv __msg_unpriv("invalid read from coro_frame R2 off 0+8 size 16")
+__caps_unpriv(CAP_BPF)
+__naked void coro_frame_helper_read_uninit(void)
+{
+	asm volatile (
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"r1 = 1;"
+	"*(u64 *)(r6 + 0) = r1;"
+	RINGBUF_OUTPUT_FROM(r6, 16)
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_ringbuf_output), __imm_addr(map_ringbuf)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper read of spilled pointer rejected without CAP_PERFMON")
+__failure_unpriv __msg_unpriv("invalid read from coro_frame R2 off 0+0 size 8")
+__caps_unpriv(CAP_BPF)
+__naked void coro_frame_helper_read_pointer(void)
+{
+	asm volatile (
+	"r9 = r1;"
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"*(u64 *)(r6 + 0) = r9;"
+	RINGBUF_OUTPUT_FROM(r6, 8)
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_ringbuf_output), __imm_addr(map_ringbuf)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper read of spilled scalar allowed")
+__success_unpriv __retval_unpriv(0)
+__caps_unpriv(CAP_BPF)
+__naked void coro_frame_helper_read_scalar_spill(void)
+{
+	asm volatile (
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"r1 = 5;"
+	"*(u64 *)(r6 + 0) = r1;"
+	RINGBUF_OUTPUT_FROM(r6, 8)
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_ringbuf_output), __imm_addr(map_ringbuf)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper size beyond the frame rejected")
+__failure __msg("invalid access to memory, mem_size=16 off=0 size=24")
+__naked void coro_frame_helper_read_oob(void)
+{
+	asm volatile (
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"r1 = 1;"
+	"*(u64 *)(r6 + 0) = r1;"
+	"*(u64 *)(r6 + 8) = r1;"
+	RINGBUF_OUTPUT_FROM(r6, 24)
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_ringbuf_output), __imm_addr(map_ringbuf)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper writes into uninitialized frame bytes")
+__success __retval(0)
+__success_unpriv __retval_unpriv(0)
+__caps_unpriv(CAP_BPF)
+__naked void coro_frame_helper_write_uninit(void)
+{
+	asm volatile (
+	"r9 = r1;"
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	SKB_LOAD_BYTES_TO(r9, r6, 16)
+	/* the callee initialized the bytes, so they may be read now */
+	"r1 = *(u64 *)(r6 + 8);"
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_skb_load_bytes)
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper write scrubs a spilled pointer")
+__failure __msg("R1 invalid mem access 'scalar'")
+__naked void coro_frame_helper_write_scrubs_pointer(void)
+{
+	asm volatile (
+	"r9 = r1;"
+	CORO_FRAME_ALLOC(16)
+	"r6 = r0;"
+	"*(u64 *)(r6 + 0) = r9;"
+	SKB_LOAD_BYTES_TO(r9, r6, 8)
+	"r1 = *(u64 *)(r6 + 0);"
+	"r1 = *(u32 *)(r1 + %[__sk_buff_len]);"
+	CORO_FRAME_FREE(r6)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_skb_load_bytes),
+	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len))
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper argument with variable offset")
+__success __retval(0)
+__naked void coro_frame_helper_var_off(void)
+{
+	asm volatile (
+	"r9 = r1;"
+	"r7 = *(u32 *)(r1 + %[__sk_buff_len]);"
+	"r7 &= 7;"
+	"r7 <<= 3;"
+	CORO_FRAME_ALLOC(64)
+	"r6 = r0;"
+	"r8 = r0;"
+	SKB_LOAD_BYTES_TO(r9, r6, 64)
+	"r6 += r7;"
+	RINGBUF_OUTPUT_FROM(r6, 8)
+	CORO_FRAME_FREE(r8)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_skb_load_bytes), __imm(bpf_ringbuf_output),
+	  __imm_addr(map_ringbuf),
+	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len))
+	: __clobber_all);
+}
+
+SEC("socket")
+__description("coro_frame: helper write with variable offset over uninitialized bytes")
+__success __retval(0)
+__naked void coro_frame_helper_var_off_uninit(void)
+{
+	asm volatile (
+	"r9 = r1;"
+	"r7 = *(u32 *)(r1 + %[__sk_buff_len]);"
+	"r7 &= 7;"
+	"r7 <<= 3;"
+	CORO_FRAME_ALLOC(64)
+	"r6 = r0;"
+	"r8 = r0;"
+	"r6 += r7;"
+	SKB_LOAD_BYTES_TO(r9, r6, 8)
+	CORO_FRAME_FREE(r8)
+	"r0 = 0;"
+	"exit;"
+	:
+	: CORO_IMMS, __imm(bpf_skb_load_bytes),
+	  __imm_const(__sk_buff_len, offsetof(struct __sk_buff, len))
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
