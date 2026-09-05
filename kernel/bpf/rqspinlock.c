@@ -77,11 +77,31 @@
  *
  */
 
+/*
+ * Maximum number of waits-for edges followed when searching for a deadlock
+ * cycle. Covers cycles spanning up to RES_MAX_HOPS CPUs; longer cycles are
+ * left to the timeout fallback. Bounds both the walk's execution time (each
+ * hop scans all CPUs' tables) and the confirmation state kept on the stack.
+ */
+#define RES_MAX_HOPS 4
+
+/*
+ * Number of consecutive 1 ms ticks the identical chain must be observed
+ * before acting on it. A verdict that only aborts our own acquisition needs
+ * less evidence than one that tears down the whole wait queue.
+ */
+#define RES_CONFIRM_PARTICIPANT	2
+#define RES_CONFIRM_FOREIGN	3
+
 struct rqspinlock_timeout {
 	u64 timeout_end;
 	u64 duration;
 	u64 cur;
 	u16 spin;
+	u8 confirm_cnt;
+	u8 chain_len;
+	u16 chain_cpus[RES_MAX_HOPS];
+	void *chain_locks[RES_MAX_HOPS];
 };
 
 #define RES_TIMEOUT_VAL	2
@@ -113,85 +133,156 @@ static noinline int check_deadlock_AA(rqspinlock_t *lock)
 }
 
 /*
- * This focuses on the most common case of ABBA deadlocks (or ABBA involving
- * more locks, which reduce to ABBA). This is not exhaustive, and we rely on
- * timeouts as the final line of defense.
+ * Bounded edge-chasing walk over the per-CPU held-locks tables, generalizing
+ * the former ABBA-only check to cycles spanning up to RES_MAX_HOPS CPUs.
+ * This is not exhaustive, and we rely on timeouts as the final line of
+ * defense.
+ *
+ * Every acquisition publishes its in-flight lock as the top-most entry of
+ * the CPU's table before touching the lock word, so the tables encode the
+ * waits-for graph: the top entry is the lock a CPU is attempting to take,
+ * the entries below it are its holds. Starting from the lock we spin on,
+ * find its holder by scanning the held (below-top) regions of all CPUs,
+ * follow the holder's top entry to the next lock, and repeat. Only waiting
+ * holders can extend a cycle, and an acquiring CPU always has its in-flight
+ * lock on top, so scanning only held regions filters out running owners for
+ * free. Finding the holder would be a constant time operation instead of
+ * O(NR_CPUS) if we could determine the owning CPU from a lock value, but
+ * that requires increasing the size of the lock word.
+ *
+ * The walk reads remote tables non-atomically, so a closed chain may be
+ * stitched together from fragments of already-dissolved waits. A real
+ * deadlock is quiescent: every participant is stuck spinning and cannot
+ * change its table. Hence, require the identical chain to be observed on
+ * consecutive invocations (1 ms apart) before acting on it, and reset the
+ * confirmation state whenever the walk turns up nothing.
+ *
+ * A chain closes in one of two ways:
+ *
+ * - Through a lock we hold: we are a participant in the cycle. Return
+ *   -EDEADLK to abort our acquisition; this breaks the cycle while
+ *   preserving the wait queue for the eventual release.
+ * - Through a revisit of the origin lock or an earlier chain node: a cycle
+ *   exists but does not pass through us, so the lock we wait on can never
+ *   be released. Return -ETIMEDOUT to take the timeout path early; for the
+ *   wait queue head this also tears down the queue, ejecting cycle
+ *   participants buried at non-head positions (which run no checks), whose
+ *   unwind is what breaks the cycle. This verdict affects all waiters
+ *   rather than just us, so require an extra confirmation tick.
  */
-static noinline int check_deadlock_ABBA(rqspinlock_t *lock, u32 mask)
+static noinline int check_deadlock_cycle(rqspinlock_t *lock, u32 mask,
+					 struct rqspinlock_timeout *ts)
 {
 	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
+	u16 chain_cpus[RES_MAX_HOPS];
+	void *chain_locks[RES_MAX_HOPS];
 	int rqh_cnt = min(RES_NR_HELD, rqh->cnt);
-	void *remote_lock;
-	int cpu;
+	void *cur = lock;
+	int len = 0, confirm, cpu;
 
-	/*
-	 * Find the CPU holding the lock that we want to acquire. If there is a
-	 * deadlock scenario, we will read a stable set on the remote CPU and
-	 * find the target. This would be a constant time operation instead of
-	 * O(NR_CPUS) if we could determine the owning CPU from a lock value, but
-	 * that requires increasing the size of the lock word.
-	 */
-	for_each_possible_cpu(cpu) {
-		struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
-		int real_cnt = READ_ONCE(rqh_cpu->cnt);
-		int cnt = min(RES_NR_HELD, real_cnt);
+	for (int hop = 0; hop < RES_MAX_HOPS; hop++) {
+		void *want = NULL;
+		int holder = -1;
 
 		/*
-		 * Let's ensure to break out of this loop if the lock is available for
-		 * us to potentially acquire.
+		 * Let's ensure to break out of this loop if the lock is
+		 * available for us to potentially acquire.
 		 */
 		if (is_lock_released(lock, mask))
-			return 0;
+			goto no_cycle;
 
-		/*
-		 * Skip ourselves, and CPUs whose count is less than 2, as they need at
-		 * least one held lock and one acquisition attempt (reflected as top
-		 * most entry) to participate in an ABBA deadlock.
-		 *
-		 * If cnt is more than RES_NR_HELD, it means the current lock being
-		 * acquired won't appear in the table, and other locks in the table are
-		 * already held, so we can't determine ABBA.
-		 */
-		if (cpu == smp_processor_id() || real_cnt < 2 || real_cnt > RES_NR_HELD)
-			continue;
+		for_each_possible_cpu(cpu) {
+			struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
+			int real_cnt = READ_ONCE(rqh_cpu->cnt);
+			int cnt = min(RES_NR_HELD, real_cnt);
+			int i;
 
-		/*
-		 * Obtain the entry at the top, this corresponds to the lock the
-		 * remote CPU is attempting to acquire in a deadlock situation,
-		 * and would be one of the locks we hold on the current CPU.
-		 */
-		remote_lock = READ_ONCE(rqh_cpu->locks[cnt - 1]);
-		/*
-		 * If it is NULL, we've raced and cannot determine a deadlock
-		 * conclusively, skip this CPU.
-		 */
-		if (!remote_lock)
-			continue;
-		/*
-		 * Find if the lock we're attempting to acquire is held by this CPU.
-		 * Don't consider the topmost entry, as that must be the latest lock
-		 * being held or acquired.  For a deadlock, the target CPU must also
-		 * attempt to acquire a lock we hold, so for this search only 'cnt - 1'
-		 * entries are important.
-		 */
-		for (int i = 0; i < cnt - 1; i++) {
-			if (READ_ONCE(rqh_cpu->locks[i]) != lock)
+			/*
+			 * Skip ourselves, and CPUs whose count is less than 2,
+			 * as they need at least one held lock and one
+			 * acquisition attempt (reflected as top most entry) to
+			 * participate in a cycle.
+			 *
+			 * If cnt is more than RES_NR_HELD, it means the
+			 * current lock being acquired won't appear in the
+			 * table, and other locks in the table are already
+			 * held, so we can't reason about the CPU's edges.
+			 */
+			if (cpu == smp_processor_id() || real_cnt < 2 || real_cnt > RES_NR_HELD)
+				continue;
+			for (i = 0; i < cnt - 1; i++) {
+				if (READ_ONCE(rqh_cpu->locks[i]) == cur)
+					break;
+			}
+			if (i == cnt - 1)
 				continue;
 			/*
-			 * We found our lock as held on the remote CPU.  Is the
-			 * acquisition attempt on the remote CPU for a lock held
-			 * by us?  If so, we have a deadlock situation, and need
-			 * to recover.
+			 * Take the first match; a stale pick cannot survive
+			 * the cross-tick confirmation below.
 			 */
-			for (int i = 0; i < rqh_cnt - 1; i++) {
-				if (rqh->locks[i] == remote_lock)
-					return -EDEADLK;
-			}
-			/*
-			 * Inconclusive; retry again later.
-			 */
-			return 0;
+			holder = cpu;
+			want = READ_ONCE(rqh_cpu->locks[cnt - 1]);
+			break;
 		}
+		/*
+		 * No holder (it may be running, not waiting), or we raced
+		 * with an entry being cleared; inconclusive, retry later.
+		 */
+		if (holder < 0 || !want)
+			goto no_cycle;
+
+		chain_cpus[len] = holder;
+		chain_locks[len] = want;
+		len++;
+
+		/*
+		 * Does the holder's in-flight acquisition close the cycle
+		 * through a lock we hold?
+		 */
+		for (int i = 0; i < rqh_cnt - 1; i++) {
+			if (rqh->locks[i] == want) {
+				confirm = RES_CONFIRM_PARTICIPANT;
+				goto closed;
+			}
+		}
+
+		/*
+		 * A revisit closes a cycle that does not pass through us.
+		 */
+		if (want == (void *)lock) {
+			confirm = RES_CONFIRM_FOREIGN;
+			goto closed;
+		}
+		for (int i = 0; i < len - 1; i++) {
+			if (chain_cpus[i] == holder || chain_locks[i] == want) {
+				confirm = RES_CONFIRM_FOREIGN;
+				goto closed;
+			}
+		}
+		cur = want;
+	}
+
+no_cycle:
+	ts->chain_len = 0;
+	ts->confirm_cnt = 0;
+	return 0;
+
+closed:
+	/*
+	 * A real deadlock is quiescent and reproduces the identical chain on
+	 * the next tick; a chain raced with dissolving waits will not.
+	 */
+	if (len == ts->chain_len &&
+	    !memcmp(chain_cpus, ts->chain_cpus, len * sizeof(chain_cpus[0])) &&
+	    !memcmp(chain_locks, ts->chain_locks, len * sizeof(chain_locks[0]))) {
+		if (ts->confirm_cnt + 1 >= confirm)
+			return confirm == RES_CONFIRM_PARTICIPANT ? -EDEADLK : -ETIMEDOUT;
+		ts->confirm_cnt++;
+	} else {
+		memcpy(ts->chain_cpus, chain_cpus, len * sizeof(chain_cpus[0]));
+		memcpy(ts->chain_locks, chain_locks, len * sizeof(chain_locks[0]));
+		ts->chain_len = len;
+		ts->confirm_cnt = 1;
 	}
 	return 0;
 }
@@ -220,7 +311,7 @@ static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
 	 */
 	if (prev + NSEC_PER_MSEC < time) {
 		ts->cur = time;
-		return check_deadlock_ABBA(lock, mask);
+		return check_deadlock_cycle(lock, mask, ts);
 	}
 
 	return 0;
@@ -243,16 +334,18 @@ static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
 #endif
 
 /*
- * Initialize the 'spin' member.
- * Set spin member to 0 to trigger AA/ABBA checks immediately.
+ * Initialize the 'spin' member and the cycle confirmation state.
+ * Set spin member to 0 to trigger AA/deadlock checks immediately.
  */
-#define RES_INIT_TIMEOUT(ts) ({ (ts).spin = 0; })
+#define RES_INIT_TIMEOUT(ts) ({ (ts).spin = 0; (ts).confirm_cnt = 0; (ts).chain_len = 0; })
 
 /*
  * We only need to reset 'timeout_end', 'spin' will just wrap around as necessary.
- * Duration is defined for each spin attempt, so set it here.
+ * Duration is defined for each spin attempt, so set it here. Confirmation
+ * state must not carry over into a new waiting phase.
  */
-#define RES_RESET_TIMEOUT(ts, _duration) ({ (ts).timeout_end = 0; (ts).duration = _duration; })
+#define RES_RESET_TIMEOUT(ts, _duration) ({ (ts).timeout_end = 0; (ts).duration = _duration; \
+					    (ts).confirm_cnt = 0; (ts).chain_len = 0; })
 
 /*
  * Provide a test-and-set fallback for cases when queued spin lock support is
