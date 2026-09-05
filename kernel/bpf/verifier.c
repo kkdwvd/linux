@@ -7688,25 +7688,50 @@ static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_refer
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
 	int m = foff % BPF_REG_SIZE;
-	bool zero;
 	int err;
 
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (reg && is_pointer_regtype(reg->type)) {
-		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
-		return -EACCES;
-	}
 
 	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
 	if (err)
 		return err;
-	if (!env->bypass_spec_v4 && slot_write_needs_nospec(slot, m, size, false))
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(slot, m, size, reg && is_pointer_regtype(reg->type)))
 		env->insn_aux_data[insn_idx].nospec_result = true;
 
-	zero = (reg && bpf_register_is_null(reg)) ||
-	       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
-	write_slot_data(env, slot, m, size, zero);
+	if (reg && !m && reg->type == SCALAR_VALUE && env->bpf_capable) {
+		spill_reg_to_slot(env, slot, reg, size);
+	} else if (!reg && !m && is_bpf_st_mem(insn) && env->bpf_capable) {
+		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
+
+		memset(tmp_reg, 0, sizeof(*tmp_reg));
+		__mark_reg_known(tmp_reg, insn->imm);
+		tmp_reg->type = SCALAR_VALUE;
+		spill_reg_to_slot(env, slot, tmp_reg, size);
+	} else if (reg && is_pointer_regtype(reg->type) &&
+		   (size == BPF_REG_SIZE || !env->allow_ptr_leaks)) {
+		if (size != BPF_REG_SIZE) {
+			verbose_linfo(env, insn_idx, "; ");
+			verbose(env, "invalid size of register spill\n");
+			return -EACCES;
+		}
+		/*
+		 * A frame can outlive the function that fills it, so a stack
+		 * pointer stored in it could dangle after that function
+		 * returns.
+		 */
+		if (reg->type == PTR_TO_STACK) {
+			verbose(env, "cannot spill stack pointers into coro_frame\n");
+			return -EINVAL;
+		}
+		spill_reg_to_slot(env, slot, reg, size);
+	} else {
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+		write_slot_data(env, slot, m, size, zero);
+	}
 	return 0;
 }
 
@@ -7761,6 +7786,7 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 	for (i = min_off; i < max_off; i++) {
 		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
 		int m = i % BPF_REG_SIZE;
+		u8 type;
 
 		if (check_slot_byte_range(env, slot, m, false, false, false) != SLOT_RANGE_OK) {
 			char tn_buf[48];
@@ -7770,7 +7796,10 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 				tn_buf, i - min_off, size);
 			return -EACCES;
 		}
-		if (slot->slot_type[slot_byte_idx(m)] == STACK_ZERO)
+		/* as in mark_reg_stack_read(), a spilled zero is zero bytes */
+		type = slot->slot_type[slot_byte_idx(m)];
+		if (type == STACK_ZERO ||
+		    (type == STACK_SPILL && bpf_register_is_null(&slot->spilled_ptr)))
 			zeros++;
 	}
 	/* Any read into a register is zero extended, so all-zero bytes give zero. */
