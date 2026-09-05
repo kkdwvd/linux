@@ -7087,39 +7087,87 @@ static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
 	return bpf_push_jmp_history(env, vstate, INSN_F_REF_ALLOC, 0, 0, id);
 }
 
+/* Record a spill into or fill from a frame slot for precision backtracking. */
+static int push_coro_frame_history(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				   int spi)
+{
+	return bpf_push_jmp_history(env, env->cur_state, INSN_F_REF_SLOT_ACCESS, spi, 0, ref->id);
+}
+
 static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
 				  int foff, int size, int value_regno, int insn_idx)
 {
 	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
-	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	int spi = foff / BPF_REG_SIZE, m = foff % BPF_REG_SIZE;
+	struct bpf_stack_state *slot = &ref->slots[spi];
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
-	int m = foff % BPF_REG_SIZE;
-	bool zero;
+	bool spill = true;
 	int err;
 
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (reg && is_pointer_regtype(reg->type)) {
-		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
-		return -EACCES;
-	}
 
 	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
 	if (err)
 		return err;
-	if (!env->bypass_spec_v4 && slot_write_needs_nospec(slot, m, size, false))
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(slot, m, size, reg && is_pointer_regtype(reg->type)))
 		env->insn_aux_data[insn_idx].nospec_result = true;
 
-	zero = (reg && bpf_register_is_null(reg)) ||
-	       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
-	return write_slot_data(env, slot, m, size, zero, value_regno);
+	if (reg && !m && reg->type == SCALAR_VALUE && env->bpf_capable) {
+		bool reg_value_fits = get_reg_width(reg) <= BITS_PER_BYTE * size;
+
+		/* Make sure that reg had an ID to build a relation on spill. */
+		if (reg_value_fits)
+			assign_scalar_id_before_mov(env, reg);
+		spill_reg_to_slot(env, slot, reg, size);
+		/* Break the relation on a narrowing spill. */
+		if (!reg_value_fits)
+			slot->spilled_ptr.id = 0;
+	} else if (!reg && !m && is_bpf_st_mem(insn) && env->bpf_capable) {
+		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
+
+		memset(tmp_reg, 0, sizeof(*tmp_reg));
+		__mark_reg_known(tmp_reg, insn->imm);
+		tmp_reg->type = SCALAR_VALUE;
+		spill_reg_to_slot(env, slot, tmp_reg, size);
+	} else if (reg && is_pointer_regtype(reg->type)) {
+		if (size != BPF_REG_SIZE) {
+			verbose_linfo(env, insn_idx, "; ");
+			verbose(env, "invalid size of register spill\n");
+			return -EACCES;
+		}
+		/*
+		 * A frame can outlive the function that fills it, so a stack
+		 * pointer stored in it could dangle after that function
+		 * returns.
+		 */
+		if (reg->type == PTR_TO_STACK) {
+			verbose(env, "cannot spill stack pointers into coro_frame\n");
+			return -EINVAL;
+		}
+		spill_reg_to_slot(env, slot, reg, size);
+	} else {
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+		err = write_slot_data(env, slot, m, size, zero, value_regno);
+		if (err)
+			return err;
+		spill = false;
+	}
+
+	if (spill)
+		return push_coro_frame_history(env, ref, spi);
+	return 0;
 }
 
 static int check_coro_frame_read(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
 				 int foff, int size, int dst_regno)
 {
-	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	int spi = foff / BPF_REG_SIZE;
+	struct bpf_stack_state *slot = &ref->slots[spi];
 	enum slot_read_result res;
 	int err;
 
@@ -7127,8 +7175,22 @@ static int check_coro_frame_read(struct bpf_verifier_env *env, struct bpf_refere
 			    &res);
 	if (err)
 		return err;
-	if (verifier_bug_if(res != SLOT_READ_DATA, env, "coro_frame slot holds a spill"))
-		return -EFAULT;
+
+	switch (res) {
+	case SLOT_READ_FILL:
+		return push_coro_frame_history(env, ref, spi);
+	case SLOT_READ_ZERO_SPILL:
+		/*
+		 * The zero came from a spilled zero; make the slot precise so
+		 * pruning cannot reuse this state for a non-zero spill.
+		 */
+		err = bpf_bt_set_ref_slot(&env->bt, ref->id, spi);
+		if (err)
+			return err;
+		return mark_chain_precision_batch(env, env->cur_state);
+	case SLOT_READ_DATA:
+		break;
+	}
 	return 0;
 }
 
@@ -7176,11 +7238,13 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 {
 	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
 	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
-	int i, zeros = 0;
+	bool zero_spill = false;
+	int i, err, zeros = 0;
 
 	for (i = min_off; i < max_off; i++) {
 		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
 		int m = i % BPF_REG_SIZE;
+		u8 type;
 
 		if (check_slot_byte_range(env, slot, m, false, false, false) != SLOT_RANGE_OK) {
 			char tn_buf[48];
@@ -7190,15 +7254,33 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 				tn_buf, i - min_off, size);
 			return -EACCES;
 		}
-		if (slot->slot_type[slot_byte_idx(m)] == STACK_ZERO)
+		type = slot->slot_type[slot_byte_idx(m)];
+		if (type == STACK_ZERO) {
 			zeros++;
+		} else if (type == STACK_SPILL && bpf_register_is_null(&slot->spilled_ptr)) {
+			zeros++;
+			zero_spill = true;
+		}
 	}
 	/* Any read into a register is zero extended, so all-zero bytes give zero. */
-	if (zeros == max_off - min_off)
-		__mark_reg_const_zero(env, &cur->regs[dst_regno]);
-	else
+	if (zeros != max_off - min_off) {
 		mark_reg_unknown(env, cur->regs, dst_regno);
-	return 0;
+		return 0;
+	}
+	__mark_reg_const_zero(env, &cur->regs[dst_regno]);
+	if (!zero_spill)
+		return 0;
+	/* Zero spills contributed: make their slots precise, as for the stack. */
+	for (i = min_off; i < max_off; i += BPF_REG_SIZE - i % BPF_REG_SIZE) {
+		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
+
+		if (!bpf_is_spilled_scalar_reg(slot))
+			continue;
+		err = bpf_bt_set_ref_slot(&env->bt, ref->id, i / BPF_REG_SIZE);
+		if (err)
+			return err;
+	}
+	return mark_chain_precision_batch(env, env->cur_state);
 }
 
 static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
