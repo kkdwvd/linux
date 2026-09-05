@@ -27,10 +27,17 @@ int bpf_push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_state
 		env->cur_hist_ent->flags |= insn_flags;
 		env->cur_hist_ent->spi = spi;
 		env->cur_hist_ent->frame = frame;
-		verifier_bug_if(env->cur_hist_ent->linked_regs != 0, env,
+		/*
+		 * Reference-owned slot accesses record the reference id in
+		 * linked_regs; the READ and WRITE sides of an atomic insn
+		 * record the same id.
+		 */
+		verifier_bug_if(env->cur_hist_ent->linked_regs != 0 &&
+				env->cur_hist_ent->linked_regs != linked_regs, env,
 				"insn history: insn_idx %d linked_regs: %#llx",
 				env->insn_idx, env->cur_hist_ent->linked_regs);
-		env->cur_hist_ent->linked_regs = linked_regs;
+		if (linked_regs)
+			env->cur_hist_ent->linked_regs = linked_regs;
 		return 0;
 	}
 
@@ -123,6 +130,17 @@ static inline void bt_reset(struct backtrack_state *bt)
 	bt->env = env;
 }
 
+static inline bool bt_ref_slots_empty(struct backtrack_state *bt)
+{
+	u64 mask = 0;
+	int i;
+
+	for (i = 0; i < bt->nr_ref_slots; i++)
+		mask |= bt->ref_slots[i].mask;
+
+	return mask == 0;
+}
+
 static inline u32 bt_empty(struct backtrack_state *bt)
 {
 	u64 mask = 0;
@@ -131,7 +149,69 @@ static inline u32 bt_empty(struct backtrack_state *bt)
 	for (i = 0; i <= bt->frame; i++)
 		mask |= bt->reg_masks[i] | bt->stack_masks[i] | bt->stack_arg_masks[i];
 
-	return mask == 0;
+	return mask == 0 && bt_ref_slots_empty(bt);
+}
+
+static int bt_find_ref(struct backtrack_state *bt, u32 id)
+{
+	int i;
+
+	for (i = 0; i < bt->nr_ref_slots; i++)
+		if (bt->ref_slots[i].id == id)
+			return i;
+	return -1;
+}
+
+static void bt_drop_ref_entry(struct backtrack_state *bt, int i)
+{
+	bt->ref_slots[i] = bt->ref_slots[--bt->nr_ref_slots];
+}
+
+/*
+ * Request precision for slot 'slot' of the reference 'id'. Fails with
+ * -ENOSPC when more distinct references are pending than the table holds;
+ * callers then fall back to marking everything precise.
+ */
+int bpf_bt_set_ref_slot(struct backtrack_state *bt, u32 id, u32 slot)
+{
+	int i = bt_find_ref(bt, id);
+
+	if (i < 0) {
+		if (bt->nr_ref_slots == BPF_BT_REF_SLOTS)
+			return -ENOSPC;
+		i = bt->nr_ref_slots++;
+		bt->ref_slots[i].id = id;
+		bt->ref_slots[i].mask = 0;
+	}
+	bt->ref_slots[i].mask |= 1ull << slot;
+	return 0;
+}
+
+static inline bool bt_is_ref_slot_set(struct backtrack_state *bt, u32 id, u32 slot)
+{
+	int i = bt_find_ref(bt, id);
+
+	return i >= 0 && (bt->ref_slots[i].mask & (1ull << slot));
+}
+
+static inline void bt_clear_ref_slot(struct backtrack_state *bt, u32 id, u32 slot)
+{
+	int i = bt_find_ref(bt, id);
+
+	if (i < 0)
+		return;
+	bt->ref_slots[i].mask &= ~(1ull << slot);
+	if (!bt->ref_slots[i].mask)
+		bt_drop_ref_entry(bt, i);
+}
+
+/* Forget all pending slots of reference 'id'. */
+static inline void bt_drop_ref(struct backtrack_state *bt, u32 id)
+{
+	int i = bt_find_ref(bt, id);
+
+	if (i >= 0)
+		bt_drop_ref_entry(bt, i);
 }
 
 static inline void bt_clear_frame_stack_arg_slot(struct backtrack_state *bt, u32 frame, u32 slot)
@@ -362,6 +442,16 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			return 0;
 		}
 
+		if (hist && hist->flags & INSN_F_REF_SLOT_ACCESS) {
+			/*
+			 * dreg = *(u64 *)(ref + off) was a fill from a slot
+			 * owned by a reference; track the slot by reference id.
+			 */
+			if (bpf_bt_set_ref_slot(bt, hist->linked_regs, hist->spi))
+				return -ENOTSUPP;
+			return 0;
+		}
+
 		/* scalars can only be spilled into stack w/o losing precision.
 		 * Load from any other memory can be zero extended.
 		 * The desire to keep that precision is already indicated
@@ -390,6 +480,15 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			if (!bt_is_frame_stack_arg_slot_set(bt, bt->frame, spi))
 				return 0;
 			bt_clear_frame_stack_arg_slot(bt, bt->frame, spi);
+			if (class == BPF_STX)
+				bt_set_reg(bt, sreg);
+			return 0;
+		}
+
+		if (hist && hist->flags & INSN_F_REF_SLOT_ACCESS) {
+			if (!bt_is_ref_slot_set(bt, hist->linked_regs, hist->spi))
+				return 0;
+			bt_clear_ref_slot(bt, hist->linked_regs, hist->spi);
 			if (class == BPF_STX)
 				bt_set_reg(bt, sreg);
 			return 0;
@@ -506,6 +605,13 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			 */
 			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL && insn->imm == 0)
 				return -ENOTSUPP;
+			/*
+			 * Nothing before the call that acquired a reference can
+			 * have written its slots, so pending requests for them
+			 * end here.
+			 */
+			if (hist && hist->flags & INSN_F_REF_ALLOC)
+				bt_drop_ref(bt, hist->linked_regs);
 			/* regular helper call sets R0 */
 			bt_clear_reg(bt, BPF_REG_0);
 			/* kfunc might also set R2 */
@@ -720,6 +826,22 @@ void bpf_mark_all_scalars_precise(struct bpf_verifier_env *env,
 				}
 			}
 		}
+		for (i = 0; i < st->acquired_refs; i++) {
+			struct bpf_reference_state *ref = &st->refs[i];
+
+			for (j = 0; j < ref->nr_slots; j++) {
+				if (!bpf_is_spilled_reg(&ref->slots[j]))
+					continue;
+				reg = &ref->slots[j].spilled_ptr;
+				if (reg->type != SCALAR_VALUE || reg->precise)
+					continue;
+				reg->precise = true;
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "force_precise: ref%d: forcing slot %d to be precise\n",
+						ref->id, j);
+				}
+			}
+		}
 	}
 }
 
@@ -860,6 +982,15 @@ int bpf_mark_chain_precision(struct bpf_verifier_env *env,
 		}
 
 		if (last_idx < 0) {
+			/*
+			 * Slots of references that predate a global subprog
+			 * cannot be tracked into its caller; be conservative.
+			 */
+			if (!bt_ref_slots_empty(bt)) {
+				bpf_mark_all_scalars_precise(env, starting_state);
+				bt_reset(bt);
+				return 0;
+			}
 			/* we are at the entry into subprog, which
 			 * is expected for global funcs, but only if
 			 * requested precise registers are R1-R5
@@ -984,6 +1115,41 @@ int bpf_mark_chain_precision(struct bpf_verifier_env *env,
 				verbose(env, "stack=%s: ", env->tmp_str_buf);
 				print_verifier_state(env, st, fr, true);
 			}
+		}
+
+		for (i = 0; i < bt->nr_ref_slots; ) {
+			struct bpf_reference_state *ref;
+			u32 id = bt->ref_slots[i].id;
+			int spi;
+
+			ref = bpf_find_ref_slots(st, id);
+			if (!ref) {
+				/* the reference did not exist yet in this state */
+				bt_drop_ref_entry(bt, i);
+				continue;
+			}
+			bitmap_from_u64(mask, bt->ref_slots[i].mask);
+			for_each_set_bit(spi, mask, 64) {
+				if (spi >= ref->nr_slots ||
+				    !bpf_is_spilled_scalar_reg(&ref->slots[spi])) {
+					bt->ref_slots[i].mask &= ~(1ull << spi);
+					continue;
+				}
+				reg = &ref->slots[spi].spilled_ptr;
+				if (reg->precise) {
+					bt->ref_slots[i].mask &= ~(1ull << spi);
+				} else {
+					reg->precise = true;
+					*changed = true;
+				}
+			}
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "mark_precise: ref%u: parent state slots=%#llx\n",
+					id, bt->ref_slots[i].mask);
+			if (!bt->ref_slots[i].mask)
+				bt_drop_ref_entry(bt, i);
+			else
+				i++;
 		}
 
 		if (bt_empty(bt))

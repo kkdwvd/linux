@@ -316,6 +316,17 @@ static bool range_within(const struct bpf_reg_state *old,
  * So we look through our idmap to see if this old id has been seen before.  If
  * so, we require the new id to match; otherwise, we add the id pair to the map.
  */
+/* Current-state id paired with 'old_id' by check_ids(), or 0 if none. */
+static u32 idmap_cur_id(struct bpf_idmap *idmap, u32 old_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < idmap->cnt; i++)
+		if (idmap->map[i].old == old_id)
+			return idmap->map[i].cur;
+	return 0;
+}
+
 static bool check_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 {
 	struct bpf_id_pair *map = idmap->map;
@@ -881,10 +892,11 @@ static bool stack_arg_safe(struct bpf_verifier_env *env, struct bpf_func_state *
 	return true;
 }
 
-static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *cur,
-		    struct bpf_idmap *idmap)
+static bool refsafe(struct bpf_verifier_env *env, struct bpf_verifier_state *old,
+		    struct bpf_verifier_state *cur, struct bpf_idmap *idmap,
+		    enum exact_level exact)
 {
-	int i;
+	int i, j;
 
 	if (old->acquired_refs != cur->acquired_refs)
 		return false;
@@ -926,6 +938,13 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 			WARN_ONCE(1, "Unhandled enum type for reference state: %d\n", old->refs[i].type);
 			return false;
 		}
+		/* Reference-owned slots are compared like stack slots. */
+		if (old->refs[i].nr_slots != cur->refs[i].nr_slots)
+			return false;
+		for (j = 0; j < old->refs[i].nr_slots; j++)
+			if (!slot_safe(env, &old->refs[i].slots[j], &cur->refs[i].slots[j],
+				       idmap, exact))
+				return false;
 	}
 
 	return true;
@@ -1014,7 +1033,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 	if (old->in_sleepable != cur->in_sleepable)
 		return false;
 
-	if (!refsafe(old, cur, &env->idmap_scratch))
+	if (!refsafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
 
 	/* for states to be equal callsites have to be the same
@@ -1080,6 +1099,33 @@ static int propagate_precision(struct bpf_verifier_env *env,
 		}
 		if (!first && (env->log.level & BPF_LOG_LEVEL2))
 			verbose(env, "\n");
+	}
+
+	/*
+	 * Precise scalars in reference-owned slots are requested under the
+	 * current state's reference id, which states_equal() paired with the
+	 * old id in the idmap.
+	 */
+	for (i = 0; i < old->acquired_refs; i++) {
+		struct bpf_reference_state *ref = &old->refs[i];
+		u32 cur_id = idmap_cur_id(&env->idmap_scratch, ref->id);
+		int j;
+
+		for (j = 0; j < ref->nr_slots; j++) {
+			if (!bpf_is_spilled_reg(&ref->slots[j]))
+				continue;
+			state_reg = &ref->slots[j].spilled_ptr;
+			if (state_reg->type != SCALAR_VALUE ||
+			    !state_reg->precise)
+				continue;
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "ref%d: propagating slot %d\n", ref->id, j);
+			if (!cur_id || bpf_bt_set_ref_slot(&env->bt, cur_id, j)) {
+				/* untrackable slot: fall back to precise everything */
+				bpf_mark_all_scalars_precise(env, cur);
+				break;
+			}
+		}
 	}
 
 	err = bpf_mark_chain_precision(env, cur, -1, changed);
@@ -1244,6 +1290,18 @@ static void mark_all_scalars_imprecise(struct bpf_verifier_env *env, struct bpf_
 			if (!bpf_is_spilled_reg(&func->stack[j]))
 				continue;
 			reg = &func->stack[j].spilled_ptr;
+			if (reg->type != SCALAR_VALUE)
+				continue;
+			reg->precise = false;
+		}
+	}
+	for (i = 0; i < st->acquired_refs; i++) {
+		struct bpf_reference_state *ref = &st->refs[i];
+
+		for (j = 0; j < ref->nr_slots; j++) {
+			if (!bpf_is_spilled_reg(&ref->slots[j]))
+				continue;
+			reg = &ref->slots[j].spilled_ptr;
 			if (reg->type != SCALAR_VALUE)
 				continue;
 			reg->precise = false;

@@ -779,6 +779,40 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 			break;
 		}
 	}
+	for (i = 0; i < vstate->acquired_refs; i++) {
+		struct bpf_reference_state *ref = &vstate->refs[i];
+		int spi;
+
+		for (spi = 0; spi < ref->nr_slots; spi++) {
+			char types_buf[BPF_REG_SIZE + 1];
+			bool valid = false;
+			int j;
+
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				u8 slot_type = ref->slots[spi].slot_type[j];
+
+				if (slot_type != STACK_INVALID && slot_type != STACK_POISON)
+					valid = true;
+				types_buf[j] = slot_type_char[slot_type];
+			}
+			types_buf[BPF_REG_SIZE] = 0;
+			if (!valid)
+				continue;
+
+			reg = &ref->slots[spi].spilled_ptr;
+			if (ref->slots[spi].slot_type[BPF_REG_SIZE - 1] == STACK_SPILL) {
+				/* print MISC/ZERO/INVALID slots above subreg spill */
+				for (j = 0; j < BPF_REG_SIZE; j++)
+					if (ref->slots[spi].slot_type[j] == STACK_SPILL)
+						break;
+				types_buf[j] = '\0';
+				verbose(env, " ref%d[%d]=%s", ref->id, spi * BPF_REG_SIZE, types_buf);
+				print_reg_state(env, state, reg);
+			} else {
+				verbose(env, " ref%d[%d]=%s", ref->id, spi * BPF_REG_SIZE, types_buf);
+			}
+		}
+	}
 	if (vstate->acquired_refs && vstate->refs[0].id) {
 		verbose(env, " refs=%d", vstate->refs[0].id);
 		for (i = 1; i < vstate->acquired_refs; i++)
