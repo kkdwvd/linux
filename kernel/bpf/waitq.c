@@ -13,6 +13,8 @@
 struct bpf_waitq_kern {
 	wait_queue_head_t waitq;
 	struct rcu_head rcu;
+	refcount_t refs;
+	u32 sequence;
 	bool draining;
 };
 
@@ -39,20 +41,53 @@ struct bpf_kthread_opaque {
 	struct bpf_kthread_kern *kthread;
 } __aligned(8);
 
+struct bpf_waitq_kern *bpf_waitq_get(struct bpf_waitq *waitq)
+{
+	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
+	struct bpf_waitq_kern *kern = READ_ONCE(opaque->waitq);
+
+	if (kern)
+		refcount_inc(&kern->refs);
+	return kern;
+}
+
+void bpf_waitq_put(struct bpf_waitq_kern *waitq)
+{
+	/*
+	 * A producer may publish the queue through an RCU-protected pointer
+	 * and signal it without holding a reference, so the memory outlives
+	 * the last reference by a grace period.
+	 */
+	if (refcount_dec_and_test(&waitq->refs))
+		kfree_rcu(waitq, rcu);
+}
+
+int bpf_waitq_signal(struct bpf_waitq_kern *waitq, u32 nr)
+{
+	unsigned long flags;
+	int ret = -ENOENT;
+
+	spin_lock_irqsave(&waitq->waitq.lock, flags);
+	if (!waitq->draining) {
+		smp_store_release(&waitq->sequence, waitq->sequence + 1);
+		__wake_up_locked(&waitq->waitq, TASK_NORMAL,
+				 nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX));
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&waitq->waitq.lock, flags);
+	return ret;
+}
+
 static void bpf_waitq_free_rcu(struct rcu_head *rcu)
 {
 	struct bpf_waitq_kern *waitq = container_of(rcu, struct bpf_waitq_kern, rcu);
 	unsigned long flags;
-	bool free_waitq;
 
 	spin_lock_irqsave(&waitq->waitq.lock, flags);
 	waitq->draining = true;
 	__wake_up_locked(&waitq->waitq, TASK_NORMAL, 0);
-	free_waitq = list_empty(&waitq->waitq.head);
 	spin_unlock_irqrestore(&waitq->waitq.lock, flags);
-
-	if (free_waitq)
-		kfree(waitq);
+	bpf_waitq_put(waitq);
 }
 
 void bpf_waitq_cancel_and_free(void *val)
@@ -201,6 +236,7 @@ __bpf_kfunc int bpf_waitq_init(struct bpf_waitq *waitq, void *p__const_map,
 	if (!new_waitq)
 		return -ENOMEM;
 	init_waitqueue_head(&new_waitq->waitq);
+	refcount_set(&new_waitq->refs, 1);
 
 	if (cmpxchg(&opaque->waitq, NULL, new_waitq)) {
 		kfree(new_waitq);
@@ -220,14 +256,13 @@ __bpf_kfunc int bpf_waitq_init(struct bpf_waitq *waitq, void *p__const_map,
 	return 0;
 }
 
-__bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
-			       u32 expected, u64 timeout_ns, u64 flags)
+static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
+			   u32 expected, u64 timeout_ns, u64 flags)
 {
 	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
 	struct bpf_waitq_kern *waitq_kern;
 	wait_queue_entry_t entry;
 	unsigned long irq_flags;
-	bool free_waitq = false;
 	int ret = 0;
 
 	if (flags)
@@ -236,6 +271,8 @@ __bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	waitq_kern = READ_ONCE(opaque->waitq);
 	if (!waitq_kern)
 		return -EINVAL;
+	if (!word)
+		word = &waitq_kern->sequence;
 
 	init_waitqueue_entry(&entry, current);
 	entry.flags |= WQ_FLAG_EXCLUSIVE;
@@ -251,6 +288,7 @@ __bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 		goto unlock;
 	}
 	__add_wait_queue_entry_tail(&waitq_kern->waitq, &entry);
+	refcount_inc(&waitq_kern->refs);
 	set_current_state(TASK_UNINTERRUPTIBLE);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
 
@@ -272,12 +310,10 @@ __bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 
 	spin_lock_irqsave(&waitq_kern->waitq.lock, irq_flags);
 	list_del_init(&entry.entry);
-	if (waitq_kern->draining && list_empty(&waitq_kern->waitq.head))
-		free_waitq = true;
+	if (waitq_kern->draining)
+		ret = -ENOENT;
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
-
-	if (free_waitq)
-		kfree(waitq_kern);
+	bpf_waitq_put(waitq_kern);
 
 	rcu_read_lock_trace();
 	migrate_disable();
@@ -288,11 +324,32 @@ unlock:
 	return ret;
 }
 
+__bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
+			     u32 expected, u64 timeout_ns, u64 flags)
+{
+	return __bpf_waitq_wait(waitq, word, expected, timeout_ns, flags);
+}
+
+/* Sample before checking readiness, then wait using the sampled sequence. */
+__bpf_kfunc u32 bpf_waitq_sequence(struct bpf_waitq *waitq)
+{
+	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
+	struct bpf_waitq_kern *kern = READ_ONCE(opaque->waitq);
+
+	return kern ? smp_load_acquire(&kern->sequence) : 0;
+}
+
+__bpf_kfunc int bpf_waitq_wait_event(struct bpf_waitq *waitq, u32 expected,
+				   u64 timeout_ns)
+{
+	return __bpf_waitq_wait(waitq, NULL, expected, timeout_ns, 0);
+}
+
 __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 {
 	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
 	struct bpf_waitq_kern *waitq_kern;
-	int nr_exclusive;
+	unsigned long irq_flags;
 
 	if (flags)
 		return -EINVAL;
@@ -303,10 +360,11 @@ __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 	if (!waitq_kern)
 		return -EINVAL;
 
-	nr_exclusive = nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX);
-	/* Publish BPF-side condition updates before waking a queued waiter. */
-	smp_mb();
-	return __wake_up(&waitq_kern->waitq, TASK_NORMAL, nr_exclusive, NULL);
+	spin_lock_irqsave(&waitq_kern->waitq.lock, irq_flags);
+	smp_store_release(&waitq_kern->sequence, waitq_kern->sequence + 1);
+	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
+	return __wake_up(&waitq_kern->waitq, TASK_NORMAL,
+			 nr == U32_MAX ? 0 : min_t(u32, nr, INT_MAX), NULL);
 }
 
 __bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_map,
@@ -464,6 +522,8 @@ __bpf_kfunc_end_defs();
 BTF_KFUNCS_START(bpf_waitq_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_waitq_init)
 BTF_ID_FLAGS(func, bpf_waitq_wait, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_waitq_sequence)
+BTF_ID_FLAGS(func, bpf_waitq_wait_event, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wake)
 BTF_ID_FLAGS(func, bpf_kthread_create, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kthread_start)
