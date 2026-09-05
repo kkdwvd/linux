@@ -205,6 +205,7 @@ static bool join_reg(struct bpf_join_state *js, struct bpf_reg_state *dst,
 	case PTR_TO_MEM:
 	case PTR_TO_BUF:
 	case PTR_TO_TP_BUFFER:
+	case PTR_TO_CORO_FRAME:
 		if (!reg_fixed_part_equal(ra, rb))
 			return false;
 		/*

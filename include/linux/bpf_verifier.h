@@ -416,6 +416,12 @@ struct bpf_reference_state {
 	u32 nr_slots;
 };
 
+/*
+ * Slots a reference may own: as many as the stack of a program that the
+ * interpreter runs has. Every copy of a state copies them, like the stack.
+ */
+#define BPF_MAX_REF_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
+
 struct bpf_retval_range {
 	s32 minval;
 	s32 maxval;

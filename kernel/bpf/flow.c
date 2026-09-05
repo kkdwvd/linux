@@ -2222,6 +2222,7 @@ static void flow_shape_ptr(struct flow_shape *sh, u32 place, const struct bpf_re
 	case PTR_TO_TP_BUFFER:
 	case PTR_TO_STACK:
 	case PTR_TO_BTF_ID:
+	case PTR_TO_CORO_FRAME:
 		has_off = true;
 		var_off = !tnum_is_const(reg->var_off);
 		break;
