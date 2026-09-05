@@ -3507,24 +3507,210 @@ static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
 		src_reg->id = ++env->id_gen;
 }
 
-static void save_register_state(struct bpf_verifier_env *env,
-				struct bpf_func_state *state,
-				int spi, struct bpf_reg_state *reg,
-				int size)
+/*
+ * Slot-level spill and scrub rules shared by every slot-tracked memory.
+ *
+ * A slot covers BPF_REG_SIZE bytes. slot_type[] describes them in reverse
+ * memory order: slot_type[BPF_REG_SIZE - 1] is the lowest address of the
+ * slot, which is where a full register spill starts and what
+ * bpf_is_spilled_reg() tests. Helpers take 'm', the byte offset within the
+ * slot in memory order, and translate with slot_byte_idx(). Accesses never
+ * straddle a slot because callers require size-aligned offsets.
+ */
+static int slot_byte_idx(int m)
+{
+	return BPF_REG_SIZE - 1 - m;
+}
+
+/* Byte offset within its slot of the stack byte at 'off' (off < 0). */
+static int stack_byte_off(int off)
+{
+	return slot_byte_idx((-off - 1) % BPF_REG_SIZE);
+}
+
+/*
+ * Unprivileged programs may not partially overwrite a spilled pointer: the
+ * remaining bytes would keep pointer bits that a later read can leak.
+ */
+static int check_slot_ptr_spill_corruption(struct bpf_verifier_env *env,
+					   struct bpf_stack_state *slot, int size,
+					   const char *mem, int off, int insn_idx)
+{
+	const char *reason;
+
+	if (env->allow_ptr_leaks || size == BPF_REG_SIZE ||
+	    !bpf_is_spilled_reg(slot) || bpf_is_spilled_scalar_reg(slot))
+		return 0;
+
+	verbose(env, "attempt to corrupt spilled pointer on %s\n", mem);
+	reason = bpf_diag_fmt(env,
+			      "This store writes %d bytes at %s offset %d into a %s slot that currently holds a spilled pointer. "
+			      "Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
+			      size, mem, off, mem);
+	bpf_diag_memory(env, insn_idx, bpf_diag_fmt(env, "%s spill corruption", mem), reason,
+			bpf_diag_fmt(env, "Write the full 8-byte spilled pointer slot, or use a separate %s slot for scalar data before overwriting only part of it.",
+				     mem));
+	return -EACCES;
+}
+
+/*
+ * A store needs Spectre v4 sanitization when it writes a pointer or lands on
+ * bytes that are not plain data, since a speculatively bypassed store could
+ * then expose a spilled pointer.
+ */
+static bool slot_write_needs_nospec(struct bpf_stack_state *slot, int m, int size,
+				    bool ptr_value)
 {
 	int i;
 
-	bpf_diag_mod_begin(env, &state->stack[spi].spilled_ptr, reg, BPF_DIAG_MOD_SPILL);
-	state->stack[spi].spilled_ptr = *reg;
+	if (ptr_value)
+		return true;
+	for (i = 0; i < size; i++) {
+		u8 type = slot->slot_type[slot_byte_idx(m + i)];
+
+		if (type != STACK_MISC && type != STACK_ZERO)
+			return true;
+	}
+	return false;
+}
+
+/* Spill a register into a slot; bytes beyond a narrow spill become MISC. */
+static void spill_reg_to_slot(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			      struct bpf_reg_state *reg, int size)
+{
+	int i;
+
+	bpf_diag_mod_begin(env, &slot->spilled_ptr, reg, BPF_DIAG_MOD_SPILL);
+	slot->spilled_ptr = *reg;
 
 	for (i = BPF_REG_SIZE; i > BPF_REG_SIZE - size; i--)
-		state->stack[spi].slot_type[i - 1] = STACK_SPILL;
+		slot->slot_type[i - 1] = STACK_SPILL;
 
 	/* size < 8 bytes spill */
 	for (; i; i--)
-		mark_stack_slot_misc(env, &state->stack[spi].slot_type[i - 1]);
+		mark_stack_slot_misc(env, &slot->slot_type[i - 1]);
 
 	bpf_diag_mod_end(env);
+}
+
+static void scrub_special_slot(struct bpf_stack_state *slot)
+{
+	int i;
+
+	/* regular write of data into the slot destroys any spilled ptr */
+	slot->spilled_ptr.type = NOT_INIT;
+	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
+	if (is_stack_slot_special(slot))
+		for (i = 0; i < BPF_REG_SIZE; i++)
+			scrub_spilled_slot(&slot->slot_type[i]);
+}
+
+/*
+ * Record a plain data write of 'size' bytes at slot offset 'm'. The bytes
+ * become STACK_ZERO when a known zero is written, otherwise STACK_MISC.
+ */
+static int write_slot_data(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			   int m, int size, bool zero, int value_regno)
+{
+	u8 type = STACK_MISC;
+	int i, err;
+
+	if (bpf_is_spilled_reg(slot))
+		bpf_diag_record_scrub(env, &slot->spilled_ptr, BPF_DIAG_MOD_WRITE);
+	scrub_special_slot(slot);
+
+	if (zero) {
+		/*
+		 * STACK_ZERO case happened because register spill wasn't
+		 * properly aligned at the stack slot boundary, so it's not a
+		 * register spill anymore; force originating register to be
+		 * precise to make STACK_ZERO correct for subsequent states.
+		 */
+		err = mark_chain_precision(env, value_regno);
+		if (err)
+			return err;
+		type = STACK_ZERO;
+	}
+
+	for (i = 0; i < size; i++)
+		slot->slot_type[slot_byte_idx(m + i)] = type;
+	return 0;
+}
+
+/*
+ * Prepare byte 'm' of a slot that lies in the range of a variable-offset
+ * write. Spilled pointers in range are destroyed since any of them may be
+ * overwritten. A written zero lets STACK_ZERO bytes and zero spills keep
+ * their state, in which case '*zero_used' tells the caller to make the
+ * written register precise.
+ */
+static int prepare_slot_byte_var_write(struct bpf_verifier_env *env,
+				       struct bpf_stack_state *slot, int m,
+				       bool writing_zero, bool *zero_used,
+				       const char *mem, int insn_idx, int off)
+{
+	u8 new_type, *stype = &slot->slot_type[slot_byte_idx(m)];
+
+	if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
+		/*
+		 * Reject the write if range we may write to has not been
+		 * initialized beforehand. If we didn't reject here, the ptr
+		 * status would be erased below (even though not all slots are
+		 * actually overwritten), possibly opening the door to leaks.
+		 *
+		 * We do however catch STACK_INVALID case below, and only allow
+		 * reading possibly uninitialized memory later for CAP_PERFMON,
+		 * as the write may not happen to that slot.
+		 */
+		verbose(env, "spilled ptr in range of var-offset %s write; insn %d, ptr off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+
+	/*
+	 * If writing_zero and the slot contains a spill of value 0, maintain
+	 * the spill type.
+	 */
+	if (writing_zero && *stype == STACK_SPILL && bpf_is_spilled_scalar_reg(slot)) {
+		struct bpf_reg_state *spill_reg = &slot->spilled_ptr;
+
+		if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0) {
+			*zero_used = true;
+			return 0;
+		}
+	}
+
+	/*
+	 * Scrub slots if variable-offset write goes over spilled pointers.
+	 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type ==
+	 * NOT_INIT and valid program is rejected by check_stack_read_fixed_off()
+	 * with obscure "invalid size of register fill" message.
+	 */
+	scrub_special_slot(slot);
+
+	/* Update the slot type. */
+	new_type = STACK_MISC;
+	if (writing_zero && *stype == STACK_ZERO) {
+		new_type = STACK_ZERO;
+		*zero_used = true;
+	}
+	/*
+	 * If the slot is STACK_INVALID, we check whether it's OK to pretend
+	 * that it will be initialized by this write. The slot might not
+	 * actually be written to, and so if we mark it as initialized future
+	 * reads might leak uninitialized memory. For privileged programs, we
+	 * will accept such reads to slots that may or may not be written
+	 * because, if we're reject them, the error would be too confusing.
+	 * Conservatively, treat STACK_POISON in a similar way.
+	 */
+	if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
+	    !env->allow_uninit_stack) {
+		verbose(env, "uninit %s in range of var-offset write prohibited for !root; insn %d, off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+	*stype = new_type;
+	return 0;
 }
 
 static bool is_bpf_st_mem(struct bpf_insn *insn)
@@ -3562,18 +3748,6 @@ static void check_fastcall_stack_contract(struct bpf_verifier_env *env,
 	}
 }
 
-static void scrub_special_slot(struct bpf_func_state *state, int spi)
-{
-	int i;
-
-	/* regular write of data into stack destroys any spilled ptr */
-	state->stack[spi].spilled_ptr.type = NOT_INIT;
-	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
-	if (is_stack_slot_special(&state->stack[spi]))
-		for (i = 0; i < BPF_REG_SIZE; i++)
-			scrub_spilled_slot(&state->stack[spi].slot_type[i]);
-}
-
 /* check_stack_{read,write}_fixed_off functions track spill/fill of registers,
  * stack boundary and alignment are checked in check_mem_access()
  */
@@ -3584,51 +3758,27 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 				       int insn_idx)
 {
 	struct bpf_func_state *cur; /* state of the current function */
-	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	int slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	struct bpf_stack_state *stack = &state->stack[spi];
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
 	int insn_flags = INSN_F_STACK_ACCESS;
 	int hist_spi = spi, hist_frame = state->frameno;
+	int m = stack_byte_off(off);
 
 	/* caller checked that off % size == 0 and -MAX_BPF_STACK <= off < 0,
 	 * so it's aligned access and [off, off + size) are within stack limits
 	 */
-	if (!env->allow_ptr_leaks &&
-	    bpf_is_spilled_reg(&state->stack[spi]) &&
-	    !bpf_is_spilled_scalar_reg(&state->stack[spi]) &&
-	    size != BPF_REG_SIZE) {
-		const char *reason;
-
-		verbose(env, "attempt to corrupt spilled pointer on stack\n");
-		reason = bpf_diag_fmt(env,
-				      "This store writes %d bytes at stack offset %d into a stack slot that currently holds a spilled pointer. "
-			"Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
-			size, off);
-		bpf_diag_memory(
-			env, insn_idx, "stack spill corruption", reason,
-			"Write the full 8-byte spilled pointer slot, or use a separate stack slot for scalar data before overwriting only part of it.");
-		return -EACCES;
-	}
+	err = check_slot_ptr_spill_corruption(env, stack, size, "stack", off, insn_idx);
+	if (err)
+		return err;
 
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (!env->bypass_spec_v4) {
-		bool sanitize = reg && is_pointer_regtype(reg->type);
-
-		for (i = 0; i < size; i++) {
-			u8 type = state->stack[spi].slot_type[(slot - i) %
-							      BPF_REG_SIZE];
-
-			if (type != STACK_MISC && type != STACK_ZERO) {
-				sanitize = true;
-				break;
-			}
-		}
-
-		if (sanitize)
-			env->insn_aux_data[insn_idx].nospec_result = true;
-	}
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(stack, m, size, reg && is_pointer_regtype(reg->type)))
+		env->insn_aux_data[insn_idx].nospec_result = true;
 
 	err = destroy_if_dynptr_stack_slot(env, state, spi);
 	if (err)
@@ -3643,10 +3793,10 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		/* Make sure that reg had an ID to build a relation on spill. */
 		if (reg_value_fits)
 			assign_scalar_id_before_mov(env, reg);
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 		/* Break the relation on a narrowing spill. */
 		if (!reg_value_fits)
-			state->stack[spi].spilled_ptr.id = 0;
+			stack->spilled_ptr.id = 0;
 	} else if (!reg && !(off % BPF_REG_SIZE) && is_bpf_st_mem(insn) &&
 		   env->bpf_capable) {
 		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
@@ -3654,7 +3804,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		memset(tmp_reg, 0, sizeof(*tmp_reg));
 		__mark_reg_known(tmp_reg, insn->imm);
 		tmp_reg->type = SCALAR_VALUE;
-		save_register_state(env, state, spi, tmp_reg, size);
+		spill_reg_to_slot(env, stack, tmp_reg, size);
 	} else if (reg && is_pointer_regtype(reg->type)) {
 		/* register containing pointer is being spilled into stack */
 		if (size != BPF_REG_SIZE) {
@@ -3666,33 +3816,15 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			verbose(env, "cannot spill pointers to stack into stack frame of the caller\n");
 			return -EINVAL;
 		}
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 	} else {
-		u8 type = STACK_MISC;
-
-		if (bpf_is_spilled_reg(&state->stack[spi]))
-			bpf_diag_record_scrub(env, &state->stack[spi].spilled_ptr,
-					      BPF_DIAG_MOD_WRITE);
-		scrub_special_slot(state, spi);
-
 		/* when we zero initialize stack slots mark them as such */
-		if ((reg && bpf_register_is_null(reg)) ||
-		    (!reg && is_bpf_st_mem(insn) && insn->imm == 0)) {
-			/* STACK_ZERO case happened because register spill
-			 * wasn't properly aligned at the stack slot boundary,
-			 * so it's not a register spill anymore; force
-			 * originating register to be precise to make
-			 * STACK_ZERO correct for subsequent states
-			 */
-			err = mark_chain_precision(env, value_regno);
-			if (err)
-				return err;
-			type = STACK_ZERO;
-		}
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
 
-		/* Mark slots affected by this stack write. */
-		for (i = 0; i < size; i++)
-			state->stack[spi].slot_type[(slot - i) % BPF_REG_SIZE] = type;
+		err = write_slot_data(env, stack, m, size, zero, value_regno);
+		if (err)
+			return err;
 		insn_flags = 0; /* not a register spill */
 	}
 
@@ -3758,74 +3890,13 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 	check_fastcall_stack_contract(env, state, insn_idx, min_off);
 	/* Variable offset writes destroy any spilled pointers in range. */
 	for (i = min_off; i < max_off; i++) {
-		u8 new_type, *stype;
-		int slot, spi;
+		int spi = bpf_get_spi(i);
 
-		slot = -i - 1;
-		spi = slot / BPF_REG_SIZE;
-		stype = &state->stack[spi].slot_type[slot % BPF_REG_SIZE];
 		mark_stack_slot_scratched(env, spi);
-
-		if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
-			/* Reject the write if range we may write to has not
-			 * been initialized beforehand. If we didn't reject
-			 * here, the ptr status would be erased below (even
-			 * though not all slots are actually overwritten),
-			 * possibly opening the door to leaks.
-			 *
-			 * We do however catch STACK_INVALID case below, and
-			 * only allow reading possibly uninitialized memory
-			 * later for CAP_PERFMON, as the write may not happen to
-			 * that slot.
-			 */
-			verbose(env, "spilled ptr in range of var-offset stack write; insn %d, ptr off: %d",
-				insn_idx, i);
-			return -EINVAL;
-		}
-
-		/* If writing_zero and the spi slot contains a spill of value 0,
-		 * maintain the spill type.
-		 */
-		if (writing_zero && *stype == STACK_SPILL &&
-		    bpf_is_spilled_scalar_reg(&state->stack[spi])) {
-			struct bpf_reg_state *spill_reg = &state->stack[spi].spilled_ptr;
-
-			if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0) {
-				zero_used = true;
-				continue;
-			}
-		}
-
-		/*
-		 * Scrub slots if variable-offset stack write goes over spilled pointers.
-		 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type == NOT_INIT
-		 * and valid program is rejected by check_stack_read_fixed_off()
-		 * with obscure "invalid size of register fill" message.
-		 */
-		scrub_special_slot(state, spi);
-
-		/* Update the slot type. */
-		new_type = STACK_MISC;
-		if (writing_zero && *stype == STACK_ZERO) {
-			new_type = STACK_ZERO;
-			zero_used = true;
-		}
-		/* If the slot is STACK_INVALID, we check whether it's OK to
-		 * pretend that it will be initialized by this write. The slot
-		 * might not actually be written to, and so if we mark it as
-		 * initialized future reads might leak uninitialized memory.
-		 * For privileged programs, we will accept such reads to slots
-		 * that may or may not be written because, if we're reject
-		 * them, the error would be too confusing.
-		 * Conservatively, treat STACK_POISON in a similar way.
-		 */
-		if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
-		    !env->allow_uninit_stack) {
-			verbose(env, "uninit stack in range of var-offset write prohibited for !root; insn %d, off: %d",
-					insn_idx, i);
-			return -EINVAL;
-		}
-		*stype = new_type;
+		err = prepare_slot_byte_var_write(env, &state->stack[spi], stack_byte_off(i),
+						  writing_zero, &zero_used, "stack", insn_idx, i);
+		if (err)
+			return err;
 	}
 	if (zero_used) {
 		/* backtracking doesn't work for STACK_ZERO yet. */
