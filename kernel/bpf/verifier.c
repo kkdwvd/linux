@@ -376,6 +376,7 @@ static bool reg_not_null(struct bpf_verifier_env *env, const struct bpf_reg_stat
 		type == PTR_TO_SOCK_COMMON ||
 		(type == PTR_TO_BTF_ID && is_trusted_reg(env, reg)) ||
 		(type == PTR_TO_MEM && !(reg->type & PTR_UNTRUSTED)) ||
+		type == PTR_TO_CORO_FRAME ||
 		type == CONST_PTR_TO_MAP;
 }
 
@@ -5592,6 +5593,11 @@ static int check_ptr_alignment(struct bpf_verifier_env *env,
 		 */
 		strict = true;
 		break;
+	case PTR_TO_CORO_FRAME:
+		pointer_desc = "coro_frame ";
+		/* Slot tracking relies on accesses not straddling slots. */
+		strict = true;
+		break;
 	case PTR_TO_SOCKET:
 		pointer_desc = "sock ";
 		break;
@@ -7047,6 +7053,208 @@ reg_unknown:
 	return 0;
 }
 
+/*
+ * Coroutine frames.
+ *
+ * bpf_coro_frame_alloc() returns PTR_TO_CORO_FRAME memory whose contents the
+ * program manages like its own stack, so the allocation's reference owns a
+ * slot array and accesses go through the shared slot helpers. Accesses are
+ * size aligned like stack accesses (see check_ptr_alignment()) and therefore
+ * never straddle a slot. The register's id is the reference id, which
+ * pointer arithmetic preserves, so any pointer into the frame finds it.
+ */
+static struct bpf_reference_state *coro_frame_ref(struct bpf_verifier_env *env,
+						  struct bpf_reg_state *reg)
+{
+	return bpf_find_ref_slots(env->cur_state, reg->id);
+}
+
+/* Attach the slot array to the reference just acquired for a frame of 'size' bytes. */
+static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_reference_state *ref = &vstate->refs[vstate->acquired_refs - 1];
+	u32 nr_slots = DIV_ROUND_UP(size, BPF_REG_SIZE);
+
+	if (verifier_bug_if(ref->id != id || nr_slots > BPF_MAX_REF_SLOTS, env,
+			    "coro_frame ref %d size %u", id, size))
+		return -EFAULT;
+	ref->slots = kcalloc(nr_slots, sizeof(*ref->slots), GFP_KERNEL_ACCOUNT);
+	if (!ref->slots)
+		return -ENOMEM;
+	ref->nr_slots = nr_slots;
+	/* Precision requests for the frame's slots end at this allocation. */
+	return bpf_push_jmp_history(env, vstate, INSN_F_REF_ALLOC, 0, 0, id);
+}
+
+static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				  int foff, int size, int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	struct bpf_reg_state *reg = NULL;
+	int m = foff % BPF_REG_SIZE;
+	bool zero;
+	int err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+	if (reg && is_pointer_regtype(reg->type)) {
+		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
+		return -EACCES;
+	}
+
+	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
+	if (err)
+		return err;
+	if (!env->bypass_spec_v4 && slot_write_needs_nospec(slot, m, size, false))
+		env->insn_aux_data[insn_idx].nospec_result = true;
+
+	zero = (reg && bpf_register_is_null(reg)) ||
+	       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+	return write_slot_data(env, slot, m, size, zero, value_regno);
+}
+
+static int check_coro_frame_read(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				 int foff, int size, int dst_regno)
+{
+	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	enum slot_read_result res;
+	int err;
+
+	err = read_slot_reg(env, slot, foff % BPF_REG_SIZE, size, dst_regno, "coro_frame", foff,
+			    &res);
+	if (err)
+		return err;
+	if (verifier_bug_if(res != SLOT_READ_DATA, env, "coro_frame slot holds a spill"))
+		return -EFAULT;
+	return 0;
+}
+
+static int check_coro_frame_write_var_off(struct bpf_verifier_env *env,
+					  struct bpf_reference_state *ref,
+					  struct bpf_reg_state *ptr_reg, int off, int size,
+					  int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	struct bpf_reg_state *reg = NULL;
+	bool writing_zero, zero_used = false;
+	int i, err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+	if (reg && is_pointer_regtype(reg->type)) {
+		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
+		return -EACCES;
+	}
+	writing_zero = (reg && bpf_register_is_null(reg)) ||
+		       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+	for (i = min_off; i < max_off; i++) {
+		err = prepare_slot_byte_var_write(env, &ref->slots[i / BPF_REG_SIZE],
+						  i % BPF_REG_SIZE, writing_zero, &zero_used,
+						  "coro_frame", insn_idx, i);
+		if (err)
+			return err;
+	}
+	if (zero_used) {
+		/* backtracking doesn't work for STACK_ZERO yet. */
+		err = mark_chain_precision(env, value_regno);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
+					 struct bpf_reference_state *ref,
+					 struct bpf_reg_state *ptr_reg, int off, int size,
+					 int dst_regno)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	int i, zeros = 0;
+
+	for (i = min_off; i < max_off; i++) {
+		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
+		int m = i % BPF_REG_SIZE;
+
+		if (check_slot_byte_range(env, slot, m, false, false, false) != SLOT_RANGE_OK) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), ptr_reg->var_off);
+			verbose(env, "invalid read from coro_frame var_off %s+%d size %d\n",
+				tn_buf, i - min_off, size);
+			return -EACCES;
+		}
+		if (slot->slot_type[slot_byte_idx(m)] == STACK_ZERO)
+			zeros++;
+	}
+	/* Any read into a register is zero extended, so all-zero bytes give zero. */
+	if (zeros == max_off - min_off)
+		__mark_reg_const_zero(env, &cur->regs[dst_regno]);
+	else
+		mark_reg_unknown(env, cur->regs, dst_regno);
+	return 0;
+}
+
+static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
+				   struct bpf_reg_state *reg, argno_t argno, int off, int size,
+				   enum bpf_access_type t, int value_regno)
+{
+	struct bpf_reference_state *ref;
+	int err;
+
+	if (type_may_be_null(reg->type)) {
+		verbose(env, "%s invalid mem access '%s'\n", reg_arg_name(env, argno),
+			reg_type_str(env, reg->type));
+		bpf_diag_invalid_deref(env, insn_idx, reg_from_argno(argno),
+				       reg_arg_name(env, argno), reg,
+				       BPF_DIAG_DEREF_NULLABLE_PTR, 0);
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, off, size, reg->mem_size, false);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+
+	if (tnum_is_const(reg->var_off)) {
+		int foff = reg->var_off.value + off;
+
+		if (t == BPF_WRITE)
+			return check_coro_frame_write(env, ref, foff, size, value_regno, insn_idx);
+		return check_coro_frame_read(env, ref, foff, size, value_regno);
+	}
+
+	/*
+	 * Variable offsets follow the stack rules: privileged only, since no
+	 * Spectre v1 masking exists for this memory, and only when a read has
+	 * a destination register, so pointer bytes cannot escape unnoticed.
+	 */
+	if (!env->bypass_spec_v1) {
+		verbose(env, "%s variable offset coro_frame access prohibited for !root\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	if (t == BPF_WRITE)
+		return check_coro_frame_write_var_off(env, ref, reg, off, size, value_regno,
+						      insn_idx);
+	if (value_regno < 0) {
+		verbose(env, "%s variable offset coro_frame access without destination register\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	return check_coro_frame_read_var_off(env, ref, reg, off, size, value_regno);
+}
+
 /* check whether memory at (regno + off) is accessible for t = (read | write)
  * if t==write, value_regno is a register which value is stored into memory
  * if t==read, value_regno is a register which will receive the value from memory
@@ -7196,6 +7404,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 		else
 			err = check_stack_write(env, reg, off, size,
 						value_regno, insn_idx);
+	} else if (base_type(reg->type) == PTR_TO_CORO_FRAME) {
+		err = check_coro_frame_access(env, insn_idx, reg, argno, off, size, t,
+					      value_regno);
 	} else if (reg_is_pkt_pointer(reg)) {
 		if (t == BPF_WRITE && !may_access_direct_pkt_data(env, NULL, t)) {
 			verbose(env, "cannot write into packet\n");
@@ -8942,6 +9153,9 @@ static const struct bpf_reg_types arena_types = {
 static const struct bpf_reg_types ctx_out_types = {
 	.types = { PTR_TO_MEM | MEM_RDONLY | PTR_TRUSTED },
 };
+static const struct bpf_reg_types coro_frame_types = {
+	.types = { PTR_TO_CORO_FRAME }
+};
 
 static const struct bpf_reg_types alloc_obj_drop_types = {
 	.types = {
@@ -9015,6 +9229,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_IRQ_FLAG]		= &stack_ptr_types,
 	[ARG_PTR_TO_ARENA]		= &arena_types,
 	[ARG_PTR_TO_CTX_OUT]		= &ctx_out_types,
+	[ARG_PTR_TO_CORO_FRAME]	= &coro_frame_types,
 };
 
 static void bpf_diag_call_arg(struct bpf_verifier_env *env, u32 insn_idx, argno_t argno,
@@ -9274,6 +9489,7 @@ static int check_func_arg_reg_off(struct bpf_verifier_env *env,
 	case PTR_TO_BUF:
 	case PTR_TO_BUF | MEM_RDONLY:
 	case PTR_TO_ARENA:
+	case PTR_TO_CORO_FRAME:
 	case SCALAR_VALUE:
 		return 0;
 	/* All the rest must be rejected, except PTR_TO_BTF_ID which allows
@@ -9742,6 +9958,8 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 		}
 		break;
 	case ARG_PTR_TO_ARENA:
+		break;
+	case ARG_PTR_TO_CORO_FRAME:
 		break;
 	case ARG_PTR_TO_ALLOC_BTF_ID:
 		if (reg->type == (PTR_TO_BTF_ID | MEM_ALLOC)) {
@@ -12886,6 +13104,11 @@ static bool is_kfunc_arg_arena(const struct btf *btf, const struct btf_param *ar
 	       btf_param_match_suffix(btf, arg, "__arena");
 }
 
+static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_frame");
+}
+
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
 					  const struct btf_param *arg,
 					  const char *name)
@@ -13283,6 +13506,7 @@ enum special_kfunc_type {
 	KF_bpf_arena_free_pages,
 	KF_bpf_arena_reserve_pages,
 	KF_bpf_session_is_return,
+	KF_bpf_coro_frame_alloc,
 	KF_bpf_stream_vprintk,
 	KF_bpf_stream_print_stack,
 };
@@ -13382,6 +13606,7 @@ BTF_ID(func, bpf_session_is_return)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, bpf_coro_frame_alloc)
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
 
@@ -13679,7 +13904,9 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		}
 		proto->arg_size[arg] = type_size;
 		arg_type = ARG_PTR_TO_CTX_OUT | MEM_FIXED_SIZE;
-	} else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
+	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]))
+		arg_type = ARG_PTR_TO_CORO_FRAME;
+	else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_FUNC;
 	else if (is_kfunc_arg_arena(meta->btf, &args[arg])) {
 		if (!bpf_jit_supports_arena_args()) {
@@ -14820,6 +15047,24 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 			return -EFAULT;
 		}
 		regs[BPF_REG_0].parent_id = meta->dynptr.id;
+	} else if (meta->func_id == special_kfunc_list[KF_bpf_coro_frame_alloc]) {
+		u64 size = meta->arg_constant.value;
+
+		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
+			return -EFAULT;
+		/*
+		 * The cap keeps every slot index within the history entry's
+		 * 'spi' field and bounds the per-state tracking cost like the
+		 * stack does.
+		 */
+		if (size == 0 || size > BPF_MAX_REF_SLOTS * BPF_REG_SIZE) {
+			verbose(env, "coro_frame size %llu out of range [1, %u]\n",
+				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
+			return -EINVAL;
+		}
+		mark_reg_known_zero(env, regs, BPF_REG_0);
+		regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
+		regs[BPF_REG_0].mem_size = size;
 	} else {
 		return 0;
 	}
@@ -15102,7 +15347,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (meta.btf != btf_vmlinux ||
 		    (!is_bpf_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_percpu_obj_new_kfunc(meta.func_id) &&
-		     !is_bpf_refcount_acquire_kfunc(meta.func_id))) {
+		     !is_bpf_refcount_acquire_kfunc(meta.func_id) &&
+		     meta.func_id != special_kfunc_list[KF_bpf_coro_frame_alloc])) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}
@@ -15261,6 +15507,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
+				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
+				if (err)
+					return err;
+			}
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -15753,6 +16004,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	case PTR_TO_BUF:
 	case PTR_TO_FUNC:
 	case CONST_PTR_TO_DYNPTR:
+	case PTR_TO_CORO_FRAME:
 		break;
 	case PTR_TO_FLOW_KEYS:
 		if (known)

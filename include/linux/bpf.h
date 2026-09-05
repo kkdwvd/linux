@@ -911,6 +911,7 @@ enum bpf_arg_type {
 	 */
 	ARG_PTR_TO_MEM,		/* pointer to valid memory (stack, packet, map value) */
 	ARG_PTR_TO_ARENA,
+	ARG_PTR_TO_CORO_FRAME,	/* pointer to a BPF coroutine frame */
 
 	ARG_MEM_SIZE,		/* number of bytes accessed from memory */
 	ARG_MEM_SIZE_OR_ZERO,	/* number of bytes accessed from memory or 0 */
@@ -1128,6 +1129,7 @@ enum bpf_reg_type {
 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
 	PTR_TO_INSN,		 /* reg points to a bpf program instruction */
 	CONST_PTR_TO_DYNPTR,	 /* reg points to a const struct bpf_dynptr */
+	PTR_TO_CORO_FRAME,	 /* reg points to a frame from bpf_coro_frame_alloc() */
 	__BPF_REG_TYPE_MAX,
 
 	/* Extended reg_types. */

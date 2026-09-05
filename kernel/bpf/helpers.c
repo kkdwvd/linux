@@ -2438,6 +2438,21 @@ __bpf_kfunc void *bpf_percpu_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 	return bpf_percpu_obj_new(local_type_id__k, meta__ign);
 }
 
+/*
+ * Coroutine frames are heap memory whose contents the verifier tracks slot by
+ * slot like the program stack, see PTR_TO_CORO_FRAME. The size is a
+ * verifier-checked constant, so the allocation and the tracked size agree.
+ */
+__bpf_kfunc void *bpf_coro_frame_alloc(u64 size__k, void *ctx__ign)
+{
+	return kmalloc_nolock(size__k, __GFP_ACCOUNT, NUMA_NO_NODE);
+}
+
+__bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
+{
+	kfree_nolock(p__coro_frame);
+}
+
 /* Must be called under migrate_disable(), as required by bpf_mem_free */
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu)
 {
@@ -5214,6 +5229,8 @@ BTF_ID_FLAGS(func, bpf_call_rcu_tasks_trace, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_coro_frame_free, KF_RELEASE)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
