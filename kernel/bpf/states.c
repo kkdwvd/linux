@@ -696,48 +696,44 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 	return NULL;
 }
 
-static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
-		      struct bpf_func_state *cur, struct bpf_idmap *idmap,
+/*
+ * Compare one slot of the explored (safe) state against the current state.
+ * 'cur' is NULL when the current state does not have the slot at all.
+ */
+static bool slot_safe(struct bpf_verifier_env *env, struct bpf_stack_state *old,
+		      struct bpf_stack_state *cur, struct bpf_idmap *idmap,
 		      enum exact_level exact)
 {
-	int i, spi;
+	struct bpf_reg_state *old_reg, *cur_reg;
+	int i;
 
-	/* walk slots of the explored stack and ignore any additional
-	 * slots in the current stack, since explored(safe) state
-	 * didn't use them
-	 */
-	for (i = 0; i < old->allocated_stack; i++) {
-		struct bpf_reg_state *old_reg, *cur_reg;
-		int im = i % BPF_REG_SIZE;
-
-		spi = i / BPF_REG_SIZE;
+	for (i = 0; i < BPF_REG_SIZE; i++) {
+		u8 old_type = old->slot_type[i];
+		u8 cur_type = cur ? cur->slot_type[i] : STACK_INVALID;
 
 		if (exact == EXACT) {
-			u8 old_type = old->stack[spi].slot_type[i % BPF_REG_SIZE];
-			u8 cur_type = i < cur->allocated_stack ?
-				      cur->stack[spi].slot_type[i % BPF_REG_SIZE] : STACK_INVALID;
+			u8 old_exact = old_type, cur_exact = cur_type;
 
 			/* STACK_INVALID and STACK_POISON are equivalent for pruning */
-			if (old_type == STACK_POISON)
-				old_type = STACK_INVALID;
-			if (cur_type == STACK_POISON)
-				cur_type = STACK_INVALID;
-			if (i >= cur->allocated_stack || old_type != cur_type)
+			if (old_exact == STACK_POISON)
+				old_exact = STACK_INVALID;
+			if (cur_exact == STACK_POISON)
+				cur_exact = STACK_INVALID;
+			if (!cur || old_exact != cur_exact)
 				return false;
 		}
 
-		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_INVALID ||
-		    old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_POISON)
+		if (old_type == STACK_INVALID || old_type == STACK_POISON)
 			continue;
 
-		if (env->allow_uninit_stack &&
-		    old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC)
+		if (env->allow_uninit_stack && old_type == STACK_MISC)
 			continue;
 
-		/* explored stack has more populated slots than current stack
-		 * and these slots were used
+		/*
+		 * explored slot is populated and was used, but current state
+		 * does not have it
 		 */
-		if (i >= cur->allocated_stack)
+		if (!cur)
 			return false;
 
 		/*
@@ -746,38 +742,38 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		 * Construct a fake register for such stack and call
 		 * regsafe() to ensure scalar ids are compared.
 		 */
-		if (im == 0 || im == 4) {
-			old_reg = scalar_reg_for_stack(env, &old->stack[spi], im);
-			cur_reg = scalar_reg_for_stack(env, &cur->stack[spi], im);
+		if (i == 0 || i == 4) {
+			old_reg = scalar_reg_for_stack(env, old, i);
+			cur_reg = scalar_reg_for_stack(env, cur, i);
 			if (old_reg && cur_reg) {
 				if (!regsafe(env, old_reg, cur_reg, idmap, exact))
 					return false;
-				i += (im == 0 ? BPF_REG_SIZE - 1 : 3);
+				i += (i == 0 ? BPF_REG_SIZE - 1 : 3);
 				continue;
 			}
 		}
 
-		/* if old state was safe with misc data in the stack
-		 * it will be safe with zero-initialized stack.
-		 * The opposite is not true
+		/*
+		 * if old state was safe with misc data in the slot it will be
+		 * safe with zero-initialized slot. The opposite is not true
 		 */
-		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
-		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_ZERO)
+		if (old_type == STACK_MISC && cur_type == STACK_ZERO)
 			continue;
-		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
-		    cur->stack[spi].slot_type[i % BPF_REG_SIZE])
-			/* Ex: old explored (safe) state has STACK_SPILL in
-			 * this stack slot, but current has STACK_MISC ->
+		if (old_type != cur_type)
+			/*
+			 * Ex: old explored (safe) state has STACK_SPILL in
+			 * this slot, but current has STACK_MISC ->
 			 * this verifier states are not equivalent,
 			 * return false to continue verification of this path
 			 */
 			return false;
-		if (i % BPF_REG_SIZE != BPF_REG_SIZE - 1)
+		if (i != BPF_REG_SIZE - 1)
 			continue;
 		/* Both old and cur are having same slot_type */
-		switch (old->stack[spi].slot_type[BPF_REG_SIZE - 1]) {
+		switch (old_type) {
 		case STACK_SPILL:
-			/* when explored and current stack slot are both storing
+			/*
+			 * when explored and current slot are both storing
 			 * spilled registers, check that stored pointers types
 			 * are the same as well.
 			 * Ex: explored safe path could have stored
@@ -787,13 +783,12 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 * such verifier states are not equivalent.
 			 * return false to continue verification of this path
 			 */
-			if (!regsafe(env, &old->stack[spi].spilled_ptr,
-				     &cur->stack[spi].spilled_ptr, idmap, exact))
+			if (!regsafe(env, &old->spilled_ptr, &cur->spilled_ptr, idmap, exact))
 				return false;
 			break;
 		case STACK_DYNPTR:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
 			if (old_reg->dynptr.type != cur_reg->dynptr.type ||
 			    old_reg->dynptr.first_slot != cur_reg->dynptr.first_slot ||
 			    !check_ids(old_reg->id, cur_reg->id, idmap) ||
@@ -801,9 +796,10 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 				return false;
 			break;
 		case STACK_ITER:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
-			/* iter.depth is not compared between states as it
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
+			/*
+			 * iter.depth is not compared between states as it
 			 * doesn't matter for correctness and would otherwise
 			 * prevent convergence; we maintain it only to prevent
 			 * infinite loop check triggering, see
@@ -818,8 +814,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 				return false;
 			break;
 		case STACK_IRQ_FLAG:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
 			if (!check_ids(old_reg->id, cur_reg->id, idmap) ||
 			    old_reg->irq.kfunc_class != cur_reg->irq.kfunc_class)
 				return false;
@@ -833,6 +829,28 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		default:
 			return false;
 		}
+	}
+	return true;
+}
+
+static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+		      struct bpf_func_state *cur, struct bpf_idmap *idmap,
+		      enum exact_level exact)
+{
+	int spi;
+
+	/*
+	 * walk slots of the explored stack and ignore any additional
+	 * slots in the current stack, since explored(safe) state
+	 * didn't use them
+	 */
+	for (spi = 0; spi < old->allocated_stack / BPF_REG_SIZE; spi++) {
+		struct bpf_stack_state *cur_slot = NULL;
+
+		if (spi * BPF_REG_SIZE < cur->allocated_stack)
+			cur_slot = &cur->stack[spi];
+		if (!slot_safe(env, &old->stack[spi], cur_slot, idmap, exact))
+			return false;
 	}
 	return true;
 }
