@@ -339,26 +339,18 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 	return NULL;
 }
 
-static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
-		      struct bpf_func_state *cur, struct bpf_idmap *idmap)
+/*
+ * Compare one slot of the old state against the current state.
+ * 'cur' is NULL when the current state does not have the slot at all.
+ */
+static bool slot_safe(struct bpf_verifier_env *env, struct bpf_stack_state *old,
+		      struct bpf_stack_state *cur, struct bpf_idmap *idmap)
 {
-	int i, spi;
+	struct bpf_reg_state *old_reg, *cur_reg;
+	int i;
 
-	/*
-	 * walk slots of the old stack and ignore any additional
-	 * slots in the current stack, since the old state
-	 * can't use them
-	 */
-	for (i = 0; i < old->allocated_stack; i++) {
-		struct bpf_stack_state *old_slot, *cur_slot;
-		struct bpf_reg_state *old_reg, *cur_reg;
-		int im = i % BPF_REG_SIZE;
-		u8 old_type;
-
-		spi = i / BPF_REG_SIZE;
-		old_slot = bpf_stack_slot(old, spi);
-		old_type = old_slot->slot_type[im];
-		cur_slot = i < cur->allocated_stack ? bpf_stack_slot(cur, spi) : NULL;
+	for (i = 0; i < BPF_REG_SIZE; i++) {
+		u8 old_type = old->slot_type[i];
 
 		if (old_type == STACK_INVALID || old_type == STACK_POISON)
 			continue;
@@ -366,17 +358,16 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		if (env->allow_uninit_stack && old_type == STACK_MISC)
 			continue;
 
-		/* old stack has more populated slots than current stack */
-		if (!cur_slot)
+		/* old slot is populated, but the current state does not have it */
+		if (!cur)
 			return false;
 
 		/*
 		 * The old spill is the first bytes of a wider spill. On big endian
 		 * these are not the low bytes of the value.
 		 */
-		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur_slot) &&
-		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old_slot),
-						bpf_spill_size(cur_slot)))
+		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur) &&
+		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old), bpf_spill_size(cur)))
 			return false;
 
 		/*
@@ -384,37 +375,37 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		 * Load from MISC/INVALID slots produces unbound scalar.
 		 * Construct a fake register for such stack and call regsafe().
 		 */
-		if (im == 0 || im == 4) {
-			old_reg = scalar_reg_for_stack(env, old_slot, im);
-			cur_reg = scalar_reg_for_stack(env, cur_slot, im);
+		if (i == 0 || i == 4) {
+			old_reg = scalar_reg_for_stack(env, old, i);
+			cur_reg = scalar_reg_for_stack(env, cur, i);
 			if (old_reg && cur_reg) {
 				if (!regsafe(env, old_reg, cur_reg, idmap))
 					return false;
-				i += (im == 0 ? BPF_REG_SIZE - 1 : 3);
+				i += (i == 0 ? BPF_REG_SIZE - 1 : 3);
 				continue;
 			}
 		}
 
-		/* if old state was safe with misc data in the stack
-		 * it will be safe with zero-initialized stack.
-		 * The opposite is not true
+		/*
+		 * if old state was safe with misc data in the slot it will be
+		 * safe with zero-initialized slot. The opposite is not true
 		 */
-		if (old_type == STACK_MISC && cur_slot->slot_type[im] == STACK_ZERO)
+		if (old_type == STACK_MISC && cur->slot_type[i] == STACK_ZERO)
 			continue;
-		if (old_type != cur_slot->slot_type[im])
+		if (old_type != cur->slot_type[i])
 			/*
 			 * Ex: old state has STACK_SPILL in
-			 * this stack slot, but current has STACK_MISC ->
+			 * this slot, but current has STACK_MISC ->
 			 * this verifier states are not equivalent
 			 */
 			return false;
-		if (im != BPF_REG_SIZE - 1)
+		if (i != BPF_REG_SIZE - 1)
 			continue;
 		/* Both old and cur are having same slot_type */
 		switch (old_type) {
 		case STACK_SPILL:
 			/*
-			 * when old and current stack slot are both storing
+			 * when old and current slot are both storing
 			 * spilled registers, check that stored pointers types
 			 * are the same as well.
 			 * Ex: old state could have stored
@@ -423,12 +414,12 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 * (bpf_reg_state) {.type = PTR_TO_STACK, .off = -16}
 			 * such verifier states are not equivalent.
 			 */
-			if (!regsafe(env, &old_slot->spilled_ptr, &cur_slot->spilled_ptr, idmap))
+			if (!regsafe(env, &old->spilled_ptr, &cur->spilled_ptr, idmap))
 				return false;
 			break;
 		case STACK_DYNPTR:
-			old_reg = &old_slot->spilled_ptr;
-			cur_reg = &cur_slot->spilled_ptr;
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
 			if (old_reg->dynptr.type != cur_reg->dynptr.type ||
 			    old_reg->dynptr.first_slot != cur_reg->dynptr.first_slot ||
 			    !check_ids(old_reg->id, cur_reg->id, idmap) ||
@@ -436,8 +427,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 				return false;
 			break;
 		case STACK_ITER:
-			old_reg = &old_slot->spilled_ptr;
-			cur_reg = &cur_slot->spilled_ptr;
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
 			if (old_reg->type != cur_reg->type ||
 			    old_reg->iter.btf != cur_reg->iter.btf ||
 			    old_reg->iter.btf_id != cur_reg->iter.btf_id ||
@@ -447,8 +438,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 				return false;
 			break;
 		case STACK_IRQ_FLAG:
-			old_reg = &old_slot->spilled_ptr;
-			cur_reg = &cur_slot->spilled_ptr;
+			old_reg = &old->spilled_ptr;
+			cur_reg = &cur->spilled_ptr;
 			if (!check_ids(old_reg->id, cur_reg->id, idmap) ||
 			    old_reg->irq.kfunc_class != cur_reg->irq.kfunc_class)
 				return false;
@@ -462,6 +453,27 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		default:
 			return false;
 		}
+	}
+	return true;
+}
+
+static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+		      struct bpf_func_state *cur, struct bpf_idmap *idmap)
+{
+	int spi;
+
+	/*
+	 * walk slots of the old stack and ignore any additional
+	 * slots in the current stack, since the old state
+	 * can't use them
+	 */
+	for (spi = 0; spi < bpf_stack_nr_slots(old); spi++) {
+		struct bpf_stack_state *cur_slot = NULL;
+
+		if (spi < bpf_stack_nr_slots(cur))
+			cur_slot = bpf_stack_slot(cur, spi);
+		if (!slot_safe(env, bpf_stack_slot(old, spi), cur_slot, idmap))
+			return false;
 	}
 	return true;
 }
