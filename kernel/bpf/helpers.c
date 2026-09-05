@@ -5383,6 +5383,8 @@ BTF_ID_FLAGS(func, bpf_call_rcu_tasks_trace, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_coro_frame_free, KF_RELEASE)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {

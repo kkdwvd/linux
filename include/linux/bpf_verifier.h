@@ -3038,6 +3038,7 @@ static inline bool bpf_reg_has_range(const struct bpf_reg_state *reg)
 	case PTR_TO_TP_BUFFER:
 	case PTR_TO_BTF_ID:
 	case PTR_TO_INSN:
+	case PTR_TO_CORO_FRAME:
 		return !type_may_be_null(reg->type);
 	default:
 		return false;
