@@ -7949,25 +7949,51 @@ static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_refer
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
 	int m = foff % BPF_REG_SIZE;
-	bool zero;
 	int err;
 
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (reg && is_pointer_regtype(reg->type)) {
-		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
-		return -EACCES;
-	}
 
 	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
 	if (err)
 		return err;
-	if (!env->bypass_spec_v4 && slot_write_needs_nospec(slot, m, size, false))
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(slot, m, size, reg && is_pointer_regtype(reg->type)))
 		env->insn_aux_data[insn_idx].nospec_result = true;
 
-	zero = (reg && bpf_register_is_null(reg)) ||
-	       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
-	write_slot_data(env, slot, m, size, zero);
+	if (reg && !m && reg->type == SCALAR_VALUE && env->bpf_capable) {
+		spill_reg_to_slot(env, slot, reg, size);
+	} else if (!reg && !m && is_bpf_st_mem(insn) && env->bpf_capable) {
+		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
+
+		memset(tmp_reg, 0, sizeof(*tmp_reg));
+		__mark_reg_known(tmp_reg, insn->imm);
+		tmp_reg->type = SCALAR_VALUE;
+		spill_reg_to_slot(env, slot, tmp_reg, size);
+	} else if (reg && is_pointer_regtype(reg->type) &&
+		   (size == BPF_REG_SIZE || !env->allow_ptr_leaks)) {
+		if (size != BPF_REG_SIZE) {
+			verbose_linfo(env, insn_idx, "; ");
+			verbose(env, "invalid size of register spill\n");
+			return -EACCES;
+		}
+		/*
+		 * A frame can outlive the function that fills it, so a stack
+		 * pointer stored in it could dangle after that function
+		 * returns. A pointer to a dynptr is one too: to the stack of a
+		 * caller, or of the helper that calls a callback.
+		 */
+		if (reg->type == PTR_TO_STACK || base_type(reg->type) == CONST_PTR_TO_DYNPTR) {
+			verbose(env, "cannot spill stack pointers into coro_frame\n");
+			return -EINVAL;
+		}
+		spill_reg_to_slot(env, slot, reg, size);
+	} else {
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+		write_slot_data(env, slot, m, size, zero);
+	}
 	return 0;
 }
 
@@ -7996,7 +8022,8 @@ static int check_coro_frame_write_var_off(struct bpf_verifier_env *env,
 
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (reg && is_pointer_regtype(reg->type)) {
+	/* no slot remembers the pointer, a load gets it as a number */
+	if (reg && __is_pointer_value(env->allow_ptr_leaks, reg)) {
 		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
 		return -EACCES;
 	}
@@ -8025,8 +8052,12 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 	for (i = min_off; i < max_off; i++) {
 		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
 		int m = i % BPF_REG_SIZE;
+		u8 type;
 
-		if (slot->slot_type[slot_byte_idx(m)] == STACK_ZERO)
+		/* as in mark_reg_stack_read(), a spilled zero is zero bytes */
+		type = slot->slot_type[slot_byte_idx(m)];
+		if (type == STACK_ZERO ||
+		    (type == STACK_SPILL && bpf_register_is_null(&slot->spilled_ptr)))
 			zeros++;
 		/* the byte is between two accesses, as in check_stack_range_initialized() */
 		if (ptr_reg->step > 1 && imod(i - off - ptr_reg->base, ptr_reg->step) >= size)
@@ -8052,6 +8083,7 @@ static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
 				   struct bpf_reg_state *reg, argno_t argno, int off, int size,
 				   enum bpf_access_type t, int value_regno)
 {
+	bool var_off = !tnum_is_const(reg->var_off);
 	struct bpf_reference_state *ref;
 	int err;
 
@@ -8073,20 +8105,23 @@ static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
 			    reg_arg_name(env, argno)))
 		return -EFAULT;
 
-	if (tnum_is_const(reg->var_off)) {
+	if (!var_off) {
 		int foff = reg->var_off.value + off;
+		struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
 
 		if (t == BPF_WRITE)
 			return check_coro_frame_write(env, ref, foff, size, value_regno, insn_idx);
-		return check_coro_frame_read(env, ref, foff, size, value_regno);
-	}
-
-	/*
-	 * Variable offsets follow the stack rules: privileged only, since no
-	 * Spectre v1 masking exists for this memory, and only when a read has
-	 * a destination register, so pointer bytes cannot escape unnoticed.
-	 */
-	if (!env->bypass_spec_v1) {
+		/* a part of a pointer is a number, as with a variable offset, see check_stack_read() */
+		var_off = value_regno >= 0 && size != BPF_REG_SIZE && env->allow_ptr_leaks &&
+			  bpf_is_spilled_reg(slot) && !bpf_is_spilled_scalar_reg(slot);
+		if (!var_off)
+			return check_coro_frame_read(env, ref, foff, size, value_regno);
+	} else if (!env->bypass_spec_v1) {
+		/*
+		 * Variable offsets follow the stack rules: privileged only, since no
+		 * Spectre v1 masking exists for this memory, and only when a read has
+		 * a destination register, so pointer bytes cannot escape unnoticed.
+		 */
 		verbose(env, "%s variable offset coro_frame access prohibited for !root\n",
 			reg_arg_name(env, argno));
 		return -EACCES;
