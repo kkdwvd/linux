@@ -6900,6 +6900,89 @@ static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
 	return mark_chain_precision_batch(env, env->cur_state);
 }
 
+/*
+ * Validate a helper or kfunc memory argument that points into a coroutine
+ * frame, mirroring check_stack_range_initialized(): reads need initialized
+ * bytes, writes may clobber anything and scrub spilled registers, and an
+ * uninitialized destination is allowed only for arguments the callee
+ * initializes (raw mode) at a constant offset.
+ */
+static int check_coro_frame_range_initialized(struct bpf_verifier_env *env,
+					      struct bpf_reg_state *reg, argno_t argno,
+					      int access_size, bool zero_size_allowed,
+					      enum bpf_access_type type,
+					      struct bpf_call_arg_meta *meta)
+{
+	bool raw_mode = meta && meta->arg_raw_mem.regno == reg_from_argno(argno);
+	bool clobber = type == BPF_WRITE;
+	struct bpf_reference_state *ref;
+	int i, err, min_off, max_off;
+
+	access_size = abs(access_size);
+
+	if (access_size == 0 && !zero_size_allowed) {
+		verbose(env, "invalid zero-sized read\n");
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, 0, access_size, reg->mem_size,
+				      zero_size_allowed);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+
+	if (tnum_is_const(reg->var_off)) {
+		min_off = max_off = reg->var_off.value;
+	} else {
+		if (!env->bypass_spec_v1) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "%s variable offset coro_frame access prohibited for !root, var_off=%s\n",
+				reg_arg_name(env, argno), tn_buf);
+			return -EACCES;
+		}
+		/*
+		 * As for the stack, only initialized memory may be passed with
+		 * a variable offset: the callee's writes cannot be attributed
+		 * to exact bytes afterwards.
+		 */
+		raw_mode = false;
+		min_off = reg_smin(reg);
+		max_off = reg_smax(reg);
+	}
+
+	if (raw_mode) {
+		meta->arg_raw_mem.size = access_size;
+		return 0;
+	}
+
+	for (i = min_off; i < max_off + access_size; i++) {
+		enum slot_range_status status;
+
+		status = check_slot_byte_range(env, &ref->slots[i / BPF_REG_SIZE],
+					       i % BPF_REG_SIZE, clobber, false);
+		if (status == SLOT_RANGE_OK)
+			continue;
+		if (tnum_is_const(reg->var_off)) {
+			verbose(env, "invalid read from coro_frame %s off %d+%d size %d\n",
+				reg_arg_name(env, argno), min_off, i - min_off, access_size);
+		} else {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "invalid read from coro_frame %s var_off %s+%d size %d\n",
+				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
+		}
+		return -EACCES;
+	}
+	return 0;
+}
+
 static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
 				   struct bpf_reg_state *reg, argno_t argno, int off, int size,
 				   enum bpf_access_type t, int value_regno)
@@ -7630,6 +7713,9 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, struct bpf_reg_
 				env, reg,
 				argno, 0, access_size,
 				zero_size_allowed, access_type, meta);
+	case PTR_TO_CORO_FRAME:
+		return check_coro_frame_range_initialized(env, reg, argno, access_size,
+							  zero_size_allowed, access_type, meta);
 	case PTR_TO_BTF_ID:
 		return check_ptr_to_btf_access(env, regs, reg, argno, 0,
 					       access_size, access_type, -1);
@@ -8764,7 +8850,7 @@ static int process_kf_arg_ptr_to_rbtree_node(struct bpf_verifier_env *env,
 static bool check_css_task_iter_allowlist(struct bpf_verifier_env *env);
 
 struct bpf_reg_types {
-	const enum bpf_reg_type types[10];
+	const enum bpf_reg_type types[11];
 	u32 *btf_id;
 };
 
@@ -8801,6 +8887,7 @@ static const struct bpf_reg_types mem_types = {
 		PTR_TO_MEM,
 		PTR_TO_MEM | MEM_RINGBUF,
 		PTR_TO_BUF,
+		PTR_TO_CORO_FRAME,
 		PTR_TO_BTF_ID | PTR_TRUSTED,
 		PTR_TO_CTX,
 	},
