@@ -47,6 +47,20 @@ struct rqsl_cpu_hist {
 
 static DEFINE_PER_CPU(struct rqsl_cpu_hist, rqsl_cpu_hists);
 
+enum rqsl_outcome {
+	RQSL_FAIL_EDEADLK = 0,
+	RQSL_FAIL_ETIMEDOUT,
+	RQSL_FAIL_MAX,
+};
+
+static const char *rqsl_outcome_names[] = {
+	[RQSL_FAIL_EDEADLK] = "EDEADLK",
+	[RQSL_FAIL_ETIMEDOUT] = "ETIMEDOUT",
+};
+
+/* Failure latency histograms by errno, aggregated across all CPUs. */
+static atomic64_t rqsl_fail_hist[RQSL_CTX_MAX][RQSL_FAIL_MAX][RQSL_NR_HIST_BUCKETS];
+
 enum rqsl_mode {
 	RQSL_MODE_AA = 0,
 	RQSL_MODE_ABBA,
@@ -132,10 +146,14 @@ static void rqsl_record_lock_result(u64 delta_ns, enum rqsl_context ctx, int ret
 	atomic64_t *buckets = hist->hist[ctx];
 
 	atomic64_inc(&buckets[bucket]);
-	if (!ret)
+	if (!ret) {
 		atomic64_inc(&hist->success[ctx]);
-	else
+	} else {
+		int out = ret == -EDEADLK ? RQSL_FAIL_EDEADLK : RQSL_FAIL_ETIMEDOUT;
+
 		atomic64_inc(&hist->failure[ctx]);
+		atomic64_inc(&rqsl_fail_hist[ctx][out][bucket]);
+	}
 }
 
 static int rqspinlock_worker_fn(void *arg)
@@ -378,12 +396,57 @@ static void rqsl_print_histograms(void)
 	}
 }
 
+static void rqsl_print_failure_histograms(void)
+{
+	int out, i;
+
+	pr_err("rqspinlock failure latency histogram by outcome (ms):\n");
+
+	for (out = 0; out < RQSL_FAIL_MAX; out++) {
+		u64 norm_counts[RQSL_NR_HIST_BUCKETS];
+		u64 nmi_counts[RQSL_NR_HIST_BUCKETS];
+		u64 norm_total = 0, nmi_total = 0;
+
+		for (i = 0; i < RQSL_NR_HIST_BUCKETS; i++) {
+			norm_counts[i] = atomic64_read(&rqsl_fail_hist[RQSL_CTX_NORMAL][out][i]);
+			nmi_counts[i] = atomic64_read(&rqsl_fail_hist[RQSL_CTX_NMI][out][i]);
+			norm_total += norm_counts[i];
+			nmi_total += nmi_counts[i];
+		}
+
+		if (!norm_total && !nmi_total)
+			continue;
+
+		pr_err(" %s: total %llu (normal %llu, nmi %llu)\n",
+		       rqsl_outcome_names[out], norm_total + nmi_total,
+		       norm_total, nmi_total);
+		for (i = 0; i < RQSL_NR_HIST_BUCKETS; i++) {
+			unsigned int start_ms;
+
+			if (!norm_counts[i] && !nmi_counts[i])
+				continue;
+
+			start_ms = i == 0 ? 0 : rqsl_hist_ms[i - 1] + 1;
+			if (i == RQSL_NR_HIST_BUCKETS - 1)
+				pr_err("   >= %ums: total %llu (normal %llu, nmi %llu)\n",
+				       start_ms, norm_counts[i] + nmi_counts[i],
+				       norm_counts[i], nmi_counts[i]);
+			else
+				pr_err("   %u-%ums: total %llu (normal %llu, nmi %llu)\n",
+				       start_ms, rqsl_hist_ms[i],
+				       norm_counts[i] + nmi_counts[i],
+				       norm_counts[i], nmi_counts[i]);
+		}
+	}
+}
+
 static void bpf_test_rqspinlock_exit(void)
 {
 	WRITE_ONCE(pause, 1);
 	free_rqsl_threads();
 	free_rqsl_evts();
 	rqsl_print_histograms();
+	rqsl_print_failure_histograms();
 }
 
 module_exit(bpf_test_rqspinlock_exit);
