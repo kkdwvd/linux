@@ -3787,6 +3787,63 @@ static int prepare_slot_byte_var_write(struct bpf_verifier_env *env,
 	return 0;
 }
 
+enum slot_range_status {
+	SLOT_RANGE_OK,
+	SLOT_RANGE_UNINIT,
+	SLOT_RANGE_POISON,
+};
+
+/*
+ * Validate byte 'm' of a slot that a helper or kfunc will access through a
+ * memory argument. A write ('clobber') may store anything, so zero bytes,
+ * uninitialized bytes that privileged programs may read, and spilled
+ * registers turn into MISC data. Unprivileged output buffers can accept
+ * uninitialized bytes without marking them initialized. Spilled pointers
+ * may be passed only by privileged programs; spilled scalars always.
+ */
+static enum slot_range_status check_slot_byte_range(struct bpf_verifier_env *env,
+						    struct bpf_stack_state *slot, int m,
+						    bool clobber, bool allow_poison, bool uninit)
+{
+	u8 *stype = &slot->slot_type[slot_byte_idx(m)];
+	int j;
+
+	if (*stype == STACK_MISC)
+		return SLOT_RANGE_OK;
+	if ((*stype == STACK_ZERO) ||
+	    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
+		if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
+			/* helper can write anything into the slot */
+			*stype = STACK_MISC;
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	/*
+	 * Only the bytes marked STACK_SPILL hold the spilled register. The rest
+	 * of a narrowly spilled slot keeps its previous type and must be
+	 * initialized on its own.
+	 */
+	if (*stype == STACK_SPILL &&
+	    (slot->spilled_ptr.type == SCALAR_VALUE || env->allow_ptr_leaks)) {
+		if (clobber) {
+			__mark_reg_unknown(env, &slot->spilled_ptr);
+			for (j = 0; j < BPF_REG_SIZE; j++)
+				scrub_spilled_slot(&slot->slot_type[j]);
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	if (*stype == STACK_POISON) {
+		if (!allow_poison)
+			return SLOT_RANGE_POISON;
+		if (uninit && env->allow_uninit_stack)
+			*stype = STACK_MISC;
+		return SLOT_RANGE_OK;
+	}
+	return SLOT_RANGE_UNINIT;
+}
+
 static bool is_bpf_st_mem(struct bpf_insn *insn)
 {
 	return BPF_CLASS(insn->code) == BPF_ST && BPF_MODE(insn->code) == BPF_MEM;
@@ -7522,7 +7579,7 @@ static int check_stack_range_initialized(
 		enum bpf_access_type type, struct bpf_call_arg_meta *meta)
 {
 	struct bpf_func_state *state = bpf_func(env, reg);
-	int err, min_off, max_off, i, j, slot, spi;
+	int err, min_off, max_off, i, slot, spi;
 	/* Some accesses can write anything into the stack, others are
 	 * read-only.
 	 */
@@ -7584,8 +7641,7 @@ static int check_stack_range_initialized(
 	}
 
 	for (i = min_off; i < max_off + access_size; i++) {
-		struct bpf_stack_state *ss;
-		u8 *stype;
+		enum slot_range_status status;
 
 		slot = -i - 1;
 		spi = slot / BPF_REG_SIZE;
@@ -7594,41 +7650,12 @@ static int check_stack_range_initialized(
 			return -EFAULT;
 		}
 
-		ss = bpf_stack_slot(state, spi);
-		stype = &ss->slot_type[slot % BPF_REG_SIZE];
-		if (*stype == STACK_MISC)
-			goto mark;
-		if ((*stype == STACK_ZERO) ||
-		    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
-			if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
-				/* helper can write anything into the stack */
-				*stype = STACK_MISC;
-			}
-			goto mark;
-		}
+		status = check_slot_byte_range(env, bpf_stack_slot(state, spi), stack_byte_off(i),
+					       clobber, allow_poison, uninit);
+		if (status == SLOT_RANGE_OK)
+			continue;
 
-		/*
-		 * Only the bytes marked STACK_SPILL hold the spilled register.
-		 * The rest of a narrowly spilled slot keeps its previous type
-		 * and must be initialized on its own.
-		 */
-		if (*stype == STACK_SPILL &&
-		    (ss->spilled_ptr.type == SCALAR_VALUE ||
-		     env->allow_ptr_leaks)) {
-			if (clobber) {
-				__mark_reg_unknown(env, &ss->spilled_ptr);
-				for (j = 0; j < BPF_REG_SIZE; j++)
-					scrub_spilled_slot(&ss->slot_type[j]);
-			}
-			goto mark;
-		}
-
-		if (*stype == STACK_POISON) {
-			if (allow_poison) {
-				if (uninit && env->allow_uninit_stack)
-					*stype = STACK_MISC;
-				goto mark;
-			}
+		if (status == SLOT_RANGE_POISON) {
 			verbose(env, "reading from stack %s off %d+%d size %d, slot poisoned by dead code elimination\n",
 				reg_arg_name(env, argno), min_off, i - min_off, access_size);
 		} else if (tnum_is_const(reg->var_off)) {
@@ -7642,8 +7669,6 @@ static int check_stack_range_initialized(
 				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
 		}
 		return -EACCES;
-mark:
-		;
 	}
 	return 0;
 }
