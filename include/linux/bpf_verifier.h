@@ -334,6 +334,16 @@ struct bpf_reference_state {
 		 */
 		void *ptr;
 	};
+	/*
+	 * Slot-tracked memory owned by the reference, if any. The slots follow
+	 * the bpf_stack_state conventions of the stack. They are freed with
+	 * the reference, deep copied with the verifier state, visited by
+	 * bpf_for_each_reg_in_vstate(), compared for pruning, and tracked by
+	 * precision backtracking through INSN_F_REF_SLOT_ACCESS history
+	 * entries keyed by 'id'.
+	 */
+	struct bpf_stack_state *slots;
+	u32 nr_slots;
 };
 
 struct bpf_retval_range {
@@ -418,6 +428,15 @@ enum {
 	INSN_F_SRC_REG_STACK = BIT(2), /* src_reg is PTR_TO_STACK */
 
 	INSN_F_STACK_ARG_ACCESS = BIT(3),
+
+	/*
+	 * Access to a slot owned by a reference, see bpf_reference_state::slots.
+	 * 'spi' holds the slot index and 'linked_regs' the reference id; the
+	 * latter is free because only conditional jumps record linked registers.
+	 */
+	INSN_F_REF_SLOT_ACCESS = BIT(4),
+	/* Call acquired a reference that owns slots; 'linked_regs' holds its id */
+	INSN_F_REF_ALLOC = BIT(5),
 };
 
 struct bpf_jmp_history_entry {
@@ -428,17 +447,21 @@ struct bpf_jmp_history_entry {
 	u32 : 2;
 	u32 prev_idx : 20;
 	/* special INSN_F_xxx flags */
-	u32 flags : 4;
-	u32 : 8;
+	u32 flags : 8;
+	u32 : 4;
 	/*
 	 * additional registers that need precision tracking when this
-	 * jump is backtracked, vector of five 11-bit records
+	 * jump is backtracked, vector of five 11-bit records; or the
+	 * reference id for INSN_F_REF_SLOT_ACCESS and INSN_F_REF_ALLOC
 	 */
 	u64 linked_regs;
 };
 
 static_assert(MAX_CALL_FRAMES <= (1 << 4));
 static_assert(MAX_BPF_STACK / 8 <= (1 << 6));
+static_assert(INSN_F_REF_ALLOC < (1 << 8));
+/* Slot indices of reference-owned slots share the 6-bit 'spi' field */
+#define BPF_MAX_REF_SLOTS (1 << 6)
 
 /* Maximum number of bpf_reg_state objects that can exist at once */
 #define MAX_STACK_ARG_SLOTS (MAX_BPF_FUNC_ARGS - MAX_BPF_FUNC_REG_ARGS)
@@ -559,6 +582,39 @@ bpf_get_spilled_stack_arg(int slot, struct bpf_func_state *frame)
 	     iter < frame->out_stack_arg_cnt;                          \
 	     iter++, reg = bpf_get_spilled_stack_arg(iter, frame))
 
+static inline struct bpf_reg_state *bpf_get_ref_slot_reg(int slot,
+							 struct bpf_reference_state *ref,
+							 u32 mask)
+{
+	if (slot < ref->nr_slots &&
+	    (1 << ref->slots[slot].slot_type[BPF_REG_SIZE - 1]) & mask)
+		return &ref->slots[slot].spilled_ptr;
+	return NULL;
+}
+
+/* Iterate over slots owned by 'ref', setting 'reg' to NULL or a spilled register. */
+#define bpf_for_each_ref_slot_reg(iter, ref, reg, mask)			\
+	for (iter = 0, reg = bpf_get_ref_slot_reg(iter, ref, mask);	\
+	     iter < (ref)->nr_slots;					\
+	     iter++, reg = bpf_get_ref_slot_reg(iter, ref, mask))
+
+/* Find the reference with 'id' that owns slots, if any. */
+static inline struct bpf_reference_state *bpf_find_ref_slots(struct bpf_verifier_state *st,
+							     u32 id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id && st->refs[i].slots)
+			return &st->refs[i];
+	return NULL;
+}
+
+/*
+ * Invoke __expr over every register in __vst: frame registers, stack spills,
+ * spilled stack arguments and spills in reference-owned slots. __state is
+ * the owning frame, or the current frame for reference-owned slots.
+ */
 #define bpf_for_each_reg_in_vstate_mask(__vst, __state, __reg, __stack, __mask, __expr)   \
 	({                                                               \
 		struct bpf_verifier_state *___vstate = __vst;            \
@@ -585,6 +641,19 @@ bpf_get_spilled_stack_arg(int slot, struct bpf_func_state *frame)
 				(void)(__expr);                          \
 			}						 \
 		}                                                        \
+		__state = ___vstate->frame[___vstate->curframe];         \
+		for (___i = 0; ___i < ___vstate->acquired_refs; ___i++) { \
+			struct bpf_reference_state *___ref = &___vstate->refs[___i]; \
+			if (!___ref->slots)                              \
+				continue;                                \
+			bpf_for_each_ref_slot_reg(___j, ___ref, __reg, __mask) { \
+				if (!__reg)                              \
+					continue;                        \
+				__stack = &___ref->slots[___j];          \
+				(void)(__expr);                          \
+			}                                                \
+		}                                                        \
+		__stack = NULL;                                          \
 		(void)__stack;                                           \
 	})
 
@@ -861,12 +930,21 @@ static inline u16 bpf_in_stack_arg_cnt(const struct bpf_subprog_info *sub)
 struct bpf_diag;
 struct bpf_verifier_env;
 
+/* Distinct references whose slots one backtracking pass can track at once */
+#define BPF_BT_REF_SLOTS 4
+
 struct backtrack_state {
 	struct bpf_verifier_env *env;
 	u32 frame;
 	u32 reg_masks[MAX_CALL_FRAMES];
 	u64 stack_masks[MAX_CALL_FRAMES];
 	u8 stack_arg_masks[MAX_CALL_FRAMES];
+	/* Pending precision requests for reference-owned slots, keyed by id */
+	struct {
+		u32 id;
+		u64 mask;
+	} ref_slots[BPF_BT_REF_SLOTS];
+	u32 nr_ref_slots;
 };
 
 struct bpf_id_pair {
@@ -1264,6 +1342,7 @@ void bpf_free_backedges(struct bpf_scc_visit *visit);
 int bpf_push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
 			 int insn_flags, int spi, int frame, u64 linked_regs);
 void bpf_bt_sync_linked_regs(struct backtrack_state *bt, struct bpf_jmp_history_entry *hist);
+int bpf_bt_set_ref_slot(struct backtrack_state *bt, u32 id, u32 slot);
 void bpf_mark_reg_not_init(const struct bpf_verifier_env *env,
 			   struct bpf_reg_state *reg);
 void bpf_mark_reg_unknown_imprecise(struct bpf_reg_state *reg);

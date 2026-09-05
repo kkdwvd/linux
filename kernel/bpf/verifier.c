@@ -1382,12 +1382,49 @@ out:
 	return arr ? arr : ZERO_SIZE_PTR;
 }
 
+static void free_reference_slots(struct bpf_verifier_state *state)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++) {
+		kfree(state->refs[i].slots);
+		state->refs[i].slots = NULL;
+		state->refs[i].nr_slots = 0;
+	}
+}
+
 static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf_verifier_state *src)
 {
+	int i;
+
+	/*
+	 * dst may be a reused state that still owns slot arrays; they must
+	 * not leak when the reference array is overwritten below.
+	 */
+	free_reference_slots(dst);
 	dst->refs = copy_array(dst->refs, src->refs, src->acquired_refs,
 			       sizeof(struct bpf_reference_state), GFP_KERNEL_ACCOUNT);
 	if (!dst->refs)
 		return -ENOMEM;
+
+	/*
+	 * The shallow copy above aliased src's slot arrays. Detach them all
+	 * before allocating so that a failure below leaves dst owning only
+	 * its own arrays and bpf_free_verifier_state() can clean up.
+	 */
+	for (i = 0; i < src->acquired_refs; i++)
+		dst->refs[i].slots = NULL;
+	for (i = 0; i < src->acquired_refs; i++) {
+		if (!src->refs[i].slots)
+			continue;
+		dst->refs[i].slots = kmemdup(src->refs[i].slots,
+					     src->refs[i].nr_slots * sizeof(*src->refs[i].slots),
+					     GFP_KERNEL_ACCOUNT);
+		if (!dst->refs[i].slots) {
+			dst->acquired_refs = src->acquired_refs;
+			return -ENOMEM;
+		}
+	}
 
 	dst->acquired_refs = src->acquired_refs;
 	dst->active_locks = src->active_locks;
@@ -1560,6 +1597,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	 * it can detect out-of-order IRQ restore. Hence use memmove to shift
 	 * the array instead of swapping the final element into the deleted idx.
 	 */
+	kfree(state->refs[idx].slots);
 	last_idx = state->acquired_refs - 1;
 	rem = state->acquired_refs - idx - 1;
 	if (last_idx && idx != last_idx)
@@ -1682,6 +1720,7 @@ void bpf_free_verifier_state(struct bpf_verifier_state *state,
 		free_func_state(state->frame[i]);
 		state->frame[i] = NULL;
 	}
+	free_reference_slots(state);
 	kfree(state->refs);
 	bpf_clear_jmp_history(state);
 	if (free_self)
