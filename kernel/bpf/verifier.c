@@ -9878,6 +9878,31 @@ static enum bpf_access_type func_arg_access_type(enum bpf_arg_type arg_type)
 	return BPF_READ | BPF_WRITE;
 }
 
+static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+				     argno_t argno, struct bpf_call_arg_meta *meta)
+{
+	u32 i;
+
+	/* An explicit KF_RELEASE on this argument must not release it twice. */
+	if (meta->release_regno == reg_from_argno(argno))
+		meta->release_regno = 0;
+	else if (meta->release_regno && cur_regs(env)[meta->release_regno].id == reg->id)
+		goto duplicate;
+
+	for (i = 0; i < meta->coro_frames.cnt; i++) {
+		if (meta->coro_frames.ids[i] == reg->id)
+			goto duplicate;
+	}
+
+	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
+	return 0;
+
+duplicate:
+	verbose(env, "%s passes the same coroutine frame to multiple consuming arguments\n",
+		reg_arg_name(env, argno));
+	return -EINVAL;
+}
+
 static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 prev_slot,
 			  struct bpf_call_arg_meta *meta,
 			  int insn_idx)
@@ -10130,6 +10155,7 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 	case ARG_PTR_TO_ARENA:
 		break;
 	case ARG_PTR_TO_CORO_FRAME:
+		err = record_coro_frame_release(env, reg, argno, meta);
 		break;
 	case ARG_PTR_TO_ALLOC_BTF_ID:
 		if (reg->type == (PTR_TO_BTF_ID | MEM_ALLOC)) {
@@ -14075,7 +14101,7 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		proto->arg_size[arg] = type_size;
 		arg_type = ARG_PTR_TO_CTX_OUT | MEM_FIXED_SIZE;
 	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]))
-		arg_type = ARG_PTR_TO_CORO_FRAME;
+		arg_type = ARG_PTR_TO_CORO_FRAME | OBJ_RELEASE;
 	else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_FUNC;
 	else if (is_kfunc_arg_arena(meta->btf, &args[arg])) {
@@ -14145,8 +14171,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		arg_type |= PTR_MAYBE_NULL;
 
 	/*
-	 * Only the first argument of a KF_RELEASE kfunc releases anything, and
-	 * bpf_fetch_kfunc_arg_meta() only ever records BPF_REG_1 for it.
+	 * KF_RELEASE consumes the first argument. Coroutine frame parameters
+	 * carry OBJ_RELEASE independently of their position and this flag.
 	 */
 	if (is_kfunc_release(meta) && arg == 0)
 		arg_type |= OBJ_RELEASE;
@@ -15472,6 +15498,17 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	 */
 	if (meta.release_regno) {
 		err = release_reg(env, &regs[meta.release_regno], false, !!meta.dynptr.id);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * All arguments have been checked against the state before the call.
+	 * Use the saved identities: releasing a frame invalidates its aliases,
+	 * including those in other frames and outgoing stack arguments.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		err = release_reference(env, meta.coro_frames.ids[i]);
 		if (err)
 			return err;
 	}
