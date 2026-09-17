@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/percpu-defs.h>
+#include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/tracepoint.h>
 #include <linux/net.h>
@@ -246,6 +247,30 @@ __bpf_kfunc void bpf_iter_testmod_seq_destroy(struct bpf_iter_testmod_seq *it)
 
 __bpf_kfunc void bpf_kfunc_common_test(void)
 {
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames(u64 cookie, void *a__coro_frame,
+				     void *b__coro_frame, u64 *rdonly_buf)
+{
+	int result = cookie + *rdonly_buf;
+
+	kfree_nolock(a__coro_frame);
+	kfree_nolock(b__coro_frame);
+	return result;
+}
+
+__bpf_kfunc void bpf_kfunc_coro_frames_release(void *a__coro_frame, void *b__coro_frame)
+{
+	kfree_nolock(a__coro_frame);
+	kfree_nolock(b__coro_frame);
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames_stack(void *a__coro_frame, u64 b, u64 c,
+					   u64 d, u64 e, void *f__coro_frame)
+{
+	kfree_nolock(a__coro_frame);
+	kfree_nolock(f__coro_frame);
+	return b + c + d + e;
 }
 
 __bpf_kfunc u64 bpf_kfunc_arena_arg_test(u64 *val__arena)
@@ -894,6 +919,9 @@ BTF_ID_FLAGS(func, bpf_iter_testmod_seq_next, KF_ITER_NEXT | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_iter_testmod_seq_destroy, KF_ITER_DESTROY)
 BTF_ID_FLAGS(func, bpf_iter_testmod_seq_value)
 BTF_ID_FLAGS(func, bpf_kfunc_common_test)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_stack)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_arg_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_nullable_test)
