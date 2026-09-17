@@ -2,6 +2,8 @@
 /*
  * Verifier tests for coroutine frames: bpf_coro_frame_alloc() memory tracked
  * as PTR_TO_CORO_FRAME with stack-like slots.
+ * bpf_coro_frame_free() is registered without KF_RELEASE, so the lifetime
+ * tests also cover ownership consumption inferred from __coro_frame.
  */
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
