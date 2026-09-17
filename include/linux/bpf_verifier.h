@@ -3246,6 +3246,10 @@ struct bpf_call_arg_meta {
 	enum bpf_dynptr_type dynptr_write_type;
 	/* The buffer of bpf_dynptr_slice() or bpf_dynptr_slice_rdwr() */
 	struct bpf_stack_range slice_buf;
+	struct {
+		u32 ids[MAX_BPF_FUNC_ARGS];
+		u32 cnt;
+	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
 	 * generally to pass info about user-defined local kptr types to later

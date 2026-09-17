@@ -355,6 +355,50 @@ In this case, a program attached to the ``inode_init_security`` LSM hook
 can pass the hook's own ``xattr_count`` argument through to the kfunc,
 which claims xattr slots by writing through it.
 
+2.3.10 __coro_frame Annotation
+------------------------------
+
+This annotation identifies an owned coroutine frame returned by
+``bpf_coro_frame_alloc()``. Each annotated parameter must receive the
+non-NULL base pointer of a live frame::
+
+        __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
+
+A ``__coro_frame`` parameter always consumes the frame reference, without
+requiring ``KF_RELEASE``. A kfunc may take several frame parameters in any
+argument position, including stack arguments on architectures that support
+them. Each consuming argument must receive a distinct owned frame; passing
+aliases of the same frame to two consuming arguments is rejected.
+
+The verifier checks all arguments before consuming any frame references.
+After the call, all aliases of each consumed frame are invalid for further
+access, resumption, or release. The kfunc must free each frame or take
+responsibility for its subsequent lifetime. Explicit ``KF_RELEASE`` retains
+its first-argument semantics and does not consume a ``__coro_frame`` first
+argument twice.
+
+A frame holds a reference on the program that allocated it until it is
+freed, so the program stays loaded while the kernel keeps one of its frames.
+A program holds the modules whose kfuncs it calls: a module cannot be
+unloaded while it keeps a frame of a program that calls its kfuncs, so it
+frees or resumes the frames it keeps on its own, not in its exit function.
+The reference is in a header in front of the frame: kernel code frees a frame
+with ``bpf_coro_frame_free()``, in any context, and never with ``kfree()`` or
+``kfree_nolock()``::
+
+        __bpf_kfunc void bpf_foo_done(void *frame__coro_frame)
+        {
+                bpf_coro_frame_free(frame__coro_frame);
+        }
+
+This annotation does not transfer references stored inside the frame or
+preserve verifier state for a later continuation. Passing frame storage to
+an ordinary memory parameter retains the usual memory-argument semantics,
+with one exception: a frame is not accepted as the buffer of
+``bpf_dynptr_slice()`` or ``bpf_dynptr_slice_rdwr()`` where the slice may be
+the buffer. The contents of a frame are tracked like those of the stack, and
+such a slice would be a second way to them.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

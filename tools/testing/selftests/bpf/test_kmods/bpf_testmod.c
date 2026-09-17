@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/delay.h>
@@ -304,6 +305,30 @@ __bpf_kfunc void bpf_iter_testmod_current_destroy(struct bpf_iter_testmod_curren
 
 __bpf_kfunc void bpf_kfunc_common_test(void)
 {
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames(u64 cookie, void *a__coro_frame,
+				     void *b__coro_frame, u64 *rdonly_buf)
+{
+	int result = cookie + *rdonly_buf;
+
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(b__coro_frame);
+	return result;
+}
+
+__bpf_kfunc void bpf_kfunc_coro_frames_release(void *a__coro_frame, void *b__coro_frame)
+{
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(b__coro_frame);
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames_stack(void *a__coro_frame, u64 b, u64 c,
+					   u64 d, u64 e, void *f__coro_frame)
+{
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(f__coro_frame);
+	return b + c + d + e;
 }
 
 __bpf_kfunc u64 bpf_kfunc_arena_arg_test(u64 *val__arena)
@@ -1046,6 +1071,9 @@ BTF_ID_FLAGS(func, bpf_iter_testmod_current_next,
 	     KF_ITER_NEXT | KF_RET_NULL | KF_ITER_RET_INDEPENDENT)
 BTF_ID_FLAGS(func, bpf_iter_testmod_current_destroy, KF_ITER_DESTROY)
 BTF_ID_FLAGS(func, bpf_kfunc_common_test)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_stack)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_arg_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_nullable_test)
