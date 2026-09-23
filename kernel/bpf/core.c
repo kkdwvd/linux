@@ -3471,6 +3471,17 @@ bool __weak bpf_jit_supports_private_stack(void)
 	return false;
 }
 
+/*
+ * Return TRUE if the JIT lays out frames of up to MAX_BPF_STACK_JIT bytes.
+ * Its prologue, epilogue and tail call sequences must encode such frame
+ * sizes, a tail call must set up the callee's own frame instead of reusing
+ * the caller's, and a private stack must be sized from the program's depth.
+ */
+bool __weak bpf_jit_supports_large_stack(void)
+{
+	return false;
+}
+
 void __weak arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
 {
 }
