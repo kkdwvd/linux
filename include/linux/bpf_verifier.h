@@ -243,12 +243,13 @@ enum bpf_stack_slot_type {
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
 
 /*
- * Largest number of BPF_REG_SIZE stack slots a single frame can have. A frame
- * may use any part of the MAX_BPF_STACK budget; check_max_stack_depth()
- * enforces the bound on the combined depth of frames sharing the kernel stack
- * and on each frame using a private stack.
+ * Largest number of BPF_REG_SIZE stack slots a single frame can have, sized
+ * for the largest stack budget any JIT supports. A frame may use any part of
+ * its program's budget; check_max_stack_depth() enforces the budget on the
+ * combined depth of frames sharing the kernel stack and on each frame using
+ * a private stack.
  */
-#define MAX_BPF_STACK_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
+#define MAX_BPF_STACK_SLOTS	(MAX_BPF_STACK_JIT / BPF_REG_SIZE)
 
 /* 4-byte stack slot granularity for liveness analysis */
 #define BPF_HALF_REG_SIZE	4
