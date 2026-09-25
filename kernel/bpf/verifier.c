@@ -6341,12 +6341,6 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	u32 btf_id = 0;
 	int ret;
 
-	/* The access rules for typed arena objects come with a later patch. */
-	if (type_is_ptr_arena_obj(reg->type)) {
-		verbose(env, "typed arena access is not supported yet\n");
-		return -EACCES;
-	}
-
 	if (!env->allow_ptr_leaks) {
 		verbose(env,
 			"'struct %s' access is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
@@ -6398,7 +6392,7 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 		return -EACCES;
 	}
 
-	if (env->ops->btf_struct_access && !type_is_alloc(reg->type) && atype == BPF_WRITE) {
+	if (env->ops->btf_struct_access && !type_is_local_obj(reg->type) && atype == BPF_WRITE) {
 		if (!btf_is_kernel(reg->btf)) {
 			verifier_bug(env, "reg->btf must be kernel btf");
 			return -EFAULT;
@@ -6410,9 +6404,11 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 				reg_arg_name(env, argno), tname, off, size);
 	} else {
 		/* Writes are permitted with default btf_struct_access for
-		 * program allocated objects (which always have id > 0).
+		 * program allocated objects (which always have id > 0) and
+		 * for typed arena objects, which are never freed.
 		 */
-		if (atype != BPF_READ && !type_is_ptr_alloc_obj(reg->type)) {
+		if (atype != BPF_READ && !type_is_ptr_alloc_obj(reg->type) &&
+		    !type_is_ptr_arena_obj(reg->type)) {
 			verbose(env, "only read is supported\n");
 			return -EACCES;
 		}

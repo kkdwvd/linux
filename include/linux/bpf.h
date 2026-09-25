@@ -4308,6 +4308,12 @@ static inline bool type_is_alloc(u32 type)
 	return type & MEM_ALLOC;
 }
 
+/* An object of a program-BTF struct: allocated by the program, or in a typed arena. */
+static inline bool type_is_local_obj(u32 type)
+{
+	return type & (MEM_ALLOC | MEM_ARENA);
+}
+
 static inline gfp_t bpf_memcg_flags(gfp_t flags)
 {
 	if (memcg_bpf_enabled())
