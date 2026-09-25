@@ -9,6 +9,37 @@
 
 #define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
 
+/* Number of objects a struct's typed arena holds; the default is 1024. */
+#define __arena_capacity(n) __attribute__((btf_decl_tag("arena_capacity:" #n)))
+
+/*
+ * Promote an arena handle to a pointer to an object of struct type T in the
+ * arena's typed arena for T, with the arena_type_cast instruction: the handle
+ * in dst, the local BTF type ID as a verifier-known constant in src. Any value
+ * promotes to some live object of T. The registers are fixed, r1 and r2, so
+ * that the instruction can be emitted byte by byte; the compiler moves the
+ * operands. The register byte holds dst in its low nibble on little-endian
+ * targets and in its high nibble on big-endian ones.
+ */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define __bpf_arena_type_cast_r1_r2 ".byte 0xbf, 0x21;"
+#else
+#define __bpf_arena_type_cast_r1_r2 ".byte 0xbf, 0x12;"
+#endif
+
+#define bpf_arena_cast(handle, T) ({						\
+	void *__p = (void *)(unsigned long)(handle);				\
+	asm volatile("r1 = %[p];\n"						\
+		     "r2 = %[id];\n"						\
+		     __bpf_arena_type_cast_r1_r2					\
+		     ".short %[off]; .long 0;\n"				\
+		     "%[p] = r1;\n"						\
+		     : [p] "+r"(__p)						\
+		     : [id] "r"((unsigned long)bpf_core_type_id_local(T)),	\
+		       [off] "i"(BPF_ARENA_TYPE_CAST)				\
+		     : "r1", "r2");						\
+	(T *)__p; })
+
 /* Convenience macro to wrap over bpf_obj_new */
 #define bpf_obj_new(type) ((type *)bpf_obj_new(bpf_core_type_id_local(type)))
 
