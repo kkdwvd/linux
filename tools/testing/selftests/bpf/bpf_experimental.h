@@ -40,6 +40,9 @@
 		     : "r1", "r2");						\
 	(T *)__p; })
 
+/* The handle of a typed arena pointer: every 32-bit view of the pointer is it. */
+#define bpf_arena_handle(p) ((__u32)(unsigned long)(p))
+
 /* Convenience macro to wrap over bpf_obj_new */
 #define bpf_obj_new(type) ((type *)bpf_obj_new(bpf_core_type_id_local(type)))
 

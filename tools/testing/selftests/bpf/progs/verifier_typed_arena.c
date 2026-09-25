@@ -82,6 +82,8 @@ struct many_obj {
 #define ARENA_TYPE_CAST MOV64_X(REGS_R1_R2, 2, 0)
 /* r1 = addr_space_cast(r1, 0, 1) */
 #define CAST_TO_ARENA MOV64_X(REGS_R1_R1, 1, 1)
+/* r7 = addr_space_cast(r7, 0, 1) */
+#define CAST_R7_TO_ARENA MOV64_X("0x77", 1, 1)
 
 SEC("syscall")
 __description("a cast lowers to the slot mask and the typed arena base")
@@ -351,6 +353,207 @@ int cast_macro(void *ctx)
 		return 1;
 	obj = bpf_arena_cast(0x12345, struct typed_obj);
 	return obj == NULL;
+}
+
+SEC("syscall")
+__description("a 32-bit copy of a typed pointer is its handle")
+__success __log_level(2)
+__msg("R3=scalar(smin=smin32=0,smax=umax=smax32=umax32=16368,var_off=(0x0; 0x3ff0))")
+__xlated("w3 = w1")
+__xlated("w3 &= 16368")
+int demote_copy(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "w3 = w1;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "r3");
+	return 0;
+}
+
+SEC("syscall")
+__description("a handle promotes again")
+__success
+__xlated("w3 = w1")
+__xlated("w3 &= 16368")
+__xlated("r1 = r3")
+__xlated("r1 &= 16368")
+int demote_then_promote(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "w3 = w1;"
+		     "r1 = r3;"
+		     ARENA_TYPE_CAST
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "r3");
+	return 0;
+}
+
+SEC("syscall")
+__description("a narrow store of a typed pointer stores its handle, a wide one the pointer")
+__success
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("*(u32 *)(r7 +0) = r12")
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("*(u16 *)(r7 +4) = r12")
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("*(u8 *)(r7 +6) = r12")
+__xlated("*(u64 *)(r7 +8) = r1")
+int demote_store(void *ctx)
+{
+	asm volatile("r7 = %[arena] ll;"
+		     "r7 = *(u64 *)(r7 + 0);"
+		     CAST_R7_TO_ARENA
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "*(u32 *)(r7 + 0) = r1;"
+		     "*(u16 *)(r7 + 4) = r1;"
+		     "*(u8 *)(r7 + 6) = r1;"
+		     "*(u64 *)(r7 + 8) = r1;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r1", "r2", "r7", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("a narrow store of a typed pointer to the stack is an invalid spill")
+__failure __msg("invalid size of register spill")
+int demote_store_to_stack(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "*(u32 *)(r10 - 8) = r1;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("a 32-bit compare of a typed pointer sees its handle")
+__success
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("if w12 == w3 goto")
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("if w3 == w12 goto")
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("if w12 == 0x10 goto")
+__xlated("if w1 == w4 goto")
+int demote_compare(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "w3 = 16;"
+		     "r4 = r1;"
+		     "if w1 == w3 goto 1f;"
+		     "if w3 == w1 goto 1f;"
+		     "if w1 == 0x10 goto 1f;"
+		     "if w1 == w4 goto 1f;"
+		     "1:"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "r3", "r4");
+	return 0;
+}
+
+SEC("syscall")
+__description("a lowered backward compare keeps its target")
+__success
+__xlated("w12 = w1")
+__xlated("w12 &= 16368")
+__xlated("if w12 == w3 goto pc-{{[0-9]+}}")
+int demote_compare_backward(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "w3 = 0;"
+		     "1:"
+		     "w3 += 1;"
+		     "if w3 > 2 goto 2f;"
+		     "if w1 == w3 goto 1b;"
+		     "2:"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "r3");
+	return 0;
+}
+
+SEC("syscall")
+__description("a 32-bit atomic does not see the handle")
+__failure __msg("R1 32-bit atomic on a typed arena pointer, copy its handle first")
+int demote_atomic(void *ctx)
+{
+	asm volatile("r7 = %[arena] ll;"
+		     "r7 = *(u64 *)(r7 + 0);"
+		     CAST_R7_TO_ARENA
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "lock *(u32 *)(r7 + 0) += w1;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r1", "r2", "r7", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("one demotion sees one type on every path")
+__failure __msg("sees different typed arena pointers on different paths")
+int demote_two_types_at_one_insn(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "call %[bpf_get_prandom_u32];"
+		     "r1 = 1;"
+		     "if r0 == 0 goto 1f;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "goto 2f;"
+		     "1:"
+		     "r2 = %[other_id];"
+		     ARENA_TYPE_CAST
+		     "2:"
+		     "w3 = w1;"
+		     :: __imm_addr(arena), __imm(bpf_get_prandom_u32),
+		        [id] "r"(TYPE_ID(struct typed_obj)),
+		        [other_id] "r"(TYPE_ID(struct other_obj))
+		     : "r0", "r1", "r2", "r3", "r4", "r5", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("the C macros demote and compare handles")
+__success __retval(0)
+int demote_macro(void *ctx)
+{
+	struct typed_obj *obj, *again;
+	__u32 handle;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct typed_obj);
+	handle = bpf_arena_handle(obj);
+	if (handle != (0x12345 & 16368))
+		return 2;
+	again = bpf_arena_cast(handle, struct typed_obj);
+	if (again != obj)
+		return 3;
+	if (bpf_arena_handle(again) != handle)
+		return 4;
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";
