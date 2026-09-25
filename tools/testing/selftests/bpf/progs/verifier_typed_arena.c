@@ -23,6 +23,13 @@ struct {
 	__ulong(map_extra, ARENA_VM_START);
 } arena SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} not_an_arena SEC(".maps");
+
 /* 16-byte slots, default capacity: a 16 KiB typed arena and a mask of 16368 */
 struct typed_obj {
 	struct task_struct __kptr *task;
@@ -823,6 +830,109 @@ int kptr_xchg_wrong_type(void *ctx)
 	if (n)
 		bpf_obj_drop(n);
 	return 0;
+}
+
+SEC("syscall")
+__description("allocated pages hold real objects reachable by handle")
+__success __retval(0)
+__xlated("r2 = 0x{{[0-9a-f]+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]}}")
+__xlated("call kernel-function")
+int pages_alloc(void *ctx)
+{
+	struct typed_obj *obj, *again, *next;
+	__u32 handle;
+
+	obj = bpf_arena_typed_alloc_pages(&arena, struct typed_obj, NULL, 1, NUMA_NO_NODE);
+	if (!obj)
+		return 1;
+	obj->value = 5;
+	handle = bpf_arena_handle(obj);
+	again = bpf_arena_cast(handle, struct typed_obj);
+	if (again != obj || again->value != 5)
+		return 2;
+	next = bpf_arena_cast(handle + sizeof(*obj), struct typed_obj);
+	next->value = 6;
+	if (next == obj || next->value != 6 || obj->value != 5)
+		return 3;
+	return 0;
+}
+
+SEC("syscall")
+__description("a fixed request takes its page once")
+__success __retval(0)
+int pages_alloc_fixed(void *ctx)
+{
+	struct typed_obj *obj, *hint;
+
+	hint = bpf_arena_cast(8192, struct typed_obj);
+	obj = bpf_arena_typed_alloc_pages(&arena, struct typed_obj, hint, 2, NUMA_NO_NODE);
+	if (!obj)
+		return 1;
+	if (bpf_arena_handle(obj) != 8192)
+		return 2;
+	if (bpf_arena_typed_alloc_pages(&arena, struct typed_obj, hint, 1, NUMA_NO_NODE))
+		return 3;
+	hint = bpf_arena_cast(8192 + 4096, struct typed_obj);
+	if (bpf_arena_typed_alloc_pages(&arena, struct typed_obj, hint, 1, NUMA_NO_NODE))
+		return 4;
+	return 0;
+}
+
+SEC("syscall")
+__description("a released page stays taken until the grace period has passed")
+__success __retval(0)
+int pages_free(void *ctx)
+{
+	struct typed_obj *obj;
+
+	obj = bpf_arena_typed_alloc_pages(&arena, struct typed_obj, NULL, 1, NUMA_NO_NODE);
+	if (!obj)
+		return 1;
+	obj->value = 7;
+	bpf_arena_typed_free_pages(&arena, struct typed_obj, obj, 1);
+	if (obj->value != 7)
+		return 2;
+	if (bpf_arena_typed_alloc_pages(&arena, struct typed_obj, obj, 1, NUMA_NO_NODE))
+		return 3;
+	return 0;
+}
+
+SEC("syscall")
+__description("an allocation must be checked for NULL")
+__failure __msg("R0 invalid mem access 'arena_ptr_or_null_'")
+int pages_alloc_null_check(void *ctx)
+{
+	struct typed_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_typed_alloc_pages(&arena, struct typed_obj, NULL, 1, NUMA_NO_NODE);
+	obj->value = 1;
+	return 0;
+}
+
+SEC("syscall")
+__description("the page kfuncs register the type like a cast")
+__failure __msg("struct plain_obj has no special fields and needs no typed arena")
+int pages_alloc_plain_struct(void *ctx)
+{
+	struct plain_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_typed_alloc_pages(&arena, struct plain_obj, NULL, 1, NUMA_NO_NODE);
+	return obj == NULL;
+}
+
+SEC("syscall")
+__description("the page kfuncs need the program's arena")
+__failure __msg("can only be used in a program that has an associated arena")
+int pages_alloc_needs_arena(void *ctx)
+{
+	struct typed_obj *obj;
+
+	obj = bpf_arena_typed_alloc_pages(&not_an_arena, struct typed_obj, NULL, 1, NUMA_NO_NODE);
+	return obj == NULL;
 }
 
 char _license[] SEC("license") = "GPL";

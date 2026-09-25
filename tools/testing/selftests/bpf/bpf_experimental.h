@@ -40,8 +40,30 @@
 		     : "r1", "r2");						\
 	(T *)__p; })
 
-/* The handle of a typed arena pointer: every 32-bit view of the pointer is it. */
-#define bpf_arena_handle(p) ((__u32)(unsigned long)(p))
+/*
+ * The handle of a typed arena pointer: every 32-bit view of the pointer is it.
+ * A 32-bit register copy is such a view; a compiler may narrow with shifts
+ * instead, which the verifier rejects on a pointer, so the copy is explicit.
+ */
+#define bpf_arena_handle(ptr) ({					\
+	__u64 __h;							\
+	asm volatile("r1 = %[p];\n"					\
+		     "w1 = w1;\n"					\
+		     "%[h] = r1;\n"					\
+		     : [h] "=r"(__h) : [p] "r"(ptr) : "r1");		\
+	(__u32)__h; })
+
+/*
+ * Back a page range of the typed arena for struct type T with zeroed objects,
+ * at the page of the typed pointer addr or anywhere for NULL, and return a
+ * pointer to the first object, or NULL. Release such a range after a grace
+ * period; the objects read as the dummy object afterwards.
+ */
+#define bpf_arena_typed_alloc_pages(map, T, addr, page_cnt, node_id)			\
+	((T *)bpf_arena_typed_alloc_pages_impl((map), bpf_core_type_id_local(T), (addr),	\
+					       (page_cnt), (node_id)))
+#define bpf_arena_typed_free_pages(map, T, ptr, page_cnt)				\
+	bpf_arena_typed_free_pages_impl((map), bpf_core_type_id_local(T), (ptr), (page_cnt))
 
 /* Convenience macro to wrap over bpf_obj_new */
 #define bpf_obj_new(type) ((type *)bpf_obj_new(bpf_core_type_id_local(type)))
