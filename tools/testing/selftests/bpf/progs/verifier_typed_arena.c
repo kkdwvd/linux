@@ -62,6 +62,15 @@ struct many_obj {
 	__u64 value;
 } __arena_capacity(16777216);
 
+struct mixed_obj {
+	struct task_struct __kptr *task;
+	struct {
+		__u32 a;
+		__u32 b;
+	} inner;
+	struct task_struct *ptr;
+};
+
 #define TYPE_ID(T) ((unsigned long)bpf_core_type_id_local(T))
 
 /*
@@ -553,6 +562,177 @@ int demote_macro(void *ctx)
 		return 3;
 	if (bpf_arena_handle(again) != handle)
 		return 4;
+	return 0;
+}
+
+SEC("syscall")
+__description("a scalar field is written and read natively, on a page faulted to scratch")
+__success __retval(7)
+__stderr("ERROR: Typed arena WRITE access to unallocated struct typed_obj at handle 0x2340")
+int access_scalar_field(void *ctx)
+{
+	struct typed_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct typed_obj);
+	obj->value = 7;
+	return obj->value;
+}
+
+SEC("syscall")
+__description("atomics run natively on a scalar field")
+__success __retval(3)
+int access_atomic(void *ctx)
+{
+	__u64 ret;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	asm volatile("r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r2 = 1;"
+		     "*(u64 *)(r1 + 8) = r2;"
+		     "r2 = 2;"
+		     "lock *(u64 *)(r1 + 8) += r2;"
+		     "%[ret] = *(u64 *)(r1 + 8);"
+		     : [ret] "=r"(ret)
+		     : [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r1", "r2", "memory");
+	return ret;
+}
+
+SEC("syscall")
+__description("pointer arithmetic stays inside the object")
+__success __log_level(2)
+__msg("R1=arena_ptr_typed_obj(imm=8) R2=scalar()")
+int access_after_arithmetic(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r1 += 8;"
+		     "r2 = *(u64 *)(r1 + 0);"
+		     "*(u16 *)(r1 + 2) = r2;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("nested structs are walked and pointer fields load as scalars")
+__success __log_level(2)
+__msg("R2=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))")
+__msg("R3=scalar()")
+int access_nested_and_pointer_fields(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r2 = *(u32 *)(r1 + 12);"
+		     "r3 = *(u64 *)(r1 + 16);"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct mixed_obj))
+		     : "r0", "r1", "r2", "r3");
+	return 0;
+}
+
+SEC("syscall")
+__description("an access beyond the object is rejected")
+__failure __msg("access beyond struct typed_obj")
+int access_beyond_object(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r2 = *(u64 *)(r1 + 16);"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2");
+	return 0;
+}
+
+SEC("syscall")
+__description("a negative offset is rejected")
+__failure __msg("invalid negative access")
+int access_negative_offset(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r1 += -8;"
+		     "r2 = *(u64 *)(r1 + 0);"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2");
+	return 0;
+}
+
+SEC("syscall")
+__description("a variable offset is rejected")
+__failure __msg("invalid variable offset")
+int access_variable_offset(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "call %[bpf_get_prandom_u32];"
+		     "r3 = r0;"
+		     "r3 &= 8;"
+		     "r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r1 += r3;"
+		     "r2 = *(u64 *)(r1 + 0);"
+		     :: __imm_addr(arena), __imm(bpf_get_prandom_u32),
+		        [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "r3", "r4", "r5", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("a kptr field is not read directly")
+__failure __msg("direct access to kptr is disallowed")
+int access_kptr_read(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "r2 = *(u64 *)(r1 + 0);"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2");
+	return 0;
+}
+
+SEC("syscall")
+__description("a kptr field is not written directly")
+__failure __msg("direct access to kptr is disallowed")
+int access_kptr_write(void *ctx)
+{
+	asm volatile("r0 = %[arena] ll;"
+		     "r1 = 0x12345;"
+		     "r2 = %[id];"
+		     ARENA_TYPE_CAST
+		     "*(u64 *)(r1 + 0) = 0;"
+		     :: __imm_addr(arena), [id] "r"(TYPE_ID(struct typed_obj))
+		     : "r0", "r1", "r2", "memory");
+	return 0;
+}
+
+SEC("syscall")
+__description("helpers do not take typed arena pointers as memory")
+__failure __msg("R1 type=arena_ptr_ expected=fp, pkt, pkt_meta, map_key, map_value, mem, ringbuf_mem, buf, trusted_ptr_, ctx")
+int helper_rejects_typed_pointer(void *ctx)
+{
+	struct typed_obj *obj;
+	__u64 src = 0;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct typed_obj);
+	bpf_probe_read_kernel(&obj->value, sizeof(obj->value), &src);
 	return 0;
 }
 
