@@ -735,27 +735,60 @@ int bpf_opt_remove_dead_code(struct bpf_verifier_env *env)
 }
 
 /*
- * Replace every arena_type_cast with the promotion sequence of the typed arena
- * the verifier resolved for it. The instruction is verified per type, so a cast
- * has exactly one typed arena by the time it gets here.
+ * Lower the instructions the verifier tied to a typed arena: an arena_type_cast
+ * becomes the typed arena's promotion sequence, and a 32-bit view of a typed
+ * pointer, a narrow copy, a narrow store, or a 32-bit compare, sees the handle
+ * the pointer was promoted from rather than the low half of a kernel address.
+ * Each instruction is verified per type, so it has exactly one typed arena by
+ * the time it gets here.
  */
-int bpf_lower_arena_type_casts(struct bpf_verifier_env *env)
+int bpf_lower_typed_arena_insns(struct bpf_verifier_env *env)
 {
 	struct bpf_insn *insn = env->prog->insnsi;
 	int i, cnt, delta = 0, insn_cnt = env->prog->len;
+	const struct bpf_insn_aux_data *aux;
 	const struct bpf_arena_type *type;
 	struct bpf_insn insn_buf[4];
 	struct bpf_prog *new_prog;
+	u8 class, reg;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		if (!insn_is_arena_type_cast(insn))
+		aux = &env->insn_aux_data[i + delta];
+		type = aux->arena_type;
+		if (!type)
 			continue;
-		type = env->insn_aux_data[i + delta].arena_type;
-		if (!type) {
-			verifier_bug(env, "arena_type_cast at insn %d has no typed arena", i);
+		class = BPF_CLASS(insn->code);
+		reg = aux->arena_reg;
+		if (insn_is_arena_type_cast(insn)) {
+			cnt = bpf_arena_type_promote_insns(type, insn->dst_reg, insn_buf);
+		} else if (class == BPF_ALU && BPF_OP(insn->code) == BPF_MOV) {
+			cnt = bpf_arena_type_demote_insns(type, insn->dst_reg, insn->src_reg, insn_buf);
+		} else if (class == BPF_STX) {
+			/* the stored value goes through the scratch register */
+			cnt = bpf_arena_type_demote_insns(type, BPF_REG_AX, reg, insn_buf);
+			insn_buf[cnt] = *insn;
+			insn_buf[cnt++].src_reg = BPF_REG_AX;
+		} else if (class == BPF_JMP32) {
+			/*
+			 * The compare moves down by the demotion; a target before it
+			 * keeps its place while a target after it moves along.
+			 */
+			cnt = bpf_arena_type_demote_insns(type, BPF_REG_AX, reg, insn_buf);
+			insn_buf[cnt] = *insn;
+			if (insn->off < 0) {
+				if (insn->off - cnt < S16_MIN)
+					return -ERANGE;
+				insn_buf[cnt].off -= cnt;
+			}
+			if (insn->dst_reg == reg)
+				insn_buf[cnt].dst_reg = BPF_REG_AX;
+			else
+				insn_buf[cnt].src_reg = BPF_REG_AX;
+			cnt++;
+		} else {
+			verifier_bug(env, "unexpected typed arena insn %d", i);
 			return -EFAULT;
 		}
-		cnt = bpf_arena_type_promote_insns(type, insn->dst_reg, insn_buf);
 		new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
 		if (!new_prog)
 			return -ENOMEM;

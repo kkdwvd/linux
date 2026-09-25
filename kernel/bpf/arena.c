@@ -512,13 +512,31 @@ int bpf_arena_type_promote_insns(const struct bpf_arena_type *type, u8 dst,
 				 struct bpf_insn *buf)
 {
 	struct bpf_insn base[2] = { BPF_LD_IMM64(BPF_REG_AX, (unsigned long)type->base) };
-	u32 mask = arena_type_size(type) - arena_type_slot_size(type);
 
-	buf[0] = BPF_ALU64_IMM(BPF_AND, dst, mask);
+	buf[0] = BPF_ALU64_IMM(BPF_AND, dst, bpf_arena_type_handle_mask(type));
 	buf[1] = base[0];
 	buf[2] = base[1];
 	buf[3] = BPF_ALU64_REG(BPF_ADD, dst, BPF_REG_AX);
 	return 4;
+}
+
+/*
+ * bpf_arena_type_demote_insns - lower a 32-bit view of a typed pointer to its handle
+ * @type: the pointer's typed arena
+ * @dst: the register that receives the handle
+ * @src: the register holding the typed pointer
+ * @buf: room for the lowered instructions
+ *
+ * The typed arena's base is a multiple of its size, so the low 32 bits of the
+ * pointer masked with the handle mask are the slot offset the pointer was
+ * promoted from. Return the number of instructions written.
+ */
+int bpf_arena_type_demote_insns(const struct bpf_arena_type *type, u8 dst, u8 src,
+				struct bpf_insn *buf)
+{
+	buf[0] = BPF_MOV32_REG(dst, src);
+	buf[1] = BPF_ALU32_IMM(BPF_AND, dst, bpf_arena_type_handle_mask(type));
+	return 2;
 }
 
 static void arena_types_free(struct bpf_arena *arena)

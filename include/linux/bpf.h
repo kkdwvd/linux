@@ -304,6 +304,12 @@ struct bpf_arena_type {
 	const struct btf_record *record;
 };
 
+/* A handle is a slot offset: the bits below the size and at or above the slot. */
+static inline u32 bpf_arena_type_handle_mask(const struct bpf_arena_type *type)
+{
+	return (1u << type->size_shift) - (1u << type->slot_shift);
+}
+
 /* Non-opaque version of bpf_rb_node in uapi/linux/bpf.h */
 struct bpf_rb_node_kern {
 	struct rb_node rb_node;
@@ -708,6 +714,8 @@ struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, 
 void bpf_arena_type_put(struct bpf_map *map, struct bpf_arena_type *type);
 int bpf_arena_type_promote_insns(const struct bpf_arena_type *type, u8 dst,
 				 struct bpf_insn *buf);
+int bpf_arena_type_demote_insns(const struct bpf_arena_type *type, u8 dst, u8 src,
+				struct bpf_insn *buf);
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
 
 struct bpf_offload_dev;

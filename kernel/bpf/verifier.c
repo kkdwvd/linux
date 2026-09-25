@@ -216,6 +216,7 @@ static bool is_tracing_prog_type(enum bpf_prog_type type);
 static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+static int record_arena_demotion(struct bpf_verifier_env *env, u32 regno);
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
 static void scalar32_min_max_add(struct bpf_reg_state *dst_reg, struct bpf_reg_state *src_reg);
@@ -7224,6 +7225,13 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	dst_reg_type = regs[insn->dst_reg].type;
 
+	/* a narrow store of a typed pointer stores its handle */
+	if (BPF_SIZE(insn->code) != BPF_DW && type_is_ptr_arena_obj(regs[insn->src_reg].type)) {
+		err = record_arena_demotion(env, insn->src_reg);
+		if (err)
+			return err;
+	}
+
 	/* Check if (dst_reg + off) is writeable. */
 	err = check_mem_access(env, env->insn_idx, regs + insn->dst_reg, argno_from_reg(insn->dst_reg), insn->off,
 			       BPF_SIZE(insn->code), BPF_WRITE, insn->src_reg,
@@ -7267,10 +7275,21 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 			verbose(env, "R%d leaks addr into mem\n", aux_reg);
 			return -EACCES;
 		}
+		if (BPF_SIZE(insn->code) == BPF_W && type_is_ptr_arena_obj(reg_state(env, aux_reg)->type)) {
+			verbose(env, "R%d 32-bit atomic on a typed arena pointer, copy its handle first\n",
+				aux_reg);
+			return -EACCES;
+		}
 	}
 
 	if (is_pointer_value(env, insn->src_reg)) {
 		verbose(env, "R%d leaks addr into mem\n", insn->src_reg);
+		return -EACCES;
+	}
+	/* the value of a 32-bit atomic is not lowered; demote it explicitly */
+	if (BPF_SIZE(insn->code) == BPF_W && type_is_ptr_arena_obj(reg_state(env, insn->src_reg)->type)) {
+		verbose(env, "R%d 32-bit atomic on a typed arena pointer, copy its handle first\n",
+			insn->src_reg);
 		return -EACCES;
 	}
 
@@ -17127,6 +17146,33 @@ static int check_arena_type_cast(struct bpf_verifier_env *env, struct bpf_insn *
 	return 0;
 }
 
+/*
+ * A 32-bit view of a typed arena pointer, a narrow copy, a narrow store, or a
+ * 32-bit compare, is lowered to the handle the pointer was promoted from. The
+ * lowering is per instruction, so one instruction cannot see two types on
+ * different paths.
+ */
+static int record_arena_demotion(struct bpf_verifier_env *env, u32 regno)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+	struct bpf_reg_state *reg = reg_state(env, regno);
+	struct bpf_arena_type *type;
+
+	type = bpf_prog_arena_type(env->prog->aux, reg->btf_id);
+	if (!type) {
+		verifier_bug(env, "R%d typed arena pointer has no typed arena", regno);
+		return -EFAULT;
+	}
+	if (aux->arena_type && (aux->arena_type != type || aux->arena_reg != regno)) {
+		verbose(env, "insn %d sees different typed arena pointers on different paths\n",
+			env->insn_idx);
+		return -EINVAL;
+	}
+	aux->arena_type = type;
+	aux->arena_reg = regno;
+	return 0;
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -17228,7 +17274,15 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 				}
 			} else {
 				/* R1 = (u32) R2 */
-				if (is_pointer_value(env, insn->src_reg)) {
+				if (type_is_ptr_arena_obj(src_reg->type) && insn->off == 0) {
+					/* the low half of a typed pointer is its handle */
+					err = record_arena_demotion(env, insn->src_reg);
+					if (err)
+						return err;
+					mark_reg_unknown(env, regs, insn->dst_reg);
+					dst_reg->var_off = tnum_and(tnum_unknown,
+						tnum_const(bpf_arena_type_handle_mask(env->insn_aux_data[env->insn_idx].arena_type)));
+				} else if (is_pointer_value(env, insn->src_reg)) {
 					verbose(env,
 						"R%d partial copy of pointer\n",
 						insn->src_reg);
@@ -18245,6 +18299,23 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		err = bpf_push_jmp_history(env, this_branch, insn_flags, 0, 0, NULL, 0);
 		if (err)
 			return err;
+	}
+
+	/*
+	 * A 32-bit compare sees the handle of a typed pointer. Two typed
+	 * pointers compare natively: for one type that is slot identity, as
+	 * their bases are equal, and for two types it means nothing either way.
+	 */
+	if (BPF_CLASS(insn->code) == BPF_JMP32) {
+		bool dst_typed = type_is_ptr_arena_obj(dst_reg->type);
+		bool src_typed = BPF_SRC(insn->code) == BPF_X &&
+				 type_is_ptr_arena_obj(src_reg->type);
+
+		if (dst_typed != src_typed) {
+			err = record_arena_demotion(env, dst_typed ? insn->dst_reg : insn->src_reg);
+			if (err)
+				return err;
+		}
 	}
 
 	/*
@@ -22880,7 +22951,7 @@ skip_full_check:
 	}
 
 	if (ret == 0)
-		ret = bpf_lower_arena_type_casts(env);
+		ret = bpf_lower_typed_arena_insns(env);
 
 	if (ret == 0)
 		/* program is valid, convert *(u32*)(ctx + off) accesses */

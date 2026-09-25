@@ -662,7 +662,8 @@ struct bpf_insn_aux_data {
 	};
 	struct bpf_iarray *jt;	/* jump table for gotox or bpf_tailcall call instruction */
 	struct btf_struct_meta *kptr_struct_meta;
-	struct bpf_arena_type *arena_type; /* typed arena an arena_type_cast lowers to */
+	struct bpf_arena_type *arena_type; /* typed arena a cast or a demotion lowers with */
+	u8 arena_reg; /* the typed arena pointer a demotion lowers */
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
 	u32 seen; /* this insn was processed by the verifier at env->pass_cnt */
@@ -1824,7 +1825,7 @@ int bpf_optimize_bpf_loop(struct bpf_verifier_env *env);
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env);
 int bpf_opt_remove_dead_code(struct bpf_verifier_env *env);
 int bpf_opt_remove_nops(struct bpf_verifier_env *env);
-int bpf_lower_arena_type_casts(struct bpf_verifier_env *env);
+int bpf_lower_typed_arena_insns(struct bpf_verifier_env *env);
 int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env, const union bpf_attr *attr);
 int bpf_convert_ctx_accesses(struct bpf_verifier_env *env);
 int bpf_jit_subprogs(struct bpf_verifier_env *env);
