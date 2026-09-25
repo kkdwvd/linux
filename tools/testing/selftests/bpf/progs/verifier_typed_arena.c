@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
-#define BPF_NO_KFUNC_PROTOTYPES
 #include <vmlinux.h>
 #include <errno.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
-#include <bpf_arena_common.h>
+
+#define NUMA_NO_NODE (-1)
 
 #ifdef __TARGET_ARCH_arm64
 #define ARENA_VM_START ((1ull << 32) | (~0u - __PAGE_SIZE * 2 + 1))
@@ -61,6 +61,16 @@ struct many_obj {
 	struct task_struct __kptr *task;
 	__u64 value;
 } __arena_capacity(16777216);
+
+struct arena_node {
+	__u64 v;
+};
+
+struct kptr_obj {
+	struct task_struct __kptr *task;
+	struct arena_node __kptr *node;
+	__u64 value;
+};
 
 struct mixed_obj {
 	struct task_struct __kptr *task;
@@ -733,6 +743,85 @@ int helper_rejects_typed_pointer(void *ctx)
 		return 1;
 	obj = bpf_arena_cast(0x12345, struct typed_obj);
 	bpf_probe_read_kernel(&obj->value, sizeof(obj->value), &src);
+	return 0;
+}
+
+SEC("syscall")
+__description("a kernel kptr is exchanged into and out of an object")
+__success __retval(0)
+int kptr_xchg_task(void *ctx)
+{
+	struct task_struct *task, *old;
+	struct kptr_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct kptr_obj);
+	task = bpf_task_acquire(bpf_get_current_task_btf());
+	if (!task)
+		return 2;
+	old = bpf_kptr_xchg(&obj->task, task);
+	if (old)
+		bpf_task_release(old);
+	old = bpf_kptr_xchg(&obj->task, NULL);
+	if (!old)
+		return 3;
+	bpf_task_release(old);
+	return 0;
+}
+
+SEC("syscall")
+__description("a local kptr left in a dummy object is dropped with the map")
+__success __retval(0)
+int kptr_xchg_local(void *ctx)
+{
+	struct arena_node *n, *old;
+	struct kptr_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct kptr_obj);
+	n = bpf_obj_new(struct arena_node);
+	if (!n)
+		return 2;
+	n->v = 42;
+	old = bpf_kptr_xchg(&obj->node, n);
+	if (old)
+		bpf_obj_drop(old);
+	return 0;
+}
+
+SEC("syscall")
+__description("an exchange needs a kptr field")
+__failure __msg("off=16 doesn't point to kptr")
+int kptr_xchg_scalar_field(void *ctx)
+{
+	struct kptr_obj *obj;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct kptr_obj);
+	bpf_kptr_xchg(&obj->value, NULL);
+	return 0;
+}
+
+SEC("syscall")
+__description("an exchange checks the value against the field's type")
+__failure __msg("invalid kptr access, R2 type=ptr_arena_node expected=ptr_task_struct")
+int kptr_xchg_wrong_type(void *ctx)
+{
+	struct kptr_obj *obj;
+	struct arena_node *n;
+
+	if (!bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0))
+		return 1;
+	obj = bpf_arena_cast(0x12345, struct kptr_obj);
+	n = bpf_obj_new(struct arena_node);
+	if (!n)
+		return 2;
+	n = bpf_kptr_xchg(&obj->task, n);
+	if (n)
+		bpf_obj_drop(n);
 	return 0;
 }
 
