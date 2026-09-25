@@ -6340,6 +6340,12 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	u32 btf_id = 0;
 	int ret;
 
+	/* The access rules for typed arena objects come with a later patch. */
+	if (type_is_ptr_arena_obj(reg->type)) {
+		verbose(env, "typed arena access is not supported yet\n");
+		return -EACCES;
+	}
+
 	if (!env->allow_ptr_leaks) {
 		verbose(env,
 			"'struct %s' access is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
@@ -16932,6 +16938,195 @@ clear_id:
 	return 0;
 }
 
+/*
+ * Every field kind that program BTF can describe; a typed arena object may
+ * only hold the ones whose operations are single-word atomics, which is what
+ * keeps them sound when the page under the object is released.
+ */
+#define BPF_ARENA_TYPE_FIELDS \
+	(BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD | \
+	 BPF_LIST_NODE | BPF_RB_ROOT | BPF_RB_NODE | BPF_REFCOUNT | BPF_WORKQUEUE | \
+	 BPF_UPTR | BPF_TASK_WORK)
+#define BPF_ARENA_TYPE_SUPPORTED_FIELDS BPF_KPTR
+
+static struct bpf_arena_type *bpf_prog_arena_type(const struct bpf_prog_aux *aux, u32 btf_id)
+{
+	u32 i;
+
+	for (i = 0; i < aux->arena_type_cnt; i++)
+		if (aux->arena_types[i]->btf_id == btf_id)
+			return aux->arena_types[i];
+	return NULL;
+}
+
+/*
+ * The typed arena's address space is a declared resource, read from the
+ * struct's "arena_capacity:<n>" decl tag, with a modest default.
+ */
+static int arena_type_capacity(struct bpf_verifier_env *env, const struct btf *btf,
+			       const struct btf_type *t, const char *tname, u32 *capacity)
+{
+	const char *value;
+	u32 cap;
+
+	value = btf_find_decl_tag_value(btf, t, -1, BPF_ARENA_CAPACITY_TAG);
+	if (IS_ERR(value)) {
+		if (PTR_ERR(value) == -ENOENT) {
+			*capacity = BPF_ARENA_TYPE_DEFAULT_CAPACITY;
+			return 0;
+		}
+		verbose(env, "struct %s has conflicting arena capacity declarations\n", tname);
+		return PTR_ERR(value);
+	}
+	if (kstrtou32(value, 0, &cap) || !cap) {
+		verbose(env, "struct %s has invalid arena capacity '%s'\n", tname, value);
+		return -EINVAL;
+	}
+	*capacity = cap;
+	return 0;
+}
+
+/*
+ * Register the typed arena for a program-BTF struct the first time this
+ * program casts to it, and hold a reference on it until the load has either
+ * succeeded, after which the typed arena lives as long as the map, or failed.
+ */
+static struct bpf_arena_type *arena_type_register(struct bpf_verifier_env *env, u32 btf_id)
+{
+	struct bpf_prog_aux *aux = env->prog->aux;
+	struct bpf_arena_type *type, **types;
+	struct btf_struct_meta *meta;
+	struct btf *btf = aux->btf;
+	const struct btf_type *t;
+	struct btf_record *record;
+	const char *tname;
+	u32 capacity, i;
+	int err;
+
+	type = bpf_prog_arena_type(aux, btf_id);
+	if (type)
+		return type;
+
+	t = btf_type_by_id(btf, btf_id);
+	if (!t || !__btf_type_is_struct(t)) {
+		verbose(env, "arena_type_cast type ID %u is not a struct\n", btf_id);
+		return ERR_PTR(-EINVAL);
+	}
+	tname = btf_name_by_offset(btf, t->name_off);
+
+	record = btf_parse_fields(btf, t, BPF_ARENA_TYPE_FIELDS, t->size);
+	if (IS_ERR(record)) {
+		verbose(env, "struct %s has invalid special fields\n", tname);
+		return ERR_CAST(record);
+	}
+	if (!record) {
+		verbose(env, "struct %s has no special fields and needs no typed arena\n", tname);
+		return ERR_PTR(-EINVAL);
+	}
+	for (i = 0; i < record->cnt; i++) {
+		if (record->fields[i].type & BPF_ARENA_TYPE_SUPPORTED_FIELDS)
+			continue;
+		verbose(env, "struct %s field %s is not supported in a typed arena\n", tname,
+			btf_field_type_name(record->fields[i].type));
+		btf_record_free(record);
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+	btf_record_free(record);
+	/* BTF keeps a record for every struct with these fields. */
+	meta = btf_find_struct_meta(btf, btf_id);
+	if (!meta) {
+		verifier_bug(env, "struct %s has special fields but no metadata", tname);
+		return ERR_PTR(-EFAULT);
+	}
+
+	err = arena_type_capacity(env, btf, t, tname, &capacity);
+	if (err)
+		return ERR_PTR(err);
+
+	types = krealloc_array(aux->arena_types, aux->arena_type_cnt + 1, sizeof(*types),
+			       GFP_KERNEL_ACCOUNT);
+	if (!types)
+		return ERR_PTR(-ENOMEM);
+	aux->arena_types = types;
+
+	type = bpf_arena_type_get(bpf_prog_arena(env->prog), btf, btf_id, meta->record, capacity);
+	if (IS_ERR(type)) {
+		switch (PTR_ERR(type)) {
+		case -E2BIG:
+			verbose(env, "struct %s is too large for a typed arena: size %u, capacity %u\n",
+				tname, t->size, capacity);
+			break;
+		case -ENOSPC:
+			verbose(env, "no room left in the typed region for struct %s\n", tname);
+			break;
+		case -EOPNOTSUPP:
+			verbose(env, "typed arenas are not supported on this architecture\n");
+			break;
+		default:
+			verbose(env, "cannot register a typed arena for struct %s: %ld\n",
+				tname, PTR_ERR(type));
+		}
+		return type;
+	}
+	aux->arena_types[aux->arena_type_cnt++] = type;
+	verbose(env, "typed arena for struct %s: slot %u bytes, capacity %u, size %llu bytes\n",
+		tname, 1u << type->slot_shift, capacity, 1ull << type->size_shift);
+	return type;
+}
+
+/*
+ * dst = arena_type_cast(dst, src): promote the handle in dst to a pointer to
+ * an object of the struct whose type ID is the constant in src. Any value
+ * promotes, since the lowering masks it to an aligned slot inside the typed
+ * arena, so the result is trusted and never NULL. The type ID must be known
+ * here rather than at run time, and the lowering is per instruction, so one
+ * instruction cannot cast to two types on different paths.
+ */
+static int check_arena_type_cast(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state *src = &regs[insn->src_reg];
+	struct bpf_reg_state *dst = &regs[insn->dst_reg];
+	struct bpf_arena_type *type;
+	int err;
+
+	/* The arena itself needs CAP_PERFMON, so the leak rules already permit a kernel pointer. */
+	if (!env->prog->aux->arena) {
+		verbose(env, "arena_type_cast insn can only be used in a program that has an associated arena\n");
+		return -EINVAL;
+	}
+	if (!env->prog->aux->btf) {
+		verbose(env, "arena_type_cast insn requires program BTF\n");
+		return -EINVAL;
+	}
+	if (src->type != SCALAR_VALUE || !tnum_is_const(src->var_off) ||
+	    src->var_off.value > U32_MAX) {
+		verbose(env, "R%d must hold a constant type ID for arena_type_cast\n",
+			insn->src_reg);
+		return -EINVAL;
+	}
+	err = mark_chain_precision(env, insn->src_reg);
+	if (err)
+		return err;
+
+	type = arena_type_register(env, src->var_off.value);
+	if (IS_ERR(type))
+		return PTR_ERR(type);
+	if (aux->arena_type && aux->arena_type != type) {
+		verbose(env, "arena_type_cast at insn %d casts to different types on different paths\n",
+			env->insn_idx);
+		return -EINVAL;
+	}
+	aux->arena_type = type;
+
+	mark_reg_known_zero(env, regs, insn->dst_reg);
+	dst->type = PTR_TO_BTF_ID | MEM_ARENA;
+	dst->btf = env->prog->aux->btf;
+	dst->btf_id = type->btf_id;
+	return 0;
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -16979,6 +17174,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			err = check_reg_arg(env, insn->src_reg, SRC_OP);
 			if (err)
 				return err;
+			/* an arena_type_cast reads the handle from its dst */
+			if (insn->off == BPF_ARENA_TYPE_CAST) {
+				err = check_reg_arg(env, insn->dst_reg, SRC_OP);
+				if (err)
+					return err;
+			}
 		}
 
 		/* check dest operand, mark as required later */
@@ -16991,7 +17192,9 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			struct bpf_reg_state *dst_reg = regs + insn->dst_reg;
 
 			if (BPF_CLASS(insn->code) == BPF_ALU64) {
-				if (insn->imm) {
+				if (insn->off == BPF_ARENA_TYPE_CAST) {
+					return check_arena_type_cast(env, insn);
+				} else if (insn->imm) {
 					/* off == BPF_ADDR_SPACE_CAST */
 					mark_reg_unknown(env, regs, insn->dst_reg);
 					if (insn->imm == 1) /* cast from as(1) to as(0) */
@@ -20137,6 +20340,11 @@ static int check_alu_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					verbose(env, "addr_space_cast insn can only convert between address space 1 and 0\n");
 					return -EINVAL;
 				}
+			} else if (insn->off == BPF_ARENA_TYPE_CAST) {
+				if (insn->dst_reg == insn->src_reg || insn->imm) {
+					verbose(env, "arena_type_cast insn needs distinct registers and zero imm\n");
+					return -EINVAL;
+				}
 			} else if ((insn->off != 0 && insn->off != 8 &&
 				    insn->off != 16 && insn->off != 32) || insn->imm) {
 				verbose(env, "BPF_MOV uses reserved fields\n");
@@ -20544,9 +20752,27 @@ static int resolve_func_ptrs(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * Drop the rejected program's typed arena references before its arena map
+ * reference. A typed arena nobody else registered is retracted; one that a
+ * loaded program registered lives on for the map's lifetime.
+ */
+static void release_arena_types(struct bpf_verifier_env *env)
+{
+	struct bpf_prog_aux *aux = env->prog->aux;
+	u32 i;
+
+	for (i = 0; i < aux->arena_type_cnt; i++)
+		bpf_arena_type_put(bpf_prog_arena(env->prog), aux->arena_types[i]);
+	kfree(aux->arena_types);
+	aux->arena_types = NULL;
+	aux->arena_type_cnt = 0;
+}
+
 /* drop refcnt of maps used by the rejected program */
 static void release_maps(struct bpf_verifier_env *env)
 {
+	release_arena_types(env);
 	__bpf_free_used_maps(env->prog->aux, env->used_maps,
 			     env->used_map_cnt);
 }
@@ -22652,6 +22878,9 @@ skip_full_check:
 		if (ret == 0)
 			sanitize_dead_code(env);
 	}
+
+	if (ret == 0)
+		ret = bpf_lower_arena_type_casts(env);
 
 	if (ret == 0)
 		/* program is valid, convert *(u32*)(ctx + off) accesses */

@@ -495,6 +495,32 @@ void bpf_arena_type_put(struct bpf_map *map, struct bpf_arena_type *type)
 	arena_type_free(arena, type);
 }
 
+/*
+ * bpf_arena_type_promote_insns - lower an arena_type_cast to plain BPF
+ * @type: the typed arena the cast names
+ * @dst: the register holding the handle, which receives the pointer
+ * @buf: room for the lowered instructions
+ *
+ * The mask is the typed arena's size less its slot size: it rounds an arbitrary
+ * handle down to an aligned slot and, as a positive 64-bit AND, clears the high
+ * half of the register, so every input lands on a live object of the type. The
+ * base is then added as a 64-bit constant. Nothing depends on the source of the
+ * handle, so the same sequence casts a raw arena pointer or an object of another
+ * type. Return the number of instructions written.
+ */
+int bpf_arena_type_promote_insns(const struct bpf_arena_type *type, u8 dst,
+				 struct bpf_insn *buf)
+{
+	struct bpf_insn base[2] = { BPF_LD_IMM64(BPF_REG_AX, (unsigned long)type->base) };
+	u32 mask = arena_type_size(type) - arena_type_slot_size(type);
+
+	buf[0] = BPF_ALU64_IMM(BPF_AND, dst, mask);
+	buf[1] = base[0];
+	buf[2] = base[1];
+	buf[3] = BPF_ALU64_REG(BPF_ADD, dst, BPF_REG_AX);
+	return 4;
+}
+
 static void arena_types_free(struct bpf_arena *arena)
 {
 	struct bpf_arena_type *type, *tmp;

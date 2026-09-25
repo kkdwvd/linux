@@ -1395,6 +1395,12 @@ enum {
 
 enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,
+	/*
+	 * dst = arena_type_cast(dst, src): dst holds an arena handle and becomes
+	 * a pointer to the object it names in the typed arena of the struct
+	 * whose program-BTF type ID is the constant in src. imm is reserved.
+	 */
+	BPF_ARENA_TYPE_CAST = 2,
 };
 
 /* flags for BPF_MAP_UPDATE_ELEM command */

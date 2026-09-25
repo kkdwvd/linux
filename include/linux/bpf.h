@@ -275,6 +275,13 @@ struct btf_record {
 };
 
 /*
+ * Objects a typed arena holds unless the struct carries an explicit
+ * "arena_capacity:<n>" BTF decl tag.
+ */
+#define BPF_ARENA_TYPE_DEFAULT_CAPACITY 1024
+#define BPF_ARENA_CAPACITY_TAG "arena_capacity:"
+
+/*
  * Map-owned storage for one program-BTF struct with special fields: a
  * kernel-only typed arena of 1 << size_shift bytes at base, a multiple of its
  * size, holding one object per 1 << slot_shift bytes. Objects are reached
@@ -699,6 +706,8 @@ struct bpf_map *bpf_prog_arena(struct bpf_prog *prog);
 struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, u32 btf_id,
 					  const struct btf_record *record, u32 capacity);
 void bpf_arena_type_put(struct bpf_map *map, struct bpf_arena_type *type);
+int bpf_arena_type_promote_insns(const struct bpf_arena_type *type, u8 dst,
+				 struct bpf_insn *buf);
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
 
 struct bpf_offload_dev;
@@ -907,6 +916,9 @@ enum bpf_type_flag {
 
 	/* DYNPTR points to file */
 	DYNPTR_TYPE_FILE	= BIT(20 + BPF_BASE_TYPE_BITS),
+
+	/* MEM is an object in a typed arena, reached through a native pointer. */
+	MEM_ARENA		= BIT(21 + BPF_BASE_TYPE_BITS),
 
 	__BPF_TYPE_FLAG_MAX,
 	__BPF_TYPE_LAST_FLAG	= __BPF_TYPE_FLAG_MAX - 1,
@@ -1873,6 +1885,9 @@ struct bpf_prog_aux {
 	u64 prog_array_member_cnt; /* counts how many times as member of prog_array */
 	struct mutex ext_mutex; /* mutex for freplace_link_cnt and prog_array_member_cnt */
 	struct bpf_arena *arena;
+	/* typed arenas this program casts to; referenced until the load fails */
+	struct bpf_arena_type **arena_types;
+	u32 arena_type_cnt;
 	void (*recursion_detected)(struct bpf_prog *prog); /* callback if recursion is detected */
 	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
 	const struct btf_type *attach_func_proto;

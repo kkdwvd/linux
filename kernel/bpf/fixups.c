@@ -734,6 +734,39 @@ int bpf_opt_remove_dead_code(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * Replace every arena_type_cast with the promotion sequence of the typed arena
+ * the verifier resolved for it. The instruction is verified per type, so a cast
+ * has exactly one typed arena by the time it gets here.
+ */
+int bpf_lower_arena_type_casts(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn = env->prog->insnsi;
+	int i, cnt, delta = 0, insn_cnt = env->prog->len;
+	const struct bpf_arena_type *type;
+	struct bpf_insn insn_buf[4];
+	struct bpf_prog *new_prog;
+
+	for (i = 0; i < insn_cnt; i++, insn++) {
+		if (!insn_is_arena_type_cast(insn))
+			continue;
+		type = env->insn_aux_data[i + delta].arena_type;
+		if (!type) {
+			verifier_bug(env, "arena_type_cast at insn %d has no typed arena", i);
+			return -EFAULT;
+		}
+		cnt = bpf_arena_type_promote_insns(type, insn->dst_reg, insn_buf);
+		new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+		if (!new_prog)
+			return -ENOMEM;
+		delta += cnt - 1;
+		env->prog = new_prog;
+		insn = new_prog->insnsi + i + delta;
+	}
+
+	return 0;
+}
+
 int bpf_opt_remove_nops(struct bpf_verifier_env *env)
 {
 	struct bpf_insn *insn = env->prog->insnsi;

@@ -3087,6 +3087,8 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
 	bpf_prog_stream_free(aux->prog);
+	/* The typed arenas outlive the program; only the load's failure retracts them. */
+	kfree(aux->arena_types);
 #endif
 #ifdef CONFIG_CGROUP_BPF
 	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)

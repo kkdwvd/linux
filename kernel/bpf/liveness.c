@@ -2388,6 +2388,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			def = dst;
 			if (BPF_SRC(insn->code) == BPF_K)
 				use = 0;
+			else if (insn->off == BPF_ARENA_TYPE_CAST)
+				/* dst = arena_type_cast(dst, src) reads the handle in dst */
+				use = dst | src;
 			else
 				use = class == BPF_ALU64 ? src : src32;
 			break;

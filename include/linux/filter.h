@@ -269,6 +269,12 @@ static inline bool insn_is_cast_user(const struct bpf_insn *insn)
 			      insn->imm == 1U << 16;
 }
 
+static inline bool insn_is_arena_type_cast(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
+	       insn->off == BPF_ARENA_TYPE_CAST;
+}
+
 /* BPF_LD_IMM64 macro encodes single 'load 64-bit immediate' insn */
 #define BPF_LD_IMM64(DST, IMM)					\
 	BPF_LD_IMM64_RAW(DST, 0, IMM)
