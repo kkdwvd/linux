@@ -293,6 +293,7 @@ struct btf_record {
  */
 struct bpf_arena_type {
 	struct list_head node;
+	struct bpf_map *map;
 	refcount_t refcnt;
 	struct btf *btf;
 	u32 btf_id;
@@ -716,6 +717,10 @@ int bpf_arena_type_promote_insns(const struct bpf_arena_type *type, u8 dst,
 				 struct bpf_insn *buf);
 int bpf_arena_type_demote_insns(const struct bpf_arena_type *type, u8 dst, u8 src,
 				struct bpf_insn *buf);
+static inline struct bpf_map *bpf_arena_type_map(const struct bpf_arena_type *type)
+{
+	return type->map;
+}
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
 
 struct bpf_offload_dev;

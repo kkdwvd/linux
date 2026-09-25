@@ -758,6 +758,9 @@ int bpf_lower_typed_arena_insns(struct bpf_verifier_env *env)
 		if (!type)
 			continue;
 		class = BPF_CLASS(insn->code);
+		/* a typed page kfunc call receives its type in the kfunc fixup */
+		if (class == BPF_JMP && BPF_OP(insn->code) == BPF_CALL)
+			continue;
 		reg = aux->arena_reg;
 		if (insn_is_arena_type_cast(insn)) {
 			cnt = bpf_arena_type_promote_insns(type, insn->dst_reg, insn_buf);
