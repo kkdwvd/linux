@@ -40,11 +40,31 @@
  * bpf program can allocate a page via bpf_arena_alloc_pages() kfunc
  * which will insert it into kernel vm_area.
  * The later fault-in from user space will populate that page into user vma.
+ *
+ * Below the lower guard the same vm_area holds a kernel-only typed region:
+ *
+ *   [ slack ][ typed region, 2 GiB ][ GUARD_SZ/2 ][ 4Gb raw arena ][ GUARD_SZ/2 ]
+ *                                                 ^ kern_vm_start
+ *
+ * Each program-BTF struct with special fields that a program casts arena
+ * memory to gets a typed arena in the region: a naturally aligned power-of-two
+ * slice holding one power-of-two slot per object, addressed by the verifier
+ * through native kernel pointers that it constructs itself. Userspace never
+ * maps these pages, and raw arena pointers cannot reach them because their
+ * instruction displacement is bounded by the guard.
  */
 
 /* number of bytes addressable by LDX/STX insn with 16-bit 'off' field */
 #define GUARD_SZ round_up(1ull << sizeof_field(struct bpf_insn, off) * 8, PAGE_SIZE << 1)
-#define KERN_VM_SZ (SZ_4G + GUARD_SZ)
+/*
+ * The typed region is aligned to the largest typed arena: a naturally aligned
+ * slice inside it then starts at a multiple of its own size, so the low 32 bits
+ * of a typed pointer mask back to the object's offset. get_vm_area() cannot
+ * align, so the reservation carries that much slack in front of the region.
+ */
+#define ARENA_TYPE_MAX_SZ SZ_128M
+#define TYPED_VM_SZ SZ_2G
+#define KERN_VM_SZ (ARENA_TYPE_MAX_SZ + TYPED_VM_SZ + SZ_4G + GUARD_SZ)
 
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
 
@@ -60,7 +80,11 @@ struct bpf_arena {
 	/* number of pages currently populated in the arena */
 	u64 nr_pages;
 	struct list_head vma_list;
-	/* protects vma_list */
+	/* typed arenas in address order; mutated under lock, walked under RCU */
+	struct list_head arena_types;
+	/* page tables of all typed arenas, for accounting */
+	u64 arena_type_mem;
+	/* protects vma_list and arena_types */
 	struct mutex lock;
 	u64 zap_gen;
 	struct mutex zap_mutex;
@@ -78,9 +102,14 @@ struct arena_free_span {
 	u32 page_cnt;
 };
 
+static unsigned long arena_typed_base(struct bpf_arena *arena)
+{
+	return ALIGN((unsigned long)arena->kern_vm->addr, ARENA_TYPE_MAX_SZ);
+}
+
 u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena)
 {
-	return arena ? (u64) (long) arena->kern_vm->addr + GUARD_SZ / 2 : 0;
+	return arena ? arena_typed_base(arena) + TYPED_VM_SZ + GUARD_SZ / 2 : 0;
 }
 
 u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena)
@@ -263,6 +292,171 @@ static int populate_pgtable_except_pte(struct bpf_arena *arena)
 				   SZ_4G + GUARD_SZ / 2, apply_range_set_cb, NULL);
 }
 
+static u64 arena_type_size(const struct bpf_arena_type *type)
+{
+	return 1ull << type->size_shift;
+}
+
+/* One page table entry per page of the typed arena. */
+static u64 arena_type_pgtable_size(const struct bpf_arena_type *type)
+{
+	return (arena_type_size(type) >> PAGE_SHIFT) * sizeof(pte_t);
+}
+
+/*
+ * First-fit search for a naturally aligned power-of-two slice of the typed
+ * region. The registry is sorted by address, so its gaps are visited in order.
+ */
+static s64 arena_type_find_slice(struct bpf_arena *arena, u64 size)
+{
+	unsigned long region = arena_typed_base(arena);
+	struct bpf_arena_type *type;
+	u64 off = 0, start;
+
+	list_for_each_entry(type, &arena->arena_types, node) {
+		start = ALIGN(off, size);
+		if (start + size <= (unsigned long)type->base - region)
+			return start;
+		off = (unsigned long)type->base - region + arena_type_size(type);
+	}
+	start = ALIGN(off, size);
+	return start + size <= TYPED_VM_SZ ? start : -ENOSPC;
+}
+
+static void arena_type_insert(struct bpf_arena *arena, struct bpf_arena_type *type)
+{
+	struct bpf_arena_type *pos;
+
+	list_for_each_entry(pos, &arena->arena_types, node) {
+		if (pos->base > type->base) {
+			list_add_tail_rcu(&type->node, &pos->node);
+			return;
+		}
+	}
+	list_add_tail_rcu(&type->node, &arena->arena_types);
+}
+
+static void arena_type_free(struct bpf_arena *arena, struct bpf_arena_type *type)
+{
+	arena->arena_type_mem -= arena_type_pgtable_size(type);
+	btf_put(type->btf);
+	kfree(type);
+}
+
+/*
+ * bpf_arena_type_get - find or create the typed arena of a program BTF struct
+ * @map: the arena map
+ * @btf: the program BTF holding the struct
+ * @btf_id: the struct's type ID in @btf
+ * @record: the struct's special fields, which the caller validated
+ * @capacity: the declared number of objects
+ *
+ * A type is keyed by @btf and @btf_id: two programs with different BTF objects
+ * get distinct typed arenas even for structurally equal structs, and one BTF
+ * declares one capacity for a struct. The slot is the power of two covering
+ * the object, at most a page, and the typed arena is the power of two covering
+ * @capacity slots, at most ARENA_TYPE_MAX_SZ. The caller holds a reference on
+ * the returned type; see bpf_arena_type_put().
+ *
+ * Return the type, or -E2BIG when the object or the typed arena is too large,
+ * -ENOSPC when the region has no naturally aligned slice left.
+ */
+struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, u32 btf_id,
+					  const struct btf_record *record, u32 capacity)
+{
+	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+	const struct btf_type *t = btf_type_by_id(btf, btf_id);
+	struct bpf_arena_type *type;
+	u64 size, slot_size;
+	s64 off;
+	int err;
+
+	if (!t || !t->size || !record || !capacity)
+		return ERR_PTR(-EINVAL);
+	slot_size = roundup_pow_of_two(t->size);
+	if (slot_size > PAGE_SIZE)
+		return ERR_PTR(-E2BIG);
+	size = max_t(u64, roundup_pow_of_two(slot_size * capacity), PAGE_SIZE);
+	if (size > ARENA_TYPE_MAX_SZ)
+		return ERR_PTR(-E2BIG);
+
+	guard(mutex)(&arena->lock);
+
+	list_for_each_entry(type, &arena->arena_types, node) {
+		if (type->btf != btf || type->btf_id != btf_id)
+			continue;
+		refcount_inc(&type->refcnt);
+		return type;
+	}
+
+	off = arena_type_find_slice(arena, size);
+	if (off < 0)
+		return ERR_PTR(off);
+
+	type = kzalloc(sizeof(*type), GFP_KERNEL_ACCOUNT);
+	if (!type)
+		return ERR_PTR(-ENOMEM);
+	type->base = (void *)(arena_typed_base(arena) + off);
+	type->size_shift = ilog2(size);
+	type->slot_shift = ilog2(slot_size);
+	/*
+	 * Populate the page tables now. A fault on an unbacked typed page is
+	 * recovered in atomic context, which cannot allocate them then.
+	 */
+	err = apply_to_page_range(&init_mm, (unsigned long)type->base, size,
+				  apply_range_set_cb, NULL);
+	if (err) {
+		kfree(type);
+		return ERR_PTR(err);
+	}
+	refcount_set(&type->refcnt, 1);
+	btf_get(btf);
+	type->btf = btf;
+	type->btf_id = btf_id;
+	type->record = record;
+	arena_type_insert(arena, type);
+	arena->arena_type_mem += arena_type_pgtable_size(type);
+	return type;
+}
+
+/*
+ * bpf_arena_type_put - drop a reference taken by bpf_arena_type_get()
+ * @map: the arena map
+ * @type: the type
+ *
+ * Only a program whose load was rejected drops its references; a program that
+ * loaded keeps the type alive for the map's lifetime, so that its objects
+ * survive program reloads. The last reference retracts the typed arena. Its
+ * page tables stay populated until the map is freed and serve the next slice
+ * placed there.
+ */
+void bpf_arena_type_put(struct bpf_map *map, struct bpf_arena_type *type)
+{
+	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+
+	guard(mutex)(&arena->lock);
+	if (!refcount_dec_and_test(&type->refcnt))
+		return;
+	/*
+	 * No loaded program holds a pointer into a typed arena it did not
+	 * register, so nothing can fault in this slice; walkers of the registry
+	 * can still be stepping past this node.
+	 */
+	list_del_rcu(&type->node);
+	synchronize_rcu();
+	arena_type_free(arena, type);
+}
+
+static void arena_types_free(struct bpf_arena *arena)
+{
+	struct bpf_arena_type *type, *tmp;
+
+	list_for_each_entry_safe(type, tmp, &arena->arena_types, node) {
+		list_del(&type->node);
+		arena_type_free(arena, type);
+	}
+}
+
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 {
 	struct vm_struct *kern_vm;
@@ -307,6 +501,7 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		arena->user_vm_end = arena->user_vm_start + vm_range;
 
 	INIT_LIST_HEAD(&arena->vma_list);
+	INIT_LIST_HEAD(&arena->arena_types);
 	init_llist_head(&arena->free_spans);
 	init_irq_work(&arena->free_irq, arena_free_irq);
 	INIT_WORK(&arena->free_work, arena_free_worker);
@@ -392,6 +587,7 @@ static void arena_map_free(struct bpf_map *map)
 	 */
 	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
 				     SZ_4G + GUARD_SZ / 2, existing_page_cb, arena);
+	arena_types_free(arena);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
 	__free_page(arena->scratch_page);
@@ -419,7 +615,8 @@ static u64 arena_map_mem_usage(const struct bpf_map *map)
 {
 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
 
-	return (u64)READ_ONCE(arena->nr_pages) << PAGE_SHIFT;
+	return ((u64)READ_ONCE(arena->nr_pages) << PAGE_SHIFT) +
+	       READ_ONCE(arena->arena_type_mem);
 }
 
 struct vma_list {

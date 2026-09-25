@@ -274,6 +274,24 @@ struct btf_record {
 	struct btf_field fields[];
 };
 
+/*
+ * Map-owned storage for one program-BTF struct with special fields: a
+ * kernel-only typed arena of 1 << size_shift bytes at base, a multiple of its
+ * size, holding one object per 1 << slot_shift bytes. Objects are reached
+ * through native kernel pointers that the verifier constructs, so record is
+ * the struct's own special-field record, from the BTF that is retained here.
+ */
+struct bpf_arena_type {
+	struct list_head node;
+	refcount_t refcnt;
+	struct btf *btf;
+	u32 btf_id;
+	u8 slot_shift;
+	u8 size_shift;
+	void *base;
+	const struct btf_record *record;
+};
+
 /* Non-opaque version of bpf_rb_node in uapi/linux/bpf.h */
 struct bpf_rb_node_kern {
 	struct rb_node rb_node;
@@ -673,6 +691,9 @@ u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena);
 u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena);
 u64 bpf_arena_map_kern_vm_start(struct bpf_map *map);
 struct bpf_map *bpf_prog_arena(struct bpf_prog *prog);
+struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, u32 btf_id,
+					  const struct btf_record *record, u32 capacity);
+void bpf_arena_type_put(struct bpf_map *map, struct bpf_arena_type *type);
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
 
 struct bpf_offload_dev;
