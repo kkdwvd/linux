@@ -65,6 +65,16 @@
 #define ARENA_TYPE_MAX_SZ SZ_128M
 #define TYPED_VM_SZ SZ_2G
 #define KERN_VM_SZ (ARENA_TYPE_MAX_SZ + TYPED_VM_SZ + SZ_4G + GUARD_SZ)
+/*
+ * Typed accesses are native loads and stores, so a fault on an unbacked typed
+ * page can only be recovered where the arena's kernel fault path is wired up,
+ * which is where the architecture provides an atomic PTE installer.
+ */
+#ifdef ptep_try_set
+#define ARENA_TYPE_SUPPORTED true
+#else
+#define ARENA_TYPE_SUPPORTED false
+#endif
 
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
 
@@ -297,10 +307,21 @@ static u64 arena_type_size(const struct bpf_arena_type *type)
 	return 1ull << type->size_shift;
 }
 
-/* One page table entry per page of the typed arena. */
-static u64 arena_type_pgtable_size(const struct bpf_arena_type *type)
+static u32 arena_type_slot_size(const struct bpf_arena_type *type)
 {
-	return (arena_type_size(type) >> PAGE_SHIFT) * sizeof(pte_t);
+	return 1u << type->slot_shift;
+}
+
+static unsigned long arena_type_nr_pages(const struct bpf_arena_type *type)
+{
+	return arena_type_size(type) >> PAGE_SHIFT;
+}
+
+/* One page table entry per page of the typed arena, its scratch page, and its bitmap. */
+static u64 arena_type_static_mem(const struct bpf_arena_type *type)
+{
+	return arena_type_nr_pages(type) * sizeof(pte_t) + PAGE_SIZE +
+	       BITS_TO_LONGS(arena_type_nr_pages(type)) * sizeof(long);
 }
 
 /*
@@ -338,7 +359,15 @@ static void arena_type_insert(struct bpf_arena *arena, struct bpf_arena_type *ty
 
 static void arena_type_free(struct bpf_arena *arena, struct bpf_arena_type *type)
 {
-	arena->arena_type_mem -= arena_type_pgtable_size(type);
+	void *scratch = page_address(type->scratch_page);
+	u32 off;
+
+	arena->arena_type_mem -= arena_type_static_mem(type);
+	/* Programs may have stored kptrs into the dummy objects. */
+	for (off = 0; off < PAGE_SIZE; off += arena_type_slot_size(type))
+		bpf_obj_free_fields(type->record, scratch + off);
+	__free_page(type->scratch_page);
+	bitmap_free(type->pages);
 	btf_put(type->btf);
 	kfree(type);
 }
@@ -366,11 +395,14 @@ struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, 
 {
 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
 	const struct btf_type *t = btf_type_by_id(btf, btf_id);
+	struct mem_cgroup *new_memcg, *old_memcg;
 	struct bpf_arena_type *type;
 	u64 size, slot_size;
 	s64 off;
 	int err;
 
+	if (!ARENA_TYPE_SUPPORTED)
+		return ERR_PTR(-EOPNOTSUPP);
 	if (!t || !t->size || !record || !capacity)
 		return ERR_PTR(-EINVAL);
 	slot_size = roundup_pow_of_two(t->size);
@@ -399,24 +431,40 @@ struct bpf_arena_type *bpf_arena_type_get(struct bpf_map *map, struct btf *btf, 
 	type->base = (void *)(arena_typed_base(arena) + off);
 	type->size_shift = ilog2(size);
 	type->slot_shift = ilog2(slot_size);
+	type->pages = bitmap_zalloc(arena_type_nr_pages(type), GFP_KERNEL_ACCOUNT);
+	if (!type->pages) {
+		err = -ENOMEM;
+		goto free_type;
+	}
+	bpf_map_memcg_enter(map, &old_memcg, &new_memcg);
+	err = bpf_map_alloc_pages(map, NUMA_NO_NODE, 1, &type->scratch_page);
+	bpf_map_memcg_exit(old_memcg, new_memcg);
+	if (err)
+		goto free_bitmap;
 	/*
 	 * Populate the page tables now. A fault on an unbacked typed page is
 	 * recovered in atomic context, which cannot allocate them then.
 	 */
 	err = apply_to_page_range(&init_mm, (unsigned long)type->base, size,
 				  apply_range_set_cb, NULL);
-	if (err) {
-		kfree(type);
-		return ERR_PTR(err);
-	}
+	if (err)
+		goto free_scratch;
 	refcount_set(&type->refcnt, 1);
 	btf_get(btf);
 	type->btf = btf;
 	type->btf_id = btf_id;
 	type->record = record;
 	arena_type_insert(arena, type);
-	arena->arena_type_mem += arena_type_pgtable_size(type);
+	arena->arena_type_mem += arena_type_static_mem(type);
 	return type;
+
+free_scratch:
+	__free_page(type->scratch_page);
+free_bitmap:
+	bitmap_free(type->pages);
+free_type:
+	kfree(type);
+	return ERR_PTR(err);
 }
 
 /*
@@ -1393,6 +1441,63 @@ static void __bpf_prog_report_arena_violation(struct bpf_prog *prog, bool write,
 	}));
 }
 
+static struct bpf_arena_type *arena_type_lookup(struct bpf_arena *arena, unsigned long addr)
+{
+	struct bpf_arena_type *type;
+
+	list_for_each_entry_rcu(type, &arena->arena_types, node)
+		if (addr - (unsigned long)type->base < arena_type_size(type))
+			return type;
+	return NULL;
+}
+
+static void __bpf_prog_report_arena_type_violation(struct bpf_prog *prog,
+						   const struct bpf_arena_type *type,
+						   bool write, unsigned long addr)
+{
+	const struct btf_type *t = btf_type_by_id(type->btf, type->btf_id);
+	struct bpf_stream_stage ss;
+
+	/* Use main prog for stream access */
+	prog = prog->aux->main_prog_aux->prog;
+
+	bpf_stream_stage(ss, prog, BPF_STDERR, ({
+		bpf_stream_printk(ss, "ERROR: Typed arena %s access to unallocated struct %s at handle 0x%lx\n",
+				  write ? "WRITE" : "READ",
+				  btf_name_by_offset(type->btf, t->name_off),
+				  (addr - (unsigned long)type->base) & ~(arena_type_slot_size(type) - 1));
+		bpf_stream_dump_stack(ss);
+	}));
+}
+
+/*
+ * A typed access reached an unbacked page, so the program used a handle it
+ * never allocated. Every handle must still denote a live object of the type:
+ * back the page with the type's scratch page, a zeroed dummy object per slot
+ * shared by every unallocated handle. Mark the page taken first, so that the
+ * allocator never puts a real page where a program may be in the middle of
+ * using the dummy object; nothing could wait for that use to end, since the
+ * next stray access would fault the scratch page right back in. The mark is
+ * an atomic bit because the fault can happen in any context.
+ */
+static bool arena_type_handle_page_fault(struct bpf_arena *arena, struct bpf_prog *prog,
+					 unsigned long addr, bool is_write)
+{
+	unsigned long page_addr = addr & PAGE_MASK;
+	struct bpf_arena_type *type;
+
+	guard(rcu)();
+	type = arena_type_lookup(arena, page_addr);
+	if (!type)
+		return false;
+	set_bit((page_addr - (unsigned long)type->base) >> PAGE_SHIFT, type->pages);
+	apply_to_page_range(&init_mm, page_addr, PAGE_SIZE, apply_range_set_scratch_cb,
+			    type->scratch_page);
+	flush_vmap_cache(page_addr, PAGE_SIZE);
+	__bpf_prog_report_arena_type_violation(prog, type, is_write, addr);
+	return true;
+}
+
 bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned long fault_ip)
 {
 	struct bpf_arena *arena;
@@ -1409,12 +1514,16 @@ bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned lon
 	if (!arena)
 		return false;
 
+	if (page_addr - arena_typed_base(arena) < TYPED_VM_SZ)
+		return arena_type_handle_page_fault(arena, prog, addr, is_write);
+
 	kbase = bpf_arena_get_kern_vm_start(arena);
 
 	/*
 	 * Recovery covers the 4 GiB mappable band plus the upper half-guard.
-	 * Lower guard is unreachable from kfuncs; an address there indicates
-	 * a different bug class - leave it to the regular kernel oops path.
+	 * Lower guard is unreachable from typed accesses and from kfuncs; an
+	 * address there indicates a different bug class - leave it to the
+	 * regular kernel oops path.
 	 */
 	if (page_addr < kbase || page_addr >= kbase + SZ_4G + GUARD_SZ / 2)
 		return false;

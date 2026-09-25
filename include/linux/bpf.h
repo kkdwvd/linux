@@ -280,6 +280,9 @@ struct btf_record {
  * size, holding one object per 1 << slot_shift bytes. Objects are reached
  * through native kernel pointers that the verifier constructs, so record is
  * the struct's own special-field record, from the BTF that is retained here.
+ * Pages are backed on demand; one that no program allocated reads as the
+ * scratch page, a zeroed dummy object per slot, once an access faults it in.
+ * The pages bitmap marks every page that holds a mapping, real or scratch.
  */
 struct bpf_arena_type {
 	struct list_head node;
@@ -289,6 +292,8 @@ struct bpf_arena_type {
 	u8 slot_shift;
 	u8 size_shift;
 	void *base;
+	struct page *scratch_page;
+	unsigned long *pages;
 	const struct btf_record *record;
 };
 
