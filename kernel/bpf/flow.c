@@ -2303,6 +2303,15 @@ static void flow_shape_places(struct bpf_verifier_env *env, struct flow_state *s
 		for (i = 0; i < frame->out_stack_arg_cnt; i++)
 			flow_shape_ptr(sh, fr << 10 | (i + args), &frame->stack_arg_regs[i]);
 	}
+	/* the slots that a reference owns are places past those of the frames */
+	for (fr = 0; fr < st->acquired_refs; fr++) {
+		const struct bpf_reference_state *ref = &st->refs[fr];
+
+		for (i = 0; i < ref->nr_slots; i++)
+			if (bpf_is_spilled_reg(&ref->slots[i]))
+				flow_shape_ptr(sh, (MAX_CALL_FRAMES + fr) << 10 | i,
+					       &ref->slots[i].spilled_ptr);
+	}
 }
 
 /* The part of the shape that is not */
@@ -2323,7 +2332,7 @@ static void flow_shape_ctx(const struct bpf_verifier_state *st, struct flow_shap
 	for (i = 0; i < st->acquired_refs; i++) {
 		ref = &st->refs[i];
 		/* the owner doesn't follow from entry_refs: a call may move a reference */
-		ctx = jhash_2words(ref->type, ref->frameno, ctx);
+		ctx = jhash_3words(ref->type, ref->frameno, ref->nr_slots, ctx);
 		/* nor does the argument that a frame above it got the reference in */
 		ctx = jhash(ref->args, sizeof(ref->args), ctx);
 		if (ref->type != REF_TYPE_PTR && ref->type != REF_TYPE_IRQ)
@@ -2371,8 +2380,9 @@ static __always_inline bool flow_same_shape(const struct flow_state *a, const st
  * FLOW_CHAIN	the chain of calls and the loops that every frame is in
  * FLOW_CTX	what is known about every loop, the iteration of a counted one,
  *		the flags of the state and of its frames, locks and references
- * FLOW_LAYOUT	which registers, stack slots and stack arguments hold a pointer, a dynptr,
- *		an iterator or an irq flag, which of the pointers are at a constant offset
+ * FLOW_LAYOUT	which registers, stack slots, stack arguments and slots of references hold
+ *		a pointer, a dynptr, an iterator or an irq flag, which of the pointers are at
+ *		a constant offset
  * FLOW_PTRS	what the pointers point to and which of their ids are set, the kind of the others
  * FLOW_OFFS	the constant offsets
  *

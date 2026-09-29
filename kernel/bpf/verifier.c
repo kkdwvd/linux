@@ -1452,14 +1452,50 @@ out:
 	return arr ? arr : ZERO_SIZE_PTR;
 }
 
+static void free_reference_slots(struct bpf_reference_state *refs, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		kfree(refs[i].slots);
+		refs[i].slots = NULL;
+		refs[i].nr_slots = 0;
+	}
+}
+
 static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf_verifier_state *src)
 {
+	int i;
+
+	/*
+	 * dst may be a reused state that still owns slot arrays; they must
+	 * not leak when the reference array is overwritten below.
+	 */
+	free_reference_slots(dst->refs, dst->acquired_refs);
 	dst->refs = copy_array(dst->refs, src->refs, src->acquired_refs,
 			       sizeof(struct bpf_reference_state), BPF_VERIFIER_GFP);
-	if (!dst->refs)
+	if (!dst->refs) {
+		dst->acquired_refs = 0;
 		return -ENOMEM;
+	}
 
+	/*
+	 * The shallow copy above aliased src's slot arrays. Detach them all
+	 * before allocating so that a failure below leaves dst owning only
+	 * its own arrays and bpf_free_verifier_state() can clean up.
+	 */
 	dst->acquired_refs = src->acquired_refs;
+	for (i = 0; i < src->acquired_refs; i++)
+		dst->refs[i].slots = NULL;
+	for (i = 0; i < src->acquired_refs; i++) {
+		if (!src->refs[i].slots)
+			continue;
+		dst->refs[i].slots = kmemdup_array(src->refs[i].slots, src->refs[i].nr_slots,
+						   sizeof(*src->refs[i].slots), BPF_VERIFIER_GFP);
+		if (!dst->refs[i].slots)
+			return -ENOMEM;
+	}
+
 	dst->active_locks = src->active_locks;
 	dst->active_preempt_locks = src->active_preempt_locks;
 	dst->active_rcu_locks = src->active_rcu_locks;
@@ -1642,6 +1678,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	 * it can detect out-of-order IRQ restore. Hence use memmove to shift
 	 * the array instead of swapping the final element into the deleted idx.
 	 */
+	kfree(state->refs[idx].slots);
 	last_idx = state->acquired_refs - 1;
 	rem = state->acquired_refs - idx - 1;
 	if (last_idx && idx != last_idx)
@@ -1795,6 +1832,7 @@ void bpf_free_verifier_state(struct bpf_verifier_state *state,
 		free_func_state(state->frame[i]);
 		state->frame[i] = NULL;
 	}
+	free_reference_slots(state->refs, state->acquired_refs);
 	kfree(state->refs);
 	if (free_self)
 		kfree(state);
@@ -11820,6 +11858,21 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		if (arg_needs_caller(env, state, sub, &caller->stack_arg_regs[i]))
 			return false;
 	}
+	/* what is spilled in the slots of what is held goes with it, see bpf_flow_return() */
+	for (i = 0; i < state->acquired_refs; i++) {
+		struct bpf_reference_state *ref = &state->refs[i];
+		struct bpf_reg_state *reg;
+		int j;
+
+		bpf_for_each_ref_slot_reg(j, ref, reg, 1 << STACK_SPILL) {
+			if (!reg)
+				continue;
+			if (reg->type == PTR_TO_STACK || base_type(reg->type) == CONST_PTR_TO_DYNPTR)
+				return false;
+			if (arg_needs_caller(env, state, sub, reg))
+				return false;
+		}
+	}
 	return true;
 }
 
@@ -11857,6 +11910,9 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		return err;
 	}
 	for (i = 0; i < entry.acquired_refs; i++) {
+		struct bpf_reg_state *reg;
+		int j;
+
 		/* the id of a lock is the id of the pointer to it, which may have none */
 		entry.refs[i].id = inherited_id(state, entry.refs[i].id);
 		if (entry.refs[i].type == REF_TYPE_PTR)
@@ -11867,6 +11923,14 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		memset(entry.refs[i].args, 0, sizeof(entry.refs[i].args));
 		entry.refs[i].args[0] = state->refs[i].args[state->curframe + 1];
 		state->refs[i].args[state->curframe + 1] = 0;
+		/* func_is_on_its_own() made sure that each of these ids has a name */
+		bpf_for_each_ref_slot_reg(j, &entry.refs[i], reg, 1 << STACK_SPILL) {
+			if (!reg)
+				continue;
+			reg->id = inherited_id(state, reg->id);
+			reg->parent_id = inherited_id(state, reg->parent_id);
+			reg->map_uid = inherited_id(state, reg->map_uid);
+		}
 		/*
 		 * What the call moved is for the function to release, see move_refs_to_callee().
 		 * The call waits as it got to the insn, with the caller as the owner: that is what
@@ -11961,6 +12025,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	struct bpf_idmap *idmap = &env->idmap_scratch;
 	u32 caller_rcu = caller->active_rcu_locks, caller_preempt = caller->active_preempt_locks;
 	struct bpf_reference_state *held;
+	struct bpf_stack_state *slots;
 	struct bpf_reg_state *reg;
 	u32 i, j, nregs, nheld, kept = 0, id;
 	int err;
@@ -11994,6 +12059,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	caller->acquired_refs = 0;
 	err = copy_reference_state(caller, exit);
 	if (err) {
+		free_reference_slots(held, nheld);
 		kfree(held);
 		return err;
 	}
@@ -12019,10 +12085,16 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		id = held[i].id ? BPF_INHERITED_ID + j : 0;
 		if (caller->refs[i].id != id || caller->refs[i].type != held[i].type)
 			break;
-		/* with the caller as the owner, of what the call moved into the function too */
+		/*
+		 * With the caller as the owner, of what the call moved into the function too.
+		 * What the function left in the slots of the object is what the caller sees.
+		 */
+		slots = caller->refs[i].slots;
 		caller->refs[i] = held[i];
+		caller->refs[i].slots = slots;
 		kept++;
 	}
+	free_reference_slots(held, nheld);
 	kfree(held);
 	/* What it means for the caller is found out in the context of the caller. */
 	if (kept != nheld || callee->entry_rcu_locks < caller_rcu ||
@@ -12047,6 +12119,15 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		if (caller->refs[i].type == REF_TYPE_PTR)
 			caller->refs[i].parent_id = fresh_id(env, idmap, caller->refs[i].parent_id);
 		caller->refs[i].frameno = caller->curframe;
+	}
+	for (i = 0; i < caller->acquired_refs; i++) {
+		bpf_for_each_ref_slot_reg(j, &caller->refs[i], reg, 1 << STACK_SPILL) {
+			if (!reg)
+				continue;
+			reg->id = fresh_id(env, idmap, reg->id);
+			reg->parent_id = fresh_id(env, idmap, reg->parent_id);
+			reg->map_uid = fresh_id(env, idmap, reg->map_uid);
+		}
 	}
 	/* and the call brought it there */
 	err = bpf_cancel_record_return(env, caller, call_idx, caller->curframe, caller->curframe,

@@ -506,10 +506,10 @@ static bool stack_arg_safe(struct bpf_verifier_env *env, struct bpf_func_state *
 	return true;
 }
 
-static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *cur,
-		    struct bpf_idmap *idmap)
+static bool refsafe(struct bpf_verifier_env *env, struct bpf_verifier_state *old,
+		    struct bpf_verifier_state *cur, struct bpf_idmap *idmap)
 {
-	int i;
+	int i, j;
 
 	if (old->acquired_refs != cur->acquired_refs)
 		return false;
@@ -557,6 +557,12 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 			WARN_ONCE(1, "Unhandled enum type for reference state: %d\n", old->refs[i].type);
 			return false;
 		}
+		/* Reference-owned slots are compared like stack slots. */
+		if (old->refs[i].nr_slots != cur->refs[i].nr_slots)
+			return false;
+		for (j = 0; j < old->refs[i].nr_slots; j++)
+			if (!slot_safe(env, &old->refs[i].slots[j], &cur->refs[i].slots[j], idmap))
+				return false;
 	}
 
 	return true;
@@ -701,7 +707,7 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (old->unwound != cur->unwound || old->changed_pkt_data != cur->changed_pkt_data)
 		return false;
 
-	if (!refsafe(old, cur, &env->idmap_scratch))
+	if (!refsafe(env, old, cur, &env->idmap_scratch))
 		return false;
 
 	/* for states to be equal callsites have to be the same

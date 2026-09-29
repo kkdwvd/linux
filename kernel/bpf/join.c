@@ -510,7 +510,8 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	for (i = 0; i < a->acquired_refs; i++) {
 		if (a->refs[i].type != b->refs[i].type ||
 		    a->refs[i].frameno != b->refs[i].frameno ||
-		    memcmp(a->refs[i].args, b->refs[i].args, sizeof(a->refs[i].args)))
+		    memcmp(a->refs[i].args, b->refs[i].args, sizeof(a->refs[i].args)) ||
+		    a->refs[i].nr_slots != b->refs[i].nr_slots)
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
@@ -553,6 +554,24 @@ static bool join_refs_check(struct bpf_join_state *js, const struct bpf_verifier
 		    !jid_strict_ok(js, a->refs[i].parent_id, b->refs[i].parent_id))
 			return false;
 	}
+	return true;
+}
+
+/* The slots that a reference owns are joined like stack slots, see bpf_reference_state::slots */
+static bool join_ref_slots(struct bpf_join_state *js, struct bpf_verifier_state *dst,
+			   const struct bpf_verifier_state *a,
+			   const struct bpf_verifier_state *b, int pass)
+{
+	u32 i, j;
+
+	/* they are no place of a loop that scalar evolution knows about */
+	js->loop = NULL;
+	js->place = -1;
+	for (i = 0; i < a->acquired_refs; i++)
+		for (j = 0; j < a->refs[i].nr_slots; j++)
+			if (!join_slot(js, &dst->refs[i].slots[j], &a->refs[i].slots[j],
+				       &b->refs[i].slots[j], pass))
+				return false;
 	return true;
 }
 
@@ -624,6 +643,8 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 				       live_regs, pass))
 				return 1;
 		}
+		if (!join_ref_slots(js, dst, a, b, pass))
+			return 1;
 	}
 
 	err = join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
