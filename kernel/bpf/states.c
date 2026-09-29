@@ -83,7 +83,7 @@ int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 	struct bpf_idmap *map = &env->idmap_scratch;
 	struct bpf_reg_state *reg;
 	struct bpf_func_state *f;
-	u32 fr, i, xreg;
+	u32 fr, i, j, xreg;
 	int held;
 
 	map->cnt = 0;
@@ -115,6 +115,13 @@ int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 				renumber_reg_ids(env, &f->stack_arg_regs[i],
 						 xreg + 1 + MAX_BPF_STACK_SLOTS + i);
 		}
+	}
+	/* The slots that references own are last. Their names follow those of all frames. */
+	xreg = MAX_CALL_FRAMES * (BPF_ID_MAP_SIZE / MAX_CALL_FRAMES + 1);
+	for (i = 0; i < st->acquired_refs && i < BPF_ID_MAP_SIZE; i++, xreg += BPF_MAX_REF_SLOTS) {
+		bpf_for_each_ref_slot_reg(j, &st->refs[i], reg, BIT(STACK_SPILL))
+			if (reg)
+				renumber_reg_ids(env, reg, xreg + j);
 	}
 	if (map->cnt < BPF_ID_MAP_SIZE && st->acquired_refs < BPF_ID_MAP_SIZE)
 		return 0;
@@ -496,6 +503,47 @@ static const struct bpf_stack_state *held_slot(const struct bpf_func_state *f, u
 	       bpf_stack_slot(f, i) : NULL;
 }
 
+/* The pointer that slot @i of @ref holds, if it holds one */
+static const struct bpf_reg_state *ref_slot_ptr(const struct bpf_reference_state *ref, u32 i)
+{
+	const struct bpf_reg_state *reg = bpf_get_ref_slot_reg(i, ref, BIT(STACK_SPILL));
+
+	return reg && reg->type != SCALAR_VALUE && reg->type != NOT_INIT ? reg : NULL;
+}
+
+/* The type of a pointer, and its object if it is not in the number, as in hash_type() */
+static size_t ptr_object_len(const struct bpf_reg_state *reg)
+{
+	if (type_is_pkt_pointer(reg->type) || base_type(reg->type) == PTR_TO_ARENA)
+		return offsetofend(struct bpf_reg_state, type);
+	return offsetof(struct bpf_reg_state, var_off);
+}
+
+/*
+ * No liveness and no dep is about the slots that a reference owns. So no pass can keep two
+ * states apart for a pointer that only one of them has there, as bpf_hash_live_types() and
+ * a partition do for an xreg, and the join of two types or objects is unreadable, see
+ * join_reg(). So these pointers are a part of the join_key: states that meet have pointers
+ * of the same type to the same object in the same slots.
+ */
+static bool same_ref_slots(const struct bpf_reference_state *a,
+			   const struct bpf_reference_state *b)
+{
+	const struct bpf_reg_state *pa, *pb;
+	u32 i;
+
+	/* a pointer to the memory is checked against its exact size */
+	if (a->nr_slots != b->nr_slots || a->mem_size != b->mem_size)
+		return false;
+	for (i = 0; i < a->nr_slots; i++) {
+		pa = ref_slot_ptr(a, i);
+		pb = ref_slot_ptr(b, i);
+		if (!pa != !pb || (pa && memcmp(pa, pb, ptr_object_len(pa))))
+			return false;
+	}
+	return true;
+}
+
 static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b)
 {
 	u32 i;
@@ -503,7 +551,8 @@ static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verif
 	for (i = 0; i < a->acquired_refs; i++)
 		if (a->refs[i].type != b->refs[i].type || a->refs[i].id != b->refs[i].id ||
 		    a->refs[i].saved != b->refs[i].saved ||
-		    memcmp(&a->refs[i].ptr, &b->refs[i].ptr, sizeof(u64)))
+		    memcmp(&a->refs[i].ptr, &b->refs[i].ptr, sizeof(u64)) ||
+		    !same_ref_slots(&a->refs[i], &b->refs[i]))
 			return false;
 	return true;
 }
@@ -564,13 +613,22 @@ u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verif
 {
 	u64 hash = bpf_hash64(&st->join_key, sizeof(st->join_key), env->hash_seed +
 			      ((u64)st->instance_id << 32 | st->insn_idx));
-	u32 fr, i, trip;
+	u32 fr, i, j, trip;
 	const struct bpf_stack_state *slot;
 	const struct loop_stack_entry *e;
 	const struct bpf_func_state *f;
+	const struct bpf_reg_state *reg;
 
-	for (i = 0; i < st->acquired_refs; i++)
+	for (i = 0; i < st->acquired_refs; i++) {
 		hash = bpf_hash64(&st->refs[i].ptr, sizeof(u64), hash + st->refs[i].type);
+		/* see same_ref_slots() */
+		hash += (u64)st->refs[i].mem_size << 16;
+		for (j = 0; j < st->refs[i].nr_slots; j++) {
+			reg = ref_slot_ptr(&st->refs[i], j);
+			if (reg)
+				hash = bpf_hash64(reg, ptr_object_len(reg), hash + j);
+		}
+	}
 	for (fr = 0; fr <= st->curframe; fr++) {
 		f = st->frame[fr];
 		hash = bpf_hash64(&f->join_key, sizeof(f->join_key), hash);
@@ -657,7 +715,7 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 bool bpf_state_subsumes(struct bpf_verifier_env *env, const struct bpf_verifier_state *old,
 			const struct bpf_verifier_state *cur)
 {
-	int i;
+	int i, j;
 
 	env->pkt_pair_cnt = 0;
 
@@ -671,6 +729,12 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, const struct bpf_verifier_
 		if (!func_states_equal(env, old->frame[i], cur->frame[i],
 				       bpf_frame_live_regs(env, old, i)))
 			return false;
+
+	/* The slots that a reference owns are compared like stack slots. All of them are live. */
+	for (i = 0; i < old->acquired_refs; i++)
+		for (j = 0; j < old->refs[i].nr_slots; j++)
+			if (!slot_safe(env, &old->refs[i].slots[j], &cur->refs[i].slots[j]))
+				return false;
 
 	return bpf_equations_subsume(env, old, cur);
 }

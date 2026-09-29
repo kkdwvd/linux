@@ -1466,14 +1466,68 @@ out:
 	return arr ? arr : ZERO_SIZE_PTR;
 }
 
+static void free_reference_slots(struct bpf_reference_state *refs, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		kfree(refs[i].slots);
+		refs[i].slots = NULL;
+		refs[i].nr_slots = 0;
+		refs[i].mem_size = 0;
+	}
+}
+
+/* @dst gets a copy of the slots that @src owns in place of its own */
+static int copy_reference_slots(struct bpf_reference_state *dst,
+				const struct bpf_reference_state *src)
+{
+	struct bpf_stack_state *slots = NULL;
+
+	if (src->nr_slots) {
+		slots = kmemdup_array(src->slots, src->nr_slots, sizeof(*slots), BPF_VERIFIER_GFP);
+		if (!slots)
+			return -ENOMEM;
+	}
+	kfree(dst->slots);
+	dst->slots = slots;
+	dst->nr_slots = src->nr_slots;
+	dst->mem_size = src->mem_size;
+	return 0;
+}
+
 static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf_verifier_state *src)
 {
+	u32 i;
+	int err;
+
+	/*
+	 * dst may be a reused state that still owns slot arrays; they must
+	 * not leak when the reference array is overwritten below.
+	 */
+	free_reference_slots(dst->refs, dst->acquired_refs);
+	dst->acquired_refs = 0;
 	dst->refs = copy_array(dst->refs, src->refs, src->acquired_refs,
 			       sizeof(struct bpf_reference_state), BPF_VERIFIER_GFP);
 	if (!dst->refs)
 		return -ENOMEM;
 
+	/*
+	 * The shallow copy above aliased src's slot arrays. Detach them all
+	 * before allocating so that a failure below leaves dst owning only
+	 * its own arrays and bpf_free_verifier_state() can clean up.
+	 */
 	dst->held = src->held;
+	for (i = 0; i < src->acquired_refs; i++) {
+		dst->refs[i].slots = NULL;
+		dst->refs[i].nr_slots = 0;
+		dst->refs[i].mem_size = 0;
+	}
+	for (i = 0; i < src->acquired_refs; i++) {
+		err = copy_reference_slots(&dst->refs[i], &src->refs[i]);
+		if (err)
+			return err;
+	}
 	return 0;
 }
 
@@ -1502,12 +1556,26 @@ static int copy_stack_state(struct bpf_func_state *dst, const struct bpf_func_st
 	return 0;
 }
 
+/* Make room for @n references. The new ones are zeroed. */
 static int resize_reference_state(struct bpf_verifier_state *state, size_t n)
 {
-	state->refs = realloc_array(state->refs, state->acquired_refs, n,
-				    sizeof(struct bpf_reference_state));
-	if (!state->refs)
-		return -ENOMEM;
+	size_t old_n = state->acquired_refs;
+	struct bpf_reference_state *refs;
+
+	/*
+	 * Not realloc_array(): it frees the array when it fails, and with it the only
+	 * pointers to the slots that the references own.
+	 */
+	if (n > old_n) {
+		refs = krealloc(state->refs, kmalloc_size_roundup(size_mul(n, sizeof(*refs))),
+				BPF_VERIFIER_GFP);
+		if (!refs)
+			return -ENOMEM;
+		memset(refs + old_n, 0, (n - old_n) * sizeof(*refs));
+		state->refs = refs;
+	} else {
+		free_reference_slots(state->refs + n, old_n - n);
+	}
 
 	state->acquired_refs = n;
 	return 0;
@@ -1647,6 +1715,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	 * it can detect out-of-order IRQ restore. Hence use memmove to shift
 	 * the array instead of swapping the final element into the deleted idx.
 	 */
+	kfree(state->refs[idx].slots);
 	last_idx = state->acquired_refs - 1;
 	rem = state->acquired_refs - idx - 1;
 	if (last_idx && idx != last_idx)
@@ -1787,10 +1856,12 @@ static void free_func_state(struct bpf_func_state *state)
 void bpf_charge_state(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
 {
 	/* with the struct that holds it */
-	u32 bytes = 2 * sizeof(*st) + ksize(st->refs), fr;
+	u32 bytes = 2 * sizeof(*st) + ksize(st->refs), fr, i;
 	struct bpf_func_state *f;
 
 	bytes += bpf_equations_bytes(&st->equations);
+	for (i = 0; i < st->acquired_refs; i++)
+		bytes += ksize(st->refs[i].slots);
 	for (fr = 0; fr <= st->curframe && (f = st->frame[fr]); fr++)
 		bytes += kmalloc_size_roundup(sizeof(*f)) + ksize(f->stack) +
 			 ksize(f->stack_arg_regs) + ksize(f->loop_stack);
@@ -1809,6 +1880,7 @@ void bpf_free_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_s
 		free_func_state(state->frame[i]);
 		state->frame[i] = NULL;
 	}
+	free_reference_slots(state->refs, state->acquired_refs);
 	kfree(state->refs);
 	bpf_equations_free(&state->equations);
 	if (free_self)
@@ -12259,6 +12331,18 @@ static bool arg_needs_caller(struct bpf_verifier_env *env, const struct bpf_veri
 	return type_may_be_null(reg->type) && !sub->recursive;
 }
 
+/*
+ * The slots that a reference owns are memory that the program writes and reads like its
+ * stack. A function that gets a pointer to them can change what its callers see there,
+ * like one that gets a pointer to the stack.
+ */
+static bool arg_points_to_ref_slots(const struct bpf_verifier_state *state,
+				    const struct bpf_reg_state *reg)
+{
+	return reg->type != SCALAR_VALUE && reg->type != NOT_INIT && reg->id &&
+	       bpf_find_ref_slots(state, reg->id);
+}
+
 static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier_state *state,
 			       int subprog)
 {
@@ -12282,7 +12366,8 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		if (!(live & BIT(i)))
 			continue;
 		if (caller->regs[i].type == PTR_TO_STACK ||
-		    base_type(caller->regs[i].type) == CONST_PTR_TO_DYNPTR)
+		    base_type(caller->regs[i].type) == CONST_PTR_TO_DYNPTR ||
+		    arg_points_to_ref_slots(state, &caller->regs[i]))
 			return false;
 		if (arg_needs_caller(env, state, sub, &caller->regs[i]))
 			return false;
@@ -12290,7 +12375,8 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 	/* callx of one function of a set asks before it is checked that the arguments are there */
 	for (i = 0; i < bpf_in_stack_arg_cnt(sub) && i < caller->out_stack_arg_cnt; i++) {
 		if (caller->stack_arg_regs[i].type == PTR_TO_STACK ||
-		    base_type(caller->stack_arg_regs[i].type) == CONST_PTR_TO_DYNPTR)
+		    base_type(caller->stack_arg_regs[i].type) == CONST_PTR_TO_DYNPTR ||
+		    arg_points_to_ref_slots(state, &caller->stack_arg_regs[i]))
 			return false;
 		if (arg_needs_caller(env, state, sub, &caller->stack_arg_regs[i]))
 			return false;
@@ -12346,6 +12432,12 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		bpf_free_verifier_state(env, &entry, false);
 		return err;
 	}
+	/*
+	 * No argument points to the slots that a reference owns, see func_is_on_its_own(),
+	 * and nothing else that the function gets leads to them: it cannot read or write
+	 * them. They stay with the call.
+	 */
+	free_reference_slots(entry.refs, entry.acquired_refs);
 	bpf_for_each_reg_in_vstate(&entry, frame, reg, reg->grew_once = false);
 	entry.max_held_cnt = state->max_held_cnt;
 	callee->entry_refs = entry.acquired_refs;
@@ -12467,7 +12559,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 {
 	struct bpf_func_state *frame = caller->frame[caller->curframe];
 	const struct bpf_func_state *callee = exit->frame[0];
-	u32 i, nregs, nheld = caller->acquired_refs;
+	u32 i, j, nregs, nheld = caller->acquired_refs;
 	struct bpf_reg_state *reg;
 	bool found_null;
 	int err;
@@ -12531,8 +12623,28 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		caller->refs[i] = exit->refs[i];
 		caller->refs[i].origin = call_idx;
 		caller->refs[i].saved = 0;
+		/* the slots are those of the exit state, which other calls return with too */
+		caller->refs[i].slots = NULL;
+		caller->refs[i].nr_slots = 0;
 	}
 	caller->held = exit->held;
+	/*
+	 * The slots of what the function took are as it left them, with new names for its
+	 * ids, like the return value. The slots of what was held at the call stayed with
+	 * the call, see call_func_on_its_own().
+	 */
+	for (i = nheld; i < exit->acquired_refs; i++) {
+		err = copy_reference_slots(&caller->refs[i], &exit->refs[i]);
+		if (err)
+			return err;
+		bpf_for_each_ref_slot_reg(j, &caller->refs[i], reg, BIT(STACK_SPILL)) {
+			if (!reg)
+				continue;
+			reg->id = returned_id(reg->id);
+			reg->parent_id = returned_id(reg->parent_id);
+			reg->map_uid = returned_id(reg->map_uid);
+		}
+	}
 
 	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
