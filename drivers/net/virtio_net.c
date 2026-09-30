@@ -763,6 +763,20 @@ static void virtnet_tx_wake_queue(struct virtnet_info *vi,
 	}
 }
 
+/*
+ * Whether TX completions of @sq need the callback armed. A busy poller, the
+ * threaded busy-poll mode or a BPF poller, keeps the TX NAPI scheduled with
+ * NAPI_STATE_IN_BUSY_POLL and reaps completions by polling; arming would
+ * only cost an interrupt per completion. Hardware drivers arm completion
+ * interrupts from napi_complete_done() alone, which is where the poller's
+ * first ordinary poll arms the callback again through
+ * virtqueue_napi_complete().
+ */
+static bool virtnet_sq_arm_cb(struct send_queue *sq)
+{
+	return !test_bit(NAPI_STATE_IN_BUSY_POLL, &sq->napi.state);
+}
+
 static void skb_xmit_done(struct virtqueue *vq)
 {
 	struct virtnet_info *vi = vq->vdev->priv;
@@ -1024,7 +1038,8 @@ static void check_sq_full_and_disable(struct virtnet_info *vi,
 		struct netdev_queue *txq = netdev_get_tx_queue(dev, qnum);
 
 		if (use_napi) {
-			if (unlikely(!virtqueue_enable_cb_delayed(sq->vq)))
+			if (virtnet_sq_arm_cb(sq) &&
+			    unlikely(!virtqueue_enable_cb_delayed(sq->vq)))
 				virtqueue_napi_schedule(&sq->napi, sq->vq);
 		} else if (unlikely(!virtqueue_enable_cb_delayed(sq->vq))) {
 			/* More just got used, free them then recheck. */
@@ -2973,7 +2988,8 @@ static void virtnet_poll_cleantx(struct receive_queue *rq, int budget)
 		do {
 			virtqueue_disable_cb(sq->vq);
 			free_old_xmit(sq, txq, !!budget);
-		} while (unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
+		} while (virtnet_sq_arm_cb(sq) &&
+			 unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
 
 		if (sq->vq->num_free >= MAX_SKB_FRAGS + 2)
 			virtnet_tx_wake_queue(vi, sq);
@@ -3389,7 +3405,8 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 	}
 
-	if (use_napi && kick && unlikely(!virtqueue_enable_cb_delayed(sq->vq)))
+	if (use_napi && kick && virtnet_sq_arm_cb(sq) &&
+	    unlikely(!virtqueue_enable_cb_delayed(sq->vq)))
 		virtqueue_napi_schedule(&sq->napi, sq->vq);
 
 	return NETDEV_TX_OK;
