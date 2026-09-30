@@ -156,7 +156,7 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	}
 	__add_wait_queue_entry_tail(&waitq_kern->waitq, &entry);
 	refcount_inc(&waitq_kern->refs);
-	set_current_state(TASK_UNINTERRUPTIBLE);
+	set_current_state(TASK_IDLE);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
 
 	migrate_enable();
