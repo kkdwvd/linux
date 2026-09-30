@@ -8,6 +8,7 @@
 #include <linux/hrtimer.h>
 #include <linux/kthread.h>
 #include <linux/rcupdate_trace.h>
+#include <linux/sched.h>
 #include <linux/wait.h>
 
 struct bpf_waitq_kern {
@@ -425,9 +426,17 @@ __bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_m
 	}
 	get_task_struct(task);
 	new_kthread->task = task;
+
+	/*
+	 * Run the thread up to its park in bpf_kthread_run() before returning.
+	 * The generic kthread() prologue that runs first resets the affinity to
+	 * the default for the thread's node and only then permits cgroup
+	 * migration, so bpf_kthread_bind() and the cgroup attach below take
+	 * effect only once it has run.
+	 */
+	wake_up_process(task);
+	wait_for_completion(&new_kthread->initialized);
 	if (cgrp) {
-		wake_up_process(task);
-		wait_for_completion(&new_kthread->initialized);
 		err = cgroup_kthread_attach(cgrp, task);
 		if (err)
 			goto stop_task;
@@ -490,6 +499,42 @@ __bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
 	return 0;
 }
 
+/*
+ * Restrict the thread to one CPU. Works before and after bpf_kthread_start():
+ * the thread has already run the kthread() prologue that would reset its
+ * affinity when bpf_kthread_create() returns, so a parked thread wakes on
+ * that CPU and a running one migrates to it. The affinity remains changeable
+ * from user space and stays subject to cpusets.
+ */
+__bpf_kfunc int bpf_kthread_bind(struct bpf_kthread *kthread, u32 cpu)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_kthread_kern *kthread_kern;
+	struct task_struct *task = NULL;
+	unsigned long irq_flags;
+	int ret;
+
+	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+		return -EINVAL;
+
+	kthread_kern = READ_ONCE(opaque->kthread);
+	if (!kthread_kern)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kthread_kern->lock, irq_flags);
+	if (!kthread_kern->stopping && kthread_kern->task) {
+		task = kthread_kern->task;
+		get_task_struct(task);
+	}
+	spin_unlock_irqrestore(&kthread_kern->lock, irq_flags);
+	if (!task)
+		return -ENOENT;
+
+	ret = set_cpus_allowed_ptr(task, cpumask_of(cpu));
+	put_task_struct(task);
+	return ret;
+}
+
 __bpf_kfunc int bpf_kthread_stop(struct bpf_kthread *kthread, u64 flags)
 {
 	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
@@ -527,6 +572,7 @@ BTF_ID_FLAGS(func, bpf_waitq_wait_event, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wake)
 BTF_ID_FLAGS(func, bpf_kthread_create, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kthread_start)
+BTF_ID_FLAGS(func, bpf_kthread_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kthread_stop, KF_SLEEPABLE)
 BTF_KFUNCS_END(bpf_waitq_kfunc_ids)
 
