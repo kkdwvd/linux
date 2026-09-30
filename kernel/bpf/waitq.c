@@ -180,12 +180,12 @@ static int bpf_kthread_run(void *data)
 	bpf_callback_t callback_fn = READ_ONCE(kthread->callback_fn);
 	int ret = 0;
 
-	set_current_state(TASK_UNINTERRUPTIBLE);
+	set_current_state(TASK_IDLE);
 	complete(&kthread->initialized);
 	while (!READ_ONCE(kthread->start_requested) &&
 	       !kthread_should_stop() && !READ_ONCE(kthread->stopping)) {
 		schedule();
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		set_current_state(TASK_IDLE);
 	}
 	__set_current_state(TASK_RUNNING);
 
@@ -289,7 +289,7 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	}
 	__add_wait_queue_entry_tail(&waitq_kern->waitq, &entry);
 	refcount_inc(&waitq_kern->refs);
-	set_current_state(TASK_UNINTERRUPTIBLE);
+	set_current_state(TASK_IDLE);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
 
 	migrate_enable();
