@@ -1666,6 +1666,7 @@ void netdev_notify_peers(struct net_device *dev)
 EXPORT_SYMBOL(netdev_notify_peers);
 
 static int napi_threaded_poll(void *data);
+static bool napi_bpf_schedule(struct napi_struct *napi);
 
 static int napi_kthread_create(struct napi_struct *n)
 {
@@ -5017,6 +5018,9 @@ static inline void ____napi_schedule(struct softnet_data *sd,
 
 	lockdep_assert_irqs_disabled();
 
+	if (test_bit(NAPI_STATE_BPF, &napi->state) && napi_bpf_schedule(napi))
+		return;
+
 	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
 		/* Paired with smp_mb__before_atomic() in
 		 * napi_enable()/netif_set_threaded().
@@ -6878,6 +6882,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 
 		new = val & ~(NAPIF_STATE_MISSED | NAPIF_STATE_SCHED |
 			      NAPIF_STATE_SCHED_THREADED |
+			      NAPIF_STATE_SCHED_BPF |
 			      NAPIF_STATE_PREFER_BUSY_POLL);
 
 		/* If STATE_MISSED was set, leave STATE_SCHED set,
@@ -7257,6 +7262,10 @@ static void napi_set_threaded_state(struct napi_struct *napi,
 int napi_set_threaded(struct napi_struct *napi,
 		      enum netdev_napi_threaded threaded)
 {
+	/* A BPF poller owns this NAPI; unbind it before giving it a thread. */
+	if (threaded && rcu_access_pointer(napi->bpf_waitq))
+		return -EBUSY;
+
 	if (threaded) {
 		if (!napi->thread) {
 			int err = napi_kthread_create(napi);
@@ -7295,6 +7304,9 @@ int netif_set_threaded(struct net_device *dev,
 	netdev_assert_locked_or_invisible(dev);
 
 	if (threaded) {
+		list_for_each_entry(napi, &dev->napi_list, dev_list)
+			if (rcu_access_pointer(napi->bpf_waitq))
+				return -EBUSY;
 		list_for_each_entry(napi, &dev->napi_list, dev_list) {
 			if (!napi->thread) {
 				err = napi_kthread_create(napi);
@@ -7664,6 +7676,12 @@ void napi_disable_locked(struct napi_struct *n)
 
 	set_bit(NAPI_STATE_DISABLE, &n->state);
 
+	/*
+	 * Take the NAPI back from its BPF poller first: pending work moves to
+	 * the native path, whose poll clears SCHED below on our behalf.
+	 */
+	napi_bpf_unbind_locked(n);
+
 	val = READ_ONCE(n->state);
 	do {
 		while (val & (NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC)) {
@@ -7674,7 +7692,9 @@ void napi_disable_locked(struct napi_struct *n)
 		new = val | NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC;
 		new &= ~(NAPIF_STATE_THREADED |
 			 NAPIF_STATE_THREADED_BUSY_POLL |
-			 NAPIF_STATE_PREFER_BUSY_POLL);
+			 NAPIF_STATE_PREFER_BUSY_POLL |
+			 NAPIF_STATE_BPF | NAPIF_STATE_SCHED_BPF |
+			 NAPIF_STATE_BPF_RESCHED);
 	} while (!try_cmpxchg(&n->state, &val, new));
 
 	hrtimer_cancel(&n->timer);
@@ -7749,6 +7769,7 @@ void __netif_napi_del_locked(struct napi_struct *napi)
 
 	/* Make sure NAPI is disabled (or was never enabled). */
 	WARN_ON(!test_bit(NAPI_STATE_SCHED, &napi->state));
+	WARN_ON(rcu_access_pointer(napi->bpf_waitq));
 
 	if (test_and_clear_bit(NAPI_STATE_HAS_NOTIFIER, &napi->state))
 		irq_set_affinity_notifier(napi->irq, NULL);
@@ -7964,6 +7985,197 @@ static int napi_threaded_poll(void *data)
 
 	return 0;
 }
+
+#ifdef CONFIG_BPF_SYSCALL
+/*
+ * BPF-owned NAPI scheduling.
+ *
+ * A bound NAPI is neither queued for softirq nor handed to a NAPI kthread.
+ * The schedule path marks it pending with NAPI_STATE_SCHED_BPF and signals
+ * the bpf_waitq its BPF poller sleeps on; the poller consumes the pending
+ * bit through napi_bpf_poll(). Since the bit is taken with
+ * test_and_clear_bit(), it doubles as the token that admits exactly one
+ * poller into the driver while NAPI_STATE_SCHED stays set. A poll runs like
+ * one iteration of napi_threaded_poll_loop() and either completes the NAPI
+ * through the driver's napi_complete_done() or hands the token back for
+ * another round.
+ *
+ * Unbinding, explicit or through napi_disable(), clears NAPI_STATE_BPF and
+ * returns a pending token to the native path, so a NAPI never stays
+ * scheduled without anyone to poll it. The schedule path and
+ * napi_bpf_poll() re-check the bound bit after setting the token for the
+ * same reason.
+ */
+static bool napi_bpf_schedule(struct napi_struct *napi)
+{
+	struct bpf_waitq_kern *waitq;
+	unsigned long val;
+
+	/* Interrupts are off, which is an RCU read-side critical section. */
+	waitq = rcu_dereference_sched(napi->bpf_waitq);
+	if (!waitq)
+		return false;
+
+	/*
+	 * Scheduled while a BPF poller is inside the driver's poll: from
+	 * napi_complete_done() finding NAPI_STATE_MISSED, from the driver
+	 * finding more work right after completing, or from an interrupt that
+	 * came in between. Softirq and threaded NAPI run that next poll after
+	 * the current one, on the same CPU or thread. Handing out the token
+	 * now would let another poller enter the driver while this one is
+	 * still in it, so make it that poller's next round instead. The
+	 * cmpxchg makes the check and the mark atomic against the poller
+	 * clearing NAPI_STATE_BPF_POLLING and collecting the mark.
+	 */
+	val = READ_ONCE(napi->state);
+	while (val & NAPIF_STATE_BPF_POLLING) {
+		if (try_cmpxchg(&napi->state, &val, val | NAPIF_STATE_BPF_RESCHED))
+			return true;
+	}
+
+	set_bit(NAPI_STATE_SCHED_BPF, &napi->state);
+	if (likely(test_bit(NAPI_STATE_BPF, &napi->state) &&
+		   !bpf_waitq_signal(waitq, 1)))
+		return true;
+
+	/*
+	 * Unbound or drained under us. Service the NAPI natively unless a
+	 * poller already took the token.
+	 */
+	return !test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state);
+}
+
+int napi_bpf_bind_locked(struct napi_struct *napi, struct bpf_waitq_kern *waitq)
+{
+	struct bpf_waitq_kern *old;
+
+	netdev_assert_locked(napi->dev);
+
+	/* The wait queue lock cannot be taken from the IRQ path on RT. */
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+		return -EOPNOTSUPP;
+	/* Threaded NAPI has a thread of its own; switch it off first. */
+	if (napi->thread)
+		return -EBUSY;
+
+	old = rcu_replace_pointer(napi->bpf_waitq, waitq,
+				  lockdep_is_held(&napi->dev->lock));
+	if (!old) {
+		/* Publish the wait queue before the schedule path looks for it. */
+		smp_mb__before_atomic();
+		set_bit(NAPI_STATE_BPF, &napi->state);
+		return 0;
+	}
+
+	/* Rebinding: work pending for the old poller is now the new one's. */
+	if (test_bit(NAPI_STATE_SCHED_BPF, &napi->state))
+		bpf_waitq_signal(waitq, 1);
+	bpf_waitq_put(old);
+	return 0;
+}
+
+void napi_bpf_unbind_locked(struct napi_struct *napi)
+{
+	struct bpf_waitq_kern *waitq;
+
+	netdev_assert_locked(napi->dev);
+
+	waitq = rcu_replace_pointer(napi->bpf_waitq, NULL,
+				    lockdep_is_held(&napi->dev->lock));
+	if (!waitq)
+		return;
+
+	clear_bit(NAPI_STATE_BPF, &napi->state);
+	/*
+	 * Pending work goes to the native path. A poll in progress finds the
+	 * bound bit clear when it returns its token, see __napi_bpf_poll().
+	 */
+	if (test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state))
+		__napi_schedule(napi);
+	bpf_waitq_put(waitq);
+}
+
+/* One round of service by the poller holding the NAPI_STATE_SCHED_BPF token. */
+static int __napi_bpf_poll(struct napi_struct *napi)
+{
+	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
+	struct softnet_data *sd;
+	bool repoll = false;
+	void *have;
+	int work;
+
+	local_bh_disable();
+	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
+
+	sd = this_cpu_ptr(&softnet_data);
+	sd->in_napi_threaded_poll = true;
+
+	set_bit(NAPI_STATE_BPF_POLLING, &napi->state);
+	have = netpoll_poll_lock(napi);
+	work = __napi_poll(napi, &repoll);
+	netpoll_poll_unlock(have);
+	clear_bit(NAPI_STATE_BPF_POLLING, &napi->state);
+	/* Scheduled again from within the poll, see napi_bpf_schedule(). */
+	if (test_and_clear_bit(NAPI_STATE_BPF_RESCHED, &napi->state))
+		repoll = true;
+
+	sd->in_napi_threaded_poll = false;
+	barrier();
+
+	if (sd_has_rps_ipi_waiting(sd)) {
+		local_irq_disable();
+		net_rps_action_and_irq_enable(sd);
+	}
+	skb_defer_free_flush();
+	bpf_net_ctx_clear(bpf_net_ctx);
+	local_bh_enable();
+
+	if (!repoll)
+		return work;
+
+	/*
+	 * Still scheduled: return the token to the poller, or to the native
+	 * path when the NAPI was unbound meanwhile.
+	 */
+	set_bit(NAPI_STATE_SCHED_BPF, &napi->state);
+	if (unlikely(!test_bit(NAPI_STATE_BPF, &napi->state)) &&
+	    test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state)) {
+		__napi_schedule(napi);
+		return work;
+	}
+	return work | BPF_NAPI_POLL_MORE;
+}
+
+/**
+ * napi_bpf_poll - one round of NAPI service by its BPF poller
+ * @napi_id: ID of a NAPI bound with napi_bpf_bind_locked()
+ *
+ * Return: the work done, ORed with BPF_NAPI_POLL_MORE when the NAPI is still
+ * scheduled and needs another round. -EAGAIN when nothing is pending for the
+ * poller, -ENOENT when no NAPI with this ID is bound.
+ */
+int napi_bpf_poll(unsigned int napi_id)
+{
+	struct napi_struct *napi;
+	int ret;
+
+	rcu_read_lock();
+	napi = napi_by_id(napi_id);
+	if (!napi || !test_bit(NAPI_STATE_BPF, &napi->state))
+		ret = -ENOENT;
+	else if (!test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state))
+		ret = -EAGAIN;
+	else
+		ret = __napi_bpf_poll(napi);
+	rcu_read_unlock();
+	return ret;
+}
+#else
+static bool napi_bpf_schedule(struct napi_struct *napi)
+{
+	return false;
+}
+#endif /* CONFIG_BPF_SYSCALL */
 
 static __latent_entropy void net_rx_action(void)
 {
