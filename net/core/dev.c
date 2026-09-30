@@ -8087,19 +8087,49 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	 * Pending work goes to the native path. A poll in progress finds the
 	 * bound bit clear when it returns its token, see __napi_bpf_poll().
 	 */
-	if (test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state))
+	if (test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state)) {
+		/* A busy poller may have left the interrupt masked. */
+		clear_bit(NAPI_STATE_IN_BUSY_POLL, &napi->state);
 		__napi_schedule(napi);
+	}
 	bpf_waitq_put(waitq);
 }
 
-/* One round of service by the poller holding the NAPI_STATE_SCHED_BPF token. */
-static int __napi_bpf_poll(struct napi_struct *napi)
+/*
+ * Take an idle NAPI for a busy poller, the transition socket busy polling
+ * makes: the driver will find the NAPI scheduled and mask its interrupt.
+ */
+static bool napi_bpf_grab_idle(struct napi_struct *napi)
+{
+	unsigned long val = READ_ONCE(napi->state);
+
+	do {
+		if (val & (NAPIF_STATE_DISABLE | NAPIF_STATE_SCHED |
+			   NAPIF_STATE_IN_BUSY_POLL | NAPIF_STATE_NPSVC |
+			   NAPIF_STATE_BPF_POLLING))
+			return false;
+	} while (!try_cmpxchg(&napi->state, &val,
+			      val | NAPIF_STATE_SCHED | NAPIF_STATE_IN_BUSY_POLL));
+	return true;
+}
+
+/*
+ * One round of service by the poller holding the NAPI_STATE_SCHED_BPF token.
+ * A busy poll keeps NAPI_STATE_IN_BUSY_POLL set across the driver's poll so
+ * that napi_complete_done() returns false and leaves the interrupt masked,
+ * as it does for socket busy polling; the NAPI then stays scheduled and the
+ * token goes back to the poller. A plain poll clears the bit first, letting
+ * the driver complete and re-arm as usual.
+ */
+static int __napi_bpf_poll(struct napi_struct *napi, bool busy)
 {
 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
 	struct softnet_data *sd;
 	bool repoll = false;
 	void *have;
 	int work;
+
+	assign_bit(NAPI_STATE_IN_BUSY_POLL, &napi->state, busy);
 
 	local_bh_disable();
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
@@ -8123,20 +8153,25 @@ static int __napi_bpf_poll(struct napi_struct *napi)
 		local_irq_disable();
 		net_rps_action_and_irq_enable(sd);
 	}
+	/* Busy polling skips the completion path that would flush GRO. */
+	if (busy)
+		gro_flush_normal(&napi->gro, HZ >= 1000);
 	skb_defer_free_flush();
 	bpf_net_ctx_clear(bpf_net_ctx);
 	local_bh_enable();
 
-	if (!repoll)
+	if (!repoll && !(busy && napi_is_scheduled(napi)))
 		return work;
 
 	/*
 	 * Still scheduled: return the token to the poller, or to the native
-	 * path when the NAPI was unbound meanwhile.
+	 * path when the NAPI was unbound meanwhile, which must be able to
+	 * complete it.
 	 */
 	set_bit(NAPI_STATE_SCHED_BPF, &napi->state);
 	if (unlikely(!test_bit(NAPI_STATE_BPF, &napi->state)) &&
 	    test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state)) {
+		clear_bit(NAPI_STATE_IN_BUSY_POLL, &napi->state);
 		__napi_schedule(napi);
 		return work;
 	}
@@ -8146,12 +8181,14 @@ static int __napi_bpf_poll(struct napi_struct *napi)
 /**
  * napi_bpf_poll - one round of NAPI service by its BPF poller
  * @napi_id: ID of a NAPI bound with napi_bpf_bind_locked()
+ * @busy: keep the NAPI scheduled and its interrupt masked afterwards; also
+ *	takes an idle NAPI instead of waiting for its interrupt
  *
  * Return: the work done, ORed with BPF_NAPI_POLL_MORE when the NAPI is still
  * scheduled and needs another round. -EAGAIN when nothing is pending for the
  * poller, -ENOENT when no NAPI with this ID is bound.
  */
-int napi_bpf_poll(unsigned int napi_id)
+int napi_bpf_poll(unsigned int napi_id, bool busy)
 {
 	struct napi_struct *napi;
 	int ret;
@@ -8160,10 +8197,11 @@ int napi_bpf_poll(unsigned int napi_id)
 	napi = napi_by_id(napi_id);
 	if (!napi || !test_bit(NAPI_STATE_BPF, &napi->state))
 		ret = -ENOENT;
-	else if (!test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state))
-		ret = -EAGAIN;
+	else if (test_and_clear_bit(NAPI_STATE_SCHED_BPF, &napi->state) ||
+		 (busy && napi_bpf_grab_idle(napi)))
+		ret = __napi_bpf_poll(napi, busy);
 	else
-		ret = __napi_bpf_poll(napi);
+		ret = -EAGAIN;
 	rcu_read_unlock();
 	return ret;
 }

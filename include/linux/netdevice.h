@@ -468,6 +468,11 @@ enum {
 	BPF_NAPI_POLL_MORE	= BIT(16),	/* Still scheduled, poll again */
 };
 
+/* bpf_napi_poll() flags. */
+enum {
+	BPF_NAPI_POLL_F_BUSY	= BIT(0),	/* Keep the NAPI scheduled, interrupt masked */
+};
+
 enum gro_result {
 	GRO_MERGED,
 	GRO_MERGED_FREE,

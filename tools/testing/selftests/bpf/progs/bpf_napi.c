@@ -114,6 +114,12 @@ int poll_napi(void *ctx)
 }
 
 SEC("syscall")
+int poll_busy(void *ctx)
+{
+	return bpf_napi_poll(napi_id, BPF_NAPI_POLL_F_BUSY);
+}
+
+SEC("syscall")
 int wake_poller(void *ctx)
 {
 	struct poller *p = get_poller();
