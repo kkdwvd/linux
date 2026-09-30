@@ -34,7 +34,7 @@ struct bpf_waitq_kern;
 #ifdef CONFIG_BPF_SYSCALL
 int napi_bpf_bind_locked(struct napi_struct *napi, struct bpf_waitq_kern *waitq);
 void napi_bpf_unbind_locked(struct napi_struct *napi);
-int napi_bpf_poll(unsigned int napi_id);
+int napi_bpf_poll(unsigned int napi_id, bool busy);
 #else
 static inline void napi_bpf_unbind_locked(struct napi_struct *napi) { }
 #endif

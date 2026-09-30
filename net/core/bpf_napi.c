@@ -80,11 +80,17 @@ __bpf_kfunc int bpf_napi_unbind(u32 napi_id)
 /**
  * bpf_napi_poll - service a bound NAPI once
  * @napi_id: NAPI bound with bpf_napi_bind()
- * @flags: must be 0
+ * @flags: BPF_NAPI_POLL_F_BUSY or 0
  *
  * Runs the driver's poll once if the NAPI is pending for its poller. The
  * driver re-arms its interrupt when it completes; the poller must call
  * again while BPF_NAPI_POLL_MORE is set in the result.
+ *
+ * With BPF_NAPI_POLL_F_BUSY the NAPI stays scheduled with its interrupt
+ * masked, so the result always carries BPF_NAPI_POLL_MORE and the poller
+ * sees new packets only by polling again; a busy poll also takes an idle
+ * NAPI instead of returning -EAGAIN. A later poll without the flag lets
+ * the driver complete and re-arm.
  *
  * Return: the work done ORed with BPF_NAPI_POLL_MORE when the NAPI is
  * still scheduled. -EAGAIN when nothing is pending, -ENOENT when no NAPI
@@ -94,10 +100,10 @@ __bpf_kfunc int bpf_napi_poll(u32 napi_id, u64 flags)
 {
 	int ret;
 
-	if (flags)
+	if (flags & ~(u64)BPF_NAPI_POLL_F_BUSY)
 		return -EINVAL;
 
-	ret = napi_bpf_poll(napi_id);
+	ret = napi_bpf_poll(napi_id, flags & BPF_NAPI_POLL_F_BUSY);
 	/* A poller that spins on a busy NAPI must still yield on voluntary-preemption kernels. */
 	cond_resched();
 	return ret;

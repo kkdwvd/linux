@@ -18,6 +18,7 @@
 /* Mirrors the enum next to the NAPI state bits in linux/netdevice.h. */
 #define BPF_NAPI_POLL_WORK_MASK 0xffff
 #define BPF_NAPI_POLL_MORE (1 << 16)
+#define BPF_NAPI_POLL_F_BUSY (1 << 0)
 #define SRC_IP "10.99.0.1"
 #define DST_IP "10.99.0.2"
 #define PORT 7777
@@ -66,6 +67,15 @@ static int udp_socket(const char *ip, bool bind_it)
 	return fd;
 }
 
+/*
+ * An interrupt-driven NAPI with nothing to do: either idle, or scheduled by
+ * a frame that the poll then completed.
+ */
+static bool idle_or_completed(int ret)
+{
+	return ret == -EAGAIN || (ret >= 0 && !(ret & BPF_NAPI_POLL_MORE));
+}
+
 /* Send one datagram; returns whether it arrived within the receive timeout. */
 static bool ping(int tx, int rx)
 {
@@ -112,6 +122,9 @@ void test_bpf_napi(void)
 
 	SYS(out, "ip netns add " NS_SRC);
 	SYS(out, "ip netns add " NS_DST);
+	/* No IPv6 chatter: every frame the NAPI sees is one this test sent. */
+	SYS(out, "ip netns exec " NS_SRC " sysctl -qw net.ipv6.conf.default.disable_ipv6=1");
+	SYS(out, "ip netns exec " NS_DST " sysctl -qw net.ipv6.conf.default.disable_ipv6=1");
 	SYS(out, "ip link add veth_src netns " NS_SRC " type veth peer name veth_dst netns " NS_DST);
 	SYS(out, "ip -n " NS_SRC " addr add dev veth_src " SRC_IP "/24");
 	SYS(out, "ip -n " NS_DST " addr add dev veth_dst " DST_IP "/24");
@@ -172,7 +185,25 @@ void test_bpf_napi(void)
 	ASSERT_EQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_pending_done");
 	if (!ASSERT_EQ(recv(rx, buf, sizeof(buf), 0), sizeof(buf), "recv_after_poll"))
 		goto out;
-	ASSERT_EQ(run_prog(skel->progs.poll_napi), -EAGAIN, "poll_idle");
+	ASSERT_TRUE(idle_or_completed(run_prog(skel->progs.poll_napi)), "poll_idle");
+
+	/*
+	 * A busy poll takes the idle NAPI and keeps its interrupt masked: the
+	 * next datagram waits for the next busy poll. A plain poll lets the
+	 * driver complete and re-arm.
+	 */
+	ret = run_prog(skel->progs.poll_busy);
+	ASSERT_GE(ret, 0, "poll_busy_grab");
+	ASSERT_NEQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_busy_grab_more");
+	ASSERT_FALSE(ping(tx, rx), "ping_stalls_while_busy");
+	ret = run_prog(skel->progs.poll_busy);
+	ASSERT_GE(ret & BPF_NAPI_POLL_WORK_MASK, 1, "poll_busy_work");
+	ASSERT_NEQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_busy_more");
+	ASSERT_EQ(recv(rx, buf, sizeof(buf), 0), sizeof(buf), "recv_after_busy_poll");
+	ret = run_prog(skel->progs.poll_napi);
+	ASSERT_GE(ret, 0, "poll_rearm");
+	ASSERT_EQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_rearm_done");
+	ASSERT_TRUE(idle_or_completed(run_prog(skel->progs.poll_napi)), "poll_idle_after_busy");
 
 	/* With a poller, packets flow and each schedule wakes it. */
 	ASSERT_EQ(run_prog(skel->progs.start_poller), 0, "start_poller");
