@@ -29,6 +29,15 @@ extern int netdev_flow_limit_table_len;
 
 struct napi_struct *
 netdev_napi_by_id_lock(struct net *net, unsigned int napi_id);
+
+struct bpf_waitq_kern;
+#ifdef CONFIG_BPF_SYSCALL
+int napi_bpf_bind_locked(struct napi_struct *napi, struct bpf_waitq_kern *waitq);
+void napi_bpf_unbind_locked(struct napi_struct *napi);
+int napi_bpf_poll(unsigned int napi_id);
+#else
+static inline void napi_bpf_unbind_locked(struct napi_struct *napi) { }
+#endif
 struct net_device *dev_get_by_napi_id(unsigned int napi_id);
 
 struct net_device *netdev_put_lock(struct net_device *dev, struct net *net,

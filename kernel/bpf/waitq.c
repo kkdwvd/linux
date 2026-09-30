@@ -11,14 +11,6 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 
-struct bpf_waitq_kern {
-	wait_queue_head_t waitq;
-	struct rcu_head rcu;
-	refcount_t refs;
-	u32 sequence;
-	bool draining;
-};
-
 struct bpf_waitq_opaque {
 	struct bpf_waitq_kern *waitq;
 } __aligned(8);

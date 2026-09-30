@@ -685,7 +685,19 @@ void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
 void bpf_timer_cancel_and_free(void *timer);
 void bpf_wq_cancel_and_free(void *timer);
 void bpf_waitq_cancel_and_free(void *waitq);
-struct bpf_waitq_kern;
+/*
+ * The kernel side of a struct bpf_waitq. Defined here rather than in
+ * kernel/bpf/waitq.c so that its producers can use the RCU accessors, which
+ * need the complete type, on pointers to it.
+ */
+struct bpf_waitq_kern {
+	wait_queue_head_t waitq;
+	struct rcu_head rcu;
+	refcount_t refs;
+	u32 sequence;
+	bool draining;
+};
+
 /* Call get under Tasks Trace RCU; the returned endpoint survives map teardown. */
 struct bpf_waitq_kern *bpf_waitq_get(struct bpf_waitq *waitq);
 void bpf_waitq_put(struct bpf_waitq_kern *waitq);

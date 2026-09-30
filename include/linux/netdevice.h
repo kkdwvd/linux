@@ -377,6 +377,8 @@ struct napi_config {
 	unsigned int napi_id;
 };
 
+struct bpf_waitq_kern;
+
 /*
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */
@@ -406,6 +408,8 @@ struct napi_struct {
 	struct hrtimer		timer;
 	/* all fields past this point are write-protected by netdev_lock */
 	struct task_struct	*thread;
+	/* Wait queue of the BPF poller that owns scheduling, see napi_bpf_bind_locked() */
+	struct bpf_waitq_kern __rcu *bpf_waitq;
 	unsigned long		gro_flush_timeout;
 	unsigned long		irq_suspend_timeout;
 	u32			defer_hard_irqs;
@@ -433,6 +437,10 @@ enum {
 	NAPI_STATE_SCHED_THREADED,	/* Napi is currently scheduled in threaded mode */
 	NAPI_STATE_HAS_NOTIFIER,	/* Napi has an IRQ notifier */
 	NAPI_STATE_THREADED_BUSY_POLL,	/* The threaded NAPI poller will busy poll */
+	NAPI_STATE_BPF,			/* A BPF poller owns scheduling */
+	NAPI_STATE_SCHED_BPF,		/* Napi is scheduled and pending for its BPF poller */
+	NAPI_STATE_BPF_POLLING,		/* A BPF poller is inside the driver's poll */
+	NAPI_STATE_BPF_RESCHED,		/* Scheduled again during that poll, poll once more */
 };
 
 enum {
@@ -448,6 +456,16 @@ enum {
 	NAPIF_STATE_SCHED_THREADED	= BIT(NAPI_STATE_SCHED_THREADED),
 	NAPIF_STATE_HAS_NOTIFIER	= BIT(NAPI_STATE_HAS_NOTIFIER),
 	NAPIF_STATE_THREADED_BUSY_POLL	= BIT(NAPI_STATE_THREADED_BUSY_POLL),
+	NAPIF_STATE_BPF			= BIT(NAPI_STATE_BPF),
+	NAPIF_STATE_SCHED_BPF		= BIT(NAPI_STATE_SCHED_BPF),
+	NAPIF_STATE_BPF_POLLING		= BIT(NAPI_STATE_BPF_POLLING),
+	NAPIF_STATE_BPF_RESCHED		= BIT(NAPI_STATE_BPF_RESCHED),
+};
+
+/* napi_bpf_poll() returns the work done ORed with these flags. */
+enum {
+	BPF_NAPI_POLL_WORK_MASK	= 0xffff,
+	BPF_NAPI_POLL_MORE	= BIT(16),	/* Still scheduled, poll again */
 };
 
 enum gro_result {
