@@ -1723,3 +1723,59 @@ static int __init psi_proc_init(void)
 module_init(psi_proc_init);
 
 #endif /* CONFIG_PROC_FS */
+
+#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_CGROUPS)
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_psi_total - Read a cgroup's cumulative pressure stall time
+ * @cgrp: the cgroup; the root cgroup reads the system-wide group
+ * @state: the state to read, for example PSI_MEM_SOME or PSI_MEM_FULL
+ *
+ * Collects the per-CPU stall times first, so the result is as fresh as a
+ * read of the cgroup's pressure files, whose total= field it matches. The
+ * periodic aggregator alone updates the group total only every two seconds,
+ * which is too coarse for a control loop that ticks faster than that.
+ *
+ * Return: the stall time in nanoseconds, or U64_MAX if PSI is disabled, the
+ * cgroup has no PSI group, or @state is not a per-group state.
+ */
+__bpf_kfunc u64 bpf_psi_total(struct cgroup *cgrp, enum psi_states state)
+{
+	struct psi_group *group;
+	u64 total;
+
+	if (static_branch_likely(&psi_disabled))
+		return U64_MAX;
+	if ((unsigned int)state >= PSI_NONIDLE)
+		return U64_MAX;
+
+	group = cgroup_psi(cgrp);
+	if (!group)
+		return U64_MAX;
+
+	mutex_lock(&group->avgs_lock);
+	collect_percpu_times(group, PSI_AVGS, NULL);
+	total = group->total[PSI_AVGS][state];
+	mutex_unlock(&group->avgs_lock);
+
+	return total;
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(bpf_psi_kfuncs)
+BTF_ID_FLAGS(func, bpf_psi_total, KF_SLEEPABLE)
+BTF_KFUNCS_END(bpf_psi_kfuncs)
+
+static const struct btf_kfunc_id_set bpf_psi_kfunc_set = {
+	.owner	= THIS_MODULE,
+	.set	= &bpf_psi_kfuncs,
+};
+
+static int __init bpf_psi_init(void)
+{
+	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_psi_kfunc_set);
+}
+late_initcall(bpf_psi_init);
+#endif /* CONFIG_BPF_SYSCALL && CONFIG_CGROUPS */
