@@ -162,6 +162,56 @@ __bpf_kfunc void bpf_mem_cgroup_flush_stats(struct mem_cgroup *memcg)
 }
 
 /**
+ * bpf_global_zone_page_state - Read a system-wide zone page state counter
+ * @item: the counter, for example NR_FREE_PAGES
+ *
+ * Reads the sum of a zone counter over all zones, as /proc/vmstat reports
+ * it. A reclaim policy that keeps a buffer of free memory needs the free
+ * page count, which lives in vm_zone_stat, a plain global variable that the
+ * kernel BTF does not carry.
+ *
+ * Return: the counter value in bytes, or -1 if @item is out of range.
+ */
+__bpf_kfunc unsigned long bpf_global_zone_page_state(enum zone_stat_item item)
+{
+	if (unlikely((unsigned int)item >= NR_VM_ZONE_STAT_ITEMS))
+		return (unsigned long)-1;
+
+	return global_zone_page_state(item) * PAGE_SIZE;
+}
+
+/**
+ * bpf_mem_cgroup_set_high - Set a memory cgroup's memory.high limit
+ * @memcg: the memory cgroup
+ * @high: the new limit in bytes; a value beyond the counter's range removes
+ *        the limit, as writing "max" to memory.high does
+ *
+ * Sets the limit as a write to memory.high with O_NONBLOCK would: the
+ * counter changes at once and no reclaim happens here. Tasks that charge
+ * the cgroup above the limit reclaim on their way back to user space and
+ * are delayed in proportion to the overage, outside any lock. A proactive
+ * reclaim policy can use this as its backstop when its own reclaim cannot
+ * keep up with a cgroup's allocation rate.
+ *
+ * Only available to BPF_PROG_TYPE_SYSCALL, like bpf_proactive_reclaim().
+ *
+ * Return: 0 on success, or -EINVAL for the root memory cgroup, which has no
+ * memory.high.
+ */
+__bpf_kfunc int bpf_mem_cgroup_set_high(struct mem_cgroup *memcg, unsigned long high)
+{
+	unsigned long nr_pages = high / PAGE_SIZE;
+
+	if (mem_cgroup_is_root(memcg))
+		return -EINVAL;
+	if (nr_pages > PAGE_COUNTER_MAX)
+		nr_pages = PAGE_COUNTER_MAX;
+
+	page_counter_set_high(&memcg->memory, nr_pages);
+	return 0;
+}
+
+/**
  * bpf_proactive_reclaim - proactively reclaim memory from a memory cgroup
  * @memcg: the target memory cgroup to reclaim from.
  * @size: the amount of memory to reclaim, in bytes, clamped to
@@ -218,11 +268,13 @@ BTF_ID_FLAGS(func, bpf_mem_cgroup_memory_events)
 BTF_ID_FLAGS(func, bpf_mem_cgroup_usage)
 BTF_ID_FLAGS(func, bpf_mem_cgroup_page_state)
 BTF_ID_FLAGS(func, bpf_mem_cgroup_flush_stats, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_global_zone_page_state)
 
 BTF_KFUNCS_END(bpf_memcontrol_kfuncs)
 
 BTF_KFUNCS_START(bpf_memcontrol_reclaim_kfuncs)
 BTF_ID_FLAGS(func, bpf_proactive_reclaim, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_mem_cgroup_set_high)
 BTF_KFUNCS_END(bpf_memcontrol_reclaim_kfuncs)
 
 static const struct btf_kfunc_id_set bpf_memcontrol_kfunc_set = {
