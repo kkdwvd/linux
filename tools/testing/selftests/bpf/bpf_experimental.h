@@ -361,6 +361,7 @@ extern int bpf_kthread_create(struct bpf_kthread *kthread, void *p__map,
 			      __u64 cgroup_id,
 			      int (callback_fn)(void *map, int *key, void *value)) __weak __ksym;
 extern int bpf_kthread_start(struct bpf_kthread *kthread, __u64 flags) __weak __ksym;
+extern int bpf_kthread_bind(struct bpf_kthread *kthread, __u32 cpu) __weak __ksym;
 extern int bpf_kthread_stop(struct bpf_kthread *kthread, __u64 flags) __weak __ksym;
 
 struct bpf_iter_kmem_cache;
