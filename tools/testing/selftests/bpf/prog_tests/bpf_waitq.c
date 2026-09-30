@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <test_progs.h>
+#include <sys/sysinfo.h>
 #include "cgroup_helpers.h"
 #include "bpf_waitq_success.skel.h"
 #include "bpf_waitq_failures.skel.h"
@@ -75,6 +76,20 @@ void test_bpf_waitq(void)
 	err = run_syscall_prog(skel->progs.wait_timeout, &retval);
 	ASSERT_OK(err, "wait_timeout");
 	ASSERT_EQ((__s32)retval, -ETIMEDOUT, "timeout_ret");
+
+	/* Pin a thread to the highest online CPU and read back where it ran. */
+	skel->bss->target_cpu = get_nprocs() - 1;
+	if (!ASSERT_GE((int)skel->bss->target_cpu, 0, "target_cpu"))
+		goto out;
+	err = run_syscall_prog(skel->progs.start_bound_case, &retval);
+	if (!ASSERT_OK(err, "start_bound_case") || !ASSERT_EQ(retval, 0, "bound_start_ret"))
+		goto out;
+	if (!ASSERT_TRUE(wait_for_counter(&skel->bss->callback_runs[3]), "bound_thread_started"))
+		goto out;
+	ASSERT_EQ(skel->bss->callback_cpus[3], skel->bss->target_cpu, "callback_cpu");
+	err = run_syscall_prog(skel->progs.stop_bound_thread, &retval);
+	ASSERT_OK(err, "stop_bound_thread");
+	ASSERT_EQ(retval, 0, "bound_stop_ret");
 
 	err = setup_cgroup_environment();
 	if (!ASSERT_OK(err, "setup_cgroup_environment"))

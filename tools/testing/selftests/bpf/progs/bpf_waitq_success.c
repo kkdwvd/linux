@@ -13,25 +13,28 @@ struct waitq_elem {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 3);
+	__uint(max_entries, 4);
 	__type(key, __u32);
 	__type(value, struct waitq_elem);
 } waitq_map SEC(".maps");
 
-__u32 callback_runs[3];
-__u32 callback_exits[3];
-__u64 callback_cgroup_ids[3];
+__u32 callback_runs[4];
+__u32 callback_exits[4];
+__u64 callback_cgroup_ids[4];
+__u32 callback_cpus[4];
 __u64 target_cgroup_id;
+__u32 target_cpu;
 
 static int thread_cb(void *map, int *key, void *value)
 {
 	struct waitq_elem *elem = value;
 	int idx = *key;
 
-	if (idx < 0 || idx >= 3)
+	if (idx < 0 || idx >= 4)
 		return 1;
 
 	callback_cgroup_ids[idx] = bpf_get_current_cgroup_id();
+	callback_cpus[idx] = bpf_get_smp_processor_id();
 	__sync_fetch_and_add(&callback_runs[idx], 1);
 	if (elem->state == 0) {
 		bpf_waitq_wait(&elem->waitq, &elem->state, 0, ~0ULL, 0);
@@ -42,7 +45,8 @@ static int thread_cb(void *map, int *key, void *value)
 	return 1;
 }
 
-static __noinline int start_one(__u32 key, __u64 cgroup_id)
+/* A negative cpu leaves the thread's affinity alone. */
+static __noinline int start_one(__u32 key, __u64 cgroup_id, int cpu)
 {
 	struct waitq_elem *elem;
 	int ret;
@@ -57,25 +61,48 @@ static __noinline int start_one(__u32 key, __u64 cgroup_id)
 	ret = bpf_kthread_create(&elem->kthread, &waitq_map, cgroup_id, thread_cb);
 	if (ret)
 		return ret;
+	if (cpu >= 0) {
+		ret = bpf_kthread_bind(&elem->kthread, cpu);
+		if (ret)
+			return ret;
+	}
 	return bpf_kthread_start(&elem->kthread, 0);
 }
 
 SEC("syscall")
 int start_wake_case(void *ctx)
 {
-	return start_one(0, 0);
+	return start_one(0, 0, -1);
 }
 
 SEC("syscall")
 int start_stop_case(void *ctx)
 {
-	return start_one(1, 0);
+	return start_one(1, 0, -1);
 }
 
 SEC("syscall")
 int start_cgroup_case(void *ctx)
 {
-	return start_one(2, target_cgroup_id);
+	return start_one(2, target_cgroup_id, -1);
+}
+
+SEC("syscall")
+int start_bound_case(void *ctx)
+{
+	return start_one(3, 0, target_cpu);
+}
+
+SEC("syscall")
+int stop_bound_thread(void *ctx)
+{
+	__u32 key = 3;
+	struct waitq_elem *elem;
+
+	elem = bpf_map_lookup_elem(&waitq_map, &key);
+	if (!elem)
+		return -1;
+	return bpf_kthread_stop(&elem->kthread, 0);
 }
 
 SEC("syscall")
