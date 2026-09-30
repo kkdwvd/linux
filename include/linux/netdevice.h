@@ -430,7 +430,7 @@ enum {
 	NAPI_STATE_DISABLE,		/* Disable pending */
 	NAPI_STATE_NPSVC,		/* Netpoll - don't dequeue from poll_list */
 	NAPI_STATE_LISTED,		/* NAPI added to system lists */
-	NAPI_STATE_NO_BUSY_POLL,	/* Do not add in napi_hash, no busy polling */
+	NAPI_STATE_NO_BUSY_POLL,	/* Not eligible for busy polling */
 	NAPI_STATE_IN_BUSY_POLL,	/* Do not rearm NAPI interrupt */
 	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
 	NAPI_STATE_THREADED,		/* The poll is performed inside its own thread*/

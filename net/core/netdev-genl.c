@@ -275,6 +275,12 @@ netdev_nl_napi_dump_one(struct net_device *netdev, struct sk_buff *rsp,
 	list_for_each_entry(napi, &netdev->napi_list, dev_list) {
 		if (!napi_id_valid(napi->napi_id))
 			continue;
+		/*
+		 * TX NAPIs get their IDs at enable time, out of the order this
+		 * list keeps for config-backed NAPIs; queue-get reports them.
+		 */
+		if (test_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state))
+			continue;
 
 		/* Dump continuation below depends on the list being sorted */
 		WARN_ON_ONCE(napi->napi_id >= prev_id);

@@ -7007,7 +7007,7 @@ restart:
 	napi_poll = NULL;
 
 	napi = napi_by_id(napi_id);
-	if (!napi)
+	if (!napi || test_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state))
 		return;
 
 	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
@@ -7162,9 +7162,6 @@ static void napi_hash_add_with_id(struct napi_struct *napi,
 static void napi_hash_add(struct napi_struct *napi)
 {
 	unsigned long flags;
-
-	if (test_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state))
-		return;
 
 	spin_lock_irqsave(&napi_hash_lock, flags);
 
