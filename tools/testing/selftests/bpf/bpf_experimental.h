@@ -366,6 +366,15 @@ extern int bpf_kthread_create(struct bpf_kthread *kthread, void *p__map,
 extern int bpf_kthread_start(struct bpf_kthread *kthread, __u64 flags) __weak __ksym;
 extern int bpf_kthread_bind(struct bpf_kthread *kthread, __u32 cpu) __weak __ksym;
 extern int bpf_kthread_stop(struct bpf_kthread *kthread, __u64 flags) __weak __ksym;
+extern int bpf_kthread_create_io(struct bpf_kthread *kthread, void *p__map,
+				 int (callback_fn)(void *map, int *key, void *value)) __weak __ksym;
+extern long bpf_sys_exec(struct bpf_kthread *kthread, __u32 nr, const __u64 *args,
+			 __u32 args__sz) __weak __ksym;
+extern int bpf_eventfd_signal(int fd) __weak __ksym;
+extern int bpf_coro_park_file(void *p__coro_frame, int fd, __u32 events,
+			      struct bpf_waitq *waitq) __weak __ksym;
+extern int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq) __weak __ksym;
+extern void *bpf_coro_unpark(struct bpf_waitq *waitq, __u64 size__k) __weak __ksym;
 
 extern int bpf_napi_bind(__u32 napi_id, struct bpf_waitq *waitq, __u64 flags) __weak __ksym;
 extern int bpf_napi_unbind(__u32 napi_id) __weak __ksym;
