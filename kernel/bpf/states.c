@@ -559,7 +559,8 @@ static bool refsafe(struct bpf_verifier_env *env, struct bpf_verifier_state *old
 			return false;
 		}
 		/* Reference-owned slots are compared like stack slots. */
-		if (old->refs[i].nr_slots != cur->refs[i].nr_slots)
+		if (old->refs[i].nr_slots != cur->refs[i].nr_slots ||
+		    old->refs[i].mem_size != cur->refs[i].mem_size)
 			return false;
 		for (j = 0; j < old->refs[i].nr_slots; j++)
 			if (!slot_safe(env, &old->refs[i].slots[j], &cur->refs[i].slots[j], idmap))
@@ -645,6 +646,10 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 		return false;
 
 	if (old->in_rcu_callback_fn != cur->in_rcu_callback_fn)
+		return false;
+
+	/* a resume function may return void, other async callbacks may not */
+	if (!old->coro_suspend_site != !cur->coro_suspend_site)
 		return false;
 
 	/* what the frame did to what its callers hold is a part of what it tells them */

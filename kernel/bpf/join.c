@@ -413,6 +413,8 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 			return false;
 		if (fa->in_callback_fn != fb->in_callback_fn ||
 		    fa->in_async_callback_fn != fb->in_async_callback_fn ||
+		    /* the continuations of two suspend points stay apart */
+		    fa->coro_suspend_site != fb->coro_suspend_site ||
 		    fa->in_exception_callback_fn != fb->in_exception_callback_fn ||
 		    fa->in_rcu_callback_fn != fb->in_rcu_callback_fn ||
 		    fa->async_entry_cnt != fb->async_entry_cnt ||
@@ -512,7 +514,8 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 		if (a->refs[i].type != b->refs[i].type ||
 		    a->refs[i].frameno != b->refs[i].frameno ||
 		    memcmp(a->refs[i].args, b->refs[i].args, sizeof(a->refs[i].args)) ||
-		    a->refs[i].nr_slots != b->refs[i].nr_slots)
+		    a->refs[i].nr_slots != b->refs[i].nr_slots ||
+		    a->refs[i].mem_size != b->refs[i].mem_size)
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
