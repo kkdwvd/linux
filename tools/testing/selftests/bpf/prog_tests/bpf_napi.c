@@ -189,8 +189,11 @@ void test_bpf_napi(void)
 
 	/*
 	 * A busy poll takes the idle NAPI and keeps its interrupt masked: the
-	 * next datagram waits for the next busy poll. A plain poll lets the
-	 * driver complete and re-arm.
+	 * next datagram waits for the next busy poll. The datagram's schedule
+	 * found the NAPI held, so the plain poll that then completes it sees
+	 * it missed and reports one more round of its own rather than handing
+	 * out the token (see napi_bpf_schedule()); the next plain poll lets
+	 * the driver complete and re-arm.
 	 */
 	ret = run_prog(skel->progs.poll_busy);
 	ASSERT_GE(ret, 0, "poll_busy_grab");
@@ -200,6 +203,9 @@ void test_bpf_napi(void)
 	ASSERT_GE(ret & BPF_NAPI_POLL_WORK_MASK, 1, "poll_busy_work");
 	ASSERT_NEQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_busy_more");
 	ASSERT_EQ(recv(rx, buf, sizeof(buf), 0), sizeof(buf), "recv_after_busy_poll");
+	ret = run_prog(skel->progs.poll_napi);
+	ASSERT_GE(ret, 0, "poll_missed");
+	ASSERT_NEQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_missed_more");
 	ret = run_prog(skel->progs.poll_napi);
 	ASSERT_GE(ret, 0, "poll_rearm");
 	ASSERT_EQ(ret & BPF_NAPI_POLL_MORE, 0, "poll_rearm_done");
