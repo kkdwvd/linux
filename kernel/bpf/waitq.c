@@ -6,6 +6,8 @@
 #include <linux/btf_ids.h>
 #include <linux/hrtimer.h>
 #include <linux/rcupdate_trace.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/wait.h>
 
 struct bpf_waitq_kern {
@@ -127,6 +129,7 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	struct bpf_waitq_kern *waitq_kern;
 	wait_queue_entry_t entry;
 	unsigned long irq_flags;
+	bool user_task = !(current->flags & PF_KTHREAD);
 	int ret = 0;
 
 	if (flags)
@@ -156,13 +159,21 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	}
 	__add_wait_queue_entry_tail(&waitq_kern->waitq, &entry);
 	refcount_inc(&waitq_kern->refs);
-	set_current_state(TASK_IDLE);
+	/*
+	 * A thread of a user process must wake for signals, SIGKILL above
+	 * all, so it sleeps interruptibly. A kthread has no signals and
+	 * sleeps in TASK_IDLE.
+	 */
+	set_current_state(user_task ? TASK_INTERRUPTIBLE : TASK_IDLE);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
 
 	migrate_enable();
 	rcu_read_unlock_trace();
 
-	if (timeout_ns == U64_MAX) {
+	if (user_task && signal_pending(current)) {
+		__set_current_state(TASK_RUNNING);
+		ret = -EINTR;
+	} else if (timeout_ns == U64_MAX) {
 		schedule();
 	} else {
 		ktime_t expires = min_t(u64, timeout_ns, KTIME_MAX);
@@ -177,10 +188,14 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	 * An exclusive wakeup that found this entry went to nobody else, so
 	 * it is this waiter's even if the timeout fired at the same time.
 	 */
-	if (list_empty(&entry.entry))
+	if (list_empty(&entry.entry)) {
 		ret = 0;
-	else
+	} else {
 		list_del_init(&entry.entry);
+		/* Nobody woke this waiter: a signal that arrived during the sleep did. */
+		if (user_task && signal_pending(current))
+			ret = -EINTR;
+	}
 	if (waitq_kern->draining)
 		ret = -ENOENT;
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
