@@ -20,6 +20,12 @@ obj-${CONFIG_BPF_LSM}	  += bpf_inode_storage.o
 obj-$(CONFIG_BPF_SYSCALL) += disasm.o mprog.o
 obj-$(CONFIG_BPF_JIT) += trampoline.o
 obj-$(CONFIG_BPF_SYSCALL) += btf.o memalloc.o rqspinlock.o stream.o waitq.o
+# bpf_sys_exec() enters system calls through the x86-64 register ABI.
+ifeq ($(CONFIG_X86_64),y)
+ifneq ($(CONFIG_UML),y)
+obj-$(CONFIG_BPF_SYSCALL) += sys_exec.o
+endif
+endif
 ifeq ($(CONFIG_MMU)$(CONFIG_64BIT),yy)
 obj-$(CONFIG_BPF_SYSCALL) += arena.o range_tree.o
 endif
