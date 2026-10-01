@@ -111,6 +111,11 @@ struct bpf_mem_cache {
 	struct llist_head waiting_for_gp;
 	struct llist_node *waiting_for_gp_tail;
 	struct rcu_head rcu;
+	/*
+	 * 0 - idle
+	 * 1 - __free_by_rcu() is queued
+	 * 2 - __free_by_rcu() is queued and free_llist_extra_rcu got more objects since
+	 */
 	atomic_t call_rcu_in_progress;
 	struct llist_head free_llist_extra_rcu;
 
@@ -392,27 +397,78 @@ static void __free_by_rcu(struct rcu_head *head)
 {
 	struct bpf_mem_cache *c = container_of(head, struct bpf_mem_cache, rcu);
 	struct bpf_mem_cache *tgt = c->tgt;
-	struct llist_node *llnode;
+	struct llist_node *llnode, *tail;
 
 	WARN_ON_ONCE(tgt->unit_size != c->unit_size);
 	WARN_ON_ONCE(tgt->percpu_size != c->percpu_size);
 
 	llnode = llist_del_all(&c->waiting_for_gp);
-	if (!llnode)
-		goto out;
+	if (llnode) {
+		llist_add_batch(llnode, c->waiting_for_gp_tail, &tgt->free_by_rcu_ttrace);
 
-	llist_add_batch(llnode, c->waiting_for_gp_tail, &tgt->free_by_rcu_ttrace);
+		/* Objects went through regular RCU GP. Send them to RCU tasks trace */
+		do_call_rcu_ttrace(tgt);
+	}
 
-	/* Objects went through regular RCU GP. Send them to RCU tasks trace */
-	do_call_rcu_ttrace(tgt);
-out:
-	atomic_set(&c->call_rcu_in_progress, 0);
+	/*
+	 * unit_free_rcu() that ran while the GP was in flight added its objects
+	 * to free_llist_extra_rcu and set 2. The cpu that owns this cache may
+	 * never run check_free_by_rcu() again, so start the next GP from here.
+	 * 'c' can be freed as soon as call_rcu_in_progress is zero.
+	 */
+	while (atomic_cmpxchg(&c->call_rcu_in_progress, 1, 0) != 1) {
+		/*
+		 * Must be done before llist_del_all(). Objects that it misses were
+		 * added by unit_free_rcu() that will set 2 after this store.
+		 */
+		atomic_set(&c->call_rcu_in_progress, 1);
+		/* Empty if the previous round or drain_mem_cache() took them */
+		llnode = llist_del_all(&c->free_llist_extra_rcu);
+		if (!llnode)
+			continue;
+		for (tail = llnode; tail->next; tail = tail->next)
+			;
+		WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
+		c->waiting_for_gp_tail = tail;
+		llist_add_batch(llnode, tail, &c->waiting_for_gp);
+
+		/* Pairs with synchronize_rcu() in free_mem_alloc() */
+		guard(rcu)();
+		if (unlikely(READ_ONCE(c->draining))) {
+			free_all(c, llist_del_all(&c->waiting_for_gp), !!c->percpu_size);
+			continue;
+		}
+		call_rcu_hurry(&c->rcu, __free_by_rcu);
+		return;
+	}
 }
 
 static void check_free_by_rcu(struct bpf_mem_cache *c)
 {
 	struct llist_node *llnode, *t;
 	unsigned long flags;
+	int in_progress;
+
+	in_progress = atomic_read(&c->call_rcu_in_progress);
+	if (in_progress) {
+		if (llist_empty(&c->free_llist_extra_rcu))
+			return;
+		/*
+		 * __free_by_rcu() will start the next GP for these objects if it
+		 * sees 2. A nested unit_free_rcu() that saw 0 may have added them
+		 * without setting it. Instead of kmalloc-ing new rcu_head and
+		 * triggering 10k call_rcu() to hit rcutree.qhimark and force RCU
+		 * to notice the overload just ask RCU to hurry up. There could be
+		 * many objects in that list.
+		 * This hint reduces memory consumption for an artificial
+		 * benchmark from 2 Gbyte to 150 Mbyte.
+		 */
+		if (in_progress == 2 || atomic_cmpxchg(&c->call_rcu_in_progress, 1, 2) != 0) {
+			rcu_request_urgent_qs_task(current);
+			return;
+		}
+		/* The GP ended and __free_by_rcu() won't look. Start another one. */
+	}
 
 	/* drain free_llist_extra_rcu */
 	if (unlikely(!llist_empty(&c->free_llist_extra_rcu))) {
@@ -426,19 +482,11 @@ static void check_free_by_rcu(struct bpf_mem_cache *c)
 	if (llist_empty(&c->free_by_rcu))
 		return;
 
-	if (atomic_xchg(&c->call_rcu_in_progress, 1)) {
-		/*
-		 * Instead of kmalloc-ing new rcu_head and triggering 10k
-		 * call_rcu() to hit rcutree.qhimark and force RCU to notice
-		 * the overload just ask RCU to hurry up. There could be many
-		 * objects in free_by_rcu list.
-		 * This hint reduces memory consumption for an artificial
-		 * benchmark from 2 Gbyte to 150 Mbyte.
-		 */
-		rcu_request_urgent_qs_task(current);
-		return;
-	}
-
+	/*
+	 * Only this irq_work sets it from zero. unit_free_rcu() and the cmpxchg
+	 * above set 2 from 1, and __free_by_rcu() sets 1 from 2.
+	 */
+	WARN_ON_ONCE(atomic_xchg(&c->call_rcu_in_progress, 1));
 	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
 
 	inc_active(c, &flags);
@@ -663,15 +711,16 @@ static void drain_mem_cache(struct bpf_mem_cache *c)
 	 * bpf_mem_cache_free() for all remaining elements and they can be in
 	 * free_by_rcu_ttrace or in waiting_for_gp_ttrace lists, so drain those lists now.
 	 *
-	 * Except for waiting_for_gp_ttrace list, there are no concurrent operations
-	 * on these lists, so it is safe to use __llist_del_all().
+	 * Except for the lists that __free_by_rcu() and __free_rcu() operate on,
+	 * there are no concurrent operations on these lists, so it is safe to
+	 * use __llist_del_all().
 	 */
 	free_all(c, llist_del_all(&c->free_by_rcu_ttrace), percpu);
 	free_all(c, llist_del_all(&c->waiting_for_gp_ttrace), percpu);
 	free_all(c, __llist_del_all(&c->free_llist), percpu);
 	free_all(c, __llist_del_all(&c->free_llist_extra), percpu);
 	free_all(c, __llist_del_all(&c->free_by_rcu), percpu);
-	free_all(c, __llist_del_all(&c->free_llist_extra_rcu), percpu);
+	free_all(c, llist_del_all(&c->free_llist_extra_rcu), percpu);
 	free_all(c, llist_del_all(&c->waiting_for_gp), percpu);
 }
 
@@ -733,9 +782,9 @@ static void free_mem_alloc(struct bpf_mem_alloc *ma)
 	 * Trace grace period implies RCU grace period, so all __free_rcu don't
 	 * need extra call_rcu() (and thus extra rcu_barrier() here).
 	 *
-	 * __free_rcu() queues itself again unless it sees 'draining'. After
-	 * synchronize_rcu() it either did that already or will not do it, so
-	 * rcu_barrier_tasks_trace() cannot miss it.
+	 * __free_by_rcu() and __free_rcu() queue themselves again unless they
+	 * see 'draining'. After synchronize_rcu() they either did that already
+	 * or will not do it, so the barriers below cannot miss them.
 	 */
 	synchronize_rcu();
 	rcu_barrier(); /* wait for __free_by_rcu */
@@ -903,20 +952,41 @@ static void notrace unit_free_rcu(struct bpf_mem_cache *c, void *ptr)
 {
 	struct llist_node *llnode = ptr - LLIST_NODE_SZ;
 	unsigned long flags;
+	int in_progress;
 
 	c->tgt = *(struct bpf_mem_cache **)llnode;
 
 	local_irq_save(flags);
-	if (local_inc_return(&c->active) == 1) {
-		if (__llist_add(llnode, &c->free_by_rcu))
-			c->free_by_rcu_tail = llnode;
-	} else {
-		llist_add(llnode, &c->free_llist_extra_rcu);
-	}
-	local_dec(&c->active);
-
-	if (!atomic_read(&c->call_rcu_in_progress))
+	in_progress = atomic_read(&c->call_rcu_in_progress);
+	if (!in_progress) {
+		if (local_inc_return(&c->active) == 1) {
+			if (__llist_add(llnode, &c->free_by_rcu))
+				c->free_by_rcu_tail = llnode;
+		} else {
+			llist_add(llnode, &c->free_llist_extra_rcu);
+		}
+		local_dec(&c->active);
 		irq_work_raise(c);
+	} else {
+		/*
+		 * RCU GP is in flight, so check_free_by_rcu() cannot start another
+		 * one and __free_by_rcu() will do it when the GP ends. It runs on
+		 * any cpu, so add to the list that it can take without the
+		 * 'active' protection.
+		 *
+		 * llist_add() and the llist_del_all() in __free_by_rcu() are
+		 * fully ordered, and __free_by_rcu() stores 1 before the latter.
+		 * If the read below returns 2, either that llist_del_all() is
+		 * still to come, or the 2 was stored after the 1 and forces one
+		 * more round; both take this object. Otherwise cmpxchg(1 -> 2)
+		 * forces the round, unless it finds 0: the GP ended and only
+		 * refill_work can start another one.
+		 */
+		llist_add(llnode, &c->free_llist_extra_rcu);
+		if (atomic_read(&c->call_rcu_in_progress) != 2 &&
+		    atomic_cmpxchg(&c->call_rcu_in_progress, 1, 2) == 0)
+			irq_work_raise(c);
+	}
 	local_irq_restore(flags);
 }
 
