@@ -399,6 +399,44 @@ with one exception: a frame is not accepted as the buffer of
 the buffer. The contents of a frame are tracked like those of the stack, and
 such a slice would be a second way to them.
 
+2.3.11 __coro_suspend Annotation
+--------------------------------
+
+A ``__coro_suspend`` parameter is a consumed frame that the kernel resumes
+later, once the event the kfunc waits for has happened::
+
+        __bpf_kfunc int bpf_blk_read_coro(struct bpf_blk_io *io__arena,
+                                          void *buf__arena,
+                                          void *frame__coro_suspend)
+
+The compiler stores the address of the coroutine's resume function in the
+frame's first slot and of its destroy function in the second, and both take
+the frame as their only argument. Each of the two slots holds the address of
+one function, not a pointer that was loaded from a table of functions and
+stands for any of them. At the call the verifier snapshots the
+frame's slots and verifies each of the two functions as an async callback
+starting from that snapshot: the slots keep their types and values, so the
+suspend index selects only the continuation of this suspend point, and the
+acquired references stored in the frame move to the callback, which must
+release them (or the frame holding them, together with the frame itself).
+Pointers that do not survive a suspension are rejected: the context, packet
+pointers, RCU-protected or untrusted pointers, values of maps other than
+arrays, inner maps of a map in map and their values, sockets that a helper
+looked up, and the arguments of a struct_ops operator. A reference survives
+when a kfunc acquired it or ``bpf_kptr_xchg()`` took it out of a map. The caller keeps the frame address as a non-NULL scalar, which
+lets the compiler-generated check for a failed frame allocation hold. A
+continuation is checked like any callback that the kernel calls: it cannot
+use ``LD_ABS`` or a tail call, and it cannot use the stack in arena (R12),
+since a resume that got none would be skipped. Nor can it be recursive: the
+check of the stack at the entry of a recursive function unwinds a frame that
+holds nothing, and a continuation holds the frame from its first insn on.
+
+The kfunc owns the frame from then on and calls its resume function once,
+with the frame as the only argument, later, from a context in which the
+program type's kfuncs are valid, and never inside an invocation of a
+program. A kfunc that fails after consuming the frame defers that call
+too, with the error reported in memory the coroutine can see.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

@@ -944,6 +944,12 @@ struct bpf_func_state {
 	 * when one state stands for another.
 	 */
 	struct bpf_pad_arg call_args[MAX_BPF_FUNC_REG_ARGS];
+	/*
+	 * Not 0 in an async callback that is the resume or destroy function of a coroutine:
+	 * one plus the call that suspended the coroutine, see push_coro_suspend(). The
+	 * continuations of two suspend points have two join_keys.
+	 */
+	u32 coro_suspend_site;
 	);
 	bool no_stack_arg_load;
 	/*
@@ -1793,6 +1799,8 @@ struct bpf_subprog_info {
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
 	bool is_async_cb: 1;
+	/* the resume or destroy function of a suspended coroutine, see push_coro_suspend() */
+	bool coro_cont: 1;
 	bool is_exception_cb: 1;
 	bool in_exception_cb: 1; /* it is the exception callback, or that may get to it */
 	/* bpf_loop() or bpf_for_each_map_elem() call it in a loop */
@@ -3249,6 +3257,8 @@ struct bpf_call_arg_meta {
 	struct {
 		u32 ids[MAX_BPF_FUNC_ARGS];
 		u32 cnt;
+		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
+		u32 suspend_mask;
 	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
