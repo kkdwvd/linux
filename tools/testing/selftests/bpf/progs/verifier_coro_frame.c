@@ -154,7 +154,7 @@ __naked void coro_frame_leak(void)
 
 SEC("socket")
 __description("coro_frame: double free rejected")
-__failure __msg("release kfunc bpf_coro_frame_free expects referenced")
+__failure __msg("R1 type=scalar expected=coro_frame")
 __naked void coro_frame_double_free(void)
 {
 	asm volatile (
