@@ -696,6 +696,13 @@ struct bpf_waitq_kern {
 	refcount_t refs;
 	u32 sequence;
 	bool draining;
+	/*
+	 * Coroutine frames parked on this queue, see bpf_coro_park_file():
+	 * waiting for their event, and ready to be handed back by
+	 * bpf_coro_unpark(). Both lists are protected by waitq.lock.
+	 */
+	struct list_head parked;
+	struct list_head ready;
 };
 
 /* Call get under Tasks Trace RCU; the returned endpoint survives map teardown. */
