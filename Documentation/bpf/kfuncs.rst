@@ -431,11 +431,31 @@ since a resume that got none would be skipped. Nor can it be recursive: the
 check of the stack at the entry of a recursive function unwinds a frame that
 holds nothing, and a continuation holds the frame from its first insn on.
 
-The kfunc owns the frame from then on and calls its resume function once,
-with the frame as the only argument, later, from a context in which the
-program type's kfuncs are valid, and never inside an invocation of a
-program. A kfunc that fails after consuming the frame defers that call
-too, with the error reported in memory the coroutine can see.
+The kfunc owns the frame from then on. Once its event has happened it
+resumes the coroutine exactly once with ``bpf_coro_run()``, and the
+continuation owns the frame then. It does so later, from kernel context in
+which the program type's kfuncs are valid: softirq, irq_work or a workqueue,
+as the kfunc arranges. ``bpf_coro_run()`` never runs inside an invocation of
+a program: not in the call that took the frame, nor in another kfunc that a
+program calls. A continuation that suspends its frame again to a kfunc that
+resumed it in the call would nest without bound. A kfunc that fails after
+taking the frame defers the resume too, with the error reported in memory
+the coroutine can see. The frame holds its reference on the program all
+along, so the kfunc takes none.
+
+Or the kfunc frees the frame with ``bpf_coro_frame_free()`` without resuming
+it. That does not release the references that the coroutine keeps in the
+slots of the frame, which leak: neither a call of the destroy function nor
+pads that release what a suspended frame holds exist yet.
+
+The kernel may unwind a continuation like any program, for a loop whose time
+is up, say, and ``bpf_coro_run()`` returns true then, so that the kfunc can
+react, by closing a connection or waking a waiter. It does the same when the
+program's own unwinding (a C++ exception) leaves the continuation. The value
+that an unwound continuation leaves is of no use to anybody, and the exception
+callback of the program is not called for it. The landing pad of
+``bpf_coro_run()`` takes a JIT that unwinds programs (x86-64 and arm64): where
+there is none, a continuation that can be unwound is not loaded.
 
 .. _BPF_kfunc_nodef:
 

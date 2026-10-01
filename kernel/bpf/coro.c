@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * BPF coroutine frames; see include/linux/bpf_coro.h.
+ * BPF coroutine frames, and their resumption from the kernel; see include/linux/bpf_coro.h.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_coro.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
+#include <linux/filter.h>
 #include <linux/irq_work.h>
 #include <linux/llist.h>
+#include <linux/preempt.h>
+#include <linux/rcupdate.h>
+#include <linux/rcupdate_trace.h>
 #include <linux/slab.h>
 
 /*
@@ -106,3 +111,91 @@ __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
 EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
 
 __bpf_kfunc_end_defs();
+
+/* The task that runs bpf_coro_run() on this CPU at each context level, see bpf_coro_run(). */
+struct bpf_coro_runners {
+	struct task_struct *task[4];
+};
+
+static DEFINE_PER_CPU(struct bpf_coro_runners, bpf_coro_runners);
+
+/*
+ * Like interrupt_context_level(), but on PREEMPT_RT too, where softirqs are served in task
+ * context and preempt_count() doesn't tell.
+ */
+static int bpf_coro_run_level(void)
+{
+	if (in_nmi())
+		return 3;
+	if (in_hardirq())
+		return 2;
+	return in_serving_softirq() ? 1 : 0;
+}
+
+/*
+ * Resume the coroutine of @frame: call the resume function in its first slot with the frame
+ * as its argument. It is a subprogram of the program that the frame holds a reference on, and
+ * runs like any invocation of the program, under RCU with migration disabled, in a context
+ * where the kfuncs of the program type are valid, which the caller sees to. Like the call of
+ * any async callback it is an invocation of its own for the time of may_goto, see
+ * bpf_timed_may_goto_save().
+ *
+ * It is never called inside an invocation of a program, from a kfunc that the program calls:
+ * a continuation that suspends its frame again to such a kfunc would nest without bound. Where
+ * that happens the same task is in here twice at the same context level of the CPU. The
+ * warning catches that much, see bpf_coro_runners: not a kfunc that resumes a frame in the
+ * call of a program that no bpf_coro_run() entered, nor one that nests while another task's
+ * call of this CPU, which was preempted, holds the task level.
+ *
+ * The continuation owns the frame and may free it, and with it the reference that keeps the
+ * program loaded. A program is freed after a grace period of RCU, or of RCU Tasks Trace if it
+ * runs sleepable, see __bpf_prog_put_noref(): the call and what follows it here are in a read
+ * section of the one that applies.
+ *
+ * The call has a landing pad, like the call of a helper whose callback may unwind, see
+ * bpf_call_cb(). The verifier has a continuation leave with kexit when the kernel unwinds it,
+ * see push_coro_suspend(), and kexit returns here, behind the label: the pads of the program
+ * have released what the continuation held. Nothing on the way to it says who is told, so this
+ * tells a struct_ops, as bpf_prog_unwound_to_kernel() would where kexit finds no landing pad.
+ * unwind_exit of the program comes to the label too: the continuation did not return either,
+ * and nobody else is told, as where such a frame returns into the kernel.
+ *
+ * Returns true when the continuation did not return: the kernel unwound it, or the program's
+ * own unwinding left it. The kfunc can react, by closing a connection or waking a waiter, say.
+ */
+noinline bool bpf_coro_run(void *frame)
+{
+	struct bpf_prog *prog = bpf_coro_frame_hdr(frame)->prog;
+	bpf_callback_t resume = READ_ONCE(*(bpf_callback_t *)frame);
+	bool sleepable = bpf_prog_runs_sleepable(prog);
+	struct bpf_timed_may_goto saved;
+	struct task_struct *runner;
+	bool unwound = false;
+	u64 ret, kind;
+	int level;
+
+	if (sleepable)
+		rcu_read_lock_trace();
+	rcu_read_lock();
+	migrate_disable();
+	level = bpf_coro_run_level();
+	runner = this_cpu_cmpxchg(bpf_coro_runners.task[level], NULL, current);
+	WARN_ONCE(runner == current, "bpf_coro_run() inside a BPF program\n");
+	bpf_timed_may_goto_save(prog, &saved);
+	bpf_call_cb(resume, frame, 0, 0, 0, 0, ret, kind, left);
+	goto done;
+left:
+	unwound = true;
+	if (kind)
+		bpf_prog_unwound_to_kernel((unsigned long)resume);
+done:
+	bpf_timed_may_goto_restore(prog, &saved);
+	if (!runner)
+		this_cpu_write(bpf_coro_runners.task[level], NULL);
+	migrate_enable();
+	rcu_read_unlock();
+	if (sleepable)
+		rcu_read_unlock_trace();
+	return unwound;
+}
+EXPORT_SYMBOL_GPL(bpf_coro_run);

@@ -6411,24 +6411,27 @@ static bool kfunc_suspends_coro(struct bpf_verifier_env *env, const struct bpf_i
  * The address of the callback at @idx goes nowhere but to a helper that keeps it for
  * later: a timer, a work queue, call_rcu. Or it goes into memory in front of a kfunc that
  * suspends a coroutine: the resume function of a coroutine, which the kernel calls later
- * and never inside of the program, see include/linux/bpf_coro.h. That is a guess: a callback
- * that a helper calls from memory after all closes a cycle that check_recursion() refuses.
+ * and never inside of the program, see include/linux/bpf_coro.h. *@resumed says which. That
+ * is a guess: a callback that a helper calls from memory after all closes a cycle that
+ * check_recursion() refuses.
  */
-static bool func_is_kept_for_later(struct bpf_verifier_env *env, int idx, int end)
+static bool func_is_kept_for_later(struct bpf_verifier_env *env, int idx, int end, bool *resumed)
 {
 	struct bpf_insn *insn = env->prog->insnsi;
 	u8 class, reg = insn[idx].dst_reg;
 	bool stored = false, in_reg = true;
 	int i;
 
+	*resumed = false;
 	if (reg < BPF_REG_1 || reg > BPF_REG_5)
 		return false;
 	for (i = idx + 2; i < end; i++) {
 		class = BPF_CLASS(insn[i].code);
 		/* an address in memory may be called from there: kept for a coroutine only */
-		if (class == BPF_JMP || class == BPF_JMP32)
-			return (!stored && bpf_is_async_callback_calling_insn(&insn[i])) ||
-			       (stored && kfunc_suspends_coro(env, &insn[i]));
+		if (class == BPF_JMP || class == BPF_JMP32) {
+			*resumed = stored && kfunc_suspends_coro(env, &insn[i]);
+			return (!stored && bpf_is_async_callback_calling_insn(&insn[i])) || *resumed;
+		}
 		if (in_reg && class == BPF_STX && BPF_MODE(insn[i].code) == BPF_MEM &&
 		    insn[i].src_reg == reg && insn[i].dst_reg != reg) {
 			stored = true;
@@ -6459,8 +6462,12 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	struct bpf_insn *insn = env->prog->insnsi;
 	int cnt = env->subprog_cnt, i, j, s, err;
 	struct bpf_call_graph cg;
-	/* the program calls the subprog, or its address may get to an indirect call */
-	enum { CALLED = 1, IN_EXC_CB = 2 };
+	bool resumed;
+	/*
+	 * CALLED: the program calls the subprog, or its address may get to an indirect call.
+	 * RESUMED: bpf_coro_run() calls it, see func_is_kept_for_later().
+	 */
+	enum { CALLED = 1, IN_EXC_CB = 2, RESUMED = 4 };
 
 	/* callx calls node 'cnt', which calls each subprog whose address is taken */
 	err = bpf_call_graph_init(&cg, cnt + 1);
@@ -6486,9 +6493,11 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				 * callback that arms itself again doesn't call itself.
 				 */
 				if (bpf_pseudo_call(&insn[i]) ||
-				    !func_is_kept_for_later(env, i, si[s + 1].start)) {
+				    !func_is_kept_for_later(env, i, si[s + 1].start, &resumed)) {
 					err = bpf_call_graph_add(&cg, s, j);
 					cg.marks[j] |= CALLED;
+				} else if (resumed) {
+					cg.marks[j] |= RESUMED;
 				}
 				if (bpf_pseudo_func(&insn[i]))
 					si[j].addr_taken = true;
@@ -6521,12 +6530,17 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	for (s = 1; s < cnt; s++)
 		si[s].in_exception_cb = cg.marks[s] & IN_EXC_CB;
 
-	/* What only the kernel calls returns to it: the main prog, the callback of a timer. */
+	/*
+	 * What only the kernel calls returns to it: the main prog, the callback of a timer. But
+	 * bpf_coro_run() has a landing pad for a continuation, which leaves with kexit when the
+	 * kernel unwinds it: that is how bpf_coro_run() knows, see push_coro_suspend().
+	 */
 	for (s = 0; s < cnt; s++) {
 		si[s].bail_unwinds = si[s].can_unwind ||
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
-				      (cg.marks[s] & CALLED));
+				      ((cg.marks[s] & CALLED) ||
+				       (BPF_HAS_CB_PADS && (cg.marks[s] & RESUMED))));
 		si[s].bail_unwinds_at_first = si[s].bail_unwinds;
 		/* it has unwind_exit. Where the kernel unwinds it, the pass finds. */
 		si[s].must_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
@@ -12662,6 +12676,12 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 
 		if (state->speculative)
 			return 0;
+		/* see push_coro_resume_cb() */
+		if (env->subprog_info[subprog].coro_cont) {
+			verbose(env, "func#%d is a coroutine continuation and cannot be an async callback\n",
+				subprog);
+			return -EINVAL;
+		}
 		/* there is no real recursion here. timer and workqueue callbacks are async */
 		env->subprog_info[subprog].is_async_cb = true;
 		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
@@ -17236,6 +17256,14 @@ bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id)
  * that do not survive a suspension are rejected: the context, packet data,
  * RCU-protected or untrusted pointers, and values of maps other than arrays,
  * which are only valid under RCU.
+ *
+ * The kfunc resumes the frame with bpf_coro_run(), whose call of the
+ * continuation has a landing pad like the call of a helper whose callback may
+ * unwind, see bpf_call_cb(). The continuation leaves with kexit where the
+ * kernel unwinds it, which needs bail_unwinds, see mark_recursive_subprogs(),
+ * and bpf_coro_run() tells the kfunc. The normal path pays nothing for that. A
+ * continuation that leaves with exit when it is unwound, where the JIT does not
+ * unwind, would tell nobody: unwind_frame() refuses that.
  */
 static struct bpf_reference_state *coro_ref_by_id(struct bpf_verifier_state *st, int id)
 {
@@ -17327,6 +17355,25 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	struct bpf_reg_state *reg;
 	int i;
 
+	/*
+	 * The kernel calls a continuation from bpf_coro_run() only, which tells the kfunc when
+	 * the kernel unwound it, see push_coro_suspend(). A timer, say, would call it with
+	 * arguments of its own, and no kfunc would learn that it was unwound.
+	 */
+	if (info->is_async_cb && !info->coro_cont) {
+		verbose(env, "func#%d is an async callback and cannot be a coroutine continuation\n",
+			subprog);
+		return -EINVAL;
+	}
+	/*
+	 * unwind_exit of the program goes to the landing pad of bpf_coro_run() as well, which
+	 * says that the continuation did not return. Where bpf_call_cb() makes none it returns.
+	 */
+	if (info->can_unwind && !BPF_HAS_CB_PADS) {
+		verbose(env, "coroutine continuation %s() has unwind_exit, and bpf_coro_run() cannot tell\n",
+			bpf_subprog_name(env, subprog));
+		return -EINVAL;
+	}
 	/*
 	 * The check at the entry of a recursive subprog unwinds a frame that holds nothing, see
 	 * emit_unwind_exit(). A continuation holds the coroutine frame and what it carried from
@@ -23776,6 +23823,18 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			goto out;
 	}
 
+	/*
+	 * The top frame of a continuation leaves with kexit, into the landing pad that
+	 * bpf_coro_run() has for it: that is how the kfunc learns that its continuation was
+	 * unwound, see push_coro_suspend(). Without it the frame would leave with exit, and
+	 * nobody would know. Nor would anybody where bpf_call_cb() makes no landing pad.
+	 */
+	if (frame_is_top(st) && sub->coro_cont && (!sub->bail_unwinds || !BPF_HAS_CB_PADS)) {
+		verbose(env, "insn %d: coroutine continuation %s() cannot be unwound here: bpf_coro_run() would not be told\n",
+			insn_idx, bpf_subprog_name(env, frame->subprogno));
+		err = -EINVAL;
+		goto unproven;
+	}
 	/* at an access to arena the state has visited the plan in check_arena_site() */
 	err = release_frame_resources(env, bpf_pad_plan(&env->insn_aux_data[insn_idx], kind));
 	if (err)
