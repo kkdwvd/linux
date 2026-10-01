@@ -309,6 +309,8 @@ struct bpf_reference_state {
 	 */
 	struct bpf_stack_state *slots;
 	u32 nr_slots;
+	/* Exact byte size of the slot-tracked memory. */
+	u32 mem_size;
 };
 
 struct bpf_retval_range {
@@ -347,6 +349,8 @@ struct bpf_func_state {
 	struct bpf_retval_range callback_ret_range;
 	bool in_callback_fn;
 	bool in_async_callback_fn;
+	/* Async callback that is a coroutine's resume or destroy function. */
+	bool coro_resume;
 	bool in_exception_callback_fn;
 	bool no_stack_arg_load;
 	/* For callback calling functions that limit number of possible
@@ -1761,6 +1765,8 @@ struct bpf_call_arg_meta {
 	struct {
 		u32 ids[MAX_BPF_FUNC_ARGS];
 		u32 cnt;
+		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
+		u32 suspend_mask;
 	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,

@@ -216,6 +216,7 @@ static bool is_tracing_prog_type(enum bpf_prog_type type);
 static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
 static void scalar32_min_max_add(struct bpf_reg_state *dst_reg, struct bpf_reg_state *src_reg);
@@ -7129,6 +7130,7 @@ static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
 	if (!ref->slots)
 		return -ENOMEM;
 	ref->nr_slots = nr_slots;
+	ref->mem_size = size;
 	/* Precision requests for the frame's slots end at this allocation. */
 	return bpf_push_ref_jmp_history(env, vstate, INSN_F_REF_ALLOC, 0, id);
 }
@@ -9946,7 +9948,7 @@ static enum bpf_access_type func_arg_access_type(enum bpf_arg_type arg_type)
 }
 
 static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
-				     argno_t argno, struct bpf_call_arg_meta *meta)
+				     u32 arg, argno_t argno, struct bpf_call_arg_meta *meta)
 {
 	u32 i;
 
@@ -9961,6 +9963,9 @@ static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_re
 			goto duplicate;
 	}
 
+	if (meta->func_proto && arg < btf_type_vlen(meta->func_proto) &&
+	    is_kfunc_arg_coro_suspend(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
 	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
 	return 0;
 
@@ -10223,7 +10228,7 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 	case ARG_PTR_TO_ARENA:
 		break;
 	case ARG_PTR_TO_CORO_FRAME:
-		err = record_coro_frame_release(env, reg, argno, meta);
+		err = record_coro_frame_release(env, reg, arg, argno, meta);
 		break;
 	case ARG_PTR_TO_ALLOC_BTF_ID:
 		if (reg->type == (PTR_TO_BTF_ID | MEM_ALLOC)) {
@@ -11278,8 +11283,23 @@ static int release_reference(struct bpf_verifier_env *env, int id)
 				continue;
 			}
 			bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_REF_RELEASE);
-			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL)
+			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL) {
+				bool coro_handle = base_type(reg->type) == PTR_TO_CORO_FRAME &&
+						   !(reg->type & PTR_MAYBE_NULL);
+
 				mark_reg_invalid(env, reg);
+				/*
+				 * A consumed coroutine frame leaves its handle
+				 * behind as a scalar; the compiler-generated
+				 * caller tests it against NULL to tell a
+				 * started coroutine from a failed allocation,
+				 * so keep what is known: it is not NULL.
+				 */
+				if (coro_handle && reg->type == SCALAR_VALUE) {
+					reg->r64 = cnum64_from_urange(1, U64_MAX);
+					reg_bounds_sync(reg);
+				}
+			}
 		}));
 	}
 
@@ -13416,6 +13436,16 @@ static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_para
 	return btf_param_match_suffix(btf, arg, "__coro_frame");
 }
 
+/*
+ * A __coro_suspend parameter is a consumed frame that the kernel resumes
+ * later: the verifier snapshots the frame at the call and verifies its
+ * resume and destroy functions from that snapshot, see push_coro_suspend().
+ */
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_suspend");
+}
+
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
 					  const struct btf_param *arg,
 					  const char *name)
@@ -14235,7 +14265,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		}
 		proto->arg_size[arg] = type_size;
 		arg_type = ARG_PTR_TO_CTX_OUT | MEM_FIXED_SIZE;
-	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]))
+	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]) ||
+		   is_kfunc_arg_coro_suspend(meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_CORO_FRAME | OBJ_RELEASE;
 	else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_FUNC;
@@ -15418,6 +15449,218 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * Suspension of a coroutine into the kernel.
+ *
+ * A kfunc that takes a __coro_suspend frame keeps the frame and resumes the
+ * coroutine later by calling the resume function whose address the compiler
+ * stored in the frame's first slot, with the frame as the only argument; the
+ * destroy function in the second slot cancels it instead. The frame's
+ * contents are all the state those functions see, so each is verified as an
+ * async callback that starts from a snapshot of the frame taken at the call:
+ * the slots keep their types and values, the suspend index among them, so
+ * only the continuation of this suspend point is explored, and the acquired
+ * references stored in the frame move to the callback, which has to release
+ * them (or the frame holding them, along with the frame itself). Pointers
+ * that do not survive a suspension are rejected: the context, packet data,
+ * RCU-protected or untrusted pointers, and values of maps other than arrays,
+ * which are only valid under RCU.
+ */
+static struct bpf_reference_state *coro_ref_by_id(struct bpf_verifier_state *st, int id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id)
+			return &st->refs[i];
+	return NULL;
+}
+
+static struct bpf_reference_state *coro_add_ref(struct bpf_verifier_state *st, int insn_idx)
+{
+	int n = st->acquired_refs;
+
+	if (resize_reference_state(st, n + 1))
+		return NULL;
+	memset(&st->refs[n], 0, sizeof(st->refs[n]));
+	st->refs[n].insn_idx = insn_idx;
+	st->refs[n].type = REF_TYPE_PTR;
+	return &st->refs[n];
+}
+
+/* Is the pointer in a frame slot an acquired kernel reference? */
+static bool coro_slot_reg_is_ref(const struct bpf_reg_state *reg)
+{
+	switch (base_type(reg->type)) {
+	case PTR_TO_BTF_ID:
+	case PTR_TO_SOCKET:
+	case PTR_TO_SOCK_COMMON:
+	case PTR_TO_TCP_SOCK:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	switch (base_type(reg->type)) {
+	case SCALAR_VALUE:
+	case PTR_TO_FUNC:
+	case PTR_TO_ARENA:
+	case CONST_PTR_TO_MAP:
+		return true;
+	case PTR_TO_MAP_VALUE:
+		return reg->map_ptr && reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY;
+	default:
+		return coro_slot_reg_is_ref(reg) && reg_is_referenced(env, reg) &&
+		       !(reg->type & (MEM_RCU | NON_OWN_REF | PTR_UNTRUSTED | PTR_MAYBE_NULL));
+	}
+}
+
+/* Verify subprog 'subprog' as the continuation of the suspended 'frame'. */
+static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
+			       struct bpf_reference_state *frame, u32 *moved, int nr_moved)
+{
+	struct bpf_verifier_state *cur = env->cur_state, *async_cb;
+	struct bpf_reference_state *ref, *src;
+	struct bpf_func_state *callee;
+	struct bpf_reg_state *reg;
+	int i;
+
+	env->subprog_info[subprog].is_async_cb = true;
+	/*
+	 * No previous instruction: the continuation starts afresh, and
+	 * precision backtracking must not walk from its entry into the
+	 * code around this call. It stops at the entry instead.
+	 */
+	async_cb = push_async_cb(env, env->subprog_info[subprog].start, -1, subprog, false);
+	if (IS_ERR(async_cb))
+		return PTR_ERR(async_cb);
+	async_cb->first_insn_idx = env->subprog_info[subprog].start;
+	callee = async_cb->frame[0];
+	callee->async_entry_cnt = cur->frame[0]->async_entry_cnt + 1;
+	callee->in_async_callback_fn = true;
+	callee->coro_resume = true;
+	callee->callback_ret_range = retval_range(0, 0);
+
+	/* The frame, with a copy of its slots. Ids are unique across states. */
+	ref = coro_add_ref(async_cb, insn_idx);
+	if (!ref)
+		return -ENOMEM;
+	ref->id = frame->id;
+	ref->slots = kmemdup(frame->slots, frame->nr_slots * sizeof(*frame->slots),
+			     GFP_KERNEL_ACCOUNT);
+	if (!ref->slots)
+		return -ENOMEM;
+	ref->nr_slots = frame->nr_slots;
+	ref->mem_size = frame->mem_size;
+	/*
+	 * The callback starts here: nothing before it can be backtracked, so
+	 * the snapshot's scalars are precise from the start.
+	 */
+	for (i = 0; i < ref->nr_slots; i++) {
+		if (!bpf_is_spilled_reg(&ref->slots[i]))
+			continue;
+		reg = &ref->slots[i].spilled_ptr;
+		if (reg->type == SCALAR_VALUE)
+			reg->precise = true;
+	}
+
+	/* The references the frame holds. */
+	for (i = 0; i < nr_moved; i++) {
+		src = coro_ref_by_id(cur, moved[i]);
+		if (verifier_bug_if(!src || src->type != REF_TYPE_PTR, env,
+				    "coro_frame holds unknown reference %u", moved[i]))
+			return -EFAULT;
+		ref = coro_add_ref(async_cb, insn_idx);
+		if (!ref)
+			return -ENOMEM;
+		ref->id = src->id;
+		ref->parent_id = src->parent_id;
+	}
+
+	/* r1 is the frame; the continuation gets nothing else. */
+	reg = &callee->regs[BPF_REG_1];
+	mark_reg_known_zero(env, callee->regs, BPF_REG_1);
+	reg->type = PTR_TO_CORO_FRAME;
+	reg->mem_size = frame->mem_size;
+	reg->id = frame->id;
+	for (i = BPF_REG_2; i <= BPF_REG_5; i++)
+		bpf_mark_reg_not_init(env, &callee->regs[i]);
+	return 0;
+}
+
+static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_reference_state *frame = bpf_find_ref_slots(cur, id);
+	u32 moved[BPF_MAX_REF_SLOTS];
+	int i, j, err, nr_moved = 0, resume, destroy = -1;
+
+	if (verifier_bug_if(!frame, env, "suspended coro_frame %d has no slots", id))
+		return -EFAULT;
+	if (frame->nr_slots < 1 || !bpf_is_spilled_reg(&frame->slots[0]) ||
+	    frame->slots[0].spilled_ptr.type != PTR_TO_FUNC) {
+		verbose(env, "suspended coro_frame has no resume function in its first slot\n");
+		return -EINVAL;
+	}
+	resume = frame->slots[0].spilled_ptr.subprogno;
+	if (frame->nr_slots >= 2 && bpf_is_spilled_reg(&frame->slots[1]) &&
+	    frame->slots[1].spilled_ptr.type == PTR_TO_FUNC)
+		destroy = frame->slots[1].spilled_ptr.subprogno;
+
+	for (i = 0; i < frame->nr_slots; i++) {
+		struct bpf_stack_state *slot = &frame->slots[i];
+		struct bpf_reg_state *reg = &slot->spilled_ptr;
+
+		if (!bpf_is_spilled_reg(slot)) {
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				if (slot->slot_type[j] == STACK_DYNPTR ||
+				    slot->slot_type[j] == STACK_ITER ||
+				    slot->slot_type[j] == STACK_IRQ_FLAG) {
+					verbose(env, "coro_frame slot %d holds a verifier object that cannot be suspended\n",
+						i);
+					return -EINVAL;
+				}
+			}
+			continue;
+		}
+		if (!coro_slot_reg_survives(env, reg)) {
+			verbose(env, "coro_frame slot %d holds %s which cannot survive a suspension\n",
+				i, reg_type_str(env, reg->type));
+			return -EINVAL;
+		}
+		if (!coro_slot_reg_is_ref(reg))
+			continue;
+		for (j = 0; j < nr_moved; j++)
+			if (moved[j] == reg->id)
+				break;
+		if (j == nr_moved)
+			moved[nr_moved++] = reg->id;
+	}
+
+	err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved);
+	if (err)
+		return err;
+	if (destroy >= 0 && destroy != resume) {
+		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * The continuation owns the references now; every copy outside the
+	 * frame goes invalid. The frame itself is released by the caller.
+	 */
+	for (i = 0; i < nr_moved; i++) {
+		err = release_reference(env, moved[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
@@ -15665,6 +15908,18 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	 */
 	if (meta.release_regno) {
 		err = release_reg(env, &regs[meta.release_regno], false, !!meta.dynptr.id);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * Frames the kernel resumes later: verify their continuations from a
+	 * snapshot of the frame before the frame reference goes away.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		if (!(meta.coro_frames.suspend_mask & BIT(i)))
+			continue;
+		err = push_coro_suspend(env, insn_idx, meta.coro_frames.ids[i]);
 		if (err)
 			return err;
 	}
@@ -19333,6 +19588,10 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 
 	/* LSM and struct_ops func-ptr's return type could be "void" */
 	if (!frame->in_async_callback_fn && program_returns_void(env))
+		return 0;
+	/* So can a coroutine's resume function, resumed by the kernel. */
+	if (frame->in_async_callback_fn && frame->coro_resume &&
+	    subprog_returns_void(env, frame->subprogno))
 		return 0;
 
 	if (prog_type == BPF_PROG_TYPE_STRUCT_OPS) {
