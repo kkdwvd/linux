@@ -27,6 +27,17 @@ struct bpf_coro_cont {
 	void (*fini)(struct bpf_coro_cont *cont);
 };
 
+/* A disk read into arena memory that resumes a coroutine when it completes. */
+struct bpf_blk_io {
+	__u64 sector;
+	__u32 dev;	/* MKDEV(major, minor) as given to bpf_blk_open() */
+	__u32 len;	/* bytes, a multiple of 512, at most BPF_BLK_IO_MAX */
+	__s32 status;	/* 0 or -errno, written on completion */
+	__u32 flags;
+};
+
+#define BPF_BLK_IO_MAX	(64 * 1024)
+
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_coro_cont_init(struct bpf_coro_cont *cont, void *frame, struct bpf_prog_aux *aux,
 			void (*fini)(struct bpf_coro_cont *cont));
