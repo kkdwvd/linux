@@ -401,7 +401,8 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 					bpf_iter_##type##_new(&___it, ##args),			\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_##type##_destroy() when used from cleanup() attribute */		\
-					(void)bpf_iter_##type##_destroy, (void *)0);		\
+					(void)bpf_iter_##type##_destroy,			\
+					(struct bpf_iter_##type *)0);				\
 	/* iteration and termination check */							\
 	(((cur) = bpf_iter_##type##_next(&___it)));						\
 )
@@ -430,7 +431,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 				bpf_iter_num_new(&___it, (start), (end)),			\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_num_destroy() when used from cleanup() attribute */			\
-				(void)bpf_iter_num_destroy, (void *)0);				\
+				(void)bpf_iter_num_destroy, (struct bpf_iter_num *)0);		\
 	({											\
 		/* iteration step */								\
 		int *___t = bpf_iter_num_next(&___it);						\
@@ -455,7 +456,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 				bpf_iter_num_new(&___it, 0, (N)),				\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_num_destroy() when used from cleanup() attribute */			\
-				(void)bpf_iter_num_destroy, (void *)0);				\
+				(void)bpf_iter_num_destroy, (struct bpf_iter_num *)0);		\
 	bpf_iter_num_next(&___it);								\
 	/* nothing here  */									\
 )
