@@ -7135,6 +7135,22 @@ static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
 	return bpf_push_ref_jmp_history(env, vstate, INSN_F_REF_ALLOC, 0, id);
 }
 
+/*
+ * A frame that comes back from the kernel after a bpf_coro_park*() call has
+ * the contents it was parked with, but the verifier does not carry them
+ * across: every slot holds unknown data, like a map value.
+ */
+static void mark_coro_frame_misc(struct bpf_verifier_env *env, struct bpf_reference_state *ref)
+{
+	u32 i, j;
+
+	for (i = 0; i < ref->nr_slots; i++) {
+		bpf_mark_reg_not_init(env, &ref->slots[i].spilled_ptr);
+		for (j = 0; j < BPF_REG_SIZE; j++)
+			ref->slots[i].slot_type[j] = STACK_MISC;
+	}
+}
+
 /* Record a spill into or fill from a frame slot for precision backtracking. */
 static int push_coro_frame_history(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
 				   int spi)
@@ -13863,6 +13879,7 @@ enum special_kfunc_type {
 	KF_bpf_arena_reserve_pages,
 	KF_bpf_session_is_return,
 	KF_bpf_coro_frame_alloc,
+	KF_bpf_coro_unpark,
 	KF_bpf_stream_vprintk,
 	KF_bpf_stream_print_stack,
 	KF_bpf_waitq_wait,
@@ -13967,12 +13984,19 @@ BTF_ID(func, bpf_session_is_return)
 BTF_ID_UNUSED
 #endif
 BTF_ID(func, bpf_coro_frame_alloc)
+BTF_ID(func, bpf_coro_unpark)
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
 BTF_ID(func, bpf_waitq_wait)
 BTF_ID(func, bpf_waitq_wait_event)
 BTF_ID(func, bpf_kthread_create)
 BTF_ID(func, bpf_kthread_create_io)
+
+static bool is_coro_frame_acquire_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_coro_frame_alloc] ||
+	       btf_id == special_kfunc_list[KF_bpf_coro_unpark];
+}
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -15430,7 +15454,7 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 			return -EFAULT;
 		}
 		regs[BPF_REG_0].parent_id = meta->dynptr.id;
-	} else if (meta->func_id == special_kfunc_list[KF_bpf_coro_frame_alloc]) {
+	} else if (is_coro_frame_acquire_kfunc(meta->func_id)) {
 		u64 size = meta->arg_constant.value;
 
 		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
@@ -15988,7 +16012,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		    (!is_bpf_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_percpu_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_refcount_acquire_kfunc(meta.func_id) &&
-		     meta.func_id != special_kfunc_list[KF_bpf_coro_frame_alloc])) {
+		     !is_coro_frame_acquire_kfunc(meta.func_id))) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}
@@ -16151,6 +16175,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
 				if (err)
 					return err;
+				if (meta.func_id == special_kfunc_list[KF_bpf_coro_unpark])
+					mark_coro_frame_misc(env, bpf_find_ref_slots(env->cur_state, id));
 			}
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
