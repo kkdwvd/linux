@@ -9,6 +9,8 @@
 #include <linux/kthread.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/wait.h>
 
 struct bpf_waitq_kern {
@@ -31,11 +33,13 @@ struct bpf_kthread_kern {
 	void *callback_fn;
 	void *value;
 	struct completion initialized;
+	struct completion exited;
 	spinlock_t lock;
 	struct work_struct stop_work;
 	struct rcu_head rcu;
 	bool start_requested;
 	bool stopping;
+	bool io_thread;	/* created by create_io_thread() in a user process */
 };
 
 struct bpf_kthread_opaque {
@@ -120,7 +124,21 @@ static int bpf_kthread_stop_one(struct bpf_kthread_kern *kthread)
 	task = kthread->task;
 	spin_unlock_irqrestore(&kthread->lock, flags);
 
-	ret = task ? kthread_stop_put(task) : -ENOENT;
+	if (!task) {
+		ret = -ENOENT;
+	} else if (kthread->io_thread) {
+		/*
+		 * Not a kthread: it leaves its loop on the stopping flag, so
+		 * break any interruptible sleep it is in, a blocking system
+		 * call included, and wait for it to run off the end.
+		 */
+		set_notify_signal(task);
+		wait_for_completion(&kthread->exited);
+		put_task_struct(task);
+		ret = 0;
+	} else {
+		ret = kthread_stop_put(task);
+	}
 
 	spin_lock_irqsave(&kthread->lock, flags);
 	kthread->task = NULL;
@@ -157,7 +175,10 @@ static void bpf_kthread_begin_stop(struct bpf_kthread_kern *kthread)
 	spin_unlock_irqrestore(&kthread->lock, flags);
 
 	if (task) {
-		wake_up_process(task);
+		if (kthread->io_thread)
+			set_notify_signal(task);
+		else
+			wake_up_process(task);
 		put_task_struct(task);
 	}
 }
@@ -216,6 +237,79 @@ static int bpf_kthread_run(void *data)
 	return ret;
 }
 
+/*
+ * The body of a BPF io thread: a thread of the process that created it,
+ * sharing its address space, file table and credentials, that never
+ * returns to user space. Its loop is the kthread's, except that it ends on
+ * the stopping flag or a fatal signal rather than kthread_should_stop(),
+ * and that it exits itself, as every thread of a user process must.
+ */
+static int bpf_kthread_run_io(void *data)
+{
+	struct bpf_kthread_kern *kthread = data;
+	bpf_callback_t callback_fn = READ_ONCE(kthread->callback_fn);
+	char comm[TASK_COMM_LEN];
+	int ret = 0;
+
+	snprintf(comm, sizeof(comm), "bpf_iothread/%u", kthread->map->id);
+	set_task_comm(current, comm);
+	complete(&kthread->initialized);
+
+	for (;;) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (READ_ONCE(kthread->start_requested) || READ_ONCE(kthread->stopping) ||
+		    signal_pending(current))
+			break;
+		schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+
+	while (!READ_ONCE(kthread->stopping)) {
+		void *key;
+		u32 idx;
+
+		if (signal_pending(current)) {
+			struct ksignal ksig;
+
+			/*
+			 * Only SIGKILL and SIGSTOP reach a user worker, and
+			 * TIF_NOTIFY_SIGNAL from the stop path. A fatal signal
+			 * means the process is going away.
+			 */
+			if (get_signal(&ksig))
+				break;
+			continue;
+		}
+
+		rcu_read_lock_trace();
+		migrate_disable();
+		key = bpf_map_key_from_value(kthread->map, kthread->value, &idx);
+		ret = (int)callback_fn((u64)(long)kthread->map, (u64)(long)key,
+				       (u64)(long)kthread->value, 0, 0);
+		migrate_enable();
+		rcu_read_unlock_trace();
+		if (ret)
+			break;
+		cond_resched();
+	}
+
+	complete(&kthread->exited);
+	do_exit(0);
+}
+
+/*
+ * Whether @kthread is the BPF io thread calling: the kfuncs that act on
+ * behalf of the thread's process check this so that no other context can
+ * borrow its identity.
+ */
+bool bpf_kthread_is_current_io(struct bpf_kthread *kthread)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_kthread_kern *kern = READ_ONCE(opaque->kthread);
+
+	return kern && kern->io_thread && READ_ONCE(kern->task) == current;
+}
+
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc int bpf_waitq_init(struct bpf_waitq *waitq, void *p__const_map,
@@ -264,6 +358,7 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	struct bpf_waitq_kern *waitq_kern;
 	wait_queue_entry_t entry;
 	unsigned long irq_flags;
+	bool user_task = !(current->flags & PF_KTHREAD);
 	int ret = 0;
 
 	if (flags)
@@ -290,13 +385,22 @@ static int __bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	}
 	__add_wait_queue_entry_tail(&waitq_kern->waitq, &entry);
 	refcount_inc(&waitq_kern->refs);
-	set_current_state(TASK_IDLE);
+	/*
+	 * A thread of a user process, a BPF io thread included, must wake for
+	 * signals: SIGKILL, and for the io thread the stop path's
+	 * TIF_NOTIFY_SIGNAL, so it sleeps interruptibly. A kthread has no
+	 * signals and sleeps in TASK_IDLE.
+	 */
+	set_current_state(user_task ? TASK_INTERRUPTIBLE : TASK_IDLE);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, irq_flags);
 
 	migrate_enable();
 	rcu_read_unlock_trace();
 
 	if ((current->flags & PF_KTHREAD) && kthread_should_stop()) {
+		__set_current_state(TASK_RUNNING);
+		ret = -EINTR;
+	} else if (user_task && signal_pending(current)) {
 		__set_current_state(TASK_RUNNING);
 		ret = -EINTR;
 	} else if (timeout_ns == U64_MAX) {
@@ -470,6 +574,93 @@ free_kthread:
 	return err;
 }
 
+/*
+ * Create a BPF thread inside the calling process, the way io_uring creates
+ * its SQPOLL thread: it shares the address space, file table and
+ * credentials of the process, so a callback running on it acts on the
+ * process's behalf, see bpf_sys_exec(). Like a kthread it is parked until
+ * bpf_kthread_start() and runs the callback until that returns nonzero or
+ * bpf_kthread_stop() is called; unlike one it also ends with its process.
+ */
+__bpf_kfunc int bpf_kthread_create_io(struct bpf_kthread *kthread, void *p__const_map,
+				      int (callback_fn)(void *map, int *key, void *value),
+				      struct bpf_prog_aux *aux)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_map *map = p__const_map;
+	struct bpf_kthread_kern *new_kthread;
+	struct bpf_prog *prog;
+	struct task_struct *task;
+	int err;
+
+	if (READ_ONCE(opaque->kthread))
+		return -EBUSY;
+	/* Only a user task can be cloned into. */
+	if (!current->mm || (current->flags & (PF_KTHREAD | PF_IO_WORKER)))
+		return -EINVAL;
+
+	prog = bpf_prog_inc_not_zero(aux->prog);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	new_kthread = bpf_map_kzalloc(map, sizeof(*new_kthread), GFP_KERNEL | __GFP_NOWARN);
+	if (!new_kthread) {
+		bpf_prog_put(prog);
+		return -ENOMEM;
+	}
+
+	new_kthread->map = map;
+	new_kthread->prog = prog;
+	new_kthread->callback_fn = callback_fn;
+	new_kthread->value = (void *)opaque - map->record->kthread_off;
+	new_kthread->io_thread = true;
+	init_completion(&new_kthread->initialized);
+	init_completion(&new_kthread->exited);
+	spin_lock_init(&new_kthread->lock);
+	INIT_WORK(&new_kthread->stop_work, bpf_kthread_stop_work);
+
+	/*
+	 * The program runs with migration disabled, and a clone inherits that
+	 * state: the thread would never leave it, and the first change of its
+	 * affinity would wait forever for it to. Clone with migration enabled,
+	 * as the wait queue sleeps do; the Tasks Trace RCU section stays.
+	 */
+	migrate_enable();
+	task = create_io_thread(bpf_kthread_run_io, new_kthread, NUMA_NO_NODE);
+	migrate_disable();
+	if (IS_ERR(task)) {
+		err = PTR_ERR(task);
+		goto free_kthread;
+	}
+	get_task_struct(task);
+	new_kthread->task = task;
+	wake_up_new_task(task);
+	wait_for_completion(&new_kthread->initialized);
+
+	if (cmpxchg(&opaque->kthread, NULL, new_kthread)) {
+		err = -EBUSY;
+		goto stop_task;
+	}
+
+	/* See bpf_kthread_create(). */
+	smp_mb();
+	if (!atomic64_read(&map->usercnt)) {
+		bpf_kthread_cancel_and_free(opaque);
+		return -EPERM;
+	}
+
+	return 0;
+
+stop_task:
+	bpf_kthread_begin_stop(new_kthread);
+	wait_for_completion(&new_kthread->exited);
+	put_task_struct(task);
+free_kthread:
+	bpf_prog_put(prog);
+	kfree(new_kthread);
+	return err;
+}
+
 __bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
 {
 	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
@@ -571,6 +762,7 @@ BTF_ID_FLAGS(func, bpf_waitq_sequence)
 BTF_ID_FLAGS(func, bpf_waitq_wait_event, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wake)
 BTF_ID_FLAGS(func, bpf_kthread_create, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_kthread_create_io, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kthread_start)
 BTF_ID_FLAGS(func, bpf_kthread_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kthread_stop, KF_SLEEPABLE)

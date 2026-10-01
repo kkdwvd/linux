@@ -12153,7 +12153,12 @@ static int set_kthread_callback_state(struct bpf_verifier_env *env,
 	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_4]);
 	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
 	callee->in_async_callback_fn = true;
+	/*
+	 * The callback returns an int, and a negative one comes back in a
+	 * 32-bit register: compare the low 32 bits, as for a global function.
+	 */
 	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	callee->callback_ret_range.return_32bit = true;
 	return 0;
 }
 
@@ -13863,6 +13868,7 @@ enum special_kfunc_type {
 	KF_bpf_waitq_wait,
 	KF_bpf_waitq_wait_event,
 	KF_bpf_kthread_create,
+	KF_bpf_kthread_create_io,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -13966,6 +13972,7 @@ BTF_ID(func, bpf_stream_print_stack)
 BTF_ID(func, bpf_waitq_wait)
 BTF_ID(func, bpf_waitq_wait_event)
 BTF_ID(func, bpf_kthread_create)
+BTF_ID(func, bpf_kthread_create_io)
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -14767,7 +14774,8 @@ static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 
 static bool is_bpf_kthread_create_kfunc(u32 btf_id)
 {
-	return btf_id == special_kfunc_list[KF_bpf_kthread_create];
+	return btf_id == special_kfunc_list[KF_bpf_kthread_create] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_create_io];
 }
 
 static bool is_bpf_waitq_wait_kfunc(u32 btf_id)
