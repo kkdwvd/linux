@@ -151,6 +151,32 @@ int park_yield(void *ctx)
 	return bpf_coro_park(frame, &e->waitq);
 }
 
+/*
+ * Three frames parked ready at once with priorities 2, 0 and 1: unparking
+ * hands them back by priority, the lowest first, whatever the order they
+ * were parked in.
+ */
+SEC("syscall")
+int park_prio_three(void *ctx)
+{
+	struct elem *e = elem0();
+	__u64 *frame;
+	int i, ret;
+
+	if (!e)
+		return -1;
+	for (i = 0; i < 3; i++) {
+		frame = bpf_coro_frame_alloc(64, NULL);
+		if (!frame)
+			return -ENOMEM;
+		frame[0] = FRAME_MARK + 10 + i;
+		ret = bpf_coro_park_prio(frame, &e->waitq, (i + 2) % 3);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /* Take a ready frame back and read what was stored before the park. */
 SEC("syscall")
 int unpark_one(void *ctx)

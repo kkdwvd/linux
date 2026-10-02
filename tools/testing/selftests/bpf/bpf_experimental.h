@@ -374,6 +374,8 @@ extern int bpf_eventfd_signal(int fd) __weak __ksym;
 extern int bpf_coro_park_file(void *p__coro_frame, int fd, __u32 events,
 			      struct bpf_waitq *waitq) __weak __ksym;
 extern int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq) __weak __ksym;
+extern int bpf_coro_park_prio(void *p__coro_frame, struct bpf_waitq *waitq,
+			      __u64 prio) __weak __ksym;
 extern void *bpf_coro_unpark(struct bpf_waitq *waitq, __u64 size__k) __weak __ksym;
 
 extern int bpf_napi_bind(__u32 napi_id, struct bpf_waitq *waitq, __u64 flags) __weak __ksym;

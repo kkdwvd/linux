@@ -698,11 +698,14 @@ struct bpf_waitq_kern {
 	bool draining;
 	/*
 	 * Coroutine frames parked on this queue, see bpf_coro_park_file():
-	 * waiting for their event, and ready to be handed back by
-	 * bpf_coro_unpark(). Both lists are protected by waitq.lock.
+	 * waiting for their event on the list, and ready to be handed back by
+	 * bpf_coro_unpark() in the tree, ordered by the priority they were
+	 * parked with and then by the order they became ready in. Both are
+	 * protected by waitq.lock.
 	 */
 	struct list_head parked;
-	struct list_head ready;
+	struct rb_root_cached ready;
+	u64 ready_seq;
 };
 
 /* Call get under Tasks Trace RCU; the returned endpoint survives map teardown. */

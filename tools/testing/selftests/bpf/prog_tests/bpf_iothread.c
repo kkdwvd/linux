@@ -125,6 +125,27 @@ static void test_park(struct bpf_iothread *skel, int *pipefd)
 	ASSERT_EQ(ret, -ENOENT, "unpark_after_drop_ret");
 }
 
+/* Frames parked with priorities come back lowest first, not in park order. */
+static void test_park_prio(struct bpf_iothread *skel)
+{
+	static const __u64 order[] = { FRAME_MARK + 11, FRAME_MARK + 12, FRAME_MARK + 10 };
+	int err, ret, i;
+
+	err = run_syscall_prog(skel->progs.park_prio_three, &ret);
+	if (!ASSERT_OK(err, "park_prio_three") || !ASSERT_EQ(ret, 0, "park_prio_three_ret"))
+		return;
+	for (i = 0; i < 3; i++) {
+		skel->bss->unparked_mark = 0;
+		err = run_syscall_prog(skel->progs.unpark_one, &ret);
+		ASSERT_OK(err, "unpark_prio");
+		ASSERT_EQ(ret, 0, "unpark_prio_ret");
+		ASSERT_EQ(skel->bss->unparked_mark, order[i], "unpark_prio_order");
+	}
+	err = run_syscall_prog(skel->progs.unpark_one, &ret);
+	ASSERT_OK(err, "unpark_prio_empty");
+	ASSERT_EQ(ret, -ENOENT, "unpark_prio_empty_ret");
+}
+
 void test_bpf_iothread(void)
 {
 	struct bpf_iothread *skel;
@@ -142,6 +163,8 @@ void test_bpf_iothread(void)
 		test_io_thread(skel, pipefd);
 	if (test__start_subtest("park"))
 		test_park(skel, pipefd);
+	if (test__start_subtest("park_prio"))
+		test_park_prio(skel);
 
 	bpf_iothread__destroy(skel);
 close_pipe:
