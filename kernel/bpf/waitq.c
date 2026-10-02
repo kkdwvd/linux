@@ -9,6 +9,7 @@
 #include <linux/hrtimer.h>
 #include <linux/kthread.h>
 #include <linux/poll.h>
+#include <linux/rbtree.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -24,18 +25,22 @@ struct bpf_waitq_kern {
 	bool draining;
 	/*
 	 * Coroutine frames parked on this queue, see bpf_coro_park_file():
-	 * waiting for their event, and ready to be handed back by
-	 * bpf_coro_unpark(). Both lists are protected by waitq.lock.
+	 * waiting for their event on the list, and ready to be handed back by
+	 * bpf_coro_unpark() in the tree, ordered by the priority they were
+	 * parked with and then by the order they became ready in. Both are
+	 * protected by waitq.lock.
 	 */
 	struct list_head parked;
-	struct list_head ready;
+	struct rb_root_cached ready;
+	u64 ready_seq;
 };
 
 /*
  * A parked coroutine frame. The frame itself is the program's allocation
  * from bpf_coro_frame_alloc(); this is the kernel's handle on it while the
  * program has given it up: the wait queue entry on the file it waits for,
- * and the node on the owning bpf_waitq's parked or ready list.
+ * the node on the owning bpf_waitq's parked list and, once ready, the node
+ * in its ready tree.
  */
 enum bpf_coro_park_state {
 	BPF_CORO_PARK_WAITING,
@@ -45,12 +50,15 @@ enum bpf_coro_park_state {
 
 struct bpf_coro_park {
 	struct list_head node;
+	struct rb_node ready_node;
 	wait_queue_entry_t wait;
 	wait_queue_head_t *whead;
 	poll_table pt;
 	struct file *file;
 	struct bpf_waitq_kern *waitq;
 	void *frame;
+	u64 prio;	/* lower is handed back first */
+	u64 seq;	/* among equal priorities, the order of becoming ready */
 	__poll_t events;
 	__poll_t revents;
 	enum bpf_coro_park_state state;
@@ -371,7 +379,7 @@ __bpf_kfunc int bpf_waitq_init(struct bpf_waitq *waitq, void *p__const_map,
 		return -ENOMEM;
 	init_waitqueue_head(&new_waitq->waitq);
 	INIT_LIST_HEAD(&new_waitq->parked);
-	INIT_LIST_HEAD(&new_waitq->ready);
+	new_waitq->ready = RB_ROOT_CACHED;
 	refcount_set(&new_waitq->refs, 1);
 
 	if (cmpxchg(&opaque->waitq, NULL, new_waitq)) {
@@ -800,12 +808,20 @@ __bpf_kfunc int bpf_kthread_stop(struct bpf_kthread *kthread, u64 flags)
  * A BPF coroutine that has to wait for a file, say a socket with no data
  * to read, hands its frame to bpf_coro_park_file(): the program gives up
  * the frame and the kernel arms a poll wait on the file. When the file
- * reports the events the frame is moved to the wait queue's ready list and
+ * reports the events the frame is moved to the wait queue's ready tree and
  * the queue is signaled like any producer would, so a thread sleeping in
  * bpf_waitq_wait_event() wakes. bpf_coro_unpark() then hands a ready frame
  * back to the program, which resumes the coroutine. The verifier treats an
  * unparked frame's contents as unknown data, as the frame left the program
  * and came back: what the coroutine kept across the wait are plain values.
+ *
+ * bpf_coro_park_prio() parks a frame ready at once with a priority: the
+ * ready tree hands back the lowest priority first and, among equal ones,
+ * the first to become ready, so a thread that resumes frames in unpark
+ * order runs the scheduling policy whose priorities the program computed,
+ * FIFO when they are all the same. A program that yields from a context
+ * that cannot sleep, an XDP program handing the rest of a request to a
+ * thread say, parks this way: the handle is allocated without sleeping.
  */
 static void bpf_coro_park_queue_proc(struct file *file, wait_queue_head_t *whead,
 				     poll_table *pt)
@@ -821,7 +837,17 @@ static void bpf_coro_park_queue_proc(struct file *file, wait_queue_head_t *whead
 	add_wait_queue(whead, &park->wait);
 }
 
-/* Move @park to the ready list and signal the queue; the lock is held. */
+static bool bpf_coro_park_less(struct rb_node *a, const struct rb_node *b)
+{
+	const struct bpf_coro_park *pa = rb_entry(a, struct bpf_coro_park, ready_node);
+	const struct bpf_coro_park *pb = rb_entry(b, struct bpf_coro_park, ready_node);
+
+	if (pa->prio != pb->prio)
+		return pa->prio < pb->prio;
+	return pa->seq < pb->seq;
+}
+
+/* Move @park to the ready tree and signal the queue; the lock is held. */
 static void bpf_coro_park_set_ready(struct bpf_coro_park *park, __poll_t revents)
 {
 	struct bpf_waitq_kern *waitq = park->waitq;
@@ -830,9 +856,22 @@ static void bpf_coro_park_set_ready(struct bpf_coro_park *park, __poll_t revents
 		return;
 	park->state = BPF_CORO_PARK_READY;
 	park->revents = revents;
-	list_move_tail(&park->node, &waitq->ready);
+	list_del_init(&park->node);
+	park->seq = waitq->ready_seq++;
+	rb_add_cached(&park->ready_node, &waitq->ready, bpf_coro_park_less);
 	smp_store_release(&waitq->sequence, waitq->sequence + 1);
 	__wake_up_locked(&waitq->waitq, TASK_NORMAL, 1);
+}
+
+/* Take the first ready frame out of the tree; the lock is held. */
+static struct bpf_coro_park *bpf_coro_park_take_ready(struct bpf_waitq_kern *waitq)
+{
+	struct rb_node *node = rb_first_cached(&waitq->ready);
+
+	if (!node)
+		return NULL;
+	rb_erase_cached(node, &waitq->ready);
+	return rb_entry(node, struct bpf_coro_park, ready_node);
 }
 
 static int bpf_coro_park_wake(wait_queue_entry_t *wait, unsigned int mode, int sync, void *key)
@@ -871,12 +910,12 @@ static void bpf_coro_park_drain(struct bpf_waitq_kern *waitq)
 	for (;;) {
 		spin_lock_irqsave(&waitq->waitq.lock, flags);
 		park = list_first_entry_or_null(&waitq->parked, struct bpf_coro_park, node);
-		if (!park)
-			park = list_first_entry_or_null(&waitq->ready, struct bpf_coro_park, node);
-		if (park) {
+		if (park)
 			list_del_init(&park->node);
+		else
+			park = bpf_coro_park_take_ready(waitq);
+		if (park)
 			park->state = BPF_CORO_PARK_CANCELLED;
-		}
 		spin_unlock_irqrestore(&waitq->waitq.lock, flags);
 		if (!park)
 			break;
@@ -964,10 +1003,13 @@ __bpf_kfunc int bpf_coro_park_file(void *p__coro_frame, int fd, u32 events,
 }
 
 /*
- * Park @p__coro_frame on @waitq's ready list at once: a yield, the frame
- * comes back from the next bpf_coro_unpark().
+ * Park @p__coro_frame on @waitq's ready tree at once with priority @prio: a
+ * yield, the frame comes back from a bpf_coro_unpark() once no frame of a
+ * lower priority, or of the same one parked earlier, is ready. Callable
+ * from any context that runs programs, as the handle is allocated without
+ * sleeping.
  */
-__bpf_kfunc int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq)
+__bpf_kfunc int bpf_coro_park_prio(void *p__coro_frame, struct bpf_waitq *waitq, u64 prio)
 {
 	struct bpf_waitq_opaque *opaque = (struct bpf_waitq_opaque *)waitq;
 	struct bpf_waitq_kern *waitq_kern;
@@ -979,7 +1021,7 @@ __bpf_kfunc int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq)
 		kfree_nolock(p__coro_frame);
 		return -EINVAL;
 	}
-	park = kzalloc(sizeof(*park), GFP_KERNEL | __GFP_ACCOUNT);
+	park = kmalloc_nolock(sizeof(*park), __GFP_ZERO | __GFP_ACCOUNT, NUMA_NO_NODE);
 	if (!park) {
 		kfree_nolock(p__coro_frame);
 		return -ENOMEM;
@@ -987,19 +1029,26 @@ __bpf_kfunc int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq)
 	INIT_LIST_HEAD(&park->node);
 	park->waitq = waitq_kern;
 	park->frame = p__coro_frame;
+	park->prio = prio;
 	park->state = BPF_CORO_PARK_WAITING;
 
 	spin_lock_irqsave(&waitq_kern->waitq.lock, flags);
 	if (waitq_kern->draining) {
 		spin_unlock_irqrestore(&waitq_kern->waitq.lock, flags);
 		kfree_nolock(p__coro_frame);
-		kfree(park);
+		kfree_nolock(park);
 		return -ENOENT;
 	}
 	list_add_tail(&park->node, &waitq_kern->parked);
 	bpf_coro_park_set_ready(park, 0);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, flags);
 	return 0;
+}
+
+/* Park @p__coro_frame on @waitq's ready tree at once, behind the frames already there. */
+__bpf_kfunc int bpf_coro_park(void *p__coro_frame, struct bpf_waitq *waitq)
+{
+	return bpf_coro_park_prio(p__coro_frame, waitq, 0);
 }
 
 /*
@@ -1023,17 +1072,15 @@ __bpf_kfunc void *bpf_coro_unpark(struct bpf_waitq *waitq, u64 size__k)
 		return NULL;
 
 	spin_lock_irqsave(&waitq_kern->waitq.lock, flags);
-	park = list_first_entry_or_null(&waitq_kern->ready, struct bpf_coro_park, node);
-	if (park)
-		list_del_init(&park->node);
+	park = bpf_coro_park_take_ready(waitq_kern);
 	spin_unlock_irqrestore(&waitq_kern->waitq.lock, flags);
 	if (!park)
 		return NULL;
 
 	/*
-	 * A frame on the ready list had its wait entry taken off the file's
-	 * queue by the wake, or by bpf_coro_park_file() when it was ready at
-	 * once; only the file reference remains.
+	 * A ready frame had its wait entry taken off the file's queue by the
+	 * wake, or by bpf_coro_park_file() when it was ready at once; only the
+	 * file reference remains.
 	 */
 	park->whead = NULL;
 	frame = park->frame;
@@ -1059,7 +1106,8 @@ BTF_ID_FLAGS(func, bpf_kthread_start)
 BTF_ID_FLAGS(func, bpf_kthread_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kthread_stop, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_coro_park_file, KF_SLEEPABLE)
-BTF_ID_FLAGS(func, bpf_coro_park, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_coro_park)
+BTF_ID_FLAGS(func, bpf_coro_park_prio)
 BTF_ID_FLAGS(func, bpf_coro_unpark, KF_ACQUIRE | KF_RET_NULL)
 BTF_KFUNCS_END(bpf_waitq_kfunc_ids)
 
@@ -1068,8 +1116,28 @@ static const struct btf_kfunc_id_set bpf_waitq_kfunc_set = {
 	.set = &bpf_waitq_kfunc_ids,
 };
 
+/*
+ * What a program on a packet path may do with a queue a syscall program
+ * owns: hand it coroutine frames and signal it. Nothing here sleeps or
+ * allocates with a sleeping allocation.
+ */
+BTF_KFUNCS_START(bpf_waitq_producer_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_waitq_sequence)
+BTF_ID_FLAGS(func, bpf_waitq_wake)
+BTF_ID_FLAGS(func, bpf_coro_park)
+BTF_ID_FLAGS(func, bpf_coro_park_prio)
+BTF_KFUNCS_END(bpf_waitq_producer_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_waitq_producer_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_waitq_producer_kfunc_ids,
+};
+
 static int __init bpf_waitq_kfunc_init(void)
 {
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_waitq_kfunc_set);
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_waitq_kfunc_set);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_waitq_producer_kfunc_set);
 }
 late_initcall(bpf_waitq_kfunc_init);
