@@ -377,6 +377,13 @@ struct tcp_sock {
 				 */
 	u32	compressed_ack_rcv_nxt;
 	struct list_head tsq_node; /* anchor in tsq_tasklet.head list */
+	/*
+	 * A BPF TX worker the socket's pushes go to, see net/ipv4/tcp_bpf_tx.c:
+	 * one plus its CPU, 0 for none; the node on its list while queued.
+	 */
+	u16	bpf_tx_cpu1;
+	u8	bpf_tx_nonagle;
+	struct list_head bpf_tx_node;
 
 	/* Information of the most recently (s)acked skb */
 	struct tcp_rack {
@@ -539,6 +546,7 @@ enum tsq_enum {
 				    * tcp_v{4|6}_mtu_reduced()
 				    */
 	TCP_ACK_DEFERRED,	   /* TX pure ack is deferred */
+	TCP_BPF_TX_QUEUED,	   /* a push waits on a BPF TX worker's list */
 };
 
 enum tsq_flags {
@@ -549,6 +557,7 @@ enum tsq_flags {
 	TCPF_DELACK_TIMER_DEFERRED	= BIT(TCP_DELACK_TIMER_DEFERRED),
 	TCPF_MTU_REDUCED_DEFERRED	= BIT(TCP_MTU_REDUCED_DEFERRED),
 	TCPF_ACK_DEFERRED		= BIT(TCP_ACK_DEFERRED),
+	TCPF_BPF_TX_QUEUED		= BIT(TCP_BPF_TX_QUEUED),
 };
 
 /* Flags of interest for tcp_release_cb() */

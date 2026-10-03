@@ -1331,6 +1331,9 @@ static void tcp_tsq_write(struct sock *sk)
 			tcp_xmit_retransmit_queue(sk);
 		}
 
+		/* The write a TX completion frees room for goes to the BPF TX worker when bound. */
+		if (tcp_bpf_tx_defer(sk, tp->nonagle))
+			return;
 		tcp_write_xmit(sk, tcp_current_mss(sk), tp->nonagle,
 			       0, GFP_ATOMIC);
 	}
@@ -3292,6 +3295,10 @@ void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 	if (unlikely(sk->sk_state == TCP_CLOSE))
 		return;
 
+	/* A socket bound to a BPF TX worker leaves the push to it. */
+	if (tcp_bpf_tx_defer(sk, nonagle))
+		return;
+
 	if (tcp_write_xmit(sk, cur_mss, nonagle, 0,
 			   sk_gfp_mask(sk, GFP_ATOMIC)))
 		tcp_check_probe_timer(sk);
@@ -3306,6 +3313,9 @@ void tcp_push_one(struct sock *sk, unsigned int mss_now)
 
 	BUG_ON(!skb || skb->len < mss_now);
 
+	/* The worker pushes everything pending, the one segment included. */
+	if (tcp_bpf_tx_defer(sk, TCP_NAGLE_PUSH))
+		return;
 	tcp_write_xmit(sk, mss_now, TCP_NAGLE_PUSH, 1, sk->sk_allocation);
 }
 

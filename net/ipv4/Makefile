@@ -76,3 +76,4 @@ endif
 ifdef CONFIG_GCOV_PROFILE_NETFILTER
 GCOV_PROFILE_netfilter.o := y
 endif
+obj-$(CONFIG_BPF_SYSCALL) += tcp_bpf_tx.o
