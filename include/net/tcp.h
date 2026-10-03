@@ -503,6 +503,11 @@ int do_tcp_getsockopt(struct sock *sk, int level,
 int tcp_getsockopt(struct sock *sk, int level, int optname,
 		   char __user *optval, int __user *optlen);
 bool tcp_bpf_bypass_getsockopt(int level, int optname);
+#ifdef CONFIG_BPF_SYSCALL
+bool tcp_bpf_tx_defer(struct sock *sk, int nonagle);
+#else
+static inline bool tcp_bpf_tx_defer(struct sock *sk, int nonagle) { return false; }
+#endif
 int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		      sockptr_t optval, unsigned int optlen);
 int tcp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,

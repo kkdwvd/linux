@@ -579,6 +579,8 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	newtp->snd_up = seq;
 
 	INIT_LIST_HEAD(&newtp->tsq_node);
+	INIT_LIST_HEAD(&newtp->bpf_tx_node);
+	newtp->bpf_tx_cpu1 = 0;
 	INIT_LIST_HEAD(&newtp->tsorted_sent_queue);
 
 	tcp_init_wl(newtp, treq->rcv_isn);
