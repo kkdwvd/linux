@@ -7,6 +7,7 @@
 #include <linux/cgroup.h>
 #include <linux/file.h>
 #include <linux/hrtimer.h>
+#include <linux/kernel_stat.h>
 #include <linux/kthread.h>
 #include <linux/poll.h>
 #include <linux/rbtree.h>
@@ -740,6 +741,27 @@ __bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
 }
 
 /*
+ * A CPU's accumulated idle time, iowait included, in nanoseconds. A policy
+ * samples it twice to know the CPU's busy fraction, as a cpufreq governor
+ * does, and can then batch its work only while the CPU is saturated. The
+ * tick-sched's idle time is clock based, so the fraction is exact over
+ * windows of a millisecond; the tick-based account is the fallback where
+ * the tick never stops.
+ */
+__bpf_kfunc s64 bpf_cpu_idle_ns(u32 cpu)
+{
+	u64 idle, iowait;
+
+	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+		return -EINVAL;
+	idle = get_cpu_idle_time_us(cpu, NULL);
+	iowait = get_cpu_iowait_time_us(cpu, NULL);
+	if (idle == -1ULL || iowait == -1ULL)
+		return kcpustat_field_idle(cpu) + kcpustat_field_iowait(cpu);
+	return (idle + iowait) * NSEC_PER_USEC;
+}
+
+/*
  * Restrict the thread to one CPU. Works before and after bpf_kthread_start():
  * the thread has already run the kthread() prologue that would reset its
  * affinity when bpf_kthread_create() returns, so a parked thread wakes on
@@ -1105,6 +1127,7 @@ BTF_ID_FLAGS(func, bpf_kthread_create_io, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kthread_start)
 BTF_ID_FLAGS(func, bpf_kthread_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kthread_stop, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_cpu_idle_ns)
 BTF_ID_FLAGS(func, bpf_coro_park_file, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_coro_park)
 BTF_ID_FLAGS(func, bpf_coro_park_prio)
