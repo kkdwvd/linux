@@ -23,6 +23,7 @@ __u32 callback_exits[4];
 __u64 callback_cgroup_ids[4];
 __u32 callback_cpus[4];
 __u64 target_cgroup_id;
+__s64 cpu_idle_ns;
 __u32 target_cpu;
 
 static int thread_cb(void *map, int *key, void *value)
@@ -177,4 +178,12 @@ int wait_timeout(void *ctx)
 	if (!elem)
 		return -1;
 	return bpf_waitq_wait(&elem->waitq, &elem->state, 0, 0, 0);
+}
+
+/* bpf_cpu_idle_ns(): a CPU's accumulated idle time, which only grows. */
+SEC("syscall")
+int read_cpu_idle(void *ctx)
+{
+	cpu_idle_ns = bpf_cpu_idle_ns(0);
+	return cpu_idle_ns < 0 ? (int)cpu_idle_ns : 0;
 }

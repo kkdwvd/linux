@@ -34,6 +34,7 @@ void test_bpf_waitq(void)
 	struct bpf_waitq_success *skel;
 	const char *cgroup_path = "/bpf_waitq_kthread";
 	int cgroup_fd = -1;
+	__s64 first_idle;
 	__u32 retval;
 	int err;
 
@@ -117,6 +118,16 @@ cleanup_cgroup:
 	if (cgroup_fd >= 0)
 		close(cgroup_fd);
 	cleanup_cgroup_environment();
+	err = run_syscall_prog(skel->progs.read_cpu_idle, &retval);
+	if (!ASSERT_OK(err, "read_cpu_idle") || !ASSERT_EQ(retval, 0, "idle_ret"))
+		goto out;
+	first_idle = skel->bss->cpu_idle_ns;
+	usleep(2000);
+	err = run_syscall_prog(skel->progs.read_cpu_idle, &retval);
+	if (!ASSERT_OK(err, "read_cpu_idle_again") || !ASSERT_EQ(retval, 0, "idle_ret_again"))
+		goto out;
+	ASSERT_GE(skel->bss->cpu_idle_ns, first_idle, "idle_grows");
+
 out:
 	bpf_waitq_success__destroy(skel);
 }
