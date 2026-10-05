@@ -1876,6 +1876,7 @@ struct bpf_prog_aux {
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
+	bool xdp_consume; /* may take ownership of frames, see XDP_CONSUME */
 	bool exception_cb;
 	bool exception_boundary;
 	bool jits_use_priv_stack;
