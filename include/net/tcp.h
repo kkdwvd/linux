@@ -566,9 +566,6 @@ struct sock *tcp_v4_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
 				  void (*opt_child_init)(struct sock *newsk,
 							 const struct sock *sk));
 int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb);
-#ifdef CONFIG_BPF_SYSCALL
-void tcp_bpf_xdp_backlog_send(struct sock *sk, struct sk_buff *skb);
-#endif
 int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len);
 int tcp_connect(struct sock *sk);
 enum tcp_synack_type {
@@ -1105,7 +1102,6 @@ enum tcp_skb_cb_sacked_flags {
 	TCPCB_TAGBITS		= (TCPCB_SACKED_ACKED | TCPCB_SACKED_RETRANS |
 				   TCPCB_LOST),	/* All tag bits			*/
 	TCPCB_REPAIRED		= (1 << 4),	/* SKB repaired (no skb_mstamp_ns)	*/
-	TCPCB_BPF_SEND		= (1 << 6),	/* response from BPF deferred through the backlog */
 	TCPCB_EVER_RETRANS	= (1 << 7),	/* Ever retransmitted frame	*/
 	TCPCB_RETRANS		= (TCPCB_SACKED_RETRANS | TCPCB_EVER_RETRANS |
 				   TCPCB_REPAIRED),

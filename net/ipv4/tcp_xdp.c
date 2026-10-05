@@ -19,7 +19,8 @@
  *                          the ACK it carries is processed, an ACK of our
  *                          own is scheduled. The program then drops the frame.
  *   bpf_xdp_tcp_send()     queues a response on the write queue and pushes it,
- *                          as a sendmsg() would, from any BH context
+ *                          as a sendmsg() would, from any BH context, or asks
+ *                          the program to try again later
  *   bpf_xdp_tcp_release()  drops the socket reference
  *
  * Everything the fast path declines (a busy socket, out-of-order or
@@ -268,11 +269,7 @@ out:
 	return err;
 }
 
-/*
- * Queue a response on the write queue and push it. The socket lock is held
- * by the caller: as the BH owner, or as the user in tcp_v4_do_rcv() for a
- * response that waited in the backlog.
- */
+/* Queue a response on the write queue and push it. The caller holds the socket lock. */
 static int xdp_tcp_queue_response(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -302,12 +299,6 @@ static int xdp_tcp_queue_response(struct sock *sk, struct sk_buff *skb)
 	return len;
 }
 
-/* Called from tcp_v4_do_rcv() when the owner processes its backlog. */
-void tcp_bpf_xdp_backlog_send(struct sock *sk, struct sk_buff *skb)
-{
-	xdp_tcp_queue_response(sk, skb);
-}
-
 /**
  * bpf_xdp_tcp_send - send data on an established socket from BPF
  * @sk: the socket
@@ -316,12 +307,10 @@ void tcp_bpf_xdp_backlog_send(struct sock *sk, struct sk_buff *skb)
  * @aux: the calling program (implicit)
  *
  * Copies the data into a new segment on the write queue and pushes it, as
- * a sendmsg() of the owner would, from BH context. When the socket is held
- * by its user, the segment waits in the socket's backlog and is queued by
- * the owner when it releases the socket, like a received segment would be
- * processed; the request has been consumed, so the response must not be
- * lost. Returns @len, or -ENOBUFS when the backlog is full, or another
- * -errno.
+ * a sendmsg() of the owner would, from BH context. Returns @len, or -EAGAIN
+ * when the socket is held by its user or the write queue has no room for
+ * the data: the program keeps the data and tries again later, the request
+ * having been consumed already. Other errors are final.
  */
 __bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len,
 				 struct bpf_prog_aux *aux)
@@ -349,16 +338,11 @@ __bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len,
 
 	bh_lock_sock_nested(sk);
 	if (sock_owned_by_user(sk)) {
-		u32 limit = READ_ONCE(sk->sk_rcvbuf) + READ_ONCE(sk->sk_sndbuf);
-
-		TCP_SKB_CB(skb)->sacked = TCPCB_BPF_SEND;
-		err = sk_add_backlog(sk, skb, limit) ? -ENOBUFS : len;
-		bh_unlock_sock(sk);
-		if (err < 0)
-			__kfree_skb(skb);
-		return err;
+		__kfree_skb(skb);
+		err = -EAGAIN;
+	} else {
+		err = xdp_tcp_queue_response(sk, skb);
 	}
-	err = xdp_tcp_queue_response(sk, skb);
 	bh_unlock_sock(sk);
 	return err;
 }

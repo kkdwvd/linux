@@ -1831,13 +1831,6 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	enum skb_drop_reason reason;
 
-#ifdef CONFIG_BPF_SYSCALL
-	/* A response bpf_xdp_tcp_send() left in the backlog for the owner. */
-	if (unlikely(TCP_SKB_CB(skb)->sacked & TCPCB_BPF_SEND)) {
-		tcp_bpf_xdp_backlog_send(sk, skb);
-		return 0;
-	}
-#endif
 	reason = psp_sk_rx_policy_check(sk, skb);
 	if (reason)
 		goto err_discard;
