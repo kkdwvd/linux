@@ -18,6 +18,7 @@
 
 #include <net/hotdata.h>
 #include <net/netdev_lock.h>
+#include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
 #include <net/xdp_priv.h> /* struct xdp_mem_allocator */
 #include <trace/events/xdp.h>
@@ -1053,3 +1054,140 @@ void xdp_features_clear_redirect_target(struct net_device *dev)
 	netdev_unlock(dev);
 }
 EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
+
+/*
+ * Frames as kptrs.
+ *
+ * A program that wants to keep a frame past its return, to reassemble a TCP
+ * stream for instance, takes it with bpf_xdp_frame_steal() and returns
+ * XDP_CONSUME. The frame is then an object the program owns: it goes into a
+ * kptr field of a map value or an allocated object, is read with
+ * bpf_xdp_frame_read(), and is given back with bpf_xdp_frame_release(), or by
+ * the destructor of the field that still holds it when its map or object goes.
+ */
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_xdp_frame_steal - take the frame behind an XDP context
+ * @ctx: the context
+ *
+ * Makes the program the owner of the frame, as a redirect target would be:
+ * the buffer is converted into a frame in place and the transfer recorded, so
+ * that the program's XDP_CONSUME return has the driver hand the buffer over
+ * instead of recycling it. The context is consumed by the call.
+ *
+ * Returns the frame, or NULL for a buffer that cannot be taken: one the stack
+ * built around an skb for generic XDP, or a test run without live frames.
+ */
+__bpf_kfunc struct xdp_frame *bpf_xdp_frame_steal(struct xdp_md *ctx)
+{
+	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
+	struct xdp_buff *xdp = (struct xdp_buff *)ctx;
+	struct xdp_rxq_info *rxq = xdp->rxq;
+	struct xdp_frame *xdpf;
+
+	/*
+	 * A frame is taken at most once: the verifier consumes the context with
+	 * it, and the redirect that follows clears the mark. A mark still set
+	 * here is a driver that did not redirect as it was told.
+	 */
+	if (WARN_ONCE(ri->kern_flags & BPF_RI_F_XDP_CONSUMED, "XDP frame already taken"))
+		return NULL;
+	/*
+	 * Generic XDP and test runs without live frames build the context
+	 * around memory that is not a driver's; their rxq is the device's own.
+	 */
+	if (!rxq || !rxq->dev ||
+	    (rxq->queue_index < rxq->dev->num_rx_queues &&
+	     rxq == &__netif_get_rx_queue(rxq->dev, rxq->queue_index)->xdp_rxq))
+		return NULL;
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (!xdpf)
+		return NULL;
+	ri->kern_flags |= BPF_RI_F_XDP_CONSUMED;
+	return xdpf;
+}
+
+/**
+ * bpf_xdp_frame_release - give a frame taken with bpf_xdp_frame_steal() back
+ * @frame: the frame
+ */
+__bpf_kfunc void bpf_xdp_frame_release(struct xdp_frame *frame)
+{
+	xdp_return_frame(frame);
+}
+
+/* The destructor of a kptr field holding a frame. */
+__bpf_kfunc void bpf_xdp_frame_dtor(void *frame)
+{
+	xdp_return_frame(frame);
+}
+CFI_NOSEAL(bpf_xdp_frame_dtor);
+
+/**
+ * bpf_xdp_frame_len - the length of a frame's payload, fragments included
+ * @frame: the frame
+ */
+__bpf_kfunc u32 bpf_xdp_frame_len(const struct xdp_frame *frame)
+{
+	return xdp_get_frame_len(frame);
+}
+
+/**
+ * bpf_xdp_frame_read - copy payload out of a frame
+ * @frame: the frame
+ * @offset: where in the payload to start
+ * @buf: where to copy to
+ * @buf__sz: how much to copy
+ *
+ * Returns 0, or -EINVAL when the range is not within the frame.
+ */
+__bpf_kfunc int bpf_xdp_frame_read(const struct xdp_frame *frame, u32 offset, void *buf,
+				   u32 buf__sz)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return __bpf_xdp_load_bytes(&xdp, offset, buf, buf__sz);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(xdp_frame_steal_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xdp_frame_steal, KF_ACQUIRE | KF_RET_NULL | KF_RELEASE_CTX)
+BTF_KFUNCS_END(xdp_frame_steal_kfunc_ids)
+
+static const struct btf_kfunc_id_set xdp_frame_steal_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &xdp_frame_steal_kfunc_ids,
+};
+
+BTF_KFUNCS_START(xdp_frame_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xdp_frame_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_xdp_frame_len)
+BTF_ID_FLAGS(func, bpf_xdp_frame_read)
+BTF_KFUNCS_END(xdp_frame_kfunc_ids)
+
+static const struct btf_kfunc_id_set xdp_frame_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &xdp_frame_kfunc_ids,
+};
+
+BTF_ID_LIST_SINGLE(xdp_frame_btf_ids, struct, xdp_frame)
+BTF_ID_LIST_SINGLE(xdp_frame_dtor_ids, func, bpf_xdp_frame_dtor)
+
+static int __init xdp_frame_kfunc_init(void)
+{
+	const struct btf_id_dtor_kfunc dtors[] = {
+		{
+			.btf_id	      = xdp_frame_btf_ids[0],
+			.kfunc_btf_id = xdp_frame_dtor_ids[0],
+		},
+	};
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &xdp_frame_steal_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &xdp_frame_kfunc_set);
+	return ret ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
+}
+late_initcall(xdp_frame_kfunc_init);

@@ -13188,6 +13188,7 @@ enum special_kfunc_type {
 	KF_bpf_dynptr_from_xdp,
 	KF_bpf_dynptr_from_skb_meta,
 	KF_bpf_xdp_pull_data,
+	KF_bpf_xdp_frame_steal,
 	KF_bpf_dynptr_slice,
 	KF_bpf_dynptr_slice_rdwr,
 	KF_bpf_dynptr_clone,
@@ -13264,7 +13265,9 @@ BTF_ID(func, bpf_dynptr_from_skb)
 BTF_ID(func, bpf_dynptr_from_xdp)
 BTF_ID(func, bpf_dynptr_from_skb_meta)
 BTF_ID(func, bpf_xdp_pull_data)
+BTF_ID(func, bpf_xdp_frame_steal)
 #else
+BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
@@ -15021,6 +15024,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (is_kfunc_release_ctx(&meta))
 		consume_ctx(env);
+
+	/* The program may now own frames; bpf_prog_run_xdp() has to look, see XDP_CONSUME. */
+	if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_xdp_frame_steal]) &&
+	    !env->prog->aux->xdp_consume) {
+		env->prog->aux->xdp_consume = true;
+		static_branch_inc(&bpf_xdp_consume_enabled_key);
+	}
 
 	if (is_bpf_list_push_kfunc(meta.func_id) || is_bpf_rbtree_add_kfunc(meta.func_id)) {
 		id = regs[BPF_REG_2].id;
