@@ -327,34 +327,52 @@ out:
 	return err;
 }
 
-/* Queue a response on the write queue and push it. The caller holds the socket lock. */
-static int xdp_tcp_queue_response(struct sock *sk, struct sk_buff *skb)
+/*
+ * Build a segment for @len bytes of @buf as tcp_sendmsg() would: the headers
+ * in the skb, the payload in page fragments, so that the stack can split and
+ * coalesce it like any other segment on the write queue. The socket's own
+ * page_frag is used, since there is no task to borrow one from in BH context,
+ * and the socket lock, held by the caller, serialises its use. The memory for
+ * the headers is scheduled by tcp_stream_alloc_skb(); the payload is left to
+ * the caller, which has to schedule skb->data_len.
+ */
+static struct sk_buff *xdp_tcp_alloc_segment(struct sock *sk, const void *buf, u32 len)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	int mss_now, size_goal, len = skb->len;
+	struct page_frag *pfrag = &sk->sk_frag;
+	struct sk_buff *skb;
 
-	if (!((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT))) {
-		__kfree_skb(skb);
-		return -ENOTCONN;
+	skb = tcp_stream_alloc_skb(sk, GFP_ATOMIC, tcp_rtx_and_write_queues_empty(sk));
+	if (!skb)
+		return NULL;
+	while (len) {
+		int i = skb_shinfo(skb)->nr_frags;
+		bool merge;
+		u32 copy;
+
+		if (!skb_page_frag_refill(32U, pfrag, GFP_ATOMIC))
+			goto fail;
+		copy = min(len, pfrag->size - pfrag->offset);
+		merge = skb_can_coalesce(skb, i, pfrag->page, pfrag->offset);
+		if (!merge && i >= MAX_SKB_FRAGS)
+			goto fail;
+		memcpy(page_address(pfrag->page) + pfrag->offset, buf, copy);
+		if (merge) {
+			skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
+		} else {
+			skb_fill_page_desc(skb, i, pfrag->page, pfrag->offset, copy);
+			page_ref_inc(pfrag->page);
+		}
+		pfrag->offset += copy;
+		skb->len += copy;
+		skb->data_len += copy;
+		skb->truesize += copy;
+		buf += copy;
+		len -= copy;
 	}
-	if (tcp_write_queue_empty(sk))
-		sk_forced_mem_schedule(sk, skb->truesize);
-	else if (!sk_stream_memory_free(sk) || !sk_wmem_schedule(sk, skb->truesize)) {
-		__kfree_skb(skb);
-		return -EAGAIN;
-	}
-	mss_now = tcp_send_mss(sk, &size_goal, 0);
-	/*
-	 * The anchor shares its storage with the skb's dst pointer, so it is
-	 * set only on a queued skb, which TCP cleans before freeing.
-	 */
-	TCP_SKB_CB(skb)->sacked = 0;
-	INIT_LIST_HEAD(&skb->tcp_tsorted_anchor);
-	tcp_skb_entail(sk, skb);
-	TCP_SKB_CB(skb)->end_seq += len;
-	WRITE_ONCE(tp->write_seq, tp->write_seq + len);
-	tcp_push(sk, 0, mss_now, TCP_NAGLE_PUSH, size_goal);
-	return len;
+	return skb;
+fail:
+	__kfree_skb(skb);
+	return NULL;
 }
 
 /**
@@ -374,9 +392,10 @@ __bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len,
 				 struct bpf_prog_aux *aux)
 {
 	u64 start = bpf_arena_get_kern_vm_start(aux->arena), addr = (u64)(long)buf__arena;
+	struct tcp_sock *tp = tcp_sk(sk);
+	int mss_now, size_goal, err;
 	struct sk_buff *skb;
 	void *p;
-	int err;
 
 	if (!len || len > SZ_64K)
 		return -EINVAL;
@@ -386,21 +405,29 @@ __bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len,
 		if (!vmalloc_to_page(p))
 			return -EFAULT;
 
-	skb = alloc_skb_fclone(MAX_TCP_HEADER + len, GFP_ATOMIC);
-	if (!skb)
-		return -ENOMEM;
-	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
-	skb_reserve(skb, MAX_TCP_HEADER);
-	skb->ip_summed = CHECKSUM_PARTIAL;
-	skb_put_data(skb, buf__arena, len);
-
 	bh_lock_sock_nested(sk);
-	if (sock_owned_by_user(sk)) {
+	err = -EAGAIN;
+	if (sock_owned_by_user(sk) || !sk_stream_memory_free(sk))
+		goto out;
+	err = -ENOTCONN;
+	if (!((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)))
+		goto out;
+	err = -ENOMEM;
+	skb = xdp_tcp_alloc_segment(sk, buf__arena, len);
+	if (!skb)
+		goto out;
+	if (!sk_wmem_schedule(sk, skb->data_len)) {
 		__kfree_skb(skb);
 		err = -EAGAIN;
-	} else {
-		err = xdp_tcp_queue_response(sk, skb);
+		goto out;
 	}
+	mss_now = tcp_send_mss(sk, &size_goal, 0);
+	tcp_skb_entail(sk, skb);
+	TCP_SKB_CB(skb)->end_seq += len;
+	WRITE_ONCE(tp->write_seq, tp->write_seq + len);
+	tcp_push(sk, 0, mss_now, TCP_NAGLE_PUSH, size_goal);
+	err = len;
+out:
 	bh_unlock_sock(sk);
 	return err;
 }
