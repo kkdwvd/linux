@@ -9,8 +9,9 @@
  *
  *   bpf_xdp_tcp_lookup()   parses the frame, finds the established socket and
  *                          reports where the payload is, if the segment is
- *                          one the fast path can handle: IPv4, no options,
- *                          header prediction holds, next in sequence
+ *                          one the fast path can handle: IPv4 or IPv6 without
+ *                          options or extension headers, header prediction
+ *                          holds, next in sequence
  *   bpf_xdp_tcp_consume()  under the socket lock, re-checks that and applies
  *                          the segment to the connection as
  *                          tcp_rcv_established()'s fast path would, except
@@ -38,8 +39,10 @@
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
 #include <linux/vmalloc.h>
-#include <net/inet_ecn.h>
+#include <net/dsfield.h>
+#include <net/inet6_hashtables.h>
 #include <net/inet_hashtables.h>
+#include <net/ip6_checksum.h>
 #include <net/tcp.h>
 #include <net/tcp_ecn.h>
 #include <net/xdp.h>
@@ -52,45 +55,85 @@ struct bpf_xdp_tcp_info {
 };
 
 struct xdp_tcp_hdrs {
-	const struct iphdr *iph;
+	const struct iphdr *iph;	/* one of the two is set */
+	const struct ipv6hdr *ip6h;
 	const struct tcphdr *th;
 	u32 payload_len;
+	u8 dsfield;
 };
 
-/* Parse an IPv4/TCP frame with a non-empty payload; false for anything else. */
+/*
+ * Parse an IPv4 or IPv6 TCP frame with a non-empty payload; false for anything
+ * else. IP options and extension headers are left to the stack.
+ */
 static bool xdp_tcp_parse(const struct xdp_buff *xdp, struct xdp_tcp_hdrs *h)
 {
 	const void *data = xdp->data, *end = xdp->data_end;
 	const struct ethhdr *eth = data;
-	const struct iphdr *iph;
 	const struct tcphdr *th;
-	u32 tot_len, hlen;
+	u32 tcp_len, hlen;
+	__sum16 csum;
 
-	if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*th) > end)
+	if (data + sizeof(*eth) > end)
 		return false;
-	if (eth->h_proto != htons(ETH_P_IP))
+	memset(h, 0, sizeof(*h));
+	if (eth->h_proto == htons(ETH_P_IP)) {
+		const struct iphdr *iph = data + sizeof(*eth);
+		u32 tot_len;
+
+		if ((void *)(iph + 1) > end)
+			return false;
+		if (iph->version != 4 || iph->ihl != 5 || iph->protocol != IPPROTO_TCP ||
+		    (iph->frag_off & htons(IP_MF | IP_OFFSET)))
+			return false;
+		tot_len = ntohs(iph->tot_len);
+		if (tot_len < sizeof(*iph) + sizeof(*th) || (void *)iph + tot_len > end)
+			return false;
+		if (ip_fast_csum(iph, iph->ihl))
+			return false;
+		th = (const void *)(iph + 1);
+		tcp_len = tot_len - sizeof(*iph);
+		/* The device does not verify checksums for XDP; do it here. */
+		csum = csum_tcpudp_magic(iph->saddr, iph->daddr, tcp_len, IPPROTO_TCP,
+					 csum_partial(th, tcp_len, 0));
+		h->iph = iph;
+		h->dsfield = ipv4_get_dsfield(iph);
+	} else if (IS_ENABLED(CONFIG_IPV6) && eth->h_proto == htons(ETH_P_IPV6)) {
+		const struct ipv6hdr *ip6h = data + sizeof(*eth);
+
+		if ((void *)(ip6h + 1) > end)
+			return false;
+		if (ip6h->version != 6 || ip6h->nexthdr != IPPROTO_TCP)
+			return false;
+		tcp_len = ntohs(ip6h->payload_len);
+		if (tcp_len < sizeof(*th) || (void *)(ip6h + 1) + tcp_len > end)
+			return false;
+		th = (const void *)(ip6h + 1);
+		csum = csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr, tcp_len, IPPROTO_TCP,
+				       csum_partial(th, tcp_len, 0));
+		h->ip6h = ip6h;
+		h->dsfield = ipv6_get_dsfield(ip6h);
+	} else {
 		return false;
-	iph = data + sizeof(*eth);
-	if (iph->version != 4 || iph->ihl != 5 || iph->protocol != IPPROTO_TCP ||
-	    (iph->frag_off & htons(IP_MF | IP_OFFSET)))
+	}
+	if (csum)
 		return false;
-	tot_len = ntohs(iph->tot_len);
-	if (tot_len < sizeof(*iph) + sizeof(*th) || (void *)iph + tot_len > end)
-		return false;
-	th = (const void *)(iph + 1);
 	hlen = th->doff * 4;
-	if (hlen < sizeof(*th) || sizeof(*iph) + hlen > tot_len)
+	if (hlen < sizeof(*th) || hlen > tcp_len)
 		return false;
-	if (ip_fast_csum(iph, iph->ihl))
-		return false;
-	/* The device does not verify checksums for XDP; do it here. */
-	if (csum_tcpudp_magic(iph->saddr, iph->daddr, tot_len - sizeof(*iph), IPPROTO_TCP,
-			      csum_partial(th, tot_len - sizeof(*iph), 0)))
-		return false;
-	h->iph = iph;
 	h->th = th;
-	h->payload_len = tot_len - sizeof(*iph) - hlen;
+	h->payload_len = tcp_len - hlen;
 	return h->payload_len != 0;
+}
+
+static struct sock *xdp_tcp_lookup6(struct net *net, const struct xdp_tcp_hdrs *h, int dif)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	return __inet6_lookup_established(net, &h->ip6h->saddr, h->th->source, &h->ip6h->daddr,
+					  ntohs(h->th->dest), dif, 0);
+#else
+	return NULL;
+#endif
 }
 
 /*
@@ -128,8 +171,8 @@ __bpf_kfunc_start_defs();
  * @ctx: the frame
  * @info: where the payload is, filled in on success
  *
- * Returns the socket, with a reference, when the frame is an IPv4 TCP data
- * segment for an established socket of the receiving netns and header
+ * Returns the socket, with a reference, when the frame is an IPv4 or IPv6 TCP
+ * data segment for an established socket of the receiving netns and header
  * prediction says the stack would take it on its fast path; NULL otherwise.
  * The checks are made without the socket lock: bpf_xdp_tcp_consume()
  * repeats them under it.
@@ -138,12 +181,17 @@ __bpf_kfunc struct sock *bpf_xdp_tcp_lookup(struct xdp_md *ctx, struct bpf_xdp_t
 {
 	struct xdp_buff *xdp = (struct xdp_buff *)ctx;
 	struct xdp_tcp_hdrs h;
+	struct net_device *dev;
 	struct sock *sk;
 
 	if (!xdp->rxq || !xdp->rxq->dev || !xdp_tcp_parse(xdp, &h))
 		return NULL;
-	sk = __inet_lookup_established(dev_net(xdp->rxq->dev), h.iph->saddr, h.th->source,
-				       h.iph->daddr, ntohs(h.th->dest), xdp->rxq->dev->ifindex, 0);
+	dev = xdp->rxq->dev;
+	if (h.iph)
+		sk = __inet_lookup_established(dev_net(dev), h.iph->saddr, h.th->source,
+					       h.iph->daddr, ntohs(h.th->dest), dev->ifindex, 0);
+	else
+		sk = xdp_tcp_lookup6(dev_net(dev), &h, dev->ifindex);
 	if (!sk)
 		return NULL;
 	/*
@@ -217,12 +265,12 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
 	skb->truesize = SKB_TRUESIZE(h.payload_len + hlen);
 	skb_reset_transport_header(skb);
 	skb->transport_header = 0;
-	skb->protocol = htons(ETH_P_IP);
+	skb->protocol = h.iph ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
 	TCP_SKB_CB(skb)->seq = seq;
 	TCP_SKB_CB(skb)->end_seq = end_seq;
 	TCP_SKB_CB(skb)->ack_seq = ntohl(th->ack_seq);
 	TCP_SKB_CB(skb)->tcp_flags = tcp_flags_ntohs(th);
-	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(h.iph);
+	TCP_SKB_CB(skb)->ip_dsfield = h.dsfield;
 	TCP_SKB_CB(skb)->sacked = 0;
 
 	bh_lock_sock_nested(sk);
