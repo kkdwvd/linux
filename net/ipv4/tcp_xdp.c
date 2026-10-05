@@ -253,10 +253,14 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
 	NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPHPHITS);
 	tcp_ecn_received_counters(sk, skb, h.payload_len);
 
-	/* Received and read by the program, so nothing is queued. */
+	/*
+	 * Received and read by the program, so nothing is queued; the read side's
+	 * receive buffer autotuning runs here since no recvmsg() will.
+	 */
 	tcp_rcv_nxt_update(tp, end_seq);
 	WRITE_ONCE(tp->copied_seq, end_seq);
 	tcp_event_data_recv(sk, skb);
+	tcp_rcv_space_adjust(sk);
 
 	if (TCP_SKB_CB(skb)->ack_seq != tp->snd_una ||
 	    (tcp_flag_word(th) & XDP_TCP_HP_BITS) != tp->pred_flags) {
