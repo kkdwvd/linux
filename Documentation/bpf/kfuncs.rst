@@ -532,6 +532,17 @@ CAP_SYS_ADMIN, in the same way that the equivalent BPF helpers are gated in
 bpf_base_func_proto(). A program loaded with CAP_BPF alone is rejected at load
 time.
 
+2.5.11 KF_RELEASE_CTX flag
+--------------------------
+
+The KF_RELEASE_CTX flag is used for kfuncs that consume the program context
+passed as their first argument, which the program holds as a trusted pointer
+rather than as an acquired reference. After the call the verifier invalidates
+every copy of the context pointer, in every frame, together with the packet
+pointers and the dynptrs that were derived from it, so the program can no
+longer reach what the kfunc took. bpf_xdp_frame_steal() uses it to turn the
+frame behind an XDP context into a kptr the program owns.
+
 2.6 Registering the kfuncs
 --------------------------
 

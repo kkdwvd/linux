@@ -10578,6 +10578,45 @@ static void clear_all_pkt_pointers(struct bpf_verifier_env *env)
 	}));
 }
 
+/*
+ * A KF_RELEASE_CTX kfunc took the program context away from the program, as
+ * bpf_xdp_frame_steal() does with the frame behind an XDP context. Nothing
+ * that came from the context may be used afterwards: every copy of the context
+ * pointer in every frame, the packet pointers derived from it and the dynptrs
+ * that read through it.
+ */
+static void consume_ctx(struct bpf_verifier_env *env)
+{
+	u32 mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR);
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *state;
+	struct bpf_reg_state *reg;
+
+	bpf_for_each_reg_in_vstate_mask(vstate, state, reg, stack, mask, ({
+		if (stack && stack->slot_type[BPF_REG_SIZE - 1] == STACK_DYNPTR) {
+			struct bpf_stack_state *dyn_stack = stack;
+
+			if (reg->dynptr.type != BPF_DYNPTR_TYPE_SKB &&
+			    reg->dynptr.type != BPF_DYNPTR_TYPE_SKB_META &&
+			    reg->dynptr.type != BPF_DYNPTR_TYPE_XDP)
+				continue;
+			if (reg->dynptr.first_slot)
+				dyn_stack--;
+			bpf_diag_record_scrub(env, &dyn_stack[0].spilled_ptr, BPF_DIAG_MOD_CTX_CONSUMED);
+			bpf_diag_record_scrub(env, &dyn_stack[1].spilled_ptr, BPF_DIAG_MOD_CTX_CONSUMED);
+			invalidate_dynptr(env, dyn_stack);
+			continue;
+		}
+		if (reg->type != PTR_TO_CTX)
+			continue;
+		bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_CTX_CONSUMED);
+		if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL)
+			mark_reg_invalid(env, reg);
+	}));
+	clear_all_pkt_pointers(env);
+}
+
 enum {
 	AT_PKT_END = -1,
 	BEYOND_PKT_END = -2,
@@ -12672,6 +12711,11 @@ static bool is_kfunc_release(struct bpf_call_arg_meta *meta)
 	return meta->kfunc_flags & KF_RELEASE;
 }
 
+static bool is_kfunc_release_ctx(struct bpf_call_arg_meta *meta)
+{
+	return meta->kfunc_flags & KF_RELEASE_CTX;
+}
+
 static bool is_kfunc_destructive(struct bpf_call_arg_meta *meta)
 {
 	return meta->kfunc_flags & KF_DESTRUCTIVE;
@@ -13643,6 +13687,13 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 
 	if (is_kfunc_arg_nullable(meta->btf, &args[arg]))
 		arg_type |= PTR_MAYBE_NULL;
+
+	/* A KF_RELEASE_CTX kfunc consumes the program context passed first, see consume_ctx(). */
+	if (is_kfunc_release_ctx(meta) && arg == 0 && base_type(arg_type) != ARG_PTR_TO_CTX) {
+		verbose(env, "kfunc %s is KF_RELEASE_CTX, but %s is not the program context\n",
+			meta->func_name, reg_arg_name(env, argno));
+		return -EINVAL;
+	}
 
 	/*
 	 * Only the first argument of a KF_RELEASE kfunc releases anything, and
@@ -14967,6 +15018,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (err)
 			return err;
 	}
+
+	if (is_kfunc_release_ctx(&meta))
+		consume_ctx(env);
 
 	if (is_bpf_list_push_kfunc(meta.func_id) || is_bpf_rbtree_add_kfunc(meta.func_id)) {
 		id = regs[BPF_REG_2].id;
