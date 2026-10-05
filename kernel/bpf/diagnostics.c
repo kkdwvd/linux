@@ -2241,6 +2241,9 @@ static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_h
 	case BPF_DIAG_MOD_PKT_DATA_CHANGE:
 		reason = "packet data may have moved";
 		break;
+	case BPF_DIAG_MOD_CTX_CONSUMED:
+		reason = "a kfunc consumed the program context";
+		break;
 	case BPF_DIAG_MOD_NON_OWN_REF:
 		reason = "leaving the protected region invalidated this borrowed pointer";
 		break;

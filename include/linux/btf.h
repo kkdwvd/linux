@@ -81,6 +81,7 @@
 #define KF_IMPLICIT_ARGS (1 << 16) /* kfunc has implicit arguments supplied by the verifier */
 #define KF_SPINLOCK_SAFE (1 << 17) /* kfunc is allowed inside bpf_spin_lock-ed region */
 #define KF_PERFMON      (1 << 18) /* kfunc requires CAP_PERFMON */
+#define KF_RELEASE_CTX  (1 << 19) /* kfunc consumes the program context passed as its first argument */
 
 /*
  * Tag marking a kernel function as a kfunc. This is meant to minimize the
