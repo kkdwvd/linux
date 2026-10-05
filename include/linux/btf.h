@@ -83,6 +83,7 @@
 #define KF_SPINLOCK_SAFE (1 << 17) /* kfunc is allowed inside bpf_spin_lock-ed region */
 #define KF_PERFMON      (1 << 18) /* kfunc requires CAP_PERFMON */
 #define KF_ITER_RET_INDEPENDENT (1 << 19) /* next result outlives the current element */
+#define KF_RELEASE_CTX  (1 << 20) /* kfunc consumes the program context passed as its first argument */
 
 /*
  * Tag marking a kernel function as a kfunc. This is meant to minimize the
