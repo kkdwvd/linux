@@ -23,9 +23,10 @@
  *                          the program to try again later
  *   bpf_xdp_tcp_release()  drops the socket reference
  *
- * Everything the fast path declines (a busy socket, out-of-order or
- * option-bearing segments, a shrinking window) is left to XDP_PASS, where the
- * stack and the application behind it handle the segment as usual.
+ * Everything the fast path declines (a busy socket, unread data in the receive
+ * queue, out-of-order or option-bearing segments, a shrinking window) is left
+ * to XDP_PASS, where the stack and the application behind it handle the
+ * segment as usual.
  *
  * tcp_ack() and friends work on an skb; the frame is described to them with
  * a stack skb whose head holds a copy of the TCP header and whose control
@@ -100,6 +101,11 @@ static bool xdp_tcp_parse(const struct xdp_buff *xdp, struct xdp_tcp_hdrs *h)
  * processing, but the consume path below runs tcp_ack() with the slow-path
  * flag and handles a change, which clients make often enough as their
  * receive buffers autotune.
+ *
+ * Nothing may be waiting in the receive queue: consuming would move
+ * copied_seq past data the application has yet to read, and tcp_recvmsg()
+ * would then find segments before its cursor. Header prediction does not
+ * cover this, since the stack's fast path can queue behind unread data.
  */
 #define XDP_TCP_HP_BITS		(~(TCP_RESERVED_BITS | TCP_FLAG_PSH))
 #define XDP_TCP_HP_NOWIN_BITS	(XDP_TCP_HP_BITS & ~htonl(0xffff))
@@ -110,7 +116,7 @@ static bool xdp_tcp_fast_ok(const struct tcp_sock *tp, const struct tcphdr *th, 
 
 	return tp->pred_flags &&
 	       ((tcp_flag_word(th) ^ tp->pred_flags) & XDP_TCP_HP_NOWIN_BITS) == 0 &&
-	       seq == tp->rcv_nxt &&
+	       seq == tp->rcv_nxt && READ_ONCE(tp->copied_seq) == tp->rcv_nxt &&
 	       between(ack_seq, tp->snd_una, tp->snd_nxt) &&
 	       !after(seq + plen, tp->rcv_nxt + tcp_receive_window(tp));
 }
