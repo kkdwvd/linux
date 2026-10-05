@@ -6701,6 +6701,10 @@ struct bpf_xdp_sock {
  * A valid XDP program must return one of these defined values. All other
  * return codes are reserved for future use. Unknown return codes will
  * result in packet drops and a warning via bpf_warn_invalid_xdp_action().
+ *
+ * XDP_CONSUME is returned after a kfunc such as bpf_xdp_frame_steal() made
+ * the program the owner of the frame. The driver is then told to redirect,
+ * and the redirect core completes that without touching the frame.
  */
 enum xdp_action {
 	XDP_ABORTED = 0,
@@ -6708,6 +6712,7 @@ enum xdp_action {
 	XDP_PASS,
 	XDP_TX,
 	XDP_REDIRECT,
+	XDP_CONSUME,
 };
 
 /* user accessible metadata for XDP packet hook

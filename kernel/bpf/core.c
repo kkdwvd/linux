@@ -3094,6 +3094,8 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	int i;
 
 	aux = container_of(work, struct bpf_prog_aux, work);
+	if (aux->xdp_consume)
+		static_branch_dec(&bpf_xdp_consume_enabled_key);
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
 #endif
@@ -3603,6 +3605,10 @@ late_initcall(bpf_global_ma_init);
 
 DEFINE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
 EXPORT_SYMBOL(bpf_stats_enabled_key);
+
+/* Switched on while a program that may take ownership of XDP frames is loaded. */
+DEFINE_STATIC_KEY_FALSE(bpf_xdp_consume_enabled_key);
+EXPORT_SYMBOL_GPL(bpf_xdp_consume_enabled_key);
 
 /* All definitions of tracepoints related to BPF. */
 #define CREATE_TRACE_POINTS
