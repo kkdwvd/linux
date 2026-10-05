@@ -700,6 +700,9 @@ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
 	 */
 	u32 act = __bpf_prog_run(prog, xdp, BPF_DISPATCHER_FUNC(xdp));
 
+	if (static_branch_unlikely(&bpf_xdp_consume_enabled_key) || unlikely(act == XDP_CONSUME))
+		act = bpf_xdp_consume_fixup(prog, act);
+
 	if (static_branch_unlikely(&bpf_master_redirect_enabled_key)) {
 		if (act == XDP_TX && netif_is_bond_slave(xdp->rxq->dev))
 			act = xdp_master_redirect(xdp);

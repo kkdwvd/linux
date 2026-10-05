@@ -770,6 +770,8 @@ struct sk_filter {
 };
 
 DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
+/* On while a program that may take ownership of XDP frames is loaded, see XDP_CONSUME. */
+DECLARE_STATIC_KEY_FALSE(bpf_xdp_consume_enabled_key);
 
 extern struct mutex nf_conn_btf_access_lock;
 extern int (*nfct_btf_struct_access)(struct bpf_verifier_log *log,
@@ -876,6 +878,7 @@ struct bpf_nh_params {
 #define BPF_RI_F_CPU_MAP_INIT	BIT(2)
 #define BPF_RI_F_DEV_MAP_INIT	BIT(3)
 #define BPF_RI_F_XSK_MAP_INIT	BIT(4)
+#define BPF_RI_F_XDP_CONSUMED	BIT(5)	/* the program owns the frame, see XDP_CONSUME */
 
 struct bpf_redirect_info {
 	u64 tgt_index;
@@ -2041,5 +2044,24 @@ static inline void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset)
 	return ERR_PTR(-EOPNOTSUPP);
 }
 #endif /* CONFIG_NET */
+
+/*
+ * XDP_CONSUME: a kfunc such as bpf_xdp_frame_steal() converted the frame and
+ * made the program its owner, recording that in the redirect info. The driver
+ * is told to redirect, which xdp_do_redirect() completes without touching the
+ * frame, so the driver's existing contract keeps it from recycling the buffer.
+ * Whatever the program returned, a frame it took is a frame it keeps. The mark
+ * in the redirect info decides, not the program that returned: the frame may
+ * have been taken by a program it tail called or by an extension of it. The
+ * static key says whether any loaded program takes frames at all. Returning
+ * XDP_CONSUME without having taken the frame is a program bug and aborts.
+ */
+static __always_inline u32 bpf_xdp_consume_fixup(const struct bpf_prog *prog, u32 act)
+{
+	if (static_branch_unlikely(&bpf_xdp_consume_enabled_key) &&
+	    (bpf_net_ctx_get_ri()->kern_flags & BPF_RI_F_XDP_CONSUMED))
+		return XDP_REDIRECT;
+	return act == XDP_CONSUME ? XDP_ABORTED : act;
+}
 
 #endif /* __LINUX_FILTER_H__ */
