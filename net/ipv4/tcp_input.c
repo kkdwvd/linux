@@ -917,8 +917,7 @@ static s32 tcp_rtt_tsopt_us(const struct tcp_sock *tp, u32 min_delta)
 	return -1;
 }
 
-static inline void tcp_rcv_rtt_measure_ts(struct sock *sk,
-					  const struct sk_buff *skb)
+void tcp_rcv_rtt_measure_ts(struct sock *sk, const struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -1039,7 +1038,7 @@ static void tcp_save_lrcv_flowlabel(struct sock *sk, const struct sk_buff *skb)
  * each ACK we send, he increments snd_cwnd and transmits more of his
  * queue.  -DaveM
  */
-static void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)
+void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -3960,7 +3959,7 @@ static void tcp_rcv_sne_update(struct tcp_sock *tp, u32 seq)
 }
 
 /* If we update tp->rcv_nxt, also update tp->bytes_received */
-static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
+void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
 {
 	u32 delta = seq - tp->rcv_nxt;
 
@@ -4733,7 +4732,7 @@ void tcp_parse_options(const struct net *net,
 }
 EXPORT_SYMBOL(tcp_parse_options);
 
-static bool tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr *th)
+bool tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr *th)
 {
 	const __be32 *ptr = (const __be32 *)(th + 1);
 
@@ -5037,7 +5036,7 @@ static inline bool tcp_sack_extend(struct tcp_sack_block *sp, u32 seq,
 	return false;
 }
 
-static void tcp_dsack_set(struct sock *sk, u32 seq, u32 end_seq)
+void tcp_dsack_set(struct sock *sk, u32 seq, u32 end_seq)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -5057,7 +5056,7 @@ static void tcp_dsack_set(struct sock *sk, u32 seq, u32 end_seq)
 	}
 }
 
-static void tcp_dsack_extend(struct sock *sk, u32 seq, u32 end_seq)
+void tcp_dsack_extend(struct sock *sk, u32 seq, u32 end_seq)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -6159,10 +6158,28 @@ static inline void tcp_data_snd_check(struct sock *sk)
 	tcp_check_space(sk);
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+/*
+ * The XDP fast path in tcp_xdp.c applies a segment as the fast path above
+ * does, but cannot see the FLAG_* bits that tcp_ack() takes; these wrappers
+ * hide them.
+ */
+bool tcp_xdp_replace_ts_recent(struct tcp_sock *tp, s32 tstamp_delta)
+{
+	return __tcp_replace_ts_recent(tp, tstamp_delta) == FLAG_TS_PROGRESS;
+}
+
+void tcp_xdp_ack(struct sock *sk, const struct sk_buff *skb, bool ts_progress)
+{
+	tcp_ack(sk, skb, FLAG_DATA | FLAG_SLOWPATH | (ts_progress ? FLAG_TS_PROGRESS : 0));
+	tcp_data_snd_check(sk);
+}
+#endif
+
 /*
  * Check if sending an ack is needed.
  */
-static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+void __tcp_ack_snd_check(struct sock *sk, bool ofo_pending)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct net *net = sock_net(sk);
@@ -6195,7 +6212,7 @@ send_now:
 		return;
 	}
 
-	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
+	if (!ofo_pending) {
 		tcp_send_delayed_ack(sk);
 		return;
 	}
@@ -6245,7 +6262,7 @@ static inline void tcp_ack_snd_check(struct sock *sk)
 		/* We sent a data segment already. */
 		return;
 	}
-	__tcp_ack_snd_check(sk, 1);
+	__tcp_ack_snd_check(sk, !RB_EMPTY_ROOT(&tcp_sk(sk)->out_of_order_queue));
 }
 
 /*
@@ -6699,7 +6716,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 				tcp_update_wl(tp, TCP_SKB_CB(skb)->seq);
 			}
 
-			__tcp_ack_snd_check(sk, 0);
+			__tcp_ack_snd_check(sk, false);
 no_ack:
 			if (eaten)
 				kfree_skb_partial(skb, fragstolen);
