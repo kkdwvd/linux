@@ -782,6 +782,15 @@ void tcp_synack_rtt_meas(struct sock *sk, struct request_sock *req);
 void tcp_done_with_error(struct sock *sk, int err);
 void tcp_reset(struct sock *sk, struct sk_buff *skb);
 void tcp_fin(struct sock *sk);
+
+/* tcp_input.c internals shared with the XDP fast path in tcp_xdp.c */
+void tcp_rcv_rtt_measure_ts(struct sock *sk, const struct sk_buff *skb);
+void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb);
+void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq);
+bool tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr *th);
+void __tcp_ack_snd_check(struct sock *sk, int ofo_possible);
+bool tcp_xdp_replace_ts_recent(struct tcp_sock *tp, s32 tstamp_delta);
+void tcp_xdp_ack(struct sock *sk, const struct sk_buff *skb, bool ts_progress);
 void __tcp_check_space(struct sock *sk);
 static inline void tcp_check_space(struct sock *sk)
 {
