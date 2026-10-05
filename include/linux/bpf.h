@@ -1876,6 +1876,7 @@ struct bpf_prog_aux {
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
+	bool xdp_consume; /* may take ownership of frames, see XDP_CONSUME */
 	bool exception_cb;
 	bool exception_boundary;
 	bool jits_use_priv_stack;
@@ -2820,6 +2821,7 @@ bool bpf_jit_bypass_spec_v4(void);
 
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);
+DECLARE_STATIC_KEY_FALSE(bpf_xdp_consume_enabled_key);
 extern struct mutex bpf_stats_enabled_mutex;
 
 /*

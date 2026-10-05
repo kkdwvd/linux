@@ -853,6 +853,7 @@ struct bpf_nh_params {
 #define BPF_RI_F_CPU_MAP_INIT	BIT(2)
 #define BPF_RI_F_DEV_MAP_INIT	BIT(3)
 #define BPF_RI_F_XSK_MAP_INIT	BIT(4)
+#define BPF_RI_F_XDP_CONSUMED	BIT(5)	/* the program owns the frame, see XDP_CONSUME */
 
 struct bpf_redirect_info {
 	u64 tgt_index;
@@ -2002,5 +2003,25 @@ static inline void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset)
 	return ERR_PTR(-EOPNOTSUPP);
 }
 #endif /* CONFIG_NET */
+
+/*
+ * XDP_CONSUME: a kfunc such as bpf_xdp_frame_steal() converted the frame and
+ * made the program its owner, recording that in the redirect info. The driver
+ * is told to redirect, which xdp_do_redirect() completes without touching the
+ * frame, so the driver's existing contract keeps it from recycling the buffer.
+ * Whatever the program returned, a frame it took is a frame it keeps. Returning
+ * XDP_CONSUME without having taken the frame is a program bug and aborts.
+ */
+static __always_inline u32 bpf_xdp_consume_fixup(const struct bpf_prog *prog, u32 act)
+{
+	struct bpf_redirect_info *ri;
+
+	if (prog->aux->xdp_consume) {
+		ri = bpf_net_ctx_get_ri();
+		if (ri->kern_flags & BPF_RI_F_XDP_CONSUMED)
+			return XDP_REDIRECT;
+	}
+	return act == XDP_CONSUME ? XDP_ABORTED : act;
+}
 
 #endif /* __LINUX_FILTER_H__ */

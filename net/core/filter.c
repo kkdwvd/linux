@@ -4685,6 +4685,11 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
 	enum bpf_map_type map_type = ri->map_type;
 
+	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
+		/* The program owns the frame, see XDP_CONSUME. */
+		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		return 0;
+	}
 	if (map_type == BPF_MAP_TYPE_XSKMAP)
 		return __xdp_do_redirect_xsk(ri, dev, xdp, xdp_prog);
 
@@ -4700,6 +4705,11 @@ int xdp_do_redirect_frame(struct net_device *dev, struct xdp_buff *xdp,
 	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
 	enum bpf_map_type map_type = ri->map_type;
 
+	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
+		/* The program owns the frame, see XDP_CONSUME. */
+		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		return 0;
+	}
 	if (map_type == BPF_MAP_TYPE_XSKMAP)
 		return __xdp_do_redirect_xsk(ri, dev, xdp, xdp_prog);
 
