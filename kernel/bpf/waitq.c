@@ -5,6 +5,7 @@
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/hrtimer.h>
+#include <linux/kthread.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/wait.h>
 
@@ -16,6 +17,22 @@ struct bpf_waitq_kern {
 
 struct bpf_waitq_opaque {
 	struct bpf_waitq_kern *waitq;
+} __aligned(8);
+
+struct bpf_kthread_kern {
+	struct task_struct *task;
+	struct bpf_map *map;
+	struct bpf_prog *prog;
+	void *callback_fn;
+	void *value;
+	spinlock_t lock;
+	struct work_struct stop_work;
+	struct rcu_head rcu;
+	bool stopping;
+};
+
+struct bpf_kthread_opaque {
+	struct bpf_kthread_kern *kthread;
 } __aligned(8);
 
 static void bpf_waitq_free_rcu(struct rcu_head *rcu)
@@ -42,6 +59,106 @@ void bpf_waitq_cancel_and_free(void *val)
 	waitq = xchg(&opaque->waitq, NULL);
 	if (waitq)
 		call_rcu_tasks_trace(&waitq->rcu, bpf_waitq_free_rcu);
+}
+
+static void bpf_kthread_free_rcu(struct rcu_head *rcu)
+{
+	struct bpf_kthread_kern *kthread = container_of(rcu, struct bpf_kthread_kern, rcu);
+
+	bpf_prog_put(kthread->prog);
+	kfree(kthread);
+}
+
+static int bpf_kthread_stop_one(struct bpf_kthread_kern *kthread)
+{
+	struct task_struct *task;
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&kthread->lock, flags);
+	kthread->stopping = true;
+	task = kthread->task;
+	spin_unlock_irqrestore(&kthread->lock, flags);
+
+	ret = task ? kthread_stop_put(task) : -ENOENT;
+
+	spin_lock_irqsave(&kthread->lock, flags);
+	kthread->task = NULL;
+	spin_unlock_irqrestore(&kthread->lock, flags);
+
+	call_rcu_tasks_trace(&kthread->rcu, bpf_kthread_free_rcu);
+	return ret;
+}
+
+static void bpf_kthread_stop_work(struct work_struct *work)
+{
+	struct bpf_kthread_kern *kthread = container_of(work, struct bpf_kthread_kern, stop_work);
+
+	bpf_kthread_stop_one(kthread);
+}
+
+static void bpf_kthread_begin_stop(struct bpf_kthread_kern *kthread)
+{
+	struct task_struct *task = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&kthread->lock, flags);
+	kthread->stopping = true;
+	if (kthread->task) {
+		task = kthread->task;
+		get_task_struct(task);
+	}
+	spin_unlock_irqrestore(&kthread->lock, flags);
+
+	if (task) {
+		wake_up_process(task);
+		put_task_struct(task);
+	}
+}
+
+void bpf_kthread_cancel_and_free(void *val)
+{
+	struct bpf_kthread_opaque *opaque = val;
+	struct bpf_kthread_kern *kthread;
+
+	kthread = xchg(&opaque->kthread, NULL);
+	if (!kthread)
+		return;
+
+	bpf_kthread_begin_stop(kthread);
+	schedule_work(&kthread->stop_work);
+}
+
+static int bpf_kthread_run(void *data)
+{
+	struct bpf_kthread_kern *kthread = data;
+	bpf_callback_t callback_fn = READ_ONCE(kthread->callback_fn);
+	int ret = 0;
+
+	while (!kthread_should_stop() && !READ_ONCE(kthread->stopping)) {
+		void *key;
+		u32 idx;
+
+		rcu_read_lock_trace();
+		migrate_disable();
+		if (READ_ONCE(kthread->stopping)) {
+			migrate_enable();
+			rcu_read_unlock_trace();
+			break;
+		}
+
+		key = bpf_map_key_from_value(kthread->map, kthread->value, &idx);
+		ret = (int)callback_fn((u64)(long)kthread->map, (u64)(long)key,
+				       (u64)(long)kthread->value, 0, 0);
+
+		migrate_enable();
+		rcu_read_unlock_trace();
+		if (ret)
+			break;
+		cond_resched();
+	}
+
+	return ret;
 }
 
 __bpf_kfunc_start_defs();
@@ -121,7 +238,10 @@ __bpf_kfunc int bpf_waitq_wait(struct bpf_waitq *waitq, const u32 *word,
 	migrate_enable();
 	rcu_read_unlock_trace();
 
-	if (timeout_ns == U64_MAX) {
+	if ((current->flags & PF_KTHREAD) && kthread_should_stop()) {
+		__set_current_state(TASK_RUNNING);
+		ret = -EINTR;
+	} else if (timeout_ns == U64_MAX) {
 		schedule();
 	} else {
 		ktime_t expires = ns_to_ktime(timeout_ns);
@@ -170,12 +290,136 @@ __bpf_kfunc int bpf_waitq_wake(struct bpf_waitq *waitq, u32 nr, u64 flags)
 	return __wake_up(&waitq_kern->waitq, TASK_NORMAL, nr_exclusive, NULL);
 }
 
+__bpf_kfunc int bpf_kthread_create(struct bpf_kthread *kthread, void *p__const_map,
+				   int (callback_fn)(void *map, int *key, void *value),
+				   u64 flags, struct bpf_prog_aux *aux)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_map *map = p__const_map;
+	struct bpf_kthread_kern *new_kthread;
+	struct bpf_prog *prog;
+	struct task_struct *task;
+
+	BUILD_BUG_ON(sizeof(struct bpf_kthread_opaque) > sizeof(struct bpf_kthread));
+	BUILD_BUG_ON(__alignof__(struct bpf_kthread_opaque) != __alignof__(struct bpf_kthread));
+
+	if (flags)
+		return -EINVAL;
+	if (READ_ONCE(opaque->kthread))
+		return -EBUSY;
+
+	prog = bpf_prog_inc_not_zero(aux->prog);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	new_kthread = bpf_map_kzalloc(map, sizeof(*new_kthread), GFP_KERNEL | __GFP_NOWARN);
+	if (!new_kthread) {
+		bpf_prog_put(prog);
+		return -ENOMEM;
+	}
+
+	new_kthread->map = map;
+	new_kthread->prog = prog;
+	new_kthread->callback_fn = callback_fn;
+	new_kthread->value = (void *)opaque - map->record->kthread_off;
+	spin_lock_init(&new_kthread->lock);
+	INIT_WORK(&new_kthread->stop_work, bpf_kthread_stop_work);
+
+	task = kthread_create(bpf_kthread_run, new_kthread, "bpf_kthread/%u", map->id);
+	if (IS_ERR(task)) {
+		int err = PTR_ERR(task);
+
+		bpf_prog_put(prog);
+		kfree(new_kthread);
+		return err;
+	}
+	get_task_struct(task);
+	new_kthread->task = task;
+
+	if (cmpxchg(&opaque->kthread, NULL, new_kthread)) {
+		kthread_stop_put(task);
+		bpf_prog_put(prog);
+		kfree(new_kthread);
+		return -EBUSY;
+	}
+
+	/*
+	 * Order publication against the final map user-reference release. Either
+	 * release observes the kthread or this side observes a zero user count.
+	 */
+	smp_mb();
+	if (!atomic64_read(&map->usercnt)) {
+		bpf_kthread_cancel_and_free(opaque);
+		return -EPERM;
+	}
+
+	return 0;
+}
+
+__bpf_kfunc int bpf_kthread_start(struct bpf_kthread *kthread, u64 flags)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_kthread_kern *kthread_kern;
+	struct task_struct *task = NULL;
+	unsigned long irq_flags;
+
+	if (flags)
+		return -EINVAL;
+
+	kthread_kern = READ_ONCE(opaque->kthread);
+	if (!kthread_kern)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kthread_kern->lock, irq_flags);
+	if (!kthread_kern->stopping && kthread_kern->task) {
+		task = kthread_kern->task;
+		get_task_struct(task);
+	}
+	spin_unlock_irqrestore(&kthread_kern->lock, irq_flags);
+	if (!task)
+		return -ENOENT;
+
+	wake_up_process(task);
+	put_task_struct(task);
+	return 0;
+}
+
+__bpf_kfunc int bpf_kthread_stop(struct bpf_kthread *kthread, u64 flags)
+{
+	struct bpf_kthread_opaque *opaque = (struct bpf_kthread_opaque *)kthread;
+	struct bpf_kthread_kern *kthread_kern;
+	unsigned long irq_flags;
+
+	if (flags)
+		return -EINVAL;
+
+	kthread_kern = READ_ONCE(opaque->kthread);
+	if (!kthread_kern)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kthread_kern->lock, irq_flags);
+	if (kthread_kern->task == current) {
+		spin_unlock_irqrestore(&kthread_kern->lock, irq_flags);
+		return -EDEADLK;
+	}
+	spin_unlock_irqrestore(&kthread_kern->lock, irq_flags);
+
+	if (cmpxchg(&opaque->kthread, kthread_kern, NULL) != kthread_kern)
+		return -ENOENT;
+
+	bpf_kthread_begin_stop(kthread_kern);
+	return bpf_kthread_stop_one(kthread_kern);
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(bpf_waitq_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_waitq_init)
 BTF_ID_FLAGS(func, bpf_waitq_wait, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_waitq_wake)
+BTF_ID_FLAGS(func, bpf_kthread_create, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_kthread_start)
+BTF_ID_FLAGS(func, bpf_kthread_stop, KF_SLEEPABLE)
 BTF_KFUNCS_END(bpf_waitq_kfunc_ids)
 
 static const struct btf_kfunc_id_set bpf_waitq_kfunc_set = {

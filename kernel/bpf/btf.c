@@ -3710,6 +3710,7 @@ static int btf_get_field_type(const struct btf *btf, const struct btf_type *var_
 		{ BPF_TIMER, "bpf_timer", true },
 		{ BPF_WORKQUEUE, "bpf_wq", true },
 		{ BPF_WAITQUEUE, "bpf_waitq", true },
+		{ BPF_KTHREAD, "bpf_kthread", true },
 		{ BPF_TASK_WORK, "bpf_task_work", true },
 		{ BPF_RCU_HEAD, "bpf_rcu_head", true },
 		{ BPF_LIST_HEAD, "bpf_list_head", false },
@@ -3894,6 +3895,7 @@ static int btf_find_field_one(const struct btf *btf,
 	case BPF_TIMER:
 	case BPF_WORKQUEUE:
 	case BPF_WAITQUEUE:
+	case BPF_KTHREAD:
 	case BPF_LIST_NODE:
 	case BPF_RB_NODE:
 	case BPF_REFCOUNT:
@@ -4193,6 +4195,7 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
 	rec->timer_off = -EINVAL;
 	rec->wq_off = -EINVAL;
 	rec->waitq_off = -EINVAL;
+	rec->kthread_off = -EINVAL;
 	rec->refcount_off = -EINVAL;
 	rec->task_work_off = -EINVAL;
 	rec->rcu_head_off = -EINVAL;
@@ -4238,6 +4241,10 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
 		case BPF_WAITQUEUE:
 			WARN_ON_ONCE(rec->waitq_off >= 0);
 			rec->waitq_off = rec->fields[i].offset;
+			break;
+		case BPF_KTHREAD:
+			WARN_ON_ONCE(rec->kthread_off >= 0);
+			rec->kthread_off = rec->fields[i].offset;
 			break;
 		case BPF_TASK_WORK:
 			WARN_ON_ONCE(rec->task_work_off >= 0);

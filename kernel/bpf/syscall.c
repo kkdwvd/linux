@@ -694,6 +694,7 @@ void btf_record_free(struct btf_record *rec)
 		case BPF_REFCOUNT:
 		case BPF_WORKQUEUE:
 		case BPF_WAITQUEUE:
+		case BPF_KTHREAD:
 		case BPF_TASK_WORK:
 		case BPF_RCU_HEAD:
 			/* Nothing to release */
@@ -750,6 +751,7 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
 		case BPF_REFCOUNT:
 		case BPF_WORKQUEUE:
 		case BPF_WAITQUEUE:
+		case BPF_KTHREAD:
 		case BPF_TASK_WORK:
 		case BPF_RCU_HEAD:
 			/* Nothing to acquire */
@@ -817,6 +819,13 @@ void bpf_obj_free_waitqueue(const struct btf_record *rec, void *obj)
 	bpf_waitq_cancel_and_free(obj + rec->waitq_off);
 }
 
+void bpf_obj_free_kthread(const struct btf_record *rec, void *obj)
+{
+	if (WARN_ON_ONCE(!btf_record_has_field(rec, BPF_KTHREAD)))
+		return;
+	bpf_kthread_cancel_and_free(obj + rec->kthread_off);
+}
+
 void bpf_obj_free_task_work(const struct btf_record *rec, void *obj)
 {
 	if (WARN_ON_ONCE(!btf_record_has_field(rec, BPF_TASK_WORK)))
@@ -855,6 +864,9 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 			break;
 		case BPF_WAITQUEUE:
 			bpf_waitq_cancel_and_free(field_ptr);
+			break;
+		case BPF_KTHREAD:
+			bpf_kthread_cancel_and_free(field_ptr);
 			break;
 		case BPF_TASK_WORK:
 			bpf_task_work_cancel_and_free(field_ptr);
@@ -1302,7 +1314,8 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 	map->record = btf_parse_fields(btf, value_type,
 				       BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD |
 				       BPF_RB_ROOT | BPF_REFCOUNT | BPF_WORKQUEUE | BPF_UPTR |
-				       BPF_TASK_WORK | BPF_RCU_HEAD | BPF_WAITQUEUE,
+				       BPF_TASK_WORK | BPF_RCU_HEAD | BPF_WAITQUEUE |
+				       BPF_KTHREAD,
 				       map->value_size);
 	if (!IS_ERR_OR_NULL(map->record)) {
 		int i;
@@ -1337,6 +1350,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 			case BPF_WORKQUEUE:
 			case BPF_TASK_WORK:
 			case BPF_WAITQUEUE:
+			case BPF_KTHREAD:
 				if (map->map_type != BPF_MAP_TYPE_HASH &&
 				    map->map_type != BPF_MAP_TYPE_RHASH &&
 				    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
