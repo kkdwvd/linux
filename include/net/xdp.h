@@ -84,6 +84,7 @@ enum xdp_buff_flags {
 	/* Kept by TCP on frames a BPF program owns, see bpf_xdp_tcp_hold(). */
 	XDP_FLAGS_BPF_TCP_HELD		= BIT(3), /* admitted to a connection */
 	XDP_FLAGS_BPF_TCP_OOO		= BIT(4), /* admitted beyond the receive cursor */
+	XDP_FLAGS_BPF_RDONLY		= BIT(5), /* read-only to the program from now on */
 };
 
 struct xdp_buff {

@@ -11177,6 +11177,25 @@ static int idstack_pop(struct bpf_idmap *idmap)
 }
 
 /* Release id and objects derived from it iteratively in a DFS manner */
+/* End what was derived from a reference, dynptrs and slices, keeping the reference. */
+static int invalidate_ref_children(struct bpf_verifier_env *env, u32 id)
+{
+	u32 mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR);
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *state;
+	struct bpf_reg_state *reg;
+	int err;
+
+	bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, stack, mask, ({
+		if (reg->parent_id == id && reg->id) {
+			err = release_reference(env, reg->id);
+			if (err)
+				return err;
+		}
+	}));
+	return 0;
+}
+
 static int release_reference(struct bpf_verifier_env *env, int id)
 {
 	u32 mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR);
@@ -13874,6 +13893,8 @@ enum special_kfunc_type {
 	KF_bpf_xdp_pull_data,
 	KF_bpf_xdp_frame_steal,
 	KF_bpf_dynptr_from_xdp_frame,
+	KF_bpf_xdp_tcp_hold,
+	KF_bpf_xdp_tcp_consume_frame,
 	KF_bpf_dynptr_slice,
 	KF_bpf_dynptr_slice_rdwr,
 	KF_bpf_dynptr_clone,
@@ -13954,6 +13975,13 @@ BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
+BTF_ID_UNUSED
+BTF_ID_UNUSED
+#endif
+#ifdef CONFIG_INET
+BTF_ID(func, bpf_xdp_tcp_hold)
+BTF_ID(func, bpf_xdp_tcp_consume_frame)
+#else
 BTF_ID_UNUSED
 BTF_ID_UNUSED
 #endif
@@ -15983,6 +16011,27 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	    !reg_is_referenced(env, &regs[BPF_REG_1])) {
 		verbose(env, "%s needs a frame the program owns\n", func_name);
 		return -EINVAL;
+	}
+
+	/*
+	 * TCP trusts the headers of a frame it admitted: the frame has to be
+	 * the program's alone, and the views the program had of it, through
+	 * which it could still write, end with the admission. New views only
+	 * read, see bpf_xdp_tcp_hold().
+	 */
+	if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_xdp_tcp_hold]) ||
+	    is_kfunc_call(&meta, special_kfunc_list[KF_bpf_xdp_tcp_consume_frame])) {
+		struct bpf_reg_state *frame = &regs[BPF_REG_2];
+
+		if (!reg_is_referenced(env, frame)) {
+			verbose(env, "%s needs a frame the program owns\n", func_name);
+			return -EINVAL;
+		}
+		if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_xdp_tcp_hold])) {
+			err = invalidate_ref_children(env, frame->id);
+			if (err)
+				return err;
+		}
 	}
 
 	/* The program may now own frames; bpf_prog_run_xdp() has to look, see XDP_CONSUME. */
