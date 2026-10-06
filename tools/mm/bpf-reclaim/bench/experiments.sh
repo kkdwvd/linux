@@ -20,8 +20,9 @@
 # Sized for a guest of 64 vCPUs and 256 GB with 192 GB of zram: sets of
 # tens of gigabytes, allocators at gigabytes a second, 32 applications. MEM
 # scales every size and rate in proportion to a different guest's gigabytes
-# (MEM=32 for a 32 GB guest). Results land under the out-dir, one directory
-# per run.
+# (MEM=32 for a 32 GB guest). RUNS, a regular expression, limits the group
+# to the runs whose names match. Results land under the out-dir, one
+# directory per run.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -38,6 +39,7 @@ mb() { python3 -c "print(int($1 * $MEM / 256))"; }
 run() {
 	local name=$1; shift
 	local dir=$OUT/$name
+	[ -n "${RUNS:-}" ] && [[ ! $name =~ $RUNS ]] && return
 	rm -rf "$dir"; mkdir -p "$dir"
 	echo "=== $name: $*"
 	python3 "$HERE/run.py" --bin "$BIN" --out "$dir" --swap-mb "$SWAP_MB" --data "$DATA" \
