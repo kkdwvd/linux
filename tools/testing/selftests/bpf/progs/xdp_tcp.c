@@ -2,7 +2,10 @@
 /*
  * A request/response service on established TCP connections, served from
  * XDP: every data segment received in order is answered with a copy of its
- * payload, or with reply_len bytes the test placed in the arena.
+ * payload, or with reply_len bytes the test placed in the arena. In hold mode
+ * the segments that arrive out of order, or while the socket is owned, are
+ * kept in per-connection state keyed by the socket cookie and delivered once
+ * their turn comes, from XDP or from a timer.
  */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
@@ -10,6 +13,8 @@
 #include "bpf_experimental.h"
 #include "bpf_arena_common.h"
 #include "bpf_xdp_tcp.h"
+#include "../test_kmods/bpf_testmod.h"
+#include "../test_kmods/bpf_testmod_kfunc.h"
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARENA);
@@ -24,7 +29,21 @@ struct {
 
 #define REPLY_MAX	32768
 
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC	1
+#endif
+
 char __arena_global reply[REPLY_MAX];
+
+/* The test owns the socket from a syscall program while segments arrive. */
+int hold_fd;
+struct sock_hold_test hold_state;
+
+SEC("syscall")
+int xdp_tcp_hold_sock(void *ctx)
+{
+	return bpf_kfunc_hold_sock(hold_fd, &hold_state);
+}
 
 /* Knobs set by the test. */
 int decline;		/* inspect every segment and leave it to the stack */
@@ -118,6 +137,268 @@ static __always_inline int inspect(struct xdp_md *ctx)
 	return XDP_PASS;
 }
 
+/*
+ * Hold mode: the stream is copied into the arena as it is received, in
+ * order, and echoed if asked. Out-of-order and busy segments are held.
+ */
+int hold_mode, stream_echo, stream_prune;
+__u32 stream_bytes, stream_fin, stream_pruned;
+__u64 stream_callbacks, stream_errors;
+int stream_last_error;
+char __arena_global stream_data[4096];
+
+struct conn_state {
+	struct bpf_xdp_tcp_conn conn;
+	struct bpf_timer timer;
+	__u32 started;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 64);
+	__type(key, __u64);
+	__type(value, struct conn_state);
+} conns SEC(".maps");
+
+static __noinline void deliver(struct bpf_xdp_tcp_sock *sock, struct bpf_dynptr *payload, __u32 len)
+{
+	__u32 offset = stream_bytes;
+	int j;
+
+	if (len > 1600 || offset > sizeof(stream_data) - 1600) {
+		stream_errors++;
+		stream_last_error = -E2BIG;
+		return;
+	}
+	bpf_for(j, 0, len) {
+		char byte, *p;
+
+		if (j >= 1600)
+			break;
+		p = bpf_dynptr_slice(payload, j, &byte, sizeof(byte));
+		if (!p)
+			break;
+		stream_data[offset + j] = *p;
+		reply[j] = *p;
+	}
+	stream_bytes += len;
+	consumed++;
+	if (stream_echo) {
+		int err = bpf_xdp_tcp_sock_send(sock, reply, len);
+
+		if (err < 0) {
+			send_errs++;
+			last_send_err = err;
+		} else {
+			sent++;
+			sent_bytes += err;
+		}
+	}
+}
+
+/* Held segments whose turn has come, or everything held when the test asks for a prune. */
+static __noinline void drain(struct bpf_xdp_tcp_sock *sock, struct conn_state *st)
+{
+	int i;
+
+	if (stream_prune) {
+		if (!bpf_xdp_tcp_sock_purge(sock, &st->conn)) {
+			stream_prune = 0;
+			stream_pruned++;
+		}
+		return;
+	}
+	bpf_for(i, 0, BPF_XDP_TCP_HOLD_MAX) {
+		struct bpf_dynptr payload;
+		int len;
+
+		len = bpf_xdp_tcp_sock_next(sock, &st->conn, &payload);
+		if (len < 0) {
+			stream_errors++;
+			stream_last_error = len;
+			break;
+		}
+		if (len > 0)
+			deliver(sock, &payload, len);
+		if (bpf_xdp_tcp_sock_eof(sock))
+			stream_fin = 1;
+		if (!len)
+			break;
+	}
+}
+
+/*
+ * Retries and reaping: every millisecond while frames are held, in case the
+ * socket was busy, and every second otherwise, to notice a closed connection.
+ */
+static int conn_timer(void *map, __u64 *key, struct conn_state *st)
+{
+	struct bpf_xdp_tcp_sock sock = {};
+
+	stream_callbacks++;
+	if (!bpf_xdp_tcp_sock_resume(&st->conn, &sock))
+		return 0;
+	if (bpf_xdp_tcp_sock_closed(&sock)) {
+		bpf_xdp_tcp_sock_release(&sock);
+		bpf_xdp_tcp_conn_destroy(&st->conn);
+		bpf_map_delete_elem(&conns, key);
+		return 0;
+	}
+	drain(&sock, st);
+	bpf_xdp_tcp_sock_release(&sock);
+	bpf_timer_start(&st->timer, st->conn.nr_held ? 1000000 : 1000000000ULL, 0);
+	return 0;
+}
+
+static __always_inline struct conn_state *conn_state(struct bpf_xdp_tcp_sock *sock)
+{
+	__u64 key = bpf_xdp_tcp_sock_cookie(sock);
+	struct conn_state *st;
+
+	st = bpf_map_lookup_elem(&conns, &key);
+	if (!st) {
+		struct conn_state zero = {};
+
+		bpf_map_update_elem(&conns, &key, &zero, BPF_NOEXIST);
+		st = bpf_map_lookup_elem(&conns, &key);
+		if (!st)
+			return NULL;
+	}
+	if (!st->started && !bpf_timer_init(&st->timer, &conns, CLOCK_MONOTONIC) &&
+	    !bpf_timer_set_callback(&st->timer, conn_timer)) {
+		st->started = 1;
+		bpf_timer_start(&st->timer, 1000000000ULL, 0);
+	}
+	return st;
+}
+
+static __always_inline int hold_input(struct xdp_md *ctx)
+{
+	struct bpf_xdp_tcp_sock sock = {};
+	struct bpf_dynptr payload;
+	struct conn_state *st;
+	int action = XDP_PASS;
+
+	if (!bpf_xdp_tcp_sock_recv(ctx, &sock, &payload))
+		return XDP_PASS;
+	st = conn_state(&sock);
+	if (!st) {
+		stream_errors++;
+		goto out;
+	}
+	switch (bpf_xdp_tcp_sock_status(&sock)) {
+	case BPF_XDP_TCP_RECEIVED:
+		if (bpf_xdp_tcp_sock_len(&sock))
+			deliver(&sock, &payload, bpf_xdp_tcp_sock_len(&sock));
+		if (bpf_xdp_tcp_sock_eof(&sock))
+			stream_fin = 1;
+		if (st->conn.nr_held || stream_prune)
+			drain(&sock, st);
+		action = XDP_DROP;
+		break;
+	case BPF_XDP_TCP_OUT_OF_ORDER:
+	case BPF_XDP_TCP_BUSY:
+		action = bpf_xdp_tcp_sock_hold(ctx, &sock, &st->conn);
+		if (action == XDP_CONSUME)
+			bpf_timer_start(&st->timer, 1000000, 0);
+		break;
+	case BPF_XDP_TCP_DUPLICATE:
+		action = XDP_DROP;
+		break;
+	default:
+		break;
+	}
+out:
+	bpf_xdp_tcp_sock_release(&sock);
+	return action;
+}
+
+/* Deliberately bypass the header to exercise what the kernel enforces. */
+int raw_mode;
+int raw_no_admission, raw_udp_consume, raw_udp_hold, raw_udp_send;
+int raw_udp_reset, raw_udp_dup, raw_udp_acquire, raw_hold, raw_hold_again;
+int raw_write, raw_writable_slice, raw_dynptr_data, raw_consume, raw_consume_again;
+int raw_rehold, raw_readonly, raw_payload_len;
+int raw_listener_acquire, raw_listener_release;
+
+static __always_inline int raw_input(struct xdp_md *ctx)
+{
+	struct bpf_xdp_tcp_info info = {};
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *udp, *lsk;
+	struct bpf_dynptr ptr;
+	struct xdp_frame *frame;
+	struct sock *sk, *ref;
+	char byte = 0;
+
+	/* The split lookup leaves the segment untouched for the frame operations below. */
+	sk = bpf_xdp_tcp_lookup(ctx, &info);
+	if (!sk)
+		return XDP_PASS;
+	tuple.ipv4.saddr = bpf_htonl(0xc0a84d02);
+	tuple.ipv4.daddr = bpf_htonl(0xc0a84d01);
+	tuple.ipv4.sport = bpf_htons(40000);
+	tuple.ipv4.dport = bpf_htons(7777);
+	udp = bpf_sk_lookup_udp(ctx, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (udp) {
+		raw_udp_consume = bpf_xdp_tcp_consume((void *)udp, ctx, &info);
+		raw_udp_send = bpf_xdp_tcp_send((void *)udp, reply, 1);
+		raw_udp_reset = bpf_xdp_tcp_ooo_reset((void *)udp);
+		raw_udp_dup = bpf_xdp_tcp_dup((void *)udp, 1, 2);
+		bpf_xdp_tcp_ack_pending((void *)udp);
+		ref = bpf_xdp_tcp_acquire((void *)udp);
+		raw_udp_acquire = ref != NULL;
+		if (ref)
+			bpf_xdp_tcp_release(ref);
+	}
+	/*
+	 * A tuple with no established socket finds the listener, which the
+	 * lookup returns without a reference: it is not a connection to acquire,
+	 * and a release of it must not put what was never taken.
+	 */
+	tuple.ipv4.sport = bpf_htons(40001);
+	lsk = bpf_sk_lookup_tcp(ctx, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (lsk) {
+		ref = bpf_xdp_tcp_acquire((void *)lsk);
+		raw_listener_acquire = ref != NULL;
+		if (ref)
+			bpf_xdp_tcp_release(ref);
+		bpf_xdp_tcp_release((void *)lsk);
+		raw_listener_release++;
+	}
+	frame = bpf_xdp_frame_steal(ctx);
+	if (!frame) {
+		if (udp)
+			bpf_sk_release(udp);
+		bpf_xdp_tcp_release(sk);
+		return XDP_PASS;
+	}
+	if (udp) {
+		raw_udp_hold = bpf_xdp_tcp_hold((void *)udp, frame);
+		bpf_sk_release(udp);
+	}
+	raw_no_admission = bpf_xdp_tcp_consume_frame(sk, frame, &info);
+	raw_hold = bpf_xdp_tcp_hold(sk, frame);
+	if (raw_hold)
+		goto out;
+	raw_hold_again = bpf_xdp_tcp_hold(sk, frame);
+	bpf_dynptr_from_xdp_frame(frame, 0, &ptr);
+	raw_readonly = bpf_dynptr_is_rdonly(&ptr);
+	raw_write = bpf_dynptr_write(&ptr, 0, &byte, sizeof(byte), 0);
+	raw_writable_slice = bpf_dynptr_slice_rdwr(&ptr, 0, &byte, sizeof(byte)) != NULL;
+	raw_dynptr_data = bpf_dynptr_data(&ptr, 0, sizeof(byte)) != NULL;
+	raw_consume = bpf_xdp_tcp_consume_frame(sk, frame, &info);
+	raw_payload_len = info.payload_len;
+	raw_consume_again = bpf_xdp_tcp_consume_frame(sk, frame, &info);
+	raw_rehold = bpf_xdp_tcp_hold(sk, frame);
+	bpf_xdp_tcp_ack_pending(sk);
+out:
+	bpf_xdp_frame_release(frame);
+	bpf_xdp_tcp_release(sk);
+	return XDP_CONSUME;
+}
+
 SEC("xdp")
 int xdp_tcp_echo(struct xdp_md *ctx)
 {
@@ -125,8 +406,12 @@ int xdp_tcp_echo(struct xdp_md *ctx)
 	struct bpf_dynptr payload;
 	int action = XDP_PASS;
 
+	if (raw_mode)
+		return raw_input(ctx);
 	if (serve_port && !to_port(ctx, serve_port))
 		return XDP_PASS;
+	if (hold_mode)
+		return hold_input(ctx);
 	if (decline)
 		return inspect(ctx);
 	if (!bpf_xdp_tcp_sock_recv(ctx, &sock, &payload))
