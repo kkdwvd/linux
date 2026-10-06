@@ -121,14 +121,21 @@ $(BINDIR)/bpf_reclaim: bpf_reclaim.c reclaim.h $(INCLUDE_DIR)/reclaim.bpf.skel.h
 
 bpf_reclaim: $(BINDIR)/bpf_reclaim
 
-all_targets: bpf_reclaim
+# The benchmark's workload generator, plain C, no BPF.
+$(BINDIR)/workload: bench/workload.c | $(BINDIR)
+	$(call msg,CC,,$(notdir $@))
+	$(Q)$(CC) -g -O2 -Wall -Werror -pthread -o $@ $<
+
+workload: $(BINDIR)/workload
+
+all_targets: bpf_reclaim workload
 
 clean:
 	rm -rf $(OUTPUT_DIR)
 
 help:
 	@echo 'Targets:'
-	@echo '  all (default)  Build the reclaimer into build/bin/bpf_reclaim'
+	@echo '  all (default)  Build the reclaimer and the workload generator into build/bin/'
 	@echo '  clean          Remove build/'
 	@echo ''
 	@echo 'Variables:'
@@ -136,7 +143,7 @@ help:
 	@echo '  VMLINUX_BTF=   The vmlinux to generate vmlinux.h from'
 	@echo '  VMLINUX_H=     Use an existing vmlinux.h instead'
 
-.PHONY: all all_targets bpf_reclaim clean help
+.PHONY: all all_targets bpf_reclaim workload clean help
 
 # Delete failed targets, keep intermediates.
 .DELETE_ON_ERROR:
