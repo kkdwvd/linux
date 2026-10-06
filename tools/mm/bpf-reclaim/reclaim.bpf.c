@@ -67,6 +67,13 @@
  * task that allocates faster than memory can be found for it. The limit is
  * lifted once the buffer is back, and on teardown.
  *
+ * The threads live in the root cgroup unless cfg.pool_cgroup_id names
+ * another, in which case cpu.max and cpu.weight there bound what the whole
+ * pool may cost, and each worker may be bound to a CPU, to keep reclaim off
+ * the CPUs a latency-sensitive workload runs on or to place it on the node
+ * whose memory it frees. Nothing charges the pool's time to the children
+ * it reclaims for; that is the subject of the remote charging RFC.
+ *
  * Children are equal unless the loader says otherwise: a per-child map of
  * overrides, keyed by cgroup ID, carries a floor, a weight that multiplies
  * into the split, a pressure target, a CPU budget, an efficiency floor and
@@ -853,11 +860,16 @@ int reclaim_setup(void *ctx)
 		if (!t)
 			return -E2BIG;
 		t->index = i;
-		ret = bpf_kthread_create(&t->kthread, &threads, 0, worker_cb);
+		ret = bpf_kthread_create(&t->kthread, &threads, cfg.pool_cgroup_id, worker_cb);
 		if (ret)
 			return ret;
+		if (t->cpu >= 0) {
+			ret = bpf_kthread_bind(&t->kthread, t->cpu);
+			if (ret)
+				return ret;
+		}
 	}
-	ret = bpf_kthread_create(&c->kthread, &control, 0, control_cb);
+	ret = bpf_kthread_create(&c->kthread, &control, cfg.pool_cgroup_id, control_cb);
 	if (ret)
 		return ret;
 

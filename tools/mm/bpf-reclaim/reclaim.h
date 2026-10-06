@@ -41,6 +41,7 @@ struct bpf_reclaim_child_cfg {
 /* The policy, filled in by the loader before the setup program runs. */
 struct bpf_reclaim_cfg {
 	__u64 root_cgroup_id;	/* the cgroup whose children are managed */
+	__u64 pool_cgroup_id;	/* the cgroup the pool's threads live in, 0 for the root */
 	__u64 interval_ns;	/* controller tick */
 	__u64 lead_ns;		/* how far ahead a drain is met, before it reaches the buffer */
 	__u64 buffer;		/* bytes of free memory to keep */
@@ -118,7 +119,7 @@ struct bpf_reclaim_cgroup {
 struct bpf_reclaim_thread {
 	struct bpf_kthread kthread;
 	__u32 index;
-	__u32 pad;
+	__s32 cpu;		/* CPU to bind to, or -1 */
 	__u64 rounds;		/* callback iterations */
 	__u64 claims;		/* quota chunks claimed */
 	__u64 reclaimed;	/* bytes reclaimed */
