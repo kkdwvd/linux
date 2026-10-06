@@ -4716,6 +4716,8 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
 		/* The program owns the frame, see XDP_CONSUME; a target it chose before is void. */
 		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		bpf_xdp_frame_put(ri->consumed_frame);
+		ri->consumed_frame = NULL;
 		ri->map_id = 0;
 		ri->map_type = BPF_MAP_TYPE_UNSPEC;
 		return 0;
@@ -4738,6 +4740,8 @@ int xdp_do_redirect_frame(struct net_device *dev, struct xdp_buff *xdp,
 	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
 		/* The program owns the frame, see XDP_CONSUME; a target it chose before is void. */
 		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		bpf_xdp_frame_put(ri->consumed_frame);
+		ri->consumed_frame = NULL;
 		ri->map_id = 0;
 		ri->map_type = BPF_MAP_TYPE_UNSPEC;
 		return 0;

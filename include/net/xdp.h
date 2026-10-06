@@ -305,10 +305,16 @@ struct xdp_frame {
 	 * while mem_type is valid on remote CPU.
 	 */
 	enum xdp_mem_type mem_type:32;
-	struct net_device *dev_rx; /* used by cpumap */
+	union {
+		struct net_device *dev_rx; /* used by cpumap */
+		/* References to a frame a BPF program took, see bpf_xdp_frame_steal(). */
+		refcount_t bpf_refs;
+	};
 	u32 frame_sz;
 	u32 flags; /* supported values defined in xdp_buff_flags */
 };
+
+void bpf_xdp_frame_put(struct xdp_frame *frame);
 
 static __always_inline bool xdp_frame_has_frags(const struct xdp_frame *frame)
 {
