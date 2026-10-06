@@ -335,8 +335,8 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 			continue;
 		printf("cgroup=%s reclaimed=%llu calls=%llu empty=%llu quota_given=%llu probed=%llu "
 		       "busy_ms=%llu refaults=%llu undone=%llu gated_ticks=%llu expensive_ticks=%llu "
-		       "budget_hits=%llu slow_calls=%llu scanned=%llu stolen=%llu coldness=%llu "
-		       "throttles=%llu throttle_ticks=%llu usage=%llu\n",
+		       "budget_hits=%llu slow_calls=%llu scanned=%llu stolen=%llu activated=%llu "
+		       "coldness=%llu throttles=%llu throttle_ticks=%llu usage=%llu\n",
 		       kids[i].name, (unsigned long long)cg.reclaimed,
 		       (unsigned long long)cg.calls, (unsigned long long)cg.empty,
 		       (unsigned long long)cg.quota_given, (unsigned long long)cg.probed,
@@ -345,7 +345,8 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 		       (unsigned long long)cg.gated_ticks, (unsigned long long)cg.expensive_ticks,
 		       (unsigned long long)cg.budget_hits, (unsigned long long)cg.slow_calls,
 		       (unsigned long long)cg.scanned_total,
-		       (unsigned long long)cg.stolen_total, (unsigned long long)cg.coldness,
+		       (unsigned long long)cg.stolen_total, (unsigned long long)cg.activated_total,
+		       (unsigned long long)cg.coldness,
 		       (unsigned long long)cg.throttles, (unsigned long long)cg.throttle_ticks,
 		       (unsigned long long)cg.usage);
 	}

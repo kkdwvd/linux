@@ -331,7 +331,11 @@ def main():
     ap.add_argument('--mode', choices=['none', 'bpf', 'userspace', 'senpai'], default='bpf')
     ap.add_argument('--seconds', type=int, default=60)
     ap.add_argument('--settle', type=int, default=5,
-                    help='seconds the resident workloads get before the reclaimer starts')
+                    help='seconds the resident workloads get before the measurement starts')
+    ap.add_argument('--reclaimer-first', action='store_true',
+                    help='start the reclaimer before the workloads, as a host would run it')
+    ap.add_argument('--mglru', choices=['y', 'n'], default=None,
+                    help='switch the multi-generational LRU on or off before the run')
     ap.add_argument('--swap-mb', type=int, default=4096, help='zram swap size, 0 for none')
     ap.add_argument('--buffer-mb', type=int, default=0,
                     help='free memory to keep; default an eighth of RAM')
@@ -371,6 +375,10 @@ def main():
     thp = '/sys/kernel/mm/transparent_hugepage/enabled'
     if os.path.exists(thp):
         write(thp, 'never')
+    lru_gen = '/sys/kernel/mm/lru_gen/enabled'
+    if args.mglru and os.path.exists(lru_gen):
+        write(lru_gen, args.mglru)
+    mglru = read(lru_gen).strip() if os.path.exists(lru_gen) else 'n/a'
     mem = meminfo()
     if not args.buffer_mb:
         args.buffer_mb = mem['MemTotal'] // MB // 8
@@ -381,6 +389,24 @@ def main():
     log(f'MemTotal={mem["MemTotal"] // MB}M MemFree={mem["MemFree"] // MB}M swap={swap} '
         f'buffer={args.buffer_mb}M mode={args.mode} scenario={args.scenario}')
 
+    reclaimer = None
+    reclaimer_log = None
+    argv = reclaimer_argv(args, parent, pool)
+
+    def start_reclaimer():
+        nonlocal reclaimer, reclaimer_log
+        reclaimer_log = open(os.path.join(args.out, 'reclaimer.log'), 'w')
+        log('starting the reclaimer: ' + ' '.join(argv))
+        reclaimer = subprocess.Popen(argv, stdout=reclaimer_log, stderr=subprocess.STDOUT)
+        if not wait_ready(reclaimer, os.path.join(args.out, 'reclaimer.log')):
+            reclaimer_log.close()
+            print(read(os.path.join(args.out, 'reclaimer.log')))
+            for w in wls:
+                w.stop()
+            raise SystemExit('bench: the reclaimer did not become ready')
+
+    if argv and args.reclaimer_first:
+        start_reclaimer()
     for w in wls:
         if not w.start_after:
             w.start()
@@ -394,19 +420,8 @@ def main():
     with open(os.path.join(args.out, 'vmstat.before'), 'w') as f:
         f.write(read('/proc/vmstat'))
 
-    reclaimer = None
-    reclaimer_log = None
-    argv = reclaimer_argv(args, parent, pool)
-    if argv:
-        reclaimer_log = open(os.path.join(args.out, 'reclaimer.log'), 'w')
-        log('starting the reclaimer: ' + ' '.join(argv))
-        reclaimer = subprocess.Popen(argv, stdout=reclaimer_log, stderr=subprocess.STDOUT)
-        if not wait_ready(reclaimer, os.path.join(args.out, 'reclaimer.log')):
-            reclaimer_log.close()
-            print(read(os.path.join(args.out, 'reclaimer.log')))
-            for w in wls:
-                w.stop()
-            raise SystemExit('bench: the reclaimer did not become ready')
+    if argv and not args.reclaimer_first:
+        start_reclaimer()
 
     free_series = []
     t0 = time.monotonic()
@@ -449,7 +464,7 @@ def main():
 
     lines = []
     lines.append(f'scenario: {args.scenario} {args.seconds}s mode={args.mode} '
-                 f'buffer={args.buffer_mb}M swap={swap} fill={args.fill}%'
+                 f'buffer={args.buffer_mb}M swap={swap} fill={args.fill}% lru_gen={mglru}'
                  + (f' policy="{args.policy_args}"' if args.policy_args else ''))
     if args.scenario != 'overcommit':
         lines.append(f'applications: {args.apps} x {args.app_rate}->{args.app_rate_max} MB/s over '

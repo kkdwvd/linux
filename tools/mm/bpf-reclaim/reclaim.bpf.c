@@ -36,10 +36,22 @@
  * few evictable pages, and costs a hundred times the CPU of a call into a
  * cold child. So each child has a CPU budget per tick, which a worker
  * checks before every call, and a child whose reclaim yields less than
- * cfg.min_efficiency bytes per CPU-second is gated as expensive, the same
- * way as one that refaults. A gated child rests for a number of ticks that
- * doubles with every consecutive gate and halves with every tick it serves
- * well, so a child that keeps proving hot is probed ever more rarely.
+ * cfg.min_efficiency bytes per CPU-second, while its scans keep finding
+ * pages in use, on three judged ticks in a row is gated as expensive, the
+ * same way as one that refaults. Slowness alone is not hotness: a cold page
+ * takes two scans to evict, the first clears its referenced bit and rotates
+ * it, the second reclaims it, so the first pass over a set nobody has
+ * reclaimed from before yields almost nothing for a minute of one CPU per
+ * hundred gigabytes. What tells that pass from a hot set is what the scans
+ * do to the pages: a hot set's pages are found referenced again and
+ * activated, an un-aged cold set's are merely rotated. So a slow tick
+ * counts against a child only when its scans activated at least half of
+ * what they looked at. The probe pays the aging pass ahead of any burst,
+ * which is a reason to leave it on at a small rate. A gated child rests for
+ * a time that
+ * doubles with every consecutive gate, up to a few seconds, and halves with
+ * every tick it serves well, so a child that keeps proving hot is probed
+ * ever more rarely.
  *
  * Worker threads sleep on one wait queue, and the controller wakes as many
  * as the demand needs given the measured reclaim throughput of one busy
@@ -120,7 +132,7 @@ char _license[] SEC("license") = "GPL";
 #define COLD_MAX BPF_RECLAIM_COLD_MAX
 #define REFAULT_MIN (256ULL << 10)	/* refaults below this rate are noise, not thrashing */
 #define BUSY_MIN 1000000	/* less CPU than this in a tick says nothing about efficiency */
-#define REST_MAX 64		/* the longest a child is rested after a gate, in ticks */
+#define REST_MAX_NS 6400000000ULL	/* the longest a child is rested after a gate */
 #define NO_LIMIT (~0UL)		/* memory.high "max" */
 #define PF_KTHREAD 0x00200000	/* task_struct::flags, not in BTF */
 #define CSS_TASK_ITER_PROCS 1	/* css task iterator flag, not in BTF */
@@ -281,7 +293,8 @@ static __always_inline void child_config(__u64 id, struct child_cfg *out)
  */
 static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *memcg,
 					__u64 *stall, __u64 *usage, __u64 *protected,
-					__u64 *refaults, __u64 *scanned, __u64 *stolen)
+					__u64 *refaults, __u64 *scanned, __u64 *stolen,
+					__u64 *activated)
 {
 	unsigned long low, min;
 
@@ -303,6 +316,8 @@ static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *
 		*scanned = bpf_mem_cgroup_page_state(memcg, PGSCAN_PROACTIVE);
 		*stolen = bpf_mem_cgroup_page_state(memcg, PGSTEAL_PROACTIVE);
 	}
+	/* Pages a scan found referenced again and moved to the active list. */
+	*activated = bpf_mem_cgroup_vm_events(memcg, PGACTIVATE);
 }
 
 /*
@@ -342,10 +357,11 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	struct mem_cgroup *memcg;
 	struct cgroup *cgrp;
 	__u64 stall, usage, protected, refaults, refaulted = 0, reclaimed, undone, pressure = 0;
-	__u64 headroom = 0, asked, busy, scanned, stolen;
+	__u64 headroom = 0, asked, busy, scanned, stolen, activated, rest_max;
+	__u64 scan_delta = 0, act_delta = 0;
 	struct child_cfg conf;
 	__s64 growth;
-	bool thrashing, expensive;
+	bool thrashing, expensive, in_use;
 
 	*weight = 0;
 	*reclaimed_out = 0;
@@ -362,7 +378,8 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		bpf_cgroup_release(cgrp);
 		return -ENOENT;
 	}
-	read_cgroup(cgrp, memcg, &stall, &usage, &protected, &refaults, &scanned, &stolen);
+	read_cgroup(cgrp, memcg, &stall, &usage, &protected, &refaults, &scanned, &stolen,
+		    &activated);
 
 	child_config(id, &conf);
 	if (conf.floor > protected)
@@ -386,6 +403,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		cg->refaults = refaults;
 		cg->scanned = scanned;
 		cg->stolen = stolen;
+		cg->activated = activated;
 		cg->quota = 0;
 		return 0;
 	}
@@ -424,19 +442,39 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	 */
 	busy = __sync_lock_test_and_set(&cg->tick_busy_ns, 0);
 	cg->busy_ppm = ewma(cg->busy_ppm, busy / dt_ms);
-	if (busy >= BUSY_MIN)
-		cg->efficiency = ewma(cg->efficiency, reclaimed * 1000 / (busy / 1000000));
-	expensive = busy >= BUSY_MIN && cg->efficiency < conf.min_efficiency;
 	if (scanned >= cg->scanned)
-		cg->scanned_total += scanned - cg->scanned;
+		scan_delta = scanned - cg->scanned;
+	if (activated >= cg->activated)
+		act_delta = activated - cg->activated;
+	cg->scanned_total += scan_delta;
+	cg->activated_total += act_delta;
 	if (stolen >= cg->stolen)
 		cg->stolen_total += stolen - cg->stolen;
+	/* Scans that activate what they look at have reached memory in use. */
+	in_use = scan_delta && act_delta * 2 > scan_delta;
+	if (busy >= BUSY_MIN) {
+		__u64 sample = reclaimed * 1000 / (busy / 1000000);
+
+		/*
+		 * The average is for reporting; the gate judges each tick on
+		 * its own, and a slow tick counts only if the scans found the
+		 * memory in use, so that an aging pass is paid, not punished.
+		 */
+		cg->efficiency = cg->efficiency ? ewma(cg->efficiency, sample) : sample;
+		if (sample >= conf.min_efficiency)
+			cg->costly = 0;
+		else if (in_use)
+			cg->costly++;
+	}
+	/* Only a tick that spent CPU on the child is evidence either way. */
+	expensive = busy >= BUSY_MIN && cg->costly >= 3;
 
 	cg->usage = usage;
 	cg->stall_ns = stall;
 	cg->refaults = refaults;
 	cg->scanned = scanned;
 	cg->stolen = stolen;
+	cg->activated = activated;
 
 	/*
 	 * The gate: refaults taking back half of what the pool reclaims, or
@@ -458,9 +496,12 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		if (expensive)
 			cg->expensive_ticks++;
 		cg->coldness = cg->coldness > 2 * COLD_MIN ? cg->coldness / 2 : COLD_MIN;
-		/* Rest it, for twice as long as after the last gate. */
+		/* Rest it, for twice as long as after the last gate, in ticks of this length. */
+		rest_max = REST_MAX_NS / cfg.interval_ns;
+		if (!rest_max)
+			rest_max = 1;
 		cg->rest = cg->backoff;
-		cg->backoff = cg->backoff < REST_MAX ? cg->backoff * 2 : REST_MAX;
+		cg->backoff = cg->backoff < rest_max ? cg->backoff * 2 : rest_max;
 	} else if (cg->rest) {
 		cg->rest--;
 	} else {
@@ -482,12 +523,15 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		if (usage > protected && !cg->exhausted && !conf.excluded)
 			headroom = usage - protected;
 		/*
-		 * A child that has not yet proved itself gets no second call
-		 * while its first is still running, longer than the tick; one
-		 * that has is served on, since a worker on cold memory is
-		 * always mid-call when the tick comes.
+		 * A child that has been gated and has not since proved itself
+		 * gets no second call while one is still running, longer than
+		 * the tick; a hot set is probed one call at a time. A child
+		 * never gated may have several, so that the aging pass over a
+		 * large cold set is shared by the workers rather than made by
+		 * one; and a proven child is served on regardless, since a
+		 * worker on cold memory is always mid-call when the tick comes.
 		 */
-		if (cg->inflight && cg->coldness <= COLD_INIT)
+		if (cg->inflight && cg->coldness <= COLD_INIT && cg->gated_ticks)
 			headroom = 0;
 		if (headroom < cfg.chunk)
 			headroom = 0;

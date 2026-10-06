@@ -92,6 +92,7 @@ struct bpf_reclaim_cgroup {
 	__u64 efficiency;	/* smoothed bytes reclaimed per CPU-second */
 	__u64 scanned;		/* proactive scan count at the last tick */
 	__u64 stolen;		/* proactive steal count at the last tick */
+	__u64 activated;	/* pages activated by reclaim scans at the last tick */
 	__s64 growth;		/* smoothed allocation net of reclaim and refaults, bytes/s */
 	__u32 exhausted;	/* a reclaim call found nothing since the last tick */
 	__u32 gated;		/* refaults, pressure or cost kept it out of the last tick */
@@ -99,6 +100,8 @@ struct bpf_reclaim_cgroup {
 	__u32 backoff;		/* ticks the next gate will rest it for */
 	__u32 inflight;		/* workers in a reclaim call on it right now */
 	__u32 throttled;	/* memory.high engaged */
+	__u32 costly;		/* consecutive judged ticks that found its reclaim expensive */
+	__u32 pad2;
 	/* counters, only added to */
 	__u64 reclaimed;	/* bytes the pool reclaimed */
 	__u64 calls;		/* bpf_proactive_reclaim() calls */
@@ -116,6 +119,7 @@ struct bpf_reclaim_cgroup {
 	__u64 throttle_ticks;	/* ticks spent with memory.high engaged */
 	__u64 scanned_total;	/* pages the kernel scanned for the pool's reclaim */
 	__u64 stolen_total;	/* pages it freed for it */
+	__u64 activated_total;	/* pages its scans found in use and activated */
 };
 
 /* A pool worker: sleeps on the pool's wait queue and claims quota. */
