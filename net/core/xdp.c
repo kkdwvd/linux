@@ -4,6 +4,9 @@
  * Copyright (c) 2017 Jesper Dangaard Brouer, Red Hat Inc.
  */
 #include <linux/bpf.h>
+#include <linux/irq_work.h>
+#include <linux/llist.h>
+#include <linux/workqueue.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/filter.h>
@@ -18,6 +21,7 @@
 
 #include <net/hotdata.h>
 #include <net/netdev_lock.h>
+#include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
 #include <net/xdp_priv.h> /* struct xdp_mem_allocator */
 #include <trace/events/xdp.h>
@@ -1053,3 +1057,169 @@ void xdp_features_clear_redirect_target(struct net_device *dev)
 	netdev_unlock(dev);
 }
 EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
+
+/*
+ * Frames as kptrs.
+ *
+ * A program that wants to keep a frame past its return, to reassemble a TCP
+ * stream for instance, takes it with bpf_xdp_frame_steal() and returns
+ * XDP_CONSUME. The frame is then an object the program owns: it goes into a
+ * kptr field of a map value or of an allocated object, and is given back with
+ * bpf_xdp_frame_release(), or by the destructor registered for the type when
+ * the field that still holds it goes.
+ *
+ * The driver completes the transfer only after the program has returned: TAP,
+ * for one, takes its page reference then. So a frame carries two references
+ * from the steal on, the program's and the one the consumed redirect drops,
+ * and is returned once both are gone, whichever goes last. The count shares
+ * its storage with dev_rx, which a frame the program owns never uses.
+ */
+/*
+ * A frame given back from a kptr destructor may be given back where the map
+ * element went: in hard interrupt or NMI context, from a tracing program, which
+ * the page pool cannot be entered from. Such frames wait on a list, with the
+ * node over the buffer's headroom, which is nobody's any more, and are
+ * returned from a work item.
+ */
+static LLIST_HEAD(bpf_xdp_frame_free_list);
+
+static void bpf_xdp_frame_free_work_fn(struct work_struct *work)
+{
+	struct llist_node *node, *next;
+
+	llist_for_each_safe(node, next, llist_del_all(&bpf_xdp_frame_free_list))
+		xdp_return_frame((struct xdp_frame *)node - 1);
+}
+
+static DECLARE_WORK(bpf_xdp_frame_free_work, bpf_xdp_frame_free_work_fn);
+
+static void bpf_xdp_frame_free_irq_work_fn(struct irq_work *work)
+{
+	schedule_work(&bpf_xdp_frame_free_work);
+}
+
+static struct irq_work bpf_xdp_frame_free_irq_work = IRQ_WORK_INIT(bpf_xdp_frame_free_irq_work_fn);
+
+void bpf_xdp_frame_put(struct xdp_frame *frame)
+{
+	if (!frame || !refcount_dec_and_test(&frame->bpf_refs))
+		return;
+	if (likely(!in_hardirq() && !in_nmi())) {
+		xdp_return_frame(frame);
+		return;
+	}
+	llist_add((struct llist_node *)(frame + 1), &bpf_xdp_frame_free_list);
+	irq_work_queue(&bpf_xdp_frame_free_irq_work);
+}
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_xdp_frame_steal - take the frame behind an XDP context
+ * @ctx: the context
+ *
+ * Makes the program the owner of the frame, as a redirect target would be:
+ * the buffer is converted into a frame in place and the transfer recorded, so
+ * that the program's XDP_CONSUME return has the driver hand the buffer over
+ * instead of recycling it. The context is consumed by the call.
+ *
+ * Returns the frame, or NULL for a buffer that cannot be taken: one the stack
+ * built around an skb for generic XDP, a test run without live frames, a
+ * devmap or cpumap program's, or a device that does not redirect, outside a
+ * live test run.
+ */
+__bpf_kfunc struct xdp_frame *bpf_xdp_frame_steal(struct xdp_md *ctx)
+{
+	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
+	struct xdp_buff *xdp = (struct xdp_buff *)ctx;
+	struct xdp_rxq_info *rxq = xdp->rxq;
+	struct xdp_frame *xdpf;
+
+	/*
+	 * A frame is taken at most once: the verifier consumes the context with
+	 * it, and the redirect that follows clears the mark. A mark still set
+	 * here is a driver that did not redirect as it was told.
+	 */
+	if (WARN_ONCE(ri->kern_flags & BPF_RI_F_XDP_CONSUMED, "XDP frame already taken"))
+		return NULL;
+	/*
+	 * The buffer has to be a driver's, with the memory model its rxq is
+	 * registered with, and the driver has to complete a redirect, which is
+	 * how the buffer changes hands: generic XDP and test runs without live
+	 * frames use the device's own rxq around memory that is not a driver's,
+	 * devmap and cpumap programs run with an rxq that is not registered, and
+	 * a driver that cannot redirect would recycle the buffer on return. A
+	 * live test run completes the redirect itself, whatever the device
+	 * under it, loopback by default, advertises.
+	 */
+	if (!rxq || !rxq->dev || !xdp_rxq_info_is_reg(rxq) ||
+	    (!(rxq->dev->xdp_features & NETDEV_XDP_ACT_REDIRECT) &&
+	     !(ri->kern_flags & BPF_RI_F_XDP_LIVE_RUN)) ||
+	    (rxq->queue_index < rxq->dev->num_rx_queues &&
+	     rxq == &__netif_get_rx_queue(rxq->dev, rxq->queue_index)->xdp_rxq))
+		return NULL;
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (!xdpf)
+		return NULL;
+	refcount_set(&xdpf->bpf_refs, 2);
+	ri->consumed_frame = xdpf;
+	ri->kern_flags |= BPF_RI_F_XDP_CONSUMED;
+	return xdpf;
+}
+
+/**
+ * bpf_xdp_frame_release - give a frame taken with bpf_xdp_frame_steal() back
+ * @frame: the frame
+ */
+__bpf_kfunc void bpf_xdp_frame_release(struct xdp_frame *frame)
+{
+	bpf_xdp_frame_put(frame);
+}
+
+/* The destructor of a kptr field holding a frame. */
+__bpf_kfunc void bpf_xdp_frame_dtor(void *frame)
+{
+	bpf_xdp_frame_put(frame);
+}
+CFI_NOSEAL(bpf_xdp_frame_dtor);
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(xdp_frame_steal_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xdp_frame_steal, KF_ACQUIRE | KF_RET_NULL | KF_RELEASE_CTX)
+BTF_KFUNCS_END(xdp_frame_steal_kfunc_ids)
+
+static const struct btf_kfunc_id_set xdp_frame_steal_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &xdp_frame_steal_kfunc_ids,
+};
+
+BTF_KFUNCS_START(xdp_frame_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xdp_frame_release, KF_RELEASE)
+BTF_KFUNCS_END(xdp_frame_kfunc_ids)
+
+static const struct btf_kfunc_id_set xdp_frame_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &xdp_frame_kfunc_ids,
+};
+
+BTF_ID_LIST_SINGLE(xdp_frame_btf_ids, struct, xdp_frame)
+BTF_ID_LIST_SINGLE(xdp_frame_dtor_ids, func, bpf_xdp_frame_dtor)
+
+static int __init xdp_frame_kfunc_init(void)
+{
+	const struct btf_id_dtor_kfunc dtors[] = {
+		{
+			.btf_id	      = xdp_frame_btf_ids[0],
+			.kfunc_btf_id = xdp_frame_dtor_ids[0],
+		},
+	};
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &xdp_frame_steal_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &xdp_frame_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &xdp_frame_kfunc_set);
+	ret = ret ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
+	return ret;
+}
+late_initcall(xdp_frame_kfunc_init);
