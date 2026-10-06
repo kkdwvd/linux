@@ -228,7 +228,9 @@ class Workload:
 
 
 def scenario_names(args):
-    names = ['hot', 'cache', 'cold']
+    # The residents with a size, then the scenario's own workloads.
+    names = [n for n, mb in (('hot', args.hot_mb), ('cache', args.cache_mb),
+                             ('cold', args.cold_mb)) if mb]
     if args.scenario == 'overcommit':
         return names + (['grow'] if args.grow_after >= 0 else [])
     return names + [f'app{i}' for i in range(args.apps)]
@@ -237,14 +239,17 @@ def scenario_names(args):
 def scenario(args, paths, out):
     workload = os.path.join(args.bin, 'workload')
     fill = ['--fill', str(args.fill)]
-    wls = [
-        Workload('hot', [workload, 'anon', '--size', str(args.hot_mb), '--threads', '2'] + fill,
-                 paths['hot'], out),
-        Workload('cache', [workload, 'file', '--path', args.data, '--size', str(args.cache_mb),
-                           '--pass-ms', str(args.cache_pass_ms)], paths['cache'], out),
-        Workload('cold', [workload, 'anon', '--size', str(args.cold_mb), '--once'] + fill,
-                 paths['cold'], out),
-    ]
+    wls = []
+    if args.hot_mb:
+        wls.append(Workload('hot', [workload, 'anon', '--size', str(args.hot_mb), '--threads',
+                                    str(args.hot_threads)] + fill, paths['hot'], out))
+    if args.cache_mb:
+        wls.append(Workload('cache', [workload, 'file', '--path', args.data, '--size',
+                                      str(args.cache_mb), '--pass-ms', str(args.cache_pass_ms)],
+                            paths['cache'], out))
+    if args.cold_mb:
+        wls.append(Workload('cold', [workload, 'anon', '--size', str(args.cold_mb), '--once'] + fill,
+                            paths['cold'], out))
     if args.scenario == 'overcommit':
         if args.grow_after >= 0:
             wls.append(Workload('grow', [workload, 'grow', '--rate', str(args.grow_rate),
@@ -336,7 +341,8 @@ def main():
     ap.add_argument('--senpai-interval', type=float, default=6)
     ap.add_argument('--senpai-probe', type=float, default=1)
     # The scenario.
-    ap.add_argument('--hot-mb', type=int, default=600)
+    ap.add_argument('--hot-mb', type=int, default=600, help='0 leaves a resident out')
+    ap.add_argument('--hot-threads', type=int, default=2)
     ap.add_argument('--cache-mb', type=int, default=400)
     ap.add_argument('--cache-pass-ms', type=int, default=2000)
     ap.add_argument('--cold-mb', type=int, default=700)
