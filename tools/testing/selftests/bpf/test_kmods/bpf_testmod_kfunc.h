@@ -171,6 +171,10 @@ struct prog_test_fail3 {
 	char arr2[];
 };
 
+struct sock_hold_test;
+
+int bpf_kfunc_hold_sock(int fd, struct sock_hold_test *state) __ksym;
+
 struct init_sock_args {
 	int af;
 	int type;
