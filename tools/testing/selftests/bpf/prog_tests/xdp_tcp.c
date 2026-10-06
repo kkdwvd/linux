@@ -14,13 +14,17 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/netfilter.h>
+#include <linux/sock_diag.h>
 #include <net/if.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <time.h>
 
 #include <test_progs.h>
 #include <network_helpers.h>
+#include "../test_kmods/bpf_testmod.h"
 #include "xdp_tcp.skel.h"
 #include "xdp_tcp_hooks.skel.h"
 
@@ -51,6 +55,7 @@
 #define TH_RST		0x04
 #define TH_PSH		0x08
 #define TH_ACK		0x10
+#define TH_ECE		0x40
 
 /* TCP option kinds and lengths. */
 #define OPT_KIND_EOL		0
@@ -126,12 +131,15 @@ static void set_flags(struct tcphdr *th, __u16 flags)
 	th->rst = !!(flags & TH_RST);
 	th->psh = !!(flags & TH_PSH);
 	th->ack = !!(flags & TH_ACK);
+	/* ECE has no name in the C library's struct tcphdr: the flag byte, bit 6. */
+	((__u8 *)th)[13] = (((__u8 *)th)[13] & ~0x40) | (flags & TH_ECE ? 0x40 : 0);
 }
 
 static __u16 get_flags(const struct tcphdr *th)
 {
 	return (th->fin ? TH_FIN : 0) | (th->syn ? TH_SYN : 0) | (th->rst ? TH_RST : 0) |
-	       (th->psh ? TH_PSH : 0) | (th->ack ? TH_ACK : 0);
+	       (th->psh ? TH_PSH : 0) | (th->ack ? TH_ACK : 0) |
+	       (((const __u8 *)th)[13] & 0x40 ? TH_ECE : 0);
 }
 
 static int parse_mac(const char *s, __u8 *mac)
@@ -472,8 +480,8 @@ static int peer_handshake(struct peer *p, unsigned int opts)
 {
 	struct seg s;
 
-	p->snd_nxt = PEER_ISS;
-	if (!ASSERT_OK(peer_send_raw(p, TH_SYN, PEER_ISS, 0, NULL, 0, opts), "send SYN"))
+	p->snd_nxt = p->snd_nxt ?: PEER_ISS;
+	if (!ASSERT_OK(peer_send_raw(p, TH_SYN, p->snd_nxt, 0, NULL, 0, opts), "send SYN"))
 		return -1;
 	p->snd_nxt++;
 	if (!ASSERT_OK(peer_recv(p, &s, TIMEOUT_MS), "recv SYN-ACK"))
@@ -1256,8 +1264,544 @@ out:
 	teardown(&c);
 }
 
+static int stream_expect_ack(struct peer *p, __u32 ack, __u32 sack_start, __u32 sack_end,
+			     bool dsack)
+{
+	__u64 deadline = now_ms() + TIMEOUT_MS;
+	struct seg s;
+
+	while (now_ms() < deadline) {
+		int i;
+
+		if (peer_recv(p, &s, deadline - now_ms()))
+			break;
+		if (!ASSERT_FALSE(before(ack, s.ack), "ACK does not cross a hole"))
+			return -1;
+		if (s.ack != ack)
+			continue;
+		if (!sack_start && !sack_end)
+			return 0;
+		if (dsack && s.nr_sack < 2)
+			continue;
+		for (i = 0; i < s.nr_sack; i++)
+			if (s.sack[i].start == sack_start && s.sack[i].end == sack_end)
+				return 0;
+	}
+	PRINT_FAIL("missing ACK %u SACK [%u,%u), dsack=%d\n", ack, sack_start, sack_end, dsack);
+	return -1;
+}
+
+static int stream_rmem(struct ctx *c)
+{
+	__u32 info[SK_MEMINFO_VARS] = {};
+	socklen_t len = sizeof(info);
+
+	if (!ASSERT_OK(getsockopt(c->conn, SOL_SOCKET, SO_MEMINFO, info, &len), "SO_MEMINFO"))
+		return -1;
+	return info[SK_MEMINFO_RMEM_ALLOC];
+}
+
+/* Invalid raw operations must fail without affecting the valid connection. */
+static void test_raw_constraints(void)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(PORT),
+	};
+	socklen_t len = sizeof(int);
+	struct ctx c;
+	int udp = -1, on = 0;
+	char app[8];
+
+	if (setup(&c, AF_INET))
+		return;
+	udp = socket(AF_INET, SOCK_DGRAM, 0);
+	if (!ASSERT_GE(udp, 0, "UDP socket"))
+		goto out;
+	inet_pton(AF_INET, KERN_IP4, &addr.sin_addr);
+	if (!ASSERT_OK(bind(udp, (void *)&addr, sizeof(addr)), "UDP bind"))
+		goto out;
+	c.skel->bss->raw_mode = 1;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, "hello", 5), "send raw request") ||
+	    stream_expect_ack(&c.peer, c.peer.snd_nxt, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->raw_no_admission, -EINVAL, "consume requires admission");
+	ASSERT_EQ(c.skel->bss->raw_udp_consume, -EINVAL, "consume rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_udp_hold, -EINVAL, "hold rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_udp_send, -EINVAL, "send rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_udp_reset, -EINVAL, "reset rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_udp_dup, -EINVAL, "duplicate rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_udp_acquire, 0, "acquire rejects UDP");
+	ASSERT_EQ(c.skel->bss->raw_listener_release, 1, "listener looked up");
+	ASSERT_EQ(c.skel->bss->raw_listener_acquire, 0, "acquire rejects a listener");
+	/* The listener is still whole after a release that must not have put it. */
+	ASSERT_OK(getsockopt(c.srv, SOL_SOCKET, SO_ACCEPTCONN, &on, &len), "listener alive");
+	ASSERT_EQ(on, 1, "listener still listening");
+	ASSERT_EQ(c.skel->bss->raw_hold, 0, "valid admission");
+	ASSERT_EQ(c.skel->bss->raw_hold_again, 0, "repeated admission");
+	ASSERT_EQ(c.skel->bss->raw_readonly, 1, "admitted frame immutable");
+	ASSERT_EQ(c.skel->bss->raw_write, -EINVAL, "dynptr write rejected");
+	ASSERT_EQ(c.skel->bss->raw_writable_slice, 0, "writable slice rejected");
+	ASSERT_EQ(c.skel->bss->raw_dynptr_data, 0, "direct writable data rejected");
+	ASSERT_EQ(c.skel->bss->raw_consume, 0, "valid consumption");
+	ASSERT_EQ(c.skel->bss->raw_payload_len, 5, "unmodified payload length");
+	ASSERT_EQ(c.skel->bss->raw_consume_again, -EINVAL, "no double consumption");
+	ASSERT_EQ(c.skel->bss->raw_rehold, -EALREADY, "no readmission of consumed data");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+	ASSERT_EQ(app_recv(&c, app, sizeof(app)), -EAGAIN, "no duplicate application delivery");
+out:
+	if (udp >= 0)
+		close(udp);
+	teardown(&c);
+}
+
+static void test_stream_echo(int family, unsigned int opts)
+{
+	struct ctx c;
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->hold_mode = 1;
+	c.skel->bss->stream_echo = 1;
+	if (connect_peer(&c, opts))
+		goto out;
+	if (request_echoed(&c, "hello") || request_echoed(&c, "world!"))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 11, "stream bytes");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, "helloworld!", 11, "stream data");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "stream errors");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
+static void test_stream_order(int family, const int order[3], bool wrap)
+{
+	const char data[] = "AAAAABBBBBCCCCC";
+	struct tcp_info_ext before, after;
+	unsigned int seen = 0;
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+	char app[16];
+	int i, next = 0;
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (wrap)
+		p->snd_nxt = 0xfffffff7;
+	if (connect_peer(&c, OPT_SACK | OPT_TS) || !ASSERT_OK(conn_info(&c, &before), "tcp_info"))
+		goto out;
+	base = p->snd_nxt;
+	for (i = 0; i < 3; i++) {
+		int idx = order[i];
+
+		if (!ASSERT_OK(peer_send_raw(p, TH_ACK | TH_PSH, base + idx * 5,
+					     p->rcv_nxt, data + idx * 5, 5, 0), "send segment"))
+			goto out;
+		seen |= 1U << idx;
+		while (next < 3 && (seen & (1U << next)))
+			next++;
+		if (stream_expect_ack(p, base + next * 5, 0, 0, false))
+			goto out;
+		ASSERT_EQ(c.skel->bss->stream_bytes, next * 5, "contiguous bytes only");
+		ASSERT_MEMEQ(c.skel->arena->stream_data, data, next * 5, "stream prefix");
+	}
+	/* Each segment counts once, whether taken in order or admitted out of it. */
+	if (ASSERT_OK(conn_info(&c, &after), "tcp_info"))
+		ASSERT_EQ(after.tcpi_data_segs_in - before.tcpi_data_segs_in, 3, "data_segs_in");
+	ASSERT_EQ(app_recv(&c, app, sizeof(app)), -EAGAIN, "application sees no payload");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "stream errors");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
+/*
+ * A segment the stack takes while frames are held: one with ECE set goes to
+ * the stack, which queues it. The SACK block for the held frame must survive
+ * that, in the ACK the stack sends, and the held frame is delivered once the
+ * application has read what the stack queued.
+ */
+static void test_stream_stack_filler(void)
+{
+	const char data[] = "AAAAABBBBB";
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+	char app[16];
+
+	if (setup(&c, AF_INET))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	base = p->snd_nxt;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK | TH_PSH, base + 5, p->rcv_nxt, data + 5, 5, 0),
+		       "send second segment") ||
+	    stream_expect_ack(p, base, base + 5, base + 10, false))
+		goto out;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK | TH_PSH | TH_ECE, base, p->rcv_nxt, data, 5, 0),
+		       "send first segment with ECE") ||
+	    stream_expect_ack(p, base + 5, base + 5, base + 10, false))
+		goto out;
+	p->snd_nxt = base + 10;
+	ASSERT_EQ(app_recv(&c, app, sizeof(app)), 5, "stack queued the first segment");
+	ASSERT_MEMEQ(app, data, 5, "first segment data");
+	/* The held frame is next once the application has read: the timer delivers it. */
+	if (stream_expect_ack(p, base + 10, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 5, "held segment delivered");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, data + 5, 5, "held segment data");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "stream errors");
+out:
+	teardown(&c);
+}
+
+static void test_stream_duplicates(int family)
+{
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	base = p->snd_nxt;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt, "BBBBB", 5, 0), "send B") ||
+	    stream_expect_ack(p, base, base + 5, base + 10, false))
+		goto out;
+	ASSERT_EQ(stream_rmem(&c), 0, "held frame not charged to the socket");
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt, "BBBBB", 5, 0), "duplicate B") ||
+	    stream_expect_ack(p, base, base + 5, base + 10, true))
+		goto out;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base, p->rcv_nxt, "AAAAA", 5, 0), "send A") ||
+	    stream_expect_ack(p, base + 10, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 10, "delivered once");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, "AAAAABBBBB", 10, "ordered data");
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base, p->rcv_nxt, "AAAAA", 5, 0), "duplicate A") ||
+	    stream_expect_ack(p, base + 10, base, base + 5, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 10, "old data not delivered again");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "stream errors");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
+static void test_stream_overlap(int family, bool same_start)
+{
+	const char data[] = "ABCDEFGHIJKLMNO";
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	base = p->snd_nxt;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt,
+				     data + 5, same_start ? 5 : 10, 0), "send tail") ||
+	    stream_expect_ack(p, base, base + 5, base + (same_start ? 10 : 15), false))
+		goto out;
+	if (same_start) {
+		if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt, data + 5, 10, 0),
+			       "extend same start"))
+			goto out;
+	}
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base, p->rcv_nxt, data, 10, 0), "overlapping head") ||
+	    stream_expect_ack(p, base + 15, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 15, "overlap delivered once");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, data, 15, "overlap data");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "stream errors");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
+static void test_stream_fin(int family)
+{
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+	char app[8];
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK | OPT_TS))
+		goto out;
+	base = p->snd_nxt;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK | TH_FIN, base + 5, p->rcv_nxt, NULL, 0, 0),
+		       "FIN across a hole") ||
+	    stream_expect_ack(p, base, base + 5, base + 6, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_fin, 0, "no early EOF");
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base, p->rcv_nxt, "hello", 5, 0), "fill hole") ||
+	    stream_expect_ack(p, base + 6, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 5, "payload before EOF");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, "hello", 5, "payload before EOF");
+	ASSERT_EQ(c.skel->bss->stream_fin, 1, "EOF delivered");
+	ASSERT_EQ(app_recv(&c, app, sizeof(app)), 0, "application EOF");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
+static void test_stream_prune(void)
+{
+	struct ctx c;
+	struct peer *p;
+	__u32 base;
+	__u64 deadline;
+
+	if (setup(&c, AF_INET))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	base = p->snd_nxt;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt, "BBBBB", 5, 0), "send B") ||
+	    stream_expect_ack(p, base, base + 5, base + 10, false))
+		goto out;
+	ASSERT_EQ(stream_rmem(&c), 0, "held frame not charged to the socket");
+	c.skel->bss->stream_prune = 1;
+	deadline = now_ms() + TIMEOUT_MS;
+	while (!c.skel->bss->stream_pruned && now_ms() < deadline)
+		usleep(1000);
+	ASSERT_EQ(c.skel->bss->stream_pruned, 1, "timer pruned the held frames");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base + 5, p->rcv_nxt, "BBBBB", 5, 0), "retransmit B") ||
+	    stream_expect_ack(p, base, base + 5, base + 10, false))
+		goto out;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, base, p->rcv_nxt, "AAAAA", 5, 0), "send A") ||
+	    stream_expect_ack(p, base + 10, 0, 0, false))
+		goto out;
+	ASSERT_EQ(c.skel->bss->stream_bytes, 10, "retransmission received");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, "AAAAABBBBB", 10, "retransmission data");
+out:
+	teardown(&c);
+}
+
+static void test_stream_close(void)
+{
+	struct ctx c;
+	struct peer *p;
+	__u64 key, deadline;
+	int fd, err;
+
+	if (setup(&c, AF_INET))
+		return;
+	c.skel->bss->hold_mode = 1;
+	p = &c.peer;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	if (!ASSERT_OK(peer_send_raw(p, TH_ACK, p->snd_nxt + 5, p->rcv_nxt, "BBBBB", 5, 0), "send B") ||
+	    stream_expect_ack(p, p->snd_nxt, p->snd_nxt + 5, p->snd_nxt + 10, false))
+		goto out;
+	fd = bpf_map__fd(c.skel->maps.conns);
+	ASSERT_OK(bpf_map_get_next_key(fd, NULL, &key), "connection state exists");
+	close(c.conn);
+	c.conn = -1;
+	deadline = now_ms() + TIMEOUT_MS;
+	do {
+		err = bpf_map_get_next_key(fd, NULL, &key);
+		if (err)
+			break;
+		usleep(1000);
+	} while (now_ms() < deadline);
+	ASSERT_EQ(err, -ENOENT, "closed connection state reaped");
+out:
+	teardown(&c);
+}
+
+struct socket_holder {
+	int prog_fd;
+	int err;
+	int retval;
+};
+
+static void *hold_socket(void *arg)
+{
+	struct socket_holder *holder = arg;
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+	holder->err = bpf_prog_test_run_opts(holder->prog_fd, &opts);
+	holder->retval = opts.retval;
+	return NULL;
+}
+
+struct stream_writer {
+	struct peer peer;
+	__u32 base;
+	int cpu;
+	int parity;
+	int err;
+};
+
+static void *write_stream(void *arg)
+{
+	struct stream_writer *writer = arg;
+	cpu_set_t mask;
+	int i;
+
+	CPU_ZERO(&mask);
+	CPU_SET(writer->cpu, &mask);
+	writer->err = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+	if (writer->err)
+		return NULL;
+	for (i = 15; i >= 0; i--) {
+		int offset = i * 2 + writer->parity;
+		char byte = 'A' + offset;
+
+		writer->err = peer_send_raw(&writer->peer, TH_ACK, writer->base + offset,
+					    writer->peer.rcv_nxt, &byte, 1, 0);
+		if (writer->err)
+			break;
+	}
+	return NULL;
+}
+
+/* Two CPUs enqueue while the socket is owned; a timer delivers without new input. */
+static void test_stream_busy_concurrent(void)
+{
+	struct stream_writer writers[2] = {};
+	struct socket_holder holder = {};
+	pthread_t holding, sending[2];
+	__u64 deadline, callbacks;
+	int i, cpu, count = 0;
+	cpu_set_t available;
+	char expected[33];
+	struct ctx c;
+	__u32 base;
+
+	if (!ASSERT_OK(sched_getaffinity(0, sizeof(available), &available), "get CPUs"))
+		return;
+	for (cpu = 0; cpu < CPU_SETSIZE && count < 2; cpu++)
+		if (CPU_ISSET(cpu, &available))
+			writers[count++].cpu = cpu;
+	if (count < 2) {
+		test__skip();
+		return;
+	}
+	if (setup(&c, AF_INET))
+		return;
+	c.skel->bss->hold_mode = 1;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, "Z", 1), "initialize stream") ||
+	    stream_expect_ack(&c.peer, c.peer.snd_nxt, 0, 0, false))
+		goto out;
+	base = c.peer.snd_nxt;
+	callbacks = c.skel->bss->stream_callbacks;
+	c.skel->bss->hold_fd = c.conn;
+	holder.prog_fd = bpf_program__fd(c.skel->progs.xdp_tcp_hold_sock);
+	if (!ASSERT_OK(pthread_create(&holding, NULL, hold_socket, &holder), "start socket owner"))
+		goto out;
+	deadline = now_ms() + TIMEOUT_MS;
+	while (!__atomic_load_n(&c.skel->bss->hold_state.entered, __ATOMIC_ACQUIRE) &&
+	       now_ms() < deadline)
+		usleep(1000);
+	if (!ASSERT_EQ(c.skel->bss->hold_state.entered, 1, "socket owned"))
+		goto release;
+	for (i = 0; i < 2; i++) {
+		writers[i].peer = c.peer;
+		writers[i].base = base;
+		writers[i].parity = i;
+		if (!ASSERT_OK(pthread_create(&sending[i], NULL, write_stream, &writers[i]),
+			       "start writer"))
+			break;
+	}
+	count = i;
+	for (i = 0; i < count; i++) {
+		ASSERT_OK(pthread_join(sending[i], NULL), "join writer");
+		ASSERT_OK(writers[i].err, "write on separate CPU");
+	}
+	ASSERT_EQ(c.skel->bss->stream_bytes, 1, "no receive while socket is owned");
+release:
+	__atomic_store_n(&c.skel->bss->hold_state.release, 1, __ATOMIC_RELEASE);
+	ASSERT_OK(pthread_join(holding, NULL), "join socket owner");
+	ASSERT_OK(holder.err, "socket owner program");
+	ASSERT_EQ(holder.retval, 0, "socket ownership released");
+	if (stream_expect_ack(&c.peer, base + 32, 0, 0, false))
+		goto out;
+	expected[0] = 'Z';
+	for (i = 0; i < 32; i++)
+		expected[i + 1] = 'A' + i;
+	ASSERT_EQ(c.skel->bss->stream_bytes, sizeof(expected), "all bytes delivered once");
+	ASSERT_MEMEQ(c.skel->arena->stream_data, expected, sizeof(expected), "ordered stream");
+	ASSERT_GT(c.skel->bss->stream_callbacks, callbacks, "timer resumed receive");
+	ASSERT_EQ(c.skel->bss->stream_errors, 0, "no receive errors");
+	ASSERT_EQ(stream_rmem(&c), 0, "nothing charged to the socket");
+out:
+	teardown(&c);
+}
+
 void test_xdp_tcp(void)
 {
+	static const int orders[][3] = {
+		{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0},
+	};
+	int family, i;
+	char name[64];
+
+	if (test__start_subtest("raw_constraints"))
+		test_raw_constraints();
+	for (family = 0; family < 2; family++) {
+		int af = family ? AF_INET6 : AF_INET;
+
+		snprintf(name, sizeof(name), "stream_echo_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_echo(af, 0);
+		snprintf(name, sizeof(name), "stream_echo_ts_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_echo(af, OPT_TS | OPT_SACK);
+		for (i = 0; i < ARRAY_SIZE(orders); i++) {
+			snprintf(name, sizeof(name), "stream_order_v%d_%d%d%d", family ? 6 : 4,
+				 orders[i][0], orders[i][1], orders[i][2]);
+			if (test__start_subtest(name))
+				test_stream_order(af, orders[i], false);
+		}
+		snprintf(name, sizeof(name), "stream_wrap_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_order(af, orders[5], true);
+		snprintf(name, sizeof(name), "stream_duplicates_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_duplicates(af);
+		snprintf(name, sizeof(name), "stream_overlap_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_overlap(af, false);
+		snprintf(name, sizeof(name), "stream_same_start_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_overlap(af, true);
+		snprintf(name, sizeof(name), "stream_fin_v%d", family ? 6 : 4);
+		if (test__start_subtest(name))
+			test_stream_fin(af);
+	}
+	if (test__start_subtest("stream_prune"))
+		test_stream_prune();
+	if (test__start_subtest("stream_stack_filler"))
+		test_stream_stack_filler();
+	if (test__start_subtest("stream_close"))
+		test_stream_close();
+	if (test__start_subtest("stream_busy_concurrent"))
+		test_stream_busy_concurrent();
 	if (test__start_subtest("echo_v4"))
 		test_echo(AF_INET, 0);
 	if (test__start_subtest("echo_v6"))
