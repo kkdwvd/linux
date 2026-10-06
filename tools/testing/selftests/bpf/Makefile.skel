@@ -93,6 +93,8 @@ $(BPF_OBJS): $(RDIR)/%.bpf.o: progs/%.c progs/*.h			\
 	$(call msg,$(BPF_CC_MSG),$(BINARY),$@)
 	$(Q)$(cmd_bpf_compile)
 
+$(RDIR)/xdp_tcp.bpf.o: bpf_xdp_tcp.h
+
 GEN_SKEL := ./gen_bpf_skel.sh
 
 cmd_bpf_gen_skel = $(call skip_if_missing,SKEL,$<,$(@:.skel.h=.subskel.h))printf \
