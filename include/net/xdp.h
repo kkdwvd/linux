@@ -81,6 +81,9 @@ enum xdp_buff_flags {
 	 * XDP program is not attached.
 	 */
 	XDP_FLAGS_FRAGS_UNREADABLE	= BIT(2),
+	/* Kept by TCP on frames a BPF program owns, see bpf_xdp_tcp_hold(). */
+	XDP_FLAGS_BPF_TCP_HELD		= BIT(3), /* admitted to a connection */
+	XDP_FLAGS_BPF_TCP_OOO		= BIT(4), /* admitted beyond the receive cursor */
 };
 
 struct xdp_buff {

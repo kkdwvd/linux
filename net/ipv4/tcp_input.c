@@ -251,7 +251,7 @@ static __cold void tcp_gro_dev_warn(const struct sock *sk, const struct sk_buff 
 /* Adapt the MSS value used to make delayed ack decision to the
  * real world.
  */
-static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
+void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	const unsigned int lss = icsk->icsk_ack.last_seg_size;
@@ -368,7 +368,7 @@ static bool tcp_in_quickack_mode(struct sock *sk)
 		(icsk->icsk_ack.quick && !inet_csk_in_pingpong_mode(sk));
 }
 
-static void tcp_data_ecn_check(struct sock *sk, const struct sk_buff *skb)
+void tcp_data_ecn_check(struct sock *sk, const struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -724,7 +724,7 @@ static u32 truesize_adjust(bool adjust, const struct sk_buff *skb)
 	return truesize;
 }
 
-static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb,
+void tcp_grow_window(struct sock *sk, const struct sk_buff *skb,
 			    bool adjust)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5179,7 +5179,7 @@ void tcp_sack_compress_send_ack(struct sock *sk)
  */
 #define TCP_SACK_BLOCKS_EXPECTED 2
 
-static void tcp_sack_new_ofo_skb(struct sock *sk, u32 seq, u32 end_seq)
+void tcp_sack_new_ofo_skb(struct sock *sk, u32 seq, u32 end_seq)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_sack_block *sp = &tp->selective_acks[0];
@@ -5234,19 +5234,23 @@ static void tcp_sack_remove(struct tcp_sock *tp)
 	int num_sacks = tp->rx_opt.num_sacks;
 	int this_sack;
 
-	/* Empty ofo queue, hence, all the SACKs are eaten. Clear. */
-	if (RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
-		tp->rx_opt.num_sacks = 0;
-		return;
-	}
-
+	/*
+	 * An empty ofo queue does not mean the blocks are eaten, nor need
+	 * RCV.NXT cover a block it has entered: the data beyond may be held
+	 * outside the queue, in frames an XDP program keeps, see
+	 * bpf_xdp_tcp_hold(). Such a block stays, trimmed to RCV.NXT.
+	 */
 	for (this_sack = 0; this_sack < num_sacks;) {
 		/* Check if the start of the sack is covered by RCV.NXT. */
 		if (!before(tp->rcv_nxt, sp->start_seq)) {
 			int i;
 
-			/* RCV.NXT must cover all the block! */
-			WARN_ON(before(tp->rcv_nxt, sp->end_seq));
+			if (before(tp->rcv_nxt, sp->end_seq)) {
+				sp->start_seq = tp->rcv_nxt;
+				this_sack++;
+				sp++;
+				continue;
+			}
 
 			/* Zap this SACK, by moving forward any other SACKS. */
 			for (i = this_sack+1; i < num_sacks; i++)
