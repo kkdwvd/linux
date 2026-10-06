@@ -345,6 +345,7 @@ static __always_inline void *xdp_buff_headroom_start(const struct xdp_buff *xdp)
 }
 
 void bpf_xdp_frame_put(struct xdp_frame *frame);
+struct sk_buff *bpf_xdp_frame_to_skb(struct xdp_frame *frame, u32 off, u32 len);
 
 static __always_inline bool xdp_frame_has_frags(const struct xdp_frame *frame)
 {
