@@ -11,6 +11,7 @@
 #define BPF_RECLAIM_MAX_THREADS		64
 #define BPF_RECLAIM_MAX_CGROUPS		256
 #define BPF_RECLAIM_AWAKE_BUCKETS	9
+#define BPF_RECLAIM_MAX_CHILD_THREADS	1024
 #define BPF_RECLAIM_PAGE_SHIFT		12
 #define BPF_RECLAIM_PAGE_SIZE		(1ULL << BPF_RECLAIM_PAGE_SHIFT)
 /* The range of a cgroup's coldness estimate; the loader prints it in percent. */
@@ -52,10 +53,12 @@ struct bpf_reclaim_cfg {
 	__u64 target_ppm;	/* tolerated stall fraction (PSI some), parts per million */
 	__u64 cpu_budget_ppm;	/* CPU a child may cost per tick, parts per million of one CPU */
 	__u64 min_efficiency;	/* bytes per CPU-second below which reclaiming a child is expensive */
-	__u32 pool;		/* worker threads */
+	__u32 pool;		/* shared worker threads */
+	__u32 per_child;	/* worker threads created inside each child, 0 for none */
 	__s32 swappiness;	/* -1 for the cgroup's own */
 	__u32 throttle;		/* set memory.high on a runaway when the pool falls behind */
 	__u32 throttle_ticks;	/* consecutive deficit ticks before throttling */
+	__u32 pad;
 };
 
 /*
@@ -128,6 +131,26 @@ struct bpf_reclaim_thread {
 };
 
 /*
+ * A worker that belongs to one child: created inside the child's cgroup
+ * when the controller first gives the child quota, woken through its own
+ * wait queue, serving only its child, and gone with it. Keyed by the
+ * child's ID and the worker's index.
+ */
+struct bpf_reclaim_child_key {
+	__u64 cgroup_id;
+	__u32 index;
+	__u32 pad;
+};
+
+struct bpf_reclaim_child_thread {
+	struct bpf_reclaim_thread t;
+	struct bpf_waitq wake;
+	__u64 cgroup_id;
+	__u32 placed;		/* created inside the child, not in the pool's cgroup */
+	__u32 pad;
+};
+
+/*
  * The workers' wait queue. A map value may hold one wait queue, and the
  * controller's own sits in its value, so the pool's lives apart.
  */
@@ -160,6 +183,9 @@ struct bpf_reclaim_control {
 	__u64 wakeups;		/* worker wakeups requested */
 	__u64 reclaimed;	/* bytes reclaimed by the pool, all children */
 	__u64 behind_ticks;	/* ticks the pool was judged behind an allocator */
+	__u64 child_threads;	/* per-child workers created */
+	__u64 child_misplaced;	/* of those, created in the pool's cgroup because the child refused */
+	__u64 child_swept;	/* per-child workers removed with their child */
 	__u64 awake_ticks[BPF_RECLAIM_AWAKE_BUCKETS]; /* ticks by workers woken, last bucket and up */
 };
 

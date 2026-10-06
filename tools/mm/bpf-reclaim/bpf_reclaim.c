@@ -18,7 +18,9 @@
  * --throttle-ticks ticks, so its own tasks reclaim and are delayed on the
  * way back to user space; the limit is lifted when the buffer is back.
  * --pool-cgroup places the threads in a cgroup of their own and --cpus
- * binds the workers to a list of CPUs, round robin.
+ * binds the workers to a list of CPUs, round robin. --per-child N gives
+ * every child N workers of its own, created inside it, instead of or as
+ * well as the shared pool; --pool 0 leaves only those.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -288,11 +290,14 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 
 	if (!bpf_map__lookup_elem(skel->maps.control, &zero, sizeof(zero), &c, sizeof(c), 0)) {
 		printf("control ticks=%llu deficit_ticks=%llu lead_ticks=%llu behind_ticks=%llu "
-		       "free_min=%llu wakeups=%llu reclaimed=%llu capacity=%llu awake_ticks=",
+		       "free_min=%llu wakeups=%llu reclaimed=%llu capacity=%llu child_threads=%llu "
+		       "child_misplaced=%llu child_swept=%llu awake_ticks=",
 		       (unsigned long long)c.ticks, (unsigned long long)c.deficit_ticks,
 		       (unsigned long long)c.lead_ticks, (unsigned long long)c.behind_ticks,
 		       (unsigned long long)c.free_min, (unsigned long long)c.wakeups,
-		       (unsigned long long)c.reclaimed, (unsigned long long)c.capacity);
+		       (unsigned long long)c.reclaimed, (unsigned long long)c.capacity,
+		       (unsigned long long)c.child_threads, (unsigned long long)c.child_misplaced,
+		       (unsigned long long)c.child_swept);
 		for (i = 0; i < BPF_RECLAIM_AWAKE_BUCKETS; i++)
 			printf("%s%llu", i ? "," : "", (unsigned long long)c.awake_ticks[i]);
 		printf("\n");
@@ -305,6 +310,25 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 		       t.index, t.cpu, (unsigned long long)t.rounds, (unsigned long long)t.claims,
 		       (unsigned long long)t.reclaimed, (unsigned long long)(t.busy_ns / 1000000),
 		       (unsigned long long)t.sleeps);
+	}
+	if (skel->bss->cfg.per_child) {
+		struct bpf_reclaim_child_key key, next;
+		struct bpf_reclaim_child_thread ct;
+		int fd = bpf_map__fd(skel->maps.child_threads), first = 1;
+
+		while (!bpf_map_get_next_key(fd, first ? NULL : &key, &next)) {
+			first = 0;
+			key = next;
+			if (bpf_map_lookup_elem(fd, &key, &ct))
+				continue;
+			printf("child_thread cgroup_id=%llu index=%u placed=%u rounds=%llu claims=%llu "
+			       "reclaimed=%llu busy_ms=%llu sleeps=%llu\n",
+			       (unsigned long long)key.cgroup_id, key.index, ct.placed,
+			       (unsigned long long)ct.t.rounds, (unsigned long long)ct.t.claims,
+			       (unsigned long long)ct.t.reclaimed,
+			       (unsigned long long)(ct.t.busy_ns / 1000000),
+			       (unsigned long long)ct.t.sleeps);
+		}
 	}
 	for (i = 0; i < (unsigned int)max; i++) {
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
@@ -346,6 +370,7 @@ int main(int argc, char **argv)
 		{ "throttle", no_argument, NULL, 'T' },
 		{ "throttle-ticks", required_argument, NULL, 'k' },
 		{ "pool-cgroup", required_argument, NULL, 'g' },
+		{ "per-child", required_argument, NULL, 'n' },
 		{ "cpus", required_argument, NULL, 'u' },
 		{ "status-ms", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
@@ -373,7 +398,7 @@ int main(int argc, char **argv)
 	int opt, i, nr_child_specs = 0, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:L:r:p:P:c:f:t:C:e:w:x:Tk:g:u:s:v", opts,
+	while ((opt = getopt_long(argc, argv, "b:i:L:r:p:P:c:f:t:C:e:w:x:Tk:g:n:u:s:v", opts,
 				  NULL)) != -1) {
 		switch (opt) {
 		case 'b':
@@ -428,6 +453,9 @@ int main(int argc, char **argv)
 		case 'g':
 			pool_cgroup = optarg;
 			break;
+		case 'n':
+			cfg.per_child = strtoul(optarg, NULL, 0);
+			break;
 		case 'u':
 			cpus = optarg;
 			break;
@@ -444,17 +472,18 @@ int main(int argc, char **argv)
 	if (optind != argc - 1)
 		goto usage;
 	root = argv[optind];
-	if (!cfg.pool || cfg.pool > BPF_RECLAIM_MAX_THREADS) {
-		fprintf(stderr, "the pool must have 1 to %d threads\n", BPF_RECLAIM_MAX_THREADS);
+	if ((!cfg.pool && !cfg.per_child) || cfg.pool > BPF_RECLAIM_MAX_THREADS) {
+		fprintf(stderr, "the pool must have 1 to %d threads, or --per-child workers\n",
+			BPF_RECLAIM_MAX_THREADS);
 		return 1;
 	}
 	if (!cfg.interval_ns || cfg.chunk < BPF_RECLAIM_PAGE_SIZE) {
 		fprintf(stderr, "the interval and the chunk must not be zero\n");
 		return 1;
 	}
-	/* By default a child may have the whole pool; the budget bounds waste, not work. */
+	/* By default a child may have all its workers; the budget bounds waste, not work. */
 	if (!cfg.cpu_budget_ppm)
-		cfg.cpu_budget_ppm = cfg.pool * 1000000ULL;
+		cfg.cpu_budget_ppm = (cfg.pool + cfg.per_child) * 1000000ULL;
 	cfg.root_cgroup_id = cgroup_id(root);
 	if (!cfg.root_cgroup_id) {
 		fprintf(stderr, "%s: not a cgroup: %s\n", root, strerror(errno));
@@ -503,11 +532,13 @@ int main(int argc, char **argv)
 		run_prog(skel->progs.reclaim_teardown, "teardown");
 		goto out;
 	}
-	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms lead=%.0fms max_rate=%.0fM/s "
+	printf("ready root=%s buffer=%.0fM pool=%u per_child=%u interval=%.0fms lead=%.0fms "
+	       "max_rate=%.0fM/s "
 	       "probe=%.2f%%/s chunk=%.0fM floor=%.0fM target=%.2f%% cpu_budget=%.0f%% "
 	       "min_efficiency=%.0fM/s throttle=%u\n",
-	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.lead_ns / 1e6,
-	       cfg.max_rate / MB, cfg.probe_ppm / 1e4, cfg.chunk / MB, cfg.floor / MB, target_pct,
+	       root, cfg.buffer / MB, cfg.pool, cfg.per_child, cfg.interval_ns / 1e6,
+	       cfg.lead_ns / 1e6, cfg.max_rate / MB, cfg.probe_ppm / 1e4, cfg.chunk / MB,
+	       cfg.floor / MB, target_pct,
 	       cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB, cfg.throttle);
 	fflush(stdout);
 
@@ -538,6 +569,7 @@ usage:
 		"          [--cpu-budget PCT]\n"
 		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N]\n"
 		"          [--throttle [--throttle-ticks N]] [--pool-cgroup PATH] [--cpus LIST]\n"
+		"          [--per-child N]\n"
 		"          [--child NAME:floor=MB,weight=N,target=PCT,budget=PCT,efficiency=MB/s,\n"
 		"                        swappiness=N|anon,exclude]... ROOT_CGROUP\n",
 		basename(argv[0]));

@@ -67,6 +67,18 @@
  * task that allocates faster than memory can be found for it. The limit is
  * lifted once the buffer is back, and on teardown.
  *
+ * cfg.per_child gives every child workers of its own instead of, or as
+ * well as, the shared pool. The controller creates them inside the child's
+ * cgroup the first time it gives the child quota, so that their CPU is
+ * charged to the child by membership, and wakes them whenever the child has
+ * quota; they serve only their child and exit when it is gone, and the
+ * controller sweeps their entries. A child that cannot hold tasks, because
+ * it has children of its own with controllers enabled, gets its workers in
+ * the pool's cgroup instead, and the fact is counted. The two placements
+ * are the two sides of the accounting debate: a thread per child charges
+ * by membership and costs a thread per child; a shared pool costs nothing
+ * per child and charges nobody.
+ *
  * The threads live in the root cgroup unless cfg.pool_cgroup_id names
  * another, in which case cpu.max and cpu.weight there bound what the whole
  * pool may cost, and each worker may be bound to a CPU, to keep reclaim off
@@ -110,6 +122,8 @@ char _license[] SEC("license") = "GPL";
 #define BUSY_MIN 1000000	/* less CPU than this in a tick says nothing about efficiency */
 #define REST_MAX 64		/* the longest a child is rested after a gate, in ticks */
 #define NO_LIMIT (~0UL)		/* memory.high "max" */
+#define PF_KTHREAD 0x00200000	/* task_struct::flags, not in BTF */
+#define CSS_TASK_ITER_PROCS 1	/* css task iterator flag, not in BTF */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -131,6 +145,13 @@ struct {
 	__type(key, __u32);
 	__type(value, struct bpf_reclaim_thread);
 } threads SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, BPF_RECLAIM_MAX_CHILD_THREADS);
+	__type(key, struct bpf_reclaim_child_key);
+	__type(value, struct bpf_reclaim_child_thread);
+} child_threads SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -473,6 +494,9 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	return 0;
 }
 
+static void child_workers_wake(__u64 id);
+static long sweep_cb(struct bpf_map *map, const void *key, void *value, void *ctx);
+
 /*
  * The probe: the fraction of a child's headroom to ask for over a tick
  * beyond the demand, scaled by how far its pressure sits below its target.
@@ -529,6 +553,8 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u3
 		cg->probed += probe;
 	}
 	bpf_cgroup_release(cgrp);
+	if (quota && cfg.per_child)
+		child_workers_wake(id);
 	return quota;
 }
 
@@ -628,7 +654,7 @@ static int control_cb(void *map, int *key, void *value)
 	 * A runaway grows by a good part of what the whole pool can reclaim
 	 * in a second, so that no pool size would keep up with it for long.
 	 */
-	cap = cfg.pool * c->capacity;
+	cap = (cfg.pool ? cfg.pool : cfg.per_child) * c->capacity;
 	if (cfg.max_rate && cfg.max_rate < cap)
 		cap = cfg.max_rate;
 	cap /= 4;
@@ -700,6 +726,12 @@ static int control_cb(void *map, int *key, void *value)
 	}
 	k = c->awake < BPF_RECLAIM_AWAKE_BUCKETS ? c->awake : BPF_RECLAIM_AWAKE_BUCKETS - 1;
 	c->awake_ticks[k]++;
+
+	if (cfg.per_child) {
+		int all = 0;
+
+		bpf_for_each_map_elem(&child_threads, sweep_cb, &all, 0);
+	}
 
 	bpf_waitq_wait_event(&c->tick, seq, cfg.interval_ns);
 	return 0;
@@ -831,6 +863,141 @@ static int worker_cb(void *map, int *key, void *value)
 	return 0;
 }
 
+/*
+ * True when nothing but kernel threads is left in a child. A worker that
+ * stayed would keep the cgroup populated and block its removal, which is
+ * the objection to threads per cgroup; so a worker leaves when its child's
+ * processes have.
+ */
+static __always_inline bool child_is_empty(struct cgroup *cgrp)
+{
+	struct task_struct *task;
+	bool empty = true;
+
+	bpf_for_each(css_task, task, &cgrp->self, CSS_TASK_ITER_PROCS) {
+		if (!(task->flags & PF_KTHREAD)) {
+			empty = false;
+			break;
+		}
+	}
+	return empty;
+}
+
+/*
+ * A per-child worker's iteration: serve its child, sleep on its own wait
+ * queue; exit once the child is gone or empty, so that it can be removed.
+ */
+static int child_worker_cb(void *map, int *key, void *value)
+{
+	struct bpf_reclaim_child_thread *v = value;
+	struct cgroup *cgrp;
+	bool empty;
+	__u32 seq;
+
+	seq = bpf_waitq_sequence(&v->wake);
+	v->t.rounds++;
+	if (serve(&v->t, v->cgroup_id))
+		return 0;
+	cgrp = bpf_cgroup_from_id(v->cgroup_id);
+	if (!cgrp)
+		return 1;
+	empty = child_is_empty(cgrp);
+	bpf_cgroup_release(cgrp);
+	if (empty)
+		return 1;
+	v->t.sleeps++;
+	bpf_waitq_wait_event(&v->wake, seq, ~0ULL);
+	return 0;
+}
+
+/* Create a child's worker, inside the child if it will have it. */
+static __always_inline void child_worker_create(struct bpf_reclaim_control *c,
+						struct bpf_reclaim_child_key *key)
+{
+	struct bpf_reclaim_child_thread init = {}, *v;
+	int ret;
+
+	init.cgroup_id = key->cgroup_id;
+	init.t.index = key->index;
+	init.t.cpu = -1;
+	if (bpf_map_update_elem(&child_threads, key, &init, BPF_NOEXIST))
+		return;
+	v = bpf_map_lookup_elem(&child_threads, key);
+	if (!v)
+		return;
+	ret = bpf_waitq_init(&v->wake, &child_threads, 0);
+	if (!ret) {
+		ret = bpf_kthread_create(&v->t.kthread, &child_threads, key->cgroup_id,
+					 child_worker_cb);
+		if (!ret) {
+			v->placed = 1;
+		} else {
+			ret = bpf_kthread_create(&v->t.kthread, &child_threads,
+						 cfg.pool_cgroup_id, child_worker_cb);
+			if (!ret)
+				c->child_misplaced++;
+		}
+	}
+	if (!ret)
+		ret = bpf_kthread_start(&v->t.kthread, 0);
+	if (ret) {
+		bpf_map_delete_elem(&child_threads, key);
+		return;
+	}
+	c->child_threads++;
+}
+
+/* Wake a child's workers, creating them the first time. */
+static void child_workers_wake(__u64 id)
+{
+	struct bpf_reclaim_child_key key = { .cgroup_id = id };
+	struct bpf_reclaim_child_thread *v;
+	struct bpf_reclaim_control *c;
+	__u32 zero = 0;
+	int i;
+
+	c = bpf_map_lookup_elem(&control, &zero);
+	if (!c)
+		return;
+	bpf_for(i, 0, cfg.per_child) {
+		key.index = i;
+		v = bpf_map_lookup_elem(&child_threads, &key);
+		if (v)
+			bpf_waitq_wake(&v->wake, 1, 0);
+		else
+			child_worker_create(c, &key);
+	}
+}
+
+/*
+ * Remove the workers of children that are gone; with @ctx pointing at a
+ * nonzero flag, all of them. The flag lives on the caller's stack, which is
+ * the only kind of context the iteration helper accepts.
+ */
+static long sweep_cb(struct bpf_map *map, const void *key, void *value, void *ctx)
+{
+	const struct bpf_reclaim_child_key *k = key;
+	struct bpf_reclaim_control *c;
+	struct cgroup *cgrp;
+	__u32 zero = 0;
+	int *all = ctx;
+
+	if (!all)
+		return 1;
+	if (!*all) {
+		cgrp = bpf_cgroup_from_id(k->cgroup_id);
+		if (cgrp) {
+			bpf_cgroup_release(cgrp);
+			return 0;
+		}
+		c = bpf_map_lookup_elem(&control, &zero);
+		if (c)
+			c->child_swept++;
+	}
+	bpf_map_delete_elem(&child_threads, k);
+	return 0;
+}
+
 SEC("syscall")
 int reclaim_setup(void *ctx)
 {
@@ -923,6 +1090,12 @@ int reclaim_teardown(void *ctx)
 		if (!t)
 			break;
 		bpf_kthread_stop(&t->kthread, 0);
+	}
+	/* The per-child workers stop as their entries go. */
+	if (cfg.per_child) {
+		int all = 1;
+
+		bpf_for_each_map_elem(&child_threads, sweep_cb, &all, 0);
 	}
 	/* Lift any memory.high the policy set. */
 	if (c && cfg.throttle) {
