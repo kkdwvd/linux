@@ -314,6 +314,168 @@ out:
 	return action;
 }
 
+/*
+ * Frame replies: the answer goes out of the request's own buffer. A reply the
+ * socket cannot take now is kept, frame and connection reference, and retried
+ * from a timer until it goes.
+ */
+int frame_reply;
+__u64 frame_sent, frame_deferred, frame_fallback, frame_errors;
+int frame_last_error;
+
+#define FRAME_REPLY_MAX	3072
+
+struct retry_state {
+	struct xdp_frame __kptr *frame;
+	struct sock __kptr *sk;
+	struct bpf_timer timer;
+	__u32 off;
+	__u32 len;
+	__u32 armed;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct retry_state);
+} retry SEC(".maps");
+
+static int retry_timer(void *map, __u32 *key, struct retry_state *st)
+{
+	struct bpf_xdp_tcp_info info = {};
+	struct xdp_frame *frame;
+	struct sock *sk;
+
+	frame = bpf_kptr_xchg(&st->frame, NULL);
+	sk = bpf_kptr_xchg(&st->sk, NULL);
+	if (!frame || !sk) {
+		if (frame)
+			bpf_xdp_frame_release(frame);
+		if (sk)
+			bpf_xdp_tcp_release(sk);
+		return 0;
+	}
+	frame = bpf_xdp_tcp_send_frame(frame, sk, st->off, st->len, &info);
+	if (!frame) {
+		frame_sent++;
+		bpf_xdp_tcp_release(sk);
+		return 0;
+	}
+	if (info.error == -EAGAIN) {
+		frame = bpf_kptr_xchg(&st->frame, frame);
+		if (frame)
+			bpf_xdp_frame_release(frame);
+		sk = bpf_kptr_xchg(&st->sk, sk);
+		if (sk)
+			bpf_xdp_tcp_release(sk);
+		bpf_timer_start(&st->timer, 1000000, 0);
+		return 0;
+	}
+	frame_errors++;
+	frame_last_error = info.error;
+	bpf_xdp_frame_release(frame);
+	bpf_xdp_tcp_release(sk);
+	return 0;
+}
+
+/* Keep a reply the socket could not take, and the connection, for the timer. */
+static __always_inline bool defer_reply(struct bpf_xdp_tcp_sock *sock, struct xdp_frame *frame,
+					__u32 off, __u32 len)
+{
+	struct retry_state *st;
+	struct sock *ref;
+	__u32 zero = 0;
+
+	st = bpf_map_lookup_elem(&retry, &zero);
+	if (!st) {
+		bpf_xdp_frame_release(frame);
+		return false;
+	}
+	ref = bpf_xdp_tcp_sock_acquire(sock);
+	if (!ref) {
+		bpf_xdp_frame_release(frame);
+		return false;
+	}
+	st->off = off;
+	st->len = len;
+	frame = bpf_kptr_xchg(&st->frame, frame);
+	if (frame)
+		bpf_xdp_frame_release(frame);
+	ref = bpf_kptr_xchg(&st->sk, ref);
+	if (ref)
+		bpf_xdp_tcp_release(ref);
+	if (!st->armed && !bpf_timer_init(&st->timer, &retry, CLOCK_MONOTONIC) &&
+	    !bpf_timer_set_callback(&st->timer, retry_timer))
+		st->armed = 1;
+	bpf_timer_start(&st->timer, 1000000, 0);
+	return true;
+}
+
+/*
+ * Answer out of the request's frame: the echo is already there; a longer
+ * reply is the test pattern, written after growing the packet.
+ */
+static __always_inline int reply_in_frame(struct xdp_md *ctx, struct bpf_xdp_tcp_sock *sock)
+{
+	__u32 off = bpf_xdp_tcp_sock_offset(sock), len = bpf_xdp_tcp_sock_len(sock);
+	struct xdp_frame *frame;
+	int i, err;
+
+	if (reply_len) {
+		__u32 want = reply_len > FRAME_REPLY_MAX ? FRAME_REPLY_MAX : reply_len;
+
+		if (bpf_xdp_adjust_tail(ctx, (int)want - (int)len)) {
+			/* No room in this buffer: the arena has the pattern too. */
+			frame_fallback++;
+			bpf_xdp_tcp_sock_send(sock, reply, want);
+			return XDP_DROP;
+		}
+		len = want;
+		bpf_for(i, 0, (FRAME_REPLY_MAX + 63) / 64) {
+			char chunk[64];
+			__u32 pos = i * 64, n;
+			int j;
+
+			if (pos >= len)
+				break;
+			bpf_for(j, 0, 64)
+				chunk[j] = 'a' + (pos + j) % 26;
+			/*
+			 * pos < len, so 1 <= len - pos; clamp to the chunk and
+			 * restate the bound as arithmetic the verifier tracks.
+			 */
+			n = len - pos;
+			if (n > 64)
+				n = 64;
+			n = ((n - 1) & 63) + 1;
+			if (bpf_xdp_store_bytes(ctx, off + pos, chunk, n))
+				break;
+		}
+	}
+	frame = bpf_xdp_tcp_sock_send_frame(ctx, sock, off, len);
+	err = bpf_xdp_tcp_sock_error(sock);
+	if (!frame) {
+		if (err) {
+			/* The buffer could not be stolen: nothing to consume, the reply is lost. */
+			frame_errors++;
+			frame_last_error = err;
+			return XDP_DROP;
+		}
+		frame_sent++;
+		return XDP_CONSUME;
+	}
+	if (err == -EAGAIN) {
+		if (defer_reply(sock, frame, off, len))
+			frame_deferred++;
+		return XDP_CONSUME;
+	}
+	frame_errors++;
+	frame_last_error = err;
+	bpf_xdp_frame_release(frame);
+	return XDP_CONSUME;
+}
+
 /* Deliberately bypass the header to exercise what the kernel enforces. */
 int raw_mode;
 int raw_no_admission, raw_udp_consume, raw_udp_hold, raw_udp_send;
@@ -418,11 +580,14 @@ int xdp_tcp_echo(struct xdp_md *ctx)
 		return XDP_PASS;
 	switch (bpf_xdp_tcp_sock_status(&sock)) {
 	case BPF_XDP_TCP_RECEIVED:
+		action = XDP_DROP;
 		if (bpf_xdp_tcp_sock_len(&sock)) {
 			consumed++;
-			respond(&sock, &payload);
+			if (frame_reply)
+				action = reply_in_frame(ctx, &sock);
+			else
+				respond(&sock, &payload);
 		}
-		action = XDP_DROP;
 		break;
 	case BPF_XDP_TCP_DUPLICATE:
 		action = XDP_DROP;
