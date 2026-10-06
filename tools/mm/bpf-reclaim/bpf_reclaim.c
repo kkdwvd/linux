@@ -171,19 +171,16 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 	struct bpf_reclaim_control c;
 	struct bpf_reclaim_cgroup cg;
 	unsigned int zero = 0;
-	double reclaimed = 0;
 	int i;
 
 	if (bpf_map__lookup_elem(skel->maps.control, &zero, sizeof(zero), &c, sizeof(c), 0))
 		return;
-	for (i = 0; i < max; i++)
-		if (kids[i].fd >= 0 && !child_state(skel, &kids[i], &cg))
-			reclaimed += cg.reclaimed - kids[i].last.reclaimed;
-	printf("t=%.1f free=%.0fM deficit=%.0fM demand=%.1fM/tick awake=%u cgroups=%u "
-	       "reclaimed=%.1fM/s\n",
+	printf("t=%.1f free=%.0fM deficit=%.0fM drain=%+.1fM/s demand=%.1fM/tick awake=%u "
+	       "capacity=%.0fM/s cgroups=%u reclaimed=%.1fM/s\n",
 	       t, c.free / MB,
 	       c.free < skel->bss->cfg.buffer ? (skel->bss->cfg.buffer - c.free) / MB : 0.0,
-	       c.demand / MB, c.awake, c.nr_cgroups, reclaimed / MB / dt);
+	       c.drain_rate / MB, c.demand / MB, c.awake, c.capacity / MB, c.nr_cgroups,
+	       (c.reclaimed - pc->reclaimed) / MB / dt);
 	*pc = c;
 	for (i = 0; i < max; i++) {
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
@@ -212,10 +209,17 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 	struct bpf_reclaim_thread t;
 	unsigned int zero = 0, i;
 
-	if (!bpf_map__lookup_elem(skel->maps.control, &zero, sizeof(zero), &c, sizeof(c), 0))
-		printf("control ticks=%llu deficit_ticks=%llu free_min=%llu wakeups=%llu\n",
+	if (!bpf_map__lookup_elem(skel->maps.control, &zero, sizeof(zero), &c, sizeof(c), 0)) {
+		printf("control ticks=%llu deficit_ticks=%llu lead_ticks=%llu free_min=%llu "
+		       "wakeups=%llu reclaimed=%llu capacity=%llu awake_ticks=",
 		       (unsigned long long)c.ticks, (unsigned long long)c.deficit_ticks,
-		       (unsigned long long)c.free_min, (unsigned long long)c.wakeups);
+		       (unsigned long long)c.lead_ticks, (unsigned long long)c.free_min,
+		       (unsigned long long)c.wakeups, (unsigned long long)c.reclaimed,
+		       (unsigned long long)c.capacity);
+		for (i = 0; i < BPF_RECLAIM_AWAKE_BUCKETS; i++)
+			printf("%s%llu", i ? "," : "", (unsigned long long)c.awake_ticks[i]);
+		printf("\n");
+	}
 	for (i = 0; i < threads; i++) {
 		if (bpf_map__lookup_elem(skel->maps.threads, &i, sizeof(i), &t, sizeof(t), 0))
 			continue;
@@ -247,6 +251,8 @@ int main(int argc, char **argv)
 	static const struct option opts[] = {
 		{ "buffer", required_argument, NULL, 'b' },
 		{ "interval-ms", required_argument, NULL, 'i' },
+		{ "lead-ms", required_argument, NULL, 'L' },
+		{ "max-rate", required_argument, NULL, 'r' },
 		{ "pool", required_argument, NULL, 'P' },
 		{ "chunk", required_argument, NULL, 'c' },
 		{ "floor", required_argument, NULL, 'f' },
@@ -261,6 +267,7 @@ int main(int argc, char **argv)
 	static struct child kids[BPF_RECLAIM_MAX_CGROUPS];
 	struct bpf_reclaim_cfg cfg = {
 		.interval_ns = 100 * 1000 * 1000ULL,
+		.lead_ns = 1000 * 1000 * 1000ULL,
 		.chunk = 2ULL << 20,
 		.target_ppm = 10000,
 		.min_efficiency = 16ULL << 20,
@@ -275,13 +282,19 @@ int main(int argc, char **argv)
 	int opt, i, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:P:c:f:t:C:e:w:s:v", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "b:i:L:r:P:c:f:t:C:e:w:s:v", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'b':
 			cfg.buffer = strtoull(optarg, NULL, 0) << 20;
 			break;
 		case 'i':
 			cfg.interval_ns = strtoull(optarg, NULL, 0) * 1000000ULL;
+			break;
+		case 'L':
+			cfg.lead_ns = strtoull(optarg, NULL, 0) * 1000000ULL;
+			break;
+		case 'r':
+			cfg.max_rate = strtoull(optarg, NULL, 0) << 20;
 			break;
 		case 'P':
 			cfg.pool = strtoul(optarg, NULL, 0);
@@ -356,10 +369,11 @@ int main(int argc, char **argv)
 		run_prog(skel->progs.reclaim_teardown, "teardown");
 		goto out;
 	}
-	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms chunk=%.0fM floor=%.0fM "
-	       "target=%.2f%% cpu_budget=%.0f%% min_efficiency=%.0fM/s\n",
-	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.chunk / MB,
-	       cfg.floor / MB, target_pct, cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB);
+	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms lead=%.0fms max_rate=%.0fM/s "
+	       "chunk=%.0fM floor=%.0fM target=%.2f%% cpu_budget=%.0f%% min_efficiency=%.0fM/s\n",
+	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.lead_ns / 1e6,
+	       cfg.max_rate / MB, cfg.chunk / MB, cfg.floor / MB, target_pct,
+	       cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB);
 	fflush(stdout);
 
 	start = last = now_s();
@@ -384,9 +398,9 @@ out:
 	reclaim__destroy(skel);
 	return err ? 1 : 0;
 usage:
-	fprintf(stderr, "usage: %s [-v] [--buffer MB] [--interval-ms N] [--pool N] [--chunk MB]\n"
-		"          [--floor MB] [--target PCT] [--cpu-budget PCT] [--min-efficiency MB/s]\n"
-		"          [--swappiness N|anon] [--status-ms N] ROOT_CGROUP\n",
+	fprintf(stderr, "usage: %s [-v] [--buffer MB] [--interval-ms N] [--lead-ms N] [--max-rate MB/s]\n"
+		"          [--pool N] [--chunk MB] [--floor MB] [--target PCT] [--cpu-budget PCT]\n"
+		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N] ROOT_CGROUP\n",
 		basename(argv[0]));
 	return 2;
 }

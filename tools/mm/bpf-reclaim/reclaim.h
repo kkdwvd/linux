@@ -10,6 +10,7 @@
 
 #define BPF_RECLAIM_MAX_THREADS		64
 #define BPF_RECLAIM_MAX_CGROUPS		256
+#define BPF_RECLAIM_AWAKE_BUCKETS	9
 #define BPF_RECLAIM_PAGE_SHIFT		12
 #define BPF_RECLAIM_PAGE_SIZE		(1ULL << BPF_RECLAIM_PAGE_SHIFT)
 /* The range of a cgroup's coldness estimate; the loader prints it in percent. */
@@ -21,7 +22,9 @@
 struct bpf_reclaim_cfg {
 	__u64 root_cgroup_id;	/* the cgroup whose children are managed */
 	__u64 interval_ns;	/* controller tick */
+	__u64 lead_ns;		/* how far ahead a drain is met, before it reaches the buffer */
 	__u64 buffer;		/* bytes of free memory to keep */
+	__u64 max_rate;		/* reclaim cap, bytes per second, 0 for none */
 	__u64 chunk;		/* bytes a worker claims from a cgroup at a time */
 	__u64 floor;		/* bytes of usage never reclaimed below */
 	__u64 target_ppm;	/* tolerated stall fraction (PSI some), parts per million */
@@ -102,6 +105,10 @@ struct bpf_reclaim_control {
 	struct bpf_waitq tick;
 	__u64 last_ns;
 	__u64 free;		/* free memory in bytes at the last tick */
+	__s64 drain_rate;	/* smoothed loss of free memory net of reclaim, bytes per second */
+	__u64 capacity;		/* smoothed reclaim throughput of one busy worker, bytes per second */
+	__u64 pool_busy;	/* workers' busy time at the last tick */
+	__u64 pool_reclaimed;	/* workers' reclaimed bytes at the last tick */
 	__u64 demand;		/* bytes wanted at the last tick */
 	__u32 awake;		/* workers woken at the last tick */
 	__u32 nr_cgroups;	/* entries of ids[] */
@@ -109,8 +116,11 @@ struct bpf_reclaim_control {
 	/* counters */
 	__u64 ticks;
 	__u64 deficit_ticks;	/* ticks that found free memory below the buffer */
+	__u64 lead_ticks;	/* ticks that met a drain before it reached the buffer */
 	__u64 free_min;
 	__u64 wakeups;		/* worker wakeups requested */
+	__u64 reclaimed;	/* bytes reclaimed by the pool, all children */
+	__u64 awake_ticks[BPF_RECLAIM_AWAKE_BUCKETS]; /* ticks by workers woken, last bucket and up */
 };
 
 #endif /* __BPF_RECLAIM_H */

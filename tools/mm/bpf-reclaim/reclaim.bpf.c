@@ -7,7 +7,10 @@
  * A controller thread ticks every cfg.interval_ns. It walks the children of
  * the root cgroup, reads the free page count, and for every child its usage,
  * its memory pressure (the PSI "some" stall time from bpf_psi_total()) and
- * its refaults. The gap below the buffer is the tick's demand. It is split
+ * its refaults. The tick's demand is the gap below the buffer plus, once
+ * the rate at which free memory drains would reach the buffer within
+ * cfg.lead_ns, a tick's worth of that drain: the buffer absorbs the lag of
+ * the reaction, the lead keeps the lag short. The demand is split
  * among the children by a weight each earns from its response to the last
  * reclaim: a coldness estimate that grows while memory leaves without
  * refaults and halves when refaults take back a good part of what was
@@ -39,7 +42,9 @@
  * well, so a child that keeps proving hot is probed ever more rarely.
  *
  * Worker threads sleep on one wait queue, and the controller wakes as many
- * as the demand has chunks. A worker claims a chunk of a child's quota with
+ * as the demand needs given the measured reclaim throughput of one busy
+ * worker, so the pool's active size follows the demand. A worker claims a
+ * chunk of a child's quota with
  * a compare-and-swap and calls bpf_proactive_reclaim() until the chunk is
  * done or the child has nothing left to give this tick, in which case the
  * child sits the next tick out. Any worker serves any child.
@@ -193,7 +198,8 @@ static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *
  * returned is coldness times the headroom in megabytes, kept small enough
  * for the split's arithmetic.
  */
-static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
+static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
+					 __u64 *reclaimed_out)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
@@ -204,6 +210,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 	bool thrashing, expensive;
 
 	*weight = 0;
+	*reclaimed_out = 0;
 	cgrp = bpf_cgroup_from_id(id);
 	if (!cgrp)
 		return -ENOENT;
@@ -246,6 +253,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 	cg->refault_rate = ewma(cg->refault_rate, per_second(refaulted, dt_ms));
 
 	reclaimed = __sync_lock_test_and_set(&cg->tick_reclaimed, 0);
+	*reclaimed_out = reclaimed;
 	asked = cg->asked;
 	cg->asked = 0;
 	cg->reclaim_rate = ewma(cg->reclaim_rate, per_second(reclaimed, dt_ms));
@@ -370,16 +378,39 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total)
 	return quota;
 }
 
+/* The pool's throughput per busy worker, from the workers' own tallies. */
+static __always_inline void measure_capacity(struct bpf_reclaim_control *c)
+{
+	struct bpf_reclaim_thread *t;
+	__u64 busy = 0, reclaimed = 0;
+	int i;
+
+	bpf_for(i, 0, cfg.pool) {
+		t = bpf_map_lookup_elem(&threads, &i);
+		if (!t)
+			break;
+		busy += t->busy_ns;
+		reclaimed += t->reclaimed;
+	}
+	if (busy > c->pool_busy && reclaimed > c->pool_reclaimed)
+		c->capacity = ewma(c->capacity, per_second(reclaimed - c->pool_reclaimed,
+							   (busy - c->pool_busy) / 1000000 + 1));
+	c->pool_busy = busy;
+	c->pool_reclaimed = reclaimed;
+}
+
 /*
  * The controller's tick: find the children, sample them, turn the
- * free-memory deficit into demand, split it into quotas, wake enough
- * workers, sleep.
+ * free-memory deficit and the forecast drain into demand, split it into
+ * quotas, wake enough workers, sleep.
  */
 static int control_cb(void *map, int *key, void *value)
 {
 	struct bpf_reclaim_control *c = value;
 	struct bpf_reclaim_pool *p;
-	__u64 now, dt_ms, free, demand, weight, total = 0, quota = 0;
+	__u64 now, dt_ms, free, demand, weight, reclaimed, lose, pred, cap, per_worker;
+	__u64 total = 0, quota = 0, tick_reclaimed = 0;
+	__s64 drain;
 	__u32 zero = 0, seq, k, n;
 	int i;
 
@@ -396,21 +427,49 @@ static int control_cb(void *map, int *key, void *value)
 
 	discover(c);
 	free = bpf_global_zone_page_state(NR_FREE_PAGES);
-	c->free = free;
 	if (free < c->free_min)
 		c->free_min = free;
-	demand = free < cfg.buffer ? cfg.buffer - free : 0;
-	if (demand)
-		c->deficit_ticks++;
-	c->demand = demand;
 
 	n = c->nr_cgroups;
 	bpf_for(i, 0, n) {
 		if (i >= BPF_RECLAIM_MAX_CGROUPS)
 			break;
-		if (!sample_cgroup(c->ids[i], dt_ms, &weight))
+		if (!sample_cgroup(c->ids[i], dt_ms, &weight, &reclaimed)) {
 			total += weight;
+			tick_reclaimed += reclaimed;
+		}
 	}
+	measure_capacity(c);
+
+	/* Free memory lost over the tick, net of what the pool put back. */
+	drain = (__s64)(c->free + tick_reclaimed) - (__s64)free;
+	c->drain_rate = ewma_s(c->drain_rate, per_second_s(drain, dt_ms));
+	c->free = free;
+	c->reclaimed += tick_reclaimed;
+
+	/*
+	 * The demand closes the gap below the buffer, and matches the drain
+	 * as soon as the drain would reach the buffer within the lead.
+	 */
+	demand = free < cfg.buffer ? cfg.buffer - free : 0;
+	if (demand)
+		c->deficit_ticks++;
+	if (c->drain_rate > 0) {
+		lose = (__u64)c->drain_rate * (cfg.lead_ns / 1000000) / 1000;
+		pred = lose < free ? free - lose : 0;
+		if (pred < cfg.buffer) {
+			if (!demand)
+				c->lead_ticks++;
+			demand += (__u64)c->drain_rate * dt_ms / 1000;
+		}
+	}
+	if (cfg.max_rate) {
+		cap = cfg.max_rate * dt_ms / 1000;
+		if (demand > cap)
+			demand = cap;
+	}
+	c->demand = demand;
+
 	if (demand && total) {
 		bpf_for(i, 0, n) {
 			if (i >= BPF_RECLAIM_MAX_CGROUPS)
@@ -419,15 +478,23 @@ static int control_cb(void *map, int *key, void *value)
 		}
 	}
 
+	/* Wake as many workers as the quota needs at the measured throughput. */
 	c->awake = 0;
 	if (quota) {
-		k = (quota + cfg.chunk - 1) / cfg.chunk;
+		k = 1;
+		per_worker = c->capacity * dt_ms / 1000;
+		if (per_worker)
+			k = (quota + per_worker - 1) / per_worker;
 		if (k > cfg.pool)
 			k = cfg.pool;
+		if (!k)
+			k = 1;
 		c->awake = k;
 		c->wakeups += k;
 		bpf_waitq_wake(&p->work, k, 0);
 	}
+	k = c->awake < BPF_RECLAIM_AWAKE_BUCKETS ? c->awake : BPF_RECLAIM_AWAKE_BUCKETS - 1;
+	c->awake_ticks[k]++;
 
 	bpf_waitq_wait_event(&c->tick, seq, cfg.interval_ns);
 	return 0;
@@ -569,6 +636,7 @@ int reclaim_setup(void *ctx)
 	c->last_ns = bpf_ktime_get_ns();
 	c->free = bpf_global_zone_page_state(NR_FREE_PAGES);
 	c->free_min = c->free;
+	c->capacity = 64ULL << 20;	/* a starting guess; measured from the first work */
 
 	bpf_for(i, 0, cfg.pool) {
 		t = bpf_map_lookup_elem(&threads, &i);
