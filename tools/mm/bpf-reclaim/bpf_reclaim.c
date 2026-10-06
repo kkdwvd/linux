@@ -8,9 +8,12 @@
  * prints "ready" and then a status block every --status-ms until SIGTERM or
  * SIGINT. On exit it stops the threads and prints the totals as key=value
  * lines. The policy keeps --buffer MB of memory free by reclaiming from the
- * children of ROOT_CGROUP, never taking one below --floor MB and never while
- * its refaults show the reclaim eating its working set, alone or with its
- * PSI memory "some" pressure above --target, in percent of wall time.
+ * children of ROOT_CGROUP, never taking one below --floor MB or its own
+ * memory.low, and never while its refaults show the reclaim eating its
+ * working set, alone or with its PSI memory "some" pressure above --target,
+ * in percent of wall time. --child NAME:key=value,... overrides the floor,
+ * weight, target, cpu budget, efficiency floor or swappiness of one child,
+ * or excludes it.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -159,6 +162,67 @@ static int scan_children(const char *root, struct child *kids, int max)
 	return n;
 }
 
+/*
+ * --child NAME:floor=MB,weight=N,target=PCT,budget=PCT,efficiency=MB/s,
+ *         swappiness=N|anon,exclude
+ * NAME is relative to the root unless it starts with a slash.
+ */
+static int parse_child(struct reclaim *skel, const char *root, char *spec)
+{
+	struct bpf_reclaim_child_cfg o = {};
+	char path[PATH_MAX], *name = spec, *opts, *kv, *val;
+	unsigned long long id;
+
+	opts = strchr(spec, ':');
+	if (opts)
+		*opts++ = '\0';
+	if (name[0] == '/')
+		snprintf(path, sizeof(path), "%s", name);
+	else
+		snprintf(path, sizeof(path), "%s/%s", root, name);
+	id = cgroup_id(path);
+	if (!id) {
+		fprintf(stderr, "%s: not a cgroup: %s\n", path, strerror(errno));
+		return -1;
+	}
+	while (opts && (kv = strsep(&opts, ","))) {
+		val = strchr(kv, '=');
+		if (val)
+			*val++ = '\0';
+		if (!strcmp(kv, "floor") && val) {
+			o.floor = strtoull(val, NULL, 0) << 20;
+			o.flags |= BPF_RECLAIM_CHILD_FLOOR;
+		} else if (!strcmp(kv, "weight") && val) {
+			o.weight = strtoull(val, NULL, 0);
+			o.flags |= BPF_RECLAIM_CHILD_WEIGHT;
+		} else if (!strcmp(kv, "target") && val) {
+			o.target_ppm = atof(val) * 10000;
+			o.flags |= BPF_RECLAIM_CHILD_TARGET;
+		} else if (!strcmp(kv, "budget") && val) {
+			o.cpu_budget_ppm = atof(val) * 10000;
+			o.flags |= BPF_RECLAIM_CHILD_BUDGET;
+		} else if (!strcmp(kv, "efficiency") && val) {
+			o.min_efficiency = strtoull(val, NULL, 0) << 20;
+			o.flags |= BPF_RECLAIM_CHILD_EFFICIENCY;
+		} else if (!strcmp(kv, "swappiness") && val) {
+			o.swappiness = !strcmp(val, "anon") ? BPF_RECLAIM_SWAPPINESS_ANON_ONLY
+							  : atoi(val);
+			o.flags |= BPF_RECLAIM_CHILD_SWAPPINESS;
+		} else if (!strcmp(kv, "exclude")) {
+			o.flags |= BPF_RECLAIM_CHILD_EXCLUDE;
+		} else {
+			fprintf(stderr, "%s: unknown child option %s\n", name, kv);
+			return -1;
+		}
+	}
+	if (bpf_map__update_elem(skel->maps.children, &id, sizeof(id), &o, sizeof(o), 0)) {
+		fprintf(stderr, "%s: failed to store the child's options: %s\n", name,
+			strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static int child_state(struct reclaim *skel, struct child *kid, struct bpf_reclaim_cgroup *cg)
 {
 	return bpf_map__lookup_elem(skel->maps.cgroups, &kid->fd, sizeof(kid->fd), cg,
@@ -185,18 +249,20 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 	for (i = 0; i < max; i++) {
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
 			continue;
-		printf("  cg=%s usage=%.0fM pressure=%.2f%% refault=%.1fM/s undone=%.1fM/s "
-		       "growth=%+.1fM/s cold=%.0f%% headroom=%.0fM reclaimed=%.1fM/s cpu=%.0f%% "
-		       "eff=%.0fM/s refaults=%llu calls=%llu empty=%llu%s%s\n",
-		       kids[i].name, cg.usage / MB, cg.pressure_ppm / 1e4, cg.refault_rate / MB,
-		       cg.undone_rate / MB, cg.growth / MB,
-		       100.0 * cg.coldness / BPF_RECLAIM_COLD_MAX, cg.headroom / MB,
-		       (cg.reclaimed - kids[i].last.reclaimed) / MB / dt, cg.busy_ppm / 1e4,
-		       cg.efficiency / MB,
+		printf("  cg=%s usage=%.0fM protected=%.0fM pressure=%.2f%% refault=%.1fM/s "
+		       "undone=%.1fM/s growth=%+.1fM/s cold=%.0f%% weight=%llu headroom=%.0fM "
+		       "reclaimed=%.1fM/s cpu=%.0f%% eff=%.0fM/s refaults=%llu calls=%llu "
+		       "empty=%llu%s%s%s\n",
+		       kids[i].name, cg.usage / MB, cg.protected / MB, cg.pressure_ppm / 1e4,
+		       cg.refault_rate / MB, cg.undone_rate / MB, cg.growth / MB,
+		       100.0 * cg.coldness / BPF_RECLAIM_COLD_MAX, (unsigned long long)cg.weight,
+		       cg.headroom / MB, (cg.reclaimed - kids[i].last.reclaimed) / MB / dt,
+		       cg.busy_ppm / 1e4, cg.efficiency / MB,
 		       (unsigned long long)(cg.refaults_total - kids[i].last.refaults_total),
 		       (unsigned long long)(cg.calls - kids[i].last.calls),
 		       (unsigned long long)(cg.empty - kids[i].last.empty),
-		       cg.gated ? " gated" : "", cg.rest ? " resting" : "");
+		       cg.gated ? " gated" : "", cg.rest ? " resting" : "",
+		       cg.excluded ? " excluded" : "");
 		kids[i].last = cg;
 	}
 	fflush(stdout);
@@ -260,6 +326,7 @@ int main(int argc, char **argv)
 		{ "cpu-budget", required_argument, NULL, 'C' },
 		{ "min-efficiency", required_argument, NULL, 'e' },
 		{ "swappiness", required_argument, NULL, 'w' },
+		{ "child", required_argument, NULL, 'x' },
 		{ "status-ms", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{},
@@ -278,11 +345,12 @@ int main(int argc, char **argv)
 	struct sigaction sa = { .sa_handler = on_signal };
 	struct reclaim *skel;
 	const char *root;
+	char *child_specs[BPF_RECLAIM_MAX_CGROUPS];
 	double status_s = 1.0, target_pct = 1.0, start, last;
-	int opt, i, err = 1;
+	int opt, i, nr_child_specs = 0, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:L:r:P:c:f:t:C:e:w:s:v", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "b:i:L:r:P:c:f:t:C:e:w:x:s:v", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'b':
 			cfg.buffer = strtoull(optarg, NULL, 0) << 20;
@@ -318,6 +386,11 @@ int main(int argc, char **argv)
 		case 'w':
 			cfg.swappiness = !strcmp(optarg, "anon") ? BPF_RECLAIM_SWAPPINESS_ANON_ONLY
 							       : atoi(optarg);
+			break;
+		case 'x':
+			if (nr_child_specs == BPF_RECLAIM_MAX_CGROUPS)
+				goto usage;
+			child_specs[nr_child_specs++] = optarg;
 			break;
 		case 's':
 			status_s = strtoul(optarg, NULL, 0) / 1000.0;
@@ -361,6 +434,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to load the reclaim object: %s\n", strerror(errno));
 		goto out;
 	}
+	for (i = 0; i < nr_child_specs; i++)
+		if (parse_child(skel, root, child_specs[i]))
+			goto out;
 
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
@@ -400,7 +476,9 @@ out:
 usage:
 	fprintf(stderr, "usage: %s [-v] [--buffer MB] [--interval-ms N] [--lead-ms N] [--max-rate MB/s]\n"
 		"          [--pool N] [--chunk MB] [--floor MB] [--target PCT] [--cpu-budget PCT]\n"
-		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N] ROOT_CGROUP\n",
+		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N]\n"
+		"          [--child NAME:floor=MB,weight=N,target=PCT,budget=PCT,efficiency=MB/s,\n"
+		"                        swappiness=N|anon,exclude]... ROOT_CGROUP\n",
 		basename(argv[0]));
 	return 2;
 }

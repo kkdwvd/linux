@@ -18,6 +18,26 @@
 /* The kernel's SWAPPINESS_ANON_ONLY from mm/internal.h: reclaim only anon. */
 #define BPF_RECLAIM_SWAPPINESS_ANON_ONLY	201
 
+/* Per-child overrides, keyed by cgroup ID. A field counts only if its bit is set. */
+#define BPF_RECLAIM_CHILD_FLOOR		(1 << 0)
+#define BPF_RECLAIM_CHILD_WEIGHT	(1 << 1)
+#define BPF_RECLAIM_CHILD_TARGET	(1 << 2)
+#define BPF_RECLAIM_CHILD_BUDGET	(1 << 3)
+#define BPF_RECLAIM_CHILD_EFFICIENCY	(1 << 4)
+#define BPF_RECLAIM_CHILD_SWAPPINESS	(1 << 5)
+#define BPF_RECLAIM_CHILD_EXCLUDE	(1 << 6)
+#define BPF_RECLAIM_WEIGHT_MAX		10000
+
+struct bpf_reclaim_child_cfg {
+	__u64 floor;		/* bytes of usage never reclaimed below */
+	__u64 weight;		/* importance in the split, 1 to BPF_RECLAIM_WEIGHT_MAX */
+	__u64 target_ppm;	/* tolerated stall fraction */
+	__u64 cpu_budget_ppm;	/* CPU it may cost per tick */
+	__u64 min_efficiency;	/* bytes per CPU-second below which it is expensive */
+	__s32 swappiness;	/* -1 for the cgroup's own, or anon only */
+	__u32 flags;
+};
+
 /* The policy, filled in by the loader before the setup program runs. */
 struct bpf_reclaim_cfg {
 	__u64 root_cgroup_id;	/* the cgroup whose children are managed */
@@ -43,8 +63,12 @@ struct bpf_reclaim_cgroup {
 	__u64 quota;		/* bytes left to reclaim this tick */
 	__u64 asked;		/* bytes of quota the last tick gave it */
 	__u64 usage;		/* bytes charged at the last tick */
+	__u64 protected;	/* the larger of its floor and its memory.low or memory.min */
 	__u64 headroom;		/* bytes on offer at the last tick */
+	__u64 weight;		/* its configured importance */
 	__u64 share;		/* its weight in this tick's split of the demand */
+	__s32 swappiness;	/* the swappiness its reclaim calls use */
+	__u32 excluded;		/* configured out of the policy */
 	__u64 coldness;		/* estimate that what it holds above the floor is cold */
 	__u64 stall_ns;		/* PSI memory some total at the last tick */
 	__u64 pressure_ppm;	/* smoothed stall fraction */

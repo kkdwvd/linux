@@ -49,6 +49,14 @@
  * done or the child has nothing left to give this tick, in which case the
  * child sits the next tick out. Any worker serves any child.
  *
+ * Children are equal unless the loader says otherwise: a per-child map of
+ * overrides, keyed by cgroup ID, carries a floor, a weight that multiplies
+ * into the split, a pressure target, a CPU budget, an efficiency floor and
+ * a swappiness, or excludes the child. A child's memory.low and memory.min
+ * are honoured as a floor of their own: the kernel ignores a cgroup's own
+ * protection when that cgroup is the root of a reclaim, as it is here, so
+ * the policy has to.
+ *
  * Per-child state lives in cgroup storage, so it is freed with the cgroup,
  * and a child that appears or disappears needs no help from user space: the
  * controller publishes the IDs it found at the last tick, and the workers
@@ -83,6 +91,13 @@ struct {
 	__type(key, int);
 	__type(value, struct bpf_reclaim_cgroup);
 } cgroups SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, BPF_RECLAIM_MAX_CGROUPS);
+	__type(key, __u64);
+	__type(value, struct bpf_reclaim_child_cfg);
+} children SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -167,17 +182,68 @@ static int discover(struct bpf_reclaim_control *c)
 	return 0;
 }
 
+/* The effective configuration of a child: the defaults, overridden per child. */
+struct child_cfg {
+	__u64 floor;
+	__u64 weight;
+	__u64 target_ppm;
+	__u64 cpu_budget_ppm;
+	__u64 min_efficiency;
+	__s32 swappiness;
+	bool excluded;
+};
+
+static __always_inline void child_config(__u64 id, struct child_cfg *out)
+{
+	struct bpf_reclaim_child_cfg *o;
+
+	out->floor = cfg.floor;
+	out->weight = 1;
+	out->target_ppm = cfg.target_ppm;
+	out->cpu_budget_ppm = cfg.cpu_budget_ppm;
+	out->min_efficiency = cfg.min_efficiency;
+	out->swappiness = cfg.swappiness;
+	out->excluded = false;
+	o = bpf_map_lookup_elem(&children, &id);
+	if (!o)
+		return;
+	if (o->flags & BPF_RECLAIM_CHILD_FLOOR)
+		out->floor = o->floor;
+	if (o->flags & BPF_RECLAIM_CHILD_WEIGHT)
+		out->weight = o->weight;
+	if (o->flags & BPF_RECLAIM_CHILD_TARGET)
+		out->target_ppm = o->target_ppm;
+	if (o->flags & BPF_RECLAIM_CHILD_BUDGET)
+		out->cpu_budget_ppm = o->cpu_budget_ppm;
+	if (o->flags & BPF_RECLAIM_CHILD_EFFICIENCY)
+		out->min_efficiency = o->min_efficiency;
+	if (o->flags & BPF_RECLAIM_CHILD_SWAPPINESS)
+		out->swappiness = o->swappiness;
+	if (o->flags & BPF_RECLAIM_CHILD_EXCLUDE)
+		out->excluded = true;
+	if (!out->weight)
+		out->weight = 1;
+	if (out->weight > BPF_RECLAIM_WEIGHT_MAX)
+		out->weight = BPF_RECLAIM_WEIGHT_MAX;
+}
+
 /*
- * One sample of a child: its stall time, usage and refaults. The stall
- * total is U64_MAX when PSI is off, in which case pressure reads as zero
- * and the gate runs on refaults alone.
+ * One sample of a child: its stall time, usage, protection and refaults.
+ * The stall total is U64_MAX when PSI is off, in which case pressure reads
+ * as zero and the gate runs on refaults alone.
  */
 static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *memcg,
-					__u64 *stall, __u64 *usage, __u64 *refaults,
-					__u64 *scanned, __u64 *stolen)
+					__u64 *stall, __u64 *usage, __u64 *protected,
+					__u64 *refaults, __u64 *scanned, __u64 *stolen)
 {
+	unsigned long low, min;
+
 	*stall = bpf_psi_total(cgrp, PSI_MEM_SOME);
 	*usage = bpf_mem_cgroup_usage(memcg);
+	/* The configured protection, which is at least the effective one. */
+	low = memcg->memory.low;
+	min = memcg->memory.min;
+	*protected = (low > min ? low : min) << PAGE_SHIFT;
 	bpf_mem_cgroup_flush_stats(memcg);
 	*refaults = bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_ANON) +
 		    bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_FILE);
@@ -204,8 +270,9 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
 	struct cgroup *cgrp;
-	__u64 stall, usage, refaults, refaulted = 0, reclaimed, undone, pressure = 0, headroom = 0;
-	__u64 asked, busy, scanned, stolen;
+	__u64 stall, usage, protected, refaults, refaulted = 0, reclaimed, undone, pressure = 0;
+	__u64 headroom = 0, asked, busy, scanned, stolen;
+	struct child_cfg conf;
 	__s64 growth;
 	bool thrashing, expensive;
 
@@ -224,11 +291,18 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		bpf_cgroup_release(cgrp);
 		return -ENOENT;
 	}
-	read_cgroup(cgrp, memcg, &stall, &usage, &refaults, &scanned, &stolen);
+	read_cgroup(cgrp, memcg, &stall, &usage, &protected, &refaults, &scanned, &stolen);
 	bpf_put_mem_cgroup(memcg);
 	bpf_cgroup_release(cgrp);
 
-	cg->budget_ns = cfg.interval_ns / 1000000 * cfg.cpu_budget_ppm;
+	child_config(id, &conf);
+	if (conf.floor > protected)
+		protected = conf.floor;
+	cg->protected = protected;
+	cg->weight = conf.weight;
+	cg->swappiness = conf.swappiness;
+	cg->excluded = conf.excluded;
+	cg->budget_ns = cfg.interval_ns / 1000000 * conf.cpu_budget_ppm;
 	/* A child seen for the first time gives baselines, not a sample. */
 	if (!cg->coldness) {
 		cg->coldness = COLD_INIT;
@@ -278,7 +352,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	cg->busy_ppm = ewma(cg->busy_ppm, busy / dt_ms);
 	if (busy >= BUSY_MIN)
 		cg->efficiency = ewma(cg->efficiency, reclaimed * 1000 / (busy / 1000000));
-	expensive = busy >= BUSY_MIN && cg->efficiency < cfg.min_efficiency;
+	expensive = busy >= BUSY_MIN && cg->efficiency < conf.min_efficiency;
 	if (scanned >= cg->scanned)
 		cg->scanned_total += scanned - cg->scanned;
 	if (stolen >= cg->stolen)
@@ -301,7 +375,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	 */
 	thrashing = cg->refault_rate > REFAULT_MIN &&
 		    (cg->refault_rate * 2 > cg->reclaim_rate ||
-		     cg->pressure_ppm > cfg.target_ppm);
+		     cg->pressure_ppm > conf.target_ppm);
 	cg->gated = thrashing || expensive;
 	if (cg->gated) {
 		cg->gated_ticks++;
@@ -323,19 +397,19 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		if (cg->coldness > COLD_MAX)
 			cg->coldness = COLD_MAX;
 		/*
-		 * On offer is the usage above the floor, unless a worker found
-		 * the child empty since the last tick: then it sits this tick
-		 * out rather than drawing quota it cannot serve. Less than a
-		 * chunk is not worth a share of the demand.
+		 * On offer is the usage above the protected part, unless a
+		 * worker found the child empty since the last tick: then it
+		 * sits this tick out rather than drawing quota it cannot
+		 * serve. Less than a chunk is not worth a share of the demand.
 		 */
-		if (usage > cfg.floor && !cg->exhausted)
-			headroom = usage - cfg.floor;
+		if (usage > protected && !cg->exhausted && !conf.excluded)
+			headroom = usage - protected;
 		if (headroom < cfg.chunk)
 			headroom = 0;
 	}
 	cg->exhausted = 0;
 	cg->headroom = headroom;
-	cg->share = cg->coldness * (headroom >> 20);
+	cg->share = conf.weight * cg->coldness * (headroom >> 20);
 	cg->quota = 0;
 	*weight = cg->share;
 	return 0;
@@ -346,7 +420,7 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
  * to a slice of its headroom: a quarter of it for a fully cold child, less
  * in proportion to a smaller coldness.
  */
-static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total)
+static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u32 shift)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct cgroup *cgrp;
@@ -358,14 +432,15 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total)
 	cg = bpf_cgrp_storage_get(&cgroups, cgrp, 0, 0);
 	if (cg && cg->share) {
 		/*
-		 * demand * share / total without a 128-bit product: the ratio
-		 * is scaled to 20 bits, which is exact to a millionth and keeps
-		 * the product within 64 bits for a demand below 16 TiB.
+		 * demand * share / total without a 128-bit product: the shares
+		 * are brought below 32 bits by the caller's shift, the ratio is
+		 * scaled to 20 bits, which is exact to a millionth, and the
+		 * product stays within 64 bits for a demand below 16 TiB.
 		 */
 		if (cg->share >= total)
 			quota = demand;
 		else
-			quota = (demand * ((cg->share << 20) / total)) >> 20;
+			quota = (demand * (((cg->share >> shift) << 20) / (total >> shift))) >> 20;
 		slice = (cg->headroom >> 2) / COLD_MAX * cg->coldness;
 		if (quota > slice)
 			quota = slice;
@@ -411,7 +486,7 @@ static int control_cb(void *map, int *key, void *value)
 	__u64 now, dt_ms, free, demand, weight, reclaimed, lose, pred, cap, per_worker;
 	__u64 total = 0, quota = 0, tick_reclaimed = 0;
 	__s64 drain;
-	__u32 zero = 0, seq, k, n;
+	__u32 zero = 0, seq, k, n, shift = 0;
 	int i;
 
 	p = bpf_map_lookup_elem(&pool, &zero);
@@ -471,10 +546,16 @@ static int control_cb(void *map, int *key, void *value)
 	c->demand = demand;
 
 	if (demand && total) {
+		/* Bring the shares below 32 bits for the split's arithmetic. */
+		bpf_repeat(64) {
+			if ((total >> shift) < (1ULL << 32))
+				break;
+			shift++;
+		}
 		bpf_for(i, 0, n) {
 			if (i >= BPF_RECLAIM_MAX_CGROUPS)
 				break;
-			quota += set_quota(c->ids[i], demand, total);
+			quota += set_quota(c->ids[i], demand, total, shift);
 		}
 	}
 
@@ -554,7 +635,7 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 			break;
 		}
 		start = bpf_ktime_get_ns();
-		ret = bpf_proactive_reclaim(memcg, take - done, cfg.swappiness);
+		ret = bpf_proactive_reclaim(memcg, take - done, cg->swappiness);
 		start = bpf_ktime_get_ns() - start;
 		busy += start;
 		__sync_fetch_and_add(&cg->tick_busy_ns, start);
