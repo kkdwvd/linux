@@ -565,6 +565,7 @@ static int setup_server(struct ctx *c, int family, unsigned int flags)
 	c->skel = xdp_tcp__open_and_load();
 	if (!ASSERT_OK_PTR(c->skel, "xdp_tcp__open_and_load"))
 		goto fail;
+	c->skel->bss->serve_port = PORT;
 	c->ifindex = if_nametoindex(DEV);
 	if (!ASSERT_GT(c->ifindex, 0, "if_nametoindex"))
 		goto fail;
