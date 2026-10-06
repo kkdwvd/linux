@@ -3,27 +3,49 @@
  * TCP from XDP.
  *
  * An XDP program that serves established TCP connections uses these kfuncs to
- * receive data segments before they become skbs, without the socket's owner
- * being woken. The stack keeps the connection: the handshake, ACK processing,
- * congestion control, retransmission, the window and the segments it sends
- * are its, and every kfunc that touches connection state runs under the
- * socket lock. What is this file's on the sending side is the way a served
- * connection's segments leave the host, see xdp_tcp_adopt().
+ * receive data segments before they become skbs and to answer through the
+ * connection, without the socket's owner being woken. The stack keeps the
+ * connection: the handshake, ACK processing, congestion control,
+ * retransmission, the window and the segments it sends are its, and every
+ * kfunc that touches connection state runs under the socket lock. What is
+ * this file's on the sending side is the way a served connection's segments
+ * leave the host, see xdp_tcp_adopt().
  *
- *   bpf_xdp_tcp_recv()     finds the connection and, if the segment is the
- *                          next in sequence and nothing is in the way, takes
- *                          it as tcp_rcv_established() would, with the data
- *                          counted as received and read rather than queued.
- *                          Anything else is a status for the program: out of
- *                          order or the socket busy, so pass the frame on; a
- *                          duplicate, acknowledged on the spot; or a segment
- *                          for the stack.
- *   bpf_xdp_tcp_lookup()   split the in-order path in two, for a program that
- *   bpf_xdp_tcp_consume()  inspects a segment before it accepts it
- *   bpf_xdp_tcp_send()     queues a response on the write queue and pushes it
- *                          at once from BH context, or asks the program to
- *                          try again
- *   bpf_xdp_tcp_release()  drops the socket reference
+ * The receive side, in the order a program uses it:
+ *
+ *   bpf_xdp_tcp_recv()          finds the connection and, if the segment is
+ *                               the next in sequence and nothing is in the
+ *                               way, takes it as tcp_rcv_established() would,
+ *                               with the data counted as received and read
+ *                               rather than queued. Anything else is a status
+ *                               for the program: out of order or the socket
+ *                               busy, so hold the frame or pass it; a
+ *                               duplicate, acknowledged on the spot; or a
+ *                               segment for the stack.
+ *   bpf_xdp_tcp_hold()          admits a frame the program took out of XDP:
+ *                               its ACK is processed and data beyond the
+ *                               receive cursor SACKed, the cursor stays. The
+ *                               program keeps the frame in structures of its
+ *                               own and under a budget of its own; nothing is
+ *                               charged to the socket.
+ *   bpf_xdp_tcp_consume_frame() takes a held frame once the cursor has
+ *                               reached it, one segment at a time.
+ *   bpf_xdp_tcp_dup()           D-SACK for overlap the program found among its
+ *                               frames, and SACK reset when it prunes them
+ *   bpf_xdp_tcp_ooo_reset()
+ *   bpf_xdp_tcp_ack_pending()   the ACK decision after a batch of frames
+ *
+ *   bpf_xdp_tcp_lookup() and bpf_xdp_tcp_consume() split the in-order path in
+ *   two, for a program that inspects a segment before it accepts it.
+ *
+ * The send side:
+ *
+ *   bpf_xdp_tcp_send()          queues a response on the write queue and
+ *                               pushes it at once from BH context, or asks
+ *                               the program to try again
+ *   bpf_xdp_tcp_acquire()       a reference to the connection to keep outside
+ *                               XDP, in a kptr
+ *   bpf_xdp_tcp_release()       drops a reference
  *
  * tcp_ack() and friends work on an skb; a segment is described to them with a
  * stack skb whose head holds a copy of the headers and whose control block is
@@ -31,6 +53,9 @@
  */
 #include <linux/bpf.h>
 #include <linux/bpf-cgroup.h>
+#include <linux/irq_work.h>
+#include <linux/llist.h>
+#include <linux/workqueue.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/skbuff.h>
@@ -52,14 +77,15 @@
 
 enum bpf_xdp_tcp_status {
 	BPF_XDP_TCP_RECEIVED = 1,	/* taken: the payload range is the program's to read */
-	BPF_XDP_TCP_OUT_OF_ORDER,	/* within the window, beyond the cursor: pass it on */
-	BPF_XDP_TCP_BUSY,		/* socket owned or unread data in the stack: pass it on */
+	BPF_XDP_TCP_OUT_OF_ORDER,	/* within the window, beyond the cursor: hold or pass */
+	BPF_XDP_TCP_BUSY,		/* socket owned or unread data in the stack: hold or pass */
 	BPF_XDP_TCP_DUPLICATE,		/* nothing new, acknowledged: drop it */
 	BPF_XDP_TCP_PASS,		/* for the stack: outside the window or unhandled here */
 };
 
 enum bpf_xdp_tcp_info_flags {
 	BPF_XDP_TCP_FIN		= 1,	/* the segment ends the peer's stream */
+	BPF_XDP_TCP_SACKED	= 2,	/* SACKed data beyond the cursor: held frames may be due */
 };
 
 struct bpf_xdp_tcp_info {
@@ -70,6 +96,7 @@ struct bpf_xdp_tcp_info {
 	__u32 rcv_nxt;		/* the connection's receive cursor afterwards */
 	__u32 status;		/* enum bpf_xdp_tcp_status */
 	__u32 flags;		/* enum bpf_xdp_tcp_info_flags */
+	__u32 reserved;
 	__u64 cookie;		/* the socket's cookie, a key for per-connection state */
 };
 
@@ -355,6 +382,7 @@ static void xdp_tcp_info(const struct xdp_buff *xdp, const struct xdp_tcp_hdrs *
 	info->rcv_nxt = READ_ONCE(tcp_sk(sk)->rcv_nxt);
 	info->status = 0;
 	info->flags = h->th->fin ? BPF_XDP_TCP_FIN : 0;
+	info->reserved = 0;
 	info->cookie = sock_gen_cookie(sk);
 }
 
@@ -493,6 +521,23 @@ static u32 xdp_tcp_classify(const struct tcp_sock *tp, u32 seq, u32 end_seq)
 	return BPF_XDP_TCP_RECEIVED;
 }
 
+/* Unlike tcp_sack_remove(), a caller can consume just part of a SACK block. */
+static void xdp_tcp_sack_remove(struct tcp_sock *tp)
+{
+	int i, n = 0;
+
+	for (i = 0; i < tp->rx_opt.num_sacks; i++) {
+		struct tcp_sack_block sack = tp->selective_acks[i];
+
+		if (!after(sack.end_seq, tp->rcv_nxt))
+			continue;
+		if (before(sack.start_seq, tp->rcv_nxt))
+			sack.start_seq = tp->rcv_nxt;
+		tp->selective_acks[n++] = sack;
+	}
+	tp->rx_opt.num_sacks = n;
+}
+
 /* The segment's ACK and timestamp count once, when it is first seen. */
 static void xdp_tcp_ack(struct sock *sk, const struct xdp_tcp_skb *fake,
 			const struct xdp_tcp_hdrs *h, s32 ts_delta)
@@ -512,13 +557,16 @@ static void xdp_tcp_ack(struct sock *sk, const struct xdp_tcp_skb *fake,
 	tcp_ecn_received_counters(sk, skb, h->payload_len);
 }
 
+#define XDP_TCP_TAKE_FRESH	BIT(0)	/* new to the connection: RTT and autotuning input */
+#define XDP_TCP_TAKE_NOW	BIT(1)	/* acknowledge at once, as after a hole is filled */
+
 /*
  * Take the new part of a segment that starts at or before the receive cursor,
  * as tcp_rcv_established() does for one the stack keeps, with the data counted
  * as read instead of queued. With the socket locked and not owned.
  */
 static void xdp_tcp_take(struct sock *sk, struct xdp_tcp_skb *fake, const struct xdp_tcp_hdrs *h,
-			 struct bpf_xdp_tcp_info *info)
+			 unsigned int how, struct bpf_xdp_tcp_info *info)
 {
 	struct sk_buff *skb = &fake->skb;
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -532,20 +580,27 @@ static void xdp_tcp_take(struct sock *sk, struct xdp_tcp_skb *fake, const struct
 	info->payload_off += skip;
 	info->payload_len -= skip;
 	info->seq += skip;
-	tcp_rcv_rtt_measure_ts(sk, skb);
-	tcp_event_data_recv(sk, skb);
+	if (how & XDP_TCP_TAKE_FRESH) {
+		tcp_rcv_rtt_measure_ts(sk, skb);
+		tcp_event_data_recv(sk, skb);
+	}
 	/* Received and read by the program; the read side's autotuning runs here. */
 	tcp_rcv_nxt_update(tp, end_seq);
 	WRITE_ONCE(tp->copied_seq, end_seq);
+	if (tp->rx_opt.num_sacks)
+		xdp_tcp_sack_remove(tp);
 	inet_csk_schedule_ack(sk);
-	if (h->th->fin) {
+	if ((how & XDP_TCP_TAKE_NOW) || h->th->fin)
 		inet_csk(sk)->icsk_ack.pending |= ICSK_ACK_NOW;
+	if (h->th->fin)
 		tcp_fin(sk);
-	}
 	tcp_rcv_space_adjust(sk);
 	info->rcv_nxt = tp->rcv_nxt;
 	info->status = BPF_XDP_TCP_RECEIVED;
+	if (tp->rx_opt.num_sacks)
+		info->flags |= BPF_XDP_TCP_SACKED;
 }
+
 
 /* What tcp_v4_rcv() counts for a segment it hands to a socket. */
 static void xdp_tcp_count_in(struct sock *sk, const struct xdp_tcp_hdrs *h)
@@ -595,8 +650,8 @@ static u32 xdp_tcp_rcv(struct sock *sk, const struct xdp_tcp_hdrs *h, struct xdp
 		xdp_tcp_count_in(sk, h);
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPHPHITS);
 		xdp_tcp_ack(sk, fake, h, ts_delta);
-		xdp_tcp_take(sk, fake, h, info);
-		__tcp_ack_snd_check(sk, 0);
+		xdp_tcp_take(sk, fake, h, XDP_TCP_TAKE_FRESH, info);
+		__tcp_ack_snd_check(sk, tp->rx_opt.num_sacks != 0);
 	}
 	return status;
 }
@@ -622,7 +677,8 @@ __bpf_kfunc_start_defs();
  * BPF_XDP_TCP_OUT_OF_ORDER: the segment is within the window but beyond the
  * receive cursor. BPF_XDP_TCP_BUSY: the segment is next, but the socket is
  * owned by its user or the stack holds unread data. In both cases nothing was
- * done, and the program passes the frame to the stack.
+ * done: the program takes the frame and holds it, see bpf_xdp_tcp_hold(), or
+ * passes it to the stack.
  *
  * BPF_XDP_TCP_DUPLICATE: nothing new in it; it was D-SACKed and acknowledged,
  * drop it. BPF_XDP_TCP_PASS: outside the window, or something handled here
@@ -713,6 +769,301 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
 	bh_unlock_sock(sk);
 	return status == BPF_XDP_TCP_RECEIVED ? 0 : -EAGAIN;
 }
+
+/**
+ * bpf_xdp_tcp_hold - admit a frame the program keeps to its connection
+ * @sk: the connection
+ * @frame: a frame taken with bpf_xdp_frame_steal()
+ *
+ * For a segment bpf_xdp_tcp_recv() reported out of order or the socket busy
+ * for. Under the socket lock, the segment's ACK and timestamp are processed
+ * and data beyond the receive cursor is SACKed; the cursor does not move.
+ * Nothing is charged to the socket: the program holds the frame in its own
+ * structures and keeps its own budget, and what it holds stays bounded by the
+ * window. The frame then belongs to bpf_xdp_tcp_consume_frame().
+ *
+ * Returns 0 once admitted, which a repeated call reports again. -EAGAIN says
+ * the socket is owned by its user: keep the frame and retry. -EALREADY says
+ * the data is all old, D-SACKed and acknowledged here; -ERANGE that it is
+ * outside the window; -EINVAL that the frame is not the socket's or not one
+ * handled here: give such frames back.
+ */
+__bpf_kfunc int bpf_xdp_tcp_hold(struct sock *sk, struct xdp_frame *frame)
+{
+	struct xdp_buff xdp = {};
+	struct xdp_tcp_skb fake;
+	struct xdp_tcp_hdrs h;
+	struct tcp_sock *tp;
+	u32 status, seq, end_seq;
+	s32 ts_delta;
+	int err;
+
+	if (frame->flags & XDP_FLAGS_BPF_TCP_HELD)
+		return 0;
+	xdp_convert_frame_to_buff(frame, &xdp);
+	if (!xdp_tcp_parse(&xdp, &h, true) || !xdp_tcp_matches(sk, &h))
+		return -EINVAL;
+	tp = tcp_sk(sk);
+	xdp_tcp_build_skb(&fake, &h);
+	fake.skb.truesize = frame->frame_sz;
+	seq = ntohl(h.th->seq);
+	end_seq = seq + h.payload_len + h.th->fin;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	err = -EAGAIN;
+	if (sock_owned_by_user(sk))
+		goto out;
+	err = -ENOTCONN;
+	if (sk->sk_state != TCP_ESTABLISHED)
+		goto out;
+	err = -EINVAL;
+	if (!xdp_tcp_validate(sk, &h, &ts_delta) || !xdp_tcp_adopt(sk))
+		goto out;
+	status = xdp_tcp_classify(tp, seq, end_seq);
+	if (status == BPF_XDP_TCP_PASS) {
+		err = -ERANGE;
+		goto out;
+	}
+	/* Admitted or acknowledged here: counted here, not when it is consumed later. */
+	xdp_tcp_count_in(sk, &h);
+	if (status == BPF_XDP_TCP_DUPLICATE) {
+		xdp_tcp_dup(sk, seq, end_seq);
+		err = -EALREADY;
+		goto out;
+	}
+	xdp_tcp_ack(sk, &fake, &h, ts_delta);
+	frame->flags |= XDP_FLAGS_BPF_TCP_HELD;
+	if (status == BPF_XDP_TCP_OUT_OF_ORDER) {
+		/*
+		 * The side effects of tcp_data_queue_ofo(), without the skb.
+		 * Header prediction goes off: a segment the stack takes while
+		 * frames are held has to go its slow path, which keeps the SACK
+		 * blocks it finds beyond RCV.NXT, see tcp_sack_remove().
+		 */
+		frame->flags |= XDP_FLAGS_BPF_TCP_OOO;
+		tp->pred_flags = 0;
+		tcp_data_ecn_check(sk, &fake.skb);
+		tcp_measure_rcv_mss(sk, &fake.skb);
+		tp->rcv_ooopack++;
+		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPOFOQUEUE);
+		if (tcp_is_sack(tp)) {
+			tcp_sack_new_ofo_skb(sk, seq, end_seq);
+			tcp_grow_window(sk, &fake.skb, false);
+		}
+		inet_csk_schedule_ack(sk);
+		__tcp_ack_snd_check(sk, true);
+	}
+	err = 0;
+out:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	return err;
+}
+
+/**
+ * bpf_xdp_tcp_consume_frame - take a held frame once the cursor has reached it
+ * @sk: the connection
+ * @frame: a frame admitted with bpf_xdp_tcp_hold()
+ * @info: the range of newly received payload, without any old prefix
+ *
+ * Returns 0 with the payload range, and the program reads it and gives the
+ * frame back. -ENODATA says a hole remains before the frame; -EAGAIN that the
+ * socket is owned by its user or the stack holds unread data: keep the frame
+ * in both cases. -EALREADY says the data has all been received meanwhile and
+ * the frame can go; -EINVAL that the frame was not admitted or is not the
+ * socket's.
+ */
+__bpf_kfunc int bpf_xdp_tcp_consume_frame(struct sock *sk, struct xdp_frame *frame,
+					  struct bpf_xdp_tcp_info *info)
+{
+	struct xdp_buff xdp = {};
+	struct xdp_tcp_skb fake;
+	struct xdp_tcp_hdrs h;
+	struct tcp_sock *tp = tcp_sk(sk);
+	u32 status, seq, end_seq;
+	int err;
+
+	if (!(frame->flags & XDP_FLAGS_BPF_TCP_HELD))
+		return -EINVAL;
+	xdp_convert_frame_to_buff(frame, &xdp);
+	/* Checked at admission, and read-only since. */
+	if (!xdp_tcp_parse(&xdp, &h, false) || !xdp_tcp_matches(sk, &h))
+		return -EINVAL;
+	xdp_tcp_build_skb(&fake, &h);
+	seq = ntohl(h.th->seq);
+	end_seq = seq + h.payload_len + h.th->fin;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	err = -EAGAIN;
+	if (sock_owned_by_user(sk))
+		goto out;
+	err = -ENOTCONN;
+	if (sk->sk_state != TCP_ESTABLISHED)
+		goto out;
+	err = -EINVAL;
+	if (!xdp_tcp_adopt(sk))
+		goto out;
+	tp->rx_opt.dsack = 0;
+	status = xdp_tcp_classify(tp, seq, end_seq);
+	switch (status) {
+	case BPF_XDP_TCP_DUPLICATE:
+		frame->flags &= ~(XDP_FLAGS_BPF_TCP_HELD | XDP_FLAGS_BPF_TCP_OOO);
+		xdp_tcp_dup(sk, seq, end_seq);
+		err = -EALREADY;
+		break;
+	case BPF_XDP_TCP_OUT_OF_ORDER:
+		err = -ENODATA;
+		break;
+	case BPF_XDP_TCP_RECEIVED:
+		/* RTT and autotuning saw data admitted out of order already. */
+		xdp_tcp_info(&xdp, &h, sk, info);
+		tcp_mstamp_refresh_inline(tp);
+		xdp_tcp_take(sk, &fake, &h, XDP_TCP_TAKE_NOW |
+			     (frame->flags & XDP_FLAGS_BPF_TCP_OOO ? 0 : XDP_TCP_TAKE_FRESH), info);
+		frame->flags &= ~(XDP_FLAGS_BPF_TCP_HELD | XDP_FLAGS_BPF_TCP_OOO);
+		err = 0;
+		break;
+	default:
+		err = -EAGAIN;
+		break;
+	}
+out:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	return err;
+}
+
+/**
+ * bpf_xdp_tcp_dup - report a duplicate range the program found among its frames
+ * @sk: the connection
+ * @seq: start of the duplicate range
+ * @end_seq: its end
+ *
+ * D-SACKs the range and acknowledges at once, as the stack does for overlap
+ * it finds in its own out-of-order queue. Returns 0, -EAGAIN when the socket
+ * is owned by its user, -EINVAL for an empty range or a socket that is not TCP.
+ */
+__bpf_kfunc int bpf_xdp_tcp_dup(struct sock *sk, u32 seq, u32 end_seq)
+{
+	int err = -EAGAIN;
+
+	if (!xdp_tcp_is_sock(sk) || !before(seq, end_seq))
+		return -EINVAL;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	if (!sock_owned_by_user(sk) && sk->sk_state == TCP_ESTABLISHED) {
+		err = -EINVAL;
+		if (xdp_tcp_adopt(sk)) {
+			xdp_tcp_dup(sk, seq, end_seq);
+			err = 0;
+		}
+	}
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	return err;
+}
+
+/**
+ * bpf_xdp_tcp_ooo_reset - forget SACKed data the program pruned
+ * @sk: the connection
+ *
+ * For a program that gave held frames back under its budget: the SACK blocks
+ * that advertised them are dropped, as tcp_prune_ofo_queue() does, so that the
+ * peer retransmits. Returns 0, or -EAGAIN while the socket is owned by its
+ * user or the stack has an out-of-order queue of its own.
+ */
+__bpf_kfunc int bpf_xdp_tcp_ooo_reset(struct sock *sk)
+{
+	int err = -EAGAIN;
+
+	if (!xdp_tcp_is_sock(sk))
+		return -EINVAL;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	if (!sock_owned_by_user(sk) && RB_EMPTY_ROOT(&tcp_sk(sk)->out_of_order_queue)) {
+		tcp_sack_reset(&tcp_sk(sk)->rx_opt);
+		err = 0;
+	}
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	return err;
+}
+
+/**
+ * bpf_xdp_tcp_ack_pending - send the ACK a batch of consumed frames calls for
+ * @sk: the connection
+ *
+ * bpf_xdp_tcp_consume_frame() schedules an ACK but does not send one, so that
+ * a run of frames taken after a hole is filled is acknowledged once; this
+ * makes the decision. Nothing happens while the socket is owned by its user.
+ */
+__bpf_kfunc void bpf_xdp_tcp_ack_pending(struct sock *sk)
+{
+	if (!xdp_tcp_is_sock(sk))
+		return;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	if (!sock_owned_by_user(sk) && inet_csk_ack_scheduled(sk) && xdp_tcp_adopt(sk))
+		__tcp_ack_snd_check(sk, tcp_sk(sk)->rx_opt.num_sacks != 0);
+	bh_unlock_sock(sk);
+	local_bh_enable();
+}
+
+/**
+ * bpf_xdp_tcp_acquire - a reference to a connection to keep outside XDP
+ * @sk: a TCP socket the program holds a reference to
+ *
+ * For a program that drives held frames from a timer: the reference goes in
+ * a kptr, with a destructor registered for it. Returns NULL for a socket that
+ * is not TCP or is going away.
+ */
+__bpf_kfunc struct sock *bpf_xdp_tcp_acquire(struct sock *sk)
+{
+	if (!xdp_tcp_is_sock(sk) || !refcount_inc_not_zero(&sk->sk_refcnt))
+		return NULL;
+	return sk;
+}
+
+/*
+ * The destructor of a connection kept in a kptr runs where the map element went:
+ * from a tracing program in hard interrupt or NMI context too, where a socket
+ * cannot be freed. A reference that is not the last is dropped there; the last
+ * one waits on a list, its node over sk_rcu, which is unused until destruction
+ * and ours alone with the last reference, and is dropped from a work item.
+ */
+static LLIST_HEAD(xdp_tcp_sock_put_list);
+
+static void xdp_tcp_sock_put_work_fn(struct work_struct *work)
+{
+	struct llist_node *node, *next;
+
+	llist_for_each_safe(node, next, llist_del_all(&xdp_tcp_sock_put_list))
+		sock_put(container_of((struct rcu_head *)node, struct sock, sk_rcu));
+}
+
+static DECLARE_WORK(xdp_tcp_sock_put_work, xdp_tcp_sock_put_work_fn);
+
+static void xdp_tcp_sock_put_irq_work_fn(struct irq_work *work)
+{
+	schedule_work(&xdp_tcp_sock_put_work);
+}
+
+static struct irq_work xdp_tcp_sock_put_irq_work = IRQ_WORK_INIT(xdp_tcp_sock_put_irq_work_fn);
+
+__bpf_kfunc void bpf_xdp_tcp_sock_dtor(void *sk)
+{
+	struct sock *s = sk;
+
+	if (likely(!in_hardirq() && !in_nmi())) {
+		sock_put(s);
+		return;
+	}
+	if (refcount_dec_not_one(&s->sk_refcnt))
+		return;
+	llist_add((struct llist_node *)&s->sk_rcu, &xdp_tcp_sock_put_list);
+	irq_work_queue(&xdp_tcp_sock_put_irq_work);
+}
+CFI_NOSEAL(bpf_xdp_tcp_sock_dtor);
 
 
 /*
@@ -1070,7 +1421,7 @@ out:
 
 /**
  * bpf_xdp_tcp_release - drop a reference to a connection
- * @sk: the socket, from bpf_xdp_tcp_recv() or bpf_xdp_tcp_lookup()
+ * @sk: the socket, from bpf_xdp_tcp_recv(), bpf_xdp_tcp_lookup() or bpf_xdp_tcp_acquire()
  *
  * The verifier lets a program hand over any socket it holds a reference to,
  * one found with bpf_sk_lookup_tcp() included, which carries no reference for
@@ -1091,7 +1442,6 @@ BTF_ID_FLAGS(func, bpf_xdp_tcp_recv, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_lookup, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_consume)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_send)
-BTF_ID_FLAGS(func, bpf_xdp_tcp_release, KF_RELEASE)
 BTF_KFUNCS_END(bpf_xdp_tcp_xdp_kfunc_ids)
 
 static const struct btf_kfunc_id_set bpf_xdp_tcp_xdp_kfunc_set = {
@@ -1099,9 +1449,43 @@ static const struct btf_kfunc_id_set bpf_xdp_tcp_xdp_kfunc_set = {
 	.set = &bpf_xdp_tcp_xdp_kfunc_ids,
 };
 
+/*
+ * On held frames and the connection: XDP and syscall programs, which is also
+ * where a timer callback of either runs. Not tracing, where the socket lock
+ * may be held by the function being traced.
+ */
+BTF_KFUNCS_START(bpf_xdp_tcp_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_hold)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_consume_frame)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_dup)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_ooo_reset)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_ack_pending)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_acquire, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_release, KF_RELEASE)
+BTF_KFUNCS_END(bpf_xdp_tcp_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_xdp_tcp_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_xdp_tcp_kfunc_ids,
+};
+
+BTF_ID_LIST_SINGLE(xdp_tcp_sock_btf_ids, struct, sock)
+BTF_ID_LIST_SINGLE(xdp_tcp_sock_dtor_ids, func, bpf_xdp_tcp_sock_dtor)
+
 static int __init bpf_xdp_tcp_kfunc_init(void)
 {
+	const struct btf_id_dtor_kfunc dtors[] = {
+		{
+			.btf_id = xdp_tcp_sock_btf_ids[0],
+			.kfunc_btf_id = xdp_tcp_sock_dtor_ids[0],
+		},
+	};
+	int err;
+
 	xdp_tcp_init_af_ops();
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_xdp_tcp_xdp_kfunc_set);
+	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_xdp_tcp_xdp_kfunc_set);
+	err = err ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_xdp_tcp_kfunc_set);
+	err = err ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_xdp_tcp_kfunc_set);
+	return err ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
 }
 late_initcall(bpf_xdp_tcp_kfunc_init);
