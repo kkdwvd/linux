@@ -787,6 +787,10 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
  * the data is all old, D-SACKed and acknowledged here; -ERANGE that it is
  * outside the window; -EINVAL that the frame is not the socket's or not one
  * handled here: give such frames back.
+ *
+ * The frame is read-only from here on, since what was admitted is what the
+ * cursor will later be moved by; the verifier invalidates the views the
+ * program had of it, and new ones only read.
  */
 __bpf_kfunc int bpf_xdp_tcp_hold(struct sock *sk, struct xdp_frame *frame)
 {
@@ -832,7 +836,7 @@ __bpf_kfunc int bpf_xdp_tcp_hold(struct sock *sk, struct xdp_frame *frame)
 		goto out;
 	}
 	xdp_tcp_ack(sk, &fake, &h, ts_delta);
-	frame->flags |= XDP_FLAGS_BPF_TCP_HELD;
+	frame->flags |= XDP_FLAGS_BPF_TCP_HELD | XDP_FLAGS_BPF_RDONLY;
 	if (status == BPF_XDP_TCP_OUT_OF_ORDER) {
 		/*
 		 * The side effects of tcp_data_queue_ofo(), without the skb.

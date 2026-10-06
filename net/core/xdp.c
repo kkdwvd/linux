@@ -1191,8 +1191,9 @@ CFI_NOSEAL(bpf_xdp_frame_dtor);
  * @ptr__uninit: the dynptr to set up
  *
  * The dynptr lives as long as the program's reference to the frame: it goes
- * when the frame is released or stored in a kptr field. Writes are allowed;
- * the frame is the program's.
+ * when the frame is released or stored in a kptr field. Writes are allowed,
+ * the frame being the program's, until a kernel subsystem that trusts the
+ * frame's contents marks it read-only, as TCP does on admission.
  */
 __bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *frame, u64 flags,
 					  struct bpf_dynptr *ptr__uninit)
@@ -1204,6 +1205,8 @@ __bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *frame, u64 flags,
 		return -EINVAL;
 	}
 	bpf_dynptr_init(ptr, frame, BPF_DYNPTR_TYPE_XDP_FRAME, 0, xdp_get_frame_len(frame));
+	if (frame->flags & XDP_FLAGS_BPF_RDONLY)
+		bpf_dynptr_set_rdonly(ptr);
 	return 0;
 }
 
