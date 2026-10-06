@@ -81,7 +81,8 @@ kfunc)
 scale)
 	common=(--apps 32 --app-rate 20 --app-rate-max 150 --ramp 40 --app-mb "$(mb 6144)"
 		--grow-after 5 --hot-mb "$(mb 16384)" --hot-threads 8 --cache-mb "$(mb 16384)"
-		--cold-mb "$(mb 32768)" --buffer-mb "$(mb 32768)" --settle 50 --seconds 80)
+		--cache-threads 8 --cold-mb "$(mb 32768)" --cold-threads 8 --buffer-mb "$(mb 32768)"
+		--settle 50 --seconds 80)
 	for sc in scale-anon scale-file; do
 		run $sc-none --scenario $sc "${common[@]}" --mode none
 		run $sc-userspace --scenario $sc "${common[@]}" --mode userspace
@@ -92,9 +93,12 @@ scale)
 	done
 	;;
 tick)
-	common=(--scenario overcommit --hot-mb "$(mb 16384)" --hot-threads 8 --cache-mb "$(mb 16384)"
-		--cold-mb "$(mb 49152)" --grow-mb "$(mb 65536)" --grow-rate 2000 --grow-after 5
-		--buffer-mb "$(mb 32768)" --settle 50 --seconds 60 --mode bpf)
+	# Residents of 160 GB leave about 90 GB free; the allocator then asks for
+	# 128 GB at 2 GB/s, so the pool must move about 70 GB of cold memory out.
+	common=(--scenario overcommit --hot-mb "$(mb 32768)" --hot-threads 8 --cache-mb "$(mb 32768)"
+		--cold-mb "$(mb 98304)" --cold-threads 8 --cache-threads 8 --grow-mb "$(mb 131072)"
+		--grow-rate 2000 --grow-threads 8 --grow-after 5 --buffer-mb "$(mb 32768)" --settle 60
+		--seconds 90 --mode bpf)
 	for interval in 25 100 400; do
 		for lead in 0 1000; do
 			run tick${interval}-lead$lead "${common[@]}" \
@@ -103,9 +107,10 @@ tick)
 	done
 	;;
 placement)
-	common=(--scenario overcommit --hot-mb "$(mb 16384)" --hot-threads 8 --cache-mb "$(mb 16384)"
-		--cold-mb "$(mb 49152)" --grow-mb "$(mb 65536)" --grow-rate 2000 --grow-after 5
-		--buffer-mb "$(mb 32768)" --settle 50 --seconds 60 --mode bpf)
+	common=(--scenario overcommit --hot-mb "$(mb 32768)" --hot-threads 8 --cache-mb "$(mb 32768)"
+		--cold-mb "$(mb 98304)" --cold-threads 8 --cache-threads 8 --grow-mb "$(mb 131072)"
+		--grow-rate 2000 --grow-threads 8 --grow-after 5 --buffer-mb "$(mb 32768)" --settle 60
+		--seconds 90 --mode bpf)
 	run shared-pool8 "${common[@]}" --policy-args "--pool 8"
 	run per-child2 "${common[@]}" --policy-args "--pool 0 --per-child 2"
 	run per-child4 "${common[@]}" --policy-args "--pool 0 --per-child 4"
@@ -113,17 +118,17 @@ placement)
 	;;
 senpai)
 	common=(--scenario overcommit --grow-after -1 --hot-mb "$(mb 16384)" --hot-threads 8
-		--cache-mb "$(mb 16384)" --cache-pass-ms 5000 --cold-mb "$(mb 49152)"
-		--buffer-mb "$(mb 4096)" --settle 50 --seconds 300)
+		--cache-mb "$(mb 16384)" --cache-threads 8 --cache-pass-ms 5000 --cold-mb "$(mb 49152)"
+		--cold-threads 8 --buffer-mb "$(mb 4096)" --settle 50 --seconds 300)
 	run senpai-6s "${common[@]}" --mode senpai --senpai-interval 6 --senpai-probe 1
 	run bpf-probe0.17 "${common[@]}" --mode bpf --policy-args "--pool 4 --probe 0.17"
 	run bpf-probe1 "${common[@]}" --mode bpf --policy-args "--pool 4 --probe 1"
 	;;
 mixed)
 	common=(--scenario overcommit --hot-mb "$(mb 32768)" --hot-threads 8 --cache-mb "$(mb 32768)"
-		--cache-pass-ms 5000 --cold-mb "$(mb 65536)" --grow-mb "$(mb 98304)"
-		--grow-rate 2000 --grow-after 30 --buffer-mb "$(mb 32768)" --settle 60
-		--seconds 120)
+		--cache-threads 8 --cache-pass-ms 5000 --cold-mb "$(mb 98304)" --cold-threads 8
+		--grow-mb "$(mb 131072)" --grow-rate 2000 --grow-threads 8 --grow-after 30
+		--buffer-mb "$(mb 32768)" --settle 60 --seconds 150)
 	run mixed-none "${common[@]}" --mode none
 	run mixed-userspace "${common[@]}" --mode userspace
 	run mixed-bpf-pool8 "${common[@]}" --mode bpf --policy-args "--pool 8"

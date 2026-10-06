@@ -10,7 +10,8 @@
  *        workload file --path P --size MB [--offset MB] [--pass-ms N]
  *        workload file --path P --size MB [--offset MB] --stream --rate MB/s
  *                      [--rate-max MB/s --ramp S]
- *        workload grow --rate MB/s --limit MB [--rate-max MB/s --ramp S] [--fill PCT]
+ *        workload grow --rate MB/s --limit MB [--threads N] [--rate-max MB/s --ramp S]
+ *                      [--fill PCT]
  *        with --seconds S to stop after S seconds.
  *
  * anon walks an anonymous working set of --size MB in 1 MB chunks, writing
@@ -24,6 +25,9 @@
  * keep up with. A rate ramps linearly from --rate to --rate-max over --ramp
  * seconds. --fill makes that many percent of each page random on its first
  * touch, so swapping it costs the compressor real work; the rest is zero.
+ * --threads splits a set or a growth, and its rate, over that many threads;
+ * one thread faults in memory at a few hundred megabytes a second in a
+ * guest, so a fast allocator needs several.
  *
  * Every second prints "t=<s> mb=<MB> p99_us=<N> max_us=<N>": the megabytes
  * touched or read in that second and the chunk latency percentiles, which
@@ -105,7 +109,10 @@ static void sleep_until(uint64_t when)
 	nanosleep(&ts, NULL);
 }
 
-/* The rate at time t since the start, ramping from --rate to --rate-max. */
+/*
+ * The rate at time t since the start, ramping from --rate to --rate-max,
+ * for one of the threads sharing it.
+ */
 static uint64_t rate_bytes(const struct opts *o, uint64_t t_ns)
 {
 	uint64_t rate = o->rate_mb << 20;
@@ -117,6 +124,7 @@ static uint64_t rate_bytes(const struct opts *o, uint64_t t_ns)
 			t_ns = ramp_ns;
 		rate += ((o->rate_max_mb - o->rate_mb) << 20) * t_ns / ramp_ns;
 	}
+	rate /= o->threads;
 	return rate ? rate : 1;
 }
 
@@ -414,7 +422,6 @@ int main(int argc, char **argv)
 		if (!o.rate_mb || !o.limit_mb)
 			goto usage;
 		total = o.limit_mb << 20;
-		o.threads = 1;
 		fn = grow_worker;
 	} else {
 		goto usage;
@@ -470,10 +477,11 @@ int main(int argc, char **argv)
 	return 0;
 usage:
 	fprintf(stderr, "usage: workload anon --size MB [--threads N] [--pass-ms N] [--once] [--fill PCT]\n"
-		"       workload file --path P --size MB [--offset MB] [--pass-ms N]\n"
+		"       workload file --path P --size MB [--threads N] [--offset MB] [--pass-ms N]\n"
 		"       workload file --path P --size MB [--offset MB] --stream --rate MB/s\n"
 		"                     [--rate-max MB/s --ramp S]\n"
-		"       workload grow --rate MB/s --limit MB [--rate-max MB/s --ramp S] [--fill PCT]\n"
+		"       workload grow --rate MB/s --limit MB [--threads N] [--rate-max MB/s --ramp S]\n"
+		"                     [--fill PCT]\n"
 		"       ... [--seconds S]\n");
 	return 2;
 }

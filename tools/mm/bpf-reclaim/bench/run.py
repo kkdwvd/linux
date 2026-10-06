@@ -245,15 +245,16 @@ def scenario(args, paths, out):
                                     str(args.hot_threads)] + fill, paths['hot'], out))
     if args.cache_mb:
         wls.append(Workload('cache', [workload, 'file', '--path', args.data, '--size',
-                                      str(args.cache_mb), '--pass-ms', str(args.cache_pass_ms)],
-                            paths['cache'], out))
+                                      str(args.cache_mb), '--threads', str(args.cache_threads),
+                                      '--pass-ms', str(args.cache_pass_ms)], paths['cache'], out))
     if args.cold_mb:
-        wls.append(Workload('cold', [workload, 'anon', '--size', str(args.cold_mb), '--once'] + fill,
-                            paths['cold'], out))
+        wls.append(Workload('cold', [workload, 'anon', '--size', str(args.cold_mb), '--threads',
+                                     str(args.cold_threads), '--once'] + fill, paths['cold'], out))
     if args.scenario == 'overcommit':
         if args.grow_after >= 0:
             wls.append(Workload('grow', [workload, 'grow', '--rate', str(args.grow_rate),
-                                         '--limit', str(args.grow_mb)] + fill,
+                                         '--limit', str(args.grow_mb), '--threads',
+                                         str(args.grow_threads)] + fill,
                                 paths['grow'], out, start_after=args.grow_after))
         return wls
     ramp = ['--rate', str(args.app_rate), '--rate-max', str(args.app_rate_max),
@@ -344,10 +345,13 @@ def main():
     ap.add_argument('--hot-mb', type=int, default=600, help='0 leaves a resident out')
     ap.add_argument('--hot-threads', type=int, default=2)
     ap.add_argument('--cache-mb', type=int, default=400)
+    ap.add_argument('--cache-threads', type=int, default=1)
     ap.add_argument('--cache-pass-ms', type=int, default=2000)
     ap.add_argument('--cold-mb', type=int, default=700)
+    ap.add_argument('--cold-threads', type=int, default=1)
     ap.add_argument('--grow-mb', type=int, default=1200)
-    ap.add_argument('--grow-rate', type=int, default=100, help='MB/s')
+    ap.add_argument('--grow-rate', type=int, default=100, help='MB/s, over all its threads')
+    ap.add_argument('--grow-threads', type=int, default=1)
     ap.add_argument('--grow-after', type=int, default=20,
                     help='seconds before the allocators start; -1 never starts them')
     ap.add_argument('--fill', type=int, default=50, help='percent of each anon page random')
