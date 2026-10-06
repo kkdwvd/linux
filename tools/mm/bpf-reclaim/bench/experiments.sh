@@ -46,6 +46,22 @@ run() {
 	grep -E '^(free memory|cpu:|kernel reclaim|reclaimer:)' "$dir/summary.txt" 2>/dev/null | sed 's/^/    /'
 }
 
+# A sparse file on an ext4 on a zram device: streaming it fills the page
+# cache at memory speed, where a file on the guest's shared root filesystem
+# is capped by the host side at well under a gigabyte a second in total.
+# The mount point must be writable through that shared root, so it sits
+# under /tmp rather than /mnt.
+ZRAM_DATA_DIR=${ZRAM_DATA_DIR:-/tmp/bpf-reclaim-data}
+zram_data() {
+	local dev
+	[ -e "$ZRAM_DATA_DIR/sparse.bin" ] && { DATA=$ZRAM_DATA_DIR/sparse.bin; return; }
+	dev=$(cat /sys/class/zram-control/hot_add) || return
+	echo 4G > /sys/block/zram$dev/disksize || return
+	mkfs.ext4 -q /dev/zram$dev && mkdir -p "$ZRAM_DATA_DIR" && mount /dev/zram$dev "$ZRAM_DATA_DIR" || return
+	truncate -s 400G "$ZRAM_DATA_DIR/sparse.bin" && DATA=$ZRAM_DATA_DIR/sparse.bin
+	echo "data file on zram$dev: $DATA"
+}
+
 mkdir -p "$OUT"
 echo "group=$GROUP mem=$MEM cpus=$(nproc) memtotal=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)M out=$OUT"
 
@@ -78,12 +94,15 @@ kfunc)
 			--policy-args "--pool $pool --lead-ms 0"
 	done
 	;;
-scale)
+scale|scale-anon|scale-file)
 	common=(--apps 32 --app-rate 20 --app-rate-max 150 --ramp 40 --app-mb "$(mb 6144)"
 		--grow-after 5 --hot-mb "$(mb 16384)" --hot-threads 8 --cache-mb "$(mb 16384)"
 		--cache-threads 8 --cold-mb "$(mb 32768)" --cold-threads 8 --buffer-mb "$(mb 32768)"
 		--settle 100 --seconds 80 --reclaimer-first)
-	for sc in scale-anon scale-file; do
+	scenarios="scale-anon scale-file"
+	[ "$GROUP" != scale ] && scenarios=$GROUP
+	for sc in $scenarios; do
+		[ "$sc" = scale-file ] && zram_data
 		run $sc-none --scenario $sc "${common[@]}" --mode none
 		run $sc-userspace --scenario $sc "${common[@]}" --mode userspace
 		for pool in 4 8 16 32; do
