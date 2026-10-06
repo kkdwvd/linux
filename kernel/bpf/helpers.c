@@ -5269,6 +5269,8 @@ void bpf_map_free_internal_structs(struct bpf_map *map, void *val)
 		bpf_obj_free_timer(map->record, val);
 	if (btf_record_has_field(map->record, BPF_WORKQUEUE))
 		bpf_obj_free_workqueue(map->record, val);
+	if (btf_record_has_field(map->record, BPF_WAITQUEUE))
+		bpf_obj_free_waitqueue(map->record, val);
 	if (btf_record_has_field(map->record, BPF_TASK_WORK))
 		bpf_obj_free_task_work(map->record, val);
 }
