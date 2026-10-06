@@ -686,6 +686,8 @@ static enum bpf_dynptr_type arg_to_dynptr_type(enum bpf_arg_type arg_type)
 		return BPF_DYNPTR_TYPE_SKB_META;
 	case DYNPTR_TYPE_FILE:
 		return BPF_DYNPTR_TYPE_FILE;
+	case DYNPTR_TYPE_XDP_FRAME:
+		return BPF_DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return BPF_DYNPTR_TYPE_INVALID;
 	}
@@ -706,6 +708,8 @@ static enum bpf_type_flag get_dynptr_type_flag(enum bpf_dynptr_type type)
 		return DYNPTR_TYPE_SKB_META;
 	case BPF_DYNPTR_TYPE_FILE:
 		return DYNPTR_TYPE_FILE;
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return 0;
 	}
@@ -13869,6 +13873,7 @@ enum special_kfunc_type {
 	KF_bpf_dynptr_from_skb_meta,
 	KF_bpf_xdp_pull_data,
 	KF_bpf_xdp_frame_steal,
+	KF_bpf_dynptr_from_xdp_frame,
 	KF_bpf_dynptr_slice,
 	KF_bpf_dynptr_slice_rdwr,
 	KF_bpf_dynptr_clone,
@@ -13943,7 +13948,9 @@ BTF_ID(func, bpf_dynptr_from_xdp)
 BTF_ID(func, bpf_dynptr_from_skb_meta)
 BTF_ID(func, bpf_xdp_pull_data)
 BTF_ID(func, bpf_xdp_frame_steal)
+BTF_ID(func, bpf_dynptr_from_xdp_frame)
 #else
+BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
@@ -14281,6 +14288,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 			arg_type |= DYNPTR_TYPE_XDP;
 		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_skb_meta]))
 			arg_type |= DYNPTR_TYPE_SKB_META;
+		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_xdp_frame]))
+			arg_type |= DYNPTR_TYPE_XDP_FRAME;
 		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_file]) ||
 			 is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_file_discard]))
 			/* OBJ_RELEASE for the latter comes from KF_RELEASE below */
@@ -15964,6 +15973,16 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		consume_ctx(env);
+	}
+
+	/*
+	 * A dynptr over a frame lives as long as the program's reference to the
+	 * frame, which is where it goes when the frame is released or stored.
+	 */
+	if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_dynptr_from_xdp_frame]) &&
+	    !reg_is_referenced(env, &regs[BPF_REG_1])) {
+		verbose(env, "%s needs a frame the program owns\n", func_name);
+		return -EINVAL;
 	}
 
 	/* The program may now own frames; bpf_prog_run_xdp() has to look, see XDP_CONSUME. */

@@ -4286,6 +4286,40 @@ out:
 	return offset + len <= size ? addr + offset : NULL;
 }
 
+/* The same accessors for a frame a program keeps, see bpf_xdp_frame_steal(). */
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return __bpf_xdp_load_bytes(&xdp, offset, buf, len);
+}
+
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return __bpf_xdp_store_bytes(&xdp, offset, buf, len);
+}
+
+void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return bpf_xdp_pointer(&xdp, offset, len);
+}
+
+void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+			    unsigned long len, bool flush)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	bpf_xdp_copy_buf(&xdp, off, buf, len, flush);
+}
+
 BPF_CALL_4(bpf_xdp_load_bytes, struct xdp_buff *, xdp, u32, offset,
 	   void *, buf, u32, len)
 {

@@ -1064,7 +1064,8 @@ EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
  * A program that wants to keep a frame past its return, to reassemble a TCP
  * stream for instance, takes it with bpf_xdp_frame_steal() and returns
  * XDP_CONSUME. The frame is then an object the program owns: it goes into a
- * kptr field of a map value or of an allocated object, and is given back with
+ * kptr field of a map value or of an allocated object, is read and written
+ * through a dynptr from bpf_dynptr_from_xdp_frame(), and is given back with
  * bpf_xdp_frame_release(), or by the destructor registered for the type when
  * the field that still holds it goes.
  *
@@ -1183,6 +1184,29 @@ __bpf_kfunc void bpf_xdp_frame_dtor(void *frame)
 }
 CFI_NOSEAL(bpf_xdp_frame_dtor);
 
+/**
+ * bpf_dynptr_from_xdp_frame - a dynptr over the payload of a frame the program keeps
+ * @frame: the frame
+ * @flags: must be 0
+ * @ptr__uninit: the dynptr to set up
+ *
+ * The dynptr lives as long as the program's reference to the frame: it goes
+ * when the frame is released or stored in a kptr field. Writes are allowed;
+ * the frame is the program's.
+ */
+__bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *frame, u64 flags,
+					  struct bpf_dynptr *ptr__uninit)
+{
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)ptr__uninit;
+
+	if (flags) {
+		bpf_dynptr_set_null(ptr);
+		return -EINVAL;
+	}
+	bpf_dynptr_init(ptr, frame, BPF_DYNPTR_TYPE_XDP_FRAME, 0, xdp_get_frame_len(frame));
+	return 0;
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(xdp_frame_steal_kfunc_ids)
@@ -1196,6 +1220,7 @@ static const struct btf_kfunc_id_set xdp_frame_steal_kfunc_set = {
 
 BTF_KFUNCS_START(xdp_frame_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_xdp_frame_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_dynptr_from_xdp_frame)
 BTF_KFUNCS_END(xdp_frame_kfunc_ids)
 
 static const struct btf_kfunc_id_set xdp_frame_kfunc_set = {

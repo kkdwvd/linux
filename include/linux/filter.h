@@ -1987,6 +1987,8 @@ int __bpf_sock_ops_load_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
 int __bpf_sock_ops_store_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
 				 const void *from, u32 len, u64 flags);
 
+struct xdp_frame;
+
 #ifdef CONFIG_NET
 int __bpf_skb_load_bytes(const struct sk_buff *skb, u32 offset, void *to, u32 len);
 int __bpf_skb_store_bytes(struct sk_buff *skb, u32 offset, const void *from,
@@ -1996,6 +1998,11 @@ int __bpf_xdp_store_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len);
 void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len);
 void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
 		      void *buf, unsigned long len, bool flush);
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len);
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len);
+void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len);
+void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+			    unsigned long len, bool flush);
 int __bpf_skb_meta_store_bytes(struct sk_buff *skb, u32 offset,
 			       const void *from, u32 len, u64 flags);
 void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset);
@@ -2031,6 +2038,28 @@ static inline void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
 
 static inline void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off, void *buf,
 				    unsigned long len, bool flush)
+{
+}
+
+static inline int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf,
+					     u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf,
+					      u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len)
+{
+	return NULL;
+}
+
+static inline void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+					  unsigned long len, bool flush)
 {
 }
 
