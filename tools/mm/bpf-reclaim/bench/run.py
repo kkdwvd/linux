@@ -199,7 +199,10 @@ class Workload:
                 self.proc.wait(10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-                self.proc.wait()
+                try:
+                    self.proc.wait(60)
+                except subprocess.TimeoutExpired:
+                    log(f'{self.name} did not exit after SIGKILL; stuck in the kernel')
         if self.logf:
             self.logf.close()
 
@@ -319,6 +322,42 @@ def parse_totals(logpath):
     return totals
 
 
+def stop_reclaimer(proc, grace=120, hard=60):
+    """SIGINT the reclaimer and wait for it, bounded: a userspace reclaimer
+    can sit inside one memory.reclaim write for minutes, and a reclaimer
+    stuck in the kernel would hang the run forever. On the first timeout
+    dump the blocked tasks to dmesg so the hang can be read afterwards,
+    then SIGKILL; if it still does not exit, give it up. Returns the
+    controller's CPU seconds, or 0 if it never exited."""
+    proc.send_signal(signal.SIGINT)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace:
+        try:
+            pid, status, ru = os.wait4(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            return 0.0
+        if pid:
+            proc.returncode = status
+            return ru.ru_utime + ru.ru_stime
+        time.sleep(0.5)
+    log(f'the reclaimer did not exit {grace}s after SIGINT; dumping blocked tasks and killing it')
+    if os.path.exists('/proc/sysrq-trigger'):
+        write('/proc/sysrq-trigger', 'w')
+    proc.kill()
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < hard:
+        try:
+            pid, status, ru = os.wait4(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            return 0.0
+        if pid:
+            proc.returncode = status
+            return ru.ru_utime + ru.ru_stime
+        time.sleep(0.5)
+    log('the reclaimer did not exit after SIGKILL; stuck in the kernel, leaving it')
+    return 0.0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -383,6 +422,11 @@ def main():
     if not args.buffer_mb:
         args.buffer_mb = mem['MemTotal'] // MB // 8
     swap = setup_swap(args.swap_mb)
+    # A run inherits the page cache the previous one left behind, which for
+    # a file scenario can be most of memory; start every run from the same
+    # place.
+    if os.path.exists('/proc/sys/vm/drop_caches'):
+        write('/proc/sys/vm/drop_caches', '3')
     names = scenario_names(args)
     parent, pool, paths = setup_cgroups(names, True)
     wls = scenario(args, paths, args.out)
@@ -444,12 +488,7 @@ def main():
     pool_after = cgroup_view(pool)
     controller_cpu = 0.0
     if reclaimer:
-        reclaimer.send_signal(signal.SIGINT)
-        try:
-            _, status, ru = os.wait4(reclaimer.pid, 0)
-            controller_cpu = ru.ru_utime + ru.ru_stime
-        except ChildProcessError:
-            pass
+        controller_cpu = stop_reclaimer(reclaimer)
         reclaimer_log.close()
     for w in wls:
         w.stop()
