@@ -213,15 +213,14 @@ static int build_opts(struct peer *p, __u8 *o, bool syn, unsigned int ask)
 	return off;
 }
 
-/* Send one segment with explicit sequence numbers; the peer's cursors are not touched. */
-static int peer_send_raw(struct peer *p, __u16 flags, __u32 seq, __u32 ack, const void *data,
-			 int len, unsigned int syn_opts)
+/* Build one segment with explicit sequence numbers into @frame; returns its length. */
+static int peer_build_raw(struct peer *p, __u8 *frame, __u16 flags, __u32 seq, __u32 ack,
+			  const void *data, int len, unsigned int syn_opts)
 {
-	__u8 frame[FRAME_MAX], opts[OPTS_MAX];
 	struct ethhdr *eth = (void *)frame;
+	__u8 opts[OPTS_MAX];
 	struct tcphdr *th;
-	int optlen, tcplen, off, tries;
-	ssize_t ret;
+	int optlen, tcplen, off;
 
 	if (len < 0 || len > DATA_MAX)
 		return -1;
@@ -275,11 +274,23 @@ static int peer_send_raw(struct peer *p, __u16 flags, __u32 seq, __u32 ack, cons
 	else
 		th->check = csum_ipv6_magic(&p->peer6, &p->kern6, tcplen, IPPROTO_TCP,
 					    csum_partial(th, tcplen, 0));
-	off += tcplen;
+	return off + tcplen;
+}
 
+/* Send one segment with explicit sequence numbers; the peer's cursors are not touched. */
+static int peer_send_raw(struct peer *p, __u16 flags, __u32 seq, __u32 ack, const void *data,
+			 int len, unsigned int syn_opts)
+{
+	__u8 frame[FRAME_MAX];
+	int flen, tries;
+	ssize_t ret;
+
+	flen = peer_build_raw(p, frame, flags, seq, ack, data, len, syn_opts);
+	if (flen < 0)
+		return -1;
 	for (tries = 0; tries < 100; tries++) {
-		ret = write(p->fd, frame, off);
-		if (ret == off)
+		ret = write(p->fd, frame, flen);
+		if (ret == flen)
 			return 0;
 		if (ret < 0 && errno == EAGAIN) {
 			usleep(1000);
@@ -1753,6 +1764,157 @@ out:
 	teardown(&c);
 }
 
+/*
+ * Feed a segment to the program through a live-frame test run on the device:
+ * the frame then sits in a page-sized buffer, as it would on a NIC, where TAP
+ * sizes its buffers to the packet.
+ */
+static int peer_inject(struct ctx *c, void *frame, int len)
+{
+	struct xdp_md ctx_in = { .data_end = len, .ingress_ifindex = c->ifindex };
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		    .data_in = frame,
+		    .data_size_in = len,
+		    .ctx_in = &ctx_in,
+		    .ctx_size_in = sizeof(ctx_in),
+		    .flags = BPF_F_TEST_XDP_LIVE_FRAMES,
+		    .repeat = 1);
+	int err;
+
+	err = bpf_prog_test_run_opts(bpf_program__fd(c->skel->progs.xdp_tcp_echo), &opts);
+	return ASSERT_OK(err, "test_run inject") ? 0 : -1;
+}
+
+/* The echo goes out of the request's own buffer. */
+static void test_frame_echo(int family, unsigned int opts)
+{
+	struct ctx c;
+
+	if (setup(&c, family))
+		return;
+	c.skel->bss->frame_reply = 1;
+	if (connect_peer(&c, opts))
+		goto out;
+	if (request_echoed(&c, "hello") || request_echoed(&c, "world!"))
+		goto out;
+	ASSERT_EQ(c.skel->bss->frame_sent, 2, "replies sent from frames");
+	ASSERT_EQ(c.skel->bss->frame_errors, 0, "frame errors");
+	ASSERT_EQ(c.skel->bss->sent, 0, "nothing sent from the arena");
+out:
+	teardown(&c);
+}
+
+/*
+ * A reply longer than the request and than one MSS: the packet grows in its
+ * page-sized buffer and the stack splits the linear data into segments.
+ */
+static void test_frame_grow(void)
+{
+	const int len = 3000;
+	char *pattern, *buf;
+	__u8 frame[FRAME_MAX];
+	struct peer *p;
+	struct ctx c;
+	int i, flen;
+
+	if (setup(&c, AF_INET))
+		return;
+	p = &c.peer;
+	pattern = malloc(len);
+	buf = malloc(len);
+	if (!ASSERT_OK_PTR(pattern, "malloc") || !ASSERT_OK_PTR(buf, "malloc"))
+		goto out;
+	for (i = 0; i < len; i++)
+		pattern[i] = 'a' + i % 26;
+	memcpy(c.skel->arena->reply, pattern, len);
+	c.skel->bss->frame_reply = 1;
+	c.skel->bss->reply_len = len;
+	if (connect_peer(&c, OPT_SACK | OPT_TS))
+		goto out;
+	flen = peer_build_raw(p, frame, TH_ACK | TH_PSH, p->snd_nxt, p->rcv_nxt, "req", 3, 0);
+	if (!ASSERT_GT(flen, 0, "build request") || peer_inject(&c, frame, flen))
+		goto out;
+	p->snd_nxt += 3;
+	if (peer_collect(p, buf, len))
+		goto out;
+	ASSERT_MEMEQ(buf, pattern, len, "reply data");
+	ASSERT_EQ(c.skel->bss->frame_sent, 1, "reply sent from the grown frame");
+	ASSERT_EQ(c.skel->bss->frame_fallback, 0, "no arena fallback");
+	ASSERT_EQ(c.skel->bss->frame_errors, 0, "frame errors");
+out:
+	free(pattern);
+	free(buf);
+	teardown(&c);
+}
+
+/*
+ * With a small send buffer and a peer that does not acknowledge, a reply
+ * finds no room: it stays in its frame and goes out from the timer once the
+ * peer acknowledges the earlier ones.
+ */
+static void test_frame_retry(void)
+{
+	char req[1000], buf[DATA_MAX];
+	int sndbuf = 4096, sent = 0, got = 0, i;
+	struct peer *p;
+	__u32 expect;
+	struct ctx c;
+	struct seg s;
+
+	if (setup(&c, AF_INET))
+		return;
+	p = &c.peer;
+	c.skel->bss->frame_reply = 1;
+	if (connect_peer(&c, OPT_SACK))
+		goto out;
+	if (!ASSERT_OK(setsockopt(c.conn, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)),
+		       "SO_SNDBUF"))
+		goto out;
+	for (i = 0; i < sizeof(req); i++)
+		req[i] = 'A' + i % 26;
+	/*
+	 * Requests that do not acknowledge the replies (rcv_nxt stays put, so
+	 * the requests carry the old ACK) until a reply has to wait.
+	 */
+	expect = p->rcv_nxt;
+	for (i = 0; i < 16 && !c.skel->bss->frame_deferred; i++) {
+		if (!ASSERT_OK(peer_send(p, TH_PSH, req, sizeof(req)), "send request"))
+			goto out;
+		sent++;
+		while (!peer_recv_data(p, &s, 200)) {
+			if (s.seq == expect) {
+				expect += s.len;
+				got += s.len;
+			}
+		}
+	}
+	if (!ASSERT_EQ(c.skel->bss->frame_deferred, 1, "a reply was deferred"))
+		goto out;
+	ASSERT_EQ(c.skel->bss->frame_errors, 0, "frame errors");
+	/* Acknowledge everything received: the deferred reply follows from the timer. */
+	p->rcv_nxt = expect;
+	if (!ASSERT_OK(peer_send(p, 0, NULL, 0), "ack replies"))
+		goto out;
+	while (got < sent * (int)sizeof(req)) {
+		if (!ASSERT_OK(peer_recv_data(p, &s, TIMEOUT_MS), "recv deferred reply"))
+			goto out;
+		if (s.seq != p->rcv_nxt)
+			continue;
+		if (!ASSERT_LE(s.len, (int)sizeof(buf), "reply len"))
+			goto out;
+		ASSERT_MEMEQ(s.data, req + got % sizeof(req), s.len, "deferred reply data");
+		p->rcv_nxt += s.len;
+		got += s.len;
+		if (!ASSERT_OK(peer_send(p, 0, NULL, 0), "ack reply"))
+			goto out;
+	}
+	ASSERT_EQ(c.skel->bss->frame_sent, sent, "every reply went out of a frame");
+	ASSERT_EQ(c.skel->bss->frame_errors, 0, "frame errors");
+	ASSERT_EQ(app_recv(&c, buf, sizeof(buf)), -EAGAIN, "application sees nothing");
+out:
+	teardown(&c);
+}
+
 void test_xdp_tcp(void)
 {
 	static const int orders[][3] = {
@@ -1802,6 +1964,14 @@ void test_xdp_tcp(void)
 		test_stream_close();
 	if (test__start_subtest("stream_busy_concurrent"))
 		test_stream_busy_concurrent();
+	if (test__start_subtest("frame_echo_v4"))
+		test_frame_echo(AF_INET, 0);
+	if (test__start_subtest("frame_echo_v6_ts_sack"))
+		test_frame_echo(AF_INET6, OPT_TS | OPT_SACK);
+	if (test__start_subtest("frame_grow"))
+		test_frame_grow();
+	if (test__start_subtest("frame_retry"))
+		test_frame_retry();
 	if (test__start_subtest("echo_v4"))
 		test_echo(AF_INET, 0);
 	if (test__start_subtest("echo_v6"))
