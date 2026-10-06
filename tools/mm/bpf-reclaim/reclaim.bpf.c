@@ -49,6 +49,15 @@
  * done or the child has nothing left to give this tick, in which case the
  * child sits the next tick out. Any worker serves any child.
  *
+ * Besides the demand, cfg.probe_ppm asks every child that is under its
+ * pressure target for a small fraction of its headroom every second, the
+ * fraction shrinking to nothing as pressure approaches the target. This is
+ * Senpai's probe: with no deficit at all it trims idle memory away over
+ * minutes, each child settling where its pressure meets its target, and the
+ * settled usage is the child's working set. The gate and the rest apply to
+ * the probe as to everything else, so a child that answers with refaults is
+ * left alone and probed more rarely.
+ *
  * Children are equal unless the loader says otherwise: a per-child map of
  * overrides, keyed by cgroup ID, carries a floor, a weight that multiplies
  * into the split, a pressure target, a CPU budget, an efficiency floor and
@@ -81,7 +90,7 @@ char _license[] SEC("license") = "GPL";
 #define COLD_MIN 4	/* a gated child keeps a token weight, so it is probed again */
 #define COLD_INIT 1024
 #define COLD_MAX BPF_RECLAIM_COLD_MAX
-#define REFAULT_MIN (1ULL << 20)	/* refaults below this rate are noise, not thrashing */
+#define REFAULT_MIN (256ULL << 10)	/* refaults below this rate are noise, not thrashing */
 #define BUSY_MIN 1000000	/* less CPU than this in a tick says nothing about efficiency */
 #define REST_MAX 64		/* the longest a child is rested after a gate, in ticks */
 
@@ -300,6 +309,8 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		protected = conf.floor;
 	cg->protected = protected;
 	cg->weight = conf.weight;
+	cg->target_ppm = conf.target_ppm;
+	cg->min_efficiency = conf.min_efficiency;
 	cg->swappiness = conf.swappiness;
 	cg->excluded = conf.excluded;
 	cg->budget_ns = cfg.interval_ns / 1000000 * conf.cpu_budget_ppm;
@@ -368,10 +379,11 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	 * The gate: refaults taking back half of what the pool reclaims, or
 	 * pressure over the target with refaults behind it, halve the
 	 * coldness every tick and keep the child out. Serving at least half
-	 * of what was asked without either grows it by an eighth; a child
-	 * that was asked and gave almost nothing is not shown to be cold by
-	 * that. Pressure without refaults is the child's own tasks stalling
-	 * in the kernel's reclaim, a reason to take more.
+	 * of what was asked, with refaults taking back less than a quarter
+	 * of it, grows it by an eighth; a child that was asked and gave
+	 * almost nothing is not shown to be cold by that. Pressure without
+	 * refaults is the child's own tasks stalling in the kernel's reclaim,
+	 * a reason to take more.
 	 */
 	thrashing = cg->refault_rate > REFAULT_MIN &&
 		    (cg->refault_rate * 2 > cg->reclaim_rate ||
@@ -387,8 +399,13 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		cg->backoff = cg->backoff < REST_MAX ? cg->backoff * 2 : REST_MAX;
 	} else if (cg->rest) {
 		cg->rest--;
+	} else if (cg->inflight) {
+		/*
+		 * A call on it is still running, longer than the tick: offer
+		 * nothing more and judge it once the call's time is in.
+		 */
 	} else {
-		if (asked && reclaimed >= asked / 2) {
+		if (asked && reclaimed >= asked / 2 && cg->refault_rate * 4 < cg->reclaim_rate) {
 			if (cg->coldness < COLD_MAX)
 				cg->coldness += cg->coldness / 8 + 1;
 			if (cg->backoff > 1)
@@ -416,15 +433,31 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 }
 
 /*
+ * The probe: the fraction of a child's headroom to ask for over a tick
+ * beyond the demand, scaled by how far its pressure sits below its target.
+ */
+static __always_inline __u64 probe_quota(struct bpf_reclaim_cgroup *cg, __u64 dt_ms)
+{
+	__u64 per_tick, room;
+
+	if (!cfg.probe_ppm || !cg->headroom || cg->pressure_ppm >= cg->target_ppm)
+		return 0;
+	per_tick = cg->headroom / 1000000 * cfg.probe_ppm * dt_ms / 1000;
+	room = cg->target_ppm - cg->pressure_ppm;
+	return per_tick * room / cg->target_ppm;
+}
+
+/*
  * Give a child its share of the demand, in proportion to its weight and up
  * to a slice of its headroom: a quarter of it for a fully cold child, less
- * in proportion to a smaller coldness.
+ * in proportion to a smaller coldness. The probe's ask comes on top.
  */
-static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u32 shift)
+static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u32 shift,
+				       __u64 dt_ms)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct cgroup *cgrp;
-	__u64 quota = 0, slice;
+	__u64 quota = 0, slice, probe;
 
 	cgrp = bpf_cgroup_from_id(id);
 	if (!cgrp)
@@ -437,17 +470,22 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u3
 		 * scaled to 20 bits, which is exact to a millionth, and the
 		 * product stays within 64 bits for a demand below 16 TiB.
 		 */
-		if (cg->share >= total)
+		if (!demand)
+			quota = 0;
+		else if (cg->share >= total)
 			quota = demand;
 		else
 			quota = (demand * (((cg->share >> shift) << 20) / (total >> shift))) >> 20;
 		slice = (cg->headroom >> 2) / COLD_MAX * cg->coldness;
 		if (quota > slice)
 			quota = slice;
+		probe = probe_quota(cg, dt_ms);
+		quota += probe;
 		quota &= ~(BPF_RECLAIM_PAGE_SIZE - 1);
 		cg->quota = quota;
 		cg->asked = quota;
 		cg->quota_given += quota;
+		cg->probed += probe;
 	}
 	bpf_cgroup_release(cgrp);
 	return quota;
@@ -545,7 +583,7 @@ static int control_cb(void *map, int *key, void *value)
 	}
 	c->demand = demand;
 
-	if (demand && total) {
+	if ((demand || cfg.probe_ppm) && total) {
 		/* Bring the shares below 32 bits for the split's arithmetic. */
 		bpf_repeat(64) {
 			if ((total >> shift) < (1ULL << 32))
@@ -555,7 +593,7 @@ static int control_cb(void *map, int *key, void *value)
 		bpf_for(i, 0, n) {
 			if (i >= BPF_RECLAIM_MAX_CGROUPS)
 				break;
-			quota += set_quota(c->ids[i], demand, total, shift);
+			quota += set_quota(c->ids[i], demand, total, shift, dt_ms);
 		}
 	}
 
@@ -627,6 +665,7 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 	}
 
 	busy = 0;
+	__sync_fetch_and_add(&cg->inflight, 1);
 	while (done < take && can_loop) {
 		/* Over the child's CPU budget for the tick: leave it be. */
 		if (cg->tick_busy_ns >= cg->budget_ns) {
@@ -648,7 +687,18 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 			break;
 		}
 		done += ret;
+		/*
+		 * A call that took long for little says the child's memory is
+		 * in use: end the chunk here rather than repeat it, and let
+		 * the tick's judgement rest the child.
+		 */
+		if (start >= BUSY_MIN && (__u64)ret * 1000 / (start / 1000000) < cg->min_efficiency) {
+			__sync_fetch_and_add(&cg->slow_calls, 1);
+			cg->quota = 0;
+			break;
+		}
 	}
+	__sync_fetch_and_sub(&cg->inflight, 1);
 	bpf_put_mem_cgroup(memcg);
 
 	t->busy_ns += busy;

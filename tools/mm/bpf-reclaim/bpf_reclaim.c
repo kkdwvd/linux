@@ -263,6 +263,12 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 		       (unsigned long long)(cg.empty - kids[i].last.empty),
 		       cg.gated ? " gated" : "", cg.rest ? " resting" : "",
 		       cg.excluded ? " excluded" : "");
+		if (getenv("BPF_RECLAIM_DEBUG"))
+			printf("    rest=%u backoff=%u inflight=%u asked=%llu quota=%llu busy_ppm=%llu "
+			       "reclaim_rate=%llu refault_rate=%llu\n", cg.rest, cg.backoff,
+			       cg.inflight, (unsigned long long)cg.asked, (unsigned long long)cg.quota,
+			       (unsigned long long)cg.busy_ppm, (unsigned long long)cg.reclaim_rate,
+			       (unsigned long long)cg.refault_rate);
 		kids[i].last = cg;
 	}
 	fflush(stdout);
@@ -297,16 +303,18 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 	for (i = 0; i < (unsigned int)max; i++) {
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
 			continue;
-		printf("cgroup=%s reclaimed=%llu calls=%llu empty=%llu quota_given=%llu "
+		printf("cgroup=%s reclaimed=%llu calls=%llu empty=%llu quota_given=%llu probed=%llu "
 		       "busy_ms=%llu refaults=%llu undone=%llu gated_ticks=%llu expensive_ticks=%llu "
-		       "budget_hits=%llu scanned=%llu stolen=%llu coldness=%llu usage=%llu\n",
+		       "budget_hits=%llu slow_calls=%llu scanned=%llu stolen=%llu coldness=%llu "
+		       "usage=%llu\n",
 		       kids[i].name, (unsigned long long)cg.reclaimed,
 		       (unsigned long long)cg.calls, (unsigned long long)cg.empty,
-		       (unsigned long long)cg.quota_given,
+		       (unsigned long long)cg.quota_given, (unsigned long long)cg.probed,
 		       (unsigned long long)(cg.busy_ns / 1000000),
 		       (unsigned long long)cg.refaults_total, (unsigned long long)cg.undone_total,
 		       (unsigned long long)cg.gated_ticks, (unsigned long long)cg.expensive_ticks,
-		       (unsigned long long)cg.budget_hits, (unsigned long long)cg.scanned_total,
+		       (unsigned long long)cg.budget_hits, (unsigned long long)cg.slow_calls,
+		       (unsigned long long)cg.scanned_total,
 		       (unsigned long long)cg.stolen_total, (unsigned long long)cg.coldness,
 		       (unsigned long long)cg.usage);
 	}
@@ -319,6 +327,7 @@ int main(int argc, char **argv)
 		{ "interval-ms", required_argument, NULL, 'i' },
 		{ "lead-ms", required_argument, NULL, 'L' },
 		{ "max-rate", required_argument, NULL, 'r' },
+		{ "probe", required_argument, NULL, 'p' },
 		{ "pool", required_argument, NULL, 'P' },
 		{ "chunk", required_argument, NULL, 'c' },
 		{ "floor", required_argument, NULL, 'f' },
@@ -350,7 +359,7 @@ int main(int argc, char **argv)
 	int opt, i, nr_child_specs = 0, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:L:r:P:c:f:t:C:e:w:x:s:v", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "b:i:L:r:p:P:c:f:t:C:e:w:x:s:v", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'b':
 			cfg.buffer = strtoull(optarg, NULL, 0) << 20;
@@ -363,6 +372,9 @@ int main(int argc, char **argv)
 			break;
 		case 'r':
 			cfg.max_rate = strtoull(optarg, NULL, 0) << 20;
+			break;
+		case 'p':
+			cfg.probe_ppm = atof(optarg) * 10000;
 			break;
 		case 'P':
 			cfg.pool = strtoul(optarg, NULL, 0);
@@ -446,9 +458,10 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms lead=%.0fms max_rate=%.0fM/s "
-	       "chunk=%.0fM floor=%.0fM target=%.2f%% cpu_budget=%.0f%% min_efficiency=%.0fM/s\n",
+	       "probe=%.2f%%/s chunk=%.0fM floor=%.0fM target=%.2f%% cpu_budget=%.0f%% "
+	       "min_efficiency=%.0fM/s\n",
 	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.lead_ns / 1e6,
-	       cfg.max_rate / MB, cfg.chunk / MB, cfg.floor / MB, target_pct,
+	       cfg.max_rate / MB, cfg.probe_ppm / 1e4, cfg.chunk / MB, cfg.floor / MB, target_pct,
 	       cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB);
 	fflush(stdout);
 
@@ -475,7 +488,8 @@ out:
 	return err ? 1 : 0;
 usage:
 	fprintf(stderr, "usage: %s [-v] [--buffer MB] [--interval-ms N] [--lead-ms N] [--max-rate MB/s]\n"
-		"          [--pool N] [--chunk MB] [--floor MB] [--target PCT] [--cpu-budget PCT]\n"
+		"          [--probe PCT/s] [--pool N] [--chunk MB] [--floor MB] [--target PCT]\n"
+		"          [--cpu-budget PCT]\n"
 		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N]\n"
 		"          [--child NAME:floor=MB,weight=N,target=PCT,budget=PCT,efficiency=MB/s,\n"
 		"                        swappiness=N|anon,exclude]... ROOT_CGROUP\n",

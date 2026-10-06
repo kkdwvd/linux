@@ -45,6 +45,7 @@ struct bpf_reclaim_cfg {
 	__u64 lead_ns;		/* how far ahead a drain is met, before it reaches the buffer */
 	__u64 buffer;		/* bytes of free memory to keep */
 	__u64 max_rate;		/* reclaim cap, bytes per second, 0 for none */
+	__u64 probe_ppm;	/* fraction of a child's headroom probed per second below target, 0 off */
 	__u64 chunk;		/* bytes a worker claims from a cgroup at a time */
 	__u64 floor;		/* bytes of usage never reclaimed below */
 	__u64 target_ppm;	/* tolerated stall fraction (PSI some), parts per million */
@@ -66,6 +67,7 @@ struct bpf_reclaim_cgroup {
 	__u64 protected;	/* the larger of its floor and its memory.low or memory.min */
 	__u64 headroom;		/* bytes on offer at the last tick */
 	__u64 weight;		/* its configured importance */
+	__u64 target_ppm;	/* its pressure target */
 	__u64 share;		/* its weight in this tick's split of the demand */
 	__s32 swappiness;	/* the swappiness its reclaim calls use */
 	__u32 excluded;		/* configured out of the policy */
@@ -79,6 +81,7 @@ struct bpf_reclaim_cgroup {
 	__u64 tick_reclaimed;	/* reclaimed since the last tick */
 	__u64 tick_busy_ns;	/* CPU spent on it since the last tick */
 	__u64 budget_ns;	/* CPU it may cost this tick */
+	__u64 min_efficiency;	/* bytes per CPU-second below which a call ends its chunk */
 	__u64 busy_ppm;		/* smoothed CPU spent on it, parts per million of one CPU */
 	__u64 efficiency;	/* smoothed bytes reclaimed per CPU-second */
 	__u64 scanned;		/* proactive scan count at the last tick */
@@ -88,17 +91,21 @@ struct bpf_reclaim_cgroup {
 	__u32 gated;		/* refaults, pressure or cost kept it out of the last tick */
 	__u32 rest;		/* ticks left to sit out after a gate */
 	__u32 backoff;		/* ticks the next gate will rest it for */
+	__u32 inflight;		/* workers in a reclaim call on it right now */
+	__u32 pad;
 	/* counters, only added to */
 	__u64 reclaimed;	/* bytes the pool reclaimed */
 	__u64 calls;		/* bpf_proactive_reclaim() calls */
 	__u64 empty;		/* calls that reclaimed nothing */
 	__u64 busy_ns;		/* time workers spent in those calls */
 	__u64 quota_given;	/* bytes of quota over all ticks */
+	__u64 probed;		/* bytes of that quota the probe asked for, beyond the demand */
 	__u64 refaults_total;	/* refaults since the policy first saw it */
 	__u64 undone_total;	/* bytes the pool took that were back by the next tick */
 	__u64 gated_ticks;	/* ticks the gate kept it out */
 	__u64 expensive_ticks;	/* ticks the gate closed for cost rather than refaults */
 	__u64 budget_hits;	/* times a worker stopped because the CPU budget was spent */
+	__u64 slow_calls;	/* calls that ended a chunk for yielding too little per CPU-second */
 	__u64 scanned_total;	/* pages the kernel scanned for the pool's reclaim */
 	__u64 stolen_total;	/* pages it freed for it */
 };
