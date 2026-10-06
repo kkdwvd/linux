@@ -1,20 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Proactive reclaim in BPF: a pool of kernel threads keeps a buffer of free
- * memory by reclaiming from the children of one cgroup.
+ * memory by reclaiming from the children of one cgroup, each only as far as
+ * its working set allows.
  *
  * A controller thread ticks every cfg.interval_ns. It walks the children of
- * the root cgroup, reads the free page count and each child's usage, and
- * turns the gap below the buffer into a demand in bytes. The demand is split
- * among the children in proportion to what each has above the floor, which
- * is the kernel's own rule for distributing reclaim pressure. Worker threads
- * sleep on one wait queue, and the controller wakes as many as the demand
- * has chunks. A worker claims a chunk of a cgroup's quota with a
- * compare-and-swap and calls bpf_proactive_reclaim() until the chunk is done
- * or the cgroup has nothing left to give this tick. Any worker serves any
- * cgroup.
+ * the root cgroup, reads the free page count, and for every child its usage,
+ * its memory pressure (the PSI "some" stall time from bpf_psi_total()) and
+ * its refaults. The gap below the buffer is the tick's demand. It is split
+ * among the children by a weight each earns from its response to the last
+ * reclaim: a coldness estimate that grows while memory leaves without
+ * refaults and halves when refaults take back a good part of what was
+ * reclaimed, or when pressure exceeds the child's target with refaults
+ * behind it, which also gates the child out for the tick. Refaults mean the
+ * reclaim has reached the working set, which is what the gate protects, the
+ * way Senpai and TMO gate theirs; pressure alone does not gate, since a
+ * child whose tasks stall in the kernel's own direct reclaim shows pressure
+ * without any working set being touched, and holds exactly the cold memory
+ * the pool should take. A child gives at most a slice of itself per tick
+ * that grows with its coldness, and the coldness grows by an eighth per
+ * tick of reclaim without complaint, so that the first probes take little
+ * before a refault has had time to arrive.
  *
- * Per-cgroup state lives in cgroup storage, so it is freed with the cgroup,
+ * Refaults undercount when a child has been squeezed small: the kernel
+ * only counts a refault whose eviction is recent relative to the child's
+ * current size. Memory the pool took that is back by the next tick is
+ * therefore also measured, as "undone" reclaim, whether it came back as a
+ * refault or as a fresh allocation; it is reported, not yet acted on.
+ *
+ * Worker threads sleep on one wait queue, and the controller wakes as many
+ * as the demand has chunks. A worker claims a chunk of a child's quota with
+ * a compare-and-swap and calls bpf_proactive_reclaim() until the chunk is
+ * done or the child has nothing left to give this tick, in which case the
+ * child sits the next tick out. Any worker serves any child.
+ *
+ * Per-child state lives in cgroup storage, so it is freed with the cgroup,
  * and a child that appears or disappears needs no help from user space: the
  * controller publishes the IDs it found at the last tick, and the workers
  * look each one up again, skipping any that has gone.
@@ -31,6 +51,13 @@
 #include "reclaim_compat.bpf.h"
 
 char _license[] SEC("license") = "GPL";
+
+#define PAGE_SHIFT BPF_RECLAIM_PAGE_SHIFT
+#define EWMA_SHIFT 3	/* an eighth of each sample: about a second of history at 100 ms ticks */
+#define COLD_MIN 4	/* a gated child keeps a token weight, so it is probed again */
+#define COLD_INIT 1024
+#define COLD_MAX BPF_RECLAIM_COLD_MAX
+#define REFAULT_MIN (1ULL << 20)	/* refaults below this rate are noise, not thrashing */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -62,6 +89,29 @@ struct {
 
 /* Set by the loader before the setup program runs. */
 struct bpf_reclaim_cfg cfg;
+
+static __always_inline __u64 ewma(__u64 old, __u64 sample)
+{
+	return old - (old >> EWMA_SHIFT) + (sample >> EWMA_SHIFT);
+}
+
+static __always_inline __s64 ewma_s(__s64 old, __s64 sample)
+{
+	return old - (old >> EWMA_SHIFT) + (sample >> EWMA_SHIFT);
+}
+
+/* Bytes over a tick to bytes per second; the tick is in milliseconds. */
+static __always_inline __u64 per_second(__u64 bytes, __u64 dt_ms)
+{
+	return bytes * 1000 / dt_ms;
+}
+
+static __always_inline __s64 per_second_s(__s64 bytes, __u64 dt_ms)
+{
+	if (bytes < 0)
+		return -(__s64)per_second(-bytes, dt_ms);
+	return per_second(bytes, dt_ms);
+}
 
 /*
  * Snapshot the IDs of the root's children. The walk needs RCU, which rules
@@ -99,14 +149,38 @@ static int discover(struct bpf_reclaim_control *c)
 	return 0;
 }
 
-/* Sample a cgroup at a tick and decide how much of it is on offer. */
-static __always_inline int sample_cgroup(__u64 id, __u64 *offered)
+/*
+ * One sample of a child: its stall time, usage and refaults. The stall
+ * total is U64_MAX when PSI is off, in which case pressure reads as zero
+ * and the gate runs on refaults alone.
+ */
+static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *memcg,
+					__u64 *stall, __u64 *usage, __u64 *refaults)
+{
+	*stall = bpf_psi_total(cgrp, PSI_MEM_SOME);
+	*usage = bpf_mem_cgroup_usage(memcg);
+	bpf_mem_cgroup_flush_stats(memcg);
+	*refaults = bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_ANON) +
+		    bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_FILE);
+}
+
+/*
+ * Sample a child at a tick, judge its response to the last reclaim, and
+ * decide how much of it is on offer and with what weight. The weight
+ * returned is coldness times the headroom in megabytes, kept small enough
+ * for the split's arithmetic.
+ */
+static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
 	struct cgroup *cgrp;
-	__u64 usage, headroom = 0;
+	__u64 stall, usage, refaults, refaulted = 0, reclaimed, undone, pressure = 0, headroom = 0;
+	__u64 asked;
+	__s64 growth;
+	bool thrashing;
 
+	*weight = 0;
 	cgrp = bpf_cgroup_from_id(id);
 	if (!cgrp)
 		return -ENOENT;
@@ -120,52 +194,122 @@ static __always_inline int sample_cgroup(__u64 id, __u64 *offered)
 		bpf_cgroup_release(cgrp);
 		return -ENOENT;
 	}
-	usage = bpf_mem_cgroup_usage(memcg);
+	read_cgroup(cgrp, memcg, &stall, &usage, &refaults);
 	bpf_put_mem_cgroup(memcg);
+	bpf_cgroup_release(cgrp);
+
+	/* A child seen for the first time gives baselines, not a sample. */
+	if (!cg->coldness) {
+		cg->coldness = COLD_INIT;
+		cg->stall_ns = stall;
+		cg->usage = usage;
+		cg->refaults = refaults;
+		cg->quota = 0;
+		return 0;
+	}
+
+	/* Stall nanoseconds over a millisecond tick is the fraction in ppm. */
+	if (stall != ~0ULL && stall >= cg->stall_ns)
+		pressure = (stall - cg->stall_ns) / dt_ms;
+	cg->pressure_ppm = ewma(cg->pressure_ppm, pressure);
+
+	if (refaults >= cg->refaults)
+		refaulted = (refaults - cg->refaults) << PAGE_SHIFT;
+	cg->refaults_total += refaulted >> PAGE_SHIFT;
+	cg->refault_rate = ewma(cg->refault_rate, per_second(refaulted, dt_ms));
+
+	reclaimed = __sync_lock_test_and_set(&cg->tick_reclaimed, 0);
+	asked = cg->asked;
+	cg->asked = 0;
+	cg->reclaim_rate = ewma(cg->reclaim_rate, per_second(reclaimed, dt_ms));
+	/* Growth is what the child allocated: refaults only take back memory. */
+	growth = (__s64)(usage + reclaimed) - (__s64)cg->usage - (__s64)refaulted;
+	cg->growth = ewma_s(cg->growth, per_second_s(growth, dt_ms));
+	/* Undone is the part of what the pool took that is already back. */
+	undone = 0;
+	if (reclaimed && usage + reclaimed > cg->usage) {
+		undone = usage + reclaimed - cg->usage;
+		if (undone > reclaimed)
+			undone = reclaimed;
+	}
+	cg->undone_total += undone;
+	cg->undone_rate = ewma(cg->undone_rate, per_second(undone, dt_ms));
+
+	cg->usage = usage;
+	cg->stall_ns = stall;
+	cg->refaults = refaults;
 
 	/*
-	 * On offer is the usage above the floor, unless a worker found the
-	 * cgroup empty since the last tick: then it sits this tick out rather
-	 * than drawing quota it cannot serve. Less than a chunk is not worth
-	 * a share of the demand.
+	 * The gate: refaults taking back half of what the pool reclaims, or
+	 * pressure over the target with refaults behind it, halve the
+	 * coldness every tick and keep the child out. Serving at least half
+	 * of what was asked without either grows it by an eighth; a child
+	 * that was asked and gave almost nothing is not shown to be cold by
+	 * that. Pressure without refaults is the child's own tasks stalling
+	 * in the kernel's reclaim, a reason to take more.
 	 */
-	if (usage > cfg.floor && !cg->exhausted)
-		headroom = usage - cfg.floor;
-	if (headroom < cfg.chunk)
-		headroom = 0;
-	cg->usage = usage;
-	cg->headroom = headroom;
+	thrashing = cg->refault_rate > REFAULT_MIN &&
+		    (cg->refault_rate * 2 > cg->reclaim_rate ||
+		     cg->pressure_ppm > cfg.target_ppm);
+	cg->gated = thrashing;
+	if (thrashing) {
+		cg->gated_ticks++;
+		cg->coldness = cg->coldness > 2 * COLD_MIN ? cg->coldness / 2 : COLD_MIN;
+	} else {
+		if (asked && reclaimed >= asked / 2 && cg->coldness < COLD_MAX)
+			cg->coldness += cg->coldness / 8 + 1;
+		if (cg->coldness > COLD_MAX)
+			cg->coldness = COLD_MAX;
+		/*
+		 * On offer is the usage above the floor, unless a worker found
+		 * the child empty since the last tick: then it sits this tick
+		 * out rather than drawing quota it cannot serve. Less than a
+		 * chunk is not worth a share of the demand.
+		 */
+		if (usage > cfg.floor && !cg->exhausted)
+			headroom = usage - cfg.floor;
+		if (headroom < cfg.chunk)
+			headroom = 0;
+	}
 	cg->exhausted = 0;
+	cg->headroom = headroom;
+	cg->share = cg->coldness * (headroom >> 20);
 	cg->quota = 0;
-	bpf_cgroup_release(cgrp);
-	*offered = headroom;
+	*weight = cg->share;
 	return 0;
 }
 
-/* Give a cgroup its share of the demand, in proportion to its headroom. */
+/*
+ * Give a child its share of the demand, in proportion to its weight and up
+ * to a slice of its headroom: a quarter of it for a fully cold child, less
+ * in proportion to a smaller coldness.
+ */
 static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct cgroup *cgrp;
-	__u64 quota = 0, headroom;
+	__u64 quota = 0, slice;
 
 	cgrp = bpf_cgroup_from_id(id);
 	if (!cgrp)
 		return 0;
 	cg = bpf_cgrp_storage_get(&cgroups, cgrp, 0, 0);
-	if (cg && cg->headroom) {
-		headroom = cg->headroom;
+	if (cg && cg->share) {
 		/*
-		 * headroom * demand / total without a 128-bit product: the
-		 * ratio is scaled to 20 bits, which is exact to a millionth
-		 * and keeps the product within 64 bits below 16 TiB.
+		 * demand * share / total without a 128-bit product: the ratio
+		 * is scaled to 20 bits, which is exact to a millionth and keeps
+		 * the product within 64 bits for a demand below 16 TiB.
 		 */
-		if (demand >= total)
-			quota = headroom;
+		if (cg->share >= total)
+			quota = demand;
 		else
-			quota = (headroom * ((demand << 20) / total)) >> 20;
+			quota = (demand * ((cg->share << 20) / total)) >> 20;
+		slice = (cg->headroom >> 2) / COLD_MAX * cg->coldness;
+		if (quota > slice)
+			quota = slice;
 		quota &= ~(BPF_RECLAIM_PAGE_SIZE - 1);
 		cg->quota = quota;
+		cg->asked = quota;
 		cg->quota_given += quota;
 	}
 	bpf_cgroup_release(cgrp);
@@ -173,14 +317,15 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total)
 }
 
 /*
- * The controller's tick: find the cgroups, turn the free-memory deficit into
- * demand, split it into per-cgroup quotas, wake enough workers, sleep.
+ * The controller's tick: find the children, sample them, turn the
+ * free-memory deficit into demand, split it into quotas, wake enough
+ * workers, sleep.
  */
 static int control_cb(void *map, int *key, void *value)
 {
 	struct bpf_reclaim_control *c = value;
 	struct bpf_reclaim_pool *p;
-	__u64 free, demand, offered, total = 0, quota = 0;
+	__u64 now, dt_ms, free, demand, weight, total = 0, quota = 0;
 	__u32 zero = 0, seq, k, n;
 	int i;
 
@@ -188,6 +333,11 @@ static int control_cb(void *map, int *key, void *value)
 	if (!p)
 		return 1;
 	seq = bpf_waitq_sequence(&c->tick);
+	now = bpf_ktime_get_ns();
+	dt_ms = (now - c->last_ns) / 1000000;
+	if (!dt_ms)
+		dt_ms = 1;
+	c->last_ns = now;
 	c->ticks++;
 
 	discover(c);
@@ -204,8 +354,8 @@ static int control_cb(void *map, int *key, void *value)
 	bpf_for(i, 0, n) {
 		if (i >= BPF_RECLAIM_MAX_CGROUPS)
 			break;
-		if (!sample_cgroup(c->ids[i], &offered))
-			total += offered;
+		if (!sample_cgroup(c->ids[i], dt_ms, &weight))
+			total += weight;
 	}
 	if (demand && total) {
 		bpf_for(i, 0, n) {
@@ -225,12 +375,11 @@ static int control_cb(void *map, int *key, void *value)
 		bpf_waitq_wake(&p->work, k, 0);
 	}
 
-	c->last_ns = bpf_ktime_get_ns();
 	bpf_waitq_wait_event(&c->tick, seq, cfg.interval_ns);
 	return 0;
 }
 
-/* Take up to a chunk of a cgroup's quota, racing the other workers. */
+/* Take up to a chunk of a child's quota, racing the other workers. */
 static __always_inline __u64 claim(struct bpf_reclaim_cgroup *cg)
 {
 	__u64 old = cg->quota, seen, take;
@@ -245,7 +394,7 @@ static __always_inline __u64 claim(struct bpf_reclaim_cgroup *cg)
 	return 0;
 }
 
-/* Serve one cgroup: claim a chunk and reclaim it. True if there was work. */
+/* Serve one child: claim a chunk and reclaim it. True if there was work. */
 static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 {
 	struct bpf_reclaim_cgroup *cg;
@@ -295,12 +444,13 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 	t->reclaimed += done;
 	__sync_fetch_and_add(&cg->busy_ns, busy);
 	__sync_fetch_and_add(&cg->reclaimed, done);
+	__sync_fetch_and_add(&cg->tick_reclaimed, done);
 	bpf_cgroup_release(cgrp);
 	return true;
 }
 
 /*
- * A worker's iteration: serve every cgroup with quota, then sleep on the
+ * A worker's iteration: serve every child with quota, then sleep on the
  * pool's wait queue. The sequence sampled first makes a wakeup that lands
  * during the scan return from the wait at once.
  */

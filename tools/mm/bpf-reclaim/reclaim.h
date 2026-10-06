@@ -12,6 +12,8 @@
 #define BPF_RECLAIM_MAX_CGROUPS		256
 #define BPF_RECLAIM_PAGE_SHIFT		12
 #define BPF_RECLAIM_PAGE_SIZE		(1ULL << BPF_RECLAIM_PAGE_SHIFT)
+/* The range of a cgroup's coldness estimate; the loader prints it in percent. */
+#define BPF_RECLAIM_COLD_MAX		65536
 /* The kernel's SWAPPINESS_ANON_ONLY from mm/internal.h: reclaim only anon. */
 #define BPF_RECLAIM_SWAPPINESS_ANON_ONLY	201
 
@@ -22,6 +24,7 @@ struct bpf_reclaim_cfg {
 	__u64 buffer;		/* bytes of free memory to keep */
 	__u64 chunk;		/* bytes a worker claims from a cgroup at a time */
 	__u64 floor;		/* bytes of usage never reclaimed below */
+	__u64 target_ppm;	/* tolerated stall fraction (PSI some), parts per million */
 	__u32 pool;		/* worker threads */
 	__s32 swappiness;	/* -1 for the cgroup's own */
 };
@@ -33,16 +36,30 @@ struct bpf_reclaim_cfg {
  */
 struct bpf_reclaim_cgroup {
 	__u64 quota;		/* bytes left to reclaim this tick */
+	__u64 asked;		/* bytes of quota the last tick gave it */
 	__u64 usage;		/* bytes charged at the last tick */
 	__u64 headroom;		/* bytes on offer at the last tick */
+	__u64 share;		/* its weight in this tick's split of the demand */
+	__u64 coldness;		/* estimate that what it holds above the floor is cold */
+	__u64 stall_ns;		/* PSI memory some total at the last tick */
+	__u64 pressure_ppm;	/* smoothed stall fraction */
+	__u64 refaults;		/* workingset refaults, anon and file, at the last tick */
+	__u64 refault_rate;	/* smoothed refaults, bytes per second */
+	__u64 reclaim_rate;	/* smoothed reclaim by the pool, bytes per second */
+	__u64 undone_rate;	/* smoothed regrowth of what the pool took, bytes per second */
+	__u64 tick_reclaimed;	/* reclaimed since the last tick */
+	__s64 growth;		/* smoothed allocation net of reclaim and refaults, bytes/s */
 	__u32 exhausted;	/* a reclaim call found nothing since the last tick */
-	__u32 pad;
+	__u32 gated;		/* refaults or pressure kept it out of the last tick */
 	/* counters, only added to */
 	__u64 reclaimed;	/* bytes the pool reclaimed */
 	__u64 calls;		/* bpf_proactive_reclaim() calls */
 	__u64 empty;		/* calls that reclaimed nothing */
 	__u64 busy_ns;		/* time workers spent in those calls */
 	__u64 quota_given;	/* bytes of quota over all ticks */
+	__u64 refaults_total;	/* refaults since the policy first saw it */
+	__u64 undone_total;	/* bytes the pool took that were back by the next tick */
+	__u64 gated_ticks;	/* ticks the gate kept it out */
 };
 
 /* A pool worker: sleeps on the pool's wait queue and claims quota. */
