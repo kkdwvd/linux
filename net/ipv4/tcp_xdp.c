@@ -43,6 +43,11 @@
  *   bpf_xdp_tcp_send()          queues a response on the write queue and
  *                               pushes it at once from BH context, or asks
  *                               the program to try again
+ *   bpf_xdp_tcp_send_frame()    the same for a response the program wrote
+ *                               into the frame the request came in: the
+ *                               segment is built around that buffer, with
+ *                               no copy, and the frame comes back to the
+ *                               program when it has to try again
  *   bpf_xdp_tcp_acquire()       a reference to the connection to keep outside
  *                               XDP, in a kptr
  *   bpf_xdp_tcp_release()       drops a reference
@@ -1428,6 +1433,86 @@ out:
 	return err;
 }
 
+/*
+ * Room the stack's headers need in front of a reply built in a frame. Every
+ * XDP frame has XDP_PACKET_HEADROOM and the request's own headers before its
+ * payload, which is more than this.
+ */
+#define XDP_TCP_REPLY_HEADROOM \
+	(MAX_TCP_OPTION_SPACE + sizeof(struct tcphdr) + sizeof(struct ipv6hdr) + LL_MAX_HEADER)
+
+/**
+ * bpf_xdp_tcp_send_frame - send a reply from the frame the program wrote it into
+ * @frame: a frame the program owns, the request's own as a rule
+ * @sk: the connection
+ * @off: offset of the reply from the frame's data
+ * @len: its length
+ * @error: where the reason for a returned frame goes
+ *
+ * The segment is built around the frame's buffer, with no copy and no head
+ * of its own: the reply is its linear data, the room before the reply the
+ * headroom the stack's headers go into, and the driver's buffer stays with
+ * the segment until the peer acknowledges it. The reply has to lie within
+ * the frame's data; a program that answers with more than the request held
+ * grows the packet with bpf_xdp_adjust_tail() before taking the frame, and
+ * one whose reply does not fit a frame uses bpf_xdp_tcp_send(). Frames with
+ * fragments are not taken.
+ *
+ * Returns NULL once the segment is queued and pushed, the frame being the
+ * stack's from then on. Otherwise the frame comes back, untouched and still
+ * the program's, with *@error saying why: -EAGAIN when the socket is
+ * owned by its user or has no room, or another CPU is still handing the
+ * frame off, cases to keep the reply and retry; -EINVAL, -ENOTCONN or
+ * -ENOMEM otherwise.
+ */
+__bpf_kfunc struct xdp_frame *bpf_xdp_tcp_send_frame(struct xdp_frame *frame, struct sock *sk,
+						      u32 off, u32 len, int *error)
+{
+	u32 truesize = SKB_TRUESIZE(frame->frame_sz - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sk_buff *skb;
+	int mss_now, err;
+
+	err = -EINVAL;
+	if (!xdp_tcp_is_sock(sk) || !len || off > frame->len || len > frame->len - off ||
+	    sizeof(*frame) + frame->headroom + off < XDP_TCP_REPLY_HEADROOM)
+		goto out;
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	err = -EAGAIN;
+	if (sock_owned_by_user(sk) || !sk_stream_memory_free(sk))
+		goto unlock;
+	err = -ENOTCONN;
+	if (!((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)))
+		goto unlock;
+	err = -EINVAL;
+	if (!xdp_tcp_adopt(sk))
+		goto unlock;
+	err = -EAGAIN;
+	if (!sk_wmem_schedule(sk, truesize))
+		goto unlock;
+	skb = bpf_xdp_frame_to_skb(frame, off, len);
+	if (IS_ERR(skb)) {
+		err = PTR_ERR(skb) == -EBUSY ? -EAGAIN : PTR_ERR(skb);
+		goto unlock;
+	}
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	INIT_LIST_HEAD(&skb->tcp_tsorted_anchor);
+	mss_now = tcp_current_mss(sk);
+	tcp_rate_check_app_limited(sk);
+	tcp_skb_entail(sk, skb);
+	TCP_SKB_CB(skb)->end_seq += len;
+	WRITE_ONCE(tp->write_seq, tp->write_seq + len);
+	xdp_tcp_push(sk, skb, mss_now);
+	err = 0;
+unlock:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+out:
+	*error = err;
+	return err ? frame : NULL;
+}
+
 /**
  * bpf_xdp_tcp_release - drop a reference to a connection
  * @sk: the socket, from bpf_xdp_tcp_recv(), bpf_xdp_tcp_lookup() or bpf_xdp_tcp_acquire()
@@ -1471,6 +1556,7 @@ BTF_ID_FLAGS(func, bpf_xdp_tcp_ooo_reset)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_ack_pending)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_acquire, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_send_frame, KF_RELEASE | KF_ACQUIRE | KF_RET_NULL)
 BTF_KFUNCS_END(bpf_xdp_tcp_kfunc_ids)
 
 static const struct btf_kfunc_id_set bpf_xdp_tcp_kfunc_set = {
