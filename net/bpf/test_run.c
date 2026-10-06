@@ -288,6 +288,7 @@ static int xdp_test_run_batch(struct xdp_test_data *xdp, struct bpf_prog *prog,
 	local_bh_disable();
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 	ri = bpf_net_ctx_get_ri();
+	ri->kern_flags |= BPF_RI_F_XDP_LIVE_RUN;
 	xdp_set_return_frame_no_direct();
 
 	for (i = 0; i < batch_sz; i++) {
