@@ -56,7 +56,7 @@ for size in $SIZES; do
 	# The kfunc, one call at a time, through the pool's probe for ten seconds.
 	timeout -s INT 12 "$BIN/bpf_reclaim" --buffer 1 --pool 1 --probe 100 --cpu-budget 100 \
 		--min-efficiency 0 --lead-ms 0 $CG > "$OUT/bpf-$size.log" 2>&1
-	calls=$(grep -o 'calls=[0-9]*' "$OUT/bpf-$size.log" | tail -1 | cut -d= -f2)
+	calls=$(grep '^cgroup=hot' "$OUT/bpf-$size.log" | grep -o ' calls=[0-9]*' | cut -d= -f2)
 	busy=$(grep '^cgroup=hot' "$OUT/bpf-$size.log" | grep -o 'busy_ms=[0-9]*' | cut -d= -f2)
 	got=$(grep '^cgroup=hot' "$OUT/bpf-$size.log" | grep -o 'reclaimed=[0-9]*' | head -1 | cut -d= -f2)
 	rf=$(grep '^cgroup=hot' "$OUT/bpf-$size.log" | grep -o 'refaults=[0-9]*' | cut -d= -f2)
