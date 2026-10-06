@@ -13,7 +13,10 @@
  * working set, alone or with its PSI memory "some" pressure above --target,
  * in percent of wall time. --child NAME:key=value,... overrides the floor,
  * weight, target, cpu budget, efficiency floor or swappiness of one child,
- * or excludes it.
+ * or excludes it. --throttle lets the policy set memory.high on the child
+ * growing fastest for its weight once the buffer has been breached for
+ * --throttle-ticks ticks, so its own tasks reclaim and are delayed on the
+ * way back to user space; the limit is lifted when the buffer is back.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -252,7 +255,7 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 		printf("  cg=%s usage=%.0fM protected=%.0fM pressure=%.2f%% refault=%.1fM/s "
 		       "undone=%.1fM/s growth=%+.1fM/s cold=%.0f%% weight=%llu headroom=%.0fM "
 		       "reclaimed=%.1fM/s cpu=%.0f%% eff=%.0fM/s refaults=%llu calls=%llu "
-		       "empty=%llu%s%s%s\n",
+		       "empty=%llu%s%s%s%s\n",
 		       kids[i].name, cg.usage / MB, cg.protected / MB, cg.pressure_ppm / 1e4,
 		       cg.refault_rate / MB, cg.undone_rate / MB, cg.growth / MB,
 		       100.0 * cg.coldness / BPF_RECLAIM_COLD_MAX, (unsigned long long)cg.weight,
@@ -262,7 +265,7 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 		       (unsigned long long)(cg.calls - kids[i].last.calls),
 		       (unsigned long long)(cg.empty - kids[i].last.empty),
 		       cg.gated ? " gated" : "", cg.rest ? " resting" : "",
-		       cg.excluded ? " excluded" : "");
+		       cg.excluded ? " excluded" : "", cg.throttled ? " throttled" : "");
 		if (getenv("BPF_RECLAIM_DEBUG"))
 			printf("    rest=%u backoff=%u inflight=%u asked=%llu quota=%llu busy_ppm=%llu "
 			       "reclaim_rate=%llu refault_rate=%llu\n", cg.rest, cg.backoff,
@@ -282,12 +285,12 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 	unsigned int zero = 0, i;
 
 	if (!bpf_map__lookup_elem(skel->maps.control, &zero, sizeof(zero), &c, sizeof(c), 0)) {
-		printf("control ticks=%llu deficit_ticks=%llu lead_ticks=%llu free_min=%llu "
-		       "wakeups=%llu reclaimed=%llu capacity=%llu awake_ticks=",
+		printf("control ticks=%llu deficit_ticks=%llu lead_ticks=%llu behind_ticks=%llu "
+		       "free_min=%llu wakeups=%llu reclaimed=%llu capacity=%llu awake_ticks=",
 		       (unsigned long long)c.ticks, (unsigned long long)c.deficit_ticks,
-		       (unsigned long long)c.lead_ticks, (unsigned long long)c.free_min,
-		       (unsigned long long)c.wakeups, (unsigned long long)c.reclaimed,
-		       (unsigned long long)c.capacity);
+		       (unsigned long long)c.lead_ticks, (unsigned long long)c.behind_ticks,
+		       (unsigned long long)c.free_min, (unsigned long long)c.wakeups,
+		       (unsigned long long)c.reclaimed, (unsigned long long)c.capacity);
 		for (i = 0; i < BPF_RECLAIM_AWAKE_BUCKETS; i++)
 			printf("%s%llu", i ? "," : "", (unsigned long long)c.awake_ticks[i]);
 		printf("\n");
@@ -306,7 +309,7 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 		printf("cgroup=%s reclaimed=%llu calls=%llu empty=%llu quota_given=%llu probed=%llu "
 		       "busy_ms=%llu refaults=%llu undone=%llu gated_ticks=%llu expensive_ticks=%llu "
 		       "budget_hits=%llu slow_calls=%llu scanned=%llu stolen=%llu coldness=%llu "
-		       "usage=%llu\n",
+		       "throttles=%llu throttle_ticks=%llu usage=%llu\n",
 		       kids[i].name, (unsigned long long)cg.reclaimed,
 		       (unsigned long long)cg.calls, (unsigned long long)cg.empty,
 		       (unsigned long long)cg.quota_given, (unsigned long long)cg.probed,
@@ -316,6 +319,7 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 		       (unsigned long long)cg.budget_hits, (unsigned long long)cg.slow_calls,
 		       (unsigned long long)cg.scanned_total,
 		       (unsigned long long)cg.stolen_total, (unsigned long long)cg.coldness,
+		       (unsigned long long)cg.throttles, (unsigned long long)cg.throttle_ticks,
 		       (unsigned long long)cg.usage);
 	}
 }
@@ -336,6 +340,8 @@ int main(int argc, char **argv)
 		{ "min-efficiency", required_argument, NULL, 'e' },
 		{ "swappiness", required_argument, NULL, 'w' },
 		{ "child", required_argument, NULL, 'x' },
+		{ "throttle", no_argument, NULL, 'T' },
+		{ "throttle-ticks", required_argument, NULL, 'k' },
 		{ "status-ms", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{},
@@ -348,6 +354,7 @@ int main(int argc, char **argv)
 		.target_ppm = 10000,
 		.min_efficiency = 16ULL << 20,
 		.pool = 2,
+		.throttle_ticks = 5,
 		.swappiness = -1,
 	};
 	struct bpf_reclaim_control pc = {};
@@ -359,7 +366,7 @@ int main(int argc, char **argv)
 	int opt, i, nr_child_specs = 0, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:L:r:p:P:c:f:t:C:e:w:x:s:v", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "b:i:L:r:p:P:c:f:t:C:e:w:x:Tk:s:v", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'b':
 			cfg.buffer = strtoull(optarg, NULL, 0) << 20;
@@ -403,6 +410,12 @@ int main(int argc, char **argv)
 			if (nr_child_specs == BPF_RECLAIM_MAX_CGROUPS)
 				goto usage;
 			child_specs[nr_child_specs++] = optarg;
+			break;
+		case 'T':
+			cfg.throttle = 1;
+			break;
+		case 'k':
+			cfg.throttle_ticks = strtoul(optarg, NULL, 0);
 			break;
 		case 's':
 			status_s = strtoul(optarg, NULL, 0) / 1000.0;
@@ -459,10 +472,10 @@ int main(int argc, char **argv)
 	}
 	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms lead=%.0fms max_rate=%.0fM/s "
 	       "probe=%.2f%%/s chunk=%.0fM floor=%.0fM target=%.2f%% cpu_budget=%.0f%% "
-	       "min_efficiency=%.0fM/s\n",
+	       "min_efficiency=%.0fM/s throttle=%u\n",
 	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.lead_ns / 1e6,
 	       cfg.max_rate / MB, cfg.probe_ppm / 1e4, cfg.chunk / MB, cfg.floor / MB, target_pct,
-	       cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB);
+	       cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB, cfg.throttle);
 	fflush(stdout);
 
 	start = last = now_s();
@@ -491,6 +504,7 @@ usage:
 		"          [--probe PCT/s] [--pool N] [--chunk MB] [--floor MB] [--target PCT]\n"
 		"          [--cpu-budget PCT]\n"
 		"          [--min-efficiency MB/s] [--swappiness N|anon] [--status-ms N]\n"
+		"          [--throttle [--throttle-ticks N]]\n"
 		"          [--child NAME:floor=MB,weight=N,target=PCT,budget=PCT,efficiency=MB/s,\n"
 		"                        swappiness=N|anon,exclude]... ROOT_CGROUP\n",
 		basename(argv[0]));

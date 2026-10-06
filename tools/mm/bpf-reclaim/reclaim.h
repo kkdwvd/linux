@@ -53,6 +53,8 @@ struct bpf_reclaim_cfg {
 	__u64 min_efficiency;	/* bytes per CPU-second below which reclaiming a child is expensive */
 	__u32 pool;		/* worker threads */
 	__s32 swappiness;	/* -1 for the cgroup's own */
+	__u32 throttle;		/* set memory.high on a runaway when the pool falls behind */
+	__u32 throttle_ticks;	/* consecutive deficit ticks before throttling */
 };
 
 /*
@@ -92,7 +94,7 @@ struct bpf_reclaim_cgroup {
 	__u32 rest;		/* ticks left to sit out after a gate */
 	__u32 backoff;		/* ticks the next gate will rest it for */
 	__u32 inflight;		/* workers in a reclaim call on it right now */
-	__u32 pad;
+	__u32 throttled;	/* memory.high engaged */
 	/* counters, only added to */
 	__u64 reclaimed;	/* bytes the pool reclaimed */
 	__u64 calls;		/* bpf_proactive_reclaim() calls */
@@ -106,6 +108,8 @@ struct bpf_reclaim_cgroup {
 	__u64 expensive_ticks;	/* ticks the gate closed for cost rather than refaults */
 	__u64 budget_hits;	/* times a worker stopped because the CPU budget was spent */
 	__u64 slow_calls;	/* calls that ended a chunk for yielding too little per CPU-second */
+	__u64 throttles;	/* times memory.high was engaged on it */
+	__u64 throttle_ticks;	/* ticks spent with memory.high engaged */
 	__u64 scanned_total;	/* pages the kernel scanned for the pool's reclaim */
 	__u64 stolen_total;	/* pages it freed for it */
 };
@@ -141,8 +145,11 @@ struct bpf_reclaim_control {
 	__u64 pool_busy;	/* workers' busy time at the last tick */
 	__u64 pool_reclaimed;	/* workers' reclaimed bytes at the last tick */
 	__u64 demand;		/* bytes wanted at the last tick */
+	__u64 runaway;		/* the fastest growing child's ID at the last tick, or 0 */
+	__u32 deficit_run;	/* consecutive ticks below the buffer */
 	__u32 awake;		/* workers woken at the last tick */
 	__u32 nr_cgroups;	/* entries of ids[] */
+	__u32 pad;
 	__u64 ids[BPF_RECLAIM_MAX_CGROUPS];	/* the managed cgroups at the last tick */
 	/* counters */
 	__u64 ticks;
@@ -151,6 +158,7 @@ struct bpf_reclaim_control {
 	__u64 free_min;
 	__u64 wakeups;		/* worker wakeups requested */
 	__u64 reclaimed;	/* bytes reclaimed by the pool, all children */
+	__u64 behind_ticks;	/* ticks the pool was judged behind an allocator */
 	__u64 awake_ticks[BPF_RECLAIM_AWAKE_BUCKETS]; /* ticks by workers woken, last bucket and up */
 };
 

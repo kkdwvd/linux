@@ -58,6 +58,15 @@
  * the probe as to everything else, so a child that answers with refaults is
  * left alone and probed more rarely.
  *
+ * When free memory has stayed below the buffer for cfg.throttle_ticks
+ * ticks, an allocator is outrunning the pool, and cfg.throttle lets the
+ * controller set memory.high of the fastest growing child, growth divided
+ * by weight, to its usage. Its own tasks then reclaim from its own
+ * hierarchy on their way back to user space and are delayed in proportion
+ * to the overage, outside any lock, which is the kernel's own answer to a
+ * task that allocates faster than memory can be found for it. The limit is
+ * lifted once the buffer is back, and on teardown.
+ *
  * Children are equal unless the loader says otherwise: a per-child map of
  * overrides, keyed by cgroup ID, carries a floor, a weight that multiplies
  * into the split, a pressure target, a CPU budget, an efficiency floor and
@@ -93,6 +102,7 @@ char _license[] SEC("license") = "GPL";
 #define REFAULT_MIN (256ULL << 10)	/* refaults below this rate are noise, not thrashing */
 #define BUSY_MIN 1000000	/* less CPU than this in a tick says nothing about efficiency */
 #define REST_MAX 64		/* the longest a child is rested after a gate, in ticks */
+#define NO_LIMIT (~0UL)		/* memory.high "max" */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -273,8 +283,31 @@ static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *
  * returned is coldness times the headroom in megabytes, kept small enough
  * for the split's arithmetic.
  */
+/*
+ * Engage or lift memory.high on a child while its memcg is held: @throttle
+ * names it as the runaway with the pool behind, @free says whether the
+ * buffer is back.
+ */
+static __always_inline void throttle_cgroup(struct bpf_reclaim_cgroup *cg, struct mem_cgroup *memcg,
+					    __u64 usage, __u64 protected, bool throttle, __u64 free)
+{
+	if (!cfg.throttle || cg->excluded)
+		return;
+	if (!cg->throttled && throttle && usage > protected) {
+		if (!bpf_mem_cgroup_set_high(memcg, usage)) {
+			cg->throttled = 1;
+			cg->throttles++;
+		}
+	} else if (cg->throttled && free >= cfg.buffer) {
+		bpf_mem_cgroup_set_high(memcg, NO_LIMIT);
+		cg->throttled = 0;
+	}
+	if (cg->throttled)
+		cg->throttle_ticks++;
+}
+
 static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
-					 __u64 *reclaimed_out)
+					 __u64 *reclaimed_out, bool throttle, __u64 free)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
@@ -301,8 +334,6 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		return -ENOENT;
 	}
 	read_cgroup(cgrp, memcg, &stall, &usage, &protected, &refaults, &scanned, &stolen);
-	bpf_put_mem_cgroup(memcg);
-	bpf_cgroup_release(cgrp);
 
 	child_config(id, &conf);
 	if (conf.floor > protected)
@@ -313,6 +344,9 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	cg->min_efficiency = conf.min_efficiency;
 	cg->swappiness = conf.swappiness;
 	cg->excluded = conf.excluded;
+	throttle_cgroup(cg, memcg, usage, protected, throttle, free);
+	bpf_put_mem_cgroup(memcg);
+	bpf_cgroup_release(cgrp);
 	cg->budget_ns = cfg.interval_ns / 1000000 * conf.cpu_budget_ppm;
 	/* A child seen for the first time gives baselines, not a sample. */
 	if (!cg->coldness) {
@@ -491,6 +525,24 @@ static __always_inline __u64 set_quota(__u64 id, __u64 demand, __u64 total, __u3
 	return quota;
 }
 
+/* A child's smoothed growth divided by its weight: the runaway ranking. */
+static __always_inline __s64 growth_per_weight(__u64 id)
+{
+	struct bpf_reclaim_cgroup *cg;
+	struct cgroup *cgrp;
+	__s64 growth = 0;
+
+	cgrp = bpf_cgroup_from_id(id);
+	if (!cgrp)
+		return 0;
+	cg = bpf_cgrp_storage_get(&cgroups, cgrp, 0, 0);
+	/* Only growth ranks, and BPF has no signed division before cpu v4. */
+	if (cg && !cg->excluded && cg->weight && cg->growth > 0)
+		growth = (__u64)cg->growth / cg->weight;
+	bpf_cgroup_release(cgrp);
+	return growth;
+}
+
 /* The pool's throughput per busy worker, from the workers' own tallies. */
 static __always_inline void measure_capacity(struct bpf_reclaim_control *c)
 {
@@ -522,9 +574,10 @@ static int control_cb(void *map, int *key, void *value)
 	struct bpf_reclaim_control *c = value;
 	struct bpf_reclaim_pool *p;
 	__u64 now, dt_ms, free, demand, weight, reclaimed, lose, pred, cap, per_worker;
-	__u64 total = 0, quota = 0, tick_reclaimed = 0;
-	__s64 drain;
+	__u64 total = 0, quota = 0, tick_reclaimed = 0, runaway = 0;
+	__s64 drain, max_growth = 0, growth;
 	__u32 zero = 0, seq, k, n, shift = 0;
+	bool behind;
 	int i;
 
 	p = bpf_map_lookup_elem(&pool, &zero);
@@ -542,17 +595,39 @@ static int control_cb(void *map, int *key, void *value)
 	free = bpf_global_zone_page_state(NR_FREE_PAGES);
 	if (free < c->free_min)
 		c->free_min = free;
+	/* The pool is behind once the buffer has been breached for a while. */
+	behind = cfg.throttle && cfg.throttle_ticks && c->deficit_run >= cfg.throttle_ticks;
+	if (behind)
+		c->behind_ticks++;
 
 	n = c->nr_cgroups;
 	bpf_for(i, 0, n) {
 		if (i >= BPF_RECLAIM_MAX_CGROUPS)
 			break;
-		if (!sample_cgroup(c->ids[i], dt_ms, &weight, &reclaimed)) {
+		if (!sample_cgroup(c->ids[i], dt_ms, &weight, &reclaimed,
+				   behind && c->ids[i] == c->runaway, free)) {
 			total += weight;
 			tick_reclaimed += reclaimed;
+			/* The one to throttle next tick if the pool stays behind. */
+			growth = growth_per_weight(c->ids[i]);
+			if (growth > max_growth) {
+				max_growth = growth;
+				runaway = c->ids[i];
+			}
 		}
 	}
 	measure_capacity(c);
+	/*
+	 * A runaway grows by a good part of what the whole pool can reclaim
+	 * in a second, so that no pool size would keep up with it for long.
+	 */
+	cap = cfg.pool * c->capacity;
+	if (cfg.max_rate && cfg.max_rate < cap)
+		cap = cfg.max_rate;
+	cap /= 4;
+	if (cap < (4ULL << 20))
+		cap = 4ULL << 20;
+	c->runaway = max_growth > (__s64)cap ? runaway : 0;
 
 	/* Free memory lost over the tick, net of what the pool put back. */
 	drain = (__s64)(c->free + tick_reclaimed) - (__s64)free;
@@ -565,8 +640,12 @@ static int control_cb(void *map, int *key, void *value)
 	 * as soon as the drain would reach the buffer within the lead.
 	 */
 	demand = free < cfg.buffer ? cfg.buffer - free : 0;
-	if (demand)
+	if (demand) {
 		c->deficit_ticks++;
+		c->deficit_run++;
+	} else {
+		c->deficit_run = 0;
+	}
 	if (c->drain_rate > 0) {
 		lose = (__u64)c->drain_rate * (cfg.lead_ns / 1000000) / 1000;
 		pred = lose < free ? free - lose : 0;
@@ -793,15 +872,37 @@ int reclaim_setup(void *ctx)
 	return bpf_kthread_start(&c->kthread, 0);
 }
 
+/* Lift a memory.high the policy set on a child. */
+static __always_inline void unthrottle_cgroup(__u64 id)
+{
+	struct bpf_reclaim_cgroup *cg;
+	struct mem_cgroup *memcg;
+	struct cgroup *cgrp;
+
+	cgrp = bpf_cgroup_from_id(id);
+	if (!cgrp)
+		return;
+	cg = bpf_cgrp_storage_get(&cgroups, cgrp, 0, 0);
+	if (cg && cg->throttled) {
+		memcg = bpf_get_mem_cgroup(&cgrp->self);
+		if (memcg) {
+			bpf_mem_cgroup_set_high(memcg, NO_LIMIT);
+			bpf_put_mem_cgroup(memcg);
+		}
+		cg->throttled = 0;
+	}
+	bpf_cgroup_release(cgrp);
+}
+
 SEC("syscall")
 int reclaim_teardown(void *ctx)
 {
 	struct bpf_reclaim_control *c;
 	struct bpf_reclaim_thread *t;
-	__u32 zero = 0;
+	__u32 zero = 0, n;
 	int i;
 
-	/* The controller first, so it wakes no more workers. */
+	/* The controller first, so it neither wakes workers nor throttles anew. */
 	c = bpf_map_lookup_elem(&control, &zero);
 	if (c)
 		bpf_kthread_stop(&c->kthread, 0);
@@ -810,6 +911,15 @@ int reclaim_teardown(void *ctx)
 		if (!t)
 			break;
 		bpf_kthread_stop(&t->kthread, 0);
+	}
+	/* Lift any memory.high the policy set. */
+	if (c && cfg.throttle) {
+		n = c->nr_cgroups;
+		bpf_for(i, 0, n) {
+			if (i >= BPF_RECLAIM_MAX_CGROUPS)
+				break;
+			unthrottle_cgroup(c->ids[i]);
+		}
 	}
 	return 0;
 }
