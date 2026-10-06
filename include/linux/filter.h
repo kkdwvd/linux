@@ -879,8 +879,10 @@ struct bpf_nh_params {
 #define BPF_RI_F_DEV_MAP_INIT	BIT(3)
 #define BPF_RI_F_XSK_MAP_INIT	BIT(4)
 #define BPF_RI_F_XDP_CONSUMED	BIT(5)	/* the program owns the frame, see XDP_CONSUME */
+#define BPF_RI_F_XDP_LIVE_RUN	BIT(6)	/* a live test run, which completes redirects itself */
 
 struct bpf_redirect_info {
+	struct xdp_frame *consumed_frame;
 	u64 tgt_index;
 	void *tgt_value;
 	struct bpf_map *map;
