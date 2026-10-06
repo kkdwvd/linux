@@ -335,7 +335,8 @@ static __always_inline void throttle_cgroup(struct bpf_reclaim_cgroup *cg, struc
 }
 
 static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
-					 __u64 *reclaimed_out, bool throttle, __u64 free)
+					 __u64 *reclaimed_out, bool throttle, __u64 free,
+					 __u64 can_serve)
 {
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
@@ -441,11 +442,12 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 	 * The gate: refaults taking back half of what the pool reclaims, or
 	 * pressure over the target with refaults behind it, halve the
 	 * coldness every tick and keep the child out. Serving at least half
-	 * of what was asked, with refaults taking back less than a quarter
-	 * of it, grows it by an eighth; a child that was asked and gave
-	 * almost nothing is not shown to be cold by that. Pressure without
-	 * refaults is the child's own tasks stalling in the kernel's reclaim,
-	 * a reason to take more.
+	 * of what was asked, or half of what one worker could serve in the
+	 * tick when the ask was more than that, with refaults taking back
+	 * less than a quarter of it, grows it by an eighth; a child that was
+	 * asked and gave almost nothing is not shown to be cold by that.
+	 * Pressure without refaults is the child's own tasks stalling in the
+	 * kernel's reclaim, a reason to take more.
 	 */
 	thrashing = cg->refault_rate > REFAULT_MIN &&
 		    (cg->refault_rate * 2 > cg->reclaim_rate ||
@@ -461,13 +463,9 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		cg->backoff = cg->backoff < REST_MAX ? cg->backoff * 2 : REST_MAX;
 	} else if (cg->rest) {
 		cg->rest--;
-	} else if (cg->inflight) {
-		/*
-		 * A call on it is still running, longer than the tick: offer
-		 * nothing more and judge it once the call's time is in.
-		 */
 	} else {
-		if (asked && reclaimed >= asked / 2 && cg->refault_rate * 4 < cg->reclaim_rate) {
+		if (asked && (reclaimed >= asked / 2 || reclaimed >= can_serve / 2) &&
+		    cg->refault_rate * 4 < cg->reclaim_rate) {
 			if (cg->coldness < COLD_MAX)
 				cg->coldness += cg->coldness / 8 + 1;
 			if (cg->backoff > 1)
@@ -483,6 +481,14 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight,
 		 */
 		if (usage > protected && !cg->exhausted && !conf.excluded)
 			headroom = usage - protected;
+		/*
+		 * A child that has not yet proved itself gets no second call
+		 * while its first is still running, longer than the tick; one
+		 * that has is served on, since a worker on cold memory is
+		 * always mid-call when the tick comes.
+		 */
+		if (cg->inflight && cg->coldness <= COLD_INIT)
+			headroom = 0;
 		if (headroom < cfg.chunk)
 			headroom = 0;
 	}
@@ -638,7 +644,8 @@ static int control_cb(void *map, int *key, void *value)
 		if (i >= BPF_RECLAIM_MAX_CGROUPS)
 			break;
 		if (!sample_cgroup(c->ids[i], dt_ms, &weight, &reclaimed,
-				   behind && c->ids[i] == c->runaway, free)) {
+				   behind && c->ids[i] == c->runaway, free,
+				   c->capacity * dt_ms / 1000)) {
 			total += weight;
 			tick_reclaimed += reclaimed;
 			/* The one to throttle next tick if the pool stays behind. */
