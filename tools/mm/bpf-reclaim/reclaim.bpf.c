@@ -28,6 +28,16 @@
  * therefore also measured, as "undone" reclaim, whether it came back as a
  * refault or as a fresh allocation; it is reported, not yet acted on.
  *
+ * Bytes do not bound what reclaim costs. A call into a child whose memory
+ * is all in use makes the kernel scan the LRU at rising priority to find a
+ * few evictable pages, and costs a hundred times the CPU of a call into a
+ * cold child. So each child has a CPU budget per tick, which a worker
+ * checks before every call, and a child whose reclaim yields less than
+ * cfg.min_efficiency bytes per CPU-second is gated as expensive, the same
+ * way as one that refaults. A gated child rests for a number of ticks that
+ * doubles with every consecutive gate and halves with every tick it serves
+ * well, so a child that keeps proving hot is probed ever more rarely.
+ *
  * Worker threads sleep on one wait queue, and the controller wakes as many
  * as the demand has chunks. A worker claims a chunk of a child's quota with
  * a compare-and-swap and calls bpf_proactive_reclaim() until the chunk is
@@ -47,6 +57,7 @@
 #include "vmlinux.h"
 #include <asm-generic/errno.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include "reclaim.h"
 #include "reclaim_compat.bpf.h"
 
@@ -58,6 +69,8 @@ char _license[] SEC("license") = "GPL";
 #define COLD_INIT 1024
 #define COLD_MAX BPF_RECLAIM_COLD_MAX
 #define REFAULT_MIN (1ULL << 20)	/* refaults below this rate are noise, not thrashing */
+#define BUSY_MIN 1000000	/* less CPU than this in a tick says nothing about efficiency */
+#define REST_MAX 64		/* the longest a child is rested after a gate, in ticks */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -155,13 +168,23 @@ static int discover(struct bpf_reclaim_control *c)
  * and the gate runs on refaults alone.
  */
 static __always_inline void read_cgroup(struct cgroup *cgrp, struct mem_cgroup *memcg,
-					__u64 *stall, __u64 *usage, __u64 *refaults)
+					__u64 *stall, __u64 *usage, __u64 *refaults,
+					__u64 *scanned, __u64 *stolen)
 {
 	*stall = bpf_psi_total(cgrp, PSI_MEM_SOME);
 	*usage = bpf_mem_cgroup_usage(memcg);
 	bpf_mem_cgroup_flush_stats(memcg);
 	*refaults = bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_ANON) +
 		    bpf_mem_cgroup_page_state(memcg, WORKINGSET_REFAULT_FILE);
+	/*
+	 * The kernel's own count of what proactive reclaim scanned and freed
+	 * in the child, in pages; kernels before the counters read zero.
+	 */
+	*scanned = *stolen = 0;
+	if (bpf_core_enum_value_exists(enum node_stat_item, PGSCAN_PROACTIVE)) {
+		*scanned = bpf_mem_cgroup_page_state(memcg, PGSCAN_PROACTIVE);
+		*stolen = bpf_mem_cgroup_page_state(memcg, PGSTEAL_PROACTIVE);
+	}
 }
 
 /*
@@ -176,9 +199,9 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 	struct mem_cgroup *memcg;
 	struct cgroup *cgrp;
 	__u64 stall, usage, refaults, refaulted = 0, reclaimed, undone, pressure = 0, headroom = 0;
-	__u64 asked;
+	__u64 asked, busy, scanned, stolen;
 	__s64 growth;
-	bool thrashing;
+	bool thrashing, expensive;
 
 	*weight = 0;
 	cgrp = bpf_cgroup_from_id(id);
@@ -194,16 +217,20 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 		bpf_cgroup_release(cgrp);
 		return -ENOENT;
 	}
-	read_cgroup(cgrp, memcg, &stall, &usage, &refaults);
+	read_cgroup(cgrp, memcg, &stall, &usage, &refaults, &scanned, &stolen);
 	bpf_put_mem_cgroup(memcg);
 	bpf_cgroup_release(cgrp);
 
+	cg->budget_ns = cfg.interval_ns / 1000000 * cfg.cpu_budget_ppm;
 	/* A child seen for the first time gives baselines, not a sample. */
 	if (!cg->coldness) {
 		cg->coldness = COLD_INIT;
+		cg->backoff = 1;
 		cg->stall_ns = stall;
 		cg->usage = usage;
 		cg->refaults = refaults;
+		cg->scanned = scanned;
+		cg->stolen = stolen;
 		cg->quota = 0;
 		return 0;
 	}
@@ -235,9 +262,25 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 	cg->undone_total += undone;
 	cg->undone_rate = ewma(cg->undone_rate, per_second(undone, dt_ms));
 
+	/*
+	 * What the tick cost: CPU as a share of one CPU, and bytes per
+	 * CPU-second, judged only from a tick that spent enough to tell.
+	 */
+	busy = __sync_lock_test_and_set(&cg->tick_busy_ns, 0);
+	cg->busy_ppm = ewma(cg->busy_ppm, busy / dt_ms);
+	if (busy >= BUSY_MIN)
+		cg->efficiency = ewma(cg->efficiency, reclaimed * 1000 / (busy / 1000000));
+	expensive = busy >= BUSY_MIN && cg->efficiency < cfg.min_efficiency;
+	if (scanned >= cg->scanned)
+		cg->scanned_total += scanned - cg->scanned;
+	if (stolen >= cg->stolen)
+		cg->stolen_total += stolen - cg->stolen;
+
 	cg->usage = usage;
 	cg->stall_ns = stall;
 	cg->refaults = refaults;
+	cg->scanned = scanned;
+	cg->stolen = stolen;
 
 	/*
 	 * The gate: refaults taking back half of what the pool reclaims, or
@@ -251,13 +294,24 @@ static __always_inline int sample_cgroup(__u64 id, __u64 dt_ms, __u64 *weight)
 	thrashing = cg->refault_rate > REFAULT_MIN &&
 		    (cg->refault_rate * 2 > cg->reclaim_rate ||
 		     cg->pressure_ppm > cfg.target_ppm);
-	cg->gated = thrashing;
-	if (thrashing) {
+	cg->gated = thrashing || expensive;
+	if (cg->gated) {
 		cg->gated_ticks++;
+		if (expensive)
+			cg->expensive_ticks++;
 		cg->coldness = cg->coldness > 2 * COLD_MIN ? cg->coldness / 2 : COLD_MIN;
+		/* Rest it, for twice as long as after the last gate. */
+		cg->rest = cg->backoff;
+		cg->backoff = cg->backoff < REST_MAX ? cg->backoff * 2 : REST_MAX;
+	} else if (cg->rest) {
+		cg->rest--;
 	} else {
-		if (asked && reclaimed >= asked / 2 && cg->coldness < COLD_MAX)
-			cg->coldness += cg->coldness / 8 + 1;
+		if (asked && reclaimed >= asked / 2) {
+			if (cg->coldness < COLD_MAX)
+				cg->coldness += cg->coldness / 8 + 1;
+			if (cg->backoff > 1)
+				cg->backoff /= 2;
+		}
 		if (cg->coldness > COLD_MAX)
 			cg->coldness = COLD_MAX;
 		/*
@@ -400,7 +454,7 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 	struct bpf_reclaim_cgroup *cg;
 	struct mem_cgroup *memcg;
 	struct cgroup *cgrp;
-	__u64 take, done = 0, busy;
+	__u64 take, done = 0, busy, start;
 	long ret;
 
 	cgrp = bpf_cgroup_from_id(id);
@@ -424,9 +478,19 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 		return true;
 	}
 
-	busy = bpf_ktime_get_ns();
+	busy = 0;
 	while (done < take && can_loop) {
+		/* Over the child's CPU budget for the tick: leave it be. */
+		if (cg->tick_busy_ns >= cg->budget_ns) {
+			__sync_fetch_and_add(&cg->budget_hits, 1);
+			cg->quota = 0;
+			break;
+		}
+		start = bpf_ktime_get_ns();
 		ret = bpf_proactive_reclaim(memcg, take - done, cfg.swappiness);
+		start = bpf_ktime_get_ns() - start;
+		busy += start;
+		__sync_fetch_and_add(&cg->tick_busy_ns, start);
 		__sync_fetch_and_add(&cg->calls, 1);
 		if (ret <= 0) {
 			/* Nothing left this tick: drop the rest of the quota. */
@@ -437,7 +501,6 @@ static __always_inline bool serve(struct bpf_reclaim_thread *t, __u64 id)
 		}
 		done += ret;
 	}
-	busy = bpf_ktime_get_ns() - busy;
 	bpf_put_mem_cgroup(memcg);
 
 	t->busy_ns += busy;

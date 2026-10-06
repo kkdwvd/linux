@@ -189,16 +189,17 @@ static void print_status(struct reclaim *skel, struct child *kids, int max, doub
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
 			continue;
 		printf("  cg=%s usage=%.0fM pressure=%.2f%% refault=%.1fM/s undone=%.1fM/s "
-		       "growth=%+.1fM/s cold=%.0f%% headroom=%.0fM reclaimed=%.1fM/s refaults=%llu "
-		       "calls=%llu empty=%llu%s\n",
+		       "growth=%+.1fM/s cold=%.0f%% headroom=%.0fM reclaimed=%.1fM/s cpu=%.0f%% "
+		       "eff=%.0fM/s refaults=%llu calls=%llu empty=%llu%s%s\n",
 		       kids[i].name, cg.usage / MB, cg.pressure_ppm / 1e4, cg.refault_rate / MB,
 		       cg.undone_rate / MB, cg.growth / MB,
 		       100.0 * cg.coldness / BPF_RECLAIM_COLD_MAX, cg.headroom / MB,
-		       (cg.reclaimed - kids[i].last.reclaimed) / MB / dt,
+		       (cg.reclaimed - kids[i].last.reclaimed) / MB / dt, cg.busy_ppm / 1e4,
+		       cg.efficiency / MB,
 		       (unsigned long long)(cg.refaults_total - kids[i].last.refaults_total),
 		       (unsigned long long)(cg.calls - kids[i].last.calls),
 		       (unsigned long long)(cg.empty - kids[i].last.empty),
-		       cg.gated ? " gated" : "");
+		       cg.gated ? " gated" : "", cg.rest ? " resting" : "");
 		kids[i].last = cg;
 	}
 	fflush(stdout);
@@ -227,14 +228,16 @@ static void print_totals(struct reclaim *skel, struct child *kids, int max, unsi
 		if (kids[i].fd < 0 || child_state(skel, &kids[i], &cg))
 			continue;
 		printf("cgroup=%s reclaimed=%llu calls=%llu empty=%llu quota_given=%llu "
-		       "busy_ms=%llu refaults=%llu undone=%llu gated_ticks=%llu coldness=%llu "
-		       "usage=%llu\n",
+		       "busy_ms=%llu refaults=%llu undone=%llu gated_ticks=%llu expensive_ticks=%llu "
+		       "budget_hits=%llu scanned=%llu stolen=%llu coldness=%llu usage=%llu\n",
 		       kids[i].name, (unsigned long long)cg.reclaimed,
 		       (unsigned long long)cg.calls, (unsigned long long)cg.empty,
 		       (unsigned long long)cg.quota_given,
 		       (unsigned long long)(cg.busy_ns / 1000000),
 		       (unsigned long long)cg.refaults_total, (unsigned long long)cg.undone_total,
-		       (unsigned long long)cg.gated_ticks, (unsigned long long)cg.coldness,
+		       (unsigned long long)cg.gated_ticks, (unsigned long long)cg.expensive_ticks,
+		       (unsigned long long)cg.budget_hits, (unsigned long long)cg.scanned_total,
+		       (unsigned long long)cg.stolen_total, (unsigned long long)cg.coldness,
 		       (unsigned long long)cg.usage);
 	}
 }
@@ -248,6 +251,8 @@ int main(int argc, char **argv)
 		{ "chunk", required_argument, NULL, 'c' },
 		{ "floor", required_argument, NULL, 'f' },
 		{ "target", required_argument, NULL, 't' },
+		{ "cpu-budget", required_argument, NULL, 'C' },
+		{ "min-efficiency", required_argument, NULL, 'e' },
 		{ "swappiness", required_argument, NULL, 'w' },
 		{ "status-ms", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
@@ -258,6 +263,7 @@ int main(int argc, char **argv)
 		.interval_ns = 100 * 1000 * 1000ULL,
 		.chunk = 2ULL << 20,
 		.target_ppm = 10000,
+		.min_efficiency = 16ULL << 20,
 		.pool = 2,
 		.swappiness = -1,
 	};
@@ -269,7 +275,7 @@ int main(int argc, char **argv)
 	int opt, i, err = 1;
 
 	cfg.buffer = total_ram() / 8;
-	while ((opt = getopt_long(argc, argv, "b:i:P:c:f:t:w:s:v", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "b:i:P:c:f:t:C:e:w:s:v", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'b':
 			cfg.buffer = strtoull(optarg, NULL, 0) << 20;
@@ -289,6 +295,12 @@ int main(int argc, char **argv)
 		case 't':
 			target_pct = atof(optarg);
 			cfg.target_ppm = target_pct * 10000;
+			break;
+		case 'C':
+			cfg.cpu_budget_ppm = atof(optarg) * 10000;
+			break;
+		case 'e':
+			cfg.min_efficiency = strtoull(optarg, NULL, 0) << 20;
 			break;
 		case 'w':
 			cfg.swappiness = !strcmp(optarg, "anon") ? BPF_RECLAIM_SWAPPINESS_ANON_ONLY
@@ -315,6 +327,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "the interval and the chunk must not be zero\n");
 		return 1;
 	}
+	/* By default a child may have the whole pool; the budget bounds waste, not work. */
+	if (!cfg.cpu_budget_ppm)
+		cfg.cpu_budget_ppm = cfg.pool * 1000000ULL;
 	cfg.root_cgroup_id = cgroup_id(root);
 	if (!cfg.root_cgroup_id) {
 		fprintf(stderr, "%s: not a cgroup: %s\n", root, strerror(errno));
@@ -342,9 +357,9 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	printf("ready root=%s buffer=%.0fM pool=%u interval=%.0fms chunk=%.0fM floor=%.0fM "
-	       "target=%.2f%%\n",
+	       "target=%.2f%% cpu_budget=%.0f%% min_efficiency=%.0fM/s\n",
 	       root, cfg.buffer / MB, cfg.pool, cfg.interval_ns / 1e6, cfg.chunk / MB,
-	       cfg.floor / MB, target_pct);
+	       cfg.floor / MB, target_pct, cfg.cpu_budget_ppm / 1e4, cfg.min_efficiency / MB);
 	fflush(stdout);
 
 	start = last = now_s();
@@ -370,8 +385,8 @@ out:
 	return err ? 1 : 0;
 usage:
 	fprintf(stderr, "usage: %s [-v] [--buffer MB] [--interval-ms N] [--pool N] [--chunk MB]\n"
-		"          [--floor MB] [--target PCT] [--swappiness N|anon] [--status-ms N]\n"
-		"          ROOT_CGROUP\n",
+		"          [--floor MB] [--target PCT] [--cpu-budget PCT] [--min-efficiency MB/s]\n"
+		"          [--swappiness N|anon] [--status-ms N] ROOT_CGROUP\n",
 		basename(argv[0]));
 	return 2;
 }

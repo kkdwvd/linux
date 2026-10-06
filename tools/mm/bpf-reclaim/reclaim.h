@@ -25,6 +25,8 @@ struct bpf_reclaim_cfg {
 	__u64 chunk;		/* bytes a worker claims from a cgroup at a time */
 	__u64 floor;		/* bytes of usage never reclaimed below */
 	__u64 target_ppm;	/* tolerated stall fraction (PSI some), parts per million */
+	__u64 cpu_budget_ppm;	/* CPU a child may cost per tick, parts per million of one CPU */
+	__u64 min_efficiency;	/* bytes per CPU-second below which reclaiming a child is expensive */
 	__u32 pool;		/* worker threads */
 	__s32 swappiness;	/* -1 for the cgroup's own */
 };
@@ -48,9 +50,17 @@ struct bpf_reclaim_cgroup {
 	__u64 reclaim_rate;	/* smoothed reclaim by the pool, bytes per second */
 	__u64 undone_rate;	/* smoothed regrowth of what the pool took, bytes per second */
 	__u64 tick_reclaimed;	/* reclaimed since the last tick */
+	__u64 tick_busy_ns;	/* CPU spent on it since the last tick */
+	__u64 budget_ns;	/* CPU it may cost this tick */
+	__u64 busy_ppm;		/* smoothed CPU spent on it, parts per million of one CPU */
+	__u64 efficiency;	/* smoothed bytes reclaimed per CPU-second */
+	__u64 scanned;		/* proactive scan count at the last tick */
+	__u64 stolen;		/* proactive steal count at the last tick */
 	__s64 growth;		/* smoothed allocation net of reclaim and refaults, bytes/s */
 	__u32 exhausted;	/* a reclaim call found nothing since the last tick */
-	__u32 gated;		/* refaults or pressure kept it out of the last tick */
+	__u32 gated;		/* refaults, pressure or cost kept it out of the last tick */
+	__u32 rest;		/* ticks left to sit out after a gate */
+	__u32 backoff;		/* ticks the next gate will rest it for */
 	/* counters, only added to */
 	__u64 reclaimed;	/* bytes the pool reclaimed */
 	__u64 calls;		/* bpf_proactive_reclaim() calls */
@@ -60,6 +70,10 @@ struct bpf_reclaim_cgroup {
 	__u64 refaults_total;	/* refaults since the policy first saw it */
 	__u64 undone_total;	/* bytes the pool took that were back by the next tick */
 	__u64 gated_ticks;	/* ticks the gate kept it out */
+	__u64 expensive_ticks;	/* ticks the gate closed for cost rather than refaults */
+	__u64 budget_hits;	/* times a worker stopped because the CPU budget was spent */
+	__u64 scanned_total;	/* pages the kernel scanned for the pool's reclaim */
+	__u64 stolen_total;	/* pages it freed for it */
 };
 
 /* A pool worker: sleeps on the pool's wait queue and claims quota. */
