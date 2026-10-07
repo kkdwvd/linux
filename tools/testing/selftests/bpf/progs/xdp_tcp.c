@@ -13,6 +13,7 @@
 #include "bpf_experimental.h"
 #include "bpf_arena_common.h"
 #include "bpf_xdp_tcp.h"
+#include "../xdp_tcp_xsk.h"
 #include "../test_kmods/bpf_testmod.h"
 #include "../test_kmods/bpf_testmod_kfunc.h"
 
@@ -33,6 +34,10 @@ struct {
 #define CLOCK_MONOTONIC	1
 #endif
 
+#ifndef ETH_HLEN
+#define ETH_HLEN	14
+#endif
+
 char __arena_global reply[REPLY_MAX];
 
 /* The test owns the socket from a syscall program while segments arrive. */
@@ -48,6 +53,7 @@ int xdp_tcp_hold_sock(void *ctx)
 /* Knobs set by the test. */
 int decline;		/* inspect every segment and leave it to the stack */
 int reply_len;		/* 0: echo the request; otherwise send this much of the arena */
+int xsk_mode;		/* hand taken segments to the AF_XDP socket in xsks */
 __u16 serve_port;	/* when set, only connections to this port are served */
 
 #ifndef ETH_P_IP
@@ -85,6 +91,88 @@ static __always_inline bool to_port(struct xdp_md *ctx, __u16 port)
 	if ((void *)(th + 1) > end)
 		return false;
 	return th->dest == bpf_htons(port);
+}
+
+/*
+ * AF_XDP mode: the kernel takes the segment as usual, and the program hands
+ * the payload to a user-space consumer through the ring instead of answering
+ * it, with the headers stripped and the stream position in front. A FIN
+ * without data is left to the kernel; the consumer sees end-of-file on the
+ * socket, which it polls alongside the ring.
+ *
+ * The redirect is applied after the program returns, and a frame the socket
+ * cannot take then is dropped there, after the kernel has acknowledged its
+ * bytes. So the segment is taken only once bpf_xsk_rx_space() says the socket
+ * has room for the frame; otherwise it is dropped untaken and unacknowledged,
+ * and the peer retransmits it when the consumer has caught up.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_XSKMAP);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} xsks SEC(".maps");
+
+__u64 xsk_delivered, xsk_backpressure;
+
+extern __u32 bpf_xsk_rx_space(struct xdp_md *ctx, struct bpf_map *map, __u32 key) __ksym;
+
+static __always_inline int deliver_xsk(struct xdp_md *ctx, struct bpf_xdp_tcp_sock *sock)
+{
+	__u64 cookie = bpf_xdp_tcp_sock_cookie(sock);
+	__u32 len = bpf_xdp_tcp_sock_len(sock), seq = bpf_xdp_tcp_sock_seq(sock);
+	__u32 strip = bpf_xdp_tcp_sock_offset(sock), off = 0;
+	bool fin = bpf_xdp_tcp_sock_eof(sock);
+	struct xdp_tcp_xsk_meta *meta;
+
+	if (!len)
+		return XDP_DROP;
+	/* The helper keeps ETH_HLEN bytes: a shorter payload keeps a tail of the headers. */
+	if (len < ETH_HLEN) {
+		off = ETH_HLEN - len;
+		strip -= off;
+	}
+	/* The record's room was reserved before the take; the headers move out of the way. */
+	if (bpf_xdp_adjust_head(ctx, strip))
+		return XDP_DROP;
+	meta = (void *)(long)ctx->data_meta;
+	if ((void *)(meta + 1) > (void *)(long)ctx->data)
+		return XDP_DROP;
+	meta->cookie = cookie;
+	meta->seq = seq;
+	meta->len = len;
+	meta->fin = fin;
+	meta->off = off;
+	xsk_delivered++;
+	return bpf_redirect_map(&xsks, ctx->rx_queue_index, XDP_DROP);
+}
+
+static __always_inline int xsk_input(struct xdp_md *ctx)
+{
+	struct bpf_xdp_tcp_sock sock = {};
+	int action = XDP_PASS;
+
+	if (!bpf_xdp_tcp_sock_lookup(ctx, &sock))
+		return XDP_PASS;
+	if (bpf_xdp_tcp_sock_len(&sock)) {
+		if (!bpf_xsk_rx_space(ctx, (struct bpf_map *)&xsks, ctx->rx_queue_index)) {
+			xsk_backpressure++;
+			action = XDP_DROP;
+			goto out;
+		}
+		/*
+		 * Nothing may fail once the segment is taken: the record's room is
+		 * made first, and a driver without metadata leaves the segment to
+		 * the stack, where the consumer reads it from the socket.
+		 */
+		if (bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_tcp_xsk_meta)))
+			goto out;
+	}
+	if (!bpf_xdp_tcp_sock_consume(&sock, ctx))
+		action = deliver_xsk(ctx, &sock);
+out:
+	bpf_xdp_tcp_sock_release(&sock);
+	return action;
 }
 
 /* What happened. */
@@ -576,6 +664,8 @@ int xdp_tcp_echo(struct xdp_md *ctx)
 		return hold_input(ctx);
 	if (decline)
 		return inspect(ctx);
+	if (xsk_mode)
+		return xsk_input(ctx);
 	if (!bpf_xdp_tcp_sock_recv(ctx, &sock, &payload))
 		return XDP_PASS;
 	switch (bpf_xdp_tcp_sock_status(&sock)) {
