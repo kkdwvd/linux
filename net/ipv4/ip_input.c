@@ -353,7 +353,8 @@ static int tcp_v4_early_demux(struct sk_buff *skb)
 			if (dst &&
 			    sk->sk_rx_dst_ifindex == skb->skb_iif)
 				skb_dst_set_noref(skb, dst);
-			if (sk->sk_state == TCP_ESTABLISHED)
+			if (sk->sk_state == TCP_ESTABLISHED &&
+			    READ_ONCE(sysctl_tcp_rx_lookahead))
 				tcp_sock_prefetch_rx(sk);
 		}
 	}
@@ -675,7 +676,7 @@ static void ip_list_rcv_finish(struct net *net, struct list_head *head)
 		skb = l3mdev_ip_rcv(skb);
 		if (!skb)
 			continue;
-		if (&next->list != head)
+		if (&next->list != head && READ_ONCE(sysctl_tcp_rx_lookahead))
 			tcp_v4_early_demux_prefetch(net, next);
 		if (ip_rcv_finish_core(net, skb, dev, hint) == NET_RX_DROP)
 			continue;

@@ -524,6 +524,8 @@ static void unlist_file(struct epitems_head *head)
 static long long_zero;
 static long long_max = LONG_MAX;
 
+static int ep_lookahead = 1;
+
 static const struct ctl_table epoll_table[] = {
 	{
 		.procname	= "max_user_watches",
@@ -533,6 +535,15 @@ static const struct ctl_table epoll_table[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 		.extra1		= &long_zero,
 		.extra2		= &long_max,
+	},
+	{
+		.procname	= "lookahead",
+		.data		= &ep_lookahead,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 };
 
@@ -2204,7 +2215,7 @@ static int ep_send_events(struct eventpoll *ep,
 	 * We can loop without lock because we are passed a task-private
 	 * scan_batch; items cannot vanish while we hold ep->mtx.
 	 */
-	if (!list_empty(&scan_batch)) {
+	if (READ_ONCE(ep_lookahead) && !list_empty(&scan_batch)) {
 		la.item = list_first_entry(&scan_batch, struct epitem, rdllink);
 		ep_send_lookahead_step(&la, &scan_batch);
 		ep_send_lookahead_step(&la, &scan_batch);
@@ -2217,7 +2228,8 @@ static int ep_send_events(struct eventpoll *ep,
 		if (res >= maxevents)
 			break;
 
-		ep_send_lookahead_step(&la, &scan_batch);
+		if (la.item || la.file || la.sock)
+			ep_send_lookahead_step(&la, &scan_batch);
 		delivered = ep_deliver_event(ep, epi, &pt, &events, &scan_batch);
 		if (delivered < 0) {
 			if (!res)

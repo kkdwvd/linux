@@ -531,6 +531,15 @@ static void proc_fib_multipath_hash_set_seed(struct net *net, u32 user_seed)
 
 static struct ctl_table ipv4_table[] = {
 	{
+		.procname	= "tcp_rx_lookahead",
+		.data		= &sysctl_tcp_rx_lookahead,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
 		.procname	= "tcp_max_orphans",
 		.data		= &sysctl_tcp_max_orphans,
 		.maxlen		= sizeof(int),

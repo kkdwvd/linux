@@ -2074,6 +2074,8 @@ static void tcp_v4_fill_cb(struct sk_buff *skb, const struct iphdr *iph,
  *	From tcp_input.c
  */
 
+int sysctl_tcp_rx_lookahead __read_mostly = 1;
+
 int tcp_v4_rcv(struct sk_buff *skb)
 {
 	struct net *net = dev_net_rcu(skb->dev);
@@ -2223,7 +2225,7 @@ process:
 		goto discard_and_relse;
 	}
 
-	if (sk->sk_state == TCP_ESTABLISHED)
+	if (sk->sk_state == TCP_ESTABLISHED && READ_ONCE(sysctl_tcp_rx_lookahead))
 		tcp_sock_prefetch_rx_deps(sk);
 
 	drop_reason = tcp_inbound_hash(sk, NULL, skb, &iph->saddr, &iph->daddr,

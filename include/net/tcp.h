@@ -2248,6 +2248,8 @@ void tcp_write_queue_purge(struct sock *sk);
  * since the last segment and so a miss to another core's cache. Issued at
  * early demux, they arrive while the rest of the batch is demuxed.
  */
+extern int sysctl_tcp_rx_lookahead;
+
 static inline void tcp_sock_prefetch_rx(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
