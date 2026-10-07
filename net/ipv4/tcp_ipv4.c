@@ -2223,6 +2223,9 @@ process:
 		goto discard_and_relse;
 	}
 
+	if (sk->sk_state == TCP_ESTABLISHED)
+		tcp_sock_prefetch_rx_deps(sk);
+
 	drop_reason = tcp_inbound_hash(sk, NULL, skb, &iph->saddr, &iph->daddr,
 				       AF_INET, dif, sdif);
 	if (drop_reason)

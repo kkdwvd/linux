@@ -353,9 +353,29 @@ static int tcp_v4_early_demux(struct sk_buff *skb)
 			if (dst &&
 			    sk->sk_rx_dst_ifindex == skb->skb_iif)
 				skb_dst_set_noref(skb, dst);
+			if (sk->sk_state == TCP_ESTABLISHED)
+				tcp_sock_prefetch_rx(sk);
 		}
 	}
 	return 0;
+}
+
+/* The hash bucket the next skb's early demux walks, a random line of a
+ * table far larger than the caches, issued a packet ahead so that it
+ * arrives while this one is demuxed.
+ */
+static void tcp_v4_early_demux_prefetch(const struct net *net,
+					const struct sk_buff *skb)
+{
+	const struct iphdr *iph = ip_hdr(skb);
+	const struct tcphdr *th = tcp_hdr(skb);
+
+	if (iph->protocol != IPPROTO_TCP || ip_is_fragment(iph) || skb->sk ||
+	    (const unsigned char *)(th + 1) > skb_tail_pointer(skb))
+		return;
+	prefetch(inet_ehash_bucket(net->ipv4.tcp_death_row.hashinfo,
+				   inet_ehashfn(net, iph->daddr, ntohs(th->dest),
+						iph->saddr, th->source)));
 }
 
 static int ip_rcv_finish_core(struct net *net,
@@ -655,6 +675,8 @@ static void ip_list_rcv_finish(struct net *net, struct list_head *head)
 		skb = l3mdev_ip_rcv(skb);
 		if (!skb)
 			continue;
+		if (&next->list != head)
+			tcp_v4_early_demux_prefetch(net, next);
 		if (ip_rcv_finish_core(net, skb, dev, hint) == NET_RX_DROP)
 			continue;
 

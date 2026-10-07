@@ -2243,6 +2243,50 @@ static inline void tcp_skb_tsorted_anchor_cleanup(struct sk_buff *skb)
 
 void tcp_write_queue_purge(struct sock *sk);
 
+/* Every line of @sk the receive fast path reads or writes, the socket's
+ * and the TCP state's groups, most of them written by the sending CPU
+ * since the last segment and so a miss to another core's cache. Issued at
+ * early demux, they arrive while the rest of the batch is demuxed.
+ */
+static inline void tcp_sock_prefetch_rx(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	const char *p;
+
+#define TCP_PREFETCH_GROUPS(obj, first, last, fn)				\
+	for (p = (const char *)&(obj)->__cacheline_group_begin__##first;	\
+	     p < (const char *)&(obj)->__cacheline_group_end__##last;		\
+	     p += L1_CACHE_BYTES)						\
+		fn(p)
+	TCP_PREFETCH_GROUPS(sk, sock_write_rx, sock_write_rx, prefetchw);
+	TCP_PREFETCH_GROUPS(sk, sock_read_rx, sock_read_rxtx, prefetch);
+	TCP_PREFETCH_GROUPS(sk, sock_write_rxtx, sock_write_tx, prefetchw);
+	TCP_PREFETCH_GROUPS(sk, sock_read_tx, sock_read_tx, prefetch);
+	TCP_PREFETCH_GROUPS(tp, tcp_sock_read_tx, tcp_sock_read_rx, prefetch);
+	TCP_PREFETCH_GROUPS(tp, tcp_sock_write_tx, tcp_sock_write_rx, prefetchw);
+#undef TCP_PREFETCH_GROUPS
+}
+
+/* What the fast path reaches through the socket a little later: the first
+ * skb of the retransmit queue, which the segment's ACK frees, and the wait
+ * queue its data wakes.
+ */
+static inline void tcp_sock_prefetch_rx_deps(struct sock *sk)
+{
+	struct rb_node *node = sk->tcp_rtx_queue.rb_node;
+	struct socket_wq *wq = rcu_access_pointer(sk->sk_wq);
+
+	if (node) {
+		struct sk_buff *skb = rb_entry(node, struct sk_buff, rbnode);
+
+		prefetch(skb);
+		prefetch(&skb->len);
+		prefetchw(&skb->users);
+	}
+	if (wq)
+		prefetch(&wq->wait);
+}
+
 static inline struct sk_buff *tcp_rtx_queue_head(const struct sock *sk)
 {
 	return skb_rb_first(&sk->tcp_rtx_queue);
