@@ -19,6 +19,9 @@
  *                          for the stack.
  *   bpf_xdp_tcp_lookup()   split the in-order path in two, for a program that
  *   bpf_xdp_tcp_consume()  inspects a segment before it accepts it
+ *   bpf_xdp_tcp_send()     queues a response on the write queue and pushes it
+ *                          at once from BH context, or asks the program to
+ *                          try again
  *   bpf_xdp_tcp_release()  drops the socket reference
  *
  * tcp_ack() and friends work on an skb; a segment is described to them with a
@@ -577,6 +580,139 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
 	return status == BPF_XDP_TCP_RECEIVED ? 0 : -EAGAIN;
 }
 
+/*
+ * tcp_push() without the sendmsg() layer's write batching. Nagle and TCP_CORK
+ * are overridden as TCP_NAGLE_PUSH overrides them, and autocorking, which
+ * holds a short segment back while an earlier one is still in the qdisc or
+ * the driver so that later writes can be merged into it, does not apply: a
+ * reply is complete when it is queued and is never merged with a later one,
+ * so the hold would only delay it until that transmission completes. The
+ * segment is marked pushed as tcp_mark_push() marks it, and the congestion
+ * and receive windows, pacing and TSQ decide when it leaves.
+ */
+static void xdp_tcp_push(struct sock *sk, struct sk_buff *skb, int mss_now)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_PSH;
+	tp->pushed_seq = tp->write_seq;
+	__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
+}
+
+/*
+ * Build a segment for @len bytes of @buf as tcp_sendmsg() would: the headers
+ * in the skb, the payload in page fragments, so that the stack can split and
+ * coalesce it like any other segment on the write queue. The socket's own
+ * page_frag is used, since there is no task to borrow one from in BH context,
+ * and the socket lock, held by the caller, serialises its use. The memory for
+ * the headers is scheduled by tcp_stream_alloc_skb(); the payload is left to
+ * the caller, which has to schedule skb->data_len.
+ *
+ * @buf is arena memory, rebased into the arena's kernel mapping by the JIT. A
+ * page there that is not populated, or that another CPU frees meanwhile,
+ * faults into the arena's scratch page and is reported against the program;
+ * a copy that runs past the range the arena recovers fails instead.
+ */
+static struct sk_buff *xdp_tcp_alloc_segment(struct sock *sk, const void *buf, u32 len)
+{
+	struct page_frag *pfrag = &sk->sk_frag;
+	struct sk_buff *skb;
+	int err;
+
+	skb = tcp_stream_alloc_skb(sk, GFP_ATOMIC, tcp_rtx_and_write_queues_empty(sk));
+	if (!skb)
+		return ERR_PTR(-ENOMEM);
+	while (len) {
+		int i = skb_shinfo(skb)->nr_frags;
+		bool merge;
+		u32 copy;
+
+		err = -ENOMEM;
+		if (!skb_page_frag_refill(32U, pfrag, GFP_ATOMIC))
+			goto fail;
+		copy = min_t(u32, len, pfrag->size - pfrag->offset);
+		merge = skb_can_coalesce(skb, i, pfrag->page, pfrag->offset);
+		if (!merge && i >= MAX_SKB_FRAGS)
+			goto fail;
+		err = -EFAULT;
+		if (copy_from_kernel_nofault(page_address(pfrag->page) + pfrag->offset, buf, copy))
+			goto fail;
+		if (merge) {
+			skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
+		} else {
+			skb_fill_page_desc(skb, i, pfrag->page, pfrag->offset, copy);
+			page_ref_inc(pfrag->page);
+		}
+		pfrag->offset += copy;
+		skb->len += copy;
+		skb->data_len += copy;
+		skb->truesize += copy;
+		buf += copy;
+		len -= copy;
+	}
+	return skb;
+fail:
+	__kfree_skb(skb);
+	return ERR_PTR(err);
+}
+
+/**
+ * bpf_xdp_tcp_send - send data on an established socket from BPF
+ * @sk: the socket
+ * @buf__arena: the data, in arena memory
+ * @len: bytes to send, at most 64 KiB
+ *
+ * Copies the data into a new segment on the write queue and pushes it at
+ * once, from BH context: the stack decides when it leaves, the sendmsg()
+ * layer's write batching does not. Returns @len, or -EAGAIN when the socket
+ * is held by its user or the write queue has no room for the data: the
+ * program keeps the data and tries again later, the request having been
+ * consumed already. Other errors are final; -EFAULT says the buffer runs
+ * past the arena.
+ */
+__bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sk_buff *skb;
+	int mss_now, err;
+
+	if (!xdp_tcp_is_sock(sk) || !len || len > SZ_64K)
+		return -EINVAL;
+	/*
+	 * An XDP program runs with bottom halves disabled, but its bpf_wq and
+	 * bpf_task_work callbacks run in process context and may call this.
+	 */
+	local_bh_disable();
+	bh_lock_sock_nested(sk);
+	err = -EAGAIN;
+	if (sock_owned_by_user(sk) || !sk_stream_memory_free(sk))
+		goto out;
+	err = -ENOTCONN;
+	if (!((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)))
+		goto out;
+	skb = xdp_tcp_alloc_segment(sk, buf__arena, len);
+	if (IS_ERR(skb)) {
+		err = PTR_ERR(skb);
+		goto out;
+	}
+	if (!sk_wmem_schedule(sk, skb->data_len)) {
+		__kfree_skb(skb);
+		err = -EAGAIN;
+		goto out;
+	}
+	mss_now = tcp_current_mss(sk);
+	tcp_rate_check_app_limited(sk);
+	tcp_skb_entail(sk, skb);
+	TCP_SKB_CB(skb)->end_seq += len;
+	WRITE_ONCE(tp->write_seq, tp->write_seq + len);
+	xdp_tcp_push(sk, skb, mss_now);
+	err = len;
+out:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	return err;
+}
+
 /**
  * bpf_xdp_tcp_release - drop a reference to a connection
  * @sk: the socket, from bpf_xdp_tcp_recv() or bpf_xdp_tcp_lookup()
@@ -599,6 +735,7 @@ BTF_KFUNCS_START(bpf_xdp_tcp_xdp_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_recv, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_lookup, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_consume)
+BTF_ID_FLAGS(func, bpf_xdp_tcp_send)
 BTF_ID_FLAGS(func, bpf_xdp_tcp_release, KF_RELEASE)
 BTF_KFUNCS_END(bpf_xdp_tcp_xdp_kfunc_ids)
 
