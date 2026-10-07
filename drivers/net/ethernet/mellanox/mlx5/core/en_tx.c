@@ -714,6 +714,68 @@ static void mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_in
 	}
 }
 
+/* The skbs a completion frees were built on the sending CPU, so every line
+ * the free touches is a miss served from that core's cache: the skb's own
+ * lines, its shared info, the page its data sits in and the socket's write
+ * counters for the destructor. Issued in order of use three skbs ahead of
+ * the free, they overlap instead of each stalling the poll in turn.
+ */
+struct mlx5e_tx_cq_lookahead {
+	struct sk_buff *a;	/* own lines issued; dependents next */
+	struct sk_buff *b;	/* dependents issued; page next */
+	u16 cc;			/* the next WQE to look at */
+	u16 pc;			/* where the posted WQEs end */
+	u16 fifo_ci;		/* the next skb of a multi-packet WQE */
+	u8 fifo_left;		/* its skbs still to issue */
+};
+
+static struct sk_buff *mlx5e_tx_cq_lookahead_next(struct mlx5e_txqsq *sq,
+						  struct mlx5e_tx_cq_lookahead *la)
+{
+	while (la->fifo_left || (s16)(la->pc - la->cc) > 0) {
+		struct mlx5e_tx_wqe_info *wi;
+
+		if (la->fifo_left) {
+			la->fifo_left--;
+			return *mlx5e_skb_fifo_get(&sq->db.skb_fifo, la->fifo_ci++);
+		}
+		wi = &sq->db.wqe_info[mlx5_wq_cyc_ctr2ix(&sq->wq, la->cc)];
+		if (unlikely(!wi->num_wqebbs))
+			break;
+		la->cc += wi->num_wqebbs;
+		if (wi->skb)
+			return wi->skb;
+		la->fifo_left = wi->num_fifo_pkts;
+	}
+	return NULL;
+}
+
+static void mlx5e_tx_cq_lookahead_step(struct mlx5e_txqsq *sq,
+				       struct mlx5e_tx_cq_lookahead *la)
+{
+	struct sk_buff *skb = la->b;
+
+	if (skb) {
+		const struct skb_shared_info *sh = skb_shinfo(skb);
+
+		/* the page or net_iov, whichever the frag holds */
+		if (sh->nr_frags)
+			prefetchw((void *)((__force unsigned long)skb_frag_netmem(&sh->frags[0]) & ~NET_IOV));
+	}
+	skb = la->b = la->a;
+	if (skb) {
+		prefetchw(skb_shinfo(skb));
+		if (skb->sk)
+			prefetchw(&skb->sk->sk_wmem_alloc);
+	}
+	skb = la->a = mlx5e_tx_cq_lookahead_next(sq, la);
+	if (skb) {
+		prefetch(skb);
+		prefetch(&skb->destructor);
+		prefetchw(&skb->users);
+	}
+}
+
 static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
 			      struct mlx5_cqe64 *cqe, int napi_budget)
 {
@@ -735,13 +797,15 @@ static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
 }
 
 static void mlx5e_tx_wi_consume_fifo_skbs(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_info *wi,
-					  struct mlx5_cqe64 *cqe, int napi_budget)
+					  struct mlx5_cqe64 *cqe, int napi_budget,
+					  struct mlx5e_tx_cq_lookahead *la)
 {
 	int i;
 
 	for (i = 0; i < wi->num_fifo_pkts; i++) {
 		struct sk_buff *skb = mlx5e_skb_fifo_pop(&sq->db.skb_fifo);
 
+		mlx5e_tx_cq_lookahead_step(sq, la);
 		mlx5e_consume_skb(sq, skb, cqe, napi_budget);
 	}
 }
@@ -759,6 +823,7 @@ void mlx5e_txqsq_wake(struct mlx5e_txqsq *sq)
 
 bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 {
+	struct mlx5e_tx_cq_lookahead la = {};
 	struct mlx5e_sq_stats *stats;
 	struct mlx5e_txqsq *sq;
 	struct mlx5_cqe64 *cqe;
@@ -790,6 +855,12 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 	/* avoid dirtying sq cache line every cqe */
 	dma_fifo_cc = sq->dma_fifo_cc;
 
+	la.cc = sqcc;
+	la.pc = READ_ONCE(sq->pc);
+	la.fifo_ci = *sq->db.skb_fifo.cc;
+	mlx5e_tx_cq_lookahead_step(sq, &la);
+	mlx5e_tx_cq_lookahead_step(sq, &la);
+
 	i = 0;
 	do {
 		struct mlx5e_tx_wqe_info *wi;
@@ -810,6 +881,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 			sqcc += wi->num_wqebbs;
 
 			if (likely(wi->skb)) {
+				mlx5e_tx_cq_lookahead_step(sq, &la);
 				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
 				mlx5e_consume_skb(sq, wi->skb, cqe, napi_budget);
 
@@ -824,7 +896,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 
 			if (wi->num_fifo_pkts) {
 				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
-				mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget);
+				mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget, &la);
 
 				npkts += wi->num_fifo_pkts;
 				nbytes += wi->num_bytes;
