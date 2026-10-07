@@ -40,6 +40,7 @@
 #include <linux/capability.h>
 #include <linux/seqlock.h>
 #include <net/busy_poll.h>
+#include <linux/tcp.h>
 
 /*
  * fs/eventpoll.c - Efficient event polling ("epoll") kernel implementation.
@@ -2125,9 +2126,62 @@ static int ep_deliver_event(struct eventpoll *ep, struct epitem *epi,
 	return 1;
 }
 
+/* A ready item's delivery walks four dependent lines before its poll can
+ * begin, the item, its file, the socket and the sock, and with tens of
+ * thousands of sockets none is in the cache; the poll then reads half a
+ * dozen lines of the sock. Keep a pipeline running a few items ahead of
+ * the delivery, one hop per step, so that each line is on its way before
+ * the step that reads it.
+ */
+struct ep_send_lookahead {
+	struct epitem *item;	/* line issued; its file and successor next */
+	struct file *file;	/* line issued; its socket next */
+	struct socket *sock;	/* line issued; its sock next */
+};
+
+static void ep_send_lookahead_step(struct ep_send_lookahead *la,
+				   const struct list_head *head)
+{
+	struct epitem *next;
+	struct sock *sk;
+
+	if (la->sock) {
+		sk = READ_ONCE(la->sock->sk);
+		if (sk) {
+			/* what sock_poll and tcp_poll read: the state and
+			 * error, the receive queue and sequence numbers, the
+			 * wait queue, the send space
+			 */
+			prefetch(sk);
+			prefetch(&sk->__cacheline_group_begin__sock_write_rx);
+			prefetch(&sk->__cacheline_group_begin__sock_read_rx);
+			prefetch(&sk->__cacheline_group_begin__sock_write_rxtx);
+			prefetch(&sk->__cacheline_group_begin__sock_write_tx);
+			prefetch(&sk->__cacheline_group_begin__sock_read_tx);
+			prefetch(&tcp_sk(sk)->rcv_nxt);
+		}
+		la->sock = NULL;
+	}
+	if (la->file) {
+		la->sock = sock_from_file(la->file);
+		if (la->sock)
+			prefetch(la->sock);
+		la->file = NULL;
+	}
+	if (la->item) {
+		la->file = la->item->ffd.file;
+		prefetch(la->file);
+		next = list_next_entry(la->item, rdllink);
+		la->item = &next->rdllink != head ? next : NULL;
+		if (la->item)
+			prefetch(la->item);
+	}
+}
+
 static int ep_send_events(struct eventpoll *ep,
 			  struct epoll_event __user *events, int maxevents)
 {
+	struct ep_send_lookahead la = {};
 	struct epitem *epi, *tmp;
 	LIST_HEAD(scan_batch);
 	poll_table pt;
@@ -2150,12 +2204,20 @@ static int ep_send_events(struct eventpoll *ep,
 	 * We can loop without lock because we are passed a task-private
 	 * scan_batch; items cannot vanish while we hold ep->mtx.
 	 */
+	if (!list_empty(&scan_batch)) {
+		la.item = list_first_entry(&scan_batch, struct epitem, rdllink);
+		ep_send_lookahead_step(&la, &scan_batch);
+		ep_send_lookahead_step(&la, &scan_batch);
+		ep_send_lookahead_step(&la, &scan_batch);
+	}
+
 	list_for_each_entry_safe(epi, tmp, &scan_batch, rdllink) {
 		int delivered;
 
 		if (res >= maxevents)
 			break;
 
+		ep_send_lookahead_step(&la, &scan_batch);
 		delivered = ep_deliver_event(ep, epi, &pt, &events, &scan_batch);
 		if (delivered < 0) {
 			if (!res)
