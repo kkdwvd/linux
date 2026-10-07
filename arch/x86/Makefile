@@ -74,6 +74,13 @@ export BITS
 #    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53383
 #
 KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a
+
+# Clang lowers __builtin_prefetch() to nothing once -mno-sse has taken the
+# SSE prefetch instructions away, so a clang-built x86-64 kernel loses every
+# prefetch() it contains; -mprfchw gives the backend a prefetch instruction
+# again and prefetch() emits prefetcht0 as it does under GCC. The flag only
+# matters to the compiler: prefetchw itself is used through alternatives.
+KBUILD_CFLAGS += $(call cc-option,-mprfchw)
 KBUILD_RUSTFLAGS += --target=$(objtree)/scripts/target.json
 KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2
 
