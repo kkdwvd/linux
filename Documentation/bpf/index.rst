@@ -34,6 +34,7 @@ that goes into great technical depth about the BPF Architecture.
    linux-notes
    other
    redirect
+   xdp_tcp
 
 .. Links:
 .. _BPF and XDP Reference Guide: https://docs.cilium.io/en/latest/bpf/
