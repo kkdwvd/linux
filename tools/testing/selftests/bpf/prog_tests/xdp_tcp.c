@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -27,6 +28,8 @@
 #include "../test_kmods/bpf_testmod.h"
 #include "xdp_tcp.skel.h"
 #include "xdp_tcp_hooks.skel.h"
+#include "xdp_tcp_xsk.h"
+#include "xsk.h"
 
 #define NS		"xdp_tcp_ns"
 #define DEV		"xdptcp0"
@@ -762,6 +765,299 @@ static void test_declined(void)
 	ASSERT_EQ(c.skel->bss->lookups, 1, "lookups");
 	ASSERT_EQ(c.skel->bss->consumed, 0, "consumed");
 out:
+	teardown(&c);
+}
+
+/*
+ * An AF_XDP socket on the device, in copy mode, as the consumer of the stream:
+ * the program hands it each payload the kernel took, with the headers stripped
+ * and the stream position in front, and the application answers through its
+ * own socket, which it also polls for end-of-file.
+ */
+#define XSK_FRAMES	16
+#define XSK_FRAMES_FEW	4	/* a ring a short burst overruns, for the backpressure test */
+#define XSK_FRAME_SIZE	XSK_UMEM__DEFAULT_FRAME_SIZE
+
+struct xsk {
+	void *area;
+	__u32 frames;		/* UMEM frames, and the depth of the RX and fill rings */
+	struct xsk_umem *umem;
+	struct xsk_ring_prod fill;
+	struct xsk_ring_cons comp;
+	struct xsk_ring_cons rx;
+	struct xsk_socket *socket;
+};
+
+/* @frames, a power of two, is the UMEM's size and the depth of the RX and fill rings alike. */
+static int open_xsk(struct xsk *xsk, int ifindex, __u32 frames)
+{
+	const struct xsk_umem_config umem_cfg = {
+		.fill_size = frames,
+		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+		.frame_size = XSK_FRAME_SIZE,
+		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+		.flags = XSK_UMEM__DEFAULT_FLAGS,
+	};
+	const struct xsk_socket_config cfg = {
+		.rx_size = frames,
+		.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+		.bind_flags = XDP_COPY,
+	};
+	__u64 area_size = (__u64)frames * XSK_FRAME_SIZE;
+	__u32 idx, i;
+	int err;
+
+	xsk->frames = frames;
+	xsk->area = mmap(NULL, area_size, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	if (!ASSERT_NEQ(xsk->area, MAP_FAILED, "mmap umem"))
+		return -1;
+	err = xsk_umem__create(&xsk->umem, xsk->area, area_size, &xsk->fill, &xsk->comp,
+			       &umem_cfg);
+	if (!ASSERT_OK(err, "xsk_umem__create"))
+		return -1;
+	err = xsk_socket__create(&xsk->socket, ifindex, 0, xsk->umem, &xsk->rx, NULL, &cfg);
+	if (!ASSERT_OK(err, "xsk_socket__create"))
+		return -1;
+	/* Every frame is the kernel's to receive into. */
+	if (!ASSERT_EQ(xsk_ring_prod__reserve(&xsk->fill, frames, &idx), frames, "reserve fill"))
+		return -1;
+	for (i = 0; i < frames; i++)
+		*xsk_ring_prod__fill_addr(&xsk->fill, idx + i) = (__u64)i * XSK_FRAME_SIZE;
+	xsk_ring_prod__submit(&xsk->fill, frames);
+	return 0;
+}
+
+static void close_xsk(struct xsk *xsk)
+{
+	if (xsk->socket)
+		xsk_socket__delete(xsk->socket);
+	if (xsk->umem)
+		xsk_umem__delete(xsk->umem);
+	if (xsk->area && xsk->area != MAP_FAILED)
+		munmap(xsk->area, (__u64)xsk->frames * XSK_FRAME_SIZE);
+}
+
+/* The socket's own count of frames the redirect dropped. */
+static int xsk_stats(struct xsk *xsk, struct xdp_statistics *st)
+{
+	socklen_t len = sizeof(*st);
+
+	memset(st, 0, sizeof(*st));
+	return getsockopt(xsk_socket__fd(xsk->socket), SOL_XDP, XDP_STATISTICS, st, &len);
+}
+
+/*
+ * Take the next payload from the ring and check it: @want at stream position
+ * @seq on connection @cookie, behind the tail of header that a payload shorter
+ * than ETH_HLEN keeps. The frame goes back to the fill ring afterwards.
+ */
+static int xsk_recv(struct xsk *xsk, __u64 cookie, __u32 seq, const char *want)
+{
+	struct pollfd pfd = { .fd = xsk_socket__fd(xsk->socket), .events = POLLIN };
+	int len = strlen(want), off = len < ETH_HLEN ? ETH_HLEN - len : 0;
+	const struct xdp_desc *desc;
+	struct xdp_tcp_xsk_meta *meta;
+	__u64 addr;
+	void *data;
+	__u32 idx;
+	int ret = -1;
+
+	if (!ASSERT_EQ(poll(&pfd, 1, TIMEOUT_MS), 1, "poll(xsk)"))
+		return -1;
+	if (!ASSERT_EQ(xsk_ring_cons__peek(&xsk->rx, 1, &idx), 1, "xsk_ring_cons__peek"))
+		return -1;
+	desc = xsk_ring_cons__rx_desc(&xsk->rx, idx);
+	addr = desc->addr;
+	data = xsk_umem__get_data(xsk->area, xsk_umem__add_offset_to_addr(addr));
+	meta = data - sizeof(*meta);
+	if (ASSERT_EQ(meta->cookie, cookie, "meta cookie") &&
+	    ASSERT_EQ(meta->seq, seq, "meta seq") &&
+	    ASSERT_EQ(meta->len, len, "meta len") &&
+	    ASSERT_EQ(meta->fin, 0, "meta fin") &&
+	    ASSERT_EQ(meta->off, off, "meta off") &&
+	    ASSERT_EQ(desc->len, off + len, "desc len") &&
+	    ASSERT_MEMEQ(data + off, want, len, "payload"))
+		ret = 0;
+	xsk_ring_cons__release(&xsk->rx, 1);
+	if (ASSERT_EQ(xsk_ring_prod__reserve(&xsk->fill, 1, &idx), 1, "reserve fill")) {
+		*xsk_ring_prod__fill_addr(&xsk->fill, idx) = xsk_umem__extract_addr(addr);
+		xsk_ring_prod__submit(&xsk->fill, 1);
+	}
+	return ret;
+}
+
+static void test_af_xdp(void)
+{
+	/* One request shorter than an Ethernet header, one longer. */
+	const char *req1 = "hello", *req2 = "world, in a longer segment";
+	socklen_t optlen = sizeof(__u64);
+	struct pollfd pfd = { .events = POLLIN };
+	struct xsk xsk = {};
+	__u32 base, key = 0;
+	char buf[DATA_MAX];
+	__u64 cookie;
+	struct ctx c;
+	struct seg s;
+	int xsk_fd;
+
+	if (setup(&c, AF_INET))
+		return;
+	if (open_xsk(&xsk, c.ifindex, XSK_FRAMES))
+		goto out;
+	xsk_fd = xsk_socket__fd(xsk.socket);
+	pfd.fd = xsk_fd;
+	if (!ASSERT_OK(bpf_map_update_elem(bpf_map__fd(c.skel->maps.xsks), &key, &xsk_fd, 0),
+		       "update xsks"))
+		goto out;
+	c.skel->bss->xsk_mode = 1;
+	if (connect_peer(&c, 0))
+		goto out;
+	if (!ASSERT_OK(getsockopt(c.conn, SOL_SOCKET, SO_COOKIE, &cookie, &optlen), "SO_COOKIE"))
+		goto out;
+	base = c.peer.snd_nxt;
+	/* A request reaches the ring, not the socket, and the kernel acknowledges it. */
+	if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, req1, strlen(req1)), "send request"))
+		goto out;
+	if (xsk_recv(&xsk, cookie, base, req1))
+		goto out;
+	ASSERT_EQ(app_recv(&c, buf, sizeof(buf)), -EAGAIN, "app sees nothing");
+	if (!ASSERT_OK(peer_recv(&c.peer, &s, TIMEOUT_MS), "recv ack"))
+		goto out;
+	ASSERT_EQ(s.ack, c.peer.snd_nxt, "ack");
+	ASSERT_EQ(s.len, 0, "no reply from the kernel");
+	/* The application answers through the socket. */
+	if (!ASSERT_EQ(send(c.conn, "HELLO", 5, 0), 5, "send reply"))
+		goto out;
+	if (!ASSERT_OK(peer_recv_data(&c.peer, &s, TIMEOUT_MS), "recv reply"))
+		goto out;
+	ASSERT_EQ(s.seq, c.peer.rcv_nxt, "reply seq");
+	ASSERT_EQ(s.len, 5, "reply len");
+	ASSERT_MEMEQ(s.data, "HELLO", 5, "reply data");
+	c.peer.rcv_nxt += s.len;
+	if (!ASSERT_OK(peer_send(&c.peer, 0, NULL, 0), "ack reply"))
+		goto out;
+	/* The next request continues the stream. */
+	if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, req2, strlen(req2)), "send second request"))
+		goto out;
+	if (xsk_recv(&xsk, cookie, base + strlen(req1), req2))
+		goto out;
+	if (!ASSERT_OK(peer_recv(&c.peer, &s, TIMEOUT_MS), "recv second ack"))
+		goto out;
+	ASSERT_EQ(s.ack, c.peer.snd_nxt, "second ack");
+	/* The FIN is the kernel's: end-of-file on the socket, nothing on the ring. */
+	if (!ASSERT_OK(peer_send(&c.peer, TH_FIN, NULL, 0), "send FIN"))
+		goto out;
+	if (!ASSERT_OK(peer_recv(&c.peer, &s, TIMEOUT_MS), "recv ack of FIN"))
+		goto out;
+	ASSERT_EQ(s.ack, c.peer.snd_nxt, "ack of FIN");
+	ASSERT_EQ(app_recv(&c, buf, sizeof(buf)), 0, "app EOF");
+	ASSERT_EQ(poll(&pfd, 1, 200), 0, "ring empty");
+	ASSERT_EQ(c.skel->bss->xsk_delivered, 2, "xsk_delivered");
+	ASSERT_EQ(c.skel->bss->consumed, 0, "consumed");
+out:
+	close_xsk(&xsk);
+	teardown(&c);
+}
+
+/* Read the kernel's segments until one acknowledges @ack. */
+static int expect_ack(struct peer *p, __u32 ack)
+{
+	__u64 deadline = now_ms() + TIMEOUT_MS;
+	struct seg s;
+
+	while (now_ms() < deadline) {
+		if (peer_recv(p, &s, deadline - now_ms()))
+			break;
+		if (s.ack == ack)
+			return 0;
+	}
+	PRINT_FAIL("missing ACK %u\n", ack);
+	return -1;
+}
+
+/*
+ * The ring is the consumer's window. The redirect is applied once the program
+ * has returned, and a frame the socket cannot take then is dropped there,
+ * after the kernel has acknowledged its bytes; so the program takes a segment
+ * only when bpf_xsk_rx_space() says the socket has room for it, and otherwise
+ * drops the frame untaken, for the peer to retransmit. Four frames fill the
+ * ring; the fifth has to wait until the consumer has caught up.
+ */
+static void test_af_xdp_backpressure(void)
+{
+	const int frames = XSK_FRAMES_FEW;
+	struct tcp_info_ext before, after;
+	struct pollfd pfd = { .events = POLLIN };
+	socklen_t optlen = sizeof(__u64);
+	struct xdp_statistics st;
+	struct xsk xsk = {};
+	char req[XSK_FRAMES_FEW + 1][8];
+	__u32 seq, fifth, key = 0;
+	__u64 cookie;
+	struct ctx c;
+	struct seg s;
+	int xsk_fd, i;
+
+	if (setup(&c, AF_INET))
+		return;
+	if (open_xsk(&xsk, c.ifindex, frames))
+		goto out;
+	xsk_fd = xsk_socket__fd(xsk.socket);
+	pfd.fd = xsk_fd;
+	if (!ASSERT_OK(bpf_map_update_elem(bpf_map__fd(c.skel->maps.xsks), &key, &xsk_fd, 0),
+		       "update xsks"))
+		goto out;
+	c.skel->bss->xsk_mode = 1;
+	if (connect_peer(&c, 0))
+		goto out;
+	if (!ASSERT_OK(getsockopt(c.conn, SOL_SOCKET, SO_COOKIE, &cookie, &optlen), "SO_COOKIE"))
+		goto out;
+	for (i = 0; i <= frames; i++)
+		snprintf(req[i], sizeof(req[i]), "seg%d", i + 1);
+	seq = c.peer.snd_nxt;
+	/* As many segments as the ring holds are taken and acknowledged, unread. */
+	for (i = 0; i < frames; i++)
+		if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, req[i], strlen(req[i])), "send"))
+			goto out;
+	if (expect_ack(&c.peer, c.peer.snd_nxt))
+		goto out;
+	ASSERT_EQ(c.skel->bss->xsk_delivered, frames, "xsk_delivered");
+	if (!ASSERT_OK(conn_info(&c, &before), "tcp_info"))
+		goto out;
+	/* The next one finds the ring full: refused before it is taken, so not acknowledged. */
+	fifth = c.peer.snd_nxt;
+	if (!ASSERT_OK(peer_send(&c.peer, TH_PSH, req[frames], strlen(req[frames])), "send fifth"))
+		goto out;
+	ASSERT_EQ(peer_recv(&c.peer, &s, 300), -1, "no ACK for the fifth");
+	ASSERT_EQ(c.skel->bss->xsk_backpressure, 1, "xsk_backpressure");
+	ASSERT_EQ(c.skel->bss->xsk_delivered, frames, "xsk_delivered unchanged");
+	if (ASSERT_OK(conn_info(&c, &after), "tcp_info"))
+		ASSERT_EQ(after.tcpi_bytes_received, before.tcpi_bytes_received,
+			  "bytes_received unchanged");
+	/* Refused by the program, not dropped by the redirect. */
+	if (ASSERT_OK(xsk_stats(&xsk, &st), "XDP_STATISTICS")) {
+		ASSERT_EQ(st.rx_dropped, 0, "rx_dropped");
+		ASSERT_EQ(st.rx_ring_full, 0, "rx_ring_full");
+	}
+	/* The consumer catches up, and the retransmission goes through. */
+	for (i = 0; i < frames; i++) {
+		if (xsk_recv(&xsk, cookie, seq, req[i]))
+			goto out;
+		seq += strlen(req[i]);
+	}
+	if (!ASSERT_OK(peer_send_raw(&c.peer, TH_PSH | TH_ACK, fifth, c.peer.rcv_nxt, req[frames],
+				     strlen(req[frames]), 0), "resend fifth"))
+		goto out;
+	if (xsk_recv(&xsk, cookie, fifth, req[frames]))
+		goto out;
+	if (expect_ack(&c.peer, c.peer.snd_nxt))
+		goto out;
+	ASSERT_EQ(c.skel->bss->xsk_delivered, frames + 1, "xsk_delivered");
+	ASSERT_EQ(c.skel->bss->xsk_backpressure, 1, "xsk_backpressure");
+	ASSERT_EQ(poll(&pfd, 1, 200), 0, "ring empty");
+out:
+	close_xsk(&xsk);
 	teardown(&c);
 }
 
@@ -1982,6 +2278,10 @@ void test_xdp_tcp(void)
 		test_echo(AF_INET6, OPT_TS | OPT_SACK);
 	if (test__start_subtest("declined"))
 		test_declined();
+	if (test__start_subtest("af_xdp"))
+		test_af_xdp();
+	if (test__start_subtest("af_xdp_backpressure"))
+		test_af_xdp_backpressure();
 	if (test__start_subtest("send_now"))
 		test_send_now();
 	if (test__start_subtest("refused_sockmap"))
