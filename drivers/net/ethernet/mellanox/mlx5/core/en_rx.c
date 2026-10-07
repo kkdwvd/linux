@@ -2453,10 +2453,52 @@ static int mlx5e_rx_cq_process_enhanced_cqe_comp(struct mlx5e_rq *rq,
 	return work_done;
 }
 
+/* The CQE after the next and, once the NIC has written the next one, what
+ * its handler touches first: the frame's first lines, the shared info the
+ * skb is built with and the page's descriptor. Each is a miss the handler
+ * otherwise takes alone, the frame's being the first touch of memory the
+ * NIC wrote; issued a CQE ahead, they arrive while the current one is
+ * handled. The next CQE's fields are read without the ownership barrier and
+ * bounded, so a stale or torn CQE costs a useless prefetch and nothing else.
+ */
+static void mlx5e_rx_cq_lookahead(struct mlx5e_rq *rq, struct mlx5_cqwq *cqwq)
+{
+	u32 cc = cqwq->cc;
+	struct mlx5_cqe64 *cqe = mlx5_cqwq_get_wqe(cqwq, mlx5_cqwq_ctr2ix(cqwq, cc));
+	struct mlx5e_frag_page *frag_page;
+	struct mlx5e_mpw_info *wi;
+	u32 wqe_offset, page_idx;
+	netmem_ref netmem;
+	void *va;
+
+	prefetch(mlx5_cqwq_get_wqe(cqwq, mlx5_cqwq_ctr2ix(cqwq, cc + 1)));
+
+	if ((cqe->op_own & MLX5_CQE_OWNER_MASK) !=
+	    (mlx5_cqwq_get_ctr_wrap_cnt(cqwq, cc) & 1))
+		return;
+
+	wi = mlx5e_get_mpw_info(rq, be16_to_cpu(cqe->wqe_id) & rq->mpwqe.wq.fbc.sz_m1);
+	wqe_offset = (u32)mpwrq_get_cqe_stride_index(cqe) << rq->mpwqe.log_stride_sz;
+	page_idx = wqe_offset >> rq->mpwqe.page_shift;
+	if (page_idx >= rq->mpwqe.pages_per_wqe)
+		return;
+	frag_page = &wi->alloc_units.frag_pages[page_idx];
+	netmem = frag_page->netmem;
+	if (!netmem || netmem_is_net_iov(netmem))
+		return;
+	prefetch(__netmem_to_page(netmem));
+	va = page_address(__netmem_to_page(netmem)) +
+	     (wqe_offset & ((1 << rq->mpwqe.page_shift) - 1));
+	net_prefetch(va + rq->buff.headroom);
+	prefetchw(va + SKB_DATA_ALIGN(rq->buff.headroom + mpwrq_get_cqe_byte_cnt(cqe)));
+}
+
 static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 					      struct mlx5_cqwq *cqwq,
 					      int budget_rem)
 {
+	bool lookahead = rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ &&
+			 !rq->xsk_pool && !test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state);
 	struct mlx5_cqe64 *cqe;
 	int work_done = 0;
 
@@ -2472,6 +2514,8 @@ static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 		}
 
 		mlx5_cqwq_pop(cqwq);
+		if (lookahead)
+			mlx5e_rx_cq_lookahead(rq, cqwq);
 		INDIRECT_CALL_3(rq->handle_rx_cqe, mlx5e_handle_rx_cqe_mpwrq,
 				mlx5e_handle_rx_cqe, mlx5e_handle_rx_cqe_mpwrq_shampo,
 				rq, cqe);
