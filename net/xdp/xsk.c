@@ -11,6 +11,8 @@
 
 #define pr_fmt(fmt) "AF_XDP: %s: " fmt, __func__
 
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
 #include <linux/if_xdp.h>
 #include <linux/init.h>
 #include <linux/sched/mm.h>
@@ -520,6 +522,80 @@ void __xsk_map_flush(struct list_head *flush_list)
 		__list_del_clearprev(&xs->flush_node);
 	}
 }
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_xsk_rx_space - how many frames an AF_XDP socket can take from this queue
+ * @ctx: the frame being processed
+ * @map: an XSKMAP
+ * @key: the index bpf_redirect_map() would be given
+ *
+ * Returns the number of frames that bpf_redirect_map(@map, @key, ...) from this
+ * device and queue would deliver before the socket's RX ring is full, bounded
+ * in copy mode by the buffers its free list and fill ring can supply. 0 when
+ * @map is not an XSKMAP or has no socket at @key, when the socket is bound to
+ * another device or queue, or when the frame is longer than the socket's frame
+ * size and the socket does not take multi-buffer frames: cases a redirect
+ * drops. A frame with fragments takes a ring entry per buffer, in copy mode
+ * one per frame size of its length, and the return is 0 when it takes more
+ * than there are. The answer holds until the program returns in native XDP,
+ * where nothing else produces into the ring from this queue; in generic XDP,
+ * where the program may run for one queue on several CPUs at once, it is an
+ * estimate.
+ */
+__bpf_kfunc u32 bpf_xsk_rx_space(struct xdp_md *ctx, struct bpf_map *map, u32 key)
+{
+	struct xdp_buff *xdp = (struct xdp_buff *)ctx;
+	u32 len = xdp_get_buff_len(xdp), frame_size, free, need = 1;
+	struct xsk_buff_pool *pool;
+	struct xdp_sock *xs;
+
+	if (map->map_type != BPF_MAP_TYPE_XSKMAP)
+		return 0;
+	xs = __xsk_map_lookup_elem(map, key);
+	if (!xs || !xsk_is_bound(xs) || !xsk_dev_queue_valid(xs, xdp->rxq))
+		return 0;
+	pool = xs->pool;
+	frame_size = __xsk_pool_get_rx_frame_size(pool);
+	if (len > frame_size && !xs->sg)
+		return 0;
+	free = xskq_prod_nb_free_peek(xs->rx);
+	if (xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) {
+		/* The frame already sits in the pool's buffers: only ring entries count. */
+		if (xdp_buff_has_frags(xdp))
+			need += xdp_get_shared_info_from_buff(xdp)->nr_frags;
+	} else {
+		/*
+		 * The frame is copied into buffers of the pool: from its free list, then
+		 * from the fill ring, where each also needs a free buffer head.
+		 */
+		u32 heads = READ_ONCE(pool->free_heads_cnt);
+		u32 bufs = READ_ONCE(pool->free_list_cnt);
+
+		bufs += min(xskq_cons_nb_entries_peek(pool->fq), heads);
+		free = min(free, bufs);
+		need = DIV_ROUND_UP(len, frame_size);
+	}
+	return free < need ? 0 : free;
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(xsk_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_xsk_rx_space)
+BTF_KFUNCS_END(xsk_kfunc_ids)
+
+static const struct btf_kfunc_id_set xsk_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &xsk_kfunc_ids,
+};
+
+static int __init xsk_kfunc_init(void)
+{
+	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &xsk_kfunc_set);
+}
+late_initcall(xsk_kfunc_init);
 
 void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
 {
