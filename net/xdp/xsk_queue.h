@@ -365,6 +365,16 @@ static inline u32 xskq_cons_nb_entries(struct xsk_queue *q, u32 max)
 	return entries >= max ? max : entries;
 }
 
+/*
+ * The entries present, for a reader that is not the consumer: the consumer's
+ * cached indexes are read, not refreshed, since it may be updating them on
+ * another CPU. A lower bound, as the producer may add entries meanwhile.
+ */
+static inline u32 xskq_cons_nb_entries_peek(struct xsk_queue *q)
+{
+	return READ_ONCE(q->ring->producer) - READ_ONCE(q->cached_cons);
+}
+
 static inline bool xskq_cons_peek_addr_unchecked(struct xsk_queue *q, u64 *addr)
 {
 	if (q->cached_prod == q->cached_cons)
@@ -425,6 +435,16 @@ static inline u32 xskq_prod_nb_free(struct xsk_queue *q, u32 max)
 static inline bool xskq_prod_is_full(struct xsk_queue *q)
 {
 	return xskq_prod_nb_free(q, 1) ? false : true;
+}
+
+/*
+ * The free entries, for a reader that is not the producer, as above. Entries
+ * reserved but not yet submitted count as taken. A lower bound, as the
+ * consumer may release entries meanwhile.
+ */
+static inline u32 xskq_prod_nb_free_peek(struct xsk_queue *q)
+{
+	return q->nentries - (READ_ONCE(q->cached_prod) - READ_ONCE(q->ring->consumer));
 }
 
 static inline void xskq_prod_cancel_n(struct xsk_queue *q, u32 cnt)
