@@ -13,6 +13,7 @@
 #include <linux/if_link.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/netfilter.h>
 #include <net/if.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -21,11 +22,14 @@
 #include <test_progs.h>
 #include <network_helpers.h>
 #include "xdp_tcp.skel.h"
+#include "xdp_tcp_hooks.skel.h"
 
 #define NS		"xdp_tcp_ns"
 #define DEV		"xdptcp0"
+#define UPPER		"xdptcp0mv"	/* a macvlan over DEV, for the stacked case */
 #define KERN_MAC	"02:00:00:00:00:01"
 #define PEER_MAC	"02:00:00:00:00:02"
+#define LOWER_MAC	"02:00:00:00:00:03"	/* DEV's own, when the kernel's addresses are UPPER's */
 #define KERN_IP4	"192.168.77.1"
 #define PEER_IP4	"192.168.77.2"
 #define KERN_IP6	"fd00:77::1"
@@ -75,6 +79,7 @@ struct peer {
 	bool ts;		/* timestamps negotiated */
 	bool sack;		/* SACK negotiated */
 	__u32 tsval, tsecr;
+	__u64 segs;		/* segments of the connection received so far */
 };
 
 struct seg {
@@ -393,6 +398,7 @@ static bool parse_frame(struct peer *p, const __u8 *frame, int flen, struct seg 
 	parse_opts(s, (const __u8 *)(th + 1), hlen - sizeof(*th));
 	if (s->has_ts)
 		p->tsecr = s->tsval;
+	p->segs++;
 	return true;
 }
 
@@ -511,12 +517,18 @@ static void teardown(struct ctx *c)
 	netns_free(c->ns);
 }
 
+/* How the server differs from the plain one. */
+#define SERVER_MAPPED	(1 << 0)	/* an IPv6 listener accepts the peer's IPv4 connection */
+#define SERVER_STACKED	(1 << 1)	/* the kernel's addresses are on a macvlan over the TAP */
+
 /*
  * @family is the peer's. A mapped server listens on an IPv6 socket for the
- * peer's IPv4 connection: the accepted socket is an IPv6 one sending IPv4.
+ * peer's IPv4 connection: the accepted socket is an IPv6 one sending IPv4. A
+ * stacked server's segments cross two devices on the way out.
  */
-static int setup_server(struct ctx *c, int family, bool mapped)
+static int setup_server(struct ctx *c, int family, unsigned int flags)
 {
+	const char *addr_dev = flags & SERVER_STACKED ? UPPER : DEV;
 	int tap, err;
 
 	memset(c, 0, sizeof(*c));
@@ -535,11 +547,20 @@ static int setup_server(struct ctx *c, int family, bool mapped)
 		goto fail;
 	}
 	SYS(fail, "sysctl -qw net.ipv6.conf.%s.accept_ra=0", DEV);
-	SYS(fail, "ip link set dev %s address %s up", DEV, KERN_MAC);
-	SYS(fail, "ip addr add %s/24 dev %s", KERN_IP4, DEV);
-	SYS(fail, "ip -6 addr add %s/64 dev %s nodad", KERN_IP6, DEV);
-	SYS(fail, "ip neigh add %s lladdr %s dev %s nud permanent", PEER_IP4, PEER_MAC, DEV);
-	SYS(fail, "ip -6 neigh add %s lladdr %s dev %s nud permanent", PEER_IP6, PEER_MAC, DEV);
+	if (flags & SERVER_STACKED) {
+		SYS(fail, "ip link set dev %s address %s up", DEV, LOWER_MAC);
+		SYS(fail, "ip link add link %s name %s address %s type macvlan mode private",
+		    DEV, UPPER, KERN_MAC);
+		SYS(fail, "sysctl -qw net.ipv6.conf.%s.accept_ra=0", UPPER);
+		SYS(fail, "ip link set dev %s up", UPPER);
+	} else {
+		SYS(fail, "ip link set dev %s address %s up", DEV, KERN_MAC);
+	}
+	SYS(fail, "ip addr add %s/24 dev %s", KERN_IP4, addr_dev);
+	SYS(fail, "ip -6 addr add %s/64 dev %s nodad", KERN_IP6, addr_dev);
+	SYS(fail, "ip neigh add %s lladdr %s dev %s nud permanent", PEER_IP4, PEER_MAC, addr_dev);
+	SYS(fail, "ip -6 neigh add %s lladdr %s dev %s nud permanent", PEER_IP6, PEER_MAC,
+	    addr_dev);
 
 	c->skel = xdp_tcp__open_and_load();
 	if (!ASSERT_OK_PTR(c->skel, "xdp_tcp__open_and_load"))
@@ -553,8 +574,9 @@ static int setup_server(struct ctx *c, int family, bool mapped)
 		c->ifindex = 0;
 		goto fail;
 	}
-	c->srv = start_server(mapped ? AF_INET6 : family, SOCK_STREAM,
-			      mapped ? "::" : family == AF_INET ? KERN_IP4 : KERN_IP6, PORT, 0);
+	c->srv = start_server(flags & SERVER_MAPPED ? AF_INET6 : family, SOCK_STREAM,
+			      flags & SERVER_MAPPED ? "::" : family == AF_INET ? KERN_IP4 : KERN_IP6,
+			      PORT, 0);
 	if (!ASSERT_GE(c->srv, 0, "start_server"))
 		goto fail;
 	return 0;
@@ -565,7 +587,7 @@ fail:
 
 static int setup(struct ctx *c, int family)
 {
-	return setup_server(c, family, false);
+	return setup_server(c, family, 0);
 }
 
 /* Connect, then make sure the application sees nothing of what XDP consumes. */
@@ -874,6 +896,140 @@ out:
 	teardown(&c);
 }
 
+/* Observers at the hooks on the way out, and the counts they stood at. */
+struct hooks {
+	struct xdp_tcp_hooks *skel;
+	struct bpf_link *nf, *cg, *tcx;
+	int cgfd;
+	__u64 nf_segs, cgroup_segs, tcx_segs, peer_segs;
+};
+
+/*
+ * Before the listener is created: an accepted socket is in the listener's
+ * cgroup, and the cgroup hook sees the handshake with the listener's.
+ */
+static int hooks_join(struct hooks *h)
+{
+	memset(h, 0, sizeof(*h));
+	h->cgfd = test__join_cgroup("/xdp_tcp_hooks");
+	return ASSERT_GE(h->cgfd, 0, "join cgroup") ? 0 : -1;
+}
+
+static int hooks_attach(struct hooks *h, int family, int ifindex)
+{
+	LIBBPF_OPTS(bpf_netfilter_opts, nfopts,
+		    .pf = family == AF_INET ? NFPROTO_IPV4 : NFPROTO_IPV6,
+		    .hooknum = NF_INET_LOCAL_OUT,
+		    .priority = -128);
+	LIBBPF_OPTS(bpf_tcx_opts, tcxopts);
+
+	h->skel = xdp_tcp_hooks__open_and_load();
+	if (!ASSERT_OK_PTR(h->skel, "xdp_tcp_hooks__open_and_load"))
+		return -1;
+	h->skel->bss->port = PORT;
+	h->nf = bpf_program__attach_netfilter(h->skel->progs.nf_count, &nfopts);
+	h->cg = bpf_program__attach_cgroup(h->skel->progs.cgroup_count, h->cgfd);
+	h->tcx = bpf_program__attach_tcx(h->skel->progs.tcx_count, ifindex, &tcxopts);
+	if (!ASSERT_OK_PTR(h->nf, "attach netfilter") || !ASSERT_OK_PTR(h->cg, "attach cgroup") ||
+	    !ASSERT_OK_PTR(h->tcx, "attach tcx"))
+		return -1;
+	return 0;
+}
+
+static void hooks_detach(struct hooks *h)
+{
+	bpf_link__destroy(h->tcx);
+	bpf_link__destroy(h->cg);
+	bpf_link__destroy(h->nf);
+	xdp_tcp_hooks__destroy(h->skel);
+	if (h->cgfd >= 0)
+		close(h->cgfd);
+}
+
+/*
+ * What each hook saw since the last call, against what the peer received:
+ * the cgroup hook sees every segment, the other two as many as @stack says.
+ */
+static void hooks_expect(struct hooks *h, struct peer *p, const char *what, __u64 stack)
+{
+	char name[64];
+
+	snprintf(name, sizeof(name), "%s: netfilter", what);
+	ASSERT_EQ(h->skel->bss->nf_segs - h->nf_segs, stack, name);
+	snprintf(name, sizeof(name), "%s: cgroup egress", what);
+	ASSERT_EQ(h->skel->bss->cgroup_segs - h->cgroup_segs, p->segs - h->peer_segs, name);
+	snprintf(name, sizeof(name), "%s: tc egress", what);
+	ASSERT_EQ(h->skel->bss->tcx_segs - h->tcx_segs, stack, name);
+	h->nf_segs = h->skel->bss->nf_segs;
+	h->cgroup_segs = h->skel->bss->cgroup_segs;
+	h->tcx_segs = h->skel->bss->tcx_segs;
+	h->peer_segs = p->segs;
+}
+
+/*
+ * The way out: a served connection's segments pass the cgroup egress hook
+ * and no other on their way to the device, whether sent in reply from XDP,
+ * retransmitted by the stack's timer, a pure ACK, or the FIN. The handshake
+ * precedes the serving and is the stack's. With @stale the neighbour entry
+ * is not in a connected state when the first reply leaves, so that it takes
+ * the resolving output path instead of the cached header. The observers sit
+ * on the TAP device, which for a stacked server is the lower device the
+ * segments reach through the macvlan's own transmit path.
+ */
+static void test_tx_hooks(int family, unsigned int flags, bool stale)
+{
+	struct peer *p;
+	struct hooks h;
+	struct ctx c;
+	struct seg s;
+
+	if (hooks_join(&h))
+		return;
+	if (setup_server(&c, family, flags))
+		goto out_hooks;
+	p = &c.peer;
+	if (hooks_attach(&h, family, c.ifindex))
+		goto out;
+	if (connect_peer(&c, 0))
+		goto out;
+	/* The SYN-ACK is the listener's: every hook sees it. */
+	hooks_expect(&h, p, "handshake", 1);
+	if (stale)
+		SYS(out, "ip %s neigh replace %s lladdr %s dev %s nud stale",
+		    family == AF_INET ? "-4" : "-6", family == AF_INET ? PEER_IP4 : PEER_IP6,
+		    PEER_MAC, flags & SERVER_STACKED ? UPPER : DEV);
+	if (request_echoed(&c, "hello") || request_echoed(&c, "world"))
+		goto out;
+	hooks_expect(&h, p, "replies", 0);
+	/* A reply the peer does not acknowledge is sent again by the timer. */
+	if (!ASSERT_OK(peer_send(p, TH_PSH, "again", 5), "send request") ||
+	    !ASSERT_OK(peer_recv_data(p, &s, TIMEOUT_MS), "recv echo") ||
+	    !ASSERT_EQ(s.seq, p->rcv_nxt, "echo seq") ||
+	    !ASSERT_OK(peer_recv_data(p, &s, TIMEOUT_MS), "recv retransmit") ||
+	    !ASSERT_EQ(s.seq, p->rcv_nxt, "retransmit seq") || !ASSERT_EQ(s.len, 5, "retransmit len"))
+		goto out;
+	p->rcv_nxt += s.len;
+	if (!ASSERT_OK(peer_send(p, 0, NULL, 0), "ack echo"))
+		goto out;
+	hooks_expect(&h, p, "retransmit", 0);
+	/* The FIN, and the ACK of the peer's. */
+	if (!ASSERT_OK(shutdown(c.conn, SHUT_WR), "shutdown") ||
+	    !ASSERT_OK(peer_recv(p, &s, TIMEOUT_MS), "recv FIN") ||
+	    !ASSERT_EQ(s.flags & TH_FIN, TH_FIN, "FIN"))
+		goto out;
+	p->rcv_nxt++;
+	if (!ASSERT_OK(peer_send(p, TH_FIN, NULL, 0), "send FIN") ||
+	    !ASSERT_OK(peer_recv(p, &s, TIMEOUT_MS), "recv ack of FIN") ||
+	    !ASSERT_EQ(s.ack, p->snd_nxt, "ack of FIN"))
+		goto out;
+	hooks_expect(&h, p, "close", 0);
+	ASSERT_EQ(c.skel->bss->sent, 3, "sent");
+out:
+	teardown(&c);
+out_hooks:
+	hooks_detach(&h);
+}
+
 /*
  * An out-of-order segment goes to the stack, which reassembles and queues
  * for the application. The fast path has to stay off until the application
@@ -1123,6 +1279,16 @@ void test_xdp_tcp(void)
 		test_refused(REFUSE_XFRM_OUT);
 	if (test__start_subtest("refused_ip_options"))
 		test_refused(REFUSE_IP_OPTIONS);
+	if (test__start_subtest("tx_hooks_v4"))
+		test_tx_hooks(AF_INET, 0, false);
+	if (test__start_subtest("tx_hooks_v6"))
+		test_tx_hooks(AF_INET6, 0, false);
+	if (test__start_subtest("tx_hooks_v6_mapped"))
+		test_tx_hooks(AF_INET, SERVER_MAPPED, false);
+	if (test__start_subtest("tx_hooks_neigh_stale"))
+		test_tx_hooks(AF_INET, 0, true);
+	if (test__start_subtest("tx_hooks_stacked"))
+		test_tx_hooks(AF_INET, SERVER_STACKED, false);
 	if (test__start_subtest("ooo_unread"))
 		test_ooo_unread();
 	if (test__start_subtest("window_update"))
