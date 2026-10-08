@@ -794,6 +794,17 @@ bool tcp_xdp_replace_ts_recent(struct tcp_sock *tp, s32 tstamp_delta);
 void tcp_xdp_ack(struct sock *sk, const struct sk_buff *skb, bool ts_progress);
 void tcp_dsack_set(struct sock *sk, u32 seq, u32 end_seq);
 void tcp_dsack_extend(struct sock *sk, u32 seq, u32 end_seq);
+
+/*
+ * A socket served from XDP transmits through af_ops of tcp_xdp.c's; disconnect
+ * gives them back. tcp_xdp.o is built with BPF_SYSCALL and the JIT, as the
+ * arena kfuncs need the latter.
+ */
+#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_BPF_JIT)
+void tcp_xdp_disconnect(struct sock *sk);
+#else
+static inline void tcp_xdp_disconnect(struct sock *sk) { }
+#endif
 void __tcp_check_space(struct sock *sk);
 
 /* Mirror of SOCK_NOSPACE in tcp_sock, maintained by sk_set_nospace()
