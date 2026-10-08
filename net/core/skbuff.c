@@ -6402,6 +6402,7 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
 	skb->offload_l3_fwd_mark = 0;
 #endif
 	ipvs_reset(skb);
+	skb_clear_skip_egress(skb);
 
 	if (!xnet)
 		return;
