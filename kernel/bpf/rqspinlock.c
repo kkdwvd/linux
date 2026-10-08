@@ -23,21 +23,16 @@
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
 #include <asm/byteorder.h>
-#ifdef CONFIG_QUEUED_SPINLOCKS
-#include <asm/qspinlock.h>
-#endif
 #include <trace/events/lock.h>
 #include <asm/rqspinlock.h>
 #include <linux/timekeeping.h>
 
 /*
- * Include queued spinlock definitions and statistics code
+ * Include the lock word helpers and statistics code
  */
 #ifdef CONFIG_QUEUED_SPINLOCKS
-#include "../locking/qspinlock.h"
 #include "../locking/lock_events.h"
 #include "rqspinlock.h"
-#include "../locking/mcs_spinlock.h"
 #endif
 
 /*
@@ -280,7 +275,7 @@ int __lockfunc resilient_tas_spin_lock(rqspinlock_t *lock)
 retry:
 	val = atomic_read(&lock->val);
 
-	if (val || !atomic_try_cmpxchg(&lock->val, &val, 1)) {
+	if (val || !atomic_try_cmpxchg(&lock->val, &val, RQ_LOCKED_VAL)) {
 		if (RES_CHECK_TIMEOUT(ts, ret, ~0u))
 			goto out;
 		cpu_relax();
@@ -302,7 +297,7 @@ EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
  *
  * Exactly fits one 64-byte cacheline on a 64-bit architecture.
  */
-static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+static DEFINE_PER_CPU_ALIGNED(struct rqnode, rqnodes[RQ_MAX_NODES]);
 
 #ifndef res_smp_cond_load_acquire
 #define res_smp_cond_load_acquire(v, c) smp_cond_load_acquire(v, c)
@@ -343,8 +338,6 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	int idx, ret = 0;
 	u32 old, tail;
 
-	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
-
 	if (resilient_virt_spin_lock_enabled())
 		return resilient_virt_spin_lock(lock);
 
@@ -356,16 +349,16 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 *
 	 * 0,1,0 -> 0,0,1
 	 */
-	if (val == _Q_PENDING_VAL) {
-		int cnt = _Q_PENDING_LOOPS;
+	if (val == RQ_PENDING_VAL) {
+		int cnt = RQ_PENDING_LOOPS;
 		val = atomic_cond_read_relaxed(&lock->val,
-					       (VAL != _Q_PENDING_VAL) || !cnt--);
+					       (VAL != RQ_PENDING_VAL) || !cnt--);
 	}
 
 	/*
 	 * If we observe any contention; queue.
 	 */
-	if (val & ~_Q_LOCKED_MASK)
+	if (val & ~RQ_LOCKED_MASK)
 		goto queue;
 
 	/*
@@ -373,7 +366,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 *
 	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
 	 */
-	val = queued_fetch_set_pending_acquire(lock);
+	val = rq_fetch_set_pending_acquire(lock);
 
 	/*
 	 * If we observe contention, there is a concurrent locker.
@@ -382,11 +375,11 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 * n,0,0 -> 0,0,0 transition fail and it will now be waiting
 	 * on @next to become !NULL.
 	 */
-	if (unlikely(val & ~_Q_LOCKED_MASK)) {
+	if (unlikely(val & ~RQ_LOCKED_MASK)) {
 
 		/* Undo PENDING if we set it. */
-		if (!(val & _Q_PENDING_MASK))
-			clear_pending(lock);
+		if (!(val & RQ_PENDING_MASK))
+			rq_clear_pending(lock);
 
 		goto queue;
 	}
@@ -401,12 +394,12 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 * this wait loop must be a load-acquire such that we match the
 	 * store-release that clears the locked bit and create lock
 	 * sequentiality; this is because not all
-	 * clear_pending_set_locked() implementations imply full
+	 * rq_clear_pending_set_locked() implementations imply full
 	 * barriers.
 	 */
-	if (val & _Q_LOCKED_MASK) {
+	if (val & RQ_LOCKED_MASK) {
 		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
-		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_MASK));
+		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, RQ_LOCKED_MASK));
 	}
 
 	if (ret) {
@@ -419,7 +412,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 		 *
 		 * *,1,* -> *,0,*
 		 */
-		clear_pending(lock);
+		rq_clear_pending(lock);
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_entry;
 	}
@@ -429,7 +422,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 *
 	 * 0,1,0 -> 0,0,1
 	 */
-	clear_pending_set_locked(lock);
+	rq_clear_pending_set_locked(lock);
 	lockevent_inc(lock_pending);
 	return 0;
 
@@ -455,7 +448,7 @@ queue:
 	/* Deadlock detection entry already held after failing fast path. */
 	node = this_cpu_ptr(&rqnodes[0].mcs);
 	idx = node->count++;
-	tail = encode_tail(smp_processor_id(), idx);
+	tail = rq_encode_tail(smp_processor_id(), idx);
 
 	trace_contention_begin(lock, LCB_F_SPIN);
 
@@ -470,16 +463,16 @@ queue:
 	 * trylock spinning will likely be treated unfairly due to lack of
 	 * queueing, hence do not spin.
 	 */
-	if (unlikely(idx >= _Q_MAX_NODES || (in_nmi() && idx > 0))) {
+	if (unlikely(idx >= RQ_MAX_NODES || (in_nmi() && idx > 0))) {
 		lockevent_inc(lock_no_node);
-		if (!queued_spin_trylock(lock)) {
+		if (!rq_trylock(lock)) {
 			ret = -EDEADLK;
 			goto err_release_node;
 		}
 		goto release;
 	}
 
-	node = grab_mcs_node(node, idx);
+	node = rq_grab_mcs_node(node, idx);
 
 	/*
 	 * Keep counts of non-zero index values:
@@ -501,12 +494,12 @@ queue:
 	 * attempt the trylock once more in the hope someone let go while we
 	 * weren't watching.
 	 */
-	if (queued_spin_trylock(lock))
+	if (rq_trylock(lock))
 		goto release;
 
 	/*
 	 * Ensure that the initialisation of @node is complete before we
-	 * publish the updated tail via xchg_tail() and potentially link
+	 * publish the updated tail via rq_xchg_tail() and potentially link
 	 * @node into the waitqueue via WRITE_ONCE(prev->next, node) below.
 	 */
 	smp_wmb();
@@ -518,17 +511,17 @@ queue:
 	 *
 	 * p,*,* -> n,*,*
 	 */
-	old = xchg_tail(lock, tail);
+	old = rq_xchg_tail(lock, tail);
 	next = NULL;
 
 	/*
 	 * if there was a previous node; link it and wait until reaching the
 	 * head of the waitqueue.
 	 */
-	if (old & _Q_TAIL_MASK) {
+	if (old & RQ_TAIL_MASK) {
 		int val;
 
-		prev = decode_tail(old, rqnodes);
+		prev = rq_decode_tail(old, rqnodes);
 
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
@@ -558,7 +551,7 @@ queue:
 	 *
 	 * this wait loop must use a load-acquire such that we match the
 	 * store-release that clears the locked bit and create lock
-	 * sequentiality; this is because the set_locked() function below
+	 * sequentiality; this is because the rq_set_locked() function below
 	 * does not imply a full barrier.
 	 *
 	 * We use RES_DEF_TIMEOUT * 2 as the duration, as RES_DEF_TIMEOUT is
@@ -567,12 +560,12 @@ queue:
 	 * us.
 	 */
 	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
-	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
-					   RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_PENDING_MASK));
+	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & RQ_LOCKED_PENDING_MASK) ||
+					   RES_CHECK_TIMEOUT(ts, ret, RQ_LOCKED_PENDING_MASK));
 
 	/* Disable queue destruction when we detect deadlocks. */
 	if (ret == -EDEADLK) {
-		if (!try_cmpxchg_tail(lock, tail, 0)) {
+		if (!rq_try_cmpxchg_tail(lock, tail, 0)) {
 			next = smp_cond_load_relaxed(&node->next, (VAL));
 			arch_mcs_spin_unlock_contended(&next->locked);
 		}
@@ -605,7 +598,7 @@ waitq_timeout:
 		 * complicated synchronization, because when not leaving in FIFO
 		 * order, prev's next pointer needs to be fixed up etc.
 		 */
-		if (!try_cmpxchg_tail(lock, tail, 0)) {
+		if (!rq_try_cmpxchg_tail(lock, tail, 0)) {
 			next = smp_cond_load_relaxed(&node->next, VAL);
 			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
 		}
@@ -624,16 +617,16 @@ waitq_timeout:
 	 * Otherwise, we only need to grab the lock.
 	 */
 
-	if ((val & _Q_TAIL_MASK) == tail) {
-		u32 new = _Q_LOCKED_VAL;
+	if ((val & RQ_TAIL_MASK) == tail) {
+		u32 new = RQ_LOCKED_VAL;
 
 		for (;;) {
 			if (atomic_try_cmpxchg_relaxed(&lock->val, &val, new))
 				goto release; /* No queued successor */
-			if ((val & _Q_TAIL_MASK) != tail)
+			if ((val & RQ_TAIL_MASK) != tail)
 				break;
 			/* A pending claimant can abandon before publishing a tail. */
-			new = _Q_LOCKED_VAL | (val & _Q_PENDING_MASK);
+			new = RQ_LOCKED_VAL | (val & RQ_PENDING_MASK);
 		}
 	}
 
@@ -642,7 +635,7 @@ waitq_timeout:
 	 * Preserve pending while installing ownership; a racing claimant may
 	 * still be undoing its speculative reservation against this queue.
 	 */
-	set_locked(lock);
+	rq_set_locked(lock);
 
 	/*
 	 * contended path; wait for next if not observed yet, release.
