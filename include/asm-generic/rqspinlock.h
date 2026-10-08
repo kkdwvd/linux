@@ -10,18 +10,84 @@
 #define __ASM_GENERIC_RQSPINLOCK_H
 
 #include <linux/types.h>
+#include <linux/build_bug.h>
+#include <linux/threads.h>
 #include <vdso/time64.h>
 #include <linux/percpu.h>
-#ifdef CONFIG_QUEUED_SPINLOCKS
-#include <asm/qspinlock.h>
-#endif
 
-struct rqspinlock {
+/*
+ * The lock word has the same layout as the queued spinlock word, but
+ * rqspinlock owns the type and the helpers that operate on it, so that the
+ * layout can diverge from qspinlock without touching the generic lock.
+ */
+typedef struct rqspinlock {
 	union {
 		atomic_t val;
-		u32 locked;
+
+		/*
+		 * By using the whole 2nd least significant byte for the
+		 * pending bit, we can allow better optimization of the lock
+		 * acquisition for the pending bit holder.
+		 */
+#ifdef __LITTLE_ENDIAN
+		struct {
+			u8	locked;
+			u8	pending;
+		};
+		struct {
+			u16	locked_pending;
+			u16	tail;
+		};
+#else
+		struct {
+			u16	tail;
+			u16	locked_pending;
+		};
+		struct {
+			u8	reserved[2];
+			u8	pending;
+			u8	locked;
+		};
+#endif
 	};
-};
+} rqspinlock_t;
+
+/*
+ * Bitfields in the lock word:
+ *
+ *  0- 7: locked byte
+ *  8-15: pending byte
+ * 16-17: tail index
+ * 18-31: tail cpu (+1)
+ */
+#define RQ_SET_MASK(type)	(((1U << RQ_ ## type ## _BITS) - 1)\
+				      << RQ_ ## type ## _OFFSET)
+#define RQ_LOCKED_OFFSET	0
+#define RQ_LOCKED_BITS		8
+#define RQ_LOCKED_MASK		RQ_SET_MASK(LOCKED)
+
+#define RQ_PENDING_OFFSET	(RQ_LOCKED_OFFSET + RQ_LOCKED_BITS)
+#define RQ_PENDING_BITS		8
+#define RQ_PENDING_MASK		RQ_SET_MASK(PENDING)
+
+#define RQ_TAIL_IDX_OFFSET	(RQ_PENDING_OFFSET + RQ_PENDING_BITS)
+#define RQ_TAIL_IDX_BITS	2
+#define RQ_TAIL_IDX_MASK	RQ_SET_MASK(TAIL_IDX)
+
+#define RQ_TAIL_CPU_OFFSET	(RQ_TAIL_IDX_OFFSET + RQ_TAIL_IDX_BITS)
+#define RQ_TAIL_CPU_BITS	(32 - RQ_TAIL_CPU_OFFSET)
+#define RQ_TAIL_CPU_MASK	RQ_SET_MASK(TAIL_CPU)
+
+#define RQ_TAIL_OFFSET		RQ_TAIL_IDX_OFFSET
+#define RQ_TAIL_MASK		(RQ_TAIL_IDX_MASK | RQ_TAIL_CPU_MASK)
+
+#define RQ_LOCKED_VAL		(1U << RQ_LOCKED_OFFSET)
+#define RQ_PENDING_VAL		(1U << RQ_PENDING_OFFSET)
+
+/*
+ * The tail cpu field must be able to hold cpu + 1 for every possible cpu.
+ */
+static_assert(CONFIG_NR_CPUS < (1U << RQ_TAIL_CPU_BITS));
 
 /* Even though this is same as struct rqspinlock, we need to emit a distinct
  * type in BTF for BPF programs.
@@ -29,13 +95,6 @@ struct rqspinlock {
 struct bpf_res_spin_lock {
 	u32 val;
 } __aligned(__alignof__(struct rqspinlock));
-
-struct qspinlock;
-#ifdef CONFIG_QUEUED_SPINLOCKS
-typedef struct qspinlock rqspinlock_t;
-#else
-typedef struct rqspinlock rqspinlock_t;
-#endif
 
 extern int resilient_tas_spin_lock(rqspinlock_t *lock);
 #ifdef CONFIG_QUEUED_SPINLOCKS
@@ -184,7 +243,7 @@ static __always_inline int res_spin_lock(rqspinlock_t *lock)
 	 */
 	grab_held_lock_entry(lock);
 
-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, RQ_LOCKED_VAL)))
 		return 0;
 	return resilient_queued_spin_lock_slowpath(lock, val);
 }
@@ -200,10 +259,9 @@ static __always_inline void res_spin_unlock(rqspinlock_t *lock)
 	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
 
 	/*
-	 * Release barrier, ensures correct ordering. Perform release store
-	 * instead of queued_spin_unlock, since we use this function for the TAS
-	 * fallback as well. When we have CONFIG_QUEUED_SPINLOCKS=n, we clear
-	 * the full 4-byte lockword.
+	 * Release barrier, ensures correct ordering. Perform a release store
+	 * of the locked byte; the test-and-set fallback only ever sets that
+	 * byte as well, so the same store serves both implementations.
 	 *
 	 * Perform the smp_store_release before clearing the lock entry so that
 	 * NMIs landing in the unlock path can correctly detect AA issues. The
@@ -221,11 +279,7 @@ static __always_inline void res_spin_unlock(rqspinlock_t *lock)
 	this_cpu_dec(rqspinlock_held_locks.cnt);
 }
 
-#ifdef CONFIG_QUEUED_SPINLOCKS
-#define raw_res_spin_lock_init(lock) ({ *(lock) = (rqspinlock_t)__ARCH_SPIN_LOCK_UNLOCKED; })
-#else
 #define raw_res_spin_lock_init(lock) ({ *(lock) = (rqspinlock_t){0}; })
-#endif
 
 #define raw_res_spin_lock(lock)                    \
 	({                                         \
