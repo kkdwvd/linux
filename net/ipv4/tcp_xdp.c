@@ -5,9 +5,10 @@
  * An XDP program that serves established TCP connections uses these kfuncs to
  * receive data segments before they become skbs, without the socket's owner
  * being woken. The stack keeps the connection: the handshake, ACK processing,
- * congestion control, retransmission, the window and the whole sending side
+ * congestion control, retransmission, the window and the segments it sends
  * are its, and every kfunc that touches connection state runs under the
- * socket lock.
+ * socket lock. What is this file's on the sending side is the way a served
+ * connection's segments leave the host, see xdp_tcp_adopt().
  *
  *   bpf_xdp_tcp_recv()     finds the connection and, if the segment is the
  *                          next in sequence and nothing is in the way, takes
@@ -29,15 +30,21 @@
  * filled as tcp_v4_fill_cb() would.
  */
 #include <linux/bpf.h>
+#include <linux/bpf-cgroup.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/skbuff.h>
 #include <linux/sock_diag.h>
 #include <linux/tcp.h>
 #include <net/dsfield.h>
+#include <net/inet6_connection_sock.h>
 #include <net/inet6_hashtables.h>
 #include <net/inet_hashtables.h>
+#include <net/ip.h>
 #include <net/ip6_checksum.h>
+#include <net/ip6_route.h>
+#include <net/ndisc.h>
+#include <net/route.h>
 #include <net/tcp.h>
 #include <net/tcp_ecn.h>
 #include <net/xdp.h>
@@ -187,6 +194,128 @@ static bool xdp_tcp_rx_guarded(const struct sock *sk)
 	return false;
 }
 
+/*
+ * The way out.
+ *
+ * A served connection's segments are the stack's: tcp_write_xmit() builds them
+ * and its timers send them again. But they leave the host through a path of
+ * this file's. The socket's af_ops are replaced, the first time a kfunc acts
+ * on it, by a copy whose queue_xmit builds the IP header from the cached
+ * route, runs the cgroup egress hook, resolves the neighbour and queues the
+ * segment on the device, with the TC and netfilter egress hooks left out.
+ * What ip_queue_xmit() and inet6_csk_xmit() do beyond that, netfilter's
+ * LOCAL_OUT and POST_ROUTING, XFRM, L3 master devices, lightweight tunnels, IP
+ * options and extension headers, a served connection's segments do not get,
+ * as their counterparts on the way in are not applied to what XDP takes. A
+ * socket that needs any of them is not served, see xdp_tcp_tx_guarded(). The
+ * pacing, TSQ, the qdisc, GSO and checksum offload are below this point and
+ * are kept. The ops go back to the stack's when the socket is disconnected
+ * for reuse.
+ */
+static struct inet_connection_sock_af_ops xdp_tcp_v4_ops, xdp_tcp_v6_ops, xdp_tcp_v6_mapped_ops;
+
+static bool xdp_tcp_lean_ops(const struct inet_connection_sock_af_ops *ops)
+{
+	return ops == &xdp_tcp_v4_ops || ops == &xdp_tcp_v6_ops || ops == &xdp_tcp_v6_mapped_ops;
+}
+
+/*
+ * The socket's own reasons for the stack's output path: IP options or
+ * extension headers to put in every segment, an XFRM output policy to apply.
+ * Checked when the socket is adopted, so that one with them is not, and on
+ * every segment after, so that one that gains them later sends the stack's
+ * way, receive being unaffected.
+ */
+static bool xdp_tcp_tx_slow(const struct sock *sk)
+{
+	if (rcu_access_pointer(inet_sk(sk)->inet_opt))
+		return true;
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sk->sk_family == AF_INET6 && rcu_access_pointer(inet6_sk(sk)->opt))
+		return true;
+#endif
+#ifdef CONFIG_XFRM
+	if (rcu_access_pointer(sk->sk_policy[XFRM_POLICY_OUT]) ||
+	    READ_ONCE(sock_net(sk)->xfrm.policy_count[XFRM_POLICY_OUT]))
+		return true;
+#endif
+	return false;
+}
+
+/* The route's: a transformation, a lightweight tunnel, an L3 master device. */
+static bool xdp_tcp_dst_slow(const struct dst_entry *dst)
+{
+	return dst_xfrm(dst) || dst->lwtstate || netif_is_l3_slave(dst_dev_rcu(dst));
+}
+
+/* What keeps a socket from being adopted. */
+static bool xdp_tcp_tx_guarded(const struct sock *sk)
+{
+	const struct dst_entry *dst;
+	bool guarded;
+
+	/* The IPv6 path needs the parts of ipv6 that a module keeps to itself. */
+	if (!IS_BUILTIN(CONFIG_IPV6) && sk->sk_family == AF_INET6)
+		return true;
+	if (xdp_tcp_tx_slow(sk))
+		return true;
+	rcu_read_lock();
+	dst = __sk_dst_get(sk);
+	guarded = dst && xdp_tcp_dst_slow(dst);
+	rcu_read_unlock();
+	return guarded;
+}
+
+/*
+ * Put the socket on the lean transmit path, the first time. Under the socket
+ * lock, which __tcp_transmit_skb() holds when it reads the ops; the pointer
+ * is swapped whole, so each segment uses one set or the other. Returns false
+ * for a socket that is not to be served.
+ */
+static bool xdp_tcp_adopt(struct sock *sk)
+{
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	const struct inet_connection_sock_af_ops *ops = icsk->icsk_af_ops;
+
+	if (likely(xdp_tcp_lean_ops(ops)))
+		return true;
+	if (xdp_tcp_tx_guarded(sk))
+		return false;
+	if (ops == &ipv4_specific)
+		ops = &xdp_tcp_v4_ops;
+#if IS_BUILTIN(CONFIG_IPV6)
+	else if (ops == &ipv6_specific)
+		ops = &xdp_tcp_v6_ops;
+	else if (sk->sk_family == AF_INET6 && ops->queue_xmit == ip_queue_xmit)
+		ops = &xdp_tcp_v6_mapped_ops;	/* ipv6_mapped, private to tcp_ipv6.c */
+#endif
+	else
+		return false;
+	/* Paired with the READ_ONCE() in tcp_setsockopt() and tcp_getsockopt(). */
+	WRITE_ONCE(icsk->icsk_af_ops, ops);
+	return true;
+}
+
+/*
+ * From tcp_disconnect(), under the socket lock: the socket may be connected
+ * again, or listen, and neither the new connection nor the children would be
+ * served. The mapped ops go back to ipv6_specific, which tcp_v6_connect()
+ * replaces with ipv6_mapped again for a mapped destination.
+ */
+void tcp_xdp_disconnect(struct sock *sk)
+{
+	struct inet_connection_sock *icsk = inet_csk(sk);
+
+	if (!xdp_tcp_lean_ops(icsk->icsk_af_ops))
+		return;
+	if (icsk->icsk_af_ops == &xdp_tcp_v4_ops)
+		WRITE_ONCE(icsk->icsk_af_ops, &ipv4_specific);
+#if IS_BUILTIN(CONFIG_IPV6)
+	else
+		WRITE_ONCE(icsk->icsk_af_ops, &ipv6_specific);
+#endif
+}
+
 /* The established socket a parsed data segment belongs to, with a reference. */
 static struct sock *xdp_tcp_find(const struct xdp_buff *xdp, struct xdp_tcp_hdrs *h)
 {
@@ -209,7 +338,7 @@ static struct sock *xdp_tcp_find(const struct xdp_buff *xdp, struct xdp_tcp_hdrs
 		return NULL;
 	}
 	if (READ_ONCE(sk->sk_state) != TCP_ESTABLISHED || !xdp_tcp_served(sk) ||
-	    xdp_tcp_rx_guarded(sk)) {
+	    xdp_tcp_rx_guarded(sk) || xdp_tcp_tx_guarded(sk)) {
 		sock_put(sk);
 		return NULL;
 	}
@@ -454,10 +583,15 @@ static u32 xdp_tcp_rcv(struct sock *sk, const struct xdp_tcp_hdrs *h, struct xdp
 	if (!xdp_tcp_validate(sk, h, &ts_delta))
 		return BPF_XDP_TCP_PASS;
 	status = xdp_tcp_classify(tp, seq, end_seq);
+	/* The socket is served from the first segment acted on, not from one looked at. */
 	if (status == BPF_XDP_TCP_DUPLICATE && commit_dup) {
+		if (!xdp_tcp_adopt(sk))
+			return BPF_XDP_TCP_PASS;
 		xdp_tcp_count_in(sk, h);
 		xdp_tcp_dup(sk, seq, end_seq);
 	} else if (status == BPF_XDP_TCP_RECEIVED) {
+		if (!xdp_tcp_adopt(sk))
+			return BPF_XDP_TCP_PASS;
 		xdp_tcp_count_in(sk, h);
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPHPHITS);
 		xdp_tcp_ack(sk, fake, h, ts_delta);
@@ -580,6 +714,224 @@ __bpf_kfunc int bpf_xdp_tcp_consume(struct sock *sk, struct xdp_md *ctx,
 	return status == BPF_XDP_TCP_RECEIVED ? 0 : -EAGAIN;
 }
 
+
+/*
+ * The one hook kept on the way out: cgroup egress, which sees the segment
+ * with its IP header on, as ip_finish_output() shows it. Returns the verdict
+ * as ip_finish_output() reads it: NET_XMIT_SUCCESS, NET_XMIT_CN for a segment
+ * to send while reporting congestion, or an error with the segment freed.
+ */
+static int xdp_tcp_egress(struct sock *sk, struct sk_buff *skb)
+{
+	int ret = BPF_CGROUP_RUN_PROG_INET_EGRESS(sk, skb);
+
+	if (unlikely(ret != NET_XMIT_SUCCESS && ret != NET_XMIT_CN))
+		kfree_skb_reason(skb, SKB_DROP_REASON_BPF_CGROUP_EGRESS);
+	return ret;
+}
+
+/* The length the IP layer would check against the path MTU. */
+static unsigned int xdp_tcp_seglen(const struct sk_buff *skb, unsigned int iphlen)
+{
+	if (skb_is_gso(skb))
+		return iphlen + tcp_hdrlen(skb) + skb_shinfo(skb)->gso_size;
+	return iphlen + skb->len;
+}
+
+/* ip_skb_dst_mtu() for a full socket, before the segment has its dst. */
+static unsigned int xdp_tcp_v4_mtu(const struct sock *sk, const struct rtable *rt,
+				   const struct net_device *dev)
+{
+	if (ip_sk_use_pmtu(sk))
+		return ip_dst_mtu_maybe_forward(&rt->dst, false);
+	return min(READ_ONCE(dev->mtu), IP_MAX_MTU);
+}
+
+/*
+ * What ip_queue_xmit() does for a connected TCP socket, less the layers a
+ * served connection goes without. The cases it has that this path does not,
+ * a segment over the MTU, a device that needs more headroom, a route the
+ * socket should not have been adopted with, are handed to it: they are rare,
+ * and it does the right thing with them.
+ */
+static int xdp_tcp_v4_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
+{
+	struct inet_sock *inet = inet_sk(sk);
+	struct net *net = sock_net(sk);
+	struct flowi4 *fl4 = &fl->u.ip4;
+	struct net_device *dev;
+	struct neighbour *neigh;
+	bool is_v6gw = false;
+	struct rtable *rt;
+	struct iphdr *iph;
+	int ret, err;
+
+	if (unlikely(xdp_tcp_tx_slow(sk)))
+		return ip_queue_xmit(sk, skb, fl);
+	rcu_read_lock();
+	rt = dst_rtable(__sk_dst_check(sk, 0));
+	if (unlikely(!rt)) {
+		/* As __ip_queue_xmit(): the retransmit timer keeps trying while there is no route. */
+		inet_sk_init_flowi4(inet, fl4);
+		fl4->flowi4_dscp = inet_dsfield_to_dscp(READ_ONCE(inet->tos));
+		rt = ip_route_output_flow(net, fl4, sk);
+		if (IS_ERR(rt)) {
+			rcu_read_unlock();
+			IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
+			kfree_skb_reason(skb, SKB_DROP_REASON_IP_OUTNOROUTES);
+			return -EHOSTUNREACH;
+		}
+		sk_setup_caps(sk, &rt->dst);
+	}
+	dev = dst_dev_rcu(&rt->dst);
+	if (unlikely(xdp_tcp_dst_slow(&rt->dst) ||
+		     xdp_tcp_seglen(skb, sizeof(*iph)) > xdp_tcp_v4_mtu(sk, rt, dev) ||
+		     (skb_headroom(skb) < sizeof(*iph) + LL_RESERVED_SPACE(dev) && dev->header_ops))) {
+		rcu_read_unlock();
+		return ip_queue_xmit(sk, skb, fl);
+	}
+	skb_dst_set_noref(skb, &rt->dst);
+
+	skb_push(skb, sizeof(*iph));
+	skb_reset_network_header(skb);
+	iph = ip_hdr(skb);
+	*((__be16 *)iph) = htons((4 << 12) | (5 << 8) | (READ_ONCE(inet->tos) & 0xff));
+	iph->frag_off = ip_dont_fragment(sk, &rt->dst) && !skb->ignore_df ? htons(IP_DF) : 0;
+	iph->ttl = ip_select_ttl(inet, &rt->dst);
+	iph->protocol = IPPROTO_TCP;
+	iph->saddr = fl4->saddr;
+	iph->daddr = fl4->daddr;
+	ip_select_ident_segs(net, skb, sk, skb_shinfo(skb)->gso_segs ?: 1);
+	iph_set_totlen(iph, skb->len);
+	ip_send_check(iph);
+	skb->priority = READ_ONCE(sk->sk_priority);
+	skb->mark = READ_ONCE(sk->sk_mark);
+	skb->protocol = htons(ETH_P_IP);
+	skb->dev = dev;
+	IP_INC_STATS(net, IPSTATS_MIB_OUTREQUESTS);
+
+	ret = xdp_tcp_egress(sk, skb);
+	if (unlikely(ret != NET_XMIT_SUCCESS && ret != NET_XMIT_CN)) {
+		rcu_read_unlock();
+		return ret;
+	}
+	IP_UPD_PO_STATS(net, IPSTATS_MIB_OUT, skb->len);
+
+	neigh = ip_neigh_for_gw(rt, skb, &is_v6gw);
+	if (unlikely(IS_ERR(neigh))) {
+		rcu_read_unlock();
+		kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_CREATEFAIL);
+		return PTR_ERR(neigh);
+	}
+	sock_confirm_neigh(skb, neigh);
+	skb_set_skip_egress(skb);
+	err = neigh_output(neigh, skb, is_v6gw);
+	rcu_read_unlock();
+	return err ?: ret;
+}
+
+#if IS_BUILTIN(CONFIG_IPV6)
+/* The same for inet6_csk_xmit() and ip6_xmit(). */
+static int xdp_tcp_v6_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
+{
+	struct ipv6_pinfo *np = inet6_sk(sk);
+	struct flowi6 *fl6 = &fl->u.ip6;
+	struct net *net = sock_net(sk);
+	const struct in6_addr *nexthop;
+	struct net_device *dev;
+	struct neighbour *neigh;
+	struct inet6_dev *idev;
+	struct dst_entry *dst;
+	struct ipv6hdr *hdr;
+	unsigned int seg_len;
+	int hlimit, ret, err;
+
+	if (unlikely(xdp_tcp_tx_slow(sk)))
+		return inet6_csk_xmit(sk, skb, fl);
+	dst = __sk_dst_check(sk, np->dst_cookie);
+	if (unlikely(!dst)) {
+		dst = inet6_csk_route_socket(sk, fl6);
+		if (IS_ERR(dst)) {
+			WRITE_ONCE(sk->sk_err_soft, -PTR_ERR(dst));
+			sk->sk_route_caps = 0;
+			sk_skb_reason_drop(sk, skb, SKB_DROP_REASON_IP_OUTNOROUTES);
+			return PTR_ERR(dst);
+		}
+		/* Restore final destination back after routing done */
+		fl6->daddr = sk->sk_v6_daddr;
+	}
+	rcu_read_lock();
+	dev = dst_dev_rcu(dst);
+	if (unlikely(xdp_tcp_dst_slow(dst) || xdp_tcp_seglen(skb, sizeof(*hdr)) > dst6_mtu(dst) ||
+		     skb_headroom(skb) < sizeof(*hdr) + LL_RESERVED_SPACE(dev))) {
+		rcu_read_unlock();
+		return inet6_csk_xmit(sk, skb, fl);
+	}
+	skb_dst_set_noref(skb, dst);
+
+	__skb_push(skb, sizeof(*hdr));
+	skb_reset_network_header(skb);
+	hdr = ipv6_hdr(skb);
+	hlimit = READ_ONCE(np->hop_limit);
+	if (hlimit < 0)
+		hlimit = ip6_dst_hoplimit(dst);
+	ip6_flow_hdr(hdr, np->tclass, ip6_make_flowlabel(net, skb, fl6->flowlabel,
+							 ip6_autoflowlabel(net, sk), fl6));
+	seg_len = skb->len - sizeof(*hdr);
+	hdr->payload_len = htons(seg_len > IPV6_MAXPLEN ? 0 : seg_len);
+	hdr->nexthdr = IPPROTO_TCP;
+	hdr->hop_limit = hlimit;
+	hdr->saddr = fl6->saddr;
+	hdr->daddr = fl6->daddr;
+	skb->protocol = htons(ETH_P_IPV6);
+	skb->priority = READ_ONCE(sk->sk_priority);
+	skb->mark = READ_ONCE(sk->sk_mark);
+	skb->dev = dev;
+	idev = ip6_dst_idev(dst);
+	IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTREQUESTS);
+
+	ret = xdp_tcp_egress(sk, skb);
+	if (unlikely(ret != NET_XMIT_SUCCESS && ret != NET_XMIT_CN)) {
+		rcu_read_unlock();
+		return ret;
+	}
+	IP6_UPD_PO_STATS(net, idev, IPSTATS_MIB_OUT, skb->len);
+
+	nexthop = rt6_nexthop(dst_rt6_info(dst), &hdr->daddr);
+	neigh = __ipv6_neigh_lookup_noref(dev, nexthop);
+	if (unlikely(!neigh))
+		neigh = __neigh_create(&nd_tbl, nexthop, dev, false);
+	if (IS_ERR(neigh)) {
+		IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTNOROUTES);
+		rcu_read_unlock();
+		kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_CREATEFAIL);
+		return -EINVAL;
+	}
+	sock_confirm_neigh(skb, neigh);
+	skb_set_skip_egress(skb);
+	err = neigh_output(neigh, skb, false);
+	rcu_read_unlock();
+	return err ?: ret;
+}
+#endif
+
+static void xdp_tcp_init_af_ops(void)
+{
+	xdp_tcp_v4_ops = ipv4_specific;
+	xdp_tcp_v4_ops.queue_xmit = xdp_tcp_v4_xmit;
+#if IS_BUILTIN(CONFIG_IPV6)
+	xdp_tcp_v6_ops = ipv6_specific;
+	xdp_tcp_v6_ops.queue_xmit = xdp_tcp_v6_xmit;
+	/* ipv6_mapped is ipv6_specific with the IPv4 output side, as MPTCP builds its copy. */
+	xdp_tcp_v6_mapped_ops = ipv6_specific;
+	xdp_tcp_v6_mapped_ops.queue_xmit = xdp_tcp_v4_xmit;
+	xdp_tcp_v6_mapped_ops.rebuild_header = ipv4_specific.rebuild_header;
+	xdp_tcp_v6_mapped_ops.sk_rx_dst_set = ipv4_specific.sk_rx_dst_set;
+	xdp_tcp_v6_mapped_ops.net_header_len = ipv4_specific.net_header_len;
+	xdp_tcp_v6_mapped_ops.mtu_reduced = ipv4_specific.mtu_reduced;
+#endif
+}
+
 /*
  * tcp_push() without the sendmsg() layer's write batching. Nagle and TCP_CORK
  * are overridden as TCP_NAGLE_PUSH overrides them, and autocorking, which
@@ -690,6 +1042,9 @@ __bpf_kfunc int bpf_xdp_tcp_send(struct sock *sk, void *buf__arena, u32 len)
 	err = -ENOTCONN;
 	if (!((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)))
 		goto out;
+	err = -EINVAL;
+	if (!xdp_tcp_adopt(sk))
+		goto out;
 	skb = xdp_tcp_alloc_segment(sk, buf__arena, len);
 	if (IS_ERR(skb)) {
 		err = PTR_ERR(skb);
@@ -746,6 +1101,7 @@ static const struct btf_kfunc_id_set bpf_xdp_tcp_xdp_kfunc_set = {
 
 static int __init bpf_xdp_tcp_kfunc_init(void)
 {
+	xdp_tcp_init_af_ops();
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_xdp_tcp_xdp_kfunc_set);
 }
 late_initcall(bpf_xdp_tcp_kfunc_init);
