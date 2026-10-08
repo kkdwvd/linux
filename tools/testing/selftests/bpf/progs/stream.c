@@ -7,6 +7,8 @@
 #include "bpf_experimental.h"
 #include <bpf_arena_common.h>
 
+extern unsigned CONFIG_NR_CPUS __kconfig __weak;
+
 struct arr_elem {
 	struct bpf_res_spin_lock lock;
 };
@@ -87,10 +89,12 @@ int stream_cond_break(void *ctx)
 
 SEC("syscall")
 __success __retval(0)
-__stderr("ERROR: AA or ABBA deadlock detected for bpf_res_spin_lock")
-__stderr("{{Attempted lock   = (0x[0-9a-fA-F]+)\n"
+__stderr("{{Expected owner CPU = ([0-9]+|unknown)\n"
+"ERROR: AA or ABBA deadlock detected for bpf_res_spin_lock\n"
+"Attempted lock   = (0x[0-9a-fA-F]+)\n"
+"Lock owner CPU   = \\1\n"
 "Total held locks = 1\n"
-"Held lock\\[ 0\\] = \\1}}")
+"Held lock\\[ 0\\] = \\2}}")
 __stderr("...")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -106,6 +110,11 @@ int stream_deadlock(void *ctx)
 	nlock = bpf_map_lookup_elem(&arrmap, &(int){0});
 	if (!nlock)
 		return 1;
+	/* Syscall test runs pin this program to a CPU. */
+	if (CONFIG_NR_CPUS <= 8192)
+		bpf_stream_printk(BPF_STDERR, "Expected owner CPU = %u\n", bpf_get_smp_processor_id());
+	else
+		bpf_stream_printk(BPF_STDERR, "Expected owner CPU = unknown\n");
 	if (bpf_res_spin_lock(lock))
 		return 1;
 	if (bpf_res_spin_lock(nlock)) {

@@ -660,6 +660,8 @@ __bpf_kfunc_start_defs();
 static void bpf_prog_report_rqspinlock_violation(const char *str, void *lock, bool irqsave)
 {
 	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
+	u32 val = atomic_read(&((rqspinlock_t *)lock)->val);
+	int owner = rq_lock_owner(val);
 	struct bpf_stream_stage ss;
 	struct bpf_prog *prog;
 
@@ -669,6 +671,12 @@ static void bpf_prog_report_rqspinlock_violation(const char *str, void *lock, bo
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
 		bpf_stream_printk(ss, "ERROR: %s for bpf_res_spin_lock%s\n", str, irqsave ? "_irqsave" : "");
 		bpf_stream_printk(ss, "Attempted lock   = 0x%px\n", lock);
+		if (!(val & RQ_LOCKED_MASK))
+			bpf_stream_printk(ss, "Lock owner CPU   = none\n");
+		else if (owner < 0)
+			bpf_stream_printk(ss, "Lock owner CPU   = unknown\n");
+		else
+			bpf_stream_printk(ss, "Lock owner CPU   = %d\n", owner);
 		bpf_stream_printk(ss, "Total held locks = %d\n", rqh->cnt);
 		for (int i = 0; i < min(RES_NR_HELD, rqh->cnt); i++)
 			bpf_stream_printk(ss, "Held lock[%2d] = 0x%px\n", i, rqh->locks[i]);
