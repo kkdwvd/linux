@@ -459,6 +459,15 @@ static inline bool ip_sk_accept_pmtu(const struct sock *sk)
 	       pmtudisc != IP_PMTUDISC_OMIT;
 }
 
+static inline int ip_select_ttl(const struct inet_sock *inet, const struct dst_entry *dst)
+{
+	int ttl = READ_ONCE(inet->uc_ttl);
+
+	if (ttl < 0)
+		ttl = ip4_dst_hoplimit(dst);
+	return ttl;
+}
+
 static inline bool ip_sk_use_pmtu(const struct sock *sk)
 {
 	return READ_ONCE(inet_sk(sk)->pmtudisc) < IP_PMTUDISC_PROBE;
