@@ -427,8 +427,14 @@ static u64 arena_map_mem_usage(const struct bpf_map *map)
 	return (u64)READ_ONCE(arena->nr_pages) << PAGE_SHIFT;
 }
 
+/*
+ * One per mmap() of the arena. mprotect() may split the mapping into
+ * pieces, which share the entry through their vm_private_data and the
+ * refcount; the pieces are found again by walking the mm within the
+ * arena's window, so the entry remembers the mm and not a vma.
+ */
 struct vma_list {
-	struct vm_area_struct *vma;
+	struct mm_struct *mm;
 	struct list_head head;
 	refcount_t mmap_count;
 	u64 zap_gen;
@@ -443,7 +449,7 @@ static int remember_vma(struct bpf_arena *arena, struct vm_area_struct *vma)
 		return -ENOMEM;
 	refcount_set(&vml->mmap_count, 1);
 	vma->vm_private_data = vml;
-	vml->vma = vma;
+	vml->mm = vma->vm_mm;
 	vml->zap_gen = 0;
 	list_add(&vml->head, &arena->vma_list);
 	return 0;
@@ -458,7 +464,8 @@ static void arena_vm_open(struct vm_area_struct *vma)
 
 static int arena_vm_may_split(struct vm_area_struct *vma, unsigned long addr)
 {
-	return -EINVAL;
+	/* A split by mprotect() or a partial munmap() is fine: zap_pages() walks every piece. */
+	return 0;
 }
 
 static int arena_vm_mremap(struct vm_area_struct *vma)
@@ -854,13 +861,34 @@ out_memcg:
  * unmap it from all user space vma-s,
  * and free it.
  */
+/*
+ * Zap [uaddr, uaddr + size) in every piece of this arena's mapping in the mm:
+ * mprotect() may have split the mapping, and a piece may have been unmapped.
+ * Called with mmap_read_lock held.
+ */
+static void zap_mm_range(struct bpf_arena *arena, struct mm_struct *mm, unsigned long uaddr,
+			 unsigned long size)
+{
+	VMA_ITERATOR(vmi, mm, arena->user_vm_start);
+	struct vm_area_struct *vma;
+
+	for_each_vma_range(vmi, vma, arena->user_vm_end) {
+		unsigned long start, end;
+
+		if (!vma->vm_file || vma->vm_file->private_data != &arena->map)
+			continue;
+		start = max(vma->vm_start, uaddr);
+		end = min(vma->vm_end, uaddr + size);
+		if (start < end)
+			zap_vma_range(vma, start, end - start);
+	}
+}
+
 static void zap_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
 {
 	unsigned long size = (unsigned long)page_cnt << PAGE_SHIFT;
-	struct vm_area_struct *vma;
 	struct mm_struct *mm;
 	struct vma_list *vml;
-	unsigned long vm_start;
 	u64 my_gen;
 
 	/*
@@ -884,10 +912,9 @@ static void zap_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
 			if (vml->zap_gen >= my_gen)
 				continue;
 			vml->zap_gen = my_gen;
-			if (!mmget_not_zero(vml->vma->vm_mm))
+			if (!mmget_not_zero(vml->mm))
 				continue;
-			mm = vml->vma->vm_mm;
-			vm_start = vml->vma->vm_start;
+			mm = vml->mm;
 			break;
 		}
 		if (!mm)
@@ -895,14 +922,8 @@ static void zap_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
 		mutex_unlock(&arena->lock);
 
 		mmap_read_lock(mm);
-		/*
-		 * Re-resolve: while we waited the VMA could have been unmapped
-		 * and a different mapping installed at the same address.
-		 */
-		vma = find_vma(mm, vm_start);
-		if (vma && vma->vm_start == vm_start &&
-		    vma->vm_file && vma->vm_file->private_data == &arena->map)
-			zap_vma_range(vma, uaddr, size);
+		/* Re-resolve: the mapping may have changed while we waited. */
+		zap_mm_range(arena, mm, uaddr, size);
 		mmap_read_unlock(mm);
 		mmput(mm);
 
