@@ -385,9 +385,20 @@ static void arena_map_free(struct bpf_map *map)
 	if (WARN_ON_ONCE(!list_empty(&arena->vma_list)))
 		return;
 
-	/* Ensure no pending deferred frees */
+	/*
+	 * Ensure no pending deferred frees: the worker may re-queue itself when
+	 * it cannot take the lock, so it is disabled, not flushed, and the
+	 * ranges it was still to release are dropped with their records (the
+	 * pages go with the vm area below).
+	 */
 	irq_work_sync(&arena->free_irq);
-	flush_work(&arena->free_work);
+	disable_work_sync(&arena->free_work);
+	{
+		struct llist_node *pos, *t;
+
+		llist_for_each_safe(pos, t, llist_del_all(&arena->free_spans))
+			kfree_nolock(llist_entry(pos, struct arena_free_span, node));
+	}
 
 	/*
 	 * free_vm_area() calls remove_vm_area() that calls free_unmap_vmap_area().
@@ -564,6 +575,15 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		}
 	}
 
+	/*
+	 * A none pte in a range that is not free is a range being freed, whose
+	 * flush is still in flight, or a reserved one: a page added here would
+	 * be found by the next allocation of the range, so SIGBUS instead.
+	 */
+	if (is_range_tree_set(&arena->rt, vmf->pgoff, 1)) {
+		fault_ret = VM_FAULT_SIGBUS;
+		goto out_err_locked_memcg;
+	}
 	ret = range_tree_clear(&arena->rt, vmf->pgoff, 1);
 	if (ret) {
 		fault_ret = VM_FAULT_SIGBUS;
@@ -949,8 +969,6 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	if (ret)
 		goto defer;
 
-	range_tree_set(&arena->rt, pgoff, page_cnt);
-
 	init_llist_head(&free_pages);
 	cdata.arena = arena;
 	cdata.free_pages = &free_pages;
@@ -979,18 +997,33 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 			zap_pages(arena, full_uaddr, 1);
 		__free_page(page);
 	}
+
+	/*
+	 * Only now may the range be handed out again. A CPU that still held a
+	 * translation of the old pages would otherwise write through it after
+	 * bpf_arena_alloc_pages() had mapped new pages there, until the flush
+	 * above reached it. If the lock cannot be taken, the worker sets the
+	 * range: clearing the already cleared ptes and flushing again is
+	 * harmless.
+	 */
+	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
+		goto defer;
+	range_tree_set(&arena->rt, pgoff, page_cnt);
+	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 	bpf_map_memcg_exit(old_memcg, new_memcg);
 
 	return;
 
 defer:
-	s = kmalloc_nolock(sizeof(struct arena_free_span), __GFP_ACCOUNT, -1);
 	bpf_map_memcg_exit(old_memcg, new_memcg);
+	s = sleepable ? kmalloc(sizeof(*s), GFP_KERNEL | __GFP_ACCOUNT) :
+			kmalloc_nolock(sizeof(*s), __GFP_ACCOUNT, -1);
 	if (!s)
 		/*
-		 * If allocation fails in non-sleepable context, pages are intentionally left
-		 * inaccessible (leaked) until the arena is destroyed. Cleanup or retries are not
-		 * possible here, so we intentionally omit them for safety.
+		 * Nothing can be retried here. In non-sleepable context the pages
+		 * are left inaccessible (leaked) until the arena is destroyed; in
+		 * sleepable context, where the free itself is done and only the
+		 * range's release is pending, the range is what leaks.
 		 */
 		return;
 
@@ -1049,7 +1082,7 @@ static void arena_free_worker(struct work_struct *work)
 	struct clear_range_data cdata;
 	struct page *page;
 	unsigned long full_uaddr;
-	long kaddr, page_cnt, pgoff;
+	long kaddr, page_cnt;
 	unsigned long flags;
 
 	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags)) {
@@ -1070,18 +1103,15 @@ static void arena_free_worker(struct work_struct *work)
 		s = llist_entry(pos, struct arena_free_span, node);
 		page_cnt = s->page_cnt;
 		kaddr = arena_vm_start + s->uaddr;
-		pgoff = compute_pgoff(arena, s->uaddr);
 
 		/* clear ptes and collect pages in free_pages llist */
 		apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
 					     apply_range_clear_cb, &cdata);
-
-		range_tree_set(&arena->rt, pgoff, page_cnt);
 	}
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 
 	/* Iterate the list again without holding spinlock to do the tlb flush and zap_pages */
-	llist_for_each_safe(pos, t, list) {
+	llist_for_each(pos, list) {
 		s = llist_entry(pos, struct arena_free_span, node);
 		page_cnt = s->page_cnt;
 		full_uaddr = clear_lo32(user_vm_start) + s->uaddr;
@@ -1092,8 +1122,6 @@ static void arena_free_worker(struct work_struct *work)
 
 		/* remove pages from user vmas */
 		zap_pages(arena, full_uaddr, page_cnt);
-
-		kfree_nolock(s);
 	}
 
 	/* free all pages collected by apply_to_existing_page_range() in the first loop */
@@ -1101,6 +1129,29 @@ static void arena_free_worker(struct work_struct *work)
 		page = llist_entry(pos, struct page, pcp_llist);
 		__free_page(page);
 	}
+
+	/*
+	 * The ranges may be handed out again only now that no CPU holds a
+	 * translation of the old pages: a range set free before the flush was
+	 * reallocated and written through a stale translation. If the lock
+	 * cannot be taken, put the spans back and try again later; clearing
+	 * the already cleared ptes and flushing again is harmless.
+	 */
+	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags)) {
+		llist_for_each_safe(pos, t, list) {
+			s = llist_entry(pos, struct arena_free_span, node);
+			llist_add(&s->node, &arena->free_spans);
+		}
+		schedule_work(work);
+		bpf_map_memcg_exit(old_memcg, new_memcg);
+		return;
+	}
+	llist_for_each_safe(pos, t, list) {
+		s = llist_entry(pos, struct arena_free_span, node);
+		range_tree_set(&arena->rt, compute_pgoff(arena, s->uaddr), s->page_cnt);
+		kfree_nolock(s);
+	}
+	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 
 	bpf_map_memcg_exit(old_memcg, new_memcg);
 }
