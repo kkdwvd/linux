@@ -1476,6 +1476,41 @@ static void btf_dump_emit_fwd_def(struct btf_dump *d, __u32 id,
 		btf_dump_printf(d, "struct %s", name);
 }
 
+/*
+ * The fixed-width integer typedefs of <stdint.h>. The kernel defines them
+ * from its own types, int64_t as long long, where a compiler's <stdint.h>
+ * may use long for the same width, as clang does for BPF. A program that
+ * includes both then sees two definitions of int64_t that differ in type,
+ * which C++ rejects. Emit these typedefs through the macros every compiler
+ * predefines for its <stdint.h>, so that the typedef is the same whichever
+ * header came first.
+ */
+static const char *btf_dump_stdint_macro(const char *name, int size)
+{
+	static const struct {
+		const char *name;
+		const char *macro;
+		int size;
+	} stdint_types[] = {
+		{ "int8_t", "__INT8_TYPE__", 1 },
+		{ "int16_t", "__INT16_TYPE__", 2 },
+		{ "int32_t", "__INT32_TYPE__", 4 },
+		{ "int64_t", "__INT64_TYPE__", 8 },
+		{ "uint8_t", "__UINT8_TYPE__", 1 },
+		{ "uint16_t", "__UINT16_TYPE__", 2 },
+		{ "uint32_t", "__UINT32_TYPE__", 4 },
+		{ "uint64_t", "__UINT64_TYPE__", 8 },
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(stdint_types); i++) {
+		if (stdint_types[i].size == size &&
+		    strcmp(stdint_types[i].name, name) == 0)
+			return stdint_types[i].macro;
+	}
+	return NULL;
+}
+
 static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 				     const struct btf_type *t, int lvl)
 {
@@ -1491,6 +1526,20 @@ static bool btf_dump_emit_typedef_def(struct btf_dump *d, __u32 id,
 	if (t->type == 0 && strcmp(name, "__gnuc_va_list") == 0) {
 		btf_dump_printf(d, "typedef __builtin_va_list __gnuc_va_list");
 		return false;
+	}
+
+	if (t->type) {
+		int base_id = btf__resolve_type(d->btf, t->type);
+		int size = btf__resolve_size(d->btf, t->type);
+		const char *macro = NULL;
+
+		if (base_id > 0 && size > 0 &&
+		    btf_is_int(btf__type_by_id(d->btf, base_id)))
+			macro = btf_dump_stdint_macro(name, size);
+		if (macro) {
+			btf_dump_printf(d, "typedef %s %s", macro, name);
+			return false;
+		}
 	}
 
 	/*
