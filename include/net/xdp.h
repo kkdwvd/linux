@@ -81,6 +81,10 @@ enum xdp_buff_flags {
 	 * XDP program is not attached.
 	 */
 	XDP_FLAGS_FRAGS_UNREADABLE	= BIT(2),
+	/* Kept by TCP on frames a BPF program owns, see bpf_xdp_tcp_hold(). */
+	XDP_FLAGS_BPF_TCP_HELD		= BIT(3), /* admitted to a connection */
+	XDP_FLAGS_BPF_TCP_OOO		= BIT(4), /* admitted beyond the receive cursor */
+	XDP_FLAGS_BPF_RDONLY		= BIT(5), /* read-only to the program from now on */
 };
 
 struct xdp_buff {
@@ -305,10 +309,17 @@ struct xdp_frame {
 	 * while mem_type is valid on remote CPU.
 	 */
 	enum xdp_mem_type mem_type:32;
-	struct net_device *dev_rx; /* used by cpumap */
+	union {
+		struct net_device *dev_rx; /* used by cpumap */
+		/* References to a frame a BPF program took, see bpf_xdp_frame_steal(). */
+		refcount_t bpf_refs;
+	};
 	u32 frame_sz;
 	u32 flags; /* supported values defined in xdp_buff_flags */
 };
+
+void bpf_xdp_frame_put(struct xdp_frame *frame);
+struct sk_buff *bpf_xdp_frame_to_skb(struct xdp_frame *frame, u32 off, u32 len);
 
 static __always_inline bool xdp_frame_has_frags(const struct xdp_frame *frame)
 {
@@ -699,6 +710,9 @@ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
 	 * for accessing map entries.
 	 */
 	u32 act = __bpf_prog_run(prog, xdp, BPF_DISPATCHER_FUNC(xdp));
+
+	if (static_branch_unlikely(&bpf_xdp_consume_enabled_key) || unlikely(act == XDP_CONSUME))
+		act = bpf_xdp_consume_fixup(prog, act);
 
 	if (static_branch_unlikely(&bpf_master_redirect_enabled_key)) {
 		if (act == XDP_TX && netif_is_bond_slave(xdp->rxq->dev))

@@ -25,6 +25,12 @@ struct bpf_testmod_test_writable_ctx {
 	int val;
 };
 
+/* Set by bpf_kfunc_hold_sock() once it owns the socket; released by the test. */
+struct sock_hold_test {
+	__u32 entered;
+	__u32 release;
+};
+
 /* BPF iter that returns *value* *n* times in a row */
 struct bpf_iter_testmod_seq {
 	s64 value;
