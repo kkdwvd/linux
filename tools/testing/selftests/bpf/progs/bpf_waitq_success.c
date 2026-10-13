@@ -75,3 +75,37 @@ int wake_one(void *ctx)
 		return -1;
 	return bpf_waitq_wake(&elem->waitq, 1, 0);
 }
+
+/* A wake between the sample and the wait is not lost: the wait returns -EAGAIN. */
+SEC("syscall")
+int wait_event_stale(void *ctx)
+{
+	struct waitq_elem *elem = lookup_elem();
+	__u32 seq;
+
+	if (!elem)
+		return -1;
+	seq = bpf_waitq_sequence(&elem->waitq);
+	bpf_waitq_wake(&elem->waitq, 1, 0);
+	return bpf_waitq_wait_event(&elem->waitq, seq, 0);
+}
+
+SEC("syscall")
+int wait_event_timeout(void *ctx)
+{
+	struct waitq_elem *elem = lookup_elem();
+
+	if (!elem)
+		return -1;
+	return bpf_waitq_wait_event(&elem->waitq, bpf_waitq_sequence(&elem->waitq), 1000000);
+}
+
+SEC("syscall")
+int wait_event_forever(void *ctx)
+{
+	struct waitq_elem *elem = lookup_elem();
+
+	if (!elem)
+		return -1;
+	return bpf_waitq_wait_event(&elem->waitq, bpf_waitq_sequence(&elem->waitq), ~0ULL);
+}

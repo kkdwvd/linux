@@ -87,6 +87,39 @@ static void test_wake(struct bpf_waitq_success *skel)
 	ASSERT_EQ((__s32)w.retval, 0, "wake_wait_ret");
 }
 
+static void test_wait_event(struct bpf_waitq_success *skel)
+{
+	__u32 retval;
+	bool woken;
+	int i, err;
+
+	err = run_syscall_prog(skel->progs.wait_event_stale, &retval);
+	ASSERT_OK(err, "wait_event_stale");
+	ASSERT_EQ((__s32)retval, -EAGAIN, "event_stale_ret");
+
+	err = run_syscall_prog(skel->progs.wait_event_timeout, &retval);
+	ASSERT_OK(err, "wait_event_timeout");
+	ASSERT_EQ((__s32)retval, -ETIMEDOUT, "event_timeout_ret");
+
+	/* A wake that lands between the waiter's sample and its sleep is not a test of the wake. */
+	for (i = 0; i < 10; i++) {
+		struct waiter w = { .prog = skel->progs.wait_event_forever };
+
+		if (!ASSERT_OK(pthread_create(&w.thread, NULL, waiter_fn, &w), "pthread_create"))
+			return;
+		woken = wake_waiter(skel, &w);
+		pthread_join(w.thread, NULL);
+		if (!ASSERT_OK(w.err, "wait_event_forever"))
+			return;
+		if (woken || (__s32)w.retval != -EAGAIN) {
+			ASSERT_TRUE(woken, "event_woken");
+			ASSERT_EQ((__s32)w.retval, 0, "event_wake_wait_ret");
+			return;
+		}
+	}
+	ASSERT_TRUE(false, "event_wake_raced_every_attempt");
+}
+
 void test_bpf_waitq(void)
 {
 	struct bpf_waitq_success *skel;
@@ -107,6 +140,8 @@ void test_bpf_waitq(void)
 		test_wait(skel);
 	if (test__start_subtest("wake"))
 		test_wake(skel);
+	if (test__start_subtest("wait_event"))
+		test_wait_event(skel);
 out:
 	bpf_waitq_success__destroy(skel);
 }

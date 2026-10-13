@@ -355,6 +355,9 @@ extern int bpf_waitq_init(struct bpf_waitq *waitq, void *p__map,
 			  unsigned int flags) __weak __ksym;
 extern int bpf_waitq_wait(struct bpf_waitq *waitq, const __u32 *word, __u32 expected,
 			  __u64 timeout_ns, __u64 flags) __weak __ksym;
+extern __u32 bpf_waitq_sequence(struct bpf_waitq *waitq) __weak __ksym;
+extern int bpf_waitq_wait_event(struct bpf_waitq *waitq, __u32 expected,
+				__u64 timeout_ns) __weak __ksym;
 extern int bpf_waitq_wake(struct bpf_waitq *waitq, __u32 nr, __u64 flags) __weak __ksym;
 
 struct bpf_iter_kmem_cache;
