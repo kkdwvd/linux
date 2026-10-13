@@ -2,6 +2,7 @@
 
 #include <test_progs.h>
 #include <pthread.h>
+#include <signal.h>
 #include "bpf_waitq_success.skel.h"
 #include "bpf_waitq_failures.skel.h"
 
@@ -120,6 +121,37 @@ static void test_wait_event(struct bpf_waitq_success *skel)
 	ASSERT_TRUE(false, "event_wake_raced_every_attempt");
 }
 
+static void sig_noop(int sig)
+{
+}
+
+static void test_signal(struct bpf_waitq_success *skel)
+{
+	struct waiter w = { .prog = skel->progs.wait_forever };
+	struct sigaction sa = { .sa_handler = sig_noop }, old_sa;
+	bool interrupted;
+	int i;
+
+	if (!ASSERT_OK(sigaction(SIGUSR2, &sa, &old_sa), "sigaction"))
+		return;
+	if (!ASSERT_OK(pthread_create(&w.thread, NULL, waiter_fn, &w), "pthread_create"))
+		goto out;
+	/* A signal handled before the thread enters its syscall ends nothing: resend. */
+	for (i = 0; i < 1000 && !waiter_done(&w); i++) {
+		pthread_kill(w.thread, SIGUSR2);
+		usleep(1000);
+	}
+	interrupted = waiter_done(&w);
+	if (!interrupted)
+		wake_waiter(skel, &w);
+	pthread_join(w.thread, NULL);
+	ASSERT_TRUE(interrupted, "interrupted");
+	ASSERT_OK(w.err, "wait_forever");
+	ASSERT_EQ((__s32)w.retval, -EINTR, "signal_wait_ret");
+out:
+	sigaction(SIGUSR2, &old_sa, NULL);
+}
+
 void test_bpf_waitq(void)
 {
 	struct bpf_waitq_success *skel;
@@ -142,6 +174,8 @@ void test_bpf_waitq(void)
 		test_wake(skel);
 	if (test__start_subtest("wait_event"))
 		test_wait_event(skel);
+	if (test__start_subtest("signal"))
+		test_signal(skel);
 out:
 	bpf_waitq_success__destroy(skel);
 }
