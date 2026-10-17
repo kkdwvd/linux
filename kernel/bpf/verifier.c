@@ -11386,6 +11386,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
+		/* Verified on its own, so whether it returned or unwound is unknown here. */
+		if (env->subprog_info[subprog].ret_unwind)
+			mark_reg_unknown(env, caller->regs, BPF_REG_UNWIND);
+
 		if (env->subprog_info[subprog].might_throw) {
 			struct bpf_verifier_state *branch;
 
@@ -11879,6 +11883,9 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			caller->regs[regno] = callee->regs[regno];
 			bpf_diag_mod_end(env);
 		}
+		/* and whether it returned or unwound, which the caller branches on */
+		if (bpf_subprog_ret_unwind(env, callee->subprogno))
+			caller->regs[BPF_REG_UNWIND] = callee->regs[BPF_REG_UNWIND];
 	}
 
 	/* Invalidate callee-local dynptrs and their slices before the frame goes away. */
@@ -19221,6 +19228,13 @@ static int check_global_subprog_return_code(struct bpf_verifier_env *env)
 	u32 subprog = cur_frame->subprogno;
 	u32 i, nregs;
 	int err;
+
+	/* its caller branches on how it returned */
+	if (bpf_subprog_ret_unwind(env, subprog)) {
+		err = check_global_ret_scalar_reg(env, BPF_REG_UNWIND);
+		if (err)
+			return err;
+	}
 
 	if (subprog_returns_void(env, subprog))
 		return 0;

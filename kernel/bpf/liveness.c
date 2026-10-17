@@ -2482,7 +2482,7 @@ static int callee_subprog(struct bpf_verifier_env *env, const struct bpf_insn *i
 static void compute_insn_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
 				   struct insn_live_regs *info,
-				   bool ret_reg_pair)
+				   bool ret_reg_pair, bool ret_unwind)
 {
 	struct bpf_call_summary cs;
 	const u8 class = BPF_CLASS(insn->code);
@@ -2616,6 +2616,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		case BPF_EXIT:
 			def = 0;
 			use = ret_reg_pair ? (r0 | r2) : r0;
+			/* the caller reads how the frame returned */
+			if (ret_unwind)
+				use |= reg64_mask(BPF_REG_UNWIND);
 			break;
 		case BPF_CALL:
 			def = ALL_CALLER_SAVED_REGS;
@@ -2665,7 +2668,7 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 	struct insn_live_regs *state;
 	int insn_cnt = env->prog->len;
 	int err = 0, i, subprog, start, end;
-	bool changed, ret_reg_pair;
+	bool changed, ret_reg_pair, ret_unwind;
 
 	/* Use the following algorithm:
 	 * - define the following:
@@ -2696,9 +2699,12 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		start = env->subprog_info[subprog].start;
 		end = env->subprog_info[subprog + 1].start;
 		ret_reg_pair = bpf_ret_reg_pair(env, subprog);
+		/* main returns to the kernel, which does not look at r3 */
+		ret_unwind = subprog && bpf_subprog_ret_unwind(env, subprog);
 
 		for (i = start; i < end; ++i)
-			compute_insn_live_regs(env, &insns[i], &state[i], ret_reg_pair);
+			compute_insn_live_regs(env, &insns[i], &state[i], ret_reg_pair,
+					       ret_unwind);
 	}
 
 	/* Forward pass: resolve stack access through FP-derived pointers */

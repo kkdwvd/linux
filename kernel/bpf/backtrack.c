@@ -448,6 +448,8 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				bt_clear_reg(bt, BPF_REG_0);
 				/* and if it does not set R2, main pass would catch it */
 				bt_clear_reg(bt, BPF_REG_2);
+				/* same for R3, which says whether it unwound */
+				bt_clear_reg(bt, BPF_REG_UNWIND);
 				/* r1-r5 are invalidated after subprog call,
 				 * so for global func call it shouldn't be set
 				 * anymore
@@ -548,7 +550,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 					return -EFAULT;
 			}
 		} else if (opcode == BPF_EXIT) {
-			bool from_subprog_call, r0_precise, r2_precise;
+			bool from_subprog_call, r0_precise, r2_precise, r3_precise;
 
 			/* BPF_EXIT in subprog or callback always returns
 			 * right after the call instruction, so by checking
@@ -565,21 +567,25 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 
 			r0_precise = from_subprog_call && bt_is_reg_set(bt, BPF_REG_0);
 			r2_precise = from_subprog_call && bt_is_reg_set(bt, BPF_REG_2);
+			r3_precise = from_subprog_call && bt_is_reg_set(bt, BPF_REG_UNWIND);
 
 			/* Backtracking to a nested function call, 'idx' is a part of
 			 * the inner frame 'subseq_idx' is a part of the outer frame.
 			 * In case of a regular function call, the callee defines the
-			 * return registers R0 and R2, so clear them before checking
-			 * that instructions giving precision to registers R1-R5 have
-			 * been found already. R2 is also an argument register, hence
-			 * it has to be cleared before that check.
+			 * return registers R0 and R2, and R3 when it can unwind, so
+			 * clear them before checking that instructions giving
+			 * precision to registers R1-R5 have been found already. R2
+			 * and R3 are also argument registers, hence they have to be
+			 * cleared before that check.
 			 * In case of a callback from bpf_loop(), R{1,4} in the calling
 			 * frame would be set as precise and that is correct, and R2
 			 * might be a precise helper argument as well, so leave it set.
 			 */
 			bt_clear_reg(bt, BPF_REG_0);
-			if (from_subprog_call)
+			if (from_subprog_call) {
 				bt_clear_reg(bt, BPF_REG_2);
+				bt_clear_reg(bt, BPF_REG_UNWIND);
+			}
 			if (from_subprog_call && (bt_reg_mask(bt) & BPF_REGMASK_ARGS)) {
 				verifier_bug(env, "backtracking exit unexpected regs %x",
 					     bt_reg_mask(bt));
@@ -593,6 +599,8 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				bt_set_reg(bt, BPF_REG_0);
 			if (r2_precise)
 				bt_set_reg(bt, BPF_REG_2);
+			if (r3_precise)
+				bt_set_reg(bt, BPF_REG_UNWIND);
 			/* r6-r9 and stack slots will stay set in caller frame
 			 * bitmasks until we return back from callee(s)
 			 */

@@ -944,6 +944,10 @@ struct bpf_subprog_info {
 	s16 fastcall_stack_off;
 	bool has_tail_call: 1;
 	bool might_throw: 1;
+	/* can start an unwind or let one of its callees' pass through */
+	bool might_unwind: 1;
+	/* says in BPF_REG_UNWIND whether it returned or unwound */
+	bool ret_unwind: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
@@ -1217,6 +1221,19 @@ static inline struct bpf_subprog_info *subprog_info(struct bpf_verifier_env *env
 static inline bool bpf_ret_reg_pair(struct bpf_verifier_env *env, int subprog)
 {
 	return subprog_info(env, subprog)->ret_reg_pair;
+}
+
+/*
+ * The register in which a subprog that can unwind tells its caller how it
+ * returned: 0 for a normal return, 1 when an unwind passes through the
+ * call. It exists only in the xlated program, as the verifier's encoding of
+ * the unwinding flag; a JIT may elide every write and read of it.
+ */
+#define BPF_REG_UNWIND BPF_REG_3
+
+static inline bool bpf_subprog_ret_unwind(struct bpf_verifier_env *env, int subprog)
+{
+	return subprog_info(env, subprog)->ret_unwind;
 }
 
 struct bpf_call_summary {
