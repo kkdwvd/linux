@@ -12,40 +12,42 @@
 #include <linux/types.h>
 #include <linux/build_bug.h>
 #include <linux/threads.h>
+#include <linux/smp.h>
 #include <vdso/time64.h>
 #include <linux/percpu.h>
 
-/*
- * The lock word has the same layout as the queued spinlock word, but
- * rqspinlock owns the type and the helpers that operate on it, so that the
- * layout can diverge from qspinlock without touching the generic lock.
- */
+#if CONFIG_NR_CPUS <= (1U << 13)
+#define RQ_OWNER_CPU_BITS	13
+#define RQ_OWNER_BITS		13
+#define RQ_PENDING_OFFSET	15
+#define RQ_TAIL_IDX_OFFSET	17
+#else
+#define RQ_OWNER_CPU_BITS	0
+#define RQ_OWNER_BITS		0
+#define RQ_PENDING_OFFSET	8
+#define RQ_TAIL_IDX_OFFSET	9
+#endif
+
 typedef struct rqspinlock {
 	union {
 		atomic_t val;
-
-		/*
-		 * By using the whole 2nd least significant byte for the
-		 * pending bit, we can allow better optimization of the lock
-		 * acquisition for the pending bit holder.
-		 */
 #ifdef __LITTLE_ENDIAN
 		struct {
 			u8	locked;
-			u8	pending;
+			u8	owner_pending;
 		};
 		struct {
-			u16	locked_pending;
+			u16	locked_owner_pending;
 			u16	tail;
 		};
 #else
 		struct {
 			u16	tail;
-			u16	locked_pending;
+			u16	locked_owner_pending;
 		};
 		struct {
 			u8	reserved[2];
-			u8	pending;
+			u8	owner_pending;
 			u8	locked;
 		};
 #endif
@@ -53,43 +55,62 @@ typedef struct rqspinlock {
 } rqspinlock_t;
 
 /*
- * Bitfields in the lock word:
+ * CONFIG_NR_CPUS <= 8192:
+ *     0: locked; 1-13: raw owner CPU; 14: unused; 15: pending;
+ *    16: unused; 17-18: tail index + 1; 19-31: raw tail CPU.
  *
- *  0- 7: locked byte
- *  8-15: pending byte
- * 16-17: tail index
- * 18-31: tail cpu (+1)
+ * Unlock clears only the low byte. Upper owner bits remain as residue
+ * while unlocked, and acquisition replaces the complete owner code.
+ * Pending is independent of the release byte and the tail halfword.
+ * A pending owner can hand over with a low-halfword store. A queue head
+ * preserves transient pending claims when replacing the owner residue.
+ *
+ * Larger configurations omit the owner: locked is bit 0, pending bit 8,
+ * tail index + 1 bits 9-10, and raw tail CPU bits 11-31. Those helpers use
+ * full-word atomic updates to preserve overlapping fields.
+ *
+ * Index + 1 reserves zero for no tail and admits three queued contexts.
+ * An NMI queues only when no other context is queued on the same CPU.
  */
 #define RQ_SET_MASK(type)	(((1U << RQ_ ## type ## _BITS) - 1)\
 				      << RQ_ ## type ## _OFFSET)
 #define RQ_LOCKED_OFFSET	0
-#define RQ_LOCKED_BITS		8
+#define RQ_LOCKED_BITS		1
 #define RQ_LOCKED_MASK		RQ_SET_MASK(LOCKED)
-
-#define RQ_PENDING_OFFSET	(RQ_LOCKED_OFFSET + RQ_LOCKED_BITS)
-#define RQ_PENDING_BITS		8
+#define RQ_OWNER_OFFSET		1
+#define RQ_OWNER_MASK		RQ_SET_MASK(OWNER)
+#define RQ_OWNER_RESIDUE_MASK	(RQ_OWNER_MASK & ~0xffU)
+#define RQ_PENDING_BITS		1
 #define RQ_PENDING_MASK		RQ_SET_MASK(PENDING)
-
-#define RQ_TAIL_IDX_OFFSET	(RQ_PENDING_OFFSET + RQ_PENDING_BITS)
-#define RQ_TAIL_IDX_BITS	2
-#define RQ_TAIL_IDX_MASK	RQ_SET_MASK(TAIL_IDX)
-
+#define RQ_TAIL_IDX_BITS		2
+#define RQ_TAIL_IDX_MASK		RQ_SET_MASK(TAIL_IDX)
 #define RQ_TAIL_CPU_OFFSET	(RQ_TAIL_IDX_OFFSET + RQ_TAIL_IDX_BITS)
-#define RQ_TAIL_CPU_BITS	(32 - RQ_TAIL_CPU_OFFSET)
-#define RQ_TAIL_CPU_MASK	RQ_SET_MASK(TAIL_CPU)
-
+#define RQ_TAIL_CPU_BITS		(32 - RQ_TAIL_CPU_OFFSET)
+#define RQ_TAIL_CPU_MASK		RQ_SET_MASK(TAIL_CPU)
 #define RQ_TAIL_OFFSET		RQ_TAIL_IDX_OFFSET
 #define RQ_TAIL_MASK		(RQ_TAIL_IDX_MASK | RQ_TAIL_CPU_MASK)
-
+#define RQ_TAIL_HALF_OFFSET	16
 #define RQ_LOCKED_VAL		(1U << RQ_LOCKED_OFFSET)
 #define RQ_PENDING_VAL		(1U << RQ_PENDING_OFFSET)
 
-/*
- * The tail cpu field must be able to hold cpu + 1 for every possible cpu.
- */
-static_assert(CONFIG_NR_CPUS < (1U << RQ_TAIL_CPU_BITS));
+static_assert(RQ_OWNER_OFFSET + RQ_OWNER_BITS <= RQ_PENDING_OFFSET);
+static_assert(!RQ_OWNER_BITS || RQ_OWNER_CPU_BITS == RQ_TAIL_CPU_BITS);
+static_assert(CONFIG_NR_CPUS <= (1U << RQ_TAIL_CPU_BITS),
+	      "rqspinlock lock word cannot encode this many CPUs");
 
-/* Even though this is same as struct rqspinlock, we need to emit a distinct
+/*
+ * The owner cpu recorded in a lock word, or -1 when owner tracking is disabled.
+ * Only meaningful while the locked bit is set in the same word.
+ */
+static __always_inline int rq_lock_owner(u32 val)
+{
+	if (!RQ_OWNER_BITS)
+		return -1;
+	return (val & RQ_OWNER_MASK) >> RQ_OWNER_OFFSET;
+}
+
+/*
+ * Even though this is same as struct rqspinlock, we need to emit a distinct
  * type in BTF for BPF programs.
  */
 struct bpf_res_spin_lock {
@@ -127,10 +148,31 @@ static __always_inline int resilient_virt_spin_lock(rqspinlock_t *lock)
 
 struct rqspinlock_held {
 	int cnt;
+	/*
+	 * This CPU's complete acquisition code, including a nonzero locked byte,
+	 * filled in for every possible CPU before rqspinlock users can run.
+	 * It shares the cacheline with cnt, which every acquisition increments.
+	 * Configurations without an owner field do not read it on acquisition.
+	 */
+	u32 owner;
 	void *locks[RES_NR_HELD];
 };
 
 DECLARE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
+
+/*
+ * The lock word value that acquires the lock for the current CPU. Callers
+ * run with preemption disabled, so read the per-CPU copy without the
+ * preemption guard or debug check; on x86 this is
+ * one load from the held-locks cacheline, and on arm64 it reuses the per-CPU
+ * base the held-locks update computes.
+ */
+static __always_inline u32 rq_locked_val(void)
+{
+	if (!RQ_OWNER_BITS)
+		return RQ_LOCKED_VAL;
+	return raw_cpu_read(rqspinlock_held_locks.owner);
+}
 
 static __always_inline void grab_held_lock_entry(void *lock)
 {
@@ -227,6 +269,7 @@ dec:
  */
 static __always_inline int res_spin_lock(rqspinlock_t *lock)
 {
+	u32 new = rq_locked_val();
 	int val = 0;
 
 	/*
@@ -243,7 +286,14 @@ static __always_inline int res_spin_lock(rqspinlock_t *lock)
 	 */
 	grab_held_lock_entry(lock);
 
-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, RQ_LOCKED_VAL)))
+	/*
+	 * Keep the residue observation close to the CAS. The CAS still requires
+	 * locked, pending and tail to be clear, and replaces the complete owner.
+	 */
+	if (RQ_OWNER_BITS)
+		val = atomic_read(&lock->val) & RQ_OWNER_RESIDUE_MASK;
+
+	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, new)))
 		return 0;
 	return resilient_queued_spin_lock_slowpath(lock, val);
 }
@@ -259,9 +309,10 @@ static __always_inline void res_spin_unlock(rqspinlock_t *lock)
 	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
 
 	/*
-	 * Release barrier, ensures correct ordering. Perform a release store
-	 * of the locked byte; the test-and-set fallback only ever sets that
-	 * byte as well, so the same store serves both implementations.
+	 * Release the locked byte, preserving pending and the independent tail.
+	 * Upper owner bits remain as residue and are ignored while unlocked.
+	 * Every acquisition replaces the complete owner and sets the locked byte.
+	 * The same release serves the queued and test-and-set paths.
 	 *
 	 * Perform the smp_store_release before clearing the lock entry so that
 	 * NMIs landing in the unlock path can correctly detect AA issues. The
