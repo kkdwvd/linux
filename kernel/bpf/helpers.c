@@ -3424,6 +3424,15 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	return false;
 }
 
+__bpf_kfunc void bpf_unwind(void)
+{
+	/*
+	 * Not meant to run: the verifier lowers every call of this kfunc into
+	 * the frame's own unwind code before the main pass.
+	 */
+	WARN_ONCE(1, "bpf_unwind was not lowered before verification\n");
+}
+
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
 	struct bpf_throw_ctx ctx = {};
@@ -3443,6 +3452,12 @@ __bpf_kfunc void bpf_throw(u64 cookie)
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
 	ctx.aux->bpf_exception_cb(cookie, ctx.sp + ctx.aux->stack_arg_sp_adjust, ctx.bp, 0, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
+}
+
+__bpf_kfunc void bpf_unwind_resume(void *ptr__ign)
+{
+	/* Not meant to run either: lowered to an unwinding return of its frame. */
+	WARN_ONCE(1, "bpf_unwind_resume was not lowered before verification\n");
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)
