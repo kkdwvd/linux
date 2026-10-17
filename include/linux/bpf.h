@@ -1883,6 +1883,7 @@ struct bpf_prog_aux {
 	bool changes_pkt_data;
 	bool might_sleep;
 	bool ret_unwind; /* says in BPF_REG_UNWIND whether it returned or unwound */
+	bool might_unwind; /* some frame of the program can unwind */
 	bool kprobe_write_ctx;
 	struct {
 		s32 keyring_serial;

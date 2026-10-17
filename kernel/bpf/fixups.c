@@ -749,6 +749,13 @@ int bpf_opt_remove_nops(struct bpf_verifier_env *env)
 			continue;
 		if (aux[i].indirect_target)
 			continue;
+		/*
+		 * A branch bpf_exc_lower() planted after a call, hard-wired into
+		 * a jump over nothing once the code between it and the pad went
+		 * dead: a JIT that leaves the branch out still records its site.
+		 */
+		if (aux[i].unwind_branch)
+			continue;
 
 		err = verifier_remove_insns(env, i, 1);
 		if (err)

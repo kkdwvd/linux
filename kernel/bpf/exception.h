@@ -8,8 +8,11 @@
 
 union bpf_attr;
 struct bpf_verifier_env;
+struct bpf_insn;
 
 int bpf_exc_check_info(struct bpf_verifier_env *env, const union bpf_attr *attr,
 		       bpfptr_t uattr);
+bool bpf_is_unwind_kfunc(const struct bpf_insn *insn);
+int bpf_exc_lower(struct bpf_verifier_env *env);
 
 #endif /* __BPF_EXCEPTION_H */

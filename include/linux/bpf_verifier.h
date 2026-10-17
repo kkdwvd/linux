@@ -804,6 +804,15 @@ struct bpf_insn_aux_data {
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
 	/* true if some jump or call instruction targets this instruction */
 	u64 jump_target:1;
+	/*
+	 * Planted by bpf_exc_lower(): the unwinding flag, BPF_REG_UNWIND,
+	 * exists only in the xlated program and a JIT may leave it out.
+	 */
+	u64 unwind_set:1; /* 'r3 = 0' before an exit or 'r3 = 1' before an unwind */
+	u64 unwind_branch:1; /* 'if r3 != 0 goto pad' after a call that can unwind */
+	u64 unwind_jump:1; /* 'goto pad' or 'goto stub' where an unwind starts */
+	u64 unwind_exit:1; /* the exit of an unwind stub: the frame is unwinding */
+	u64 landing_pad:1; /* first insn of an exception cleanup landing pad: a CFG root */
 
 	unsigned int orig_idx; /* original instruction index, initialized once */
 	/*
@@ -948,6 +957,8 @@ struct bpf_subprog_info {
 	bool might_unwind: 1;
 	/* says in BPF_REG_UNWIND whether it returned or unwound */
 	bool ret_unwind: 1;
+	/* ends with the 'r0 = 0; r2 = 0; exit' an unwind leaves through */
+	bool unwind_stub: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
@@ -1107,6 +1118,8 @@ struct bpf_verifier_env {
 	struct bpf_func_ptr *func_ptrs;
 	u32 func_ptr_cnt;
 	bool has_callx;
+	/* a callee of callx can unwind: every address-taken subprog says in r3 how it returned */
+	bool callx_unwinds;
 	/*
 	 * Call graph edges created by callx instructions. A bitmap of
 	 * subprog_cnt * subprog_cnt bits, where bit (caller * subprog_cnt + callee)

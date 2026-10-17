@@ -5955,6 +5955,16 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 		}
 	}
 
+	/*
+	 * A private stack keeps its frame pointer in a register that the JIT
+	 * saves and restores around every call. A frame resumed at its landing
+	 * pad by an unwind, rather than after the call, would address its
+	 * stack through whatever that register holds then. No private stack
+	 * for any program that can unwind, on every arch for now.
+	 */
+	if (env->prog->aux->might_unwind)
+		priv_stack_mode = NO_PRIV_STACK;
+
 	if (priv_stack_mode == PRIV_STACK_UNKNOWN)
 		priv_stack_mode = bpf_enable_priv_stack(env->prog);
 
@@ -23446,15 +23456,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
 
-	env->explored_states = kvzalloc_objs(struct list_head,
-					     state_htab_size(env),
-					     GFP_KERNEL_ACCOUNT);
-	ret = -ENOMEM;
-	if (!env->explored_states)
-		goto skip_full_check;
-
-	for (i = 0; i < state_htab_size(env); i++)
-		INIT_LIST_HEAD(&env->explored_states[i]);
 	INIT_LIST_HEAD(&env->free_list);
 
 	/* Prepare BTF and func_info needed to discover all subprograms. */
@@ -23501,6 +23502,25 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = add_kfuncs(env);
 	if (ret < 0)
 		goto skip_full_check;
+
+	/*
+	 * Turn the exception cleanup table into code. Everything above has
+	 * recorded the insn offsets it needs, so the patches adjust them, and
+	 * the insn count the state table is sized by is final after it.
+	 */
+	ret = bpf_exc_lower(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	env->explored_states = kvzalloc_objs(struct list_head,
+					     state_htab_size(env),
+					     GFP_KERNEL_ACCOUNT);
+	ret = -ENOMEM;
+	if (!env->explored_states)
+		goto skip_full_check;
+
+	for (i = 0; i < state_htab_size(env); i++)
+		INIT_LIST_HEAD(&env->explored_states[i]);
 
 	if (bpf_prog_is_offloaded(env->prog->aux)) {
 		ret = bpf_prog_offload_verifier_prep(env->prog);
