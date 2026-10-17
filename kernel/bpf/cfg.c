@@ -667,36 +667,19 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 	}
 }
 
-/* non-recursive depth-first-search to detect loops in BPF program
- * loop == back-edge in directed graph
- */
-int bpf_check_cfg(struct bpf_verifier_env *env)
+/* Depth-first from @root, over what earlier walks have not explored yet. */
+static int walk_cfg(struct bpf_verifier_env *env, int root)
 {
-	int insn_cnt = env->prog->len;
-	int *insn_stack, *insn_state;
-	int ex_insn_beg, i, ret = 0;
+	int *insn_stack = env->cfg.insn_stack;
+	int *insn_state = env->cfg.insn_state;
+	int ret;
 
-	insn_state = env->cfg.insn_state = kvzalloc_objs(int, insn_cnt,
-							 GFP_KERNEL_ACCOUNT);
-	if (!insn_state)
-		return -ENOMEM;
-
-	insn_stack = env->cfg.insn_stack = kvzalloc_objs(int, insn_cnt,
-							 GFP_KERNEL_ACCOUNT);
-	if (!insn_stack) {
-		kvfree(insn_state);
-		return -ENOMEM;
-	}
-
-	ex_insn_beg = env->exception_callback_subprog
-		      ? env->subprog_info[env->exception_callback_subprog].start
-		      : 0;
-
-	insn_state[0] = DISCOVERED; /* mark 1st insn as discovered */
-	insn_stack[0] = 0; /* 0 is the first instruction */
+	if (insn_state[root] == EXPLORED)
+		return 0;
+	insn_state[root] = DISCOVERED;
+	insn_stack[0] = root;
 	env->cfg.cur_stack = 1;
 
-walk_cfg:
 	while (env->cfg.cur_stack > 0) {
 		int t = insn_stack[env->cfg.cur_stack - 1];
 
@@ -713,21 +696,71 @@ walk_cfg:
 				verifier_bug(env, "visit_insn internal bug");
 				ret = -EFAULT;
 			}
-			goto err_free;
+			return ret;
 		}
 	}
 
 	if (env->cfg.cur_stack < 0) {
 		verifier_bug(env, "pop stack internal bug");
-		ret = -EFAULT;
-		goto err_free;
+		return -EFAULT;
+	}
+	return 0;
+}
+
+/* non-recursive depth-first-search to detect loops in BPF program
+ * loop == back-edge in directed graph
+ */
+int bpf_check_cfg(struct bpf_verifier_env *env)
+{
+	int insn_cnt = env->prog->len;
+	int *insn_stack, *insn_state;
+	int i, ret = 0;
+
+	insn_state = env->cfg.insn_state = kvzalloc_objs(int, insn_cnt,
+							 GFP_KERNEL_ACCOUNT);
+	if (!insn_state)
+		return -ENOMEM;
+
+	insn_stack = env->cfg.insn_stack = kvzalloc_objs(int, insn_cnt,
+							 GFP_KERNEL_ACCOUNT);
+	if (!insn_stack) {
+		kvfree(insn_state);
+		return -ENOMEM;
 	}
 
-	if (ex_insn_beg && insn_state[ex_insn_beg] != EXPLORED) {
-		insn_state[ex_insn_beg] = DISCOVERED;
-		insn_stack[0] = ex_insn_beg;
-		env->cfg.cur_stack = 1;
-		goto walk_cfg;
+	/* 0 is the first instruction */
+	ret = walk_cfg(env, 0);
+	if (ret)
+		goto err_free;
+
+	if (env->exception_callback_subprog) {
+		ret = walk_cfg(env, env->subprog_info[env->exception_callback_subprog].start);
+		if (ret)
+			goto err_free;
+	}
+
+	/*
+	 * A landing pad, flagged by bpf_exc_lower(), is entered only by the
+	 * branch it plants after a covered call that can unwind. A pad over a
+	 * call that cannot -- a Rust caller declaring a C callee "C-unwind"
+	 * when the C side never unwinds, or the invokes clang puts around
+	 * kfunc calls under -fexceptions -- has no predecessor at all. Walk it
+	 * as a root of its own, so that it is not refused as unreachable; the
+	 * main pass never enters it, and dead code elimination removes it.
+	 *
+	 * Likewise what follows the jump bpf_exc_lower() planted in place of
+	 * a call to bpf_unwind() or bpf_unwind_resume(): the loop a compiler
+	 * puts after a call that does not return, for instance. It was
+	 * reachable as the program was written, and stays dead code rather
+	 * than becoming an error.
+	 */
+	for (i = 0; i < insn_cnt; i++) {
+		if (env->insn_aux_data[i].landing_pad)
+			ret = walk_cfg(env, i);
+		else if (env->insn_aux_data[i].unwind_jump && i + 1 < insn_cnt)
+			ret = walk_cfg(env, i + 1);
+		if (ret)
+			goto err_free;
 	}
 
 	for (i = 0; i < insn_cnt; i++) {
