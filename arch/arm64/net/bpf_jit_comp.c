@@ -80,6 +80,7 @@ struct jit_ctx {
 	int epilogue_offset;
 	int *offset;
 	int exentry_idx;
+	int unwind_site_idx;
 	int nr_used_callee_reg;
 	u8 used_callee_reg[8]; /* r6~r9, fp, arena_vm_start */
 	__le32 *image;
@@ -1044,7 +1045,8 @@ static void __maybe_unused build_bhb_mitigation(struct jit_ctx *ctx)
 	}
 }
 
-static void build_epilogue(struct jit_ctx *ctx, bool was_classic)
+/* The epilogue up to its return: the frame is gone and x30 is authenticated. */
+static void build_epilogue_common(struct jit_ctx *ctx, bool was_classic)
 {
 	const u8 r0 = bpf2a64[BPF_REG_0];
 	const u8 ptr = bpf2a64[TCCNT_PTR];
@@ -1072,8 +1074,56 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic)
 	/* Authenticate lr */
 	if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
 		emit(A64_AUTIASP, ctx);
+}
 
+static void build_epilogue(struct jit_ctx *ctx, bool was_classic)
+{
+	build_epilogue_common(ctx, was_classic);
 	emit(A64_RET(A64_LR), ctx);
+}
+
+/*
+ * At the exit of a subprog's unwind stub, once the epilogue has reloaded
+ * x29 and x30 and authenticated x30: the frame returns into a caller whose
+ * branch on r3 was left out. Ask bpf_unwind_target() where that branch
+ * would have gone and return there, with r0 = 0 as a pad is entered. The
+ * new address goes straight into x30, so it needs no signing, and JITed
+ * code keeps no copy of its return address on a shadow call stack.
+ */
+static void emit_unwind_fixup(struct jit_ctx *ctx)
+{
+	emit_a64_mov_i64(A64_R(0), (u64)ctx->prog->aux, ctx);
+	emit(A64_MOV(1, A64_R(1), A64_LR), ctx);
+	emit_call((u64)bpf_unwind_target, ctx);
+	emit(A64_MOV(1, A64_LR, A64_R(0)), ctx);
+	emit_a64_mov_i(1, A64_R(0), 0, ctx);
+}
+
+/*
+ * Right after the call at insn @i was emitted: if bpf_exc_lower() planted a
+ * branch on r3 after it, the branch is left out, and the call's return
+ * address, where the next instruction goes, is recorded with the branch's
+ * target instead, in the final pass where every offset is known.
+ */
+static int record_unwind_site(const struct bpf_verifier_env *env, struct jit_ctx *ctx, int i)
+{
+	struct bpf_unwind_site *site;
+	int tgt;
+
+	if (i + 1 >= ctx->prog->len ||
+	    bpf_insn_unwind_kind(env, ctx->prog, i + 1) != BPF_UNWIND_BRANCH)
+		return 0;
+	bpf_insn_unwind_branch_target(env, ctx->prog, i + 1, &tgt);
+	if (tgt < 0 || !ctx->image || !ctx->write)
+		return 0;
+	if (WARN_ON_ONCE(ctx->unwind_site_idx >= ctx->prog->aux->unwind_site_cnt))
+		return -EFAULT;
+	site = &ctx->prog->aux->unwind_sites[ctx->unwind_site_idx++];
+	/* switch to the rw buffer for the writes */
+	site = (void *)ctx->image + ((void *)site - (void *)ctx->ro_image);
+	site->ra = (unsigned long)&ctx->ro_image[ctx->idx];
+	site->target = (unsigned long)&ctx->ro_image[ctx->offset[tgt]];
+	return 0;
 }
 
 /*
@@ -1378,9 +1428,30 @@ static int build_insn(const struct bpf_verifier_env *env, const struct bpf_insn 
 	int off_adj;
 	int ret;
 	bool sign_extend;
+	bool unwind_exit = false;
+	int tgt;
 
+	/* Before the elision below: an 'exit' a gotox targets became 'r3 = 0; exit'. */
 	if (bpf_insn_is_indirect_target(env, ctx->prog, i))
 		emit_bti(A64_BTI_J, ctx);
+
+	/*
+	 * The unwinding flag r3 is not materialized: nothing is emitted for
+	 * its writes nor for the branch on it after a call, which was recorded
+	 * with the call. The exit of a subprog's unwind stub fixes the return
+	 * address up instead; the main program's stub returns to the kernel.
+	 */
+	switch (bpf_insn_unwind_kind(env, ctx->prog, i)) {
+	case BPF_UNWIND_SET:
+		return 0;
+	case BPF_UNWIND_BRANCH:
+		return bpf_insn_unwind_branch_target(env, ctx->prog, i, &tgt) - 1;
+	case BPF_UNWIND_EXIT:
+		unwind_exit = bpf_is_subprog(ctx->prog);
+		break;
+	default:
+		break;
+	}
 
 	switch (code) {
 	/* dst = src */
@@ -1781,6 +1852,9 @@ emit_cond_jmp:
 			emit_kfunc_arg_moves(ctx, fm);
 		}
 		emit_call(func_addr, ctx);
+		ret = record_unwind_site(env, ctx, i);
+		if (ret)
+			return ret;
 		/*
 		 * Call to arch_bpf_timed_may_goto() is emitted by the
 		 * verifier and called with custom calling convention with
@@ -1799,6 +1873,9 @@ emit_cond_jmp:
 		 * counter and the private stack are callee saved.
 		 */
 		emit(A64_BLR(dst), ctx);
+		ret = record_unwind_site(env, ctx, i);
+		if (ret)
+			return ret;
 		emit(A64_MOV(1, bpf2a64[BPF_REG_0], A64_R(0)), ctx);
 		break;
 	/* tail call */
@@ -1808,6 +1885,13 @@ emit_cond_jmp:
 		break;
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
+		/* An unwinding frame leaves through an epilogue of its own. */
+		if (unwind_exit) {
+			build_epilogue_common(ctx, bpf_prog_was_classic(ctx->prog));
+			emit_unwind_fixup(ctx);
+			emit(A64_RET(A64_LR), ctx);
+			break;
+		}
 		/* Optimization: when last instruction is EXIT,
 		   simply fallthrough to epilogue. */
 		if (i == ctx->prog->len - 1)
@@ -2136,6 +2220,7 @@ static int build_body(struct bpf_verifier_env *env, struct jit_ctx *ctx, bool ex
 	 * - offset[3] - offset of the end of 3rd instruction,
 	 *   start of 4th instruction
 	 */
+	ctx->unwind_site_idx = 0;
 	for (i = 0; i < prog->len; i++) {
 		const struct bpf_insn *insn = &prog->insnsi[i];
 		int ret;
@@ -2179,6 +2264,9 @@ static int validate_ctx(struct jit_ctx *ctx)
 		return -1;
 
 	if (WARN_ON_ONCE(ctx->exentry_idx != ctx->prog->aux->num_exentries))
+		return -1;
+
+	if (WARN_ON_ONCE(ctx->unwind_site_idx != ctx->prog->aux->unwind_site_cnt))
 		return -1;
 
 	return 0;
@@ -2227,6 +2315,7 @@ struct arm64_jit_data {
 struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_prog *prog)
 {
 	int image_size, prog_size, extable_size, extable_align, extable_offset;
+	int unwind_size, unwind_offset;
 	struct bpf_binary_header *header;
 	struct bpf_binary_header *ro_header = NULL;
 	struct arm64_jit_data *jit_data;
@@ -2284,6 +2373,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	if (ctx.offset == NULL)
 		goto out_off;
 
+	/* The call sites whose branch on r3 the passes below leave out. */
+	bpf_prog_count_unwind_sites(env, prog);
+
 	ctx.user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 	ctx.arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
 
@@ -2321,7 +2413,11 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	prog_size = sizeof(u32) * ctx.idx;
 	/* also allocate space for plt target */
 	extable_offset = round_up(prog_size + PLT_TARGET_SIZE, extable_align);
-	image_size = extable_offset + extable_size;
+	/* and for the unwind table, after the extable */
+	unwind_size = prog->aux->unwind_site_cnt * sizeof(struct bpf_unwind_site);
+	unwind_offset = round_up(extable_offset + extable_size,
+				 __alignof__(struct bpf_unwind_site));
+	image_size = unwind_offset + unwind_size;
 	ro_header = bpf_jit_binary_pack_alloc(image_size, &ro_image_ptr,
 					      sizeof(u64), &header, &image_ptr,
 					      jit_fill_hole, was_classic);
@@ -2341,6 +2437,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	ctx.ro_image = (__le32 *)ro_image_ptr;
 	if (extable_size)
 		prog->aux->extable = (void *)ro_image_ptr + extable_offset;
+	if (unwind_size)
+		prog->aux->unwind_sites = (void *)ro_image_ptr + unwind_offset;
 skip_init_ctx:
 	ctx.idx = 0;
 	ctx.exentry_idx = 0;
@@ -2450,6 +2548,16 @@ out_free_hdr:
 }
 
 bool bpf_jit_supports_private_stack(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_unwind_fixup(void)
 {
 	return true;
 }
