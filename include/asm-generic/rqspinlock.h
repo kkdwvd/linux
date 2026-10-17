@@ -274,9 +274,6 @@ static __always_inline int res_spin_lock(rqspinlock_t *lock)
 	u32 new = rq_locked_val();
 	int val = 0;
 
-	if (RQ_OWNER_BITS)
-		val = atomic_read(&lock->val) & RQ_OWNER_RESIDUE_MASK;
-
 	/*
 	 * Grab the deadlock detection entry before doing the cmpxchg, so that
 	 * reentrancy due to NMIs between the succeeding cmpxchg and creation of
@@ -291,7 +288,13 @@ static __always_inline int res_spin_lock(rqspinlock_t *lock)
 	 */
 	grab_held_lock_entry(lock);
 
-	/* Observe the residue while requiring locked, pending and tail to be clear. */
+	/*
+	 * Keep the residue observation close to the CAS. The CAS still requires
+	 * locked, pending and tail to be clear, and replaces the complete owner.
+	 */
+	if (RQ_OWNER_BITS)
+		val = atomic_read(&lock->val) & RQ_OWNER_RESIDUE_MASK;
+
 	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, new)))
 		return 0;
 	return resilient_queued_spin_lock_slowpath(lock, val);
