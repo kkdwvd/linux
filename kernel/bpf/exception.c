@@ -505,6 +505,12 @@ int bpf_exc_lower(struct bpf_verifier_env *env)
 				sub->has_tail_call ? "tail call" : "BPF_LD_[ABS|IND]");
 			return -EINVAL;
 		}
+		/* It returns to the kernel, which has no branch for it. */
+		if (sub->is_exception_cb && sub->might_unwind) {
+			verbose(env, "exception callback subprog %d cannot unwind\n",
+				(int)(sub - env->subprog_info));
+			return -EINVAL;
+		}
 		if (is_final_call(env, sub)) {
 			err = add_exit_after_final_call(env, sub);
 			if (err)

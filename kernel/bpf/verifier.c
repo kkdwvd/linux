@@ -22185,6 +22185,28 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 				prog_extension ? "Extension" : "Tracing");
 			return -EINVAL;
 		}
+		/*
+		 * A trampoline that calls its target returns to the target's
+		 * caller on its behalf, and an extension returns straight to it;
+		 * neither hands the caller the r3 it branches on, so an unwind out
+		 * of the target would end as a normal return. fentry calls
+		 * nothing, and the main program returns to the kernel.
+		 */
+		if (aux->func && subprog && aux->func[subprog]->aux->ret_unwind &&
+		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
+			return -EINVAL;
+		}
+		/*
+		 * An unwind out of an extension would look its return address up
+		 * in the extension's own program, where the target's caller has
+		 * no entry, and return normally into a frame that planted no
+		 * branch for it.
+		 */
+		if (prog_extension && prog->aux->might_unwind) {
+			bpf_log(log, "extension program that can unwind cannot be attached\n");
+			return -EINVAL;
+		}
 		conservative = aux->func_info_aux[subprog].unreliable;
 		if (prog_extension) {
 			if (conservative) {
