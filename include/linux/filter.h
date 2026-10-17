@@ -1249,6 +1249,23 @@ bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);
 bool bpf_jit_supports_exceptions(void);
 bool bpf_jit_supports_unwind(void);
+bool bpf_jit_supports_unwind_fixup(void);
+
+/* What bpf_exc_lower() planted at an insn, for a JIT that elides r3. */
+enum bpf_unwind_insn {
+	BPF_UNWIND_NONE,	/* an ordinary insn */
+	BPF_UNWIND_SET,		/* 'r3 = 0' or 'r3 = 1': emit nothing */
+	BPF_UNWIND_BRANCH,	/* 'if r3 != 0 goto pad' after a call: emit nothing, record it */
+	BPF_UNWIND_JUMP,	/* 'goto pad' where an unwind starts: an ordinary jump */
+	BPF_UNWIND_EXIT,	/* exit of an unwind stub: fix the return address up */
+};
+
+enum bpf_unwind_insn bpf_insn_unwind_kind(const struct bpf_verifier_env *env,
+					  const struct bpf_prog *prog, int insn_idx);
+int bpf_insn_unwind_branch_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+				  int insn_idx, int *tgt);
+u32 bpf_prog_count_unwind_sites(const struct bpf_verifier_env *env, struct bpf_prog *prog);
+unsigned long bpf_unwind_target(const struct bpf_prog_aux *aux, unsigned long ra);
 bool bpf_jit_supports_ptr_xchg(void);
 bool bpf_jit_supports_arena(void);
 bool bpf_jit_supports_arena_scalar(void);

@@ -1841,6 +1841,16 @@ enum bpf_sig_keyring {
 	BPF_SIG_KEYRING_BPF,
 };
 
+/*
+ * A call after which bpf_exc_lower() planted 'if r3 != 0 goto pad' and whose
+ * branch the JIT left out: a frame returning to @ra while unwinding is sent
+ * to @target, the pad or the unwind stub, instead.
+ */
+struct bpf_unwind_site {
+	unsigned long ra;
+	unsigned long target;
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1957,6 +1967,13 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	/*
+	 * Sorted by ra, in the JIT image after the extable; filled by the
+	 * JIT, read by bpf_unwind_target(). None where the JIT does not do
+	 * the fixup: the planted branches do the dispatch there.
+	 */
+	struct bpf_unwind_site *unwind_sites;
+	u32 unwind_site_cnt;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;

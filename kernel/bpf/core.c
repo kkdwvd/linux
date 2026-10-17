@@ -1600,6 +1600,15 @@ struct bpf_prog *bpf_jit_blind_constants(struct bpf_verifier_env *env, struct bp
 			continue;
 		}
 
+		/*
+		 * The insns bpf_exc_lower() planted carry the kernel's own
+		 * constants, and a JIT that leaves the unwinding flag out relies
+		 * on the branch sitting right after its call: leave them alone.
+		 */
+		if (env && (env->insn_aux_data[i].unwind_set ||
+			    env->insn_aux_data[i].unwind_branch))
+			continue;
+
 		/* We temporarily need to hold the original ld64 insn
 		 * so that we can still access the first part in the
 		 * second blinding run.
@@ -1667,6 +1676,136 @@ u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_p
 		return 0;
 	sub = &env->subprog_info[prog->aux->func_idx];
 	return sub->stack_arg_cnt - bpf_in_stack_arg_cnt(sub);
+}
+
+/*
+ * The unwinding flag r3 exists only in the xlated program. A JIT that knows
+ * which insns bpf_exc_lower() planted may leave the flag out: it emits
+ * nothing for the writes and for the branch after a call, and instead sends
+ * the return of an unwind stub straight to where the branch would have
+ * gone, through a table of (return address, target) per JITed function.
+ *
+ * A JIT that does not do the fixup, and one without the verifier's aux
+ * data, as for a program without subprogs JITed from
+ * bpf_prog_select_runtime(), is told every insn is an ordinary one and
+ * emits the program as written. That is correct on any JIT that keeps r3
+ * across a subprog's exit: the planted writes and branches then are the
+ * unwind, at the cost of the branch after each call that can unwind.
+ */
+enum bpf_unwind_insn bpf_insn_unwind_kind(const struct bpf_verifier_env *env,
+					  const struct bpf_prog *prog, int insn_idx)
+{
+	const struct bpf_insn_aux_data *aux;
+
+	if (!env || !bpf_jit_supports_unwind_fixup())
+		return BPF_UNWIND_NONE;
+	aux = &env->insn_aux_data[insn_idx + prog->aux->subprog_start];
+	if (aux->unwind_exit)
+		return BPF_UNWIND_EXIT;
+	if (aux->unwind_branch)
+		return BPF_UNWIND_BRANCH;
+	if (aux->unwind_set)
+		return BPF_UNWIND_SET;
+	if (aux->unwind_jump)
+		return BPF_UNWIND_JUMP;
+	return BPF_UNWIND_NONE;
+}
+
+/*
+ * The branch planted after the call at @insn_idx - 1 starts at @insn_idx.
+ * It was 'if r3 != 0 goto pad', or 'if r3 == 0 goto +1; gotol pad' when
+ * the pad was out of reach, and the passes after the main one may have
+ * hard-wired it into a jump or stripped it down to the gotol; constant
+ * blinding leaves it alone. Returns how many insns it spans, and in @tgt
+ * the pad's insn index, or -1 when no verified path takes it.
+ */
+int bpf_insn_unwind_branch_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+				  int insn_idx, int *tgt)
+{
+	const struct bpf_insn *insn = &prog->insnsi[insn_idx];
+
+	*tgt = -1;
+	switch (insn->code) {
+	case BPF_JMP | BPF_JNE | BPF_K:
+	case BPF_JMP | BPF_JA:
+		*tgt = insn_idx + 1 + insn->off;
+		return 1;
+	case BPF_JMP32 | BPF_JA:
+		*tgt = insn_idx + 1 + insn->imm;
+		return 1;
+	case BPF_JMP | BPF_JEQ | BPF_K:
+		if (insn_idx + 1 < prog->len && insn[1].code == (BPF_JMP32 | BPF_JA) &&
+		    bpf_insn_unwind_kind(env, prog, insn_idx + 1) == BPF_UNWIND_BRANCH) {
+			*tgt = insn_idx + 2 + insn[1].imm;
+			return 2;
+		}
+		return 1;
+	default:
+		WARN_ONCE(1, "bpf: unexpected unwind branch %02x at insn %d\n",
+			  insn->code, insn_idx);
+		return 1;
+	}
+}
+
+/*
+ * How many sites the JIT will record for @prog, so that it makes room for
+ * them in its image, after the code and the extable, before its first pass.
+ * Zero where the JIT does not do the fixup: the branches dispatch then.
+ */
+u32 bpf_prog_count_unwind_sites(const struct bpf_verifier_env *env, struct bpf_prog *prog)
+{
+	u32 i, cnt = 0;
+	int n, tgt;
+
+	for (i = 0; i < prog->len; i += n) {
+		n = 1;
+		if (bpf_insn_unwind_kind(env, prog, i) != BPF_UNWIND_BRANCH)
+			continue;
+		n = bpf_insn_unwind_branch_target(env, prog, i, &tgt);
+		if (tgt >= 0)
+			cnt++;
+	}
+	prog->aux->unwind_site_cnt = cnt;
+	return cnt;
+}
+
+/*
+ * Called from the unwind stub of a JITed subprog, @aux being its own:
+ * where should the frame returning to @ra go, now that it is unwinding?
+ * The function @ra returns into is one of the program's own, since a
+ * callback, a trampoline, an extension and a tail call are all refused for
+ * a frame that can unwind. Not finding the site is a bug.
+ */
+unsigned long bpf_unwind_target(const struct bpf_prog_aux *aux, unsigned long ra)
+{
+	const struct bpf_unwind_site *sites;
+	const struct bpf_prog *p;
+	u32 i, n, l, r;
+	unsigned long start;
+
+	n = aux->func ? aux->real_func_cnt : 1;
+	for (i = 0; i < n; i++) {
+		p = aux->func ? aux->func[i] : aux->prog;
+		start = (unsigned long)p->bpf_func;
+		if (ra <= start || ra > start + p->jited_len)
+			continue;
+		sites = p->aux->unwind_sites;
+		l = 0;
+		r = p->aux->unwind_site_cnt;
+		while (l < r) {
+			u32 m = l + (r - l) / 2;
+
+			if (sites[m].ra < ra)
+				l = m + 1;
+			else if (sites[m].ra > ra)
+				r = m;
+			else
+				return sites[m].target;
+		}
+		break;
+	}
+	WARN_ONCE(1, "bpf: no unwind target for return address %pS\n", (void *)ra);
+	return ra;
 }
 #endif /* CONFIG_BPF_JIT */
 
@@ -3502,7 +3641,25 @@ bool __weak bpf_jit_supports_exceptions(void)
 	return false;
 }
 
+/*
+ * Whether the JIT keeps the register backing BPF_REG_3 intact across a
+ * subprog's exit: its epilogue, its tail call counter handling, its stack
+ * bookkeeping and any exit trampoline. A subprog that can unwind says in
+ * that register whether it returned or unwound, and its caller branches on
+ * it right after the call. Each arch opts in after checking its exit path.
+ */
 bool __weak bpf_jit_supports_unwind(void)
+{
+	return false;
+}
+
+/*
+ * Whether the JIT leaves the unwinding flag out of the machine code and
+ * sends an unwinding frame's return straight to its caller's landing pad,
+ * see bpf_insn_unwind_kind(). An optimization: without it, the planted
+ * insns are compiled as written and the branch after a call is the cost.
+ */
+bool __weak bpf_jit_supports_unwind_fixup(void)
 {
 	return false;
 }
