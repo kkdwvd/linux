@@ -69,6 +69,7 @@ void test_res_spin_lock_success(void)
 
 	/* Multi-threaded ABBA deadlock. */
 
+	WRITE_ONCE(skip, false);
 	prog_fd = bpf_program__fd(skel->progs.res_spin_lock_test_AB);
 	for (i = 0; i < 16; i++) {
 		int err;
@@ -94,9 +95,9 @@ void test_res_spin_lock_success(void)
 			goto end;
 	}
 
-	ASSERT_EQ(READ_ONCE(skel->bss->err), -EDEADLK, "timeout err");
+	ASSERT_EQ(READ_ONCE(skel->bss->err), -EDEADLK, "deadlock err");
 	ASSERT_OK(err, "err");
-	ASSERT_EQ(topts.retval, -EDEADLK, "timeout");
+	ASSERT_EQ(topts.retval, -EDEADLK, "deadlock retval");
 end:
 	res_spin_lock__destroy(skel);
 	return;
@@ -109,9 +110,11 @@ void serial_test_res_spin_lock_stress(void)
 		.type = PERF_TYPE_HARDWARE,
 		.config = PERF_COUNT_HW_CPU_CYCLES,
 	};
+	static const char * const modes[] = { "AA", "ABBA" };
+	char params[32];
 	int pmu_fd;
 
-	if (libbpf_num_possible_cpus() < 3) {
+	if (get_nprocs() < 3) {
 		test__skip();
 		return;
 	}
@@ -127,11 +130,17 @@ void serial_test_res_spin_lock_stress(void)
 	}
 	close(pmu_fd);
 
-	ASSERT_OK(load_module("bpf_test_rqspinlock.ko", false), "load module AA");
-	sleep(5);
-	unload_module("bpf_test_rqspinlock", false);
+	for (int mode = 0; mode < ARRAY_SIZE(modes); mode++) {
+		if (!test__start_subtest(modes[mode]))
+			continue;
+		snprintf(params, sizeof(params), "test_mode=%d", mode);
+		if (!ASSERT_OK(load_module_params("bpf_test_rqspinlock.ko", params, false),
+			       "load module"))
+			continue;
+		sleep(5);
+		ASSERT_OK(unload_module("bpf_test_rqspinlock", false), "unload module");
+	}
 	/*
-	 * Insert bpf_test_rqspinlock.ko manually with test_mode=[1|2] to test
-	 * other cases (ABBA, ABBCCA).
+	 * Insert bpf_test_rqspinlock.ko manually with test_mode=2 to test ABBCCA.
 	 */
 }

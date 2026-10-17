@@ -127,6 +127,47 @@ static noinline int check_deadlock_AA(rqspinlock_t *lock)
 }
 
 /*
+ * Return -ENOENT if this CPU's table does not contain the target below its
+ * current acquisition attempt, 0 if it does but no cycle is found, or
+ * -EDEADLK for an ABBA cycle. Never dereference a remote table entry.
+ */
+static int check_deadlock_ABBA_cpu(rqspinlock_t *lock, int cpu,
+				   struct rqspinlock_held *rqh, int rqh_cnt)
+{
+	struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
+	int cnt = READ_ONCE(rqh_cpu->cnt);
+	void *remote_lock;
+
+	/*
+	 * A remote CPU needs a held lock and an acquisition attempt to form a
+	 * cycle. Above RES_NR_HELD, its current attempt is absent from the table.
+	 */
+	if (cpu == smp_processor_id() || cnt < 2 || cnt > RES_NR_HELD)
+		return -ENOENT;
+
+	remote_lock = READ_ONCE(rqh_cpu->locks[cnt - 1]);
+	if (!remote_lock)
+		return -ENOENT;
+
+	/*
+	 * The owner snapshot may already be stale. Confirm that this CPU still
+	 * lists our target below its top entry, even when it was selected by the
+	 * owner field. Missing entries during publication or unwind are
+	 * inconclusive; a later check can retry.
+	 */
+	for (int i = 0; i < cnt - 1; i++) {
+		if (READ_ONCE(rqh_cpu->locks[i]) != lock)
+			continue;
+		for (int j = 0; j < rqh_cnt - 1; j++) {
+			if (rqh->locks[j] == remote_lock)
+				return -EDEADLK;
+		}
+		return 0;
+	}
+	return -ENOENT;
+}
+
+/*
  * This focuses on the most common case of ABBA deadlocks (or ABBA involving
  * more locks, which reduce to ABBA). This is not exhaustive, and we rely on
  * timeouts as the final line of defense.
@@ -135,75 +176,46 @@ static noinline int check_deadlock_ABBA(rqspinlock_t *lock, u32 mask)
 {
 	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
 	int rqh_cnt = min(RES_NR_HELD, rqh->cnt);
-	void *remote_lock;
-	int cpu;
+	int cpu, ret;
+	u32 val;
+
+	if (rqh_cnt < 2)
+		return 0;
+
+	if (RQ_OWNER_BITS) {
+		val = atomic_read_acquire(&lock->val);
+		if (!(val & mask & ~RQ_OWNER_RESIDUE_MASK))
+			return 0;
+		if (val & RQ_LOCKED_MASK) {
+			cpu = rq_lock_owner(val);
+			if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+				return 0;
+			ret = check_deadlock_ABBA_cpu(lock, cpu, rqh, rqh_cnt);
+			if (ret == -EDEADLK)
+				return ret;
+			/*
+			 * Pending and tail reservations can belong to interrupted
+			 * waiters on other CPUs. If they also block this caller,
+			 * the current owner is not the only possible cycle partner.
+			 */
+			if (!(val & mask & ~(RQ_LOCKED_MASK | RQ_OWNER_MASK)))
+				return 0;
+		}
+	}
 
 	/*
-	 * Find the CPU holding the lock that we want to acquire. If there is a
-	 * deadlock scenario, we will read a stable set on the remote CPU and
-	 * find the target. Owner tracking does not change this held-table scan.
+	 * Without an owner field, search every possible CPU. Do the same for
+	 * blocking reservations, even if the lock is still owned: a pending
+	 * waiter interrupted by an NMI can participate in a cycle without
+	 * owning the lock. Held tables include such interrupted attempts, so
+	 * the owner field cannot locate that waiter.
 	 */
 	for_each_possible_cpu(cpu) {
-		struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
-		int real_cnt = READ_ONCE(rqh_cpu->cnt);
-		int cnt = min(RES_NR_HELD, real_cnt);
-
-		/*
-		 * Let's ensure to break out of this loop if the lock is available for
-		 * us to potentially acquire.
-		 */
 		if (is_lock_released(lock, mask))
 			return 0;
-
-		/*
-		 * Skip ourselves, and CPUs whose count is less than 2, as they need at
-		 * least one held lock and one acquisition attempt (reflected as top
-		 * most entry) to participate in an ABBA deadlock.
-		 *
-		 * If cnt is more than RES_NR_HELD, it means the current lock being
-		 * acquired won't appear in the table, and other locks in the table are
-		 * already held, so we can't determine ABBA.
-		 */
-		if (cpu == smp_processor_id() || real_cnt < 2 || real_cnt > RES_NR_HELD)
-			continue;
-
-		/*
-		 * Obtain the entry at the top, this corresponds to the lock the
-		 * remote CPU is attempting to acquire in a deadlock situation,
-		 * and would be one of the locks we hold on the current CPU.
-		 */
-		remote_lock = READ_ONCE(rqh_cpu->locks[cnt - 1]);
-		/*
-		 * If it is NULL, we've raced and cannot determine a deadlock
-		 * conclusively, skip this CPU.
-		 */
-		if (!remote_lock)
-			continue;
-		/*
-		 * Find if the lock we're attempting to acquire is held by this CPU.
-		 * Don't consider the topmost entry, as that must be the latest lock
-		 * being held or acquired.  For a deadlock, the target CPU must also
-		 * attempt to acquire a lock we hold, so for this search only 'cnt - 1'
-		 * entries are important.
-		 */
-		for (int i = 0; i < cnt - 1; i++) {
-			if (READ_ONCE(rqh_cpu->locks[i]) != lock)
-				continue;
-			/*
-			 * We found our lock as held on the remote CPU.  Is the
-			 * acquisition attempt on the remote CPU for a lock held
-			 * by us?  If so, we have a deadlock situation, and need
-			 * to recover.
-			 */
-			for (int i = 0; i < rqh_cnt - 1; i++) {
-				if (rqh->locks[i] == remote_lock)
-					return -EDEADLK;
-			}
-			/*
-			 * Inconclusive; retry again later.
-			 */
-			return 0;
-		}
+		ret = check_deadlock_ABBA_cpu(lock, cpu, rqh, rqh_cnt);
+		if (ret != -ENOENT)
+			return ret;
 	}
 	return 0;
 }
