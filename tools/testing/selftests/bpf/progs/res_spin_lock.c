@@ -118,7 +118,8 @@ int res_spin_lock_test_held_lock_max(struct __sk_buff *ctx)
 
 	time_beg = bpf_ktime_get_ns();
 	for (i = 0; i < 34; i++) {
-		if (bpf_res_spin_lock(locks[i]))
+		ret = bpf_res_spin_lock(locks[i]);
+		if (ret)
 			goto end;
 	}
 
@@ -138,10 +139,19 @@ end:
 	for (i = i - 1; i >= 0; i--)
 		bpf_res_spin_unlock(locks[i]);
 	time = bpf_ktime_get_ns() - time_beg;
-	/* Time spent should be easily above our limit (1/4 s), since AA
+	if (ret)
+		return ret;
+
+	/* The timeout must leave no reservation behind after the owner unlocks. */
+	if (bpf_res_spin_lock(locks[34]))
+		return 3;
+	bpf_res_spin_unlock(locks[34]);
+
+	/*
+	 * Time spent should be easily above our limit (1/4 s), since AA
 	 * detection won't be expedited due to lack of held lock entry.
 	 */
-	return ret ?: (time > 1000000000 / 4 ? 0 : 1);
+	return time > 1000000000 / 4 ? 0 : 1;
 }
 
 char _license[] SEC("license") = "GPL";

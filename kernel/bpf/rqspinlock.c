@@ -53,14 +53,12 @@
  * unlock the next pending (next->locked), we compress both these: {tail,
  * next->locked} into a single u32 value.
  *
- * Since a spinlock disables recursion of its own context and there is a limit
- * to the contexts that can nest; namely: task, softirq, hardirq, nmi. As there
- * are at most 4 nesting levels, it can be encoded by a 2-bit number. Now
- * we can encode the tail by combining the 2-bit nesting level with the cpu
- * number. With one byte for the lock value and 3 bytes for the tail, only a
- * 32-bit word is now needed. Even though we only need 1 bit for the lock,
- * we extend it to a full byte to achieve better performance for architectures
- * that support atomic byte write.
+ * Task, softirq, and hardirq contexts need at most three queue nodes per CPU.
+ * An NMI only queues if no interrupted context is already queued. Encode the
+ * node index plus one in two bits, reserving zero for no tail, and store the
+ * raw CPU number beside it. The low byte indicates ownership and is released
+ * with a byte store. The remaining low-halfword bits hold the upper owner
+ * code and pending; see the layout in asm-generic/rqspinlock.h.
  *
  * We also change the first spinner to spin on the lock bit instead of its
  * node; whereby avoiding the need to carry a node from lock to unlock, and
@@ -81,12 +79,33 @@ struct rqspinlock_timeout {
 
 #define RES_TIMEOUT_VAL	2
 
-DEFINE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
+DEFINE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks) = {
+	.owner = RQ_LOCKED_VAL,
+};
 EXPORT_SYMBOL_GPL(rqspinlock_held_locks);
+
+#if RQ_OWNER_BITS
+/*
+ * Fill in each CPU's owner value for the lock word. Per-CPU memory for every
+ * possible CPU exists from setup_per_cpu_areas() on, and an early initcall
+ * runs before secondary CPUs are brought up and before regular initcalls,
+ * including the BPF and locktorture users. Initialize the cache before use:
+ * the static initializer supplies CPU0's complete acquisition value.
+ */
+static int __init rqspinlock_init_owner(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		per_cpu(rqspinlock_held_locks.owner, cpu) = (cpu << RQ_OWNER_OFFSET) | RQ_LOCKED_VAL;
+	return 0;
+}
+early_initcall(rqspinlock_init_owner);
+#endif
 
 static bool is_lock_released(rqspinlock_t *lock, u32 mask)
 {
-	if (!(atomic_read_acquire(&lock->val) & (mask)))
+	if (!(atomic_read_acquire(&lock->val) & mask & ~RQ_OWNER_RESIDUE_MASK))
 		return true;
 	return false;
 }
@@ -122,9 +141,7 @@ static noinline int check_deadlock_ABBA(rqspinlock_t *lock, u32 mask)
 	/*
 	 * Find the CPU holding the lock that we want to acquire. If there is a
 	 * deadlock scenario, we will read a stable set on the remote CPU and
-	 * find the target. This would be a constant time operation instead of
-	 * O(NR_CPUS) if we could determine the owning CPU from a lock value, but
-	 * that requires increasing the size of the lock word.
+	 * find the target. Owner tracking does not change this held-table scan.
 	 */
 	for_each_possible_cpu(cpu) {
 		struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
@@ -275,7 +292,7 @@ int __lockfunc resilient_tas_spin_lock(rqspinlock_t *lock)
 retry:
 	val = atomic_read(&lock->val);
 
-	if (val || !atomic_try_cmpxchg(&lock->val, &val, RQ_LOCKED_VAL)) {
+	if ((val & ~RQ_OWNER_RESIDUE_MASK) || !atomic_try_cmpxchg(&lock->val, &val, rq_locked_val())) {
 		if (RES_CHECK_TIMEOUT(ts, ret, ~0u))
 			goto out;
 		cpu_relax();
@@ -292,10 +309,10 @@ EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
 #ifdef CONFIG_QUEUED_SPINLOCKS
 
 /*
- * Per-CPU queue node structures; we can never have more than 4 nested
- * contexts: task, softirq, hardirq, nmi.
+ * Per-CPU queue nodes for task, softirq, and hardirq contexts. An NMI can
+ * use the first node only when no interrupted context is already queued.
  *
- * Exactly fits one 64-byte cacheline on a 64-bit architecture.
+ * Fits within one 64-byte cacheline on a 64-bit architecture.
  */
 static DEFINE_PER_CPU_ALIGNED(struct rqnode, rqnodes[RQ_MAX_NODES]);
 
@@ -349,57 +366,40 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 	 *
 	 * 0,1,0 -> 0,0,1
 	 */
-	if (val == RQ_PENDING_VAL) {
+	if ((val & ~RQ_OWNER_RESIDUE_MASK) == RQ_PENDING_VAL) {
 		int cnt = RQ_PENDING_LOOPS;
 		val = atomic_cond_read_relaxed(&lock->val,
-					       (VAL != RQ_PENDING_VAL) || !cnt--);
+					       ((VAL & ~RQ_OWNER_RESIDUE_MASK) != RQ_PENDING_VAL) || !cnt--);
 	}
 
 	/*
 	 * If we observe any contention; queue.
 	 */
-	if (val & ~RQ_LOCKED_MASK)
+	if (val & ~RQ_LOCKED_OWNER_MASK)
 		goto queue;
 
 	/*
-	 * trylock || pending
-	 *
-	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
+	 * Reserve pending optimistically, retaining the baseline admission
+	 * path. If a queue appeared, undo only a reservation that we created.
 	 */
 	val = rq_fetch_set_pending_acquire(lock);
-
-	/*
-	 * If we observe contention, there is a concurrent locker.
-	 *
-	 * Undo and queue; our setting of PENDING might have made the
-	 * n,0,0 -> 0,0,0 transition fail and it will now be waiting
-	 * on @next to become !NULL.
-	 */
-	if (unlikely(val & ~RQ_LOCKED_MASK)) {
-
-		/* Undo PENDING if we set it. */
+	if (unlikely(val & ~RQ_LOCKED_OWNER_MASK)) {
 		if (!(val & RQ_PENDING_MASK))
-			rq_clear_pending(lock);
-
+			rq_undo_pending(lock);
 		goto queue;
 	}
 
 	/* Deadlock detection entry already held after failing fast path. */
 
 	/*
-	 * We're pending, wait for the owner to go away.
-	 *
-	 * 0,1,1 -> *,1,0
-	 *
-	 * this wait loop must be a load-acquire such that we match the
-	 * store-release that clears the locked bit and create lock
-	 * sequentiality; this is because not all
-	 * rq_clear_pending_set_locked() implementations imply full
-	 * barriers.
+	 * Pending excludes new owners. If the previous owner is still locked,
+	 * acquire-observe its byte release before the plain halfword handover.
+	 * The pending helper otherwise supplies the acquisition ordering.
 	 */
 	if (val & RQ_LOCKED_MASK) {
 		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
-		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, RQ_LOCKED_MASK));
+		res_smp_cond_load_acquire(&lock->locked, !VAL ||
+					  RES_CHECK_TIMEOUT(ts, ret, RQ_LOCKED_MASK));
 	}
 
 	if (ret) {
@@ -412,7 +412,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
 		 *
 		 * *,1,* -> *,0,*
 		 */
-		rq_clear_pending(lock);
+		rq_clear_pending(lock, val);
 		lockevent_inc(rqspinlock_lock_timeout);
 		goto err_release_entry;
 	}
@@ -453,15 +453,11 @@ queue:
 	trace_contention_begin(lock, LCB_F_SPIN);
 
 	/*
-	 * 4 nodes are allocated based on the assumption that there will
-	 * not be nested NMIs taking spinlocks. That may not be true in
-	 * some architectures even though the chance of needing more than
-	 * 4 nodes will still be extremely unlikely. When that happens,
-	 * we fall back to attempting a trylock operation without using
-	 * any MCS node. Unlike qspinlock which cannot fail, we have the
-	 * option of failing the slow path, and under contention, such a
-	 * trylock spinning will likely be treated unfairly due to lack of
-	 * queueing, hence do not spin.
+	 * Three nodes cover task, softirq, and hardirq nesting. An NMI must
+	 * not queue behind a context it interrupted, so it uses a node only
+	 * when the count was zero. If no node can be used, try once without
+	 * queueing and report deadlock on failure. Unlike qspinlock, this
+	 * lock can fail instead of spinning unfairly outside the queue.
 	 */
 	if (unlikely(idx >= RQ_MAX_NODES || (in_nmi() && idx > 0))) {
 		lockevent_inc(lock_no_node);
@@ -582,13 +578,8 @@ waitq_timeout:
 		 *
 		 * n,*,* -> 0,*,*
 		 *
-		 * When performing cmpxchg for the whole word (NR_CPUS > 16k), it is
-		 * possible locked/pending bits keep changing and we see failures even
-		 * when we remain the head of wait queue. However, eventually,
-		 * pending bit owner will unset the pending bit, and new waiters
-		 * will queue behind us. This will leave the lock owner in
-		 * charge, and it will eventually either set locked bit to 0, or
-		 * leave it as 1, allowing us to make progress.
+		 * Tail cleanup preserves locked, owner residue, and pending even
+		 * when an optimistic pending setter races with queue teardown.
 		 *
 		 * We terminate the whole wait queue for two reasons. Firstly,
 		 * we eschew per-waiter timeouts with one applied at the head of
@@ -618,7 +609,7 @@ waitq_timeout:
 	 */
 
 	if ((val & RQ_TAIL_MASK) == tail) {
-		u32 new = RQ_LOCKED_VAL;
+		u32 new = rq_locked_val();
 
 		for (;;) {
 			if (atomic_try_cmpxchg_relaxed(&lock->val, &val, new))
@@ -626,7 +617,7 @@ waitq_timeout:
 			if ((val & RQ_TAIL_MASK) != tail)
 				break;
 			/* A pending claimant can abandon before publishing a tail. */
-			new = RQ_LOCKED_VAL | (val & RQ_PENDING_MASK);
+			new = rq_locked_val() | (val & RQ_PENDING_MASK);
 		}
 	}
 
@@ -635,7 +626,7 @@ waitq_timeout:
 	 * Preserve pending while installing ownership; a racing claimant may
 	 * still be undoing its speculative reservation against this queue.
 	 */
-	rq_set_locked(lock);
+	rq_set_locked(lock, val);
 
 	/*
 	 * contended path; wait for next if not observed yet, release.
