@@ -5,6 +5,7 @@
 #include <linux/btf_ids.h>
 #include <linux/filter.h>
 #include <linux/slab.h>
+#include "diagnostics.h"
 #include "exception.h"
 
 #define verbose(env, fmt, args...) bpf_verifier_log_write(env, fmt, ##args)
@@ -335,6 +336,67 @@ static int patch_branch(struct bpf_verifier_env *env, u32 off, struct bpf_insn *
 	return cnt;
 }
 
+static bool is_final_call(struct bpf_verifier_env *env, const struct bpf_subprog_info *sub)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[(sub + 1)->start - 1];
+
+	return BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_CALL;
+}
+
+/*
+ * check_subprogs() lets a subprog end with a call, as a compiler emits
+ * nothing after a call it knows does not return: a pad's _Unwind_Resume,
+ * or a call to a Rust function returning `!` because it unwinds. Refuse
+ * any such call that cannot unwind, since it would return into the next
+ * subprog.
+ */
+static int check_final_calls(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *sub;
+	u32 last;
+
+	for (sub = env->subprog_info; sub < env->subprog_info + env->subprog_cnt; sub++) {
+		last = (sub + 1)->start - 1;
+		if (!is_final_call(env, sub) || unwinds_at(env, last))
+			continue;
+		verbose(env, "last insn is not an exit or jmp\n");
+		bpf_diag_program_structure(
+			env, last, "subprogram can fall through",
+			"End each subprogram with an exit or an explicit jump that keeps control flow inside the subprogram.",
+			"Subprogram %d reaches its last instruction %d without an exit or jump, so control could continue into the next subprogram.",
+			(int)(sub - env->subprog_info), last);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * Put 'r0 = 0; exit' after a final call to a subprog, so that the call's
+ * fall-through is an ordinary return and the unwind stub after it is
+ * reached only by the branch planted after the call. The verifier walks
+ * the fall-through only where the callee can return. A final call to
+ * bpf_unwind() or bpf_unwind_resume() becomes a jump, which needs nothing
+ * after it.
+ */
+static int add_exit_after_final_call(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
+{
+	u32 last = (sub + 1)->start - 1;
+	struct bpf_insn buf[3];
+	int err;
+
+	if (bpf_is_unwind_kfunc(&env->prog->insnsi[last]))
+		return 0;
+	buf[0] = env->prog->insnsi[last];
+	buf[1] = BPF_MOV64_IMM(BPF_REG_0, 0);
+	buf[2] = BPF_EXIT_INSN();
+	err = patch(env, last, buf, ARRAY_SIZE(buf));
+	if (err)
+		return err;
+	if (sub->exit_idx == U32_MAX)
+		sub->exit_idx = last + 2;
+	return 0;
+}
+
 /*
  * The table has served: what the passes after the lowering need is in
  * insn_aux_data. A planted branch carries its target in its own off field,
@@ -416,6 +478,9 @@ int bpf_exc_lower(struct bpf_verifier_env *env)
 
 	any = mark_might_unwind(env);
 	env->prog->aux->might_unwind = any;
+	err = check_final_calls(env);
+	if (err)
+		return err;
 	if (!any) {
 		retire_table(env);
 		return 0;
@@ -439,6 +504,11 @@ int bpf_exc_lower(struct bpf_verifier_env *env)
 				(int)(sub - env->subprog_info),
 				sub->has_tail_call ? "tail call" : "BPF_LD_[ABS|IND]");
 			return -EINVAL;
+		}
+		if (is_final_call(env, sub)) {
+			err = add_exit_after_final_call(env, sub);
+			if (err)
+				return err;
 		}
 		if (!needs_stub(env, sub))
 			continue;
