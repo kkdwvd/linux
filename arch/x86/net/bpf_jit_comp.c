@@ -2511,6 +2511,29 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
 	}
 }
 
+/*
+ * At the exit of a subprog's unwind stub, after the epilogue: [rsp] is the
+ * frame's return address, into a caller whose branch on r3 was left out.
+ * Replace it with where that branch would have gone, the caller's landing
+ * pad or unwind stub, and return there with r0 = 0, as a pad is entered.
+ */
+static int emit_unwind_fixup(u8 **pprog, struct bpf_prog *bpf_prog, u8 *ip)
+{
+	u8 *prog = *pprog, *start = prog;
+
+	/* mov rdi, aux */
+	emit_mov_imm64(&prog, BPF_REG_1, (long)bpf_prog->aux >> 32, (u32)(long)bpf_prog->aux);
+	EMIT4(0x48, 0x8B, 0x34, 0x24);	/* mov rsi, [rsp] */
+	ip += prog - start;
+	ip += x86_call_depth_emit_accounting(&prog, bpf_unwind_target, ip);
+	if (emit_call(&prog, bpf_unwind_target, ip))
+		return -EINVAL;
+	EMIT4(0x48, 0x89, 0x04, 0x24);	/* mov [rsp], rax */
+	EMIT2(0x31, 0xC0);		/* xor eax, eax */
+	*pprog = prog;
+	return 0;
+}
+
 static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 		  u8 *rw_image, int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -2518,13 +2541,13 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	struct bpf_insn *insn = bpf_prog->insnsi;
 	bool callee_regs_used[4] = {};
 	int insn_cnt = bpf_prog->len;
-	bool seen_exit = false;
+	bool seen_exit = false, skip_insn = false;
 	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
 	void __percpu *priv_frame_ptr = NULL;
 	u16 out_stack_arg_cnt, outgoing_rsp;
 	u64 arena_vm_start, user_vm_start;
 	void __percpu *priv_stack_ptr;
-	int i, excnt = 0;
+	int i, excnt = 0, usite = 0;
 	int ilen, proglen = 0;
 	u8 *ip, *prog = temp;
 	u32 stack_depth;
@@ -2654,6 +2677,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 		u8 *func;
 		int nops;
 		u32 jmp_op = BPF_OP(insn->code);
+		bool unwind_exit = false;
 		s32 cmp_imm;
 
 		if (priv_frame_ptr) {
@@ -2664,8 +2688,50 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 				dst_reg = X86_REG_R9;
 		}
 
+		/* Before the elision below: an 'exit' a gotox targets became 'r3 = 0; exit'. */
 		if (bpf_insn_is_indirect_target(env, bpf_prog, i - 1))
 			EMIT_ENDBR();
+
+		/* The second half of a planted branch, handled with the first. */
+		if (skip_insn) {
+			skip_insn = false;
+			goto insn_done;
+		}
+
+		/*
+		 * The unwinding flag r3 is not materialized: nothing is emitted
+		 * for its writes nor for the branch on it after a call. Instead
+		 * the call's return address and the branch's target go into the
+		 * table that an unwinding callee's exit looks itself up in.
+		 */
+		switch (bpf_insn_unwind_kind(env, bpf_prog, i - 1)) {
+		case BPF_UNWIND_SET:
+			goto insn_done;
+		case BPF_UNWIND_BRANCH: {
+			struct bpf_unwind_site *site;
+			int tgt;
+
+			skip_insn = bpf_insn_unwind_branch_target(env, bpf_prog, i - 1, &tgt) == 2;
+			if (tgt < 0 || !image)
+				goto insn_done;
+			if (usite >= bpf_prog->aux->unwind_site_cnt) {
+				pr_err("bpf_jit: unwind table bug\n");
+				return -EFAULT;
+			}
+			site = &bpf_prog->aux->unwind_sites[usite++];
+			/* switch to the rw buffer for the writes */
+			site = (void *)rw_image + ((void *)site - (void *)image);
+			site->ra = (unsigned long)image + addrs[i - 1];
+			site->target = (unsigned long)image + addrs[tgt];
+			goto insn_done;
+		}
+		case BPF_UNWIND_EXIT:
+			/* The main program's stub returns zero to the kernel. */
+			unwind_exit = bpf_is_subprog(bpf_prog);
+			break;
+		default:
+			break;
+		}
 
 		ip = image + addrs[i - 1] + (prog - temp);
 		insn_idx = i - 1 + bpf_prog->aux->subprog_start;
@@ -3772,13 +3838,16 @@ emit_jmp:
 			break;
 
 		case BPF_JMP | BPF_EXIT:
-			if (seen_exit) {
-				jmp_offset = ctx->cleanup_addr - addrs[i];
-				goto emit_jmp;
+			/* An unwinding exit has an epilogue of its own, with the fixup. */
+			if (!unwind_exit) {
+				if (seen_exit) {
+					jmp_offset = ctx->cleanup_addr - addrs[i];
+					goto emit_jmp;
+				}
+				seen_exit = true;
+				/* Update cleanup_addr */
+				ctx->cleanup_addr = proglen;
 			}
-			seen_exit = true;
-			/* Update cleanup_addr */
-			ctx->cleanup_addr = proglen;
 			if (bpf_prog_was_classic(bpf_prog) &&
 			    !ns_capable_noaudit(&init_user_ns, CAP_SYS_ADMIN)) {
 				if (emit_spectre_bhb_barrier(&prog, ip, bpf_prog))
@@ -3795,7 +3864,11 @@ emit_jmp:
 					pop_r12(&prog);
 			}
 			EMIT1(0xC9);         /* leave */
-			bpf_prog->aux->ksym.fp_end = prog - temp;
+			if (!unwind_exit)
+				bpf_prog->aux->ksym.fp_end = prog - temp;
+			else if (emit_unwind_fixup(&prog, bpf_prog,
+						   image + addrs[i - 1] + (prog - temp)))
+				return -EINVAL;
 
 			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
 			break;
@@ -3811,6 +3884,7 @@ emit_jmp:
 			return -EINVAL;
 		}
 
+insn_done:
 		ilen = prog - temp;
 		if (ilen > BPF_MAX_INSN_SIZE) {
 			pr_err("bpf_jit: fatal insn size error\n");
@@ -3840,6 +3914,10 @@ emit_jmp:
 
 	if (image && excnt != bpf_prog->aux->num_exentries) {
 		pr_err("extable is not populated\n");
+		return -EFAULT;
+	}
+	if (image && usite != bpf_prog->aux->unwind_site_cnt) {
+		pr_err("unwind table is not populated\n");
 		return -EFAULT;
 	}
 	return proglen;
@@ -4869,6 +4947,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	if (!addrs)
 		goto out_addrs;
 
+	/* The call sites whose branch on r3 the passes below leave out. */
+	bpf_prog_count_unwind_sites(env, prog);
+
 	/*
 	 * Before first pass, make a rough estimation of addrs[]
 	 * each BPF instruction is translated to less than 64 bytes
@@ -4926,15 +5007,21 @@ out_image:
 			u32 align = __alignof__(struct exception_table_entry);
 			u32 extable_size = prog->aux->num_exentries *
 				sizeof(struct exception_table_entry);
+			/* and the unwind table, after the extable */
+			u32 unwind_size = prog->aux->unwind_site_cnt *
+				sizeof(struct bpf_unwind_site);
+			u32 unwind_off = roundup(roundup(proglen, align) + extable_size,
+						 __alignof__(struct bpf_unwind_site));
 
 			/* allocate module memory for x86 insns and extable */
-			header = bpf_jit_binary_pack_alloc(roundup(proglen, align) + extable_size,
+			header = bpf_jit_binary_pack_alloc(unwind_off + unwind_size,
 							   &image, align, &rw_header, &rw_image,
 							   jit_fill_hole,
 							   bpf_prog_was_classic(prog));
 			if (!header)
 				goto out_addrs;
 			prog->aux->extable = (void *) image + roundup(proglen, align);
+			prog->aux->unwind_sites = unwind_size ? (void *)image + unwind_off : NULL;
 		}
 		oldproglen = proglen;
 		cond_resched();
@@ -5112,6 +5199,16 @@ bool bpf_jit_supports_exceptions(void)
 	 * to walk kernel frames and reach BPF frames in the stack trace.
 	 */
 	return IS_ENABLED(CONFIG_UNWINDER_ORC);
+}
+
+bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_unwind_fixup(void)
+{
+	return true;
 }
 
 bool bpf_jit_supports_private_stack(void)
