@@ -43,6 +43,8 @@ struct rqsl_cpu_hist {
 	atomic64_t hist[RQSL_CTX_MAX][RQSL_NR_HIST_BUCKETS];
 	atomic64_t success[RQSL_CTX_MAX];
 	atomic64_t failure[RQSL_CTX_MAX];
+	atomic64_t deadlock[RQSL_CTX_MAX];
+	atomic64_t timeout[RQSL_CTX_MAX];
 };
 
 static DEFINE_PER_CPU(struct rqsl_cpu_hist, rqsl_cpu_hists);
@@ -136,6 +138,10 @@ static void rqsl_record_lock_result(u64 delta_ns, enum rqsl_context ctx, int ret
 		atomic64_inc(&hist->success[ctx]);
 	else
 		atomic64_inc(&hist->failure[ctx]);
+	if (ret == -EDEADLK)
+		atomic64_inc(&hist->deadlock[ctx]);
+	else if (ret == -ETIMEDOUT)
+		atomic64_inc(&hist->timeout[ctx]);
 }
 
 static int rqspinlock_worker_fn(void *arg)
@@ -339,6 +345,12 @@ static void rqsl_print_histograms(void)
 
 		if (!total)
 			continue;
+
+		pr_err(" cpu%d errors: EDEADLK normal %lld nmi %lld, ETIMEDOUT normal %lld nmi %lld\n",
+		       cpu, atomic64_read(&hist->deadlock[RQSL_CTX_NORMAL]),
+		       atomic64_read(&hist->deadlock[RQSL_CTX_NMI]),
+		       atomic64_read(&hist->timeout[RQSL_CTX_NORMAL]),
+		       atomic64_read(&hist->timeout[RQSL_CTX_NMI]));
 
 		if (!has_slow) {
 			pr_err(" cpu%d: total %llu (normal %llu, nmi %llu) | "

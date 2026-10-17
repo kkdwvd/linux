@@ -73,10 +73,11 @@ int res_spin_lock_test_BA(struct __sk_buff *ctx)
 	r = bpf_res_spin_lock(&lockB);
 	if (r)
 		return !r;
-	if (!bpf_res_spin_lock(&lockA))
+	r = bpf_res_spin_lock(&lockA);
+	if (!r)
 		bpf_res_spin_unlock(&lockA);
 	else
-		err = -EDEADLK;
+		err = r;
 	bpf_res_spin_unlock(&lockB);
 	return err ?: 0;
 }
