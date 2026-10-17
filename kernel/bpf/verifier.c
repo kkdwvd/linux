@@ -11200,6 +11200,14 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	 * callbacks
 	 */
 	env->subprog_info[subprog].is_cb = true;
+	/*
+	 * The helper or kfunc that calls it does not look at r3: an unwind
+	 * out of it would end there as a normal return to the caller.
+	 */
+	if (env->subprog_info[subprog].might_unwind) {
+		verbose(env, "subprog %d may unwind and is used as a callback\n", subprog);
+		return -EINVAL;
+	}
 	if (bpf_pseudo_kfunc_call(insn) &&
 	    !is_callback_calling_kfunc(insn->imm)) {
 		verifier_bug(env, "kfunc %s#%d not marked as callback-calling",
@@ -11879,6 +11887,19 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			verifier_bug(env, "in callback at %d, callsite %d !calls_callback",
 				     *insn_idx, callee->callsite);
 			return -EFAULT;
+		}
+		/*
+		 * A callback marked ret_unwind only because its address is
+		 * taken still has to return normally: nothing reads r3 here.
+		 */
+		if (bpf_subprog_ret_unwind(env, callee->subprogno)) {
+			err = mark_chain_precision(env, BPF_REG_UNWIND);
+			if (err)
+				return err;
+			if (!bpf_register_is_null(&callee->regs[BPF_REG_UNWIND])) {
+				verbose(env, "callback cannot unwind\n");
+				return -EINVAL;
+			}
 		}
 	} else {
 		/*
