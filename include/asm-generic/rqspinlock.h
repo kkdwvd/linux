@@ -176,24 +176,26 @@ static __always_inline u32 rq_locked_val(void)
 
 static __always_inline void grab_held_lock_entry(void *lock)
 {
-	int cnt = this_cpu_inc_return(rqspinlock_held_locks.cnt);
-
-	if (unlikely(cnt > RES_NR_HELD)) {
-		/* Still keep the inc so we decrement later. */
-		return;
-	}
+	int idx = this_cpu_read(rqspinlock_held_locks.cnt);
 
 	/*
-	 * Implied compiler barrier in per-CPU operations; otherwise we can have
-	 * the compiler reorder inc with write to table, allowing interrupts to
-	 * overwrite and erase our write to the table (as on interrupt exit it
-	 * will be reset to NULL).
-	 *
-	 * It is fine for cnt inc to be reordered wrt remote readers though,
-	 * they won't observe our entry until the cnt update is visible, that's
-	 * all.
+	 * Preemption is disabled. An interrupt using this count before our
+	 * store restores it before returning, so idx remains valid. Reserve
+	 * the slot before publishing its pointer to a nested context.
 	 */
-	this_cpu_write(rqspinlock_held_locks.locks[cnt - 1], lock);
+	this_cpu_write(rqspinlock_held_locks.cnt, idx + 1);
+
+	/*
+	 * Keep the compiler from publishing the entry before reserving it.
+	 * Otherwise an interrupt can reuse our slot and clear it on exit.
+	 * Remote readers may still observe a reserved slot before its pointer.
+	 */
+	barrier();
+	if (unlikely(idx >= RES_NR_HELD)) {
+		/* Still account for acquisitions beyond the table capacity. */
+		return;
+	}
+	this_cpu_write(rqspinlock_held_locks.locks[idx], lock);
 }
 
 /*
