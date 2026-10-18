@@ -527,6 +527,12 @@ bool bpf_jit_supports_kfunc_call(void)
 	return IS_ENABLED(CONFIG_PPC64);
 }
 
+/* On ppc64, r5, which backs BPF_REG_3, is not touched on the way out of a subprog */
+bool bpf_jit_supports_unwind(void)
+{
+	return IS_ENABLED(CONFIG_PPC64);
+}
+
 bool bpf_jit_supports_private_stack(void)
 {
 	return IS_ENABLED(CONFIG_PPC64);
