@@ -2488,6 +2488,12 @@ bool bpf_jit_supports_kfunc_call(void)
 	return true;
 }
 
+/* %r4, which backs BPF_REG_3, is not touched on the way out of a subprog */
+bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
 bool bpf_jit_supports_far_kfunc_call(void)
 {
 	return true;
