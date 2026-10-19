@@ -46,9 +46,10 @@ static __noinline int add1(int v)
 }
 
 /*
- * Pointers to functions and to data in read-only data of a program with callx.
- * Volatile, so that the compiler doesn't replace the pointers with what
- * they point to.
+ * Pointers to functions and to data in read-only data, which is in arena like
+ * the rest of the data. A program can't call through a pointer to a function
+ * that it loads from arena, so that one is NULL. Volatile, so that the
+ * compiler doesn't replace the pointers with what they point to.
  */
 static const volatile struct {
 	op_fn fn;
@@ -61,12 +62,9 @@ int use_ops(void *ctx)
 {
 	/* a program has the arena when its code refers to it */
 	counter++;
-#ifdef __clang__
-	return ops.fn(*ops.data) + ops.name[1];
-#else
-	/* gcc doesn't support indirect calls */
-	return add1(*ops.data) + ops.name[1];
-#endif
+	if (ops.fn)
+		return -1;
+	return *ops.data + 1 + ops.name[1];
 }
 
 SEC("syscall")

@@ -571,12 +571,15 @@ struct bpf_struct_ops {
  * one that is just large enough for the data. bpf_object__find_map_by_name()
  * finds it by the name "arena" and bpf_map__set_max_entries() changes its
  * size before the object is loaded.
- * Read-only sections with pointers to functions and sections with constant
- * strings stay frozen array maps. A constant that a helper or a kfunc takes
- * by pointer has to be in such section.
+ * Read-only data is in arena too, .data.rel.ro and sections with pointers in
+ * them included: a program reaches a vtable through a number that it loads
+ * from data, and a frozen map can't be reached from a number. Sections with
+ * constant strings stay frozen array maps, with a copy in arena. A constant
+ * that a helper or a kfunc takes by pointer has to be in such section.
  * Pointers to data that are stored in data become addresses of arena.
  * The load fails if such pointer points to a section that is not in arena,
- * or if the arena is pinned or reused and has no map_extra.
+ * or if the arena is pinned or reused and has no map_extra. Pointers to
+ * functions are NULL, see bpf_object__collect_data_ptr().
  *
  * It's for programs written in Rust. There are no address spaces in Rust,
  * the program accesses arena through plain numbers, so programs of the object
@@ -3177,41 +3180,25 @@ static bool map_is_const_str(const struct bpf_map *map)
 	       str_has_pfx(map->real_name, RODATA_SEC ".str");
 }
 
-static bool map_data_goes_to_arena(const struct bpf_object *obj, const struct bpf_map *map)
+/*
+ * All global data goes to arena when data is in arena, read-only data with
+ * pointers in it included. A program reaches a vtable, and the type info that
+ * it points to, through a number that it loads from data, and a frozen map
+ * can't be reached from a number. Const strings that kfuncs and helpers take
+ * have to be in a frozen map, so they stay one too, and pointers to them that
+ * are stored in data point to a copy of the strings in arena, see
+ * bpf_object__init_arena_data().
+ */
+static bool map_data_goes_to_arena(const struct bpf_map *map)
 {
-	int i;
-
 	switch (map->libbpf_type) {
 	case LIBBPF_MAP_DATA:
 	case LIBBPF_MAP_BSS:
-		return true;
 	case LIBBPF_MAP_RODATA:
-		break;
+		return true;
 	default:
 		return false;
 	}
-
-	/*
-	 * Const strings that kfuncs and helpers take have to be in a frozen
-	 * map. Pointers to them that are stored in data point to a copy of
-	 * the strings that is in arena.
-	 */
-	if (map_is_const_str(map))
-		return true;
-	/*
-	 * Read-only data with pointers stays a frozen map: the kernel
-	 * recognizes pointers to functions in it.
-	 */
-	if (str_has_pfx(map->real_name, DATA_REL_RO_SEC))
-		return false;
-	for (i = 0; i < obj->efile.sec_cnt; i++) {
-		const struct elf_sec_desc *sec = &obj->efile.secs[i];
-
-		if (sec->sec_type == SEC_RELO &&
-		    obj->efile.secs[sec->shdr->sh_info].map_sec_idx == map->sec_idx)
-			return false;
-	}
-	return true;
 }
 
 /* Returns the offset of the data of the map in arena data that is sz bytes so far */
@@ -3223,8 +3210,8 @@ static size_t map_arena_off(const struct bpf_object *obj, const struct bpf_map *
 }
 
 /*
- * Make .data, .bss and .rodata a part of arena data. They follow __arena
- * variables of the object, if there are any.
+ * Make .data, .bss and .rodata, of any name, a part of arena data. They follow
+ * __arena variables of the object, if there are any.
  */
 static int bpf_object__init_arena_data(struct bpf_object *obj)
 {
@@ -3239,7 +3226,7 @@ static int bpf_object__init_arena_data(struct bpf_object *obj)
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		map = &obj->maps[i];
-		if (map_data_goes_to_arena(obj, map))
+		if (map_data_goes_to_arena(map))
 			sz = map_arena_off(obj, map, sz) + map->def.value_size;
 	}
 	if (sz == obj->arena_data_sz)
@@ -3281,7 +3268,7 @@ static int bpf_object__init_arena_data(struct bpf_object *obj)
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		map = &obj->maps[i];
-		if (!map_data_goes_to_arena(obj, map))
+		if (!map_data_goes_to_arena(map))
 			continue;
 		sz = map_arena_off(obj, map, sz);
 		map->arena_off = sz;
@@ -8749,8 +8736,8 @@ static bool sym_is_arena(const struct bpf_object *obj, const Elf64_Sym *sym)
  * the data, so the pointer has to be the address of the target in arena.
  *
  * A pointer to a function in arena data, e.g. in a vtable that is in arena,
- * is NULL. The verifier knows a pointer to a function only by its value in
- * read-only data, see create_func_ptr_map(), so a program can't call through
+ * is NULL. The verifier knows a pointer to a function only by its value in a
+ * frozen map, see create_func_ptr_map(), so a program can't call through
  * a pointer that it loads from arena. There is no address to give it either:
  * a function has one in each program that it is a part of, and the data in
  * arena is the same for all of them.
@@ -8768,9 +8755,8 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 	if (ELF64_ST_TYPE(sym->st_info) == STT_SECTION && sym->st_shndx < obj->efile.sec_cnt)
 		sym_name = elf_sec_name(obj, elf_sec_by_idx(obj, sym->st_shndx)) ?: "<?>";
 
-	/* .data is in arena when data is, read-only data with pointers is not */
-	in_arena = obj->efile.secs[sec_idx].sec_type == SEC_ARENA ||
-		   (obj->data_in_arena && obj->efile.secs[sec_idx].sec_type == SEC_DATA);
+	/* all global data is in arena when data is, see map_data_goes_to_arena() */
+	in_arena = obj->efile.secs[sec_idx].sec_type == SEC_ARENA || obj->data_in_arena;
 	func = sym->st_shndx < obj->efile.sec_cnt && section_have_execinstr(obj, sym->st_shndx);
 
 	if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
@@ -8820,9 +8806,9 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 
 /*
  * Collect pointers in a data section that is in arena: __arena variables, or
- * any data section when data is in arena. Other data sections have only
- * their pointers to __arena variables relocated. The rest of their
- * relocations were never applied.
+ * any data section, read-only or not, when data is in arena. Other data
+ * sections have only their pointers to __arena variables relocated. The rest
+ * of their relocations were never applied.
  */
 static int bpf_object__collect_data_relos(struct bpf_object *obj,
 					  Elf64_Shdr *shdr, Elf_Data *data)
@@ -8858,8 +8844,9 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
  * R_BPF_64_ABS64 relocations against .text section, where the offset of
  * a static function in the section is stored in place. Relocations in data
  * sections were ignored before pointers to functions were supported. Those
- * that are something else, e.g. pointers to data, still are, unless data
- * is in arena or they point to arena.
+ * that are something else, e.g. pointers to data, still are, unless they
+ * point to arena. When data is in arena, so is read-only data, and its
+ * relocations are collected by bpf_object__collect_data_relos().
  */
 static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 					    Elf64_Shdr *shdr, Elf_Data *data)
@@ -8897,7 +8884,7 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		    !sym_is_subprog(obj, sym)) {
 			int err;
 
-			if (obj->data_in_arena || sym_is_arena(obj, sym)) {
+			if (sym_is_arena(obj, sym)) {
 				err = bpf_object__collect_data_ptr(obj, relo_sec_name, i,
 								   sec_idx, rel, sym);
 				if (err)
@@ -8981,9 +8968,11 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 			return -LIBBPF_ERRNO__INTERNAL;
 		}
 
-		if (obj->efile.secs[idx].sec_type == SEC_RODATA)
+		/* read-only data is in arena when data is */
+		if (obj->efile.secs[idx].sec_type == SEC_RODATA && !obj->data_in_arena)
 			err = bpf_object__collect_rodata_relos(obj, shdr, data);
 		else if (obj->efile.secs[idx].sec_type == SEC_DATA ||
+			 obj->efile.secs[idx].sec_type == SEC_RODATA ||
 			 obj->efile.secs[idx].sec_type == SEC_ARENA)
 			err = bpf_object__collect_data_relos(obj, shdr, data);
 		else if (obj->efile.secs[idx].sec_type == SEC_ST_OPS)
