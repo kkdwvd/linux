@@ -3449,6 +3449,32 @@ static int next_callx_callee(struct bpf_verifier_env *env, int caller, int from)
 }
 
 /*
+ * What the callee of a callx may do, the caller may do too, like for a direct
+ * call, see merge_callee_effects(). The callees are known after the main pass,
+ * and the attach checks rely on the summaries of the subprogs, e.g. that
+ * bpf_throw can't run with the frame of a subprog on the stack. Callees come
+ * before their callers in the topological order, which sort_subprogs_topo()
+ * has recomputed with the callx edges.
+ */
+static void merge_callx_callee_effects(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *caller, *callee;
+	int i, c, subprog;
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		subprog = env->subprog_topo_order[i];
+		caller = &env->subprog_info[subprog];
+		for (c = next_callx_callee(env, subprog, 0); c >= 0;
+		     c = next_callx_callee(env, subprog, c + 1)) {
+			callee = &env->subprog_info[c];
+			caller->changes_pkt_data |= callee->changes_pkt_data;
+			caller->might_sleep |= callee->might_sleep;
+			caller->might_throw |= callee->might_throw;
+		}
+	}
+}
+
+/*
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
@@ -22941,6 +22967,18 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
 			return -EINVAL;
 		}
+		/*
+		 * bpf_throw unwinds to the frame of the main program, over the
+		 * trampoline that called the subprog for fexit, which then never
+		 * returns. The walk of the stack doesn't get past the trampoline
+		 * either, see bpf_stack_walker(). An fentry trampoline has
+		 * returned by the time the subprog runs.
+		 */
+		if (aux->func && subprog && aux->func[subprog]->aux->might_throw &&
+		    !prog_extension && prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			bpf_log(log, "Only fentry can attach to %s, which might throw\n", tname);
+			return -EINVAL;
+		}
 		conservative = aux->func_info_aux[subprog].unreliable;
 		if (prog_extension) {
 			if (aux->func_info_aux[subprog].linkage != BTF_FUNC_GLOBAL ||
@@ -24410,6 +24448,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	/* reject recursion through the callx edges found by the main pass */
 	if (ret == 0 && env->callx_edges)
 		ret = sort_subprogs_topo(env);
+	if (ret == 0 && env->callx_edges)
+		merge_callx_callee_effects(env);
 
 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
 		ret = bpf_prog_offload_finalize(env);
