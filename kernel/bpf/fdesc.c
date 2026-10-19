@@ -626,6 +626,36 @@ static int fdesc_pool_add(struct bpf_verifier_env *env, const struct bpf_fdesc_b
 	return pool->cnt++;
 }
 
+/* A site the program did not ask for, at which the kernel may cancel it. */
+static bool fdesc_site_implicit(u8 site)
+{
+	return site == BPF_FDESC_SITE_MAY_GOTO || site == BPF_FDESC_SITE_ARENA ||
+	       site == BPF_FDESC_SITE_GLOBAL;
+}
+
+/* Is the site a call to a global subprog, where the frame keeps only R6-R9? */
+static bool fdesc_site_is_call(u8 site)
+{
+	return site == BPF_FDESC_SITE_CALL || site == BPF_FDESC_SITE_GLOBAL;
+}
+
+/*
+ * Is @insn, after all rewrites, what the unwinder sees a site of kind @site
+ * through: the probed access of an arena site, a call for every other kind.
+ */
+static bool fdesc_site_insn_ok(const struct bpf_insn *insn, u8 site)
+{
+	u8 class = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
+
+	if (site != BPF_FDESC_SITE_ARENA)
+		return insn->code == (BPF_JMP | BPF_CALL);
+	if (class == BPF_LDX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
+	if (class == BPF_STX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC;
+	return class == BPF_ST && mode == BPF_PROBE_MEM32;
+}
+
 /*
  * After all instruction rewrites, turn the descriptors attached to instructions
  * into the per subprogram tables the unwinder uses, keyed by instruction index
@@ -660,8 +690,8 @@ int bpf_fdesc_build_tables(struct bpf_verifier_env *env)
 		for (i = start; i < end; i++) {
 			if (!aux[i].fdesc || aux[i].fdesc->fallback || aux[i].fdesc->conflict)
 				continue;
-			if (verifier_bug_if(env->prog->insnsi[i].code != (BPF_JMP | BPF_CALL), env,
-					    "frame descriptor at insn %d is not at a call", i))
+			if (verifier_bug_if(!fdesc_site_insn_ok(&env->prog->insnsi[i], aux[i].fdesc->site),
+					    env, "frame descriptor at insn %d is not at a site", i))
 				return -EFAULT;
 			ret = fdesc_pool_add(env, aux[i].fdesc);
 			if (ret < 0)
@@ -828,18 +858,6 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
 		if (res->kind == BPF_FDESC_RES_LOCK_IRQ)
 			flags = NULL;
 	}
-}
-
-/* Is the site one the kernel chose, which falls back when it cannot be described? */
-static bool fdesc_site_implicit(u8 site)
-{
-	return site == BPF_FDESC_SITE_MAY_GOTO || site == BPF_FDESC_SITE_GLOBAL;
-}
-
-/* Is the site a call to a global subprog, where the frame keeps only R6-R9? */
-static bool fdesc_site_is_call(u8 site)
-{
-	return site == BPF_FDESC_SITE_CALL || site == BPF_FDESC_SITE_GLOBAL;
 }
 
 /* Append a lock, IRQ flag or section entry of frame @f on this path. */
@@ -1098,8 +1116,10 @@ static int fdesc_place_fixed(struct bpf_verifier_env *env, struct fdesc_scratch 
 /*
  * Record the state at a site where the program may be unwound. @site says
  * which registers of the innermost frame the unwinder can see: at a
- * bpf_throw() call the entry stub saves R0-R9, while a frame waiting in a
- * call only keeps R6-R9 and its stack. Only live locations are considered,
+ * bpf_throw() call, a may_goto or an arena access the entry stub saves
+ * R0-R9, while a frame waiting in a call only keeps R6-R9 and its stack. At
+ * an arena access that is the state before the access takes effect, since
+ * the fault precedes any write of its result. Only live locations are considered,
  * which keeps the descriptors consistent with state pruning: two states the
  * verifier treats as equivalent agree on every live location.
  */

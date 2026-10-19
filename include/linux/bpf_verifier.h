@@ -1075,6 +1075,7 @@ enum bpf_fdesc_site {
 	BPF_FDESC_SITE_CALL,		/* calling a global subprog that may throw */
 	BPF_FDESC_SITE_GLOBAL,		/* calling a global subprog the kernel may cancel inside */
 	BPF_FDESC_SITE_MAY_GOTO,	/* a may_goto whose timeout cancels the program: R0-R9 saved */
+	BPF_FDESC_SITE_ARENA,		/* an arena access whose fault cancels the program: R0-R9 saved */
 };
 
 /* What a register or stack slot holds across the paths merged into a descriptor. */
