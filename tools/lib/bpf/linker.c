@@ -865,15 +865,48 @@ static const struct {
 	{ ".bss", ".rel.bss" },
 };
 
-static int group_base(const char *sec_name)
+/* Whether section sec defines a symbol called name */
+static bool sec_defines_sym(struct src_obj *obj, const struct src_sec *sec, const char *name)
+{
+	struct src_sec *symtab = &obj->secs[obj->symtab_sec_idx];
+	const Elf64_Sym *sym = symtab->data->d_buf;
+	size_t i, n = symtab->shdr->sh_size / sizeof(*sym);
+	const char *sym_name;
+
+	for (i = 1; i < n; i++) {
+		if (sym[i].st_shndx != sec->sec_idx || ELF64_ST_TYPE(sym[i].st_info) == STT_SECTION)
+			continue;
+		sym_name = elf_strptr(obj->elf, symtab->shdr->sh_link, sym[i].st_name);
+		if (sym_name && strcmp(sym_name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The section that a member of a COMDAT group joins: .text for code, which
+ * is all subprograms, and the base section of data that the compiler named
+ * after the symbol that it defines, e.g. .rodata.foo of an inline variable
+ * foo. Other data has an explicit name, e.g. SEC(".data.foo") of an inline
+ * variable bar, and is linked by name, as without a group. An explicit name
+ * that is the one the compiler would give, e.g. SEC(".data.foo") of foo,
+ * can't be told apart and joins the base section too. The loader places the
+ * members of an object that is not linked in the same way.
+ */
+static int group_base(struct src_obj *obj, const struct src_sec *sec)
 {
 	int i;
 
 	for (i = 0; i < sizeof(group_bases) / sizeof(group_bases[0]); i++) {
 		size_t len = strlen(group_bases[i].name);
 
-		if (strncmp(sec_name, group_bases[i].name, len) == 0 && sec_name[len] == '.')
+		if (strncmp(sec->sec_name, group_bases[i].name, len) != 0 ||
+		    sec->sec_name[len] != '.')
+			continue;
+		if ((sec->shdr->sh_flags & SHF_EXECINSTR) ||
+		    sec_defines_sym(obj, sec, sec->sec_name + len + 1))
 			return i;
+		return -1;
 	}
 	return -1;
 }
@@ -883,10 +916,8 @@ static int group_base(const char *sec_name)
  * as an inline function that was not inlined everywhere or an inline
  * variable. The first group with a signature is linked and the members of
  * every later one are dropped, their global symbols resolving to the
- * definitions of the first. A member .text.foo joins .text, the only section
- * libbpf links subprogram calls to, and .data.rel.ro.foo, .rodata.foo,
- * .data.foo and .bss.foo join theirs, as libbpf would otherwise map each to
- * an array of its own or, for .bss.foo, not at all; relocations follow.
+ * definitions of the first. A member joins the section that group_base()
+ * says, if any, and relocations follow.
  */
 static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
 {
@@ -947,7 +978,7 @@ static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
 				member->skipped = true;
 				member->comdat_dup = true;
 			} else if (member->shdr->sh_type != SHT_REL) {
-				int base = group_base(member->sec_name);
+				int base = group_base(obj, member);
 
 				if (base >= 0)
 					member->dst_name = group_bases[base].name;
@@ -959,13 +990,15 @@ static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
 	for (i = 1; i < obj->sec_cnt; i++) {
 		struct src_sec *sec = &obj->secs[i];
 		const struct src_sec *target;
+		int j;
 
 		if (sec->ephemeral || sec->skipped || sec->shdr->sh_type != SHT_REL ||
 		    sec->shdr->sh_info >= obj->sec_cnt)
 			continue;
 		target = &obj->secs[sec->shdr->sh_info];
-		if (target->dst_name)
-			sec->dst_name = group_bases[group_base(target->sec_name)].rel_name;
+		for (j = 0; j < sizeof(group_bases) / sizeof(group_bases[0]); j++)
+			if (target->dst_name == group_bases[j].name)
+				sec->dst_name = group_bases[j].rel_name;
 	}
 
 	return 0;
