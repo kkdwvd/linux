@@ -44,7 +44,7 @@ TEST_PROGS := test_bpftool_build.sh \
 	test_xdp_features.sh
 
 TEST_PROGS_EXTENDED := \
-	ima_setup.sh verify_sig_setup.sh
+	ima_setup.sh verify_sig_setup.sh run_bpf_net_driver.sh bench_bpf_net_driver.sh
 
 TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
 	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
@@ -53,6 +53,7 @@ TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
 # Compile but not part of 'make run_tests'
 TEST_GEN_PROGS_EXTENDED = \
 	bench \
+	bpf_net_driver_ctl \
 	flow_dissector_load \
 	test_cpp \
 	veristat \
@@ -478,6 +479,9 @@ RUNNER_EXTRA_FILES := $(OUTPUT)/urandom_read				\
 		      $(OUTPUT)/uprobe_multi				\
 		      $(TEST_KMOD_TARGETS)				\
 		      ima_setup.sh					\
+		      run_bpf_net_driver.sh				\
+		      bench_bpf_net_driver.sh				\
+		      $(OUTPUT)/bpf_net_driver_ctl			\
 		      $(VERIFY_SIG_SETUP)				\
 		      $(wildcard progs/btf_dump_test_case_*.c)		\
 		      $(wildcard progs/*.bpf.o)				\
@@ -607,6 +611,8 @@ $(OUTPUT)/xdp_features: xdp_features.c network_helpers.c xdp_features.h \
 CXXFLAGS += $(CFLAGS)
 CXXFLAGS := $(subst -D_GNU_SOURCE=,,$(CXXFLAGS))
 CXXFLAGS := $(subst -std=gnu11,-std=gnu++11,$(CXXFLAGS))
+$(OUTPUT)/bpf_net_driver_ctl: $(OUTPUT)/bpf_net_virtio_run.skel.h $(OUTPUT)/bpf_net_mlx5_run.skel.h
+
 $(OUTPUT)/test_cpp: test_cpp.cpp $(OUTPUT)/test_core_extern.skel.h $(BPFOBJ)
 	$(call msg,CXX,,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(filter %.a %.o %.cpp,$^) $(LDLIBS) -o $@

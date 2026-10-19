@@ -31,6 +31,7 @@ test_cpp
 /host-tools
 /tools
 /bench
+/bpf_net_driver_ctl
 /veristat
 /sign-file
 /uprobe_multi
