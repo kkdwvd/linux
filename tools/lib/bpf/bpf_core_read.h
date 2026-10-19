@@ -330,7 +330,7 @@ enum bpf_enum_value_kind {
 #define bpf_core_read_user_str(dst, sz, src)				    \
 	bpf_probe_read_user_str(dst, sz, (const void *)__builtin_preserve_access_index(src))
 
-extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
+extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __bpf_noexcept __ksym __weak;
 
 /*
  * Cast provided pointer *ptr* into a pointer to a specified *type* in such
