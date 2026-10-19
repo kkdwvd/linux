@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <sys/mman.h>
 #include <test_progs.h>
 #include "data_in_arena.skel.h"
 #include "data_in_arena_decl.skel.h"
@@ -167,6 +168,119 @@ out:
 	data_in_arena__destroy(skel);
 }
 
+#if defined(__aarch64__)
+#define ARENA_ADDR (1ull << 32)
+#else
+#define ARENA_ADDR (1ull << 44)
+#endif
+#define ARENA_PAGES 4
+
+/*
+ * With map_extra the address of an arena that libbpf doesn't create is known. libbpf doesn't
+ * write to such arena, so the data goes there from bpf_map__initial_value().
+ */
+static void test_reused_arena_at(void)
+{
+	LIBBPF_OPTS(bpf_map_create_opts, opts, .map_flags = BPF_F_MMAPABLE,
+		    .map_extra = ARENA_ADDR);
+	size_t page_sz = getpagesize(), arena_sz = ARENA_PAGES * page_sz, sz, off;
+	struct data_in_arena__data *data;
+	void *image, *base = MAP_FAILED;
+	struct data_in_arena *skel;
+	struct bpf_map *arena;
+	int fd = -1;
+
+	skel = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel, "open"))
+		return;
+	arena = bpf_object__find_map_by_name(skel->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	fd = bpf_map_create(BPF_MAP_TYPE_ARENA, "arena", 0, 0, ARENA_PAGES, &opts);
+	if (!ASSERT_GE(fd, 0, "map_create"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(arena, fd), "reuse_fd"))
+		goto out;
+	if (!ASSERT_OK(data_in_arena__load(skel), "load"))
+		goto out;
+
+	image = bpf_map__initial_value(arena, &sz);
+	if (!ASSERT_OK_PTR(image, "initial_value"))
+		goto out;
+	/*
+	 * skel->data points into the image, px is the address of x in arena,
+	 * and the image goes where that puts x.
+	 */
+	off = (unsigned long)skel->data->px - ARENA_ADDR - ((void *)&skel->data->x - image);
+	if (!ASSERT_LT(off, arena_sz, "data offset") ||
+	    !ASSERT_LE(sz, arena_sz - off, "data size") ||
+	    !ASSERT_EQ(off % page_sz, 0, "data alignment"))
+		goto out;
+
+	base = mmap((void *)ARENA_ADDR, arena_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (!ASSERT_EQ(base, (void *)ARENA_ADDR, "mmap"))
+		goto out;
+	memcpy(base + off, image, sz);
+
+	ASSERT_EQ(run_prog(skel->progs.use_ptrs), 0, "use_ptrs");
+	data = base + off + ((void *)skel->data - image);
+	ASSERT_EQ(data->x, 43, "x");
+	ASSERT_EQ(data->px, &data->x, "px");
+	ASSERT_EQ(*data->px, 43, "*px");
+	ASSERT_STREQ(data->str, "hello", "str");
+out:
+	if (base != MAP_FAILED)
+		munmap(base, arena_sz);
+	if (fd >= 0)
+		close(fd);
+	data_in_arena__destroy(skel);
+}
+
+/*
+ * A pinned arena with map_extra is at that address, whether libbpf creates it or reuses it
+ * from the pin.
+ */
+static void test_pinned_arena_at(void)
+{
+	const char *pin_path = "/sys/fs/bpf/data_in_arena_at";
+	struct data_in_arena *skel1, *skel2 = NULL;
+	struct bpf_map *arena;
+
+	unlink(pin_path);
+	skel1 = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel1, "open"))
+		return;
+	arena = bpf_object__find_map_by_name(skel1->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	ASSERT_OK(bpf_map__set_map_extra(arena, ARENA_ADDR), "map_extra");
+	ASSERT_OK(bpf_map__set_pin_path(arena, pin_path), "pin_path");
+	if (!ASSERT_OK(data_in_arena__load(skel1), "load"))
+		goto out;
+	ASSERT_EQ(run_prog(skel1->progs.use_ptrs), 0, "use_ptrs");
+	ASSERT_EQ((unsigned long)skel1->data->px >> 32, ARENA_ADDR >> 32, "px");
+	ASSERT_EQ(*skel1->data->px, 43, "*px");
+
+	skel2 = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel2, "open"))
+		goto out;
+	arena = bpf_object__find_map_by_name(skel2->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	ASSERT_OK(bpf_map__set_map_extra(arena, ARENA_ADDR), "map_extra");
+	ASSERT_OK(bpf_map__set_pin_path(arena, pin_path), "pin_path");
+	if (!ASSERT_OK(data_in_arena__load(skel2), "load"))
+		goto out;
+	ASSERT_TRUE(bpf_map__is_pinned(arena), "pinned");
+	/* the image of the second object points to the data of the first one, x is 43 there */
+	ASSERT_EQ(skel2->data->px, skel1->data->px, "px");
+	ASSERT_EQ(run_prog(skel2->progs.use_ptrs), 2, "use_ptrs");
+out:
+	data_in_arena__destroy(skel2);
+	data_in_arena__destroy(skel1);
+	unlink(pin_path);
+}
+
 /* The object is there if rustc and clang can build it, see Makefile.buildvars */
 static void test_rust(void)
 {
@@ -211,6 +325,10 @@ void test_data_in_arena(void)
 		test_not_my_arena(true);
 	if (test__start_subtest("reused_arena"))
 		test_not_my_arena(false);
+	if (test__start_subtest("reused_arena_at"))
+		test_reused_arena_at();
+	if (test__start_subtest("pinned_arena_at"))
+		test_pinned_arena_at();
 	if (test__start_subtest("rust"))
 		test_rust();
 }
