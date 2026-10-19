@@ -558,8 +558,8 @@ struct bpf_struct_ops {
 #define STRUCT_OPS_SEC ".struct_ops"
 #define STRUCT_OPS_LINK_SEC ".struct_ops.link"
 /*
- * __arena variables. Pointers to data in them become addresses of arena,
- * see bpf_object__relocate_data_ptrs().
+ * __arena variables. Pointers to them, in them or in other data, become
+ * addresses of arena, see bpf_object__relocate_data_ptrs().
  */
 #define ARENA_SEC ".addr_space.1"
 /*
@@ -835,8 +835,9 @@ struct bpf_object {
 	bool data_in_arena;
 	bool arena_mapped;
 	/*
-	 * Pointers to data in __arena variables, and in the data of internal
-	 * maps when data is in arena
+	 * Pointers to data in __arena variables, in the data of internal maps
+	 * when data is in arena, and pointers to __arena variables in the
+	 * data of other internal maps
 	 */
 	struct data_ptr {
 		int sec_idx;
@@ -4618,13 +4619,12 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			/*
 			 * Only do relo for section with exec instructions,
 			 * struct_ops, maps, read-only data that might have
-			 * pointers to functions, and data in arena that might
-			 * have pointers to data.
+			 * pointers to functions, and data that might have
+			 * pointers to arena.
 			 */
 			if (!section_have_execinstr(obj, targ_sec_idx) &&
-			    !(obj->data_in_arena &&
-			      (!strcmp(name, ".rel" DATA_SEC) ||
-			       str_has_pfx(name, ".rel" DATA_SEC "."))) &&
+			    strcmp(name, ".rel" DATA_SEC) &&
+			    !str_has_pfx(name, ".rel" DATA_SEC ".") &&
 			    strcmp(name, ".rel" ARENA_SEC) &&
 			    strcmp(name, ".rel" RODATA_SEC) &&
 			    !str_has_pfx(name, ".rel" RODATA_SEC ".") &&
@@ -8735,10 +8735,17 @@ static int bpf_object__collect_map_relos(struct bpf_object *obj,
 	return 0;
 }
 
+/* Whether the symbol is an __arena variable */
+static bool sym_is_arena(const struct bpf_object *obj, const Elf64_Sym *sym)
+{
+	return sym->st_shndx < obj->efile.sec_cnt &&
+	       obj->efile.secs[sym->st_shndx].sec_type == SEC_ARENA;
+}
+
 /*
- * A pointer to data that is stored in data. When data is in arena
- * the program dereferences what it loads from data, so the pointer has
- * to be the address of the target in arena.
+ * A pointer to data that is stored in data, where either the data or what
+ * it points to is in arena. The program dereferences what it loads from
+ * the data, so the pointer has to be the address of the target in arena.
  */
 static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo_sec_name,
 					int relo_idx, size_t sec_idx, const Elf64_Rel *rel,
@@ -8784,11 +8791,17 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 	return 0;
 }
 
-/* Collect pointers in data that is in arena: __arena variables, or a data section */
+/*
+ * Collect pointers in a data section that is in arena: __arena variables, or
+ * any data section when data is in arena. Other data sections have only
+ * their pointers to __arena variables relocated. The rest of their
+ * relocations were never applied.
+ */
 static int bpf_object__collect_data_relos(struct bpf_object *obj,
 					  Elf64_Shdr *shdr, Elf_Data *data)
 {
 	int i, err, nrels = shdr->sh_size / shdr->sh_entsize;
+	bool in_arena = obj->data_in_arena || obj->efile.secs[shdr->sh_info].sec_type == SEC_ARENA;
 	const char *relo_sec_name;
 	Elf64_Sym *sym;
 	Elf64_Rel *rel;
@@ -8800,6 +8813,11 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
 		if (!sym) {
 			pr_warn("sec '%s': failed to get relo #%d\n", relo_sec_name, i);
 			return -LIBBPF_ERRNO__FORMAT;
+		}
+		if (!in_arena && !sym_is_arena(obj, sym)) {
+			pr_debug("sec '%s': relo #%d: not a pointer to arena, skipping...\n",
+				 relo_sec_name, i);
+			continue;
 		}
 		err = bpf_object__collect_data_ptr(obj, relo_sec_name, i, shdr->sh_info, rel, sym);
 		if (err)
@@ -8814,7 +8832,7 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
  * a static function in the section is stored in place. Relocations in data
  * sections were ignored before pointers to functions were supported. Those
  * that are something else, e.g. pointers to data, still are, unless data
- * is in arena.
+ * is in arena or they point to arena.
  */
 static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 					    Elf64_Shdr *shdr, Elf_Data *data)
@@ -8852,7 +8870,7 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		    !sym_is_subprog(obj, sym)) {
 			int err;
 
-			if (obj->data_in_arena) {
+			if (obj->data_in_arena || sym_is_arena(obj, sym)) {
 				err = bpf_object__collect_data_ptr(obj, relo_sec_name, i,
 								   sec_idx, rel, sym);
 				if (err)
