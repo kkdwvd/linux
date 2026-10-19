@@ -973,6 +973,10 @@ struct bpf_subprog_info {
 	bool keep_fastcall_stack: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
+	/* reachable under a callback: a kernel frame the unwinder cannot cross sits above it */
+	bool below_cb: 1;
+	/* a global subprog whose cancellation could not unwind through every caller */
+	bool cancel_fallback: 1;
 	u8 arg_slot_cnt:4;
 
 	enum priv_stack_mode priv_stack_mode;
@@ -1069,6 +1073,8 @@ enum bpf_fdesc_site {
 	BPF_FDESC_SITE_CALLER = 1,	/* waiting in a call: R6-R9 and the stack are available */
 	BPF_FDESC_SITE_THROW,		/* calling bpf_throw(): the entry stub saves R0-R9 */
 	BPF_FDESC_SITE_CALL,		/* calling a global subprog that may throw */
+	BPF_FDESC_SITE_GLOBAL,		/* calling a global subprog the kernel may cancel inside */
+	BPF_FDESC_SITE_MAY_GOTO,	/* a may_goto whose timeout cancels the program: R0-R9 saved */
 };
 
 /* What a register or stack slot holds across the paths merged into a descriptor. */
@@ -1080,10 +1086,14 @@ struct bpf_fdesc_loc {
 
 /* Frame descriptor under construction for one (subprog, insn), see fdesc.c. */
 struct bpf_fdesc_build {
+	u32 pc;		/* the instruction the frame is at */
 	u32 visits;
 	u16 nr_slots;
 	u8 site;	/* enum bpf_fdesc_site */
-	bool conflict;
+	bool conflict;	/* a location cannot be described on every path */
+	bool fallback;	/* an implicit site that keeps its ordinary semantics */
+	u16 nr_callers;
+	struct bpf_fdesc_build **callers; /* descriptors of the frames a site was reached under */
 	struct bpf_fdesc_loc regs[BPF_REG_10];
 	struct bpf_fdesc_loc slots[];
 };
@@ -1129,6 +1139,8 @@ struct bpf_verifier_env {
 	u32 fdesc_conflicts;
 	u32 fdesc_sites;			/* table entries */
 	u32 fdesc_bytes;			/* tables, descriptors and resource classes */
+	u32 fdesc_fallbacks;			/* implicit sites that could not be described */
+	u32 fdesc_masked;			/* implicit sites in a region the unwinder cannot leave */
 	void *fdesc_scratch;
 	bool cancellable;			/* the kernel may cancel this program at implicit sites */
 	int exception_callback_subprog;
@@ -2052,6 +2064,8 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in fdesc.c */
 int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site);
+int bpf_fdesc_resolve(struct bpf_verifier_env *env);
+void bpf_fdesc_move_site(struct bpf_verifier_env *env, u32 from, u32 to);
 int bpf_fdesc_build_tables(struct bpf_verifier_env *env);
 void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,
 			     u32 len);

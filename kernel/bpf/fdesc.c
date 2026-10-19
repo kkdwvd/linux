@@ -69,6 +69,7 @@ static struct bpf_fdesc_build *fdesc_build_get(struct bpf_verifier_env *env, u32
 		b = kvzalloc(struct_size(b, slots, nr_slots), GFP_KERNEL_ACCOUNT);
 		if (!b)
 			return NULL;
+		b->pc = pc;
 		b->nr_slots = nr_slots;
 		env->insn_aux_data[pc].fdesc = b;
 	} else if (b->nr_slots < nr_slots) {
@@ -84,6 +85,8 @@ static struct bpf_fdesc_build *fdesc_build_get(struct bpf_verifier_env *env, u32
 
 void bpf_fdesc_build_free(struct bpf_insn_aux_data *aux)
 {
+	if (aux->fdesc)
+		kvfree(aux->fdesc->callers);
 	kvfree(aux->fdesc);
 	aux->fdesc = NULL;
 }
@@ -97,6 +100,24 @@ static int fdesc_insn_subprog(struct bpf_verifier_env *env, u32 idx)
 		if (idx < env->subprog_info[s + 1].start)
 			return s;
 	return -1;
+}
+
+/* Remember that the site of @b was reached with @caller waiting in a call. */
+static int fdesc_add_caller(struct bpf_fdesc_build *b, struct bpf_fdesc_build *caller)
+{
+	struct bpf_fdesc_build **callers;
+	int i;
+
+	for (i = 0; i < b->nr_callers; i++)
+		if (b->callers[i] == caller)
+			return 0;
+	callers = kvrealloc(b->callers, array_size(b->nr_callers + 1, sizeof(*callers)),
+			    GFP_KERNEL_ACCOUNT);
+	if (!callers)
+		return -ENOMEM;
+	callers[b->nr_callers++] = caller;
+	b->callers = callers;
+	return 0;
 }
 
 void bpf_fdesc_env_free(struct bpf_verifier_env *env)
@@ -500,7 +521,7 @@ int bpf_fdesc_build_tables(struct bpf_verifier_env *env)
 		u32 cnt = 0;
 
 		for (i = start; i < end; i++)
-			cnt += !!aux[i].fdesc;
+			cnt += aux[i].fdesc && !aux[i].fdesc->fallback && !aux[i].fdesc->conflict;
 		if (!cnt)
 			continue;
 		tab = kvzalloc(struct_size(tab, pc, cnt), GFP_KERNEL_ACCOUNT);
@@ -509,10 +530,9 @@ int bpf_fdesc_build_tables(struct bpf_verifier_env *env)
 		env->subprog_info[s].fdesc_tab = tab;
 		env->fdesc_bytes += struct_size(tab, pc, cnt);
 		for (i = start; i < end; i++) {
-			if (!aux[i].fdesc)
+			if (!aux[i].fdesc || aux[i].fdesc->fallback || aux[i].fdesc->conflict)
 				continue;
-			if (verifier_bug_if(!bpf_pseudo_call(&env->prog->insnsi[i]) &&
-					    !bpf_pseudo_kfunc_call(&env->prog->insnsi[i]), env,
+			if (verifier_bug_if(env->prog->insnsi[i].code != (BPF_JMP | BPF_CALL), env,
 					    "frame descriptor at insn %d is not at a call", i))
 				return -EFAULT;
 			ret = fdesc_pool_add(env, aux[i].fdesc);
@@ -643,6 +663,18 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
 	}
 }
 
+/* Is the site one the kernel chose, which falls back when it cannot be described? */
+static bool fdesc_site_implicit(u8 site)
+{
+	return site == BPF_FDESC_SITE_MAY_GOTO || site == BPF_FDESC_SITE_GLOBAL;
+}
+
+/* Is the site a call to a global subprog, where the frame keeps only R6-R9? */
+static bool fdesc_site_is_call(u8 site)
+{
+	return site == BPF_FDESC_SITE_CALL || site == BPF_FDESC_SITE_GLOBAL;
+}
+
 /*
  * Record the state at a site where the program may be unwound. @site says
  * which registers of the innermost frame the unwinder can see: at a
@@ -651,16 +683,14 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
  * which keeps the descriptors consistent with state pruning: two states the
  * verifier treats as equivalent agree on every live location.
  */
-int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
+static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct fdesc_scratch *s = env->fdesc_scratch;
 	int f, i, k, nr, ret;
 
-	if (st->speculative)
-		return 0;
 	if (!s) {
-		s = kvzalloc(sizeof(*s), GFP_KERNEL_ACCOUNT);
+		s = kvzalloc_obj(*s, GFP_KERNEL_ACCOUNT);
 		if (!s)
 			return -ENOMEM;
 		env->fdesc_scratch = s;
@@ -677,10 +707,15 @@ int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 			return -ENOMEM;
 		memset(s->class[f], 0, BPF_REG_10 + nr_slots);
 		s->live_regs[f] = env->insn_aux_data[s->pcs[f]].live_regs_before;
-		if (f != st->curframe || site != BPF_FDESC_SITE_THROW)
+		if (f != st->curframe || fdesc_site_is_call(site))
 			s->live_regs[f] &= FDESC_REGS_CALLEE_SAVED;
 		if (!s->builds[f]->site)
 			s->builds[f]->site = f == st->curframe ? site : BPF_FDESC_SITE_CALLER;
+	}
+	for (f = 0; f < st->curframe; f++) {
+		ret = fdesc_add_caller(s->builds[st->curframe], s->builds[f]);
+		if (ret)
+			return ret;
 	}
 
 	/* Place every reference at one live location. */
@@ -771,4 +806,162 @@ int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 		b->visits++;
 	}
 	return 0;
+}
+
+/*
+ * Is the program in a region the unwinder cannot leave? Locks, IRQ flags,
+ * RCU and preemption sections are not described yet, and a callback runs
+ * below a kernel frame the unwinder would have to skip.
+ */
+static bool fdesc_site_masked(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int f;
+
+	if (st->active_locks || st->active_irq_id || st->active_rcu_locks ||
+	    st->active_preempt_locks)
+		return true;
+	for (f = 0; f <= st->curframe; f++) {
+		struct bpf_func_state *frame = st->frame[f];
+
+		if (frame->in_callback_fn || frame->in_async_callback_fn ||
+		    frame->in_exception_callback_fn)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Describe the state at a site where the program may be unwound. A site the
+ * program asked for, bpf_throw() or a call to a global subprog that may
+ * throw, must be describable or the program is rejected. An implicit site,
+ * which the kernel would use to cancel the program, falls back to its
+ * ordinary semantics instead.
+ */
+int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
+{
+	bool implicit = fdesc_site_implicit(site);
+	struct fdesc_scratch *s;
+	int ret;
+
+	if (env->cur_state->speculative)
+		return 0;
+	if (implicit && !env->cancellable)
+		return 0;
+	if (implicit && fdesc_site_masked(env)) {
+		env->fdesc_masked++;
+		return 0;
+	}
+	ret = fdesc_site_do(env, site);
+	if (!ret || ret == -ENOMEM || !implicit)
+		return ret;
+	s = env->fdesc_scratch;
+	s->builds[env->cur_state->curframe]->fallback = true;
+	env->fdesc_fallbacks++;
+	return 0;
+}
+
+/*
+ * After verification, decide which sites the unwinder may be entered from. A
+ * frame whose descriptor conflicts cannot be unwound through, which takes
+ * every site reached under it with it: an explicit site then rejects the
+ * program, an implicit site falls back. A program keeping an implicit site
+ * needs the exception boundary the throw path relies on.
+ *
+ * A global subprog is verified on its own, so its sites know nothing of its
+ * callers: each call to it is a site in the caller, and the frames of a
+ * global subprog, or of anything it calls, can only be unwound when every
+ * call to it can be. A site below a callback can never be: a kernel frame
+ * sits between it and the exception boundary.
+ */
+/* Can the unwinder enter at the site of @b and get through every frame above it? */
+static bool fdesc_build_valid(struct bpf_verifier_env *env, const struct bpf_fdesc_build *b)
+{
+	const struct bpf_subprog_info *subprog = env->subprog_info;
+	int c;
+
+	if (b->conflict || subprog[fdesc_insn_subprog(env, b->pc)].cancel_fallback)
+		return false;
+	for (c = 0; c < b->nr_callers; c++) {
+		const struct bpf_fdesc_build *caller = b->callers[c];
+
+		if (caller->conflict || subprog[fdesc_insn_subprog(env, caller->pc)].cancel_fallback)
+			return false;
+	}
+	return true;
+}
+
+int bpf_fdesc_resolve(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_subprog_info *subprog = env->subprog_info;
+	bool changed;
+	int i;
+
+	for (i = 0; i < env->prog->len; i++) {
+		struct bpf_fdesc_build *b = aux[i].fdesc;
+
+		if (!b || !fdesc_site_implicit(b->site) || b->fallback ||
+		    !subprog[fdesc_insn_subprog(env, i)].below_cb)
+			continue;
+		b->fallback = true;
+		env->fdesc_masked++;
+	}
+	do {
+		changed = false;
+		for (i = 0; i < env->prog->len; i++) {
+			struct bpf_fdesc_build *b = aux[i].fdesc;
+			const struct bpf_insn *insn = &env->prog->insnsi[i];
+			int callee;
+
+			if (!b || !fdesc_site_is_call(b->site))
+				continue;
+			callee = bpf_find_subprog(env, i + insn->imm + 1);
+			if (subprog[callee].cancel_fallback || (!b->fallback && fdesc_build_valid(env, b)))
+				continue;
+			subprog[callee].cancel_fallback = true;
+			changed = true;
+		}
+	} while (changed);
+	for (i = 0; i < env->prog->len; i++) {
+		struct bpf_fdesc_build *b = aux[i].fdesc;
+		bool valid;
+
+		if (!b || b->site == BPF_FDESC_SITE_CALLER || b->fallback)
+			continue;
+		valid = fdesc_build_valid(env, b);
+		if (valid) {
+			if (fdesc_site_implicit(b->site))
+				env->seen_exception = true;
+			continue;
+		}
+		if (fdesc_site_implicit(b->site)) {
+			b->fallback = true;
+			env->fdesc_fallbacks++;
+			continue;
+		}
+		verbose(env, "frame_desc: a caller of the throw at insn %d cannot be described\n", i);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * An instruction rewrite moved a site's descriptor to insn @from together
+ * with the rest of its aux data; the slow path call the unwinder sees the
+ * site through is insn @to. A site that fell back keeps no descriptor.
+ */
+void bpf_fdesc_move_site(struct bpf_verifier_env *env, u32 from, u32 to)
+{
+	struct bpf_fdesc_build *b = env->insn_aux_data[from].fdesc;
+
+	if (!b)
+		return;
+	env->insn_aux_data[from].fdesc = NULL;
+	if (b->fallback || b->conflict) {
+		kvfree(b->callers);
+		kvfree(b);
+		return;
+	}
+	env->insn_aux_data[to].fdesc = b;
 }

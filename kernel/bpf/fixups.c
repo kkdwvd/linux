@@ -2218,6 +2218,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			if (!new_prog)
 				return -ENOMEM;
 
+			/* The unwinder sees a cancelled may_goto through its slow path call. */
+			bpf_fdesc_move_site(env, i + delta + cnt - 1, i + delta + cnt - 2);
 			delta += cnt - 1;
 			env->prog = prog = new_prog;
 			insn = new_prog->insnsi + i + delta;
@@ -2236,6 +2238,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			if (!new_prog)
 				return -ENOMEM;
 
+			/* Without a timed slow path there is nothing to cancel from. */
+			bpf_fdesc_build_free(&env->insn_aux_data[i + delta + cnt - 1]);
 			delta += cnt - 1;
 			env->prog = prog = new_prog;
 			insn = new_prog->insnsi + i + delta;

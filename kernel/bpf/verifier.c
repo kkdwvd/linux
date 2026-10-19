@@ -5733,6 +5733,9 @@ static int check_max_stack_depth_subprog(struct bpf_verifier_env *env, int idx,
 		subprog[idx].priv_stack_mode = NO_PRIV_STACK;
 process_func:
 	dinfo[idx].callx_insn = -1;
+	/* The kernel never cancels a program below a callback: see bpf_fdesc_resolve(). */
+	for (tmp = idx; tmp >= 0 && !subprog[idx].below_cb; tmp = dinfo[tmp].caller)
+		subprog[idx].below_cb = subprog[tmp].is_cb;
 	if (subprog[idx].has_ld_abs) {
 		for (tmp = idx; tmp >= 0; tmp = dinfo[tmp].caller) {
 			if (subprog[tmp].is_cb) {
@@ -11534,6 +11537,12 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (err)
 				return err;
 			return process_bpf_exit_full(env, NULL, true);
+		}
+		/* A cancellation inside the callee unwinds through this frame. */
+		if (env->cancellable) {
+			err = bpf_fdesc_site(env, BPF_FDESC_SITE_GLOBAL);
+			if (err)
+				return err;
 		}
 
 		/* continue with next insn after call */
@@ -18732,6 +18741,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 
 		prev_st = find_prev_entry(env, cur_st->parent, idx);
 
+		/* A timed out may_goto may cancel the program instead of branching. */
+		err = bpf_fdesc_site(env, BPF_FDESC_SITE_MAY_GOTO);
+		if (err)
+			return err;
+
 		/* branch out 'fallthrough' insn as a new state to explore */
 		queued_st = push_stack(env, idx + 1, idx, false);
 		if (IS_ERR(queued_st))
@@ -21945,10 +21959,10 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->max_states_per_insn, env->total_states,
 		env->peak_states, env->longest_mark_read_walk);
 	if (env->log.level & BPF_LOG_STATS)
-		verbose(env, "frame descriptors: sites %u visits %u conflicts %u classes %u bytes %u\n",
+		verbose(env, "frame descriptors: sites %u visits %u conflicts %u classes %u bytes %u fallbacks %u masked %u\n",
 			env->fdesc_sites, env->fdesc_visits, env->fdesc_conflicts,
 			env->fdesc_pool ? env->fdesc_pool->res_cnt : env->fdesc_res_cnt,
-			env->fdesc_bytes);
+			env->fdesc_bytes, env->fdesc_fallbacks, env->fdesc_masked);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
@@ -23912,6 +23926,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
 	ret = do_check_main(env);
 	ret = ret ?: do_check_subprogs(env);
+	/* Global subprogs have sites of their own: resolve once every frame is described. */
+	if (ret == 0)
+		ret = bpf_fdesc_resolve(env);
 
 	/* reject recursion through the callx edges found by the main pass */
 	if (ret == 0 && env->callx_edges)
