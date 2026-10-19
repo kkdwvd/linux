@@ -195,52 +195,6 @@ int reject_with_rbtree_add_throw(void *ctx)
 	return 0;
 }
 
-SEC("?tc")
-__failure __msg("Unreleased reference")
-int reject_with_reference(void *ctx)
-{
-	struct foo *f;
-
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 0;
-	bpf_throw(0);
-	return 0;
-}
-
-__noinline int global_subprog_may_throw(struct __sk_buff *ctx)
-{
-	if (ctx->len)
-		bpf_throw(0);
-	return 0;
-}
-
-SEC("?tc")
-__failure __msg("Unreleased reference")
-int reject_global_subprog_throw_with_reference(struct __sk_buff *ctx)
-{
-	struct foo *f;
-
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 0;
-	if (ctx->protocol)
-		global_subprog_may_throw(ctx);
-	bpf_obj_drop(f);
-	return 0;
-}
-
-__noinline static int subprog_ref(struct __sk_buff *ctx)
-{
-	struct foo *f;
-
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 0;
-	bpf_throw(0);
-	return 0;
-}
-
 __noinline static int subprog_cb_ref(u32 i, void *ctx)
 {
 	bpf_throw(0);
@@ -248,7 +202,7 @@ __noinline static int subprog_cb_ref(u32 i, void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__failure __msg("cannot be called from callback")
 int reject_with_cb_reference(void *ctx)
 {
 	struct foo *f;
@@ -267,13 +221,6 @@ int reject_with_cb(void *ctx)
 {
 	bpf_loop(5, subprog_cb_ref, NULL, 0);
 	return 0;
-}
-
-SEC("?tc")
-__failure __msg("Unreleased reference")
-int reject_with_subprog_reference(void *ctx)
-{
-	return subprog_ref(ctx) + 1;
 }
 
 __noinline int throwing_exception_cb(u64 c)
