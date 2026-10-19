@@ -42,6 +42,7 @@ enum {
 
 #define FDESC_REGS_CALLEE_SAVED	(BIT(BPF_REG_6) | BIT(BPF_REG_7) | BIT(BPF_REG_8) | BIT(BPF_REG_9))
 #define FDESC_FRAME_LOCS	(BPF_REG_10 + MAX_BPF_STACK_SLOTS)
+#define FDESC_MAX_FIXED		32	/* locks, IRQ flags and sections a frame may hold */
 
 /* A candidate location of one reference on the current path. */
 struct fdesc_cand {
@@ -59,6 +60,10 @@ struct fdesc_scratch {
 	struct bpf_fdesc_build *builds[MAX_CALL_FRAMES];
 	u32 pcs[MAX_CALL_FRAMES];
 	u32 live_regs[MAX_CALL_FRAMES];
+	struct bpf_fdesc_ent fixed[MAX_CALL_FRAMES][FDESC_MAX_FIXED];
+	u16 nr_fixed[MAX_CALL_FRAMES];
+	u16 obj_frames;		/* frames that release an object on this path */
+	u16 sleep_frames;	/* frames that release an object whose destructor sleeps */
 };
 
 static struct bpf_fdesc_build *fdesc_build_get(struct bpf_verifier_env *env, u32 pc, u32 nr_slots)
@@ -83,11 +88,18 @@ static struct bpf_fdesc_build *fdesc_build_get(struct bpf_verifier_env *env, u32
 	return b;
 }
 
+static void fdesc_build_destroy(struct bpf_fdesc_build *b)
+{
+	if (!b)
+		return;
+	kvfree(b->callers);
+	kvfree(b->fixed);
+	kvfree(b);
+}
+
 void bpf_fdesc_build_free(struct bpf_insn_aux_data *aux)
 {
-	if (aux->fdesc)
-		kvfree(aux->fdesc->callers);
-	kvfree(aux->fdesc);
+	fdesc_build_destroy(aux->fdesc);
 	aux->fdesc = NULL;
 }
 
@@ -160,13 +172,14 @@ static int fdesc_res_registry(struct bpf_verifier_env *env, struct btf *btf, u32
 	const struct btf_id_dtor_kfunc *dtor = btf_find_dtor(btf, btf_id);
 	const char *name = btf_name_by_offset(btf, btf_type_by_id(btf, btf_id)->name_off);
 	const struct btf_type *t;
-	u32 i;
+	u32 i, *flags;
 
 	for (i = 0; i < env->fdesc_res_cnt; i++) {
 		const struct bpf_fdesc_res *r = &env->fdesc_res[i];
 
 		if (r->kind == res->kind && r->btf == btf && r->btf_id == btf_id) {
 			res->dtor = r->dtor;
+			res->sleeps = r->sleeps;
 			return 0;
 		}
 	}
@@ -174,11 +187,13 @@ static int fdesc_res_registry(struct bpf_verifier_env *env, struct btf *btf, u32
 		verbose(env, "frame_desc: no cleanup destructor registered for %s %s\n", what, name);
 		return -EOPNOTSUPP;
 	}
-	if (!btf_kfunc_flags(btf, dtor->release_btf_id, env->prog)) {
+	flags = btf_kfunc_flags(btf, dtor->release_btf_id, env->prog);
+	if (!flags) {
 		verbose(env, "frame_desc: release kfunc of %s %s is not callable by this program\n",
 			what, name);
 		return -EOPNOTSUPP;
 	}
+	res->sleeps = *flags & KF_SLEEPABLE;
 	t = btf_type_by_id(btf, dtor->kfunc_btf_id);
 	res->dtor = t ? (void *)kallsyms_lookup_name(btf_name_by_offset(btf, t->name_off)) : NULL;
 	if (!res->dtor) {
@@ -318,6 +333,107 @@ static int fdesc_slot_ref(struct bpf_verifier_env *env, const struct bpf_stack_s
 	}
 }
 
+static bool fdesc_res_is_lock(const struct bpf_fdesc_res *res)
+{
+	return res->kind == BPF_FDESC_SPIN_LOCK || res->kind == BPF_FDESC_RES_LOCK ||
+	       res->kind == BPF_FDESC_RES_LOCK_IRQ;
+}
+
+static u8 fdesc_lock_kind(enum ref_state_type type)
+{
+	switch (type) {
+	case REF_TYPE_LOCK:
+		return BPF_FDESC_SPIN_LOCK;
+	case REF_TYPE_RES_LOCK:
+		return BPF_FDESC_RES_LOCK;
+	default:
+		return BPF_FDESC_RES_LOCK_IRQ;
+	}
+}
+
+/* Offset of the lock of kind @kind in the object @rec describes. */
+static int fdesc_lock_off(const struct btf_record *rec, u8 kind)
+{
+	if (kind == BPF_FDESC_SPIN_LOCK)
+		return btf_record_has_field(rec, BPF_SPIN_LOCK) ? rec->spin_lock_off : -ENOENT;
+	return btf_record_has_field(rec, BPF_RES_SPIN_LOCK) ? rec->res_spin_lock_off : -ENOENT;
+}
+
+/*
+ * Does @reg point into the object whose lock @ref holds? Any constant offset
+ * will do: the lock is found from the pointer value by a fixed delta.
+ */
+static bool fdesc_reg_is_lock(const struct bpf_reg_state *reg,
+			      const struct bpf_reference_state *ref)
+{
+	if (reg->type == NOT_INIT || reg->type == SCALAR_VALUE || reg->id != ref->id ||
+	    !tnum_is_const(reg->var_off))
+		return false;
+	if (reg->type == PTR_TO_MAP_VALUE)
+		return reg->map_ptr == ref->ptr;
+	return base_type(reg->type) == PTR_TO_BTF_ID && (type_flag(reg->type) & MEM_ALLOC) &&
+	       reg->btf == ref->ptr;
+}
+
+/* The class of a lock of kind @kind reached from the pointer in @reg. */
+static int fdesc_res_of_lock(struct bpf_verifier_env *env, const struct bpf_reg_state *reg, u8 kind)
+{
+	const struct btf_record *rec;
+	struct bpf_fdesc_res res;
+	s64 delta;
+	int off;
+
+	if (reg->type == PTR_TO_MAP_VALUE) {
+		rec = reg->map_ptr->record;
+	} else {
+		struct btf_struct_meta *meta = btf_find_struct_meta(reg->btf, reg->btf_id);
+
+		rec = meta ? meta->record : NULL;
+	}
+	off = fdesc_lock_off(rec, kind);
+	if (off < 0)
+		return off;
+	delta = off - (s64)reg->var_off.value;
+	if (delta != (s16)delta)
+		return -ERANGE;
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	res.delta = delta;
+	return fdesc_res_intern(env, &res);
+}
+
+/*
+ * A lock in the value of a single element array map, that is in a global
+ * variable, has a fixed address: no location of the program needs to point at
+ * it. The verifier tracks such a lock without an id; a lock without an id in
+ * any other map cannot be told from the locks of the other elements.
+ */
+static int fdesc_res_of_global_lock(struct bpf_verifier_env *env,
+				    const struct bpf_reference_state *ref, u8 kind)
+{
+	struct bpf_map *map = NULL;
+	struct bpf_fdesc_res res;
+	u64 addr;
+	int i, off;
+
+	for (i = 0; i < env->used_map_cnt; i++)
+		if (env->used_maps[i] == ref->ptr)
+			map = env->used_maps[i];
+	if (!map || map->map_type != BPF_MAP_TYPE_ARRAY || map->max_entries != 1 ||
+	    !map->ops->map_direct_value_addr) {
+		verbose(env, "frame_desc: cannot tell which element holds the lock acquired at insn %d\n",
+			ref->insn_idx);
+		return -EINVAL;
+	}
+	off = fdesc_lock_off(map->record, kind);
+	if (off < 0 || map->ops->map_direct_value_addr(map, &addr, off))
+		return -EINVAL;
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	res.addr = (void *)(long)(addr + off);
+	return fdesc_res_intern(env, &res);
+}
+
 static void fdesc_verbose_cand(struct bpf_verifier_env *env, const struct fdesc_cand *c)
 {
 	if (c->is_slot)
@@ -430,16 +546,24 @@ static int fdesc_merge(struct bpf_fdesc_loc *loc, int class, u16 res)
 	}
 }
 
+/* Release order: latest acquired lock or IRQ flag first, sections, then objects. */
 static int fdesc_ent_cmp(const void *a, const void *b)
 {
 	const struct bpf_fdesc_ent *x = a, *y = b;
 
+	if (x->order != y->order)
+		return y->order - x->order;
 	if (x->loc != y->loc)
 		return x->loc - y->loc;
-	return x->off - y->off;
+	if (x->off != y->off)
+		return x->off - y->off;
+	return x->res - y->res;
 }
 
-/* Lay out the entries of one descriptor: every listed location of the frame. */
+/*
+ * Lay out the entries of one descriptor: every listed location of the frame
+ * and the locks, IRQ flags and sections it holds.
+ */
 static u32 fdesc_build_body(const struct bpf_fdesc_build *b, struct bpf_fdesc *d)
 {
 	u32 n = 0, i;
@@ -460,12 +584,16 @@ static u32 fdesc_build_body(const struct bpf_fdesc_build *b, struct bpf_fdesc *d
 		ent->off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
 		ent->flags = loc->nullable ? BPF_FDESC_F_NULLABLE : 0;
 		ent->res = loc->res;
-		ent->order = 0;
+		ent->order = -2;
 	}
 	if (d) {
+		for (i = 0; i < b->nr_fixed; i++)
+			d->ent[n++] = b->fixed[i];
 		d->nent = n;
 		d->size = struct_size(d, ent, n);
 		sort(d->ent, n, sizeof(d->ent[0]), fdesc_ent_cmp, NULL);
+	} else {
+		n += b->nr_fixed;
 	}
 	return n;
 }
@@ -584,7 +712,7 @@ void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog
  * Release the resource an entry describes, at run time. Not inlined so that
  * every release of an unwind can be observed by attaching to this function.
  */
-noinline void bpf_fdesc_release(const struct bpf_fdesc_res *res, void *loc)
+noinline void bpf_fdesc_release(const struct bpf_fdesc_res *res, void *loc, void *flags)
 {
 	void *obj;
 
@@ -594,6 +722,29 @@ noinline void bpf_fdesc_release(const struct bpf_fdesc_res *res, void *loc)
 		return;
 	case BPF_FDESC_ITER:
 		res->dtor(loc);
+		return;
+	case BPF_FDESC_IRQ_FLAG:
+		bpf_local_irq_restore(loc);
+		return;
+	case BPF_FDESC_IRQ_FLAG_LOCK:
+		/* Restored together with the lock that saved it. */
+		return;
+	case BPF_FDESC_RCU:
+		bpf_rcu_read_unlock();
+		return;
+	case BPF_FDESC_PREEMPT:
+		bpf_preempt_enable();
+		return;
+	case BPF_FDESC_SPIN_LOCK:
+	case BPF_FDESC_RES_LOCK:
+	case BPF_FDESC_RES_LOCK_IRQ:
+		obj = loc ? *(void **)loc + res->delta : res->addr;
+		if (res->kind == BPF_FDESC_SPIN_LOCK)
+			bpf_spin_unlock_proto.func((u64)(long)obj, 0, 0, 0, 0);
+		else if (res->kind == BPF_FDESC_RES_LOCK)
+			bpf_res_spin_unlock(obj);
+		else
+			bpf_res_spin_unlock_irqrestore(obj, flags);
 		return;
 	default:
 		break;
@@ -635,6 +786,7 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
 {
 	const struct bpf_fdesc_pool *pool = prog->aux->fdesc_pool;
 	const struct bpf_fdesc *d;
+	void *flags = NULL;
 	u32 i;
 
 	if (!prog->aux->fdesc_tab)
@@ -644,22 +796,37 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
 		return;
 	for (i = 0; i < d->nent; i++) {
 		const struct bpf_fdesc_ent *ent = &d->ent[i];
+		const struct bpf_fdesc_res *res = &pool->res[ent->res];
+		void *loc;
 		u64 reg;
+		int n;
 
-		if (ent->loc == BPF_FDESC_LOC_STACK) {
-			bpf_fdesc_release(&pool->res[ent->res], (void *)(long)(fp + ent->off));
+		if (ent->loc == BPF_FDESC_LOC_NONE) {
+			for (n = ent->off; n; n--)
+				bpf_fdesc_release(res, NULL, flags);
+			if (res->kind == BPF_FDESC_RES_LOCK_IRQ)
+				flags = NULL;
 			continue;
 		}
-		if (ent->off >= BPF_REG_6) {
+		if (ent->loc == BPF_FDESC_LOC_STACK) {
+			loc = (void *)(long)(fp + ent->off);
+		} else if (ent->off >= BPF_REG_6) {
 			reg = callee_regs[ent->off - BPF_REG_6];
+			loc = &reg;
 		} else if (regs) {
 			reg = regs->r[ent->off];
+			loc = &reg;
 		} else {
 			WARN_ONCE(1, "bpf: no register file to release R%d of %s from\n", ent->off,
 				  prog->aux->name);
 			continue;
 		}
-		bpf_fdesc_release(&pool->res[ent->res], &reg);
+		/* The flags of an irqsave lock precede the lock, which restores them. */
+		if (res->kind == BPF_FDESC_IRQ_FLAG_LOCK)
+			flags = loc;
+		bpf_fdesc_release(res, loc, flags);
+		if (res->kind == BPF_FDESC_RES_LOCK_IRQ)
+			flags = NULL;
 	}
 }
 
@@ -675,6 +842,259 @@ static bool fdesc_site_is_call(u8 site)
 	return site == BPF_FDESC_SITE_CALL || site == BPF_FDESC_SITE_GLOBAL;
 }
 
+/* Append a lock, IRQ flag or section entry of frame @f on this path. */
+static int fdesc_fixed_add(struct bpf_verifier_env *env, struct fdesc_scratch *s, int f,
+			   struct bpf_fdesc_ent ent)
+{
+	if (s->nr_fixed[f] >= FDESC_MAX_FIXED) {
+		verbose(env, "frame_desc: frame%d holds too many locks and sections\n", f);
+		return -E2BIG;
+	}
+	s->fixed[f][s->nr_fixed[f]++] = ent;
+	return 0;
+}
+
+/* The entry an earlier path listed for the lock or IRQ flag of rank @order, and its frame. */
+static const struct bpf_fdesc_ent *fdesc_fixed_find(struct fdesc_scratch *s, int curframe,
+						    s16 order, int *frame)
+{
+	int f, i;
+
+	for (f = 0; f <= curframe; f++) {
+		struct bpf_fdesc_build *b = s->builds[f];
+
+		for (i = 0; i < b->nr_fixed; i++) {
+			if (b->fixed[i].order == order) {
+				*frame = f;
+				return &b->fixed[i];
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Place a held lock: at its fixed address when it has one, else at a live
+ * location holding a pointer into its object. An earlier path's choice must
+ * be reused, as the entries have to agree. Locks are the innermost resources,
+ * so prefer the innermost frame, then a stack slot or callee-saved register.
+ */
+static int fdesc_place_lock(struct bpf_verifier_env *env, struct fdesc_scratch *s,
+			    const struct bpf_reference_state *ref, s16 order)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_fdesc_ent ent = { .order = order };
+	u8 kind = fdesc_lock_kind(ref->type);
+	const struct bpf_fdesc_ent *prev;
+	const struct fdesc_cand *c;
+	int f, k, nr = 0, prev_frame, chosen = -1, best = INT_MAX, ret;
+
+	if (!ref->id) {
+		ret = fdesc_res_of_global_lock(env, ref, kind);
+		if (ret < 0)
+			return ret;
+		ent.loc = BPF_FDESC_LOC_NONE;
+		ent.off = 1;
+		ent.res = ret;
+		return fdesc_fixed_add(env, s, st->curframe, ent);
+	}
+	for (f = st->curframe; f >= 0; f--) {
+		struct bpf_func_state *frame = st->frame[f];
+		const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+
+		for (k = 0; k < BPF_REG_10; k++) {
+			if (!(s->live_regs[f] & BIT(k)) || !fdesc_reg_is_lock(&frame->regs[k], ref))
+				continue;
+			ret = fdesc_res_of_lock(env, &frame->regs[k], kind);
+			if (ret < 0)
+				return ret;
+			s->cands[nr++] = (struct fdesc_cand) { f, 0, k, ret };
+		}
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+			if (!test_bit(k, live_stack) || !bpf_is_spilled_reg(slot) ||
+			    !fdesc_reg_is_lock(&slot->spilled_ptr, ref))
+				continue;
+			ret = fdesc_res_of_lock(env, &slot->spilled_ptr, kind);
+			if (ret < 0)
+				return ret;
+			s->cands[nr++] = (struct fdesc_cand) { f, 1, k, ret };
+		}
+	}
+	prev = fdesc_fixed_find(s, st->curframe, order, &prev_frame);
+	for (k = 0; k < nr; k++) {
+		int rank;
+
+		c = &s->cands[k];
+		if (prev) {
+			if (c->frameno == prev_frame && c->res == prev->res &&
+			    prev->loc == (c->is_slot ? BPF_FDESC_LOC_STACK : BPF_FDESC_LOC_REG) &&
+			    prev->off == (c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx)) {
+				chosen = k;
+				break;
+			}
+			continue;
+		}
+		rank = (st->curframe - c->frameno) * 4;
+		rank += c->is_slot ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
+		if (rank < best) {
+			best = rank;
+			chosen = k;
+		}
+	}
+	if (chosen < 0) {
+		verbose(env, "frame_desc: %s to release the lock acquired at insn %d from\n",
+			prev ? "another path uses a different location" : "no location",
+			ref->insn_idx);
+		return -EINVAL;
+	}
+	c = &s->cands[chosen];
+	ent.loc = c->is_slot ? BPF_FDESC_LOC_STACK : BPF_FDESC_LOC_REG;
+	ent.off = c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx;
+	ent.res = c->res;
+	return fdesc_fixed_add(env, s, c->frameno, ent);
+}
+
+/*
+ * Place saved IRQ flags: the stack slot they live in. The flags of an irqsave
+ * lock are restored by the lock, so they must sit in the lock's frame.
+ */
+static int fdesc_place_irq(struct bpf_verifier_env *env, struct fdesc_scratch *s,
+			   const struct bpf_reference_state *ref, s16 order)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_fdesc_ent ent = { .order = order, .loc = BPF_FDESC_LOC_STACK };
+	struct bpf_fdesc_res res;
+	int f, k, ret;
+
+	for (f = st->curframe; f >= 0; f--) {
+		struct bpf_func_state *frame = st->frame[f];
+		const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+			bool lock = slot->spilled_ptr.irq.kfunc_class == IRQ_LOCK_KFUNC;
+
+			if (slot->slot_type[BPF_REG_SIZE - 1] != STACK_IRQ_FLAG ||
+			    slot->spilled_ptr.id != ref->id)
+				continue;
+			if (!test_bit(k, live_stack)) {
+				verbose(env, "frame_desc: the irq flags saved at insn %d are dead\n",
+					ref->insn_idx);
+				return -EINVAL;
+			}
+			if (lock && (!s->nr_fixed[f] ||
+				     s->fixed[f][s->nr_fixed[f] - 1].order != order - 1)) {
+				verbose(env, "frame_desc: the lock of the irq flags saved at insn %d is not in their frame\n",
+					ref->insn_idx);
+				return -EINVAL;
+			}
+			memset(&res, 0, sizeof(res));
+			res.kind = lock ? BPF_FDESC_IRQ_FLAG_LOCK : BPF_FDESC_IRQ_FLAG;
+			ret = fdesc_res_intern(env, &res);
+			if (ret < 0)
+				return ret;
+			ent.off = -(k + 1) * BPF_REG_SIZE;
+			ent.res = ret;
+			return fdesc_fixed_add(env, s, f, ent);
+		}
+	}
+	verbose(env, "frame_desc: no stack slot holds the irq flags saved at insn %d\n", ref->insn_idx);
+	return -EINVAL;
+}
+
+/* Sections have no location; the frame that entered them leaves them. */
+static int fdesc_place_section(struct bpf_verifier_env *env, struct fdesc_scratch *s, int f,
+			       u8 kind, u32 count)
+{
+	struct bpf_fdesc_ent ent = { .order = -1, .loc = BPF_FDESC_LOC_NONE };
+	struct bpf_fdesc_res res;
+	int ret;
+
+	if (!count)
+		return 0;
+	if (count > S16_MAX) {
+		verbose(env, "frame_desc: frame%d is in too many nested sections\n", f);
+		return -E2BIG;
+	}
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	ret = fdesc_res_intern(env, &res);
+	if (ret < 0)
+		return ret;
+	ent.off = count;
+	ent.res = ret;
+	return fdesc_fixed_add(env, s, f, ent);
+}
+
+/*
+ * Place the locks, IRQ flags and sections held on this path. Unlike objects,
+ * these are released in order: the verifier keeps locks and IRQ flags in
+ * acquisition order, and the unwinder releases inner frames first, so the
+ * ranks placed in a frame must all follow those of its callers. Every path
+ * must place exactly the same entries in every frame.
+ */
+static int fdesc_place_fixed(struct bpf_verifier_env *env, struct fdesc_scratch *s)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int i, f, k, order = 0, last = -1, ret;
+
+	memset(s->nr_fixed, 0, sizeof(s->nr_fixed));
+	for (i = 0; i < st->acquired_refs; i++) {
+		const struct bpf_reference_state *ref = &st->refs[i];
+
+		if (ref->type & REF_TYPE_LOCK_MASK)
+			ret = fdesc_place_lock(env, s, ref, order++);
+		else if (ref->type == REF_TYPE_IRQ)
+			ret = fdesc_place_irq(env, s, ref, order++);
+		else
+			continue;
+		if (ret)
+			return ret;
+	}
+	for (f = 0; f <= st->curframe; f++) {
+		ret = fdesc_place_section(env, s, f, BPF_FDESC_RCU, st->frame[f]->rcu_locks);
+		ret = ret ?: fdesc_place_section(env, s, f, BPF_FDESC_PREEMPT,
+						 st->frame[f]->preempt_locks);
+		if (ret)
+			return ret;
+	}
+
+	for (f = 0; f <= st->curframe; f++) {
+		struct bpf_fdesc_build *b = s->builds[f];
+		size_t sz = s->nr_fixed[f] * sizeof(s->fixed[f][0]);
+
+		sort(s->fixed[f], s->nr_fixed[f], sizeof(s->fixed[f][0]), fdesc_ent_cmp, NULL);
+		/* Sorted latest first: the last ranked entry has the lowest rank. */
+		for (k = s->nr_fixed[f] - 1; k >= 0; k--) {
+			if (s->fixed[f][k].order < 0)
+				continue;
+			if (s->fixed[f][k].order <= last) {
+				verbose(env, "frame_desc: frame%d insn %d: holds a lock or irq flags acquired before a caller's\n",
+					f, s->pcs[f]);
+				return -EINVAL;
+			}
+			last = s->fixed[f][0].order;
+			break;
+		}
+		if (!b->visits) {
+			/* A visit that failed in a later frame may have placed these already. */
+			kvfree(b->fixed);
+			b->fixed = sz ? kvmemdup(s->fixed[f], sz, GFP_KERNEL_ACCOUNT) : NULL;
+			if (sz && !b->fixed)
+				return -ENOMEM;
+			b->nr_fixed = s->nr_fixed[f];
+		} else if (b->nr_fixed != s->nr_fixed[f] ||
+			   (sz && memcmp(b->fixed, s->fixed[f], sz))) {
+			verbose(env, "frame_desc: frame%d insn %d: holds different locks or sections on another path\n",
+				f, s->pcs[f]);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /*
  * Record the state at a site where the program may be unwound. @site says
  * which registers of the innermost frame the unwinder can see: at a
@@ -687,7 +1107,7 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct fdesc_scratch *s = env->fdesc_scratch;
-	int f, i, k, nr, ret;
+	int f, i, k, nr, held, ret;
 
 	if (!s) {
 		s = kvzalloc_obj(*s, GFP_KERNEL_ACCOUNT);
@@ -696,6 +1116,8 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 		env->fdesc_scratch = s;
 	}
 	env->fdesc_visits++;
+	s->obj_frames = 0;
+	s->sleep_frames = 0;
 
 	for (f = 0; f <= st->curframe; f++) {
 		struct bpf_func_state *frame = st->frame[f];
@@ -762,6 +1184,31 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 			s->class[c->frameno][idx] = k == chosen ? FDESC_CLASS_RES : FDESC_CLASS_COPY;
 			s->res[c->frameno][idx] = c->res;
 		}
+		s->obj_frames |= BIT(s->cands[chosen].frameno);
+		if (env->fdesc_res[s->cands[chosen].res].sleeps)
+			s->sleep_frames |= BIT(s->cands[chosen].frameno);
+	}
+
+	ret = fdesc_place_fixed(env, s);
+	if (ret) {
+		env->fdesc_conflicts++;
+		return ret;
+	}
+	/*
+	 * The objects of a frame are released after its own locks and sections,
+	 * but while the frames above still hold theirs. A caller's lock forbids
+	 * any release, as the program could call none there; a caller's
+	 * section or IRQ flags forbid a destructor that sleeps.
+	 */
+	for (f = 1, held = 0; f <= st->curframe; f++) {
+		for (k = 0; k < s->nr_fixed[f - 1]; k++)
+			held |= fdesc_res_is_lock(&env->fdesc_res[s->fixed[f - 1][k].res]) ? 2 : 1;
+		if (!((held & 2 ? s->obj_frames : s->sleep_frames) & BIT(f)))
+			continue;
+		verbose(env, "frame_desc: frame%d insn %d: holds an object that cannot be released under what a caller holds\n",
+			f, s->pcs[f]);
+		env->fdesc_conflicts++;
+		return -EINVAL;
 	}
 
 	/* Classify the remaining live locations and merge every frame. */
@@ -808,19 +1255,12 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 	return 0;
 }
 
-/*
- * Is the program in a region the unwinder cannot leave? Locks, IRQ flags,
- * RCU and preemption sections are not described yet, and a callback runs
- * below a kernel frame the unwinder would have to skip.
- */
+/* Is the program below a callback? It runs under a kernel frame the unwinder would have to skip. */
 static bool fdesc_site_masked(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	int f;
 
-	if (st->active_locks || st->active_irq_id || st->active_rcu_locks ||
-	    st->active_preempt_locks)
-		return true;
 	for (f = 0; f <= st->curframe; f++) {
 		struct bpf_func_state *frame = st->frame[f];
 
@@ -848,8 +1288,10 @@ int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 		return 0;
 	if (implicit && !env->cancellable)
 		return 0;
-	if (implicit && fdesc_site_masked(env)) {
-		env->fdesc_masked++;
+	if (fdesc_site_masked(env)) {
+		/* A throw below a callback is rejected once the call graph is checked. */
+		if (implicit)
+			env->fdesc_masked++;
 		return 0;
 	}
 	ret = fdesc_site_do(env, site);
@@ -959,8 +1401,7 @@ void bpf_fdesc_move_site(struct bpf_verifier_env *env, u32 from, u32 to)
 		return;
 	env->insn_aux_data[from].fdesc = NULL;
 	if (b->fallback || b->conflict) {
-		kvfree(b->callers);
-		kvfree(b);
+		fdesc_build_destroy(b);
 		return;
 	}
 	env->insn_aux_data[to].fdesc = b;

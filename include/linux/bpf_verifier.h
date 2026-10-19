@@ -1094,6 +1094,8 @@ struct bpf_fdesc_build {
 	bool fallback;	/* an implicit site that keeps its ordinary semantics */
 	u16 nr_callers;
 	struct bpf_fdesc_build **callers; /* descriptors of the frames a site was reached under */
+	u16 nr_fixed;
+	struct bpf_fdesc_ent *fixed;	/* locks, IRQ flags and sections, equal on every path */
 	struct bpf_fdesc_loc regs[BPF_REG_10];
 	struct bpf_fdesc_loc slots[];
 };
@@ -1140,7 +1142,7 @@ struct bpf_verifier_env {
 	u32 fdesc_sites;			/* table entries */
 	u32 fdesc_bytes;			/* tables, descriptors and resource classes */
 	u32 fdesc_fallbacks;			/* implicit sites that could not be described */
-	u32 fdesc_masked;			/* implicit sites in a region the unwinder cannot leave */
+	u32 fdesc_masked;			/* implicit sites below a callback */
 	void *fdesc_scratch;
 	bool cancellable;			/* the kernel may cancel this program at implicit sites */
 	int exception_callback_subprog;
