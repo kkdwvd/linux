@@ -450,6 +450,16 @@ config VIRTIO_NET
 	  This is the virtual network driver for virtio.  It can be used with
 	  QEMU based VMMs (like KVM or Xen).  Say Y or M.
 
+config BPF_VIRTIO_NET
+	tristate "Experimental BPF virtio network driver"
+	depends on VIRTIO && BPF_NET_DRIVER
+	help
+	  Provides checked virtqueue and packet-buffer capabilities to BPF
+	  network drivers. This experimental driver supports one queue pair,
+	  virtio 1.0 devices, and Ethernet MTUs up to 1500 without offloads.
+	  Bind a dedicated test device through the virtio bus bind attribute.
+	  The module is called bpf_virtio_net.
+
 config NLMON
 	tristate "Virtual netlink monitoring device"
 	help
