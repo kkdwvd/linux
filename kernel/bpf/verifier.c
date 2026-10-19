@@ -4739,6 +4739,9 @@ static int check_stack_arg_read(struct bpf_verifier_env *env, struct bpf_func_st
 	if (spi + 1 > bpf_in_stack_arg_cnt(subprog)) {
 		verbose(env, "invalid read from stack arg off %d depth %d\n",
 			off, bpf_in_stack_arg_cnt(subprog) * BPF_REG_SIZE);
+		if (!subprog->args_cached)
+			verbose(env, "the arguments of %s() are not known from its BTF, which the stack args need\n",
+				bpf_subprog_name(env, state->subprogno));
 		return -EACCES;
 	}
 

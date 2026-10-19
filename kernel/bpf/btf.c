@@ -8986,18 +8986,26 @@ skip_pointer:
 					i, btf_type_str(t), tname, t->size, 2 * BPF_REG_SIZE);
 				return -EINVAL;
 			}
-			if (btf_type_is_struct(t) &&
-			    !btf_struct_is_composed_of(env, btf, t, BTF_MEMBER_SCALAR)) {
-				if (!is_global)
-					return -EINVAL;
-				bpf_log(log, "Arg#%d type %s in %s() is not composed of scalars\n",
-					i, btf_type_str(t), tname);
-				return -EINVAL;
-			}
-
 			nslots = (t->size + BPF_REG_SIZE - 1) / BPF_REG_SIZE;
 			if (slots_used + nslots > MAX_BPF_FUNC_ARGS)
 				goto too_many_slots;
+			if (btf_type_is_struct(t) &&
+			    !btf_struct_is_composed_of(env, btf, t, BTF_MEMBER_SCALAR)) {
+				if (is_global) {
+					bpf_log(log, "Arg#%d type %s in %s() is not composed of scalars\n",
+						i, btf_type_str(t), tname);
+					return -EINVAL;
+				}
+				/*
+				 * A local function is verified inline, so it gets
+				 * the registers of its caller as they are, pointers
+				 * included. Only the slots the struct takes matter,
+				 * e.g. for the arguments that go on the stack.
+				 */
+				while (nslots--)
+					sub->args[slots_used++].arg_type = ARG_ANYTHING;
+				continue;
+			}
 			while (nslots--)
 				sub->args[slots_used++].arg_type = ARG_SCALAR;
 			continue;
