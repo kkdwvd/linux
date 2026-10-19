@@ -48,6 +48,7 @@ static void test_in_arena(void)
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.data), "data autocreate");
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.bss), "bss autocreate");
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.rodata), "rodata autocreate");
+	ASSERT_FALSE(bpf_map__autocreate(skel->maps.data_rel_ro), "data_rel_ro autocreate");
 	ASSERT_EQ(bpf_map__set_autocreate(skel->maps.data, true), -EOPNOTSUPP, "set_autocreate");
 	ASSERT_EQ(bpf_map__set_value_size(skel->maps.bss, 4096), -EOPNOTSUPP, "set_value_size");
 	ASSERT_EQ(bpf_map__initial_value(skel->maps.data, &sz), skel->data, "initial_value");
@@ -63,9 +64,11 @@ static void test_in_arena(void)
 	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.bss), &info, &len), "bss map");
 	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.rodata), &info, &len),
 		   "rodata map");
+	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.data_rel_ro), &info, &len),
+		   "data_rel_ro map");
 	run(skel, 100);
 
-	/* pointers to data next to pointers to functions */
+	/* read-only data with pointers to data and to functions, which are NULL */
 	ASSERT_EQ(run_prog(skel->progs.use_ops), 42 + 1 + 'e', "use_ops");
 	ASSERT_EQ(skel->data->counter, 102, "counter");
 
@@ -107,7 +110,10 @@ out:
 	data_in_arena_decl__destroy(skel);
 }
 
-/* A pointer in data that can't be made an address of arena fails the load */
+/*
+ * A pointer in data that can't be made an address of arena fails the load:
+ * one to per-CPU data, which is a map of its own
+ */
 static void test_ptr_to_map(void)
 {
 	struct data_in_arena_fail *skel;
@@ -115,7 +121,7 @@ static void test_ptr_to_map(void)
 	skel = data_in_arena_fail__open();
 	if (!ASSERT_OK_PTR(skel, "open"))
 		return;
-	ASSERT_ERR(data_in_arena_fail__load(skel), "load");
+	ASSERT_EQ(data_in_arena_fail__load(skel), -LIBBPF_ERRNO__RELOC, "load");
 	data_in_arena_fail__destroy(skel);
 }
 
