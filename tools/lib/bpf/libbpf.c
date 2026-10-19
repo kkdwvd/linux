@@ -4101,10 +4101,18 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	if (is_sec_name_dwarf(name))
 		return true;
 
+	/* unwind tables, which BPF has no use for */
+	if (strcmp(name, ".eh_frame") == 0)
+		return true;
+
 	if (str_has_pfx(name, ".rel")) {
 		name += sizeof(".rel") - 1;
 		/* DWARF section relocations */
 		if (is_sec_name_dwarf(name))
+			return true;
+
+		/* and those of the unwind tables */
+		if (strcmp(name, ".eh_frame") == 0)
 			return true;
 
 		/* .BTF and .BTF.ext don't need relocations */

@@ -624,10 +624,18 @@ static bool is_ignored_sec(struct src_sec *sec)
 	if (is_dwarf_sec_name(sec->sec_name))
 		return true;
 
+	/* unwind tables, which BPF has no use for */
+	if (strcmp(name, ".eh_frame") == 0)
+		return true;
+
 	if (strncmp(name, ".rel", sizeof(".rel") - 1) == 0) {
 		name += sizeof(".rel") - 1;
 		/* DWARF section relocations */
 		if (is_dwarf_sec_name(name))
+			return true;
+
+		/* and those of the unwind tables */
+		if (strcmp(name, ".eh_frame") == 0)
 			return true;
 
 		/* .BTF and .BTF.ext don't need relocations */
