@@ -26,6 +26,15 @@ menuconfig NET
 
 if NET
 
+config BPF_NET_DRIVER
+	bool "BPF network driver algorithms"
+	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF && INET
+	depends on !PREEMPT_RT
+	help
+	  Run bounded network driver algorithms through struct_ops. Native
+	  transports retain DMA authority, packet ownership and reset handling.
+	  This is an experimental interface for driver development.
+
 config WANT_COMPAT_NETLINK_MESSAGES
 	bool
 	help
