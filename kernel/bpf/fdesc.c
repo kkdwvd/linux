@@ -561,6 +561,89 @@ void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog
 }
 
 /*
+ * Release the resource an entry describes, at run time. Not inlined so that
+ * every release of an unwind can be observed by attaching to this function.
+ */
+noinline void bpf_fdesc_release(const struct bpf_fdesc_res *res, void *loc)
+{
+	void *obj;
+
+	switch (res->kind) {
+	case BPF_FDESC_DYNPTR_RINGBUF:
+		bpf_ringbuf_discard_dynptr_proto.func((u64)(long)loc, 0, 0, 0, 0);
+		return;
+	case BPF_FDESC_ITER:
+		res->dtor(loc);
+		return;
+	default:
+		break;
+	}
+	obj = *(void **)loc;
+	if (!obj)
+		return;
+	switch (res->kind) {
+	case BPF_FDESC_OBJ:
+		bpf_obj_drop_impl(obj, res->meta);
+		break;
+	case BPF_FDESC_PERCPU_OBJ:
+		bpf_percpu_obj_drop_impl(obj, res->meta);
+		break;
+	case BPF_FDESC_KPTR:
+		res->dtor(obj);
+		break;
+#ifdef CONFIG_INET
+	case BPF_FDESC_SOCK:
+		bpf_sk_release_proto.func((u64)(long)obj, 0, 0, 0, 0);
+		break;
+#endif
+	case BPF_FDESC_RINGBUF:
+		bpf_ringbuf_discard_proto.func((u64)(long)obj, 0, 0, 0, 0);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+	}
+}
+
+/*
+ * Release the resources of one frame of @prog during an unwind. @pc is an
+ * address inside the instruction the frame is at, @fp the frame's BPF frame
+ * pointer, @regs the register file saved at the throw site when this is the
+ * innermost frame, and @callee_regs the frame's R6-R9.
+ */
+void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
+			    const struct bpf_throw_regs *regs, const u64 *callee_regs)
+{
+	const struct bpf_fdesc_pool *pool = prog->aux->fdesc_pool;
+	const struct bpf_fdesc *d;
+	u32 i;
+
+	if (!prog->aux->fdesc_tab)
+		return;
+	d = bpf_prog_fdesc_lookup(prog, pc);
+	if (WARN_ONCE(!d, "bpf: no frame descriptor for %s at %lx\n", prog->aux->name, pc))
+		return;
+	for (i = 0; i < d->nent; i++) {
+		const struct bpf_fdesc_ent *ent = &d->ent[i];
+		u64 reg;
+
+		if (ent->loc == BPF_FDESC_LOC_STACK) {
+			bpf_fdesc_release(&pool->res[ent->res], (void *)(long)(fp + ent->off));
+			continue;
+		}
+		if (ent->off >= BPF_REG_6) {
+			reg = callee_regs[ent->off - BPF_REG_6];
+		} else if (regs) {
+			reg = regs->r[ent->off];
+		} else {
+			WARN_ONCE(1, "bpf: no register file to release R%d of %s from\n", ent->off,
+				  prog->aux->name);
+			continue;
+		}
+		bpf_fdesc_release(&pool->res[ent->res], &reg);
+	}
+}
+
+/*
  * Record the state at a site where the program may be unwound. @site says
  * which registers of the innermost frame the unwinder can see: at a
  * bpf_throw() call the entry stub saves R0-R9, while a frame waiting in a

@@ -3433,10 +3433,13 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 						prog->aux->func[0]->aux : prog->aux;
 
 		/*
-		 * Recover the caller's callee-saved registers: those this frame's
+		 * Release what this frame holds. Every frame is at a call, whose
+		 * return address is the first byte of the next instruction. Then
+		 * recover the caller's callee-saved registers: those this frame's
 		 * prologue saved sit in its frame, the rest are still the values
 		 * the frame itself has.
 		 */
+		bpf_fdesc_unwind_frame(prog, ip - 1, bp, ctx->cnt ? NULL : ctx->regs, ctx->saved);
 		for (i = 0; i < BPF_THROW_NR_CALLEE_SAVED; i++)
 			if (fn->callee_reg_off[i])
 				ctx->saved[i] = *(u64 *)(long)(bp + fn->callee_reg_off[i]);

@@ -3007,6 +3007,8 @@ void bpf_obj_free_task_work(const struct btf_record *rec, void *obj);
 void bpf_obj_cancel_fields(struct bpf_map *map, void *obj);
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj);
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu);
+void bpf_obj_drop_impl(void *p__alloc, void *meta__ign);
+void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign);
 
 struct bpf_map *bpf_map_get(u32 ufd);
 struct bpf_map *bpf_map_get_with_uref(u32 ufd);
@@ -4224,6 +4226,7 @@ extern const struct bpf_func_proto bpf_ringbuf_output_proto;
 extern const struct bpf_func_proto bpf_ringbuf_reserve_proto;
 extern const struct bpf_func_proto bpf_ringbuf_submit_proto;
 extern const struct bpf_func_proto bpf_ringbuf_discard_proto;
+extern const struct bpf_func_proto bpf_sk_release_proto;
 extern const struct bpf_func_proto bpf_ringbuf_query_proto;
 extern const struct bpf_func_proto bpf_ringbuf_reserve_dynptr_proto;
 extern const struct bpf_func_proto bpf_ringbuf_submit_dynptr_proto;
@@ -4490,6 +4493,10 @@ void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
 void bpf_prog_fill_fdesc(struct bpf_prog *prog, const u32 *offsets, void *image);
+struct bpf_throw_regs;
+void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
+			    const struct bpf_throw_regs *regs, const u64 *callee_regs);
+void bpf_fdesc_release(const struct bpf_fdesc_res *res, void *loc);
 const struct bpf_fdesc *bpf_prog_fdesc_lookup(const struct bpf_prog *prog, unsigned long ip);
 void bpf_fdesc_tab_free(struct bpf_fdesc_tab *tab);
 void bpf_fdesc_pool_free(struct bpf_fdesc_pool *pool);
