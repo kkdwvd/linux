@@ -3557,16 +3557,30 @@ void * __weak bpf_arch_throw_entry(void)
 	return NULL;
 }
 
+/*
+ * The entry a fault at an arena access of JITed code is redirected to, which
+ * captures the BPF register file of the access, or NULL when the architecture
+ * resumes the program after such a fault.
+ */
+void * __weak bpf_arch_throw_fault_entry(void)
+{
+	return NULL;
+}
+
 bool __weak bpf_jit_supports_timed_may_goto(void)
 {
 	return false;
 }
 
-/* Can the kernel cancel a running program on this architecture? */
+/*
+ * Can the kernel cancel a running program on this architecture? It needs the
+ * entries of every kind of cancellation point, so that a site the verifier
+ * described is one the kernel can unwind from.
+ */
 bool bpf_jit_supports_cancellation(void)
 {
 	return bpf_jit_supports_exceptions() && bpf_jit_supports_timed_may_goto() &&
-	       bpf_arch_throw_entry();
+	       bpf_arch_throw_entry() && bpf_arch_throw_fault_entry();
 }
 
 u64 __weak arch_bpf_timed_may_goto(void)

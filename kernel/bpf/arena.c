@@ -1182,7 +1182,8 @@ static int __init kfunc_init(void)
 late_initcall(kfunc_init);
 
 static void __bpf_prog_report_arena_violation(struct bpf_prog *prog, bool write,
-					      unsigned long addr, unsigned long fault_ip)
+					      unsigned long addr, unsigned long fault_ip,
+					      bool cancel)
 {
 	struct bpf_stream_stage ss;
 	u64 user_vm_start;
@@ -1194,8 +1195,9 @@ static void __bpf_prog_report_arena_violation(struct bpf_prog *prog, bool write,
 	addr += clear_lo32(user_vm_start);
 
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
-		bpf_stream_printk(ss, "ERROR: Arena %s access at unmapped address 0x%lx\n",
-				  write ? "WRITE" : "READ", addr);
+		bpf_stream_printk(ss, "ERROR: Arena %s access at unmapped address 0x%lx%s\n",
+				  write ? "WRITE" : "READ", addr,
+				  cancel ? ", cancelling program" : "");
 		bpf_stream_dump_stack(ss);
 	}));
 }
@@ -1229,13 +1231,20 @@ bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned lon
 	apply_to_page_range(&init_mm, page_addr, PAGE_SIZE,
 			    apply_range_set_scratch_cb, arena->scratch_page);
 	flush_vmap_cache(page_addr, PAGE_SIZE);
-	__bpf_prog_report_arena_violation(prog, is_write, page_addr - kbase, fault_ip);
+	__bpf_prog_report_arena_violation(prog, is_write, page_addr - kbase, fault_ip, false);
 	return true;
 }
 
-void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
+/*
+ * Report a fault of JITed code at an arena access, @fault_ip. Returns true
+ * when the access is a cancellation point, that is, the verifier described
+ * the state at it: the caller then unwinds the program instead of resuming it
+ * after the access.
+ */
+bool bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
 {
 	struct bpf_prog *prog;
+	bool cancel;
 
 	/*
 	 * The RCU read lock is held to safely traverse the latch tree, but we
@@ -1246,6 +1255,8 @@ void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned lo
 	prog = bpf_prog_ksym_find(fault_ip);
 	rcu_read_unlock();
 	if (!prog)
-		return;
-	__bpf_prog_report_arena_violation(prog, write, addr, fault_ip);
+		return false;
+	cancel = bpf_prog_fdesc_lookup(prog, fault_ip);
+	__bpf_prog_report_arena_violation(prog, write, addr, fault_ip, cancel);
+	return cancel;
 }

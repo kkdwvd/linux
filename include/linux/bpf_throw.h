@@ -13,6 +13,7 @@
  */
 #define BPF_THROW_CALL		0	/* a call to bpf_throw() */
 #define BPF_THROW_MAY_GOTO	1	/* the timed may_goto slow path */
+#define BPF_THROW_FAULT		2	/* an exception-table fixup */
 
 /*
  * Returned by bpf_check_timed_may_goto() in place of a loop count when the
@@ -57,9 +58,14 @@ struct bpf_throw_regs {
 static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind);
-/* The native entry of bpf_throw(), on an architecture that has one. */
+/*
+ * The native entry of bpf_throw(), on an architecture that has one, and the
+ * entry a fault at an arena access of JITed code is redirected to.
+ */
 void bpf_throw_entry(void);
+void bpf_throw_fault_entry(void);
 void *bpf_arch_throw_entry(void);
+void *bpf_arch_throw_fault_entry(void);
 #endif /* __ASSEMBLER__ */
 
 #endif /* _LINUX_BPF_THROW_H */

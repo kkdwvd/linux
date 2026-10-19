@@ -3402,6 +3402,7 @@ struct bpf_throw_ctx {
 	u64 bp;
 	int cnt;
 	const struct bpf_throw_regs *regs;	/* register file of the throw site, or NULL */
+	unsigned int kind;
 	/*
 	 * The callee-saved registers of the frame being walked, R6-R9 then the
 	 * architecture's own: what the throw site had, then what each frame
@@ -3437,13 +3438,15 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 		if (fn->priv_stack_ptr)
 			fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
 		/*
-		 * Release what this frame holds. Every frame is at a call, whose
-		 * return address is the first byte of the next instruction. Then
-		 * recover the caller's callee-saved registers: those this frame's
-		 * prologue saved sit in its frame, the rest are still the values
-		 * the frame itself has.
+		 * Release what this frame holds. The innermost frame of a fault
+		 * is at the faulting instruction; every other frame is at a
+		 * call, whose return address is the first byte of the next
+		 * instruction. Then recover the caller's callee-saved registers:
+		 * those this frame's prologue saved sit in its frame, the rest
+		 * are still the values the frame itself has.
 		 */
-		bpf_fdesc_unwind_frame(prog, ip - 1, fp, ctx->cnt ? NULL : ctx->regs, ctx->saved);
+		bpf_fdesc_unwind_frame(prog, ctx->cnt || ctx->kind != BPF_THROW_FAULT ? ip - 1 : ip,
+				       fp, ctx->cnt ? NULL : ctx->regs, ctx->saved);
 		for (i = 0; i < BPF_THROW_NR_CALLEE_SAVED; i++)
 			if (fn->callee_reg_off[i])
 				ctx->saved[i] = *(u64 *)(long)(bp + fn->callee_reg_off[i]);
@@ -3467,7 +3470,7 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
  */
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
-	struct bpf_throw_ctx ctx = { .regs = regs };
+	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
 
 	if (regs)
 		memcpy(ctx.saved, &regs->r[BPF_REG_6], sizeof(ctx.saved));
