@@ -771,6 +771,12 @@ struct bpf_insn_aux_data {
 	struct btf_struct_meta *kptr_struct_meta;
 	/* frame descriptor of the frame this insn is executed or waited in, see fdesc.c */
 	struct bpf_fdesc_build *fdesc;
+	/* unique slot of the reference this insn acquires, and the slot it clears as a release */
+	u8 fdesc_slot;		/* BPF_FDESC_SLOT_* */
+	bool fdesc_clear;	/* the insn releases a reference kept in the slot at fdesc_clear_off */
+	u16 fdesc_slot_res;
+	s16 fdesc_slot_off;
+	s16 fdesc_clear_off;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	/*
 	 * Per-instruction summary of stack slots in the current frame
@@ -1082,7 +1088,9 @@ enum bpf_fdesc_site {
 struct bpf_fdesc_loc {
 	u8 state;
 	u8 nullable;
+	u8 multi;	/* references acquired at different insns were merged here */
 	u16 res;
+	u32 acq;	/* insn that acquired the reference listed here */
 };
 
 /* Frame descriptor under construction for one (subprog, insn), see fdesc.c. */
@@ -1097,8 +1105,26 @@ struct bpf_fdesc_build {
 	struct bpf_fdesc_build **callers; /* descriptors of the frames a site was reached under */
 	u16 nr_fixed;
 	struct bpf_fdesc_ent *fixed;	/* locks, IRQ flags and sections, equal on every path */
+	u16 nr_slot_acqs;
+	u32 *slot_acqs;	/* acquisitions whose unique slot this frame releases */
+	u16 nr_spills;
+	struct bpf_fdesc_ent *spills;	/* the unique slots, laid out once reserved */
 	struct bpf_fdesc_loc regs[BPF_REG_10];
 	struct bpf_fdesc_loc slots[];
+};
+
+/* A release of a reference, recorded for the unique slot of its acquisition. */
+struct bpf_fdesc_rel {
+	u32 rel;	/* releasing insn */
+	u32 acq;	/* acquiring insn */
+};
+
+/* The unique slot of the reference an insn acquires, see fdesc.c. */
+enum {
+	BPF_FDESC_SLOT_NONE,
+	BPF_FDESC_SLOT_WANTED,		/* a site needs the reference in its slot */
+	BPF_FDESC_SLOT_RESERVED,
+	BPF_FDESC_SLOT_BAD,		/* the slot cannot be kept up to date */
 };
 
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
@@ -1144,7 +1170,12 @@ struct bpf_verifier_env {
 	u32 fdesc_bytes;			/* tables, descriptors and resource classes */
 	u32 fdesc_fallbacks;			/* implicit sites that could not be described */
 	u32 fdesc_masked;			/* implicit sites below a callback */
+	u32 fdesc_slots;			/* unique slots reserved */
+	u32 fdesc_spills;			/* instructions keeping them up to date */
+	bool fdesc_spill_all;			/* BPF_F_TEST_SPILL_REFS: every reference in a slot */
 	void *fdesc_scratch;
+	struct bpf_fdesc_rel *fdesc_rels;	/* releases, for the unique slots */
+	u32 fdesc_rel_cnt;
 	bool cancellable;			/* the kernel may cancel this program at implicit sites */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2067,7 +2098,9 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in fdesc.c */
 int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site);
+int bpf_fdesc_release_hook(struct bpf_verifier_env *env, int id);
 int bpf_fdesc_resolve(struct bpf_verifier_env *env);
+int bpf_fdesc_emit_slots(struct bpf_verifier_env *env);
 void bpf_fdesc_move_site(struct bpf_verifier_env *env, u32 from, u32 to);
 int bpf_fdesc_build_tables(struct bpf_verifier_env *env);
 void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,

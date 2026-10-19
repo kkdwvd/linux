@@ -1350,6 +1350,13 @@ enum bpf_perf_event_type {
  */
 #define BPF_F_ARENA_SCALAR	(1U << 8)
 
+/*
+ * The verifier internal test flag: keep every reference in a unique stack slot
+ * for the unwinder, as if no frame descriptor could place it. Measures the
+ * worst case cost of cancellation support. Behavior is otherwise undefined.
+ */
+#define BPF_F_TEST_SPILL_REFS		(1U << 9)
+
 /* link_create.kprobe_multi.flags used in LINK_CREATE command for
  * BPF_TRACE_KPROBE_MULTI attach type to create return probe.
  */

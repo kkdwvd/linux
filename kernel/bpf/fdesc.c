@@ -57,6 +57,7 @@ struct fdesc_scratch {
 	struct fdesc_cand cands[MAX_CALL_FRAMES * FDESC_FRAME_LOCS];
 	u8 class[MAX_CALL_FRAMES][FDESC_FRAME_LOCS];
 	u16 res[MAX_CALL_FRAMES][FDESC_FRAME_LOCS];
+	u32 acq[MAX_CALL_FRAMES][FDESC_FRAME_LOCS];
 	struct bpf_fdesc_build *builds[MAX_CALL_FRAMES];
 	u32 pcs[MAX_CALL_FRAMES];
 	u32 live_regs[MAX_CALL_FRAMES];
@@ -94,6 +95,8 @@ static void fdesc_build_destroy(struct bpf_fdesc_build *b)
 		return;
 	kvfree(b->callers);
 	kvfree(b->fixed);
+	kvfree(b->slot_acqs);
+	kvfree(b->spills);
 	kvfree(b);
 }
 
@@ -136,8 +139,10 @@ void bpf_fdesc_env_free(struct bpf_verifier_env *env)
 {
 	kvfree(env->fdesc_res);
 	kvfree(env->fdesc_scratch);
+	kvfree(env->fdesc_rels);
 	env->fdesc_res = NULL;
 	env->fdesc_scratch = NULL;
+	env->fdesc_rels = NULL;
 }
 
 /* Intern a resource class; descriptors refer to it by index. */
@@ -434,14 +439,6 @@ static int fdesc_res_of_global_lock(struct bpf_verifier_env *env,
 	return fdesc_res_intern(env, &res);
 }
 
-static void fdesc_verbose_cand(struct bpf_verifier_env *env, const struct fdesc_cand *c)
-{
-	if (c->is_slot)
-		verbose(env, "frame%d fp%d", c->frameno, -(c->idx + 1) * BPF_REG_SIZE);
-	else
-		verbose(env, "frame%d R%d", c->frameno, c->idx);
-}
-
 /*
  * Rank a candidate location that no earlier path lists: a location another
  * path left NULL merges best, then a stack slot or a callee-saved register,
@@ -456,15 +453,167 @@ static int fdesc_cand_rank(const struct fdesc_cand *c, const struct bpf_fdesc_lo
 	return rank + (c->idx >= BPF_REG_6 ? 1 : 2);
 }
 
+
+/* Can a reference of class @res live in a unique slot: a pointer released from a register. */
+static bool fdesc_res_slottable(const struct bpf_fdesc_res *res)
+{
+	switch (res->kind) {
+	case BPF_FDESC_OBJ:
+	case BPF_FDESC_PERCPU_OBJ:
+	case BPF_FDESC_KPTR:
+	case BPF_FDESC_SOCK:
+	case BPF_FDESC_RINGBUF:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Note that frame @b releases the reference acquired at @acq from its unique slot. */
+static int fdesc_build_add_slot(struct bpf_fdesc_build *b, u32 acq)
+{
+	u32 *acqs;
+	int i;
+
+	for (i = 0; i < b->nr_slot_acqs; i++)
+		if (b->slot_acqs[i] == acq)
+			return 0;
+	acqs = kvrealloc(b->slot_acqs, array_size(b->nr_slot_acqs + 1, sizeof(*acqs)),
+			 GFP_KERNEL_ACCOUNT);
+	if (!acqs)
+		return -ENOMEM;
+	acqs[b->nr_slot_acqs++] = acq;
+	b->slot_acqs = acqs;
+	return 0;
+}
+
 /*
- * Choose where reference @ref is released from, given its candidate locations
+ * Ask for the reference acquired at insn @acq, of class @res, to be released
+ * from a unique slot: a hidden slot of the frame that acquired it, kept equal
+ * to the reference while it is held and NULL otherwise. The frame must be on
+ * the stack, since a reference a callee returned has no frame to keep it in.
+ * Whether the slot can be kept up to date at every release is decided after
+ * verification; a site asking for it may still conflict then.
+ */
+static int fdesc_slot_want(struct bpf_verifier_env *env, struct fdesc_scratch *s, u32 acq, u16 res)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[acq];
+	struct bpf_verifier_state *st = env->cur_state;
+	int f, sub;
+
+	if (aux->fdesc_slot == BPF_FDESC_SLOT_NONE) {
+		if (fdesc_res_slottable(&env->fdesc_res[res]) &&
+		    env->prog->insnsi[acq].code == (BPF_JMP | BPF_CALL)) {
+			aux->fdesc_slot = BPF_FDESC_SLOT_WANTED;
+			aux->fdesc_slot_res = res;
+		} else {
+			aux->fdesc_slot = BPF_FDESC_SLOT_BAD;
+		}
+	}
+	if (aux->fdesc_slot != BPF_FDESC_SLOT_BAD) {
+		sub = fdesc_insn_subprog(env, acq);
+		for (f = st->curframe; f >= 0; f--) {
+			if (st->frame[f]->subprogno != sub)
+				continue;
+			s->obj_frames |= BIT(f);
+			if (env->fdesc_res[res].sleeps)
+				s->sleep_frames |= BIT(f);
+			return fdesc_build_add_slot(s->builds[f], acq);
+		}
+		aux->fdesc_slot = BPF_FDESC_SLOT_BAD;
+	}
+	verbose(env, "frame_desc: the reference acquired at insn %d cannot use a unique slot\n", acq);
+	return -EINVAL;
+}
+
+/*
+ * Retract the listing at @loc: the reference an earlier path put there is
+ * released from its unique slot instead, on every path through the site.
+ */
+static int fdesc_loc_retract(struct bpf_verifier_env *env, struct fdesc_scratch *s,
+			     struct bpf_fdesc_loc *loc)
+{
+	int ret;
+
+	if (loc->multi) {
+		verbose(env, "frame_desc: references acquired at different insns share a location\n");
+		return -EINVAL;
+	}
+	ret = fdesc_slot_want(env, s, loc->acq, loc->res);
+	if (ret)
+		return ret;
+	loc->state = FDESC_LOC_OTHER;
+	return 0;
+}
+
+/* The class of @ref, from any location holding it, live or not. */
+static int fdesc_ref_res(struct bpf_verifier_env *env, const struct bpf_reference_state *ref)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int f, k, ret;
+
+	for (f = st->curframe; f >= 0; f--) {
+		struct bpf_func_state *frame = st->frame[f];
+
+		for (k = 0; k < BPF_REG_10; k++)
+			if (fdesc_reg_is_ref(&frame->regs[k], ref->id))
+				return fdesc_res_of_reg(env, &frame->regs[k]);
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			ret = fdesc_slot_ref(env, bpf_stack_slot(frame, k), ref->id);
+			if (ret != -ENOENT)
+				return ret;
+		}
+	}
+	return -ENOENT;
+}
+
+/*
+ * Release @ref from the unique slot of its acquisition instead of from a
+ * location: what earlier paths listed at its @nr candidates is retracted,
+ * and on this path the candidates hold copies.
+ */
+static int fdesc_ref_to_slot(struct bpf_verifier_env *env, struct fdesc_scratch *s,
+			     const struct bpf_reference_state *ref, int nr)
+{
+	int k, res, ret;
+
+	res = nr ? s->cands[0].res : fdesc_ref_res(env, ref);
+	if (res < 0)
+		return res;
+	for (k = 0; k < nr; k++) {
+		const struct fdesc_cand *c = &s->cands[k];
+		struct bpf_fdesc_build *b = s->builds[c->frameno];
+		struct bpf_fdesc_loc *loc = c->is_slot ? &b->slots[c->idx] : &b->regs[c->idx];
+
+		if (loc->state == FDESC_LOC_RES) {
+			ret = fdesc_loc_retract(env, s, loc);
+			if (ret)
+				return ret;
+		}
+		s->class[c->frameno][c->is_slot ? BPF_REG_10 + c->idx : c->idx] = FDESC_CLASS_COPY;
+	}
+	return fdesc_slot_want(env, s, ref->insn_idx, res);
+}
+
+static void fdesc_verbose_unplaced(struct bpf_verifier_env *env,
+				   const struct bpf_reference_state *ref, int err)
+{
+	verbose(env, "frame_desc: reference id=%d (acquired at insn %d) %s\n", ref->id, ref->insn_idx,
+		err == -ENOENT ? "has no live location to be released from" :
+		err == -EEXIST ? "is at different locations on different paths" :
+		"shares a location with another resource on another path");
+}
+
+/*
+ * Choose where a reference is released from, given its @nr candidate locations
  * on this path and what earlier paths put into the descriptors. A location
  * that an earlier path already lists must be reused, so that the reference is
  * never listed twice on a path; otherwise prefer a location no earlier path
  * has put a resource or a copy into, by rank and then outermost frame first.
+ * Fails when earlier paths list it at two candidates (-EEXIST), list another
+ * resource at one (-EINVAL), or when no candidate is free (-ENOENT).
  */
-static int fdesc_choose(struct bpf_verifier_env *env, struct fdesc_scratch *s,
-			const struct bpf_reference_state *ref, int nr)
+static int fdesc_choose(struct fdesc_scratch *s, int nr)
 {
 	int i, chosen = -1, fallback = -1, fallback_rank = INT_MAX;
 
@@ -474,20 +623,10 @@ static int fdesc_choose(struct bpf_verifier_env *env, struct fdesc_scratch *s,
 		struct bpf_fdesc_loc *loc = c->is_slot ? &b->slots[c->idx] : &b->regs[c->idx];
 
 		if (loc->state == FDESC_LOC_RES) {
-			if (chosen >= 0) {
-				verbose(env, "frame_desc: reference id=%d is listed at ", ref->id);
-				fdesc_verbose_cand(env, &s->cands[chosen]);
-				verbose(env, " and at ");
-				fdesc_verbose_cand(env, c);
-				verbose(env, " on different paths\n");
+			if (chosen >= 0)
+				return -EEXIST;
+			if (loc->res != c->res)
 				return -EINVAL;
-			}
-			if (loc->res != c->res) {
-				verbose(env, "frame_desc: ");
-				fdesc_verbose_cand(env, c);
-				verbose(env, " holds a different resource on another path\n");
-				return -EINVAL;
-			}
 			chosen = i;
 		} else if (loc->state == FDESC_LOC_UNSEEN || loc->state == FDESC_LOC_NULL) {
 			int rank = fdesc_cand_rank(c, loc);
@@ -500,15 +639,12 @@ static int fdesc_choose(struct bpf_verifier_env *env, struct fdesc_scratch *s,
 	}
 	if (chosen >= 0)
 		return chosen;
-	if (fallback >= 0)
-		return fallback;
-	verbose(env, "frame_desc: no location to release reference id=%d (acquired at insn %d) from\n",
-		ref->id, ref->insn_idx);
-	return -EINVAL;
+	return fallback >= 0 ? fallback : -ENOENT;
 }
 
 /* Merge one path's classification of a location into the descriptor. */
-static int fdesc_merge(struct bpf_fdesc_loc *loc, int class, u16 res)
+static int fdesc_merge(struct bpf_verifier_env *env, struct fdesc_scratch *s,
+		       struct bpf_fdesc_loc *loc, int class, u16 res, u32 acq)
 {
 	switch (loc->state) {
 	case FDESC_LOC_UNSEEN:
@@ -518,6 +654,8 @@ static int fdesc_merge(struct bpf_fdesc_loc *loc, int class, u16 res)
 			loc->nullable = loc->state == FDESC_LOC_NULL;
 			loc->state = FDESC_LOC_RES;
 			loc->res = res;
+			loc->acq = acq;
+			loc->multi = 0;
 			break;
 		case FDESC_CLASS_NULL:
 			loc->state = FDESC_LOC_NULL;
@@ -533,12 +671,15 @@ static int fdesc_merge(struct bpf_fdesc_loc *loc, int class, u16 res)
 		switch (class) {
 		case FDESC_CLASS_RES:
 			/* fdesc_choose() reuses a listed location only for the same class. */
+			if (loc->acq != acq)
+				loc->multi = 1;
 			return 0;
 		case FDESC_CLASS_NULL:
 			loc->nullable = 1;
 			return 0;
 		default:
-			return -EINVAL;
+			/* Not the resource on this path: release it from its slot instead. */
+			return fdesc_loc_retract(env, s, loc);
 		}
 	default:
 		/* fdesc_choose() never lists a location an earlier path used otherwise. */
@@ -589,11 +730,13 @@ static u32 fdesc_build_body(const struct bpf_fdesc_build *b, struct bpf_fdesc *d
 	if (d) {
 		for (i = 0; i < b->nr_fixed; i++)
 			d->ent[n++] = b->fixed[i];
+		for (i = 0; i < b->nr_spills; i++)
+			d->ent[n++] = b->spills[i];
 		d->nent = n;
 		d->size = struct_size(d, ent, n);
 		sort(d->ent, n, sizeof(d->ent[0]), fdesc_ent_cmp, NULL);
 	} else {
-		n += b->nr_fixed;
+		n += b->nr_fixed + b->nr_spills;
 	}
 	return n;
 }
@@ -859,6 +1002,7 @@ void bpf_fdesc_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 f
 			flags = NULL;
 	}
 }
+
 
 /* Append a lock, IRQ flag or section entry of frame @f on this path. */
 static int fdesc_fixed_add(struct bpf_verifier_env *env, struct fdesc_scratch *s, int f,
@@ -1154,10 +1298,14 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 		if (!s->builds[f]->site)
 			s->builds[f]->site = f == st->curframe ? site : BPF_FDESC_SITE_CALLER;
 	}
-	for (f = 0; f < st->curframe; f++) {
-		ret = fdesc_add_caller(s->builds[st->curframe], s->builds[f]);
-		if (ret)
-			return ret;
+	for (f = 1; f <= st->curframe; f++) {
+		int g;
+
+		for (g = 0; g < f; g++) {
+			ret = fdesc_add_caller(s->builds[f], s->builds[g]);
+			if (ret)
+				return ret;
+		}
 	}
 
 	/* Place every reference at one live location. */
@@ -1192,10 +1340,17 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 				s->cands[nr++] = (struct fdesc_cand) { f, 1, k, ret };
 			}
 		}
-		chosen = fdesc_choose(env, s, ref, nr);
-		if (chosen < 0) {
-			env->fdesc_conflicts++;
-			return chosen;
+		chosen = fdesc_choose(s, nr);
+		if (chosen < 0 || (env->fdesc_spill_all && nr &&
+				   fdesc_res_slottable(&env->fdesc_res[s->cands[0].res]))) {
+			ret = fdesc_ref_to_slot(env, s, ref, nr);
+			if (ret) {
+				if (chosen < 0)
+					fdesc_verbose_unplaced(env, ref, chosen);
+				env->fdesc_conflicts++;
+				return ret;
+			}
+			continue;
 		}
 		for (k = 0; k < nr; k++) {
 			const struct fdesc_cand *c = &s->cands[k];
@@ -1203,6 +1358,7 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 
 			s->class[c->frameno][idx] = k == chosen ? FDESC_CLASS_RES : FDESC_CLASS_COPY;
 			s->res[c->frameno][idx] = c->res;
+			s->acq[c->frameno][idx] = ref->insn_idx;
 		}
 		s->obj_frames |= BIT(s->cands[chosen].frameno);
 		if (env->fdesc_res[s->cands[chosen].res].sleeps)
@@ -1257,7 +1413,8 @@ static int fdesc_site_do(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 					s->class[f][loc] = FDESC_CLASS_NULL;
 				dst = &b->slots[k];
 			}
-			ret = fdesc_merge(dst, s->class[f][loc], s->res[f][loc]);
+			ret = fdesc_merge(env, s, dst, s->class[f][loc], s->res[f][loc],
+					  s->acq[f][loc]);
 			if (ret) {
 				b->conflict = true;
 				env->fdesc_conflicts++;
@@ -1323,19 +1480,161 @@ int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site)
 	return 0;
 }
 
+
 /*
- * After verification, decide which sites the unwinder may be entered from. A
- * frame whose descriptor conflicts cannot be unwound through, which takes
- * every site reached under it with it: an explicit site then rejects the
- * program, an implicit site falls back. A program keeping an implicit site
- * needs the exception boundary the throw path relies on.
- *
- * A global subprog is verified on its own, so its sites know nothing of its
- * callers: each call to it is a site in the caller, and the frames of a
- * global subprog, or of anything it calls, can only be unwound when every
- * call to it can be. A site below a callback can never be: a kernel frame
- * sits between it and the exception boundary.
+ * Can the slot of the reference acquired at @acq be kept up to date? Every
+ * release must be in the acquiring subprog, so that the clear reaches the
+ * slot, and must release references of this acquisition only: two
+ * references of one type may be to one object, so a release insn that
+ * releases one of several acquisitions on different paths could not tell
+ * their slots apart by value.
  */
+static bool fdesc_slot_eligible(struct bpf_verifier_env *env, u32 acq)
+{
+	int sub = fdesc_insn_subprog(env, acq);
+	u32 i, j;
+
+	for (i = 0; i < env->fdesc_rel_cnt; i++) {
+		const struct bpf_fdesc_rel *r = &env->fdesc_rels[i];
+
+		if (r->acq != acq)
+			continue;
+		if (fdesc_insn_subprog(env, r->rel) != sub) {
+			verbose(env, "frame_desc: insn %d releases the reference of insn %d in another subprog\n",
+				r->rel, acq);
+			return false;
+		}
+		for (j = 0; j < env->fdesc_rel_cnt; j++) {
+			if (env->fdesc_rels[j].rel == r->rel && env->fdesc_rels[j].acq != acq) {
+				verbose(env, "frame_desc: insn %d releases the references of insns %d and %d\n",
+					r->rel, acq, env->fdesc_rels[j].acq);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* List the slot of @acq in @b, or in the caller frames of @b that own it. */
+static int fdesc_build_list_slot(struct bpf_verifier_env *env, struct bpf_fdesc_build *b, int sub,
+				 u32 acq)
+{
+	int asub = fdesc_insn_subprog(env, acq), c, ret;
+	bool found = false;
+
+	if (asub == sub)
+		return fdesc_build_add_slot(b, acq);
+	for (c = 0; c < b->nr_callers; c++) {
+		if (fdesc_insn_subprog(env, b->callers[c]->pc) != asub)
+			continue;
+		ret = fdesc_build_add_slot(b->callers[c], acq);
+		if (ret)
+			return ret;
+		found = true;
+	}
+	if (!found) {
+		b->conflict = true;
+		env->fdesc_conflicts++;
+	}
+	return 0;
+}
+
+/*
+ * Reserve the unique slots the sites asked for, attach their clears to the
+ * release insns, and make the slots the only listing of their references:
+ * every location listed for such a reference is retracted and the frame
+ * owning the slot lists it instead, NULL on the paths that do not hold it.
+ * A frame relying on a slot that could not be reserved cannot be described.
+ */
+static int fdesc_slots_resolve(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u32 i, k, len = env->prog->len;
+	int ret;
+
+	for (i = 0; i < len; i++) {
+		s16 off;
+		int sub;
+
+		if (aux[i].fdesc_slot != BPF_FDESC_SLOT_WANTED)
+			continue;
+		if (!fdesc_slot_eligible(env, i)) {
+			aux[i].fdesc_slot = BPF_FDESC_SLOT_BAD;
+			continue;
+		}
+		sub = fdesc_insn_subprog(env, i);
+		ret = bpf_reserve_stack_slots(env, sub, 1, &off);
+		ret = ret ?: bpf_stack_slot_init(env, sub, off, 0);
+		if (ret)
+			return ret;
+		aux[i].fdesc_slot = BPF_FDESC_SLOT_RESERVED;
+		aux[i].fdesc_slot_off = off;
+		env->fdesc_slots++;
+	}
+	if (!env->fdesc_slots)
+		return 0;
+
+	/* An eligible acquisition is the only one its release insns release. */
+	for (i = 0; i < env->fdesc_rel_cnt; i++) {
+		const struct bpf_fdesc_rel *r = &env->fdesc_rels[i];
+
+		if (aux[r->acq].fdesc_slot != BPF_FDESC_SLOT_RESERVED)
+			continue;
+		aux[r->rel].fdesc_clear = true;
+		aux[r->rel].fdesc_clear_off = aux[r->acq].fdesc_slot_off;
+	}
+
+	for (i = 0; i < len; i++) {
+		struct bpf_fdesc_build *b = aux[i].fdesc;
+		int sub, l;
+
+		if (!b)
+			continue;
+		sub = fdesc_insn_subprog(env, i);
+		for (l = 0; l < BPF_REG_10 + b->nr_slots; l++) {
+			struct bpf_fdesc_loc *loc = l < BPF_REG_10 ? &b->regs[l] :
+								&b->slots[l - BPF_REG_10];
+
+			if (loc->state != FDESC_LOC_RES ||
+			    aux[loc->acq].fdesc_slot != BPF_FDESC_SLOT_RESERVED)
+				continue;
+			if (loc->multi) {
+				b->conflict = true;
+				env->fdesc_conflicts++;
+				continue;
+			}
+			loc->state = FDESC_LOC_OTHER;
+			ret = fdesc_build_list_slot(env, b, sub, loc->acq);
+			if (ret)
+				return ret;
+		}
+	}
+	for (i = 0; i < len; i++) {
+		struct bpf_fdesc_build *b = aux[i].fdesc;
+
+		if (!b || !b->nr_slot_acqs)
+			continue;
+		b->spills = kvcalloc(b->nr_slot_acqs, sizeof(*b->spills), GFP_KERNEL_ACCOUNT);
+		if (!b->spills)
+			return -ENOMEM;
+		for (k = 0; k < b->nr_slot_acqs; k++) {
+			u32 acq = b->slot_acqs[k];
+
+			if (aux[acq].fdesc_slot != BPF_FDESC_SLOT_RESERVED) {
+				b->conflict = true;
+				env->fdesc_conflicts++;
+				continue;
+			}
+			b->spills[b->nr_spills++] = (struct bpf_fdesc_ent) {
+				.loc = BPF_FDESC_LOC_STACK, .flags = BPF_FDESC_F_NULLABLE,
+				.res = aux[acq].fdesc_slot_res, .off = aux[acq].fdesc_slot_off,
+				.order = -2,
+			};
+		}
+	}
+	return 0;
+}
+
 /* Can the unwinder enter at the site of @b and get through every frame above it? */
 static bool fdesc_build_valid(struct bpf_verifier_env *env, const struct bpf_fdesc_build *b)
 {
@@ -1353,13 +1652,29 @@ static bool fdesc_build_valid(struct bpf_verifier_env *env, const struct bpf_fde
 	return true;
 }
 
+/*
+ * After verification, decide which sites the unwinder may be entered from. A
+ * frame whose descriptor conflicts cannot be unwound through, which takes
+ * every site reached under it with it: an explicit site then rejects the
+ * program, an implicit site falls back. A program keeping an implicit site
+ * needs the exception boundary the throw path relies on.
+ *
+ * A global subprog is verified on its own, so its sites know nothing of its
+ * callers: each call to it is a site in the caller, and the frames of a
+ * global subprog, or of anything it calls, can only be unwound when every
+ * call to it can be. A site below a callback can never be: a kernel frame
+ * sits between it and the exception boundary.
+ */
 int bpf_fdesc_resolve(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_subprog_info *subprog = env->subprog_info;
 	bool changed;
-	int i;
+	int i, ret;
 
+	ret = fdesc_slots_resolve(env);
+	if (ret)
+		return ret;
 	for (i = 0; i < env->prog->len; i++) {
 		struct bpf_fdesc_build *b = aux[i].fdesc;
 
@@ -1425,4 +1740,74 @@ void bpf_fdesc_move_site(struct bpf_verifier_env *env, u32 from, u32 to)
 		return;
 	}
 	env->insn_aux_data[to].fdesc = b;
+}
+
+/*
+ * Record that reference @id is released at the current insn: the unique slot
+ * of its acquisition, if it gets one, is cleared there. A NULL check releases
+ * a reference too, but leaves nothing in a slot.
+ */
+int bpf_fdesc_release_hook(struct bpf_verifier_env *env, int id)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_fdesc_rel *rels, rel = { .rel = env->insn_idx };
+	u32 i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].type == REF_TYPE_PTR && st->refs[i].id == id)
+			break;
+	if (i == st->acquired_refs)
+		return 0;
+	rel.acq = st->refs[i].insn_idx;
+	for (i = 0; i < env->fdesc_rel_cnt; i++)
+		if (env->fdesc_rels[i].rel == rel.rel && env->fdesc_rels[i].acq == rel.acq)
+			return 0;
+	rels = kvrealloc(env->fdesc_rels, array_size(env->fdesc_rel_cnt + 1, sizeof(*rels)),
+			 GFP_KERNEL_ACCOUNT);
+	if (!rels)
+		return -ENOMEM;
+	rels[env->fdesc_rel_cnt++] = rel;
+	env->fdesc_rels = rels;
+	return 0;
+}
+
+/*
+ * Keep the unique slots up to date: store the result of an acquisition into
+ * its slot, and clear the slot before a release. Patching a call keeps the
+ * jumps to it, so the clear precedes it; the aux data of the call, with the
+ * descriptor of the site it may be, is moved back onto it.
+ */
+int bpf_fdesc_emit_slots(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn_buf = env->insn_buf;
+	int i, cnt, delta = 0, insn_cnt = env->prog->len;
+
+	if (!env->fdesc_slots)
+		return 0;
+	for (i = 0; i < insn_cnt; i++) {
+		struct bpf_insn_aux_data *aux = &env->insn_aux_data[i + delta];
+		struct bpf_insn *insn = &env->prog->insnsi[i + delta], *p = insn_buf;
+		bool spill = aux->fdesc_slot == BPF_FDESC_SLOT_RESERVED;
+		struct bpf_prog *new_prog;
+
+		if (!spill && !aux->fdesc_clear)
+			continue;
+		if (aux->fdesc_clear)
+			*p++ = BPF_ST_MEM(BPF_DW, BPF_REG_10, aux->fdesc_clear_off, 0);
+		*p++ = *insn;
+		if (spill)
+			*p++ = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, aux->fdesc_slot_off);
+		cnt = p - insn_buf;
+		new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+		if (!new_prog)
+			return -ENOMEM;
+		env->prog = new_prog;
+		/* The aux data of the call, which later fixups need, landed on the store. */
+		if (spill)
+			swap(env->insn_aux_data[i + delta + cnt - 1],
+			     env->insn_aux_data[i + delta + cnt - 2]);
+		env->fdesc_spills += cnt - 1;
+		delta += cnt - 1;
+	}
+	return 0;
 }

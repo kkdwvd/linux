@@ -2971,6 +2971,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 				 BPF_F_XDP_HAS_FRAGS |
 				 BPF_F_XDP_DEV_BOUND_ONLY |
 				 BPF_F_TEST_REG_INVARIANTS |
+				 BPF_F_TEST_SPILL_REFS |
 				 BPF_F_ARENA_SCALAR |
 				 BPF_F_TOKEN_FD))
 		return -EINVAL;

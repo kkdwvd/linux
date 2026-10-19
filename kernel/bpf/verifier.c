@@ -10963,6 +10963,9 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
 	int err;
 
+	err = bpf_fdesc_release_hook(env, id);
+	if (err)
+		return err;
 	err = __release_reference_nomark(env->cur_state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
@@ -21987,10 +21990,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->max_states_per_insn, env->total_states,
 		env->peak_states, env->longest_mark_read_walk);
 	if (env->log.level & BPF_LOG_STATS)
-		verbose(env, "frame descriptors: sites %u visits %u conflicts %u classes %u bytes %u fallbacks %u masked %u\n",
+		verbose(env, "frame descriptors: sites %u visits %u conflicts %u classes %u bytes %u fallbacks %u masked %u slots %u spills %u\n",
 			env->fdesc_sites, env->fdesc_visits, env->fdesc_conflicts,
 			env->fdesc_pool ? env->fdesc_pool->res_cnt : env->fdesc_res_cnt,
-			env->fdesc_bytes, env->fdesc_fallbacks, env->fdesc_masked);
+			env->fdesc_bytes, env->fdesc_fallbacks, env->fdesc_masked,
+			env->fdesc_slots, env->fdesc_spills);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
@@ -23819,8 +23823,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (attr->prog_flags & BPF_F_ANY_ALIGNMENT)
 		env->strict_alignment = false;
 
-	if (is_priv)
+	if (is_priv) {
 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
+		env->fdesc_spill_all = attr->prog_flags & BPF_F_TEST_SPILL_REFS;
+	}
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
 
@@ -23954,9 +23960,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
 	ret = do_check_main(env);
 	ret = ret ?: do_check_subprogs(env);
-	/* Global subprogs have sites of their own: resolve once every frame is described. */
-	if (ret == 0)
-		ret = bpf_fdesc_resolve(env);
 
 	/* reject recursion through the callx edges found by the main pass */
 	if (ret == 0 && env->callx_edges)
@@ -23977,6 +23980,13 @@ skip_full_check:
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
+	/*
+	 * Every frame is described, including those of global subprogs, and the
+	 * stack is final: resolve the sites and reserve the unique slots.
+	 */
+	if (ret == 0)
+		ret = bpf_fdesc_resolve(env);
+
 	/* instruction rewrites happen after this point */
 	if (ret == 0)
 		ret = bpf_optimize_bpf_loop(env);
@@ -23996,6 +24006,9 @@ skip_full_check:
 	if (ret == 0)
 		/* program is valid, convert *(u32*)(ctx + off) accesses */
 		ret = bpf_convert_ctx_accesses(env);
+
+	if (ret == 0)
+		ret = bpf_fdesc_emit_slots(env);
 
 	if (ret == 0)
 		ret = bpf_do_misc_fixups(env);
