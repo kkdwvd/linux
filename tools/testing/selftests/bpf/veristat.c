@@ -57,6 +57,8 @@ enum stat_id {
 	FDESC_CONFLICTS,
 	FDESC_CLASSES,
 	FDESC_BYTES,
+	FDESC_FALLBACKS,
+	FDESC_MASKED,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -817,7 +819,7 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 21,
+	.spec_cnt = 23,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
@@ -825,7 +827,7 @@ static const struct stat_specs default_csv_output_spec = {
 		SIZE, JITED_SIZE, PROG_TYPE, ATTACH_TYPE,
 		STACK, MAX_STACK, MEMORY_PEAK,
 		FDESC_SITES, FDESC_VISITS, FDESC_CONFLICTS,
-		FDESC_CLASSES, FDESC_BYTES,
+		FDESC_CLASSES, FDESC_BYTES, FDESC_FALLBACKS, FDESC_MASKED,
 	},
 };
 
@@ -873,6 +875,8 @@ static struct stat_def {
 	[FDESC_CONFLICTS] = { "Frame desc conflicts", {"fdesc_conflicts", }, },
 	[FDESC_CLASSES] = { "Frame desc classes", {"fdesc_classes", }, },
 	[FDESC_BYTES] = { "Frame desc bytes", {"fdesc_bytes", }, },
+	[FDESC_FALLBACKS] = { "Frame desc fallbacks", {"fdesc_fallbacks", }, },
+	[FDESC_MASKED] = { "Frame desc masked", {"fdesc_masked", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1061,12 +1065,14 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				&s->stats[MARK_READ_MAX_LEN]))
 			continue;
 		/* Only kernels with frame descriptors print this line. */
-		if (5 == sscanf(cur, "frame descriptors: sites %ld visits %ld conflicts %ld classes %ld bytes %ld",
+		if (5 <= sscanf(cur, "frame descriptors: sites %ld visits %ld conflicts %ld classes %ld bytes %ld fallbacks %ld masked %ld",
 				&s->stats[FDESC_SITES],
 				&s->stats[FDESC_VISITS],
 				&s->stats[FDESC_CONFLICTS],
 				&s->stats[FDESC_CLASSES],
-				&s->stats[FDESC_BYTES]))
+				&s->stats[FDESC_BYTES],
+				&s->stats[FDESC_FALLBACKS],
+				&s->stats[FDESC_MASKED]))
 			continue;
 
 		/*
@@ -2373,6 +2379,8 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case FDESC_CONFLICTS:
 	case FDESC_CLASSES:
 	case FDESC_BYTES:
+	case FDESC_FALLBACKS:
+	case FDESC_MASKED:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2609,6 +2617,8 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case FDESC_CONFLICTS:
 	case FDESC_CLASSES:
 	case FDESC_BYTES:
+	case FDESC_FALLBACKS:
+	case FDESC_MASKED:
 		*val = s ? s->stats[id] : 0;
 		break;
 	default:
@@ -2701,6 +2711,8 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case FDESC_CONFLICTS:
 	case FDESC_CLASSES:
 	case FDESC_BYTES:
+	case FDESC_FALLBACKS:
+	case FDESC_MASKED:
 	case STACK:
 	case MAX_STACK: {
 		long val;
