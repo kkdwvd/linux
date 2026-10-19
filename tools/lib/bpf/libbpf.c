@@ -6902,8 +6902,12 @@ static int create_func_ptr_map(struct bpf_object *obj, struct bpf_program *prog,
 			    prog->subprogs[j].sec_insn_off == sec_insn_off)
 				break;
 		if (j == prog->subprog_cnt) {
-			pr_debug("prog '%s': map '%s': no function for the pointer at offset %zu, it's NULL\n",
-				 prog->name, map->name, ptrs[i].sec_off);
+			struct bpf_program *func;
+
+			/* a virtual call through it would be a call of NULL */
+			func = find_prog_by_sec_insn(obj, ptrs[i].func_sec_idx, sec_insn_off);
+			pr_warn("prog '%s': map '%s': pointer at offset %zu to global function '%s' is NULL, callx calls static and hidden functions only\n",
+				prog->name, map->name, ptrs[i].sec_off, func ? func->name : "<?>");
 			val = 0;
 		} else {
 			val = (__u64)prog->subprogs[j].sub_insn_off * BPF_INSN_SZ;
