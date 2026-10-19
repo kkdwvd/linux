@@ -571,7 +571,7 @@ struct bpf_struct_ops {
  * by pointer has to be in such section.
  * Pointers to data that are stored in data become addresses of arena.
  * The load fails if such pointer points to a section that is not in arena,
- * or if the arena is pinned or reused.
+ * or if the arena is pinned or reused and has no map_extra.
  *
  * It's for programs written in Rust. There are no address spaces in Rust,
  * the program accesses arena through plain numbers, so programs of the object
@@ -8348,14 +8348,20 @@ err_out:
 }
 
 /*
- * Turn pointers to data that are stored in data into addresses of arena.
- * The arena is created here, ahead of the other maps: the address has to be
- * known before the maps that hold the pointers are created.
+ * Turn pointers to data that are stored in data into addresses of arena,
+ * the addresses that the kernel gives programs for the data: the user
+ * address of the arena plus the offset of the data. The address has to be
+ * known before the maps that hold the pointers are created. An arena with
+ * map_extra is at map_extra whoever creates it, a pinned arena included:
+ * libbpf reuses a pinned map only if its map_extra is the same. Without
+ * map_extra the first mmap() of the arena picks the address, so libbpf
+ * creates and maps the arena here, ahead of the other maps. It can't know
+ * the address of such arena that it doesn't create.
  */
 static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 {
 	struct bpf_map *arena, *map, *targ;
-	__u64 addr, val;
+	__u64 base, addr, val;
 	size_t i;
 	int err;
 
@@ -8389,20 +8395,22 @@ static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 	arena = &obj->maps[obj->arena_map_idx];
 	if (!arena->autocreate)
 		return 0;
-	/* libbpf doesn't mmap an arena that it didn't create, so the address is not known */
-	if (arena->reused || arena->pin_path) {
-		pr_warn("map '%s': pointers to data in data are not supported with pinned or reused arena\n",
+	if (arena->map_extra) {
+		base = arena->map_extra;
+	} else if (arena->reused || arena->pin_path) {
+		pr_warn("map '%s': pointers to data in data need the address of pinned or reused arena, set its map_extra\n",
 			arena->name);
 		return -ENOTSUP;
+	} else {
+		err = bpf_object__create_map(obj, arena, false);
+		err = err ?: bpf_object__mmap_arena(obj, arena);
+		if (err) {
+			pr_warn("map '%s': failed to create: %s\n", arena->name, errstr(err));
+			return err;
+		}
+		obj->arena_mapped = true;
+		base = (__u64)(unsigned long)arena->mmaped;
 	}
-
-	err = bpf_object__create_map(obj, arena, false);
-	err = err ?: bpf_object__mmap_arena(obj, arena);
-	if (err) {
-		pr_warn("map '%s': failed to create: %s\n", arena->name, errstr(err));
-		return err;
-	}
-	obj->arena_mapped = true;
 
 	for (i = 0; i < obj->data_ptr_cnt; i++) {
 		struct data_ptr *p = &obj->data_ptrs[i];
@@ -8411,7 +8419,7 @@ static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 		if (!map || (!map->in_arena && !map->autocreate))
 			continue;
 
-		addr = (__u64)(unsigned long)arena->mmaped + obj->arena_data_off + p->targ_off;
+		addr = base + obj->arena_data_off + p->targ_off;
 		if (p->targ_sec_idx >= 0)
 			addr += bpf_object__sec_map(obj, p->targ_sec_idx)->arena_off;
 
