@@ -11340,6 +11340,22 @@ __bpf_kfunc void scx_bpf_put_cpumask(const struct cpumask *cpumask)
 	 */
 }
 
+/*
+ * Destructors the unwinder runs for the references a cancelled program holds:
+ * a cpumask from any of the get kfuncs, and a DSQ iterator.
+ */
+__bpf_kfunc void scx_bpf_put_cpumask_dtor(void *p)
+{
+	scx_bpf_put_cpumask(p);
+}
+CFI_NOSEAL(scx_bpf_put_cpumask_dtor);
+
+__bpf_kfunc void bpf_iter_scx_dsq_destroy_dtor(void *p)
+{
+	bpf_iter_scx_dsq_destroy(p);
+}
+CFI_NOSEAL(bpf_iter_scx_dsq_destroy_dtor);
+
 /**
  * scx_bpf_task_running - Is task the current scheduling context?
  * @p: task of interest
@@ -11712,6 +11728,10 @@ static const struct btf_kfunc_id_set scx_kfunc_set_any = {
 	.filter			= scx_kfunc_context_filter,
 };
 
+BPF_DTOR_ID_LIST(scx_cpumask_dtor_ids, cpumask, scx_bpf_put_cpumask_dtor, scx_bpf_put_cpumask)
+BPF_DTOR_ID_LIST(scx_dsq_iter_dtor_ids, bpf_iter_scx_dsq, bpf_iter_scx_dsq_destroy_dtor,
+		 bpf_iter_scx_dsq_destroy)
+
 /*
  * cpu-form kfuncs that are forbidden from cid-form schedulers
  * (bpf_sched_ext_ops_cid). Programs targeting the cid struct_ops type must
@@ -11997,6 +12017,18 @@ static int __init scx_init(void)
 	    (ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
 					     &scx_kfunc_set_any))) {
 		pr_err("sched_ext: Failed to register kfunc sets (%d)\n", ret);
+		return ret;
+	}
+
+	/* The BTF ids are resolved at link time, so the entries are not constants. */
+	const struct btf_id_dtor_kfunc scx_dtors[] = {
+		BPF_DTOR_ENTRY(scx_cpumask_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(scx_dsq_iter_dtor_ids, BPF_DTOR_CLEANUP),
+	};
+
+	ret = register_btf_id_dtor_kfuncs(scx_dtors, ARRAY_SIZE(scx_dtors), THIS_MODULE);
+	if (ret) {
+		pr_err("sched_ext: Failed to register destructors (%d)\n", ret);
 		return ret;
 	}
 
