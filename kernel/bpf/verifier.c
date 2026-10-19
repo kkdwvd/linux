@@ -24326,6 +24326,7 @@ err_free_env:
 	kvfree(env->gotox_tmp_buf);
 	kvfree(env->callx_edges);
 	kvfree(env->func_ptrs);
+	kvfree(env->stack_inits);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

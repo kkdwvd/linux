@@ -456,6 +456,106 @@ static int adjust_jmp_off(struct bpf_prog *prog, u32 tgt_idx, u32 delta)
 	return 0;
 }
 
+/*
+ * Hidden stack slots. Post-verification rewrites need stack space the program
+ * does not know about: may_goto counters, the spill area of an inlined
+ * bpf_loop(), the context pointer a generated epilogue reads back. Such slots
+ * are reserved below the stack depth verification established for a
+ * subprogram, after bpf_remove_fastcall_spills_fills() has shrunk it, so that
+ * they sit directly under the program's own frame. Slots are 8 bytes, 8-byte
+ * aligned and handed out top down: the first slot of a subprogram lies right
+ * below its verified depth rounded up to 8 bytes.
+ */
+static s16 next_stack_slot_off(const struct bpf_subprog_info *info)
+{
+	return -(s32)(round_up(info->stack_depth, BPF_REG_SIZE) + BPF_REG_SIZE);
+}
+
+/* Reserve @nr slots in @subprog; @off receives the offset of the topmost one. */
+int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off)
+{
+	struct bpf_subprog_info *info = &env->subprog_info[subprog];
+	u32 depth = round_up(info->stack_depth, BPF_REG_SIZE) + nr * BPF_REG_SIZE;
+	u32 extra = depth - info->stack_depth;
+
+	if ((depth > MAX_BPF_STACK && !env->prog->jit_requested) || depth > S16_MAX + 1U) {
+		verbose(env, "stack size %d(extra %d) is too large\n", depth, info->stack_extra + extra);
+		return -EINVAL;
+	}
+	*off = next_stack_slot_off(info);
+	info->stack_depth = depth;
+	info->stack_extra += extra;
+	return 0;
+}
+
+/* Initialize the hidden slot at @off of @subprog to @imm in its prologue. */
+int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm)
+{
+	struct bpf_stack_init *inits;
+	u32 cnt = env->stack_init_cnt;
+
+	inits = kvrealloc(env->stack_inits, array_size(cnt + 1, sizeof(*inits)),
+			  GFP_KERNEL_ACCOUNT);
+	if (!inits)
+		return -ENOMEM;
+	inits[cnt] = (struct bpf_stack_init) { .subprog = subprog, .off = off, .imm = imm };
+	env->stack_inits = inits;
+	env->stack_init_cnt = cnt + 1;
+	return 0;
+}
+
+/*
+ * Emit the stores that initialize hidden slots at the start of each subprogram.
+ * Jumps to the first instruction are redirected past the stores, so a loop back
+ * to the entry does not rerun the initialization.
+ */
+static int bpf_emit_stack_inits(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn_buf = env->insn_buf;
+	struct bpf_prog *new_prog;
+	u32 i, j, cnt;
+	int ret;
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		u32 start = env->subprog_info[i].start;
+
+		j = 0;
+		do {
+			cnt = 0;
+			for (; j < env->stack_init_cnt && cnt < INSN_BUF_SIZE - 1; j++) {
+				const struct bpf_stack_init *init = &env->stack_inits[j];
+
+				if (init->subprog == i)
+					insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, init->off,
+								     init->imm);
+			}
+			if (!cnt)
+				break;
+			/* Copy the first instruction to preserve it. */
+			insn_buf[cnt] = env->prog->insnsi[start];
+			ret = bpf_adj_moved_insn(&insn_buf[cnt], cnt);
+			if (ret) {
+				verbose(env, "insn %d cannot be patched due to 16-bit range\n",
+					env->insn_aux_data[start].orig_idx);
+				return ret;
+			}
+			cnt++;
+			new_prog = __bpf_patch_insn_data(env, start, insn_buf, cnt,
+							 BPF_PATCH_MOVE_TARGET);
+			if (!new_prog)
+				return -ENOMEM;
+			env->prog = new_prog;
+			/*
+			 * A jump to the first instruction has to land after the
+			 * stores. Adjustment will succeed because
+			 * bpf_patch_insn_data() didn't fail.
+			 */
+			WARN_ON(adjust_jmp_off(env->prog, start, cnt - 1));
+		} while (j < env->stack_init_cnt);
+	}
+	return 0;
+}
+
 static int adjust_subprog_starts_after_remove(struct bpf_verifier_env *env,
 					      u32 off, u32 cnt)
 {
@@ -944,17 +1044,23 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 	int epilogue_idx = 0;
 
 	if (ops->gen_epilogue) {
-		epilogue_cnt = ops->gen_epilogue(epilogue_buf, env->prog,
-						 -(subprogs[0].stack_depth + 8));
+		s16 ctx_off = next_stack_slot_off(&subprogs[0]);
+
+		epilogue_cnt = ops->gen_epilogue(epilogue_buf, env->prog, ctx_off);
 		if (epilogue_cnt >= INSN_BUF_SIZE) {
 			verifier_bug(env, "epilogue is too long");
 			return -EFAULT;
 		} else if (epilogue_cnt) {
+			s16 off;
+
 			/* Save the ARG_PTR_TO_CTX for the epilogue to use */
+			ret = bpf_reserve_stack_slots(env, 0, 1, &off);
+			if (ret)
+				return ret;
+			if (verifier_bug_if(off != ctx_off, env, "epilogue context slot moved"))
+				return -EFAULT;
 			cnt = 0;
-			subprogs[0].stack_depth += 8;
-			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_1,
-						      -subprogs[0].stack_depth);
+			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_1, off);
 			insn_buf[cnt++] = env->prog->insnsi[0];
 			new_prog = __bpf_patch_insn_data(env, 0, insn_buf, cnt,
 							 BPF_PATCH_MOVE_TARGET);
@@ -1806,6 +1912,29 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 }
 
 /*
+ * Reserve the hidden slots of the may_goto instructions of @subprog once:
+ * either the count alone, or the count below the loop's start timestamp, see
+ * struct bpf_timed_may_goto. @off receives the offset of the topmost slot.
+ */
+static int may_goto_stack_slots(struct bpf_verifier_env *env, int subprog, s16 *off)
+{
+	int ret;
+
+	if (*off)
+		return 0;
+	if (bpf_jit_supports_timed_may_goto()) {
+		ret = bpf_reserve_stack_slots(env, subprog, 2, off);
+		ret = ret ?: bpf_stack_slot_init(env, subprog, *off - BPF_REG_SIZE,
+						 BPF_MAX_TIMED_LOOPS);
+		ret = ret ?: bpf_stack_slot_init(env, subprog, *off, 0);
+	} else {
+		ret = bpf_reserve_stack_slots(env, subprog, 1, off);
+		ret = ret ?: bpf_stack_slot_init(env, subprog, *off, BPF_MAX_LOOPS);
+	}
+	return ret;
+}
+
+/*
  * Expand may_goto: load the count from the stack, jump to the target of
  * may_goto when it is zero, then the tail that updates the count.
  * Use gotol when the target is too far for 16-bit offset of a conditional jump.
@@ -1847,8 +1976,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	struct bpf_map *map_ptr;
 	int i, ret, cnt, delta = 0, cur_subprog = 0;
 	struct bpf_subprog_info *subprogs = env->subprog_info;
-	u16 stack_depth = subprogs[cur_subprog].stack_depth;
-	u16 stack_depth_extra = 0;
+	s16 may_goto_off = 0;
 
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn *patch = insn_buf;
@@ -2118,8 +2246,14 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			goto next_insn;
 		}
 
+		if (bpf_is_may_goto_insn(insn)) {
+			ret = may_goto_stack_slots(env, cur_subprog, &may_goto_off);
+			if (ret)
+				return ret;
+		}
+
 		if (bpf_is_may_goto_insn(insn) && bpf_jit_supports_timed_may_goto()) {
-			int stack_off_cnt = -stack_depth - 16;
+			int stack_off_cnt = may_goto_off - BPF_REG_SIZE;
 			/*
 			 * AX is used as an argument to pass in stack_off_cnt
 			 * (to add to r10/fp), and also as the return value of
@@ -2134,9 +2268,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			};
 
 			/*
-			 * Two 8 byte slots, depth-16 stores the count, and
-			 * depth-8 stores the start timestamp of the loop.
-			 *
 			 * The starting value of count is BPF_MAX_TIMED_LOOPS
 			 * (0xffff).  Every iteration loads it and subs it by 1,
 			 * until the value becomes 0 in AX (thus, 1 in stack),
@@ -2147,7 +2278,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			 * continue iterating until the next time value is 0
 			 * after subtraction, rinse and repeat.
 			 */
-			stack_depth_extra = 16;
 			cnt = may_goto_expand(insn_buf, insn->off, stack_off_cnt,
 					      tail, ARRAY_SIZE(tail));
 
@@ -2160,13 +2290,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			insn = new_prog->insnsi + i + delta;
 			goto next_insn;
 		} else if (bpf_is_may_goto_insn(insn)) {
-			int stack_off = -stack_depth - 8;
+			int stack_off = may_goto_off;
 			struct bpf_insn tail[] = {
 				BPF_ALU64_IMM(BPF_SUB, BPF_REG_AX, 1),
 				BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_AX, stack_off),
 			};
 
-			stack_depth_extra = 8;
 			cnt = may_goto_expand(insn_buf, insn->off, stack_off,
 					      tail, ARRAY_SIZE(tail));
 
@@ -2751,71 +2880,18 @@ patch_call_imm:
 		insn->imm = BPF_CALL_IMM(fn->func);
 next_insn:
 		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
-			subprogs[cur_subprog].stack_depth += stack_depth_extra;
-			subprogs[cur_subprog].stack_extra = stack_depth_extra;
-
-			stack_depth = subprogs[cur_subprog].stack_depth;
-			if (stack_depth > MAX_BPF_STACK && !prog->jit_requested) {
-				verbose(env, "stack size %d(extra %d) is too large\n",
-					stack_depth, stack_depth_extra);
-				return -EINVAL;
-			}
 			cur_subprog++;
-			stack_depth = subprogs[cur_subprog].stack_depth;
-			stack_depth_extra = 0;
+			may_goto_off = 0;
 		}
 		i++;
 		insn++;
 	}
 
-	env->prog->aux->stack_depth = subprogs[0].stack_depth;
-	for (i = 0; i < env->subprog_cnt; i++) {
-		int delta = bpf_jit_supports_timed_may_goto() ? 2 : 1;
-		int subprog_start = subprogs[i].start;
-		int stack_slots = subprogs[i].stack_extra / 8;
-		int slots = delta, cnt = 0;
-
-		if (!stack_slots)
-			continue;
-		/* We need two slots in case timed may_goto is supported. */
-		if (stack_slots > slots) {
-			verifier_bug(env, "stack_slots supports may_goto only");
-			return -EFAULT;
-		}
-
-		stack_depth = subprogs[i].stack_depth;
-		if (bpf_jit_supports_timed_may_goto()) {
-			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth,
-						     BPF_MAX_TIMED_LOOPS);
-			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth + 8, 0);
-		} else {
-			/* Add ST insn to subprog prologue to init extra stack */
-			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, -stack_depth,
-						     BPF_MAX_LOOPS);
-		}
-		/* Copy first actual insn to preserve it */
-		insn_buf[cnt] = env->prog->insnsi[subprog_start];
-		ret = bpf_adj_moved_insn(&insn_buf[cnt], cnt);
-		if (ret) {
-			verbose(env, "insn %d cannot be patched due to 16-bit range\n",
-				env->insn_aux_data[subprog_start].orig_idx);
-			return ret;
-		}
-		cnt++;
-
-		new_prog = __bpf_patch_insn_data(env, subprog_start, insn_buf, cnt,
-						 BPF_PATCH_MOVE_TARGET);
-		if (!new_prog)
-			return -ENOMEM;
-		env->prog = prog = new_prog;
-		/*
-		 * If may_goto is a first insn of a prog there could be a jmp
-		 * insn that points to it, hence adjust all such jmps to point
-		 * to insn after BPF_ST that inits may_goto count.
-		 * Adjustment will succeed because bpf_patch_insn_data() didn't fail.
-		 */
-		WARN_ON(adjust_jmp_off(env->prog, subprog_start, delta));
-	}
+	ret = bpf_emit_stack_inits(env);
+	if (ret)
+		return ret;
+	prog = env->prog;
+	prog->aux->stack_depth = subprogs[0].stack_depth;
 
 	/* Since poke tab is now finalized, publish aux to tracker. */
 	for (i = 0; i < prog->aux->size_poke_tab; i++) {
@@ -2964,24 +3040,22 @@ static bool is_bpf_loop_call(struct bpf_insn *insn)
 		insn->imm == BPF_FUNC_loop;
 }
 
-/* For all sub-programs in the program (including main) check
+/*
+ * For all sub-programs in the program (including main) check
  * insn_aux_data to see if there are bpf_loop calls that require
  * inlining. If such calls are found the calls are replaced with a
  * sequence of instructions produced by `inline_bpf_loop` function and
- * subprog stack_depth is increased by the size of 3 registers.
- * This stack space is used to spill values of the R6, R7, R8.  These
- * registers are used to store the loop bound, counter and context
- * variables.
+ * three hidden stack slots are reserved in the subprog to spill the
+ * values of R6, R7, R8. These registers are used to store the loop
+ * bound, counter and context variables.
  */
 int bpf_optimize_bpf_loop(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *subprogs = env->subprog_info;
-	int i, cur_subprog = 0, cnt, delta = 0;
+	int i, cur_subprog = 0, cnt, delta = 0, ret;
 	struct bpf_insn *insn = env->prog->insnsi;
 	int insn_cnt = env->prog->len;
-	u16 stack_depth = subprogs[cur_subprog].stack_depth;
-	u16 stack_depth_roundup = round_up(stack_depth, 8) - stack_depth;
-	u16 stack_depth_extra = 0;
+	s16 loop_off = 0;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		struct bpf_loop_inline_state *inline_state =
@@ -2990,10 +3064,15 @@ int bpf_optimize_bpf_loop(struct bpf_verifier_env *env)
 		if (is_bpf_loop_call(insn) && inline_state->fit_for_inline) {
 			struct bpf_prog *new_prog;
 
-			stack_depth_extra = BPF_REG_SIZE * 3 + stack_depth_roundup;
+			/* Three slots spill R6, R7 and R8, shared by the subprog's loops. */
+			if (!loop_off) {
+				ret = bpf_reserve_stack_slots(env, cur_subprog, 3, &loop_off);
+				if (ret)
+					return ret;
+			}
 			new_prog = inline_bpf_loop(env,
 						   i + delta,
-						   -(stack_depth + stack_depth_extra),
+						   loop_off - 2 * BPF_REG_SIZE,
 						   inline_state->callback_subprogno,
 						   &cnt);
 			if (!new_prog)
@@ -3005,11 +3084,8 @@ int bpf_optimize_bpf_loop(struct bpf_verifier_env *env)
 		}
 
 		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
-			subprogs[cur_subprog].stack_depth += stack_depth_extra;
 			cur_subprog++;
-			stack_depth = subprogs[cur_subprog].stack_depth;
-			stack_depth_roundup = round_up(stack_depth, 8) - stack_depth;
-			stack_depth_extra = 0;
+			loop_off = 0;
 		}
 	}
 
