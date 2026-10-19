@@ -529,7 +529,7 @@ DEFAULT_RUNNER_ARGS := RUNNER=test_progs FLAVOR= TESTS_DIR=prog_tests	\
 CLANG_RUNNER_ARGS := BPF_CC='$(CLANG)' BPF_CC_MSG=CLNG-BPF		\
 	BPF_SYS_INCLUDES='$(CLANG_SYS_INCLUDES)'
 
-$(OUTPUT)/test_progs: $(RUNNER_PREREQS) $(BPF_OBJS) $(ALL_SKELS) FORCE
+$(OUTPUT)/test_progs: $(RUNNER_PREREQS) $(BPF_OBJS) $(BPF_ARCHIVES) $(ALL_SKELS) FORCE
 	+$(Q)$(RUNNER_MAKE) $(DEFAULT_RUNNER_ARGS)
 
 $(OUTPUT)/test_progs-no_alu32: $(RUNNER_PREREQS) FORCE
@@ -560,7 +560,7 @@ $(OUTPUT)/test_maps: $(RUNNER_PREREQS) $(BPF_OBJS)	\
 		     $(ALL_SKELS) FORCE
 	+$(Q)$(RUNNER_MAKE) RUNNER=test_maps FLAVOR= TESTS_DIR=map_tests
 
-TEST_GEN_FILES += $(BPF_OBJS)
+TEST_GEN_FILES += $(BPF_OBJS) $(BPF_ARCHIVES)
 
 # Define test_verifier test runner.
 # It is much simpler than test_maps/test_progs and sufficiently different from
