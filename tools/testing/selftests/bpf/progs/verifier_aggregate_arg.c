@@ -197,4 +197,38 @@ int aggregate_arg_ptr_member_fail(struct __sk_buff *skb)
 	return take_with_ptr_global(s);
 }
 
+/*
+ * A local function gets the registers of its caller, so a struct with a
+ * pointer in it can be passed by value, also in the slots that go on the
+ * stack, like the three __bit_iterators of libc++'s bitset algorithms.
+ */
+#if (defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64) || \
+	(defined(__TARGET_ARCH_riscv) && __riscv_xlen == 64)) && \
+	defined(__BPF_FEATURE_STACK_ARGUMENT)
+
+struct iter {
+	__u64 *p;
+	__u32 c;
+};
+
+/* six slots: c.c is the sixth, on the stack */
+static __noinline __u64 take_iters(struct iter a, struct iter b, struct iter c)
+{
+	return *a.p + a.c + *b.p + b.c + *c.p + c.c;
+}
+
+SEC("tc")
+__success __retval(0)
+int aggregate_arg_static_ptr_member_stack_arg(struct __sk_buff *skb)
+{
+	__u64 v[3] = { skb->len ^ MIX_A, skb->len ^ MIX_B, 7 };
+	struct iter a = { &v[0], 1 }, b = { &v[1], 2 }, c = { &v[2], 3 };
+
+	if (take_iters(a, b, c) != v[0] + v[1] + v[2] + 6)
+		return 1;
+	return 0;
+}
+
+#endif
+
 char _license[] SEC("license") = "GPL";
