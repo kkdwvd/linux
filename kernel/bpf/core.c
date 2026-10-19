@@ -3332,6 +3332,17 @@ bool __weak bpf_jit_supports_unwind(void)
 }
 
 /*
+ * A callback that can unwind returns the bit in r3 and the helper reads it from
+ * the arch's second return register, next to r0. True when r3 is that register,
+ * or when the JIT moves it there in the epilogue of such a callback and back
+ * into r3 after a call of a helper that passes it on.
+ */
+bool __weak bpf_jit_supports_cb_unwind(void)
+{
+	return false;
+}
+
+/*
  * A subprog that can unwind says so in r3 and its caller does
  * 'if r3 != 0 goto pad' after the call. A JIT can keep that off the normal path.
  * It doesn't emit the branch and adds an extable entry instead:

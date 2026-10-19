@@ -5128,6 +5128,12 @@ bool bpf_jit_supports_unwind(void)
 	return true;
 }
 
+/* r3 is rdx, the second return register of the ABI. Nothing to move. */
+bool bpf_jit_supports_cb_unwind(void)
+{
+	return true;
+}
+
 const struct bpf_jit_arg_abi *bpf_jit_arg_abi(void)
 {
 	return &x86_arg_abi;

@@ -535,6 +535,9 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			bt_clear_reg(bt, BPF_REG_0);
 			/* kfunc might also set R2 */
 			bt_clear_reg(bt, BPF_REG_2);
+			/* a helper that passes on the unwind bit of its callback sets R3 */
+			if (bpf_helper_call(insn) && env->insn_aux_data[idx].cb_unwind)
+				bt_clear_reg(bt, BPF_REG_UNWIND);
 			if (bt_reg_mask(bt) & BPF_REGMASK_ARGS) {
 				/* if backtracking was looking for registers R1-R5
 				 * they should have been found already.

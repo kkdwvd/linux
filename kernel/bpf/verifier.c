@@ -11983,8 +11983,20 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 					       "At callback return", "R0");
 			return -EINVAL;
 		}
-		/* the helper that called it does not look at r3 */
-		if (ret_unwind) {
+		if (ret_unwind && env->insn_aux_data[callee->callsite].cb_unwind) {
+			struct bpf_reg_state *r3 = &callee->regs[BPF_REG_UNWIND];
+
+			/* the helper reads r3 and passes it on */
+			err = check_reg_arg(env, BPF_REG_UNWIND, SRC_OP);
+			if (err)
+				return err;
+			if (r3->type != SCALAR_VALUE) {
+				verbose(env, "At callback return the register R%d is not a scalar value (%s)\n",
+					BPF_REG_UNWIND, reg_type_str(env, r3->type));
+				return -EINVAL;
+			}
+		} else if (ret_unwind) {
+			/* the helper that called it does not look at r3 */
 			if (!bpf_register_is_null(&callee->regs[BPF_REG_UNWIND])) {
 				verbose(env, "callback cannot unwind\n");
 				return -EINVAL;
@@ -12474,6 +12486,41 @@ static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 	return err;
 }
 
+/*
+ * Does the helper pass on the unwind bit of the callback it calls? Only when the
+ * callback says something in r3, the helper has a variant that reads it, and the
+ * JIT delivers it in the second return register. Otherwise the callback is held
+ * to r3 == 0 at exit, as for any helper that does not look at r3.
+ */
+static bool helper_cb_unwind(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta)
+{
+	if (!meta->fn->func_unwind || !bpf_jit_supports_cb_unwind())
+		return false;
+	if (!subprog_info(env, meta->subprogno)->ret_unwind)
+		return false;
+	if (meta->func_id == BPF_FUNC_for_each_map_elem &&
+	    (!meta->map.ptr || !meta->map.ptr->ops->map_for_each_callback_unwind))
+		return false;
+	return true;
+}
+
+/* The fixup pass picks the variant per insn, so every visit has to agree. */
+static int record_cb_unwind(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
+			    int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	bool cb_unwind = helper_cb_unwind(env, meta);
+
+	if (aux->cb_unwind_seen && aux->cb_unwind != cb_unwind) {
+		verbose(env, "callbacks passed to %s#%d at insn %d disagree on unwinding\n",
+			meta->func_name, meta->func_id, insn_idx);
+		return -EINVAL;
+	}
+	aux->cb_unwind_seen = true;
+	aux->cb_unwind = cb_unwind;
+	return 0;
+}
+
 static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			     int *insn_idx_p)
 {
@@ -12589,6 +12636,12 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 				   (reg->type & MEM_ALLOC) && (reg->type & MEM_PERCPU);
 
 		err = release_reg(env, reg, convert_rcu, !!meta.dynptr.id);
+		if (err)
+			return err;
+	}
+
+	if (is_sync_callback_calling_function(func_id)) {
+		err = record_cb_unwind(env, &meta, insn_idx);
 		if (err)
 			return err;
 	}
@@ -12932,6 +12985,13 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 
 	bpf_diag_mod_end(env);
+
+	/* The callback can unwind and the helper passes the bit on in r3. */
+	if (env->insn_aux_data[insn_idx].cb_unwind) {
+		bpf_diag_mod_begin(env, &regs[BPF_REG_UNWIND], NULL, BPF_DIAG_MOD_WRITE);
+		mark_reg_unknown(env, regs, BPF_REG_UNWIND);
+		bpf_diag_mod_end(env);
+	}
 
 	err = check_map_func_compatibility(env, meta.map.ptr, func_id);
 	if (err)
@@ -19889,6 +19949,12 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	 * Exit from exception callback is equivalent to main program exit.
 	 * Exit from async callback implies return code restrictions
 	 * that depend on async scheduling mechanism.
+	 * Neither has a BPF caller frame that looks at r3: the kernel calls
+	 * an async callback and bpf_throw() lands in the exception callback,
+	 * and both take r0 only. An exit with r3 != 0 in a subprog that can
+	 * unwind is a plain return there, the lookup of the return address
+	 * on the way out finds no pad. So such a frame may unwind and nothing
+	 * is required of r3.
 	 */
 	if (cur_frame->subprogno &&
 	    !cur_frame->in_async_callback_fn &&

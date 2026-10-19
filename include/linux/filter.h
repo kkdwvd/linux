@@ -1245,6 +1245,7 @@ bool bpf_jit_supports_kfunc_call(void);
 bool bpf_jit_supports_callx(void);
 bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
+bool bpf_jit_supports_cb_unwind(void);
 
 enum bpf_unwind_exit {
 	BPF_EXIT_RETURNS,

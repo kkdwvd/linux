@@ -2366,7 +2366,11 @@ patch_map_ops_generic:
 				insn->imm = BPF_CALL_IMM(ops->map_redirect);
 				goto next_insn;
 			case BPF_FUNC_for_each_map_elem:
-				insn->imm = BPF_CALL_IMM(ops->map_for_each_callback);
+				/* The callback can unwind and the op passes the bit on. */
+				if (aux->cb_unwind)
+					insn->imm = BPF_CALL_IMM(ops->map_for_each_callback_unwind);
+				else
+					insn->imm = BPF_CALL_IMM(ops->map_for_each_callback);
 				goto next_insn;
 			case BPF_FUNC_map_lookup_percpu_elem:
 				insn->imm = BPF_CALL_IMM(ops->map_lookup_percpu_elem);
@@ -2639,6 +2643,14 @@ patch_call_imm:
 				     "not inlined functions %s#%d is missing func",
 				     func_id_name(insn->imm), insn->imm);
 			return -EFAULT;
+		}
+		/* The callback can unwind and the helper passes the bit on. */
+		if (env->insn_aux_data[i + delta].cb_unwind) {
+			if (verifier_bug_if(!fn->func_unwind, env, "%s#%d passes on unwinding w/o func_unwind",
+					    func_id_name(insn->imm), insn->imm))
+				return -EFAULT;
+			insn->imm = BPF_CALL_IMM(fn->func_unwind);
+			goto next_insn;
 		}
 		insn->imm = BPF_CALL_IMM(fn->func);
 next_insn:

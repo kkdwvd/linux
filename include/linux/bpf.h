@@ -72,6 +72,18 @@ extern struct bpf_mem_alloc bpf_global_ma, bpf_global_percpu_ma;
 extern bool bpf_global_ma_set;
 
 typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
+
+/*
+ * What a callback that can unwind returns: r0 and the bit it leaves in r3, in
+ * the first two return registers of the arch, so that the helper that called it
+ * reads both as a two word struct. See bpf_func_proto::func_unwind.
+ */
+struct bpf_cb_ret {
+	u64 r0;
+	u64 unwind;
+};
+
+typedef struct bpf_cb_ret (*bpf_unwind_callback_t)(u64, u64, u64, u64, u64);
 typedef int (*bpf_iter_init_seq_priv_t)(void *private_data,
 					struct bpf_iter_aux_info *aux);
 typedef void (*bpf_iter_fini_seq_priv_t)(void *private_data);
@@ -183,6 +195,10 @@ struct bpf_map_ops {
 	long (*map_for_each_callback)(struct bpf_map *map,
 				     bpf_callback_t callback_fn,
 				     void *callback_ctx, u64 flags);
+	/* Same, for a callback that can unwind. See bpf_func_proto::func_unwind. */
+	struct bpf_cb_ret (*map_for_each_callback_unwind)(struct bpf_map *map,
+							  bpf_unwind_callback_t callback_fn,
+							  void *callback_ctx, u64 flags);
 
 	u64 (*map_mem_usage)(const struct bpf_map *map);
 
@@ -1032,6 +1048,17 @@ static_assert(__BPF_RET_TYPE_MAX <= BPF_BASE_TYPE_LIMIT);
  */
 struct bpf_func_proto {
 	u64 (*func)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+	/*
+	 * The verifier calls this one instead of func when the callback passed to
+	 * the helper can unwind, i.e. says in r3 whether it returns or unwinds.
+	 * It reads the bit after every call of the callback, stops when it is set,
+	 * and returns it next to its own r0, where the caller sees it in r3 after
+	 * 'call helper; if r3 != 0 goto pad'. The normal path of func and of the
+	 * callback do not change: the bit travels in the second return register,
+	 * which the JIT leaves alone between the callback's 'exit' and the insn
+	 * after the helper call.
+	 */
+	struct bpf_cb_ret (*func_unwind)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
 	bool gpl_only;
 	bool pkt_access;
 	bool might_sleep;

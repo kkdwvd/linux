@@ -805,6 +805,13 @@ struct bpf_insn_aux_data {
 	 * accepts callback function as a parameter.
 	 */
 	u64 calls_callback:1;
+	/*
+	 * For such a call: the callback can unwind and the helper passes the bit
+	 * on, so the verifier reads r3 after the call and the fixup pass calls
+	 * fn->func_unwind. Set on the first visit, every visit has to agree.
+	 */
+	u64 cb_unwind:1;
+	u64 cb_unwind_seen:1;
 	u64 indirect_target:1; /* if it is an indirect jump target */
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
 	/* true if some jump or call instruction targets this instruction */
