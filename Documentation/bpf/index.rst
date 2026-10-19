@@ -23,6 +23,7 @@ that goes into great technical depth about the BPF Architecture.
    cpumasks
    fs_kfuncs
    programs
+   net-driver
    maps
    bpf_prog_run
    classic_vs_extended.rst
