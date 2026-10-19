@@ -1060,6 +1060,12 @@ __bpf_kfunc void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it)
 	}
 }
 
+__bpf_kfunc void bpf_iter_task_vma_destroy_dtor(void *it)
+{
+	bpf_iter_task_vma_destroy(it);
+}
+CFI_NOSEAL(bpf_iter_task_vma_destroy_dtor);
+
 __bpf_kfunc_end_defs();
 
 #ifdef CONFIG_CGROUPS
@@ -1117,6 +1123,12 @@ __bpf_kfunc void bpf_iter_css_task_destroy(struct bpf_iter_css_task *it)
 	css_task_iter_end(kit->css_it);
 	bpf_mem_free(&bpf_global_ma, kit->css_it);
 }
+
+__bpf_kfunc void bpf_iter_css_task_destroy_dtor(void *it)
+{
+	bpf_iter_css_task_destroy(it);
+}
+CFI_NOSEAL(bpf_iter_css_task_destroy_dtor);
 
 __bpf_kfunc_end_defs();
 
@@ -1207,6 +1219,12 @@ get_next_task:
 __bpf_kfunc void bpf_iter_task_destroy(struct bpf_iter_task *it)
 {
 }
+
+__bpf_kfunc void bpf_iter_task_destroy_dtor(void *it)
+{
+	bpf_iter_task_destroy(it);
+}
+CFI_NOSEAL(bpf_iter_task_destroy_dtor);
 
 __bpf_kfunc_end_defs();
 
