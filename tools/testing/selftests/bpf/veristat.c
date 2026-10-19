@@ -59,6 +59,8 @@ enum stat_id {
 	FDESC_BYTES,
 	FDESC_FALLBACKS,
 	FDESC_MASKED,
+	FDESC_SLOTS,
+	FDESC_SPILLS,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -203,6 +205,7 @@ static struct env {
 	bool quiet;
 	bool force_checkpoints;
 	bool force_reg_invariants;
+	bool spill_refs;
 	enum resfmt out_fmt;
 	bool show_version;
 	bool comparison_mode;
@@ -287,6 +290,7 @@ enum {
 	OPT_LOG_FIXED = 1000,
 	OPT_LOG_SIZE = 1001,
 	OPT_DUMP = 1002,
+	OPT_SPILL_REFS = 1003,
 };
 
 static const struct argp_option opts[] = {
@@ -309,6 +313,8 @@ static const struct argp_option opts[] = {
 	  "Force frequent BPF verifier state checkpointing (set BPF_F_TEST_STATE_FREQ program flag)" },
 	{ "test-reg-invariants", 'r', NULL, 0,
 	  "Force BPF verifier failure on register invariant violation (BPF_F_TEST_REG_INVARIANTS program flag)" },
+	{ "spill-refs", OPT_SPILL_REFS, NULL, 0,
+	  "Keep every reference in a unique stack slot for the unwinder (BPF_F_TEST_SPILL_REFS program flag)" },
 	{ "top-src-lines", 'S', "N", 0, "Emit N most frequent source code lines" },
 	{ "set-global-vars", 'G', "GLOBAL", 0, "Set global variables provided in the expression, for example \"var1 = 1\"" },
 	{ "dump", OPT_DUMP, "DUMP_MODE", OPTION_ARG_OPTIONAL, "Print BPF program dump (xlated, jited)" },
@@ -388,6 +394,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'r':
 		env.force_reg_invariants = true;
+		break;
+	case OPT_SPILL_REFS:
+		env.spill_refs = true;
 		break;
 	case 'n':
 		errno = 0;
@@ -819,7 +828,7 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 23,
+	.spec_cnt = 25,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
@@ -828,6 +837,7 @@ static const struct stat_specs default_csv_output_spec = {
 		STACK, MAX_STACK, MEMORY_PEAK,
 		FDESC_SITES, FDESC_VISITS, FDESC_CONFLICTS,
 		FDESC_CLASSES, FDESC_BYTES, FDESC_FALLBACKS, FDESC_MASKED,
+		FDESC_SLOTS, FDESC_SPILLS,
 	},
 };
 
@@ -877,6 +887,8 @@ static struct stat_def {
 	[FDESC_BYTES] = { "Frame desc bytes", {"fdesc_bytes", }, },
 	[FDESC_FALLBACKS] = { "Frame desc fallbacks", {"fdesc_fallbacks", }, },
 	[FDESC_MASKED] = { "Frame desc masked", {"fdesc_masked", }, },
+	[FDESC_SLOTS] = { "Frame desc slots", {"fdesc_slots", }, },
+	[FDESC_SPILLS] = { "Frame desc spills", {"fdesc_spills", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1065,14 +1077,16 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				&s->stats[MARK_READ_MAX_LEN]))
 			continue;
 		/* Only kernels with frame descriptors print this line. */
-		if (5 <= sscanf(cur, "frame descriptors: sites %ld visits %ld conflicts %ld classes %ld bytes %ld fallbacks %ld masked %ld",
+		if (5 <= sscanf(cur, "frame descriptors: sites %ld visits %ld conflicts %ld classes %ld bytes %ld fallbacks %ld masked %ld slots %ld spills %ld",
 				&s->stats[FDESC_SITES],
 				&s->stats[FDESC_VISITS],
 				&s->stats[FDESC_CONFLICTS],
 				&s->stats[FDESC_CLASSES],
 				&s->stats[FDESC_BYTES],
 				&s->stats[FDESC_FALLBACKS],
-				&s->stats[FDESC_MASKED]))
+				&s->stats[FDESC_MASKED],
+				&s->stats[FDESC_SLOTS],
+				&s->stats[FDESC_SPILLS]))
 			continue;
 
 		/*
@@ -1751,6 +1765,8 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 		bpf_program__add_flags(prog, BPF_F_TEST_STATE_FREQ);
 	if (env.force_reg_invariants)
 		bpf_program__add_flags(prog, BPF_F_TEST_REG_INVARIANTS);
+	if (env.spill_refs)
+		bpf_program__add_flags(prog, BPF_F_TEST_SPILL_REFS);
 
 	opts.log_buf = buf;
 	opts.log_size = buf_sz;
@@ -2381,6 +2397,8 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case FDESC_BYTES:
 	case FDESC_FALLBACKS:
 	case FDESC_MASKED:
+	case FDESC_SLOTS:
+	case FDESC_SPILLS:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2619,6 +2637,8 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case FDESC_BYTES:
 	case FDESC_FALLBACKS:
 	case FDESC_MASKED:
+	case FDESC_SLOTS:
+	case FDESC_SPILLS:
 		*val = s ? s->stats[id] : 0;
 		break;
 	default:
@@ -2713,6 +2733,8 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case FDESC_BYTES:
 	case FDESC_FALLBACKS:
 	case FDESC_MASKED:
+	case FDESC_SLOTS:
+	case FDESC_SPILLS:
 	case STACK:
 	case MAX_STACK: {
 		long val;

@@ -536,6 +536,59 @@ int cancel_may_goto_nested(struct __sk_buff *ctx)
 	return 0;
 }
 
+/* may_goto +2: BPF_JMP | BPF_JCOND, off 2 */
+static const struct bpf_insn may_goto_insn = { .code = 0xe5, .off = 2 };
+
+/*
+ * R6 holds the ringbuf record on one path and a number on the other at the
+ * site: no location describes both, so the record is released from a unique
+ * slot of the frame, which the acquisition fills and the release clears.
+ */
+#define SLOT_PROG(name, site)						\
+SEC("tc")								\
+__naked int name(void)							\
+{									\
+	asm volatile (							\
+	"r6 = *(u32 *)(r1 + %[len]);"					\
+	"r7 = 0;"							\
+	"if r6 == 0 goto 1f;"						\
+	"r1 = %[ringbuf] ll;"						\
+	"r2 = 8;"							\
+	"r3 = 0;"							\
+	"call %[bpf_ringbuf_reserve];"					\
+	"if r0 == 0 goto 3f;"						\
+	"r6 = r0;"							\
+	"r7 = 1;"							\
+	"r1 = %[acquired] ll;"						\
+	"*(u64 *)(r1 + 0) = r0;"					\
+	"r1 = %[acquired_cnt] ll;"					\
+	"*(u32 *)(r1 + 0) = r7;"					\
+	"goto 2f;"							\
+	"1: r6 = 42;"							\
+	"2: " site							\
+	"if r7 == 0 goto 3f;"						\
+	"r1 = r6;"							\
+	"r2 = 0;"							\
+	"call %[bpf_ringbuf_discard];"					\
+	"3: r0 = 0;"							\
+	"exit;"								\
+	:								\
+	: __imm_addr(ringbuf),						\
+	  __imm_addr(acquired),						\
+	  __imm_addr(acquired_cnt),					\
+	  __imm(bpf_ringbuf_reserve),					\
+	  __imm(bpf_ringbuf_discard),					\
+	  __imm(bpf_throw),						\
+	  [len]"i"(offsetof(struct __sk_buff, len)),			\
+	  __imm_insn(may_goto, may_goto_insn)				\
+	: __clobber_all);						\
+}
+
+/* A may_goto timeout: the loop spins until it is cancelled. */
+SLOT_PROG(cancel_may_goto_slot, ".8byte %[may_goto]; r0 = 0; goto 2b;")
+/* An explicit throw. */
+SLOT_PROG(throw_slot, "r1 = 0xeB9F; call %[bpf_throw];")
+
 /* bpf_throw() leaves a spin lock and a section too. */
 SEC("tc")
 int throw_spin_lock(struct __sk_buff *ctx)
@@ -813,8 +866,6 @@ int nocancel_may_goto_shared_subprog(struct __sk_buff *ctx)
 	bpf_obj_drop(f);
 	return 0;
 }
-
-static const struct bpf_insn may_goto_insn = { .code = 0xe5, .off = 2 };
 
 /*
  * A tracing program with 64 bytes of stack runs on a private stack: the

@@ -45,19 +45,35 @@ static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog, 
 	}
 }
 
-void test_exceptions_cleanup(void)
+/*
+ * Run every program, loaded as is, or with every reference kept in a unique
+ * stack slot for the unwinder (@spill), which is what the verifier does on its
+ * own when no location describes a reference on every path. @prefix names
+ * the pass in the subtest names.
+ */
+static void run_suite(bool spill, const char *prefix)
 {
 	struct exceptions_cleanup *skel;
+	struct bpf_program *prog;
+	char name[64];
 
-	skel = exceptions_cleanup__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "exceptions_cleanup__open_and_load"))
+	skel = exceptions_cleanup__open();
+	if (!ASSERT_OK_PTR(skel, "exceptions_cleanup__open"))
 		return;
+	if (spill) {
+		bpf_object__for_each_program(prog, skel->obj)
+			bpf_program__set_flags(prog, bpf_program__flags(prog) |
+						     BPF_F_TEST_SPILL_REFS);
+	}
+	if (!ASSERT_OK(exceptions_cleanup__load(skel), "exceptions_cleanup__load"))
+		goto out;
 	if (!ASSERT_OK(exceptions_cleanup__attach(skel), "attach"))
 		goto out;
 
-#define RUN(name, n, released, sections, ordered, retval) do {			\
-	if (test__start_subtest(#name))						\
-		run_prog(skel, skel->progs.name, n, released, sections, ordered, retval); \
+#define RUN(pname, n, released, sections, ordered, retval) do {			\
+	snprintf(name, sizeof(name), "%s%s", prefix, #pname);			\
+	if (test__start_subtest(name))						\
+		run_prog(skel, skel->progs.pname, n, released, sections, ordered, retval); \
 } while (0)
 #define THROW(name, n) RUN(name, n, n, 0, false, 0xeB9F)
 	THROW(throw_obj_reg, 1);
@@ -70,6 +86,7 @@ void test_exceptions_cleanup(void)
 	THROW(throw_obj_unconditional, 1);
 	THROW(throw_obj_subprog, 1);
 	THROW(throw_obj_global_caller, 1);
+	THROW(throw_slot, 1);
 	RUN(throw_spin_lock, 2, 2, 0, true, 0xeB9F);
 	RUN(throw_rcu, 1, 1, 1, true, 0xeB9F);
 	RUN(throw_irq, 1, 1, 1, true, 0xeB9F);
@@ -77,6 +94,7 @@ void test_exceptions_cleanup(void)
 #define CANCEL(name, n, sections) RUN(name, n, n, sections, true, 2)
 	CANCEL(cancel_may_goto_obj, 1, 0);
 	CANCEL(cancel_may_goto_caller, 1, 0);
+	CANCEL(cancel_may_goto_slot, 1, 0);
 	CANCEL(cancel_may_goto_rcu, 1, 1);
 	CANCEL(cancel_may_goto_rcu_shared, 1, 1);
 	CANCEL(cancel_may_goto_preempt, 0, 3);
@@ -110,4 +128,15 @@ void test_exceptions_cleanup(void)
 #undef RUN
 out:
 	exceptions_cleanup__destroy(skel);
+}
+
+void test_exceptions_cleanup(void)
+{
+	run_suite(false, "");
+	run_suite(true, "spill_");
+	/* Constant blinding rewrites the program after the descriptors are keyed. */
+	if (!ASSERT_OK(write_sysctl("/proc/sys/net/core/bpf_jit_harden", "2"), "bpf_jit_harden"))
+		return;
+	run_suite(false, "harden_");
+	write_sysctl("/proc/sys/net/core/bpf_jit_harden", "0");
 }
