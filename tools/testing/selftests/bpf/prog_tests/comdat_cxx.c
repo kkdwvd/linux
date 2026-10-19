@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include <bpf/btf.h>
+#include <elf.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /* counter<int>::count, counter<long>::count, and static tag_d */
 #define COUNT_INT "_ZN7counterIiE5countE"
@@ -276,6 +279,129 @@ static void test_arena(void)
 	unlink(out);
 }
 
+/*
+ * Make the call of prime_sum() in comdat_c() of in a relocation against the
+ * section symbol of .text._Z9prime_sumj, as a call of a local function in
+ * the section would be, and write the object to out.
+ */
+static int retarget_call(const char *in, const char *out)
+{
+	const char *target = ".text._Z9prime_sumj", *func = "_Z9prime_sumj";
+	Elf64_Shdr *sh, *symtab = NULL, *reltc = NULL;
+	int fd, target_idx = -1, secsym = -1, err = -EINVAL;
+	const char *shstr, *str;
+	Elf64_Ehdr *eh;
+	Elf64_Sym *sym;
+	Elf64_Rel *rel;
+	struct stat st;
+	char *buf = NULL;
+	size_t i;
+
+	fd = open(in, O_RDONLY);
+	if (!ASSERT_OK_FD(fd, "open in") || !ASSERT_OK(fstat(fd, &st), "fstat"))
+		goto out;
+	buf = malloc(st.st_size);
+	if (!ASSERT_OK_PTR(buf, "malloc") ||
+	    !ASSERT_EQ(read(fd, buf, st.st_size), st.st_size, "read"))
+		goto out;
+	close(fd);
+	fd = -1;
+
+	eh = (Elf64_Ehdr *)buf;
+	sh = (Elf64_Shdr *)(buf + eh->e_shoff);
+	shstr = buf + sh[eh->e_shstrndx].sh_offset;
+	for (i = 1; i < eh->e_shnum; i++) {
+		if (sh[i].sh_type == SHT_SYMTAB)
+			symtab = &sh[i];
+		if (strcmp(shstr + sh[i].sh_name, target) == 0)
+			target_idx = i;
+		if (strcmp(shstr + sh[i].sh_name, ".reltc") == 0)
+			reltc = &sh[i];
+	}
+	if (!ASSERT_OK_PTR(symtab, "symtab") || !ASSERT_GT(target_idx, 0, "target section") ||
+	    !ASSERT_OK_PTR(reltc, ".reltc"))
+		goto out;
+	str = buf + sh[symtab->sh_link].sh_offset;
+	sym = (Elf64_Sym *)(buf + symtab->sh_offset);
+	for (i = 1; i < symtab->sh_size / sizeof(*sym); i++)
+		if (ELF64_ST_TYPE(sym[i].st_info) == STT_SECTION && sym[i].st_shndx == target_idx)
+			secsym = i;
+	if (!ASSERT_GT(secsym, 0, "section symbol"))
+		goto out;
+	rel = (Elf64_Rel *)(buf + reltc->sh_offset);
+	for (i = 0; i < reltc->sh_size / sizeof(*rel); i++) {
+		if (strcmp(str + sym[ELF64_R_SYM(rel[i].r_info)].st_name, func))
+			continue;
+		rel[i].r_info = ELF64_R_INFO(secsym, ELF64_R_TYPE(rel[i].r_info));
+		err = 0;
+	}
+	if (!ASSERT_OK(err, "relocation of the call"))
+		goto out;
+
+	fd = open(out, O_WRONLY | O_TRUNC);
+	if (!ASSERT_OK_FD(fd, "open out") ||
+	    !ASSERT_EQ(write(fd, buf, st.st_size), st.st_size, "write"))
+		err = -EIO;
+out:
+	if (fd >= 0)
+		close(fd);
+	free(buf);
+	return err;
+}
+
+static char link_log[4096];
+
+static int log_link(enum libbpf_print_level level, const char *fmt, va_list args)
+{
+	size_t len = strlen(link_log);
+
+	if (level == LIBBPF_WARN)
+		vsnprintf(link_log + len, sizeof(link_log) - len, fmt, args);
+	return 0;
+}
+
+/*
+ * The group of prime_sum() of the second object is discarded for the one of
+ * the first. A call of a local function of its section, which only the
+ * section symbol names, has nothing to resolve to then, like for ld and lld.
+ */
+static void test_discarded(void)
+{
+	const char *file1 = "./comdat_cxx.bpf.o", *file2 = "./comdat_cxx2.bpf.o";
+	char patched[] = "/tmp/comdat_cxx2.XXXXXX", out[] = "/tmp/comdat_cxx.XXXXXX";
+	libbpf_print_fn_t old_print;
+	int fd;
+
+	if (skip(file1, "calls") || skip(file2, "calls"))
+		return;
+	fd = mkstemp(patched);
+	if (!ASSERT_OK_FD(fd, "mkstemp"))
+		return;
+	close(fd);
+	fd = mkstemp(out);
+	if (!ASSERT_OK_FD(fd, "mkstemp"))
+		goto out;
+	close(fd);
+	if (retarget_call(file2, patched))
+		goto out;
+
+	link_log[0] = 0;
+	old_print = libbpf_set_print(log_link);
+	ASSERT_ERR(link_objs(out, file1, patched), "link");
+	libbpf_set_print(old_print);
+	ASSERT_HAS_SUBSTR(link_log,
+			  "refers to symbol '.text._Z9prime_sumj' in section '.text._Z9prime_sumj', which is in a discarded COMDAT group",
+			  "link log");
+	/* the first object alone doesn't discard anything */
+	link_log[0] = 0;
+	old_print = libbpf_set_print(log_link);
+	ASSERT_OK(link_objs(out, patched, NULL), "link alone");
+	libbpf_set_print(old_print);
+out:
+	unlink(patched);
+	unlink(out);
+}
+
 void test_comdat_cxx(void)
 {
 	if (test__start_subtest("object"))
@@ -284,4 +410,6 @@ void test_comdat_cxx(void)
 		test_linked();
 	if (test__start_subtest("arena"))
 		test_arena();
+	if (test__start_subtest("discarded"))
+		test_discarded();
 }
