@@ -33,7 +33,9 @@ DESCRIPTION
 ===========
 bpftool gen object *OUTPUT_FILE* *INPUT_FILE* [*INPUT_FILE*...]
     Statically link (combine) together one or more *INPUT_FILE*'s into a single
-    resulting *OUTPUT_FILE*. All the files involved are BPF ELF object files.
+    resulting *OUTPUT_FILE*. An *INPUT_FILE* is a BPF ELF object file or an
+    archive of them, as **ar**\ (1) or **llvm-ar** creates, and *OUTPUT_FILE*
+    is a BPF ELF object file.
 
     The rules of BPF static linking are mostly the same as for user-space
     object files, but in addition to combining data and instruction sections,
@@ -41,6 +43,19 @@ bpftool gen object *OUTPUT_FILE* *INPUT_FILE* [*INPUT_FILE*...]
     together. .BTF data is deduplicated, so all the common types across
     *INPUT_FILE*'s will only be represented once in the resulting BTF
     information.
+
+    An object file is linked whole. A member of an archive is linked only when
+    it defines a symbol that the inputs before it left undefined, as with
+    **ld**\ (1): a weak reference does not link a member, and neither does a
+    reference to a symbol that an earlier input defines. A member linked this
+    way may need other members of the same archive, in any order, which are
+    linked in turn. An archive only satisfies the references of the inputs
+    before it, so it goes after the object files that use it, and after the
+    archives that use it; an archive that an earlier one needs may be named
+    again. Archives are in the GNU or the BSD format, with their symbol index,
+    as **ar s** or **ranlib** writes it, or without one, in which case the
+    members are scanned for the symbols they define. Thin archives are not
+    supported.
 
     BPF static linking allows to partition BPF source code into individually
     compiled files that are then linked into a single resulting BPF object
