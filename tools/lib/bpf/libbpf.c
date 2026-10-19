@@ -6892,8 +6892,9 @@ static int create_func_ptr_map(struct bpf_object *obj, struct bpf_program *prog,
 			goto err_free;
 		}
 		/*
-		 * Static functions were appended by bpf_object__append_func_ptrs_code().
-		 * A global function is in the program only if the code refers to it.
+		 * Static and hidden functions were appended by
+		 * bpf_object__append_func_ptrs_code(). A global function is in
+		 * the program only if the code refers to it.
 		 */
 		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
 		for (j = 0; j < prog->subprog_cnt; j++)
@@ -7518,10 +7519,12 @@ bpf_object__append_func_ptrs_code(struct bpf_object *obj, struct bpf_program *ma
 		}
 
 		/*
-		 * callx can't call global functions. Don't add one to the
-		 * program only because the data points to it.
+		 * callx can't call global functions. A hidden one is static
+		 * to the verifier, see bpf_object__sanitize_and_load_btf().
+		 * Don't add a global one to the program only because the data
+		 * points to it.
 		 */
-		if (subprog->sym_global)
+		if (subprog->sym_global && !subprog->mark_btf_static)
 			continue;
 
 		/* see the comment in bpf_object__reloc_code() */
