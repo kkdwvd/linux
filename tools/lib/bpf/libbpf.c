@@ -559,7 +559,8 @@ struct bpf_struct_ops {
 #define STRUCT_OPS_LINK_SEC ".struct_ops.link"
 /*
  * __arena variables. Pointers to them, in them or in other data, become
- * addresses of arena, see bpf_object__relocate_data_ptrs().
+ * addresses of arena, see bpf_object__relocate_data_ptrs(). Pointers to
+ * functions in them are NULL.
  */
 #define ARENA_SEC ".addr_space.1"
 /*
@@ -8746,6 +8747,13 @@ static bool sym_is_arena(const struct bpf_object *obj, const Elf64_Sym *sym)
  * A pointer to data that is stored in data, where either the data or what
  * it points to is in arena. The program dereferences what it loads from
  * the data, so the pointer has to be the address of the target in arena.
+ *
+ * A pointer to a function in arena data, e.g. in a vtable that is in arena,
+ * is NULL. The verifier knows a pointer to a function only by its value in
+ * read-only data, see create_func_ptr_map(), so a program can't call through
+ * a pointer that it loads from arena. There is no address to give it either:
+ * a function has one in each program that it is a part of, and the data in
+ * arena is the same for all of them.
  */
 static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo_sec_name,
 					int relo_idx, size_t sec_idx, const Elf64_Rel *rel,
@@ -8755,19 +8763,38 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 	const char *sym_name = elf_sym_str(obj, sym->st_name) ?: "<?>";
 	const struct elf_sec_desc *targ;
 	struct data_ptr *ptrs;
+	bool in_arena, func;
 
 	if (ELF64_ST_TYPE(sym->st_info) == STT_SECTION && sym->st_shndx < obj->efile.sec_cnt)
 		sym_name = elf_sec_name(obj, elf_sec_by_idx(obj, sym->st_shndx)) ?: "<?>";
 
+	/* .data is in arena when data is, read-only data with pointers is not */
+	in_arena = obj->efile.secs[sec_idx].sec_type == SEC_ARENA ||
+		   (obj->data_in_arena && obj->efile.secs[sec_idx].sec_type == SEC_DATA);
+	func = sym->st_shndx < obj->efile.sec_cnt && section_have_execinstr(obj, sym->st_shndx);
+
 	if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
 	    sym->st_shndx >= obj->efile.sec_cnt ||
 	    (obj->efile.secs[sym->st_shndx].sec_type != SEC_ARENA &&
-	     !bpf_object__shndx_is_data(obj, sym->st_shndx)) ||
+	     !bpf_object__shndx_is_data(obj, sym->st_shndx) && !(in_arena && func)) ||
 	    rel->r_offset >= scn_data->d_size ||
 	    scn_data->d_size - rel->r_offset < sizeof(__u64)) {
 		pr_warn("sec '%s': relo #%d: can't resolve pointer to '%s' at offset %zu when data is in arena\n",
 			relo_sec_name, relo_idx, sym_name, (size_t)rel->r_offset);
 		return -LIBBPF_ERRNO__RELOC;
+	}
+
+	if (func) {
+		const struct elf_sec_desc *sec_desc = &obj->efile.secs[sec_idx];
+		const char *name;
+		void *data;
+
+		/* in the map of the section, see bpf_object__layout_data() */
+		data = bpf_object__data_ptr_sec(obj, sec_desc->map_sec_idx, &name);
+		memset(data + sec_desc->map_off + rel->r_offset, 0, sizeof(__u64));
+		pr_debug("sec '%s': relo #%d: pointer at offset %zu to function '%s' is NULL in arena\n",
+			 relo_sec_name, relo_idx, (size_t)rel->r_offset, sym_name);
+		return 0;
 	}
 
 	ptrs = libbpf_reallocarray(obj->data_ptrs, obj->data_ptr_cnt + 1, sizeof(*ptrs));
