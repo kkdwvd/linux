@@ -388,14 +388,16 @@ struct reloc_desc {
 			int map_idx;
 			unsigned int sym_off;
 			/*
-			 * The following two fields can be unionized, as the
-			 * ext_idx field is used for extern symbols, and the
+			 * The following fields can be unionized, as the
+			 * ext_idx field is used for extern symbols, the
 			 * sym_size is used for jump tables, which are never
-			 * extern
+			 * extern, and the sec_idx is used for calls and
+			 * addresses of subprograms
 			 */
 			union {
 				int ext_idx;
 				int sym_size;
+				int sec_idx;
 			};
 		};
 	};
@@ -439,6 +441,7 @@ struct bpf_sec_def {
 };
 
 struct bpf_light_subprog {
+	__u32 sec_idx;
 	__u32 sec_insn_off;
 	__u32 sub_insn_off;
 };
@@ -497,6 +500,8 @@ struct bpf_program {
 	bool autoload;
 	bool autoattach;
 	bool sym_global;
+	/* a function that main programs call, see sec_is_text() */
+	bool subprog;
 	/* the program or a function that it calls has callx */
 	bool has_callx;
 	bool mark_btf_static;
@@ -696,6 +701,7 @@ struct module_btf {
 
 enum sec_type {
 	SEC_UNUSED = 0,
+	SEC_TEXT,
 	SEC_RELO,
 	SEC_BSS,
 	SEC_DATA,
@@ -708,6 +714,8 @@ struct elf_sec_desc {
 	enum sec_type sec_type;
 	Elf64_Shdr *shdr;
 	Elf_Data *data;
+	/* member of a COMDAT group */
+	bool comdat;
 };
 
 struct elf_state {
@@ -724,7 +732,6 @@ struct elf_state {
 	size_t sec_cnt;
 	int btf_maps_shndx;
 	__u32 btf_maps_sec_btf_id;
-	int text_shndx;
 	int symbols_shndx;
 	bool has_st_ops;
 	int arena_data_shndx;
@@ -838,7 +845,8 @@ struct bpf_object {
 	struct func_ptr {
 		int sec_idx;		/* ELF section that contains the pointer */
 		size_t sec_off;		/* offset of the pointer in the section */
-		size_t text_off;	/* offset of the function in .text section */
+		int func_sec_idx;	/* section of the function, see sec_is_text() */
+		size_t func_off;	/* offset of the function in that section */
 	} *func_ptrs;
 	size_t func_ptr_cnt;
 
@@ -989,6 +997,15 @@ errout:
 	return -ENOMEM;
 }
 
+/*
+ * Whether the functions of the section are subprograms: it is .text or the
+ * code of a COMDAT group, which the static linker joins to .text.
+ */
+static bool sec_is_text(const struct bpf_object *obj, size_t sec_idx)
+{
+	return sec_idx < obj->efile.sec_cnt && obj->efile.secs[sec_idx].sec_type == SEC_TEXT;
+}
+
 static int
 bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 			 const char *sec_name, int sec_idx)
@@ -1029,7 +1046,7 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 			return -LIBBPF_ERRNO__FORMAT;
 		}
 
-		if (sec_idx != obj->efile.text_shndx && ELF64_ST_BIND(sym->st_info) == STB_LOCAL) {
+		if (!sec_is_text(obj, sec_idx) && ELF64_ST_BIND(sym->st_info) == STB_LOCAL) {
 			pr_warn("sec '%s': program '%s' is static and not supported\n", sec_name, name);
 			return -ENOTSUP;
 		}
@@ -1059,6 +1076,8 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 
 		if (ELF64_ST_BIND(sym->st_info) != STB_LOCAL)
 			prog->sym_global = true;
+
+		prog->subprog = sec_is_text(obj, sec_idx);
 
 		/* if function is a global/weak symbol, but has restricted
 		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF FUNC
@@ -4128,6 +4147,46 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	return false;
 }
 
+/*
+ * C++ defines an inline function that is not inlined everywhere, an inline
+ * variable or a template instance in every translation unit that uses it,
+ * each time in a COMDAT group of its own: .text.foo for code, .rodata.foo,
+ * .data.foo or .bss.foo for data, and their relocations. The static linker
+ * keeps the first copy of a group. An object has only one, so mark its
+ * members and ignore the group.
+ */
+static int bpf_object__collect_group(struct bpf_object *obj, Elf_Scn *scn, Elf64_Shdr *sh)
+{
+	size_t i, n, idx = elf_ndxscn(scn);
+	Elf_Data *data;
+	__u32 *words;
+
+	data = elf_sec_data(obj, scn);
+	if (!data)
+		return -LIBBPF_ERRNO__FORMAT;
+
+	words = data->d_buf;
+	n = data->d_size / sizeof(*words);
+	if (sh->sh_entsize != sizeof(*words) || n == 0) {
+		pr_warn("elf: group section(%zu) is malformed in %s\n", idx, obj->path);
+		return -LIBBPF_ERRNO__FORMAT;
+	}
+
+	/* only COMDAT groups say something about their members */
+	if (!(words[0] & GRP_COMDAT))
+		return 0;
+
+	for (i = 1; i < n; i++) {
+		if (!words[i] || words[i] >= obj->efile.sec_cnt) {
+			pr_warn("elf: group section(%zu) has invalid member section(%u) in %s\n",
+				idx, words[i], obj->path);
+			return -LIBBPF_ERRNO__FORMAT;
+		}
+		obj->efile.secs[words[i]].comdat = true;
+	}
+	return 0;
+}
+
 static int cmp_progs(const void *_a, const void *_b)
 {
 	const struct bpf_program *a = _a;
@@ -4166,14 +4225,21 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 	if (!obj->efile.secs)
 		return -ENOMEM;
 
-	/* a bunch of ELF parsing functionality depends on processing symbols,
-	 * so do the first pass and find the symbol table
+	/*
+	 * A bunch of ELF parsing functionality depends on processing symbols,
+	 * so do the first pass and find the symbol table, and members of groups.
 	 */
 	scn = NULL;
 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
 		sh = elf_sec_hdr(obj, scn);
 		if (!sh)
 			return -LIBBPF_ERRNO__FORMAT;
+
+		if (sh->sh_type == SHT_GROUP) {
+			err = bpf_object__collect_group(obj, scn, sh);
+			if (err)
+				return err;
+		}
 
 		/* the second pass has to know it when it sees relocations of data */
 		name = elf_sec_str(obj, sh->sh_name);
@@ -4254,8 +4320,12 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			/* already processed during the first pass above */
 		} else if (sh->sh_type == SHT_PROGBITS && data->d_size > 0) {
 			if (sh->sh_flags & SHF_EXECINSTR) {
-				if (strcmp(name, ".text") == 0)
-					obj->efile.text_shndx = idx;
+				if (strcmp(name, ".text") == 0 ||
+				    (sec_desc->comdat && str_has_pfx(name, ".text."))) {
+					sec_desc->sec_type = SEC_TEXT;
+					sec_desc->shdr = sh;
+					sec_desc->data = data;
+				}
 				err = bpf_object__add_programs(obj, data, name, idx);
 				if (err)
 					return err;
@@ -4381,13 +4451,13 @@ static bool sym_is_extern(const Elf64_Sym *sym)
 	       ELF64_ST_TYPE(sym->st_info) == STT_NOTYPE;
 }
 
-static bool sym_is_subprog(const Elf64_Sym *sym, int text_shndx)
+static bool sym_is_subprog(const struct bpf_object *obj, const Elf64_Sym *sym)
 {
 	int bind = ELF64_ST_BIND(sym->st_info);
 	int type = ELF64_ST_TYPE(sym->st_info);
 
-	/* in .text section */
-	if (sym->st_shndx != text_shndx)
+	/* in a section of subprograms */
+	if (!sec_is_text(obj, sym->st_shndx))
 		return false;
 
 	/* local function */
@@ -4801,7 +4871,7 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 
 static bool prog_is_subprog(const struct bpf_object *obj, const struct bpf_program *prog)
 {
-	return prog->sec_idx == obj->efile.text_shndx;
+	return prog->subprog;
 }
 
 struct bpf_program *
@@ -4948,8 +5018,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 			pr_warn("prog '%s': incorrect bpf_call opcode\n", prog->name);
 			return -LIBBPF_ERRNO__RELOC;
 		}
-		/* text_shndx can be 0, if no default "main" program exists */
-		if (!shdr_idx || shdr_idx != obj->efile.text_shndx) {
+		if (!sec_is_text(obj, shdr_idx)) {
 			sym_sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, shdr_idx));
 			pr_warn("prog '%s': bad call relo against '%s' in section '%s'\n",
 				prog->name, sym_name, sym_sec_name);
@@ -4962,6 +5031,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		}
 		reloc_desc->type = RELO_CALL;
 		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->sec_idx = shdr_idx;
 		reloc_desc->sym_off = sym->st_value;
 		return 0;
 	}
@@ -4973,7 +5043,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	}
 
 	/* loading subprog addresses */
-	if (sym_is_subprog(sym, obj->efile.text_shndx)) {
+	if (sym_is_subprog(obj, sym)) {
 		/* global_func: sym->st_value = offset in the section, insn->imm = 0.
 		 * local_func: sym->st_value = 0, insn->imm = offset in the section.
 		 */
@@ -4985,6 +5055,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 
 		reloc_desc->type = RELO_SUBPROG_ADDR;
 		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->sec_idx = shdr_idx;
 		reloc_desc->sym_off = sym->st_value;
 		return 0;
 	}
@@ -6824,9 +6895,10 @@ static int create_func_ptr_map(struct bpf_object *obj, struct bpf_program *prog,
 		 * Static functions were appended by bpf_object__append_func_ptrs_code().
 		 * A global function is in the program only if the code refers to it.
 		 */
-		sec_insn_off = ptrs[i].text_off / BPF_INSN_SZ;
+		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
 		for (j = 0; j < prog->subprog_cnt; j++)
-			if (prog->subprogs[j].sec_insn_off == sec_insn_off)
+			if (prog->subprogs[j].sec_idx == ptrs[i].func_sec_idx &&
+			    prog->subprogs[j].sec_insn_off == sec_insn_off)
 				break;
 		if (j == prog->subprog_cnt) {
 			pr_debug("prog '%s': map '%s': no function for the pointer at offset %zu, it's NULL\n",
@@ -7264,6 +7336,7 @@ static int save_subprog_offsets(struct bpf_program *main_prog, struct bpf_progra
 		return -ENOMEM;
 
 	main_prog->subprogs = tmp;
+	main_prog->subprogs[cnt].sec_idx = subprog->sec_idx;
 	main_prog->subprogs[cnt].sec_insn_off = subprog->sec_insn_off;
 	main_prog->subprogs[cnt].sub_insn_off = subprog->sub_insn_off;
 	main_prog->subprog_cnt++;
@@ -7315,7 +7388,7 @@ static int
 bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 		       struct bpf_program *prog)
 {
-	size_t sub_insn_idx, insn_idx;
+	size_t sub_sec_idx, sub_insn_idx, insn_idx;
 	struct bpf_program *subprog;
 	struct reloc_desc *relo;
 	struct bpf_insn *insn;
@@ -7356,6 +7429,7 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 				sub_insn_idx = relo->sym_off / BPF_INSN_SZ + insn->imm + 1;
 			else
 				sub_insn_idx = (relo->sym_off + insn->imm) / BPF_INSN_SZ;
+			sub_sec_idx = relo->sec_idx;
 		} else if (insn_is_pseudo_func(insn)) {
 			/*
 			 * RELO_SUBPROG_ADDR relo is always emitted even if both
@@ -7372,13 +7446,14 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 			 * instruction's original position within the section
 			 */
 			sub_insn_idx = prog->sec_insn_off + insn_idx + insn->imm + 1;
+			sub_sec_idx = prog->sec_idx;
 		}
 
-		/* we enforce that sub-programs should be in .text section */
-		subprog = find_prog_by_sec_insn(obj, obj->efile.text_shndx, sub_insn_idx);
-		if (!subprog) {
-			pr_warn("prog '%s': no .text section found yet sub-program call exists\n",
-				prog->name);
+		/* we enforce that sub-programs are in .text, see sec_is_text() */
+		subprog = find_prog_by_sec_insn(obj, sub_sec_idx, sub_insn_idx);
+		if (!subprog || !prog_is_subprog(obj, subprog)) {
+			pr_warn("prog '%s': no sub-program found for the call at insn #%zu\n",
+				prog->name, insn_idx);
 			return -LIBBPF_ERRNO__RELOC;
 		}
 
@@ -7433,11 +7508,12 @@ bpf_object__append_func_ptrs_code(struct bpf_object *obj, struct bpf_program *ma
 	ptrs = map->func_ptrs;
 	cnt = map->func_ptr_cnt;
 	for (i = 0; i < cnt; i++) {
-		sec_insn_off = ptrs[i].text_off / BPF_INSN_SZ;
-		subprog = find_prog_by_sec_insn(obj, obj->efile.text_shndx, sec_insn_off);
+		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
+		subprog = find_prog_by_sec_insn(obj, ptrs[i].func_sec_idx, sec_insn_off);
 		if (!subprog || subprog->sec_insn_off != sec_insn_off) {
-			pr_warn("prog '%s': map '%s': no function at .text+%zu for the pointer at offset %zu\n",
-				main_prog->name, map->name, ptrs[i].text_off, ptrs[i].sec_off);
+			pr_warn("prog '%s': map '%s': no function at section(%d)+%zu for the pointer at offset %zu\n",
+				main_prog->name, map->name, ptrs[i].func_sec_idx, ptrs[i].func_off,
+				ptrs[i].sec_off);
 			return -LIBBPF_ERRNO__RELOC;
 		}
 
@@ -8496,7 +8572,7 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		}
 
 		if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
-		    !sym_is_subprog(sym, obj->efile.text_shndx)) {
+		    !sym_is_subprog(obj, sym)) {
 			int err;
 
 			if (obj->data_in_arena) {
@@ -8536,11 +8612,14 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 
 		ptrs[obj->func_ptr_cnt].sec_idx = sec_idx;
 		ptrs[obj->func_ptr_cnt].sec_off = rel->r_offset;
-		ptrs[obj->func_ptr_cnt].text_off = sym->st_value + addend;
+		ptrs[obj->func_ptr_cnt].func_sec_idx = sym->st_shndx;
+		ptrs[obj->func_ptr_cnt].func_off = sym->st_value + addend;
 		obj->func_ptr_cnt++;
 
-		pr_debug("sec '%s': relo #%d: pointer at offset %zu to a function at .text+%zu\n",
-			 relo_sec_name, i, (size_t)rel->r_offset, (size_t)(sym->st_value + addend));
+		pr_debug("sec '%s': relo #%d: pointer at offset %zu to a function at %s+%zu\n",
+			 relo_sec_name, i, (size_t)rel->r_offset,
+			 elf_sec_name(obj, elf_sec_by_idx(obj, sym->st_shndx)) ?: "<?>",
+			 (size_t)(sym->st_value + addend));
 	}
 	return 0;
 }
