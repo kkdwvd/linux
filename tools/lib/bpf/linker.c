@@ -3216,6 +3216,14 @@ static int finalize_btf(struct bpf_linker *linker)
 	return 0;
 }
 
+/* .BTF.ext records start with the offset of their instruction */
+static int cmp_btf_ext_rec_insn_off(const void *a, const void *b)
+{
+	__u32 off_a = *(const __u32 *)a, off_b = *(const __u32 *)b;
+
+	return off_a < off_b ? -1 : off_a > off_b;
+}
+
 static int emit_btf_ext_data(struct bpf_linker *linker, void *output,
 			     const char *sec_name, struct btf_ext_sec_data *sec_data)
 {
@@ -3238,6 +3246,13 @@ static int emit_btf_ext_data(struct bpf_linker *linker, void *output,
 
 	sz = sec_data->rec_cnt * sec_data->rec_sz;
 	memcpy(cur, sec_data->recs, sz);
+	/*
+	 * The records of a section go in the order of the instructions, as
+	 * the loader and the kernel expect. Sections of an object are appended
+	 * in their order, but records in the order of .BTF.ext, which differ
+	 * when COMDAT code joins .text, see linker_load_groups().
+	 */
+	qsort(cur, sec_data->rec_cnt, sec_data->rec_sz, cmp_btf_ext_rec_insn_off);
 	cur += sz;
 
 	return cur - output;
