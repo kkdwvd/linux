@@ -1788,6 +1788,30 @@ struct bpf_jit_poke_descriptor {
  * entry layout is defined together with the generator; this header only fixes
  * the container so that tables can be built, keyed and freed.
  */
+/* Kinds of resources a frame descriptor can release. */
+enum bpf_fdesc_kind {
+	BPF_FDESC_OBJ,		/* bpf_obj_new() object: bpf_obj_drop_impl(p, meta) */
+	BPF_FDESC_PERCPU_OBJ,	/* bpf_percpu_obj_new() object: bpf_percpu_obj_drop_impl(p, meta) */
+	BPF_FDESC_KPTR,		/* referenced kernel object: dtor(p) from the BTF dtor registry */
+	BPF_FDESC_SOCK,		/* socket acquired by a helper: bpf_sk_release() */
+	BPF_FDESC_RINGBUF,	/* bpf_ringbuf_reserve() record: bpf_ringbuf_discard() */
+	BPF_FDESC_DYNPTR_RINGBUF, /* ringbuf dynptr on the stack: bpf_ringbuf_discard_dynptr() */
+	BPF_FDESC_ITER,		/* open-coded iterator on the stack: its destroy kfunc */
+};
+
+/* A resource class of a program; descriptor entries refer to it by index. */
+struct bpf_fdesc_res {
+	u8 kind;	/* enum bpf_fdesc_kind */
+	s16 delta;	/* reserved for locks: offset of the lock from the pointer value */
+	u32 type;	/* bpf_reg_type of a pointer resource */
+	u32 btf_id;
+	struct btf *btf;
+	union {
+		void (*dtor)(void *);
+		struct btf_struct_meta *meta;
+	};
+};
+
 struct bpf_fdesc {
 	u32 size;	/* total size in bytes, including this header */
 	u32 nent;	/* number of entries that follow */

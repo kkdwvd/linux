@@ -769,6 +769,8 @@ struct bpf_insn_aux_data {
 		u64 insert_off;
 	};
 	struct btf_struct_meta *kptr_struct_meta;
+	/* frame descriptor of the frame this insn is executed or waited in, see fdesc.c */
+	struct bpf_fdesc_build *fdesc;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	/*
 	 * Per-instruction summary of stack slots in the current frame
@@ -1062,6 +1064,30 @@ struct bpf_fd_array {
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
+/* How the innermost frame reaches a site at which the program may be unwound. */
+enum bpf_fdesc_site {
+	BPF_FDESC_SITE_CALLER = 1,	/* waiting in a call: R6-R9 and the stack are available */
+	BPF_FDESC_SITE_THROW,		/* calling bpf_throw(): the entry stub saves R0-R9 */
+	BPF_FDESC_SITE_CALL,		/* calling a global subprog that may throw */
+};
+
+/* What a register or stack slot holds across the paths merged into a descriptor. */
+struct bpf_fdesc_loc {
+	u8 state;
+	u8 nullable;
+	u16 res;
+};
+
+/* Frame descriptor under construction for one (subprog, insn), see fdesc.c. */
+struct bpf_fdesc_build {
+	u32 visits;
+	u16 nr_slots;
+	u8 site;	/* enum bpf_fdesc_site */
+	bool conflict;
+	struct bpf_fdesc_loc regs[BPF_REG_10];
+	struct bpf_fdesc_loc slots[];
+};
+
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
 struct bpf_stack_init {
 	u32 subprog;
@@ -1097,6 +1123,11 @@ struct bpf_verifier_env {
 	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	struct bpf_stack_init *stack_inits; /* hidden slot initializations, see bpf_stack_slot_init() */
 	u32 stack_init_cnt;
+	struct bpf_fdesc_res *fdesc_res;	/* resource classes of frame descriptors */
+	u32 fdesc_res_cnt;
+	u32 fdesc_visits;			/* paths merged into frame descriptors */
+	u32 fdesc_conflicts;
+	void *fdesc_scratch;
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
@@ -2015,6 +2046,11 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
 int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off);
 int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm);
+
+/* Functions in fdesc.c */
+int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site);
+void bpf_fdesc_build_free(struct bpf_insn_aux_data *aux);
+void bpf_fdesc_env_free(struct bpf_verifier_env *env);
 int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env);
 int bpf_optimize_bpf_loop(struct bpf_verifier_env *env);
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env);

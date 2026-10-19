@@ -11529,6 +11529,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				verbose(env, "failed to push state for global subprog exception path\n");
 				return PTR_ERR(branch);
 			}
+			err = bpf_fdesc_site(env, BPF_FDESC_SITE_CALL);
+			if (err)
+				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
 
@@ -20160,8 +20163,14 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				return check_func_callx(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (bpf_is_throw_kfunc(insn)) {
+					err = bpf_fdesc_site(env, BPF_FDESC_SITE_THROW);
+					if (err)
+						return err;
+				}
 				return check_kfunc_call(env, insn, &env->insn_idx);
+			}
 			return check_helper_call(env, insn, &env->insn_idx);
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
@@ -23994,6 +24003,7 @@ err_free_env:
 	kvfree(env->callx_edges);
 	kvfree(env->func_ptrs);
 	kvfree(env->stack_inits);
+	bpf_fdesc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

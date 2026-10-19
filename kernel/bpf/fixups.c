@@ -696,6 +696,7 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 			kvfree(aux_data[i].loop);
 			aux_data[i].loop = NULL;
 		}
+		bpf_fdesc_build_free(&aux_data[i]);
 	}
 }
 
