@@ -404,6 +404,14 @@ static inline int mlx5e_init(void){ return 0; }
 static inline void mlx5e_cleanup(void){}
 #endif
 
+#ifdef CONFIG_MLX5_BPF_NET
+int mlx5_bpf_net_init(void);
+void mlx5_bpf_net_cleanup(void);
+#else
+static inline int mlx5_bpf_net_init(void) { return 0; }
+static inline void mlx5_bpf_net_cleanup(void) { }
+#endif
+
 static inline bool mlx5_sriov_is_enabled(struct mlx5_core_dev *dev)
 {
 	return pci_num_vf(dev->pdev) ? true : false;

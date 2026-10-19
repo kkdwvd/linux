@@ -36,6 +36,7 @@ mlx5_core-$(CONFIG_MLX5_CORE_EN) += en/rqt.o en/tir.o en/rss.o en/rx_res.o \
 # Netdev extra
 #
 mlx5_core-$(CONFIG_MLX5_EN_ARFS)     += en_arfs.o
+mlx5_core-$(CONFIG_MLX5_BPF_NET)     += bpf_net.o
 mlx5_core-$(CONFIG_MLX5_EN_RXNFC)    += en_fs_ethtool.o
 mlx5_core-$(CONFIG_MLX5_CORE_EN_DCB) += en_dcbnl.o en/port_buffer.o
 mlx5_core-$(CONFIG_PCI_HYPERV_INTERFACE) += en/hv_vhca_stats.o

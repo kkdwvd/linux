@@ -2359,6 +2359,10 @@ static int __init mlx5_init(void)
 	if (err)
 		goto err_debug;
 
+	err = mlx5_bpf_net_init();
+	if (err)
+		goto err_bpf;
+
 	err = mlx5_sf_driver_register();
 	if (err)
 		goto err_sf;
@@ -2372,6 +2376,8 @@ static int __init mlx5_init(void)
 err_pci:
 	mlx5_sf_driver_unregister();
 err_sf:
+	mlx5_bpf_net_cleanup();
+err_bpf:
 	mlx5e_cleanup();
 err_debug:
 	mlx5_unregister_debugfs();
@@ -2382,6 +2388,7 @@ static void __exit mlx5_cleanup(void)
 {
 	pci_unregister_driver(&mlx5_core_driver);
 	mlx5_sf_driver_unregister();
+	mlx5_bpf_net_cleanup();
 	mlx5e_cleanup();
 	mlx5_unregister_debugfs();
 }

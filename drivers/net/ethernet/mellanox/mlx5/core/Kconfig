@@ -43,6 +43,18 @@ config MLX5_EN_ARFS
 	  Mellanox MLX5 ethernet hardware-accelerated receive flow steering support,
 	  Enables ethernet netdevice arfs support and ntuple filtering.
 
+config MLX5_BPF_NET
+	bool "Experimental bounded BPF Ethernet driver transport"
+	depends on MLX5_CORE_EN && BPF_NET_DRIVER
+	help
+	  Build an alternative mlx5_core.eth auxiliary driver for the bounded
+	  BPF network-driver experiment. It owns independent SQ/RQ/CQ objects
+	  and validates packet capabilities before writing hardware descriptors.
+	  The normal mlx5 Ethernet driver remains the default; bind the
+	  mlx5_core.bpf_net auxiliary driver explicitly to select this transport.
+	  This initial version supports one queue pair, MTU up to 1500, and
+	  basic Ethernet on a PF without active SR-IOV, switchdev, or LAG.
+
 config MLX5_EN_RXNFC
 	bool "Mellanox MLX5 ethernet rx nfc flow steering support"
 	depends on MLX5_CORE_EN
