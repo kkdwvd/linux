@@ -749,34 +749,68 @@ const struct bpf_func_proto bpf_for_each_map_elem_proto = {
 	.arg4_type	= ARG_ANYTHING,
 };
 
-BPF_CALL_4(bpf_loop, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
-	   u64, flags)
+/*
+ * With unwind the callback says in r3, which it returns next to r0, whether it
+ * returned or unwound. The loop stops on the latter and returns the bit the same
+ * way, so the caller of bpf_loop() sees it in r3. The normal path is the same
+ * as without, the compiler folds the test of the bit into the test of r0.
+ */
+static __always_inline struct bpf_cb_ret __bpf_loop(u32 nr_loops, void *callback_fn,
+						    void *callback_ctx, u64 flags, bool unwind)
 {
-	bpf_callback_t callback = (bpf_callback_t)callback_fn;
-	u64 ret;
+	struct bpf_cb_ret ret = {};
 	u32 i;
 
 	/* Note: these safety checks are also verified when bpf_loop
 	 * is inlined, be careful to modify this code in sync. See
-	 * function verifier.c:inline_bpf_loop.
+	 * function fixups.c:inline_bpf_loop.
 	 */
-	if (flags)
-		return -EINVAL;
-	if (nr_loops > BPF_MAX_LOOPS)
-		return -E2BIG;
-
-	for (i = 0; i < nr_loops; i++) {
-		ret = callback((u64)i, (u64)(long)callback_ctx, 0, 0, 0);
-		/* return value: 0 - continue, 1 - stop and return */
-		if (ret)
-			return i + 1;
+	if (flags) {
+		ret.r0 = -EINVAL;
+		return ret;
+	}
+	if (nr_loops > BPF_MAX_LOOPS) {
+		ret.r0 = -E2BIG;
+		return ret;
 	}
 
-	return i;
+	for (i = 0; i < nr_loops; i++) {
+		if (unwind) {
+			ret = ((bpf_unwind_callback_t)callback_fn)((u64)i, (u64)(long)callback_ctx,
+								   0, 0, 0);
+			if (ret.unwind)
+				return ret;
+		} else {
+			ret.r0 = ((bpf_callback_t)callback_fn)((u64)i, (u64)(long)callback_ctx,
+							       0, 0, 0);
+		}
+		/* return value: 0 - continue, 1 - stop and return */
+		if (ret.r0) {
+			ret.r0 = i + 1;
+			return ret;
+		}
+	}
+
+	ret.r0 = i;
+	return ret;
+}
+
+BPF_CALL_4(bpf_loop, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
+	   u64, flags)
+{
+	return __bpf_loop(nr_loops, callback_fn, callback_ctx, flags, false).r0;
+}
+
+static struct bpf_cb_ret bpf_loop_unwind(u64 nr_loops, u64 callback_fn, u64 callback_ctx,
+					 u64 flags, u64 r5)
+{
+	return __bpf_loop(nr_loops, (void *)(long)callback_fn, (void *)(long)callback_ctx,
+			  flags, true);
 }
 
 const struct bpf_func_proto bpf_loop_proto = {
 	.func		= bpf_loop,
+	.func_unwind	= bpf_loop_unwind,
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_SCALAR,
