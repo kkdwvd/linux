@@ -155,6 +155,16 @@ struct btf_id_dtor_kfunc {
 	u32 flags;
 };
 
+/* The BTF ids of a destructor entry: the type, the destructor and the release kfunc. */
+#define BPF_DTOR_ID_LIST(name, type, dtor, release)	\
+BTF_ID_LIST(name)					\
+BTF_ID(struct, type)					\
+BTF_ID(func, dtor)					\
+BTF_ID(func, release)
+
+#define BPF_DTOR_ENTRY(ids, dtor_flags)							\
+	{ .btf_id = ids[0], .kfunc_btf_id = ids[1], .release_btf_id = ids[2], .flags = dtor_flags }
+
 struct btf_struct_meta {
 	u32 btf_id;
 	struct btf_record *record;
