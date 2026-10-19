@@ -4092,6 +4092,10 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	if (hdr->sh_type == SHT_LLVM_ADDRSIG)
 		return true;
 
+	/* one object has no other copy of a COMDAT group to drop */
+	if (hdr->sh_type == SHT_GROUP)
+		return true;
+
 	/* no subprograms will lead to an empty .text section, ignore it */
 	if (hdr->sh_type == SHT_PROGBITS && hdr->sh_size == 0 &&
 	    strcmp(name, ".text") == 0)

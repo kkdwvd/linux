@@ -40,6 +40,10 @@ struct src_sec {
 	bool skipped;
 	/* whether section is an ephemeral section, not mapped to an ELF section */
 	bool ephemeral;
+	/* whether section belongs to a COMDAT group an earlier object provided */
+	bool comdat_dup;
+	/* name of the matching section in the final object file, if not sec_name */
+	const char *dst_name;
 
 	/* ELF info */
 	size_t sec_idx;
@@ -147,6 +151,7 @@ struct bpf_linker {
 	int sec_cnt;
 
 	struct strset *strtab_strs; /* STRTAB unique strings */
+	struct strset *comdat_sigs; /* signatures of the COMDAT groups linked */
 	size_t strtab_sec_idx; /* STRTAB section index */
 	size_t symtab_sec_idx; /* SYMTAB section index */
 
@@ -171,6 +176,7 @@ static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 static int linker_load_obj_file(struct bpf_linker *linker,
 				struct src_obj *obj);
 static int linker_sanity_check_elf(struct src_obj *obj);
+static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_sanity_check_elf_symtab(struct src_obj *obj, struct src_sec *sec);
 static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *sec);
 static int linker_sanity_check_btf(struct src_obj *obj);
@@ -203,6 +209,7 @@ void bpf_linker__free(struct bpf_linker *linker)
 		close(linker->fd);
 
 	strset__free(linker->strtab_strs);
+	strset__free(linker->comdat_sigs);
 
 	btf__free(linker->btf);
 	btf_ext__free(linker->btf_ext);
@@ -385,6 +392,10 @@ static int init_output_elf(struct bpf_linker *linker)
 	linker->strtab_strs = strset__new(INT_MAX, "", sizeof(""));
 	if (libbpf_get_error(linker->strtab_strs))
 		return libbpf_get_error(linker->strtab_strs);
+
+	linker->comdat_sigs = strset__new(INT_MAX, "", sizeof(""));
+	if (libbpf_get_error(linker->comdat_sigs))
+		return libbpf_get_error(linker->comdat_sigs);
 
 	sec = add_dst_sec(linker, ".strtab");
 	if (!sec)
@@ -818,6 +829,10 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 		case SHT_REL:
 			/* relocations */
 			break;
+		case SHT_GROUP:
+			/* the members are linked, see linker_load_groups() */
+			sec->skipped = true;
+			break;
 		default:
 			pr_warn("unrecognized section #%zu (%s) in %s\n",
 				sec_idx, sec_name, obj->filename);
@@ -827,11 +842,128 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 	}
 
 	err = err ?: linker_sanity_check_elf(obj);
+	err = err ?: linker_load_groups(linker, obj);
 	err = err ?: linker_sanity_check_btf(obj);
 	err = err ?: linker_sanity_check_btf_ext(obj);
 	err = err ?: linker_fixup_btf(obj);
 
 	return err;
+}
+
+/* the sections that members of COMDAT groups join, and their relocations */
+static const struct {
+	const char *name;
+	const char *rel_name;
+} group_bases[] = {
+	{ ".text", ".rel.text" },
+	{ ".data", ".rel.data" },
+	{ ".rodata", ".rel.rodata" },
+	{ ".bss", ".rel.bss" },
+};
+
+static int group_base(const char *sec_name)
+{
+	int i;
+
+	for (i = 0; i < sizeof(group_bases) / sizeof(group_bases[0]); i++) {
+		size_t len = strlen(group_bases[i].name);
+
+		if (strncmp(sec_name, group_bases[i].name, len) == 0 && sec_name[len] == '.')
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * A COMDAT group holds a definition that every object using it carries, such
+ * as an inline function that was not inlined everywhere or an inline
+ * variable. The first group with a signature is linked and the members of
+ * every later one are dropped, their global symbols resolving to the
+ * definitions of the first. A member .text.foo joins .text, the only section
+ * libbpf links subprogram calls to, and .rodata.foo, .data.foo and .bss.foo
+ * join theirs, as libbpf would otherwise map each to an array of its own or,
+ * for .bss.foo, not at all; relocations follow.
+ */
+static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
+{
+	struct src_sec *symtab = &obj->secs[obj->symtab_sec_idx];
+	size_t sym_cnt = symtab->shdr->sh_size / sizeof(Elf64_Sym);
+	int i, err;
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *sec = &obj->secs[i];
+		const Elf64_Sym *sym;
+		const __u32 *words;
+		const char *sig;
+		size_t j, n;
+		bool dup;
+
+		if (sec->ephemeral || sec->shdr->sh_type != SHT_GROUP)
+			continue;
+
+		words = sec->data->d_buf;
+		n = sec->shdr->sh_size / sizeof(*words);
+		if (sec->shdr->sh_entsize != sizeof(*words) || n == 0 ||
+		    sec->shdr->sh_link != obj->symtab_sec_idx ||
+		    sec->shdr->sh_info >= sym_cnt) {
+			pr_warn("ELF group section #%zu is malformed in %s\n",
+				sec->sec_idx, obj->filename);
+			return -EINVAL;
+		}
+		/* only a COMDAT group asks the linker to do anything */
+		if (!(words[0] & GRP_COMDAT))
+			continue;
+
+		sym = symtab->data->d_buf;
+		sig = elf_strptr(obj->elf, symtab->shdr->sh_link, sym[sec->shdr->sh_info].st_name);
+		if (!sig) {
+			pr_warn_elf("failed to get the signature of group section #%zu in %s",
+				    sec->sec_idx, obj->filename);
+			return -EINVAL;
+		}
+
+		dup = strset__find_str(linker->comdat_sigs, sig) >= 0;
+		if (!dup) {
+			err = strset__add_str(linker->comdat_sigs, sig);
+			if (err < 0)
+				return err;
+		}
+
+		for (j = 1; j < n; j++) {
+			struct src_sec *member;
+
+			if (!words[j] || words[j] >= obj->sec_cnt) {
+				pr_warn("ELF group section #%zu points to missing section #%u in %s\n",
+					sec->sec_idx, words[j], obj->filename);
+				return -EINVAL;
+			}
+			member = &obj->secs[words[j]];
+			if (dup) {
+				member->skipped = true;
+				member->comdat_dup = true;
+			} else if (member->shdr->sh_type != SHT_REL) {
+				int base = group_base(member->sec_name);
+
+				if (base >= 0)
+					member->dst_name = group_bases[base].name;
+			}
+		}
+	}
+
+	/* relocations follow the section they relocate */
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *sec = &obj->secs[i];
+		const struct src_sec *target;
+
+		if (sec->ephemeral || sec->skipped || sec->shdr->sh_type != SHT_REL ||
+		    sec->shdr->sh_info >= obj->sec_cnt)
+			continue;
+		target = &obj->secs[sec->shdr->sh_info];
+		if (target->dst_name)
+			sec->dst_name = group_bases[group_base(target->sec_name)].rel_name;
+	}
+
+	return 0;
 }
 
 static int linker_sanity_check_elf(struct src_obj *obj)
@@ -905,6 +1037,8 @@ static int linker_sanity_check_elf(struct src_obj *obj)
 				return err;
 			break;
 		case SHT_LLVM_ADDRSIG:
+			break;
+		case SHT_GROUP:
 			break;
 		default:
 			pr_warn("ELF section #%zu (%s) has unrecognized type %zu in %s\n",
@@ -1175,13 +1309,16 @@ static int init_sec(struct bpf_linker *linker, struct dst_sec *dst_sec, struct s
 	dst_sec->data = data;
 	dst_sec->sec_idx = elf_ndxscn(scn);
 
-	name_off = strset__add_str(linker->strtab_strs, src_sec->sec_name);
+	name_off = strset__add_str(linker->strtab_strs, dst_sec->sec_name);
 	if (name_off < 0)
 		return name_off;
 
 	shdr->sh_name = name_off;
 	shdr->sh_type = src_sec->shdr->sh_type;
-	shdr->sh_flags = src_sec->shdr->sh_flags;
+	shdr->sh_flags = src_sec->shdr->sh_flags & ~SHF_GROUP;
+	/* the linker always fills in sh_info of relocations */
+	if (shdr->sh_type == SHT_REL)
+		shdr->sh_flags |= SHF_INFO_LINK;
 	shdr->sh_size = 0;
 	/* sh_link and sh_info have different meaning for different types of
 	 * sections, so we leave it up to the caller code to fill them in, if
@@ -1216,8 +1353,15 @@ static struct dst_sec *find_dst_sec_by_name(struct bpf_linker *linker, const cha
 	return NULL;
 }
 
+static const char *dst_sec_name(const struct src_sec *sec)
+{
+	return sec->dst_name ?: sec->sec_name;
+}
+
 static bool secs_match(struct dst_sec *dst, struct src_sec *src)
 {
+	Elf64_Xword ignored_flags;
+
 	if (dst->ephemeral || src->ephemeral)
 		return true;
 
@@ -1225,7 +1369,14 @@ static bool secs_match(struct dst_sec *dst, struct src_sec *src)
 		pr_warn("sec %s types mismatch\n", dst->sec_name);
 		return false;
 	}
-	if (dst->shdr->sh_flags != src->shdr->sh_flags) {
+	/*
+	 * A member of a group lands in a section that is in none, and its
+	 * relocations come without SHF_INFO_LINK.
+	 */
+	ignored_flags = SHF_GROUP;
+	if (src->shdr->sh_type == SHT_REL)
+		ignored_flags |= SHF_INFO_LINK;
+	if ((dst->shdr->sh_flags & ~ignored_flags) != (src->shdr->sh_flags & ~ignored_flags)) {
 		pr_warn("sec %s flags mismatch\n", dst->sec_name);
 		return false;
 	}
@@ -1370,9 +1521,9 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 		if (!is_data_sec(src_sec))
 			continue;
 
-		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
+		dst_sec = find_dst_sec_by_name(linker, dst_sec_name(src_sec));
 		if (!dst_sec) {
-			dst_sec = add_dst_sec(linker, src_sec->sec_name);
+			dst_sec = add_dst_sec(linker, dst_sec_name(src_sec));
 			if (!dst_sec)
 				return -ENOMEM;
 			err = init_sec(linker, dst_sec, src_sec);
@@ -2024,6 +2175,17 @@ static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 		}
 	} else if (sym->st_shndx < SHN_LORESERVE) {
 		src_sec = &obj->secs[sym->st_shndx];
+		if (src_sec->comdat_dup && sym_bind != STB_LOCAL) {
+			/* the group linked first defines it */
+			glob_sym = find_glob_sym(linker, sym_name);
+			if (!glob_sym) {
+				pr_warn("symbol '%s' of a duplicate COMDAT group is not in the first one in '%s'\n",
+					sym_name, obj->filename);
+				return -EINVAL;
+			}
+			obj->sym_map[src_sym_idx] = glob_sym->sym_idx;
+			return 0;
+		}
 		if (src_sec->skipped)
 			return 0;
 		dst_sec = &linker->secs[src_sec->dst_id];
@@ -2286,9 +2448,9 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 		if (src_linked_sec->skipped)
 			continue;
 
-		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
+		dst_sec = find_dst_sec_by_name(linker, dst_sec_name(src_sec));
 		if (!dst_sec) {
-			dst_sec = add_dst_sec(linker, src_sec->sec_name);
+			dst_sec = add_dst_sec(linker, dst_sec_name(src_sec));
 			if (!dst_sec) {
 				err = -ENOMEM;
 				goto out;
@@ -2758,6 +2920,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->func_info.rec_sz == 0)
@@ -2787,6 +2951,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->line_info.rec_sz == 0)
@@ -2829,6 +2995,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->core_relo_info.rec_sz == 0)
