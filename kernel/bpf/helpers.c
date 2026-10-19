@@ -5209,12 +5209,6 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
 };
 
 /* A type, its void (*)(void *) destructor, and the kfunc a program calls to release it */
-#define BPF_DTOR_ID_LIST(name, type, dtor, release)	\
-BTF_ID_LIST(name)					\
-BTF_ID(struct, type)					\
-BTF_ID(func, dtor)					\
-BTF_ID(func, release)
-
 BPF_DTOR_ID_LIST(task_dtor_ids, task_struct, bpf_task_release_dtor, bpf_task_release)
 BPF_DTOR_ID_LIST(iter_num_dtor_ids, bpf_iter_num, bpf_iter_num_destroy_dtor, bpf_iter_num_destroy)
 BPF_DTOR_ID_LIST(iter_task_dtor_ids, bpf_iter_task, bpf_iter_task_destroy_dtor,
@@ -5238,9 +5232,6 @@ BPF_DTOR_ID_LIST(key_dtor_ids, bpf_key, bpf_key_put_dtor, bpf_key_put)
 BPF_DTOR_ID_LIST(iter_dmabuf_dtor_ids, bpf_iter_dmabuf, bpf_iter_dmabuf_destroy_dtor,
 		 bpf_iter_dmabuf_destroy)
 #endif
-
-#define BPF_DTOR_ENTRY(ids, dtor_flags)							\
-	{ .btf_id = ids[0], .kfunc_btf_id = ids[1], .release_btf_id = ids[2], .flags = dtor_flags }
 
 BTF_KFUNCS_START(common_btf_ids)
 BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx, KF_FASTCALL)

@@ -2228,6 +2228,8 @@ DECLARE_PER_CPU(struct rq *, scx_locked_rq_state);
 DECLARE_STATIC_KEY_FALSE(__scx_is_cid_type);
 
 int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id);
+void scx_bpf_put_cpumask_dtor(void *p);
+void bpf_iter_scx_dsq_destroy_dtor(void *p);
 
 bool scx_cpu_valid(struct scx_sched *sch, s32 cpu, const char *where);
 
