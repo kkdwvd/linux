@@ -2527,6 +2527,29 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 			src_sym = src_symtab->data->d_buf + sizeof(*src_sym) * src_sym_idx;
 
 			dst_sym_idx = obj->sym_map[src_sym_idx];
+			/*
+			 * A global symbol of a COMDAT group that an earlier object
+			 * provided resolves to that object's. Nothing else of a
+			 * discarded section is in the output, so a relocation
+			 * against it can't be, like for ld and lld.
+			 */
+			if (src_sym_idx && !dst_sym_idx &&
+			    src_sym->st_shndx < obj->sec_cnt &&
+			    obj->secs[src_sym->st_shndx].comdat_dup) {
+				const struct src_sec *sym_sec = &obj->secs[src_sym->st_shndx];
+				const char *sym_name;
+
+				if (ELF64_ST_TYPE(src_sym->st_info) == STT_SECTION)
+					sym_name = sym_sec->sec_name;
+				else
+					sym_name = elf_strptr(obj->elf, src_symtab->shdr->sh_link,
+							      src_sym->st_name) ?: "<?>";
+				pr_warn("relocation #%d in section '%s' refers to symbol '%s' in section '%s', which is in a discarded COMDAT group, in %s\n",
+					j, src_linked_sec->sec_name, sym_name, sym_sec->sec_name,
+					obj->filename);
+				err = -EINVAL;
+				goto out;
+			}
 			dst_rel->r_offset += src_linked_sec->dst_off;
 			sym_type = ELF64_R_TYPE(src_rel->r_info);
 			dst_rel->r_info = ELF64_R_INFO(dst_sym_idx, sym_type);
