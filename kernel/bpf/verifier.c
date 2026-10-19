@@ -12234,6 +12234,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 
 	if (!exception_exit && cur_func(env)->frameno)
 		return 0;
+	/* The unwinder releases what the frame descriptors of the throw site list. */
+	if (exception_exit && bpf_arch_throw_entry())
+		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type != REF_TYPE_PTR)
