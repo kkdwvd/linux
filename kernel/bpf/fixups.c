@@ -2642,6 +2642,23 @@ patch_map_ops_generic:
 			goto next_insn;
 		}
 
+		if (insn->imm == BPF_FUNC_kptr_xchg &&
+		    env->insn_aux_data[i + delta].kptr_xchg_mode == BPF_KPTR_XCHG_ARENA) {
+			struct bpf_insn arena_xchg[] = {
+				BPF_LD_IMM64(BPF_REG_3, (unsigned long)prog->aux->arena),
+				BPF_EMIT_CALL(bpf_arena_kptr_xchg),
+			};
+
+			cnt = ARRAY_SIZE(arena_xchg);
+			new_prog = bpf_patch_insn_data(env, i + delta, arena_xchg, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+			delta += cnt - 1;
+			env->prog = prog = new_prog;
+			insn = new_prog->insnsi + i + delta;
+			goto next_insn;
+		}
+
 		/* Implement bpf_kptr_xchg inline */
 		if (prog->jit_requested && BITS_PER_LONG == 64 &&
 		    insn->imm == BPF_FUNC_kptr_xchg &&

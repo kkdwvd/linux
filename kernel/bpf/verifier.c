@@ -8343,14 +8343,59 @@ static int process_timer_func(struct bpf_verifier_env *env, struct bpf_reg_state
 	return check_map_field_pointer(env, reg, argno, BPF_TIMER, map);
 }
 
+/*
+ * WIP: PTR_TO_ARENA does not carry field BTF. An entry-program declaration tag
+ * selects one kernel pointee type for all of its arena exchanges, including
+ * exchanges with NULL. This deliberately does not validate the slot contents,
+ * protect slots against raw stores, or release references on arena teardown.
+ */
+static int process_arena_kptr_func(struct bpf_verifier_env *env,
+				 struct bpf_call_arg_meta *meta)
+{
+	struct bpf_prog_aux *aux = env->prog->aux;
+	const struct btf_type *func;
+	const char *name;
+	int id;
+
+	if (!aux->arena || !aux->func_info_cnt || !env->bpf_capable || !btf_vmlinux)
+		return -EACCES;
+	func = btf_type_by_id(aux->btf, aux->func_info[0].type_id);
+	name = btf_find_decl_tag_value(aux->btf, func, -1, "bpf_arena_kptr:");
+	if (IS_ERR(name)) {
+		verbose(env, "arena kptr exchange requires one bpf_arena_kptr:TYPE tag on the entry program\n");
+		return PTR_ERR(name);
+	}
+	id = btf_find_by_name_kind(btf_vmlinux, name, BTF_KIND_STRUCT);
+	if (id < 0) {
+		verbose(env, "arena kptr type '%s' is not a vmlinux struct\n", name);
+		return id;
+	}
+	meta->kptr_field->type = BPF_KPTR_REF;
+	meta->kptr_field->kptr.btf = btf_vmlinux;
+	meta->kptr_field->kptr.btf_id = id;
+	return 0;
+}
+
 static int process_kptr_func(struct bpf_verifier_env *env, int regno,
 			     struct bpf_call_arg_meta *meta)
 {
 	struct bpf_reg_state *reg = reg_state(env, regno);
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+	enum bpf_kptr_xchg_mode mode;
 	struct btf_field *kptr_field;
 	struct bpf_map *map_ptr;
 	struct btf_record *rec;
 	u32 kptr_off;
+
+	mode = is_arena_reg(env, regno) || is_arena_scalar(env, regno) ?
+		BPF_KPTR_XCHG_ARENA : BPF_KPTR_XCHG_NATIVE;
+	if (aux->kptr_xchg_mode && aux->kptr_xchg_mode != mode) {
+		verbose(env, "kptr exchange mixes arena and native destinations\n");
+		return -EINVAL;
+	}
+	aux->kptr_xchg_mode = mode;
+	if (mode == BPF_KPTR_XCHG_ARENA)
+		return process_arena_kptr_func(env, meta);
 
 	if (type_is_ptr_alloc_obj(reg->type)) {
 		rec = reg_btf_record(reg);
@@ -9118,6 +9163,7 @@ static const struct bpf_reg_types alloc_obj_types = {
 static const struct bpf_reg_types kptr_xchg_dest_types = {
 	.types = {
 		PTR_TO_MAP_VALUE,
+		PTR_TO_ARENA,
 		PTR_TO_BTF_ID | MEM_ALLOC,
 		PTR_TO_BTF_ID | MEM_ALLOC | NON_OWN_REF,
 		PTR_TO_BTF_ID | MEM_ALLOC | NON_OWN_REF | MEM_RCU,
@@ -9310,6 +9356,9 @@ static int check_reg_type(struct bpf_verifier_env *env, struct bpf_reg_state *re
 	}
 	if (is_kfunc(meta) && base_type(arg_type) == ARG_PTR_TO_BTF_ID &&
 	    (base_type(type) == PTR_TO_BTF_ID || reg2btf_ids[base_type(type)]))
+		goto found;
+	if (arg_type == ARG_KPTR_XCHG_DEST && type == SCALAR_VALUE &&
+	    env->arena_scalar && env->prog->aux->arena)
 		goto found;
 
 	/* ARG_PTR_TO_MEM + RDONLY is compatible with PTR_TO_MEM and PTR_TO_MEM + RDONLY,
@@ -12486,6 +12535,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	enum bpf_type_flag ret_flag;
 	struct bpf_reg_state *regs;
 	struct bpf_call_arg_meta meta;
+	struct btf_field arena_kptr_field = {};
 	const char *operation;
 	int insn_idx = *insn_idx_p;
 	bool changes_data;
@@ -12567,6 +12617,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	meta.func_id = func_id;
 	meta.func_name = func_id_name(func_id);
 	meta.fn = fn;
+	meta.kptr_field = &arena_kptr_field;
 	err = check_func_args(env, &meta, insn_idx);
 	if (err)
 		return err;

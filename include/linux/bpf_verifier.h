@@ -730,6 +730,12 @@ struct bpf_loop {
 	unsigned long store_base_regs[BITS_TO_LONGS(BPF_SCEV_REGS_NUM)];
 };
 
+enum bpf_kptr_xchg_mode {
+	BPF_KPTR_XCHG_UNSEEN,
+	BPF_KPTR_XCHG_NATIVE,
+	BPF_KPTR_XCHG_ARENA,
+};
+
 struct bpf_insn_aux_data {
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
@@ -781,6 +787,7 @@ struct bpf_insn_aux_data {
 	u64 is_iter_next:1; /* bpf_iter_<type>_next() kfunc call */
 	u64 call_with_percpu_alloc_ptr:1; /* {this,per}_cpu_ptr() with prog percpu alloc */
 	u64 arena_scalar:1; /* ldx/stx/st/atomic through a number, it's an address in arena */
+	u64 kptr_xchg_mode:2; /* enum bpf_kptr_xchg_mode */
 	u64 bb_end:1; /* last instruction of a basic block */
 	u64 need_scev:1;
 	u64 alu_state:5; /* used in combination with alu_limit */

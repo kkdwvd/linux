@@ -255,7 +255,7 @@ fail:
 }
 
 SEC("syscall")
-__failure __msg("R1 type=scalar expected=map_value, ptr_, ptr_")
+__failure __msg("R1 type=scalar expected=map_value, arena, ptr_, ptr_")
 long non_own_ref_kptr_xchg_no_lock(void *ctx)
 {
 	struct tree_node *tnode;

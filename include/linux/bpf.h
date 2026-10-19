@@ -733,12 +733,18 @@ int bpf_dynptr_from_file_sleepable(struct file *file, u32 flags,
 				   struct bpf_dynptr *ptr__uninit);
 
 #if defined(CONFIG_MMU) && defined(CONFIG_64BIT)
+u64 bpf_arena_kptr_xchg(u64 dst, u64 ptr, u64 arena, u64 unused4, u64 unused5);
 void *bpf_arena_alloc_pages_non_sleepable(void *p__map, void *addr__ign, u32 page_cnt, int node_id,
 					  u64 flags);
 void bpf_arena_free_pages_non_sleepable(void *p__map, void *ptr__ign, u32 page_cnt);
 void *bpf_arena_alloc_pages_sleepable(void *p__map, void *addr__ign, u32 page_cnt, int node_id,
 				      u64 flags);
 #else
+static inline u64 bpf_arena_kptr_xchg(u64 dst, u64 ptr, u64 arena, u64 unused4, u64 unused5)
+{
+	return ptr;
+}
+
 static inline void *bpf_arena_alloc_pages_non_sleepable(void *p__map, void *addr__ign, u32 page_cnt,
 							int node_id, u64 flags)
 {

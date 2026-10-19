@@ -713,6 +713,43 @@ static u64 clear_lo32(u64 val)
 	return val & ~(u64)~0U;
 }
 
+/*
+ * WIP: only the destination access is protected here. The caller must keep
+ * pointer slots private, use the declared pointee type, and drain them before
+ * freeing the arena. Raw arena stores and user mappings can violate all of
+ * these requirements until typed arenas provide their lifetime enforcement.
+ *
+ * Return the incoming reference if the destination is invalid or unavailable:
+ * bpf_kptr_xchg() transfers its ownership to R0 even when no exchange occurs.
+ */
+BPF_CALL_3(bpf_arena_kptr_xchg, void *, dst, void *, ptr, struct bpf_arena *, arena)
+{
+	unsigned long addr = (u32)(unsigned long)dst;
+	unsigned long flags, kaddr;
+	struct page *page;
+	u64 uaddr;
+
+	if (!arena || !IS_ALIGNED(addr, sizeof(unsigned long)))
+		return (unsigned long)ptr;
+	uaddr = clear_lo32(arena->user_vm_start) + addr;
+	if (uaddr < arena->user_vm_start || uaddr >= arena->user_vm_end)
+		return (unsigned long)ptr;
+	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
+		return (unsigned long)ptr;
+
+	/*
+	 * Serialize against population and free. Access the backing page rather
+	 * than the arena alias, which can fault or have a stale TLB entry.
+	 */
+	kaddr = bpf_arena_get_kern_vm_start(arena) + addr;
+	page = vmalloc_to_page((void *)kaddr);
+	if (page && page != arena->scratch_page)
+		ptr = (void *)xchg((unsigned long *)(page_address(page) + offset_in_page(addr)),
+				  (unsigned long)ptr);
+	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+	return (unsigned long)ptr;
+}
+
 static int arena_adjust_tree(struct bpf_arena *arena, long uaddr, long page_cnt, long *pgoff)
 {
 	int ret;
