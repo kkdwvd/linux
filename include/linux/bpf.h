@@ -2246,6 +2246,9 @@ struct btf_member;
  * @free_after_mult_rcu_gp: Same as @free_after_tasks_rcu_gp but waiting for
  *                          both tasks_trace_rcu and regular rcu grace period.
  *                          It is usually needed if the struct_ops has sleepable prog.
+ * @no_prog_composition: Reject tracing and extension attachments to these
+ *                       programs, including their subprograms, so attached code
+ *                       cannot bypass subsystem admission checks on a callback.
  */
 struct bpf_struct_ops {
 	const struct bpf_verifier_ops *verifier_ops;
@@ -2267,6 +2270,7 @@ struct bpf_struct_ops {
 	int cgroup_atype;
 	bool free_after_tasks_rcu_gp;
 	bool free_after_mult_rcu_gp;
+	bool no_prog_composition;
 };
 
 /* Every member of a struct_ops type has an instance even a member is not

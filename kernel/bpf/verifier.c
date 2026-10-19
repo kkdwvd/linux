@@ -22388,6 +22388,11 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		bool tgt_changes_pkt_data;
 		bool tgt_might_sleep;
 
+		if (aux->st_ops && aux->st_ops->no_prog_composition) {
+			bpf_log(log, "Cannot attach to %s struct_ops programs\n", aux->st_ops->name);
+			return -EACCES;
+		}
+
 		if (bpf_prog_is_dev_bound(prog->aux) &&
 		    !bpf_prog_dev_bound_match(prog, tgt_prog)) {
 			bpf_log(log, "Target program bound device mismatch");
