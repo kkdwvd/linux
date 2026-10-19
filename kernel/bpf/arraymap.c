@@ -800,19 +800,24 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 	.seq_priv_size		= sizeof(struct bpf_iter_seq_array_map_info),
 };
 
-static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback_fn,
-				    void *callback_ctx, u64 flags)
+/* See __bpf_loop() for unwind. */
+static __always_inline struct bpf_cb_ret __bpf_for_each_array_elem(struct bpf_map *map,
+								   void *callback_fn,
+								   void *callback_ctx, u64 flags,
+								   bool unwind)
 {
 	u32 i, key, num_elems = 0;
+	struct bpf_cb_ret ret = {};
 	struct bpf_array *array;
 	bool is_percpu;
-	u64 ret = 0;
 	void *val;
 
 	cant_migrate();
 
-	if (flags != 0)
-		return -EINVAL;
+	if (flags != 0) {
+		ret.r0 = -EINVAL;
+		return ret;
+	}
 
 	is_percpu = map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
 	array = container_of(map, struct bpf_array, map);
@@ -823,14 +828,37 @@ static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback
 			val = array_map_elem_ptr(array, i);
 		num_elems++;
 		key = i;
-		ret = callback_fn((u64)(long)map, (u64)(long)&key,
-				  (u64)(long)val, (u64)(long)callback_ctx, 0);
+		if (unwind) {
+			ret = ((bpf_unwind_callback_t)callback_fn)((u64)(long)map, (u64)(long)&key,
+								   (u64)(long)val,
+								   (u64)(long)callback_ctx, 0);
+			if (ret.unwind)
+				return ret;
+		} else {
+			ret.r0 = ((bpf_callback_t)callback_fn)((u64)(long)map, (u64)(long)&key,
+							       (u64)(long)val,
+							       (u64)(long)callback_ctx, 0);
+		}
 		/* return value: 0 - continue, 1 - stop and return */
-		if (ret)
+		if (ret.r0)
 			break;
 	}
 
-	return num_elems;
+	ret.r0 = num_elems;
+	return ret;
+}
+
+static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+				    void *callback_ctx, u64 flags)
+{
+	return __bpf_for_each_array_elem(map, callback_fn, callback_ctx, flags, false).r0;
+}
+
+static struct bpf_cb_ret bpf_for_each_array_elem_unwind(struct bpf_map *map,
+							bpf_unwind_callback_t callback_fn,
+							void *callback_ctx, u64 flags)
+{
+	return __bpf_for_each_array_elem(map, callback_fn, callback_ctx, flags, true);
 }
 
 static u64 array_map_mem_usage(const struct bpf_map *map)
@@ -877,6 +905,7 @@ const struct bpf_map_ops array_map_ops = {
 	.map_update_batch = generic_map_update_batch,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_array_elem,
+	.map_for_each_callback_unwind = bpf_for_each_array_elem_unwind,
 	.map_mem_usage = array_map_mem_usage,
 	.map_btf_id = &array_map_btf_ids[0],
 	.iter_seq_info = &iter_seq_info,
@@ -902,6 +931,7 @@ const struct bpf_map_ops percpu_array_map_ops = {
 	.map_update_batch = generic_map_update_batch,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_array_elem,
+	.map_for_each_callback_unwind = bpf_for_each_array_elem_unwind,
 	.map_mem_usage = array_map_mem_usage,
 	.map_btf_id = &array_map_btf_ids[0],
 	.iter_seq_info = &iter_seq_info,

@@ -739,8 +739,19 @@ BPF_CALL_4(bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
 	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx, flags);
 }
 
+/* The callback can unwind. The verifier checked that the map has the op. */
+static struct bpf_cb_ret bpf_for_each_map_elem_unwind(u64 map, u64 callback_fn, u64 callback_ctx,
+						      u64 flags, u64 r5)
+{
+	struct bpf_map *m = (struct bpf_map *)(long)map;
+
+	return m->ops->map_for_each_callback_unwind(m, (bpf_unwind_callback_t)(long)callback_fn,
+						    (void *)(long)callback_ctx, flags);
+}
+
 const struct bpf_func_proto bpf_for_each_map_elem_proto = {
 	.func		= bpf_for_each_map_elem,
+	.func_unwind	= bpf_for_each_map_elem_unwind,
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_CONST_MAP_PTR,

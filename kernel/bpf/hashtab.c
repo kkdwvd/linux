@@ -2496,24 +2496,29 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 	.seq_priv_size		= sizeof(struct bpf_iter_seq_hash_map_info),
 };
 
-static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
-				   void *callback_ctx, u64 flags)
+/* See __bpf_loop() for unwind. */
+static __always_inline struct bpf_cb_ret __bpf_for_each_hash_elem(struct bpf_map *map,
+								  void *callback_fn,
+								  void *callback_ctx, u64 flags,
+								  bool unwind)
 {
 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
 	struct hlist_nulls_head *head;
 	struct hlist_nulls_node *n;
+	struct bpf_cb_ret ret = {};
 	struct htab_elem *elem;
 	int i, num_elems = 0;
 	void __percpu *pptr;
 	struct bucket *b;
 	void *key, *val;
 	bool is_percpu;
-	u64 ret = 0;
 
 	cant_migrate();
 
-	if (flags != 0)
-		return -EINVAL;
+	if (flags != 0) {
+		ret.r0 = -EINVAL;
+		return ret;
+	}
 
 	is_percpu = htab_is_percpu(htab);
 
@@ -2535,10 +2540,25 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
 				val = htab_elem_value(elem, map->key_size);
 			}
 			num_elems++;
-			ret = callback_fn((u64)(long)map, (u64)(long)key,
-					  (u64)(long)val, (u64)(long)callback_ctx, 0);
+			if (unwind) {
+				ret = ((bpf_unwind_callback_t)callback_fn)((u64)(long)map,
+									   (u64)(long)key,
+									   (u64)(long)val,
+									   (u64)(long)callback_ctx,
+									   0);
+				if (ret.unwind) {
+					rcu_read_unlock();
+					return ret;
+				}
+			} else {
+				ret.r0 = ((bpf_callback_t)callback_fn)((u64)(long)map,
+								       (u64)(long)key,
+								       (u64)(long)val,
+								       (u64)(long)callback_ctx,
+								       0);
+			}
 			/* return value: 0 - continue, 1 - stop and return */
-			if (ret) {
+			if (ret.r0) {
 				rcu_read_unlock();
 				goto out;
 			}
@@ -2546,7 +2566,21 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
 		rcu_read_unlock();
 	}
 out:
-	return num_elems;
+	ret.r0 = num_elems;
+	return ret;
+}
+
+static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+				   void *callback_ctx, u64 flags)
+{
+	return __bpf_for_each_hash_elem(map, callback_fn, callback_ctx, flags, false).r0;
+}
+
+static struct bpf_cb_ret bpf_for_each_hash_elem_unwind(struct bpf_map *map,
+						       bpf_unwind_callback_t callback_fn,
+						       void *callback_ctx, u64 flags)
+{
+	return __bpf_for_each_hash_elem(map, callback_fn, callback_ctx, flags, true);
 }
 
 static u64 htab_map_mem_usage(const struct bpf_map *map)
@@ -2603,6 +2637,7 @@ const struct bpf_map_ops htab_map_ops = {
 	.map_seq_show_elem = htab_map_seq_show_elem,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_hash_elem,
+	.map_for_each_callback_unwind = bpf_for_each_hash_elem_unwind,
 	.map_check_btf = htab_map_check_btf,
 	.map_mem_usage = htab_map_mem_usage,
 	BATCH_OPS(htab),
@@ -2626,6 +2661,7 @@ const struct bpf_map_ops htab_lru_map_ops = {
 	.map_seq_show_elem = htab_map_seq_show_elem,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_hash_elem,
+	.map_for_each_callback_unwind = bpf_for_each_hash_elem_unwind,
 	.map_check_btf = htab_map_check_btf,
 	.map_mem_usage = htab_map_mem_usage,
 	BATCH_OPS(htab_lru),
@@ -2806,6 +2842,7 @@ const struct bpf_map_ops htab_percpu_map_ops = {
 	.map_seq_show_elem = htab_percpu_map_seq_show_elem,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_hash_elem,
+	.map_for_each_callback_unwind = bpf_for_each_hash_elem_unwind,
 	.map_check_btf = htab_map_check_btf,
 	.map_mem_usage = htab_map_mem_usage,
 	BATCH_OPS(htab_percpu),
@@ -2827,6 +2864,7 @@ const struct bpf_map_ops htab_lru_percpu_map_ops = {
 	.map_seq_show_elem = htab_percpu_map_seq_show_elem,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_for_each_hash_elem,
+	.map_for_each_callback_unwind = bpf_for_each_hash_elem_unwind,
 	.map_check_btf = htab_map_check_btf,
 	.map_mem_usage = htab_map_mem_usage,
 	BATCH_OPS(htab_lru_percpu),
@@ -3407,19 +3445,24 @@ static void rhtab_map_seq_show_elem(struct bpf_map *map, void *key, struct seq_f
 	seq_putc(m, '\n');
 }
 
-static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
-				void *callback_ctx, u64 flags)
+/* See __bpf_loop() for unwind. */
+static __always_inline struct bpf_cb_ret __bpf_each_rhash_elem(struct bpf_map *map,
+							       void *callback_fn,
+							       void *callback_ctx, u64 flags,
+							       bool unwind)
 {
 	struct bpf_rhtab *rhtab = container_of(map, struct bpf_rhtab, map);
+	struct bpf_cb_ret ret = {};
 	void *prev_key = NULL;
 	struct rhtab_elem *elem;
 	int num_elems = 0;
-	u64 ret = 0;
 
 	cant_migrate();
 
-	if (flags != 0)
-		return -EINVAL;
+	if (flags != 0) {
+		ret.r0 = -EINVAL;
+		return ret;
+	}
 
 	rcu_read_lock();
 	/*
@@ -3431,18 +3474,43 @@ static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 		if (IS_ERR(elem))
 			break;
 		num_elems++;
-		ret = callback_fn((u64)(long)map,
-				  (u64)(long)elem->data,
-				  (u64)(long)rhtab_elem_value(elem, map->key_size),
-				  (u64)(long)callback_ctx, 0);
-		if (ret)
+		if (unwind) {
+			ret = ((bpf_unwind_callback_t)callback_fn)((u64)(long)map,
+								   (u64)(long)elem->data,
+								   (u64)(long)rhtab_elem_value(elem, map->key_size),
+								   (u64)(long)callback_ctx, 0);
+			if (ret.unwind) {
+				rcu_read_unlock();
+				return ret;
+			}
+		} else {
+			ret.r0 = ((bpf_callback_t)callback_fn)((u64)(long)map,
+							       (u64)(long)elem->data,
+							       (u64)(long)rhtab_elem_value(elem, map->key_size),
+							       (u64)(long)callback_ctx, 0);
+		}
+		if (ret.r0)
 			break;
 
 		prev_key = elem->data;	/* valid while RCU held */
 	}
 	rcu_read_unlock();
 
-	return num_elems;
+	ret.r0 = num_elems;
+	return ret;
+}
+
+static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+				void *callback_ctx, u64 flags)
+{
+	return __bpf_each_rhash_elem(map, callback_fn, callback_ctx, flags, false).r0;
+}
+
+static struct bpf_cb_ret bpf_each_rhash_elem_unwind(struct bpf_map *map,
+						    bpf_unwind_callback_t callback_fn,
+						    void *callback_ctx, u64 flags)
+{
+	return __bpf_each_rhash_elem(map, callback_fn, callback_ctx, flags, true);
 }
 
 static u64 rhtab_map_mem_usage(const struct bpf_map *map)
@@ -3743,6 +3811,7 @@ const struct bpf_map_ops rhtab_map_ops = {
 	.map_seq_show_elem = rhtab_map_seq_show_elem,
 	.map_set_for_each_callback_args = map_set_for_each_callback_args,
 	.map_for_each_callback = bpf_each_rhash_elem,
+	.map_for_each_callback_unwind = bpf_each_rhash_elem_unwind,
 	.map_mem_usage = rhtab_map_mem_usage,
 	BATCH_OPS(rhtab),
 	.map_btf_id = &rhtab_map_btf_ids[0],
