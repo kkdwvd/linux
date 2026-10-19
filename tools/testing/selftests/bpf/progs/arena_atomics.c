@@ -275,28 +275,19 @@ __u64 __arena_global uaf_r0_after_src_r0;
 /* What reading the faulted address again gives, see the end of uaf() */
 __u64 __arena_global uaf_reread;
 
-SEC("syscall")
-int uaf(const void *ctx)
-{
-	if (pid != (bpf_get_current_pid_tgid() >> 32))
-		return 0;
-/*
- * __BPF_FEATURE_ADDR_SPACE_CAST is required by the asm below, which spells
- * addr_space_cast textually. That and the mnemonic both arrived in LLVM 19.
- */
 #if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
 	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
+/*
+ * A fault at an arena access cancels the program unless the access is in a
+ * callback, which the unwinder cannot leave. There the accesses below are
+ * recovered by the exception table entry of the JIT, which is what this
+ * program checks.
+ */
+static int uaf_cb(__u32 i, void __arena **pagep)
+{
 	__u32 __arena *page32;
 	__u64 __arena *page64;
-	void __arena *page;
-
-	page = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
-	bpf_arena_free_pages(&arena, page, 1);
-	uaf_recovery_fails = 26;
-	uaf_r1_after_dst_r0 = 1;
-	uaf_r0_after_dst_r0 = 1;
-	uaf_r0_after_src_r0 = 1;
-	uaf_reread = 1;
+	void __arena *page = *pagep;
 
 	page32 = (__u32 __arena *)page;
 	uaf_sink += __sync_fetch_and_add(page32, 1);
@@ -417,6 +408,32 @@ int uaf(const void *ctx)
 	: : [page]"r"(page64),
 	    __imm_addr(uaf_reread)
 	: "r1", "r2", "r3", "memory");
+	return 0;
+}
+#endif
+
+SEC("syscall")
+int uaf(const void *ctx)
+{
+	if (pid != (bpf_get_current_pid_tgid() >> 32))
+		return 0;
+/*
+ * __BPF_FEATURE_ADDR_SPACE_CAST is required by the asm below, which spells
+ * addr_space_cast textually. That and the mnemonic both arrived in LLVM 19.
+ */
+#if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
+	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
+	void __arena *page;
+
+	page = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
+	bpf_arena_free_pages(&arena, page, 1);
+	uaf_recovery_fails = 26;
+	uaf_r1_after_dst_r0 = 1;
+	uaf_r0_after_dst_r0 = 1;
+	uaf_r0_after_src_r0 = 1;
+	uaf_reread = 1;
+
+	bpf_loop(1, uaf_cb, &page, 0);
 #endif
 
 	return 0;

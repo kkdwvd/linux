@@ -19,7 +19,7 @@ void __arena *htab_for_user;
 bool skip = false;
 
 int zero = 0;
-char __arena arr1[100000];
+char __arena_global arr1[100000];
 char arr2[1000];
 
 SEC("syscall")

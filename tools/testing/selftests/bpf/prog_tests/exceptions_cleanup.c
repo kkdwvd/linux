@@ -98,6 +98,13 @@ void test_exceptions_cleanup(void)
 	RUN(nocancel_may_goto_obj_under_caller_lock, 1, 0, 0, false, 0);
 	/* A cancelled tracing program returns 0. */
 	RUN(cancel_may_goto_priv_stack, 1, 1, 0, true, 0);
+	/* An arena page fault cancels the program as a may_goto timeout does. */
+	CANCEL(cancel_arena_read, 1, 0);
+	CANCEL(cancel_arena_write, 1, 0);
+	CANCEL(cancel_arena_caller, 1, 0);
+	CANCEL(cancel_arena_global, 1, 0);
+	CANCEL(cancel_arena_fetch_r0, 1, 0);
+	RUN(nocancel_arena_callback, 1, 0, 0, false, 0);
 #undef CANCEL
 #undef THROW
 #undef RUN
