@@ -1791,6 +1791,11 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	if (!prog)
 		return -ENOMEM;
 	env->prog = prog;
+	/*
+	 * The patch starts with the original last insn, but patching moved that
+	 * insn's aux data to the end of the patch: give it back to the insn.
+	 */
+	swap(env->insn_aux_data[prog->len - len], env->insn_aux_data[prog->len - 1]);
 	info[cnt + 1].start = info[cnt].start;
 	info[cnt].start = prog->len - len + 1;
 	/* The patch ends with the exit. */
