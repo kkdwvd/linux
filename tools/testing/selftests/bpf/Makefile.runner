@@ -111,14 +111,14 @@ cmd_runner_link = $(CC) $(CFLAGS) \
 		$(filter %.a %.o,$^)) \
 	$(LDLIBS) $(LLVM_LDLIBS) $(LDFLAGS) $(LLVM_LDFLAGS) -o $@
 
-# BPF objects are also needed at runtime.
+# BPF objects and archives are also needed at runtime.
 # In permissive mode, existing test objects are normal prerequisites
 # so edits trigger relinking. Order-only prerequisites attempt all
 # tests; the recipe links the objects that exist afterward.
 $(OUTPUT)/$(BINARY): $(if $(PERMISSIVE_TESTS),$(wildcard $(TEST_OBJS)),$(TEST_OBJS)) \
 		     $(RUNNER_OBJS-$(RUNNER)) $(BPFOBJ)			\
 		     $(TRUNNER_BPFTOOL)					\
-		     | $(BPF_OBJS)					\
+		     | $(BPF_OBJS) $(BPF_ARCHIVES)			\
 		     $(if $(PERMISSIVE_TESTS),$(TEST_OBJS))
 	$(call msg,BINARY,,$@)
 	$(Q)$(cmd_runner_link)
