@@ -41,6 +41,14 @@ extern "C" {
 #endif
 #endif
 
+#ifndef __bpf_noexcept
+#ifdef __cplusplus
+#define __bpf_noexcept noexcept
+#else
+#define __bpf_noexcept
+#endif
+#endif
+
 enum {
 	E0 = 1,
 };
