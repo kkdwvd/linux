@@ -74,6 +74,7 @@
 
 static struct bpf_map *bpf_object__add_map(struct bpf_object *obj);
 static bool prog_is_subprog(const struct bpf_object *obj, const struct bpf_program *prog);
+static bool bpf_object__shndx_is_data(const struct bpf_object *obj, int shndx);
 static int map_set_def_max_entries(struct bpf_map *map);
 
 static const char * const attach_type_name[] = {
@@ -716,6 +717,17 @@ struct elf_sec_desc {
 	Elf_Data *data;
 	/* member of a COMDAT group */
 	bool comdat;
+	/*
+	 * Global data is in map map_name, which is that of section
+	 * map_sec_idx, map_off bytes into it, see bpf_object__layout_data().
+	 * The section with the map has its size and alignment in map_sz and
+	 * map_align.
+	 */
+	const char *map_name;
+	int map_sec_idx;
+	size_t map_off;
+	size_t map_sz;
+	size_t map_align;
 };
 
 struct elf_state {
@@ -2145,11 +2157,25 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	return 0;
 }
 
+/* Copy in the data of the sections in the map of map_sec_idx, see bpf_object__layout_data() */
+static void bpf_object__fill_map_data(struct bpf_object *obj, int map_sec_idx, void *data)
+{
+	struct elf_sec_desc *sec_desc;
+	int sec_idx;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (sec_desc->map_sec_idx != map_sec_idx || !sec_desc->data->d_buf)
+			continue;
+		memcpy(data + sec_desc->map_off, sec_desc->data->d_buf, sec_desc->data->d_size);
+	}
+}
+
 static int bpf_object__init_global_data_maps(struct bpf_object *obj)
 {
 	struct elf_sec_desc *sec_desc;
-	const char *sec_name;
-	int err = 0, sec_idx;
+	enum libbpf_map_type type;
+	int err, sec_idx;
 
 	/*
 	 * Populate obj->maps with libbpf internal maps.
@@ -2157,46 +2183,34 @@ static int bpf_object__init_global_data_maps(struct bpf_object *obj)
 	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
 		sec_desc = &obj->efile.secs[sec_idx];
 
-		/* Skip recognized sections with size 0. */
-		if (!sec_desc->data || sec_desc->data->d_size == 0)
+		/* Skip recognized sections with size 0, and those in another map */
+		if (!sec_desc->data || sec_desc->map_sec_idx != sec_idx || !sec_desc->map_sz)
 			continue;
 
 		switch (sec_desc->sec_type) {
 		case SEC_DATA:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_DATA,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_DATA;
 			break;
 		case SEC_RODATA:
 			obj->has_rodata = true;
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_RODATA,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_RODATA;
 			break;
 		case SEC_BSS:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_BSS,
-							    sec_name, sec_idx,
-							    NULL,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_BSS;
 			break;
 		case SEC_PERCPU:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_PERCPU,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_PERCPU;
 			break;
 		default:
 			/* skip */
-			break;
+			continue;
 		}
+
+		err = bpf_object__init_internal_map(obj, type, sec_desc->map_name, sec_idx, NULL,
+						    sec_desc->map_sz);
 		if (err)
 			return err;
+		bpf_object__fill_map_data(obj, sec_idx, obj->maps[obj->nr_maps - 1].mmaped);
 	}
 	return 0;
 }
@@ -3181,7 +3195,8 @@ static bool map_data_goes_to_arena(const struct bpf_object *obj, const struct bp
 	for (i = 0; i < obj->efile.sec_cnt; i++) {
 		const struct elf_sec_desc *sec = &obj->efile.secs[i];
 
-		if (sec->sec_type == SEC_RELO && sec->shdr->sh_info == map->sec_idx)
+		if (sec->sec_type == SEC_RELO &&
+		    obj->efile.secs[sec->shdr->sh_info].map_sec_idx == map->sec_idx)
 			return false;
 	}
 	return true;
@@ -3190,7 +3205,7 @@ static bool map_data_goes_to_arena(const struct bpf_object *obj, const struct bp
 /* Returns the offset of the data of the map in arena data that is sz bytes so far */
 static size_t map_arena_off(const struct bpf_object *obj, const struct bpf_map *map, size_t sz)
 {
-	size_t align = obj->efile.secs[map->sec_idx].shdr->sh_addralign;
+	size_t align = obj->efile.secs[map->sec_idx].map_align;
 
 	return roundup(sz, max(align, sizeof(__u64)));
 }
@@ -3670,6 +3685,25 @@ static int compare_vsi_off(const void *_a, const void *_b)
 	return a->offset - b->offset;
 }
 
+/*
+ * The section of global data with the map called name, see
+ * bpf_object__layout_data(), or that of the name in no group if plain
+ */
+static int sec_by_map_name(const struct bpf_object *obj, const char *name, bool plain)
+{
+	const struct elf_sec_desc *sec_desc;
+	int sec_idx;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (!sec_desc->map_name || strcmp(sec_desc->map_name, name) != 0)
+			continue;
+		if (plain ? !sec_desc->comdat : sec_desc->map_sec_idx == sec_idx)
+			return sec_idx;
+	}
+	return 0;
+}
+
 static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 			     struct btf_type *t)
 {
@@ -3677,7 +3711,8 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 	const char *sec_name = btf__name_by_offset(btf, t->name_off);
 	struct btf_var_secinfo *vsi;
 	bool fixup_offsets = false;
-	int err;
+	size_t static_off = 0;
+	int err, sec_idx;
 
 	if (!sec_name) {
 		pr_debug("No name found in string section for DATASEC kind.\n");
@@ -3702,7 +3737,14 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 	 * symbol matching just once.
 	 */
 	if (t->size == 0) {
-		err = find_elf_sec_sz(obj, sec_name, &size);
+		/* that of a map of global data covers all its sections */
+		sec_idx = sec_by_map_name(obj, sec_name, false);
+		if (sec_idx) {
+			size = obj->efile.secs[sec_idx].map_sz;
+			err = 0;
+		} else {
+			err = find_elf_sec_sz(obj, sec_name, &size);
+		}
 		if (err || !size) {
 			pr_debug("sec '%s': failed to determine size from ELF: size %u, err %s\n",
 				 sec_name, size, errstr(err));
@@ -3711,6 +3753,14 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 
 		t->size = size;
 		fixup_offsets = true;
+
+		/*
+		 * Clang gives the offsets of static variables, in the section
+		 * of the name that is in no group
+		 */
+		sec_idx = sec_by_map_name(obj, sec_name, true);
+		if (sec_idx)
+			static_off = obj->efile.secs[sec_idx].map_off;
 	}
 
 	for (i = 0, vsi = btf_var_secinfos(t); i < vars; i++, vsi++) {
@@ -3726,6 +3776,8 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 		}
 
 		var = btf_var(t_var);
+		if (var->linkage == BTF_VAR_STATIC && fixup_offsets)
+			vsi->offset += static_off;
 		if (var->linkage == BTF_VAR_STATIC || var->linkage == BTF_VAR_GLOBAL_EXTERN)
 			continue;
 
@@ -3743,8 +3795,12 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 			return -ENOENT;
 		}
 
-		if (fixup_offsets)
+		/* the offset in the map, see bpf_object__layout_data() */
+		if (fixup_offsets) {
 			vsi->offset = sym->st_value;
+			if (sym->st_shndx < obj->efile.sec_cnt)
+				vsi->offset += obj->efile.secs[sym->st_shndx].map_off;
+		}
 
 		/* if variable is a global/weak symbol, but has restricted
 		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF VAR
@@ -3760,6 +3816,52 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 
 sort_vars:
 	qsort(btf_var_secinfos(t), vars, sizeof(*vsi), compare_vsi_off);
+	return 0;
+}
+
+/*
+ * The variables of a COMDAT member that is named after its symbol are in
+ * the map of its base section, see bpf_object__layout_data(), at the offsets
+ * that btf_fixup_datasec() gave them. Move them to the DATASEC of the map,
+ * as the static linker does, which is created if the object has none.
+ */
+static int btf_layout_datasecs(struct bpf_object *obj)
+{
+	const struct elf_sec_desc *sec_desc;
+	const char *sec_name, *map_name;
+	int sec_idx, src_id, dst_id, err;
+	struct btf_type *t;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		map_name = sec_desc->map_name;
+		sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+		if (!map_name || !sec_name || strcmp(sec_name, map_name) == 0)
+			continue;
+		src_id = btf__find_by_name_kind(obj->btf, sec_name, BTF_KIND_DATASEC);
+		if (src_id < 0)
+			continue;
+
+		dst_id = btf__find_by_name_kind(obj->btf, map_name, BTF_KIND_DATASEC);
+		if (dst_id < 0) {
+			dst_id = btf__add_datasec(obj->btf, map_name, 0);
+			if (dst_id < 0)
+				return dst_id;
+		}
+
+		err = btf_datasec_move_vars(obj->btf, dst_id, src_id);
+		if (err) {
+			pr_warn("sec '%s': failed to move variables to DATASEC '%s': %s\n",
+				sec_name, map_name, errstr(err));
+			return err;
+		}
+
+		t = btf_type_by_id(obj->btf, dst_id);
+		t->size = obj->efile.secs[sec_desc->map_sec_idx].map_sz;
+		qsort(btf_var_secinfos(t), btf_vlen(t), sizeof(struct btf_var_secinfo),
+		      compare_vsi_off);
+	}
+
 	return 0;
 }
 
@@ -3786,7 +3888,7 @@ static int bpf_object_fixup_btf(struct bpf_object *obj)
 		}
 	}
 
-	return 0;
+	return btf_layout_datasecs(obj);
 }
 
 static bool prog_needs_vmlinux_btf(struct bpf_program *prog)
@@ -4187,6 +4289,114 @@ static int bpf_object__collect_group(struct bpf_object *obj, Elf_Scn *scn, Elf64
 	return 0;
 }
 
+/* Whether section sec_idx defines a symbol called name */
+static bool sec_defines_sym(const struct bpf_object *obj, int sec_idx, const char *name)
+{
+	size_t i, n = obj->efile.symbols->d_size / sizeof(Elf64_Sym);
+	const Elf64_Sym *sym;
+	const char *sym_name;
+
+	for (i = 1; i < n; i++) {
+		sym = elf_sym_by_idx(obj, i);
+		if (sym->st_shndx != sec_idx || ELF64_ST_TYPE(sym->st_info) == STT_SECTION)
+			continue;
+		sym_name = elf_sym_str(obj, sym->st_name);
+		if (sym_name && strcmp(sym_name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The sections that the static linker joins the data of COMDAT groups to,
+ * as it joins their code to .text
+ */
+static const char * const comdat_data_bases[] = {
+	/* ahead of .data, which would match it */
+	DATA_REL_RO_SEC,
+	RODATA_SEC,
+	DATA_SEC,
+	BSS_SEC,
+};
+
+/*
+ * The section that the data of a COMDAT group member joins, when the
+ * compiler named the member after the symbol that it defines: .rodata.foo
+ * of an inline variable foo joins .rodata. Other names are explicit, e.g.
+ * SEC(".data.foo") of an inline variable bar, and are their own sections,
+ * as without a group. An explicit name that is the one the compiler would
+ * give, e.g. SEC(".data.foo") of foo, can't be told apart and joins the
+ * base section too. The static linker does the same, see group_base().
+ */
+static const char *comdat_data_base(const struct bpf_object *obj, int sec_idx,
+				    const char *sec_name)
+{
+	size_t i, len;
+
+	for (i = 0; i < ARRAY_SIZE(comdat_data_bases); i++) {
+		len = strlen(comdat_data_bases[i]);
+		if (strncmp(sec_name, comdat_data_bases[i], len) != 0 || sec_name[len] != '.')
+			continue;
+		if (!sec_defines_sym(obj, sec_idx, sec_name + len + 1))
+			return NULL;
+		return comdat_data_bases[i];
+	}
+	return NULL;
+}
+
+/*
+ * The static linker places the sections of a name one after another, in
+ * the order of the object, and a member of a COMDAT group that is named
+ * after its symbol, e.g. .rodata.foo, with its base section, see
+ * comdat_data_base(). Lay out global data in maps in the same way: a map
+ * for each name, which the first section of the name has, rather than for
+ * each section. The maps are then those of the linked object, the sections
+ * of a name that several groups have are one map like they are one section
+ * after linking, and inline variables and templates don't use up the maps
+ * that a program may use.
+ */
+static void bpf_object__layout_data(struct bpf_object *obj)
+{
+	struct elf_sec_desc *sec_desc, *map_desc;
+	int sec_idx, map_idx;
+	const char *name;
+	size_t align;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (!bpf_object__shndx_is_data(obj, sec_idx))
+			continue;
+
+		name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+		sec_desc->map_name = sec_desc->comdat ? comdat_data_base(obj, sec_idx, name) : NULL;
+		if (!sec_desc->map_name)
+			sec_desc->map_name = name;
+
+		for (map_idx = 1; map_idx < sec_idx; map_idx++) {
+			map_desc = &obj->efile.secs[map_idx];
+			if (map_desc->map_sec_idx == map_idx &&
+			    map_desc->sec_type == sec_desc->sec_type &&
+			    strcmp(map_desc->map_name, sec_desc->map_name) == 0)
+				break;
+		}
+		if (map_idx == sec_idx) {
+			sec_desc->map_sec_idx = sec_idx;
+			sec_desc->map_sz = sec_desc->data->d_size;
+			sec_desc->map_align = sec_desc->shdr->sh_addralign ?: 1;
+			continue;
+		}
+
+		/* aligned as the static linker aligns it */
+		align = max(map_desc->map_align, sec_desc->shdr->sh_addralign);
+		sec_desc->map_sec_idx = map_idx;
+		sec_desc->map_off = roundup(map_desc->map_sz, align);
+		map_desc->map_sz = sec_desc->map_off + sec_desc->data->d_size;
+		map_desc->map_align = align;
+		pr_debug("elf: section(%d) %s is in map '%s' of section(%d) at offset %zu\n",
+			 sec_idx, name, sec_desc->map_name, map_idx, sec_desc->map_off);
+	}
+}
+
 static int cmp_progs(const void *_a, const void *_b)
 {
 	const struct bpf_program *a = _a;
@@ -4428,6 +4638,8 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 		pr_warn("elf: symbol strings section missing or invalid in %s\n", obj->path);
 		return -LIBBPF_ERRNO__FORMAT;
 	}
+
+	bpf_object__layout_data(obj);
 
 	/* change BPF program insns to native endianness for introspection */
 	if (!is_native_endianness(obj))
@@ -4976,6 +5188,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	size_t map_idx, nr_maps = prog->obj->nr_maps;
 	struct bpf_object *obj = prog->obj;
 	__u32 shdr_idx = sym->st_shndx;
+	struct elf_sec_desc *sec_desc;
 	enum libbpf_map_type type;
 	const char *sym_sec_name;
 	struct bpf_map *map;
@@ -5128,9 +5341,10 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 			prog->name, sym_sec_name);
 		return -LIBBPF_ERRNO__RELOC;
 	}
+	sec_desc = &obj->efile.secs[shdr_idx];
 	for (map_idx = 0; map_idx < nr_maps; map_idx++) {
 		map = &obj->maps[map_idx];
-		if (map->libbpf_type != type || map->sec_idx != sym->st_shndx)
+		if (map->libbpf_type != type || map->sec_idx != sec_desc->map_sec_idx)
 			continue;
 		pr_debug("prog '%s': found data map %zu (%s, sec %d, off %zu) for insn %u\n",
 			 prog->name, map_idx, map->name, map->sec_idx,
@@ -5146,7 +5360,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	reloc_desc->type = RELO_DATA;
 	reloc_desc->insn_idx = insn_idx;
 	reloc_desc->map_idx = map_idx;
-	reloc_desc->sym_off = sym->st_value;
+	reloc_desc->sym_off = sec_desc->map_off + sym->st_value;
 	if (map->in_arena) {
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off += map->arena_off;
@@ -8477,6 +8691,7 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 {
 	Elf_Data *scn_data = obj->efile.secs[sec_idx].data;
 	const char *sym_name = elf_sym_str(obj, sym->st_name) ?: "<?>";
+	const struct elf_sec_desc *targ;
 	struct data_ptr *ptrs;
 
 	if (ELF64_ST_TYPE(sym->st_info) == STT_SECTION && sym->st_shndx < obj->efile.sec_cnt)
@@ -8498,12 +8713,13 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 		return -ENOMEM;
 	obj->data_ptrs = ptrs;
 
-	ptrs[obj->data_ptr_cnt].sec_idx = sec_idx;
-	ptrs[obj->data_ptr_cnt].sec_off = rel->r_offset;
+	ptrs[obj->data_ptr_cnt].sec_idx = obj->efile.secs[sec_idx].map_sec_idx;
+	ptrs[obj->data_ptr_cnt].sec_off = obj->efile.secs[sec_idx].map_off + rel->r_offset;
 	/* __arena variables are at the start of arena data */
+	targ = &obj->efile.secs[sym->st_shndx];
 	ptrs[obj->data_ptr_cnt].targ_sec_idx =
-		sym->st_shndx == obj->efile.arena_data_shndx ? -1 : sym->st_shndx;
-	ptrs[obj->data_ptr_cnt].targ_off = sym->st_value;
+		sym->st_shndx == obj->efile.arena_data_shndx ? -1 : targ->map_sec_idx;
+	ptrs[obj->data_ptr_cnt].targ_off = targ->map_off + sym->st_value;
 	ptrs[obj->data_ptr_cnt].sym_name = strdup(sym_name);
 	if (!ptrs[obj->data_ptr_cnt].sym_name)
 		return -ENOMEM;
@@ -8549,7 +8765,7 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
 static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 					    Elf64_Shdr *shdr, Elf_Data *data)
 {
-	size_t sec_idx = shdr->sh_info, sym_idx;
+	size_t sec_idx = shdr->sh_info, sym_idx, map_off;
 	int i, nrels = shdr->sh_size / shdr->sh_entsize;
 	const char *relo_sec_name;
 	struct func_ptr *ptrs;
@@ -8595,7 +8811,8 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		}
 
 		/* the kernel finds aligned pointers only */
-		if (rel->r_offset % sizeof(__u64) || rel->r_offset >= scn_data->d_size ||
+		map_off = obj->efile.secs[sec_idx].map_off + rel->r_offset;
+		if (map_off % sizeof(__u64) || rel->r_offset >= scn_data->d_size ||
 		    scn_data->d_size - rel->r_offset < sizeof(__u64)) {
 			pr_debug("sec '%s': relo #%d: unsupported offset 0x%zx, skipping...\n",
 				 relo_sec_name, i, (size_t)rel->r_offset);
@@ -8617,8 +8834,8 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 			return -ENOMEM;
 		obj->func_ptrs = ptrs;
 
-		ptrs[obj->func_ptr_cnt].sec_idx = sec_idx;
-		ptrs[obj->func_ptr_cnt].sec_off = rel->r_offset;
+		ptrs[obj->func_ptr_cnt].sec_idx = obj->efile.secs[sec_idx].map_sec_idx;
+		ptrs[obj->func_ptr_cnt].sec_off = map_off;
 		ptrs[obj->func_ptr_cnt].func_sec_idx = sym->st_shndx;
 		ptrs[obj->func_ptr_cnt].func_off = sym->st_value + addend;
 		obj->func_ptr_cnt++;
