@@ -23945,6 +23945,10 @@ skip_full_check:
 	if (env->prog->type == BPF_PROG_TYPE_EXT)
 		env->prog->expected_attach_type = 0;
 
+	/* The program owns the frame descriptors from here on. */
+	env->prog->aux->fdesc_pool = env->fdesc_pool;
+	env->fdesc_pool = NULL;
+
 	env->prog = __bpf_prog_select_runtime(env, env->prog, &ret);
 
 err_release_maps:
@@ -23973,6 +23977,9 @@ err_prep:
 	release_btfs(env);
 err_free_env:
 	bpf_free_subprog_jts(env);
+	for (i = 0; i < env->subprog_cnt; i++)
+		bpf_fdesc_tab_free(env->subprog_info[i].fdesc_tab);
+	bpf_fdesc_pool_free(env->fdesc_pool);
 	if (env->insn_aux_data)
 		bpf_clear_insn_aux_data(env, 0, env->insn_aux_data_len);
 	vfree(env->insn_aux_data);

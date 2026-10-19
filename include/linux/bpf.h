@@ -1783,6 +1783,39 @@ struct bpf_jit_poke_descriptor {
 	u32 insn_idx;
 };
 
+/*
+ * Frame descriptor: the resources a BPF frame holds at one instruction. The
+ * entry layout is defined together with the generator; this header only fixes
+ * the container so that tables can be built, keyed and freed.
+ */
+struct bpf_fdesc {
+	u32 size;	/* total size in bytes, including this header */
+	u32 nent;	/* number of entries that follow */
+};
+
+/* One throw site of a JITed function. */
+struct bpf_fdesc_pc {
+	u32 off;	/* native offset of the instruction's first byte from prog->bpf_func */
+	u32 end;	/* native offset one past the instruction's last byte */
+	u32 desc;	/* index into the main program's descriptor pool */
+};
+
+/*
+ * The throw sites of one JITed function, sorted by off. Until the JIT fills it,
+ * off holds the function-relative instruction index and end is unused.
+ */
+struct bpf_fdesc_tab {
+	u32 cnt;
+	bool filled;
+	struct bpf_fdesc_pc pc[];
+};
+
+/* Owned by the main program and shared by its subprograms. */
+struct bpf_fdesc_pool {
+	u32 cnt;
+	struct bpf_fdesc *desc[];
+};
+
 /* reg_type info for ctx arguments */
 struct bpf_ctx_arg_aux {
 	u32 offset;
@@ -1983,6 +2016,14 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	/*
+	 * fdesc_tab keys the throw sites of this JITed function by native offset,
+	 * fdesc_pool holds the descriptors they index. The main and sub progs share
+	 * the pool, which is freed with the main prog only. The main prog's
+	 * fdesc_tab is that of func[0] and is freed with func[0].
+	 */
+	struct bpf_fdesc_tab *fdesc_tab;
+	struct bpf_fdesc_pool *fdesc_pool;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;
@@ -4405,9 +4446,27 @@ void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
 
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
+void bpf_prog_fill_fdesc(struct bpf_prog *prog, const u32 *offsets, void *image);
+const struct bpf_fdesc *bpf_prog_fdesc_lookup(const struct bpf_prog *prog, unsigned long ip);
+void bpf_fdesc_tab_free(struct bpf_fdesc_tab *tab);
+void bpf_fdesc_pool_free(struct bpf_fdesc_pool *pool);
 #else
 static inline void
 bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image)
+{
+}
+static inline void bpf_prog_fill_fdesc(struct bpf_prog *prog, const u32 *offsets, void *image)
+{
+}
+static inline const struct bpf_fdesc *
+bpf_prog_fdesc_lookup(const struct bpf_prog *prog, unsigned long ip)
+{
+	return NULL;
+}
+static inline void bpf_fdesc_tab_free(struct bpf_fdesc_tab *tab)
+{
+}
+static inline void bpf_fdesc_pool_free(struct bpf_fdesc_pool *pool)
 {
 }
 #endif

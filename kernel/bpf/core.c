@@ -293,6 +293,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		kfree(fp->aux->poke_tab);
+		bpf_fdesc_tab_free(fp->aux->fdesc_tab);
 		kfree(fp->aux);
 	}
 	free_percpu(fp->stats);
@@ -3091,6 +3092,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
+	bpf_fdesc_pool_free(aux->fdesc_pool);
 	for (i = 0; i < aux->real_func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
@@ -3100,6 +3102,8 @@ static void bpf_prog_free_images(struct work_struct *work)
 		bpf_jit_free(aux->func[i]);
 	}
 	if (aux->real_func_cnt) {
+		/* The main prog's fdesc_tab is func[0]'s and was released with it. */
+		aux->fdesc_tab = NULL;
 		kfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);
 	} else {
@@ -3730,6 +3734,75 @@ int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char *
 	if (nump)
 		*nump = src.line_num;
 	return 0;
+}
+
+/*
+ * Convert the instruction indices of the throw-site table to native offsets.
+ * offsets[k] is the first byte of instruction k relative to image and
+ * offsets[prog->len] the end of the program, as for bpf_prog_update_insn_ptrs().
+ */
+void bpf_prog_fill_fdesc(struct bpf_prog *prog, const u32 *offsets, void *image)
+{
+	struct bpf_fdesc_tab *tab = prog->aux->fdesc_tab;
+	u32 i;
+
+	if (!tab || tab->filled)
+		return;
+
+	for (i = 0; i < tab->cnt; i++) {
+		struct bpf_fdesc_pc *pc = &tab->pc[i];
+
+		pc->end = image + offsets[pc->off + 1] - (void *)prog->bpf_func;
+		pc->off = image + offsets[pc->off] - (void *)prog->bpf_func;
+	}
+	tab->filled = true;
+}
+
+/*
+ * Find the descriptor of the throw site of prog that ip falls into, or NULL.
+ * ip is an address within the instruction: a caller that holds a return
+ * address passes ra - 1, since the return address is the first byte of the
+ * next instruction.
+ */
+const struct bpf_fdesc *bpf_prog_fdesc_lookup(const struct bpf_prog *prog, unsigned long ip)
+{
+	const struct bpf_fdesc_tab *tab = prog->aux->fdesc_tab;
+	unsigned long off;
+	u32 l, r, m;
+
+	if (!tab || !tab->filled)
+		return NULL;
+	off = ip - (unsigned long)prog->bpf_func;
+
+	/* The entries are disjoint and sorted: find the first that ends after off. */
+	l = 0;
+	r = tab->cnt;
+	while (l < r) {
+		m = l + (r - l) / 2;
+		if (tab->pc[m].end <= off)
+			l = m + 1;
+		else
+			r = m;
+	}
+	if (l == tab->cnt || tab->pc[l].off > off)
+		return NULL;
+	return prog->aux->fdesc_pool->desc[tab->pc[l].desc];
+}
+
+void bpf_fdesc_tab_free(struct bpf_fdesc_tab *tab)
+{
+	kvfree(tab);
+}
+
+void bpf_fdesc_pool_free(struct bpf_fdesc_pool *pool)
+{
+	u32 i;
+
+	if (!pool)
+		return;
+	for (i = 0; i < pool->cnt; i++)
+		kvfree(pool->desc[i]);
+	kvfree(pool);
 }
 
 struct walk_stack_ctx {
