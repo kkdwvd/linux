@@ -76,7 +76,7 @@ void test_unwind_cxx(void)
 	run(obj, "catches", 64, 65, 12);
 	run(obj, "catches", 200, 42, 12);
 	run(obj, "does_not_catch", 64, 65, 12);
-	run(obj, "does_not_catch", 200, 0, 12);
+	run(obj, "does_not_catch", 200, 77, 12);
 out:
 	bpf_object__close(obj);
 	if (err)
