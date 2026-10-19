@@ -7,10 +7,16 @@
 #include "bpf_experimental.h"
 
 #define MAX_RES 8
+#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
 
 struct foo {
 	int data;
 	struct bpf_list_node node;
+};
+
+struct locked_foo {
+	int data;
+	struct bpf_spin_lock lock;
 };
 
 struct {
@@ -18,11 +24,16 @@ struct {
 	__uint(max_entries, 4096);
 } ringbuf SEC(".maps");
 
+private(A) struct bpf_spin_lock glock;
+private(B) struct bpf_res_spin_lock grlock;
+
 /* Resources the program under test acquired, and those the unwinder released. */
 __u64 acquired[MAX_RES];
 __u32 acquired_cnt;
 __u64 released[MAX_RES];
 __u32 released_cnt;
+/* RCU and preemption sections the unwinder left. */
+__u32 sections_cnt;
 
 static __always_inline void mark_acquired(void *p)
 {
@@ -49,14 +60,35 @@ static __always_inline void mark_released(void *p)
 	}
 }
 
-/* Observe every release the unwinder performs. */
+/* Observe every release the unwinder performs, identified like the program sees it. */
 SEC("fentry/bpf_fdesc_release")
-int BPF_PROG(release_hook, struct bpf_fdesc_res *res, void *loc)
+int BPF_PROG(release_hook, struct bpf_fdesc_res *res, void *loc, void *flags)
 {
 	void *obj = loc;
 
-	if (res->kind != BPF_FDESC_DYNPTR_RINGBUF && res->kind != BPF_FDESC_ITER)
+	switch (res->kind) {
+	case BPF_FDESC_RCU:
+	case BPF_FDESC_PREEMPT:
+		sections_cnt++;
+		return 0;
+	case BPF_FDESC_DYNPTR_RINGBUF:
+	case BPF_FDESC_ITER:
+	case BPF_FDESC_IRQ_FLAG:
+	case BPF_FDESC_IRQ_FLAG_LOCK:
+		break;
+	case BPF_FDESC_SPIN_LOCK:
+	case BPF_FDESC_RES_LOCK:
+	case BPF_FDESC_RES_LOCK_IRQ:
+		if (!loc) {
+			obj = res->addr;
+			break;
+		}
 		bpf_probe_read_kernel(&obj, sizeof(obj), loc);
+		obj += res->delta;
+		break;
+	default:
+		bpf_probe_read_kernel(&obj, sizeof(obj), loc);
+	}
 	mark_released(obj);
 	return 0;
 }
@@ -316,9 +348,9 @@ int nocancel_may_goto_callback(struct __sk_buff *ctx)
 	return 0;
 }
 
-/* Under an RCU read lock the may_goto keeps exiting the loop as well. */
+/* An RCU read section is left before the object is released. */
 SEC("tc")
-int nocancel_may_goto_rcu(struct __sk_buff *ctx)
+int cancel_may_goto_rcu(struct __sk_buff *ctx)
 {
 	struct foo *f;
 
@@ -330,6 +362,219 @@ int nocancel_may_goto_rcu(struct __sk_buff *ctx)
 	spin();
 	bpf_rcu_read_unlock();
 	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * The frame the timeout hits in is reached both inside and outside an RCU
+ * section: the section belongs to the caller that entered it, so the callee's
+ * descriptor is the same on both paths. At run time the loop runs under RCU.
+ */
+SEC("tc")
+int cancel_may_goto_rcu_shared(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (ctx->len == 0)
+		spin_in_subprog(ctx);
+	bpf_rcu_read_lock();
+	spin_in_subprog(ctx);
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* Nested RCU sections and a preemption disabled section are all left. */
+SEC("tc")
+int cancel_may_goto_preempt(struct __sk_buff *ctx)
+{
+	bpf_rcu_read_lock();
+	bpf_rcu_read_lock();
+	bpf_preempt_disable();
+	spin();
+	bpf_preempt_enable();
+	bpf_rcu_read_unlock();
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* A global spin lock is released from its fixed address, before the object. */
+SEC("tc")
+int cancel_may_goto_spin_lock(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&glock);
+	bpf_spin_lock(&glock);
+	spin();
+	bpf_spin_unlock(&glock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The lock of an allocated object is found from the pointer to the object. */
+SEC("tc")
+int cancel_may_goto_obj_lock(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	spin();
+	bpf_spin_unlock(&f->lock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The lock is held by the caller of the frame the timeout hits in. */
+SEC("tc")
+int cancel_may_goto_lock_caller(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	spin_in_subprog(ctx);
+	bpf_spin_unlock(&f->lock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* A resilient spin lock. */
+SEC("tc")
+int cancel_may_goto_res_lock(struct __sk_buff *ctx)
+{
+	mark_acquired(&grlock);
+	if (bpf_res_spin_lock(&grlock))
+		return 1;
+	spin();
+	bpf_res_spin_unlock(&grlock);
+	return 0;
+}
+
+/* A resilient spin lock with IRQs disabled: the flags on the stack are restored with it. */
+SEC("tc")
+int cancel_may_goto_res_lock_irq(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	/* The verifier tracks the lock first, then the flags it saved. */
+	mark_acquired(&grlock);
+	mark_acquired(&flags);
+	if (bpf_res_spin_lock_irqsave(&grlock, &flags))
+		return 1;
+	spin();
+	bpf_res_spin_unlock_irqrestore(&grlock, &flags);
+	return 0;
+}
+
+/* Saved IRQ flags. */
+SEC("tc")
+int cancel_may_goto_irq(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
+/* Everything nested: released in the reverse order of acquisition. */
+SEC("tc")
+int cancel_may_goto_nested(struct __sk_buff *ctx)
+{
+	unsigned long flags, lflags;
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	mark_acquired(&grlock);
+	mark_acquired(&lflags);
+	if (bpf_res_spin_lock_irqsave(&grlock, &lflags)) {
+		bpf_local_irq_restore(&flags);
+		bpf_rcu_read_unlock();
+		bpf_obj_drop(f);
+		return 1;
+	}
+	spin();
+	bpf_res_spin_unlock_irqrestore(&grlock, &lflags);
+	bpf_local_irq_restore(&flags);
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* bpf_throw() leaves a spin lock and a section too. */
+SEC("tc")
+int throw_spin_lock(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&glock);
+	bpf_spin_lock(&glock);
+	if (ctx->len)
+		bpf_throw(0xeB9F);
+	bpf_spin_unlock(&glock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+SEC("tc")
+int throw_rcu(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	if (ctx->len)
+		bpf_throw(0xeB9F);
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+SEC("tc")
+int throw_irq(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	bpf_preempt_disable();
+	if (ctx->len)
+		bpf_throw(0xeB9F);
+	bpf_preempt_enable();
+	bpf_local_irq_restore(&flags);
 	return 0;
 }
 
@@ -467,6 +712,61 @@ __naked int cancel_may_goto_priv_stack(void)
 	  __imm(bpf_ringbuf_discard),
 	  __imm_insn(may_goto, may_goto_insn)
 	: __clobber_all);
+}
+
+struct locked_list {
+	struct bpf_spin_lock lock;
+	struct bpf_list_head head __contains(foo, node);
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, int);
+	__type(value, struct locked_list);
+	__uint(max_entries, 1);
+} locked_list_map SEC(".maps");
+
+/* The node popped under the caller's lock is this frame's only resource: the lock is not. */
+static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
+
+	spin();
+	return n;
+}
+
+/*
+ * The callee holds an object while the caller holds the lock it was popped
+ * under: a cancellation would drop the object under the lock, which no
+ * program could do, so the site falls back and the loop exits.
+ */
+SEC("tc")
+int nocancel_may_goto_obj_under_caller_lock(struct __sk_buff *ctx)
+{
+	struct bpf_list_node *n;
+	struct locked_list *l;
+	struct foo *f;
+	int key = 0;
+
+	l = bpf_map_lookup_elem(&locked_list_map, &key);
+	if (!l)
+		return 1;
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_spin_lock(&l->lock);
+	bpf_list_push_back(&l->head, &f->node);
+	n = pop_and_spin(l);
+	if (n)
+		bpf_list_push_back(&l->head, n);
+	bpf_spin_unlock(&l->lock);
+	bpf_spin_lock(&l->lock);
+	n = bpf_list_pop_front(&l->head);
+	bpf_spin_unlock(&l->lock);
+	if (n)
+		bpf_obj_drop(container_of(n, struct foo, node));
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";

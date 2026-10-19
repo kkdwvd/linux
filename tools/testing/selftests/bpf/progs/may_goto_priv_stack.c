@@ -9,32 +9,17 @@
 __u64 regs_64[7];
 __u64 regs_128[7];
 
-extern void bpf_rcu_read_lock(void) __ksym;
-extern void bpf_rcu_read_unlock(void) __ksym;
-
-/* clang emits BTF for an extern only when C code refers to it. */
-SEC("?raw_tp")
-int force_clang_to_emit_btf_for_externs(void *ctx)
-{
-	bpf_rcu_read_lock();
-	bpf_rcu_read_unlock();
-	return 0;
-}
-
 /*
- * fentry prog with 64 or more bytes of stack uses private stack.
- * Loop until may_goto expires. r0-r5 should stay zero. The loop runs under
- * an RCU read lock so that the timeout exits the loop instead of cancelling
- * the program.
+ * A subprog with 64 or more bytes of stack uses private stack. Loop until
+ * may_goto expires. r0-r5 should stay zero. The loop runs in a callback, where
+ * the timeout exits the loop instead of cancelling the program.
  */
 #define TIMED_MAY_GOTO_PRIV_STACK(size, func)				\
-SEC("fentry/" #func)							\
-__naked void priv_stack_##size(void)					\
+static __naked int priv_stack_cb_##size(__u64 i, void *ctx)		\
 {									\
 	asm volatile (							\
 	"r6 = 0;"							\
 	"*(u64 *)(r10 - " #size ") = r6;"				\
-	"call %[bpf_rcu_read_lock];"					\
 	"r7 = %[regs] ll;"						\
 	"r0 = 0;"							\
 	"r1 = 0;"							\
@@ -53,15 +38,21 @@ __naked void priv_stack_##size(void)					\
 	"*(u64 *)(r7 + 32) = r4;"					\
 	"*(u64 *)(r7 + 40) = r5;"					\
 	"*(u64 *)(r7 + 48) = r6;"					\
-	"call %[bpf_rcu_read_unlock];"					\
 	"r0 = 0;"							\
 	"exit;"								\
 	:								\
 	: [regs]"i"(&regs_##size),					\
-	  __imm(bpf_rcu_read_lock),					\
-	  __imm(bpf_rcu_read_unlock),					\
 	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2, 0)) \
 	: __clobber_all);						\
+}									\
+									\
+SEC("fentry/" #func)							\
+int priv_stack_##size(void *ctx)					\
+{									\
+	volatile __u64 pad[size / 8] = {};				\
+									\
+	bpf_loop(1, priv_stack_cb_##size, (void *)pad, 0);		\
+	return pad[0];							\
 }
 
 TIMED_MAY_GOTO_PRIV_STACK(64, bpf_fentry_test1)
