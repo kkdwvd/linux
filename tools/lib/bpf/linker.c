@@ -2993,13 +2993,13 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 						insn->imm += sec->dst_off / sizeof(struct bpf_insn);
 					else
 						insn->imm += sec->dst_off;
-				} else if (sym_type == R_BPF_64_ABS64 &&
-					   (sec->shdr->sh_flags & SHF_EXECINSTR)) {
+				} else if (sym_type == R_BPF_64_ABS64) {
 					/*
-					 * A pointer to a static function in a data section,
-					 * which is stored in place as an offset of the
-					 * function in its section. Data sections are kept
-					 * in the byte order of the object.
+					 * A pointer to a static function or variable in a
+					 * data section, which is stored in place as an
+					 * offset in the section of the function or the
+					 * variable. Data sections are kept in the byte
+					 * order of the object.
 					 */
 					void *ptr = dst_linked_sec->raw_data + dst_rel->r_offset;
 					__u64 off;
