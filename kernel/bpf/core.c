@@ -3574,23 +3574,26 @@ u64 __weak arch_bpf_timed_may_goto(void)
 	return 0;
 }
 
-static noinline void bpf_prog_report_may_goto_violation(void)
-{
 #ifdef CONFIG_BPF_SYSCALL
+static noinline void bpf_prog_report_may_goto_violation(struct bpf_prog *prog, bool cancel)
+{
 	struct bpf_stream_stage ss;
-	struct bpf_prog *prog;
 
-	prog = bpf_prog_find_from_stack();
-	if (!prog)
-		return;
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
-		bpf_stream_printk(ss, "ERROR: Timeout detected for may_goto instruction\n");
+		bpf_stream_printk(ss, "ERROR: Timeout detected for may_goto instruction%s\n",
+				  cancel ? ", cancelling program" : "");
 		bpf_stream_dump_stack(ss);
 	}));
-#endif
 }
+#endif
 
-u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
+/*
+ * @ra is the return address of the slow path into the program, which says
+ * which may_goto exhausted its count. When that may_goto is a cancellation
+ * point, that is, its instruction has a frame descriptor, a timeout cancels
+ * the invocation instead of taking the branch.
+ */
+u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p, unsigned long ra)
 {
 	u64 time = ktime_get_mono_fast_ns();
 
@@ -3601,8 +3604,19 @@ u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
 	}
 	/* Check if we've exhausted our time slice, and zero count. */
 	if (unlikely(time - p->timestamp >= (NSEC_PER_SEC / 4))) {
-		bpf_prog_report_may_goto_violation();
-		return 0;
+		bool cancel = false;
+#ifdef CONFIG_BPF_SYSCALL
+		struct bpf_prog *prog;
+
+		rcu_read_lock();
+		prog = bpf_prog_ksym_find(ra);
+		rcu_read_unlock();
+		if (prog) {
+			cancel = bpf_prog_fdesc_lookup(prog, ra - 1);
+			bpf_prog_report_may_goto_violation(prog->aux->main_prog_aux->prog, cancel);
+		}
+#endif
+		return cancel ? BPF_TIMED_MAY_GOTO_CANCEL : 0;
 	}
 	/* Refresh the count for the stack frame. */
 	return BPF_MAX_TIMED_LOOPS;

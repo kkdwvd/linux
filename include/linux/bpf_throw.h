@@ -15,6 +15,12 @@
 #define BPF_THROW_MAY_GOTO	1	/* the timed may_goto slow path */
 
 /*
+ * Returned by bpf_check_timed_may_goto() in place of a loop count when the
+ * program is to be cancelled; the slow path then enters bpf_throw_unwind().
+ */
+#define BPF_TIMED_MAY_GOTO_CANCEL	-1
+
+/*
  * The callee-saved registers of the architecture that no BPF register maps
  * to, which the unwinder restores along with R6..R9 when it discards frames:
  * r12 on x86-64, which holds the arena base, and x23..x28 on arm64, of which
