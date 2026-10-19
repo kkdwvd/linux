@@ -23,6 +23,11 @@ struct {
 	__uint(value_size, sizeof(int));
 } prog_array SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_USER_RINGBUF);
+	__uint(max_entries, 4096);
+} user_ringbuf SEC(".maps");
+
 /*
  * The verifier removes 'if r3 != 0' when it knows r3. To have it at run time
  * the tests pass skb->len, which is 64, or skb->len - 64.
@@ -436,7 +441,10 @@ __naked int calls_global_r3_is_pointer(void)
 	);
 }
 
-/* The helper that calls a callback doesn't look at r3. */
+/*
+ * bpf_loop() passes the bit on, see verifier_unwind_cb.c.
+ * bpf_user_ringbuf_drain() doesn't look at r3.
+ */
 __naked __noinline __used __unwind
 static unsigned long cb_returns(void)
 {
@@ -497,15 +505,16 @@ __failure __msg("callback cannot unwind")
 __naked int callback_unwinds(void)
 {
 	asm volatile (
-		"r1 = 3;"
+		"r1 = %[user_ringbuf] ll;"
 		"r2 = %[cb_unwinds];"
 		"r3 = 0;"
 		"r4 = 0;"
-		"call %[bpf_loop];"
+		"call %[bpf_user_ringbuf_drain];"
 		"exit;"
 		:
 		: __imm_ptr(cb_unwinds),
-		  __imm(bpf_loop)
+		  __imm(bpf_user_ringbuf_drain),
+		  __imm_addr(user_ringbuf)
 		: __clobber_common
 	);
 }
@@ -519,15 +528,16 @@ __failure __msg("callback cannot unwind")
 __naked int callback_r3_not_set(void)
 {
 	asm volatile (
-		"r1 = 3;"
+		"r1 = %[user_ringbuf] ll;"
 		"r2 = %[cb_r3_not_set];"
 		"r3 = 0;"
 		"r4 = 0;"
-		"call %[bpf_loop];"
+		"call %[bpf_user_ringbuf_drain];"
 		"exit;"
 		:
 		: __imm_ptr(cb_r3_not_set),
-		  __imm(bpf_loop)
+		  __imm(bpf_user_ringbuf_drain),
+		  __imm_addr(user_ringbuf)
 		: __clobber_common
 	);
 }
