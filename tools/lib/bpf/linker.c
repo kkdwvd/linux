@@ -856,6 +856,8 @@ static const struct {
 	const char *rel_name;
 } group_bases[] = {
 	{ ".text", ".rel.text" },
+	/* ahead of .data, which would match it */
+	{ ".data.rel.ro", ".rel.data.rel.ro" },
 	{ ".data", ".rel.data" },
 	{ ".rodata", ".rel.rodata" },
 	{ ".bss", ".rel.bss" },
@@ -880,9 +882,9 @@ static int group_base(const char *sec_name)
  * variable. The first group with a signature is linked and the members of
  * every later one are dropped, their global symbols resolving to the
  * definitions of the first. A member .text.foo joins .text, the only section
- * libbpf links subprogram calls to, and .rodata.foo, .data.foo and .bss.foo
- * join theirs, as libbpf would otherwise map each to an array of its own or,
- * for .bss.foo, not at all; relocations follow.
+ * libbpf links subprogram calls to, and .data.rel.ro.foo, .rodata.foo,
+ * .data.foo and .bss.foo join theirs, as libbpf would otherwise map each to
+ * an array of its own or, for .bss.foo, not at all; relocations follow.
  */
 static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
 {
