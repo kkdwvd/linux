@@ -193,10 +193,95 @@ out:
 	unlink(out);
 }
 
+/* The initial value of the __arena variable var, as BTF describes it */
+static long arena_value(struct bpf_object *obj, const char *var)
+{
+	struct bpf_map *map = bpf_object__find_map_by_name(obj, "arena");
+	struct btf *btf = bpf_object__btf(obj);
+	const struct btf_var_secinfo *vsi;
+	const struct btf_type *t, *v;
+	const char *data;
+	size_t sz;
+	int i, id;
+
+	data = map ? bpf_map__initial_value(map, &sz) : NULL;
+	id = btf__find_by_name_kind(btf, ".addr_space.1", BTF_KIND_DATASEC);
+	if (!ASSERT_OK_PTR(data, "arena_data") || !ASSERT_GT(id, 0, "arena_datasec"))
+		return -1;
+	t = btf__type_by_id(btf, id);
+	if (!ASSERT_EQ(t->size, sz, "arena_size"))
+		return -1;
+	vsi = btf_var_secinfos(t);
+	for (i = 0; i < btf_vlen(t); i++, vsi++) {
+		v = btf__type_by_id(btf, vsi->type);
+		if (strcmp(btf__name_by_offset(btf, v->name_off), var))
+			continue;
+		if (vsi->size == sizeof(long))
+			return *(long *)(data + vsi->offset);
+		return *(int *)(data + vsi->offset);
+	}
+	PRINT_FAIL("no variable %s in the arena\n", var);
+	return -1;
+}
+
+static void run_arena(const char *file)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+	struct bpf_program *prog;
+	struct bpf_object *obj;
+
+	obj = bpf_object__open_file(file, NULL);
+	if (!ASSERT_OK_PTR(obj, "open"))
+		return;
+	prog = bpf_object__find_program_by_name(obj, "comdat_arena");
+	if (!prog) {
+		printf("comdat_cxx:SKIP:llvm doesn't do addr_space_cast\n");
+		test__skip();
+		goto out;
+	}
+
+	ASSERT_EQ(arena_value(obj, "plain_ar"), 5, "plain_ar");
+	ASSERT_EQ(arena_value(obj, "_ZL9static_ar"), 7, "static_ar");
+	ASSERT_EQ(arena_value(obj, "hits"), 0, "hits");
+	ASSERT_EQ(arena_value(obj, "total"), 10, "total");
+	if (!ASSERT_OK(bpf_object__load(obj), "load"))
+		goto out;
+
+	/* hits * 1000 + total, which grows by plain_ar + static_ar */
+	ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &opts), "test_run");
+	ASSERT_EQ(opts.retval, 1000 + 10 + 5 + 7, "first");
+	ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &opts), "test_run");
+	ASSERT_EQ(opts.retval, 2000 + 22 + 5 + 8, "second");
+out:
+	bpf_object__close(obj);
+}
+
+/* The arena sections of the groups and the other one are one, linked or not */
+static void test_arena(void)
+{
+	const char *file = "./comdat_cxx_arena.bpf.o";
+	char out[] = "/tmp/comdat_cxx_arena.XXXXXX";
+	int fd;
+
+	if (skip(file, "hits"))
+		return;
+	run_arena(file);
+
+	fd = mkstemp(out);
+	if (!ASSERT_OK_FD(fd, "mkstemp"))
+		return;
+	close(fd);
+	if (ASSERT_OK(link_objs(out, file, NULL), "link"))
+		run_arena(out);
+	unlink(out);
+}
+
 void test_comdat_cxx(void)
 {
 	if (test__start_subtest("object"))
 		test_object();
 	if (test__start_subtest("linked"))
 		test_linked();
+	if (test__start_subtest("arena"))
+		test_arena();
 }
