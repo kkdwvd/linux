@@ -586,6 +586,10 @@ extern const struct bench bench_lpm_trie_update;
 extern const struct bench bench_lpm_trie_delete;
 extern const struct bench bench_lpm_trie_free;
 extern const struct bench bench_bpf_nop;
+extern const struct bench bench_cancel_ringbuf;
+extern const struct bench bench_cancel_ringbuf_spill;
+extern const struct bench bench_cancel_obj;
+extern const struct bench bench_cancel_obj_spill;
 extern const struct bench bench_xdp_lb;
 extern const struct bench bench_libarena_malloc;
 extern const struct bench bench_libarena_calloc;
@@ -672,6 +676,10 @@ static const struct bench *benchs[] = {
 	&bench_lpm_trie_delete,
 	&bench_lpm_trie_free,
 	&bench_bpf_nop,
+	&bench_cancel_ringbuf,
+	&bench_cancel_ringbuf_spill,
+	&bench_cancel_obj,
+	&bench_cancel_obj_spill,
 	&bench_xdp_lb,
 	&bench_libarena_malloc,
 	&bench_libarena_calloc,
