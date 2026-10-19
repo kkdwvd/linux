@@ -25,6 +25,7 @@
 #include "btf.h"
 #include "libbpf_internal.h"
 #include "strset.h"
+#include "hashmap.h"
 
 #define BTF_EXTERN_SEC ".extern"
 
@@ -163,6 +164,8 @@ struct bpf_linker {
 	/* global (including extern) ELF symbols */
 	int glob_sym_cnt;
 	struct glob_sym *glob_syms;
+	/* their index in glob_syms by name_off, the offset of their name in strtab_strs */
+	struct hashmap *glob_sym_map;
 
 	bool fd_is_owned;
 };
@@ -170,6 +173,9 @@ struct bpf_linker {
 #define pr_warn_elf(fmt, ...)									\
 	libbpf_print(LIBBPF_WARN, "libbpf: " fmt ": %s\n", ##__VA_ARGS__, elf_errmsg(-1))
 
+static size_t glob_sym_hash_fn(long key, void *ctx);
+static bool glob_sym_equal_fn(long k1, long k2, void *ctx);
+static bool sym_is_in_jumptables(const struct src_obj *obj, const Elf64_Sym *sym);
 static int init_output_elf(struct bpf_linker *linker);
 
 static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
@@ -230,6 +236,7 @@ void bpf_linker__free(struct bpf_linker *linker)
 	free(linker->secs);
 
 	free(linker->glob_syms);
+	hashmap__free(linker->glob_sym_map);
 	free(linker);
 }
 
@@ -398,6 +405,13 @@ static int init_output_elf(struct bpf_linker *linker)
 	linker->comdat_sigs = strset__new(INT_MAX, "", sizeof(""));
 	if (libbpf_get_error(linker->comdat_sigs))
 		return libbpf_get_error(linker->comdat_sigs);
+
+	linker->glob_sym_map = hashmap__new(glob_sym_hash_fn, glob_sym_equal_fn, NULL);
+	if (IS_ERR(linker->glob_sym_map)) {
+		err = PTR_ERR(linker->glob_sym_map);
+		linker->glob_sym_map = NULL;
+		return err;
+	}
 
 	sec = add_dst_sec(linker, ".strtab");
 	if (!sec)
@@ -1640,24 +1654,33 @@ static Elf64_Sym *get_sym_by_idx(struct bpf_linker *linker, size_t sym_idx)
 	return &syms[sym_idx];
 }
 
-static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name)
+/*
+ * The name of a global symbol is in strtab_strs once, so its offset there
+ * is its key
+ */
+static size_t glob_sym_hash_fn(long key, void *ctx)
 {
-	struct glob_sym *glob_sym;
-	const char *name;
-	int i;
-
-	for (i = 0; i < linker->glob_sym_cnt; i++) {
-		glob_sym = &linker->glob_syms[i];
-		name = strset__data(linker->strtab_strs) + glob_sym->name_off;
-
-		if (strcmp(name, sym_name) == 0)
-			return glob_sym;
-	}
-
-	return NULL;
+	return key;
 }
 
-static struct glob_sym *add_glob_sym(struct bpf_linker *linker)
+static bool glob_sym_equal_fn(long k1, long k2, void *ctx)
+{
+	return k1 == k2;
+}
+
+static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name)
+{
+	long idx;
+	int name_off;
+
+	name_off = strset__find_str(linker->strtab_strs, sym_name);
+	if (name_off < 0 || !hashmap__find(linker->glob_sym_map, name_off, &idx))
+		return NULL;
+	return &linker->glob_syms[idx];
+}
+
+/* Add the global symbol whose name is at name_off in strtab_strs, and has none yet */
+static struct glob_sym *add_glob_sym(struct bpf_linker *linker, int name_off)
 {
 	struct glob_sym *syms, *sym;
 
@@ -1665,12 +1688,15 @@ static struct glob_sym *add_glob_sym(struct bpf_linker *linker)
 				   sizeof(*linker->glob_syms));
 	if (!syms)
 		return NULL;
+	linker->glob_syms = syms;
 
 	sym = &syms[linker->glob_sym_cnt];
 	memset(sym, 0, sizeof(*sym));
 	sym->var_idx = -1;
+	sym->name_off = name_off;
 
-	linker->glob_syms = syms;
+	if (hashmap__add(linker->glob_sym_map, name_off, linker->glob_sym_cnt))
+		return NULL;
 	linker->glob_sym_cnt++;
 
 	return sym;
@@ -2383,8 +2409,12 @@ add_sym:
 		dst_sym->st_value = 0;
 	}
 
-	if (sym_bind != STB_LOCAL) {
-		glob_sym = add_glob_sym(linker);
+	/*
+	 * A jump table is global in its object only: the compiler names those
+	 * of every object alike, and the linker keeps each object's, see above.
+	 */
+	if (sym_bind != STB_LOCAL && !sym_is_in_jumptables(obj, sym)) {
+		glob_sym = add_glob_sym(linker, name_off);
 		if (!glob_sym)
 			return -ENOMEM;
 
@@ -2396,7 +2426,6 @@ add_sym:
 		 * associated with it, so dst_sec->id == dst_sec->sec_idx == 0.
 		 */
 		glob_sym->sec_id = dst_sec ? dst_sec->id : 0;
-		glob_sym->name_off = name_off;
 		/* we will fill btf_id in during BTF merging step */
 		glob_sym->btf_id = 0;
 		glob_sym->is_extern = sym_is_extern;
