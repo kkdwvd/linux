@@ -3333,6 +3333,71 @@ int btf__add_datasec_var_info(struct btf *btf, int var_type_id, __u32 offset, __
 	return 0;
 }
 
+/*
+ * Move the variables of DATASEC *src_id* to the end of DATASEC *dst_id*,
+ * which leaves *src_id* with none. *dst_id* grows as much as *src_id*
+ * shrinks, so only the types between the two shift, and no type ID changes.
+ */
+int btf_datasec_move_vars(struct btf *btf, __u32 dst_id, __u32 src_id)
+{
+	const size_t vsi_sz = sizeof(struct btf_var_secinfo);
+	size_t src_end, dst_end, sz;
+	struct btf_var_secinfo *vsis;
+	struct btf_type *src, *dst;
+	__u32 i, n;
+	void *types;
+	int err;
+
+	if (src_id == dst_id || src_id < btf->start_id || dst_id < btf->start_id ||
+	    src_id >= btf__type_cnt(btf) || dst_id >= btf__type_cnt(btf))
+		return -EINVAL;
+
+	err = btf_ensure_modifiable(btf);
+	if (err)
+		return err;
+
+	src = btf_type_by_id(btf, src_id);
+	dst = btf_type_by_id(btf, dst_id);
+	if (!btf_is_datasec(src) || !btf_is_datasec(dst))
+		return -EINVAL;
+
+	n = btf_vlen(src);
+	if (!n)
+		return 0;
+	if (btf_vlen(dst) + n > BTF_MAX_VLEN)
+		return -ENOSPC;
+
+	sz = n * vsi_sz;
+	vsis = malloc(sz);
+	if (!vsis)
+		return -ENOMEM;
+	memcpy(vsis, btf_var_secinfos(src), sz);
+
+	types = btf->types_data;
+	src_end = btf->type_offs[src_id - btf->start_id] + sizeof(*src) + sz;
+	dst_end = btf->type_offs[dst_id - btf->start_id] + sizeof(*dst) + btf_vlen(dst) * vsi_sz;
+	if (src_id < dst_id) {
+		/* what follows the variables of src, up to the end of dst, moves down */
+		memmove(types + src_end - sz, types + src_end, dst_end - src_end);
+		memcpy(types + dst_end - sz, vsis, sz);
+		for (i = src_id + 1; i <= dst_id; i++)
+			btf->type_offs[i - btf->start_id] -= sz;
+	} else {
+		/* what follows dst, up to the variables of src, moves up */
+		memmove(types + dst_end + sz, types + dst_end, src_end - sz - dst_end);
+		memcpy(types + dst_end, vsis, sz);
+		for (i = dst_id + 1; i <= src_id; i++)
+			btf->type_offs[i - btf->start_id] += sz;
+	}
+	free(vsis);
+
+	src = btf_type_by_id(btf, src_id);
+	src->info = btf_type_info(BTF_KIND_DATASEC, 0, btf_kflag(src));
+	dst = btf_type_by_id(btf, dst_id);
+	dst->info = btf_type_info(BTF_KIND_DATASEC, btf_vlen(dst) + n, btf_kflag(dst));
+	return 0;
+}
+
 static int btf_add_decl_tag(struct btf *btf, const char *value, int ref_type_id,
 			    int component_idx, int kflag)
 {
