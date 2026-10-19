@@ -754,20 +754,30 @@ static struct bpf_iter_reg task_vma_reg_info = {
 	.show_fdinfo		= bpf_iter_task_show_fdinfo,
 };
 
-BPF_CALL_5(bpf_find_vma, struct task_struct *, task, u64, start,
-	   bpf_callback_t, callback_fn, void *, callback_ctx, u64, flags)
+/*
+ * See __bpf_loop() for unwind. The callback runs under mmap_lock and
+ * rcu_read_lock(), both are dropped on the way out whether it unwound or not.
+ */
+static __always_inline struct bpf_cb_ret __bpf_find_vma(struct task_struct *task, u64 start,
+							void *callback_fn, void *callback_ctx,
+							u64 flags, bool unwind)
 {
 	struct mmap_unlock_irq_work *work;
 	struct vm_area_struct *vma;
 	bool __maybe_unused mmput_needed = false;
+	struct bpf_cb_ret cb_ret = {};
 	struct mm_struct *mm;
 	int ret = -ENOENT;
 
-	if (flags)
-		return -EINVAL;
+	if (flags) {
+		cb_ret.r0 = -EINVAL;
+		return cb_ret;
+	}
 
-	if (!task)
-		return -ENOENT;
+	if (!task) {
+		cb_ret.r0 = -ENOENT;
+		return cb_ret;
+	}
 
 	if (task == current) {
 		mm = task->mm;
@@ -777,12 +787,18 @@ BPF_CALL_5(bpf_find_vma, struct task_struct *, task, u64, start,
 		 * Use trylock on alloc_lock instead of get_task_mm()'s
 		 * blocking task_lock() to avoid deadlocking the target task.
 		 */
-		if (!IS_ENABLED(CONFIG_MMU))
-			return -EOPNOTSUPP;
-		if (irqs_disabled())
-			return -EBUSY;
-		if (!spin_trylock(&task->alloc_lock))
-			return -EBUSY;
+		if (!IS_ENABLED(CONFIG_MMU)) {
+			cb_ret.r0 = -EOPNOTSUPP;
+			return cb_ret;
+		}
+		if (irqs_disabled()) {
+			cb_ret.r0 = -EBUSY;
+			return cb_ret;
+		}
+		if (!spin_trylock(&task->alloc_lock)) {
+			cb_ret.r0 = -EBUSY;
+			return cb_ret;
+		}
 		mm = task->mm;
 		if (mm && !(task->flags & PF_KTHREAD)) {
 			mmget(mm);
@@ -792,8 +808,10 @@ BPF_CALL_5(bpf_find_vma, struct task_struct *, task, u64, start,
 		}
 		spin_unlock(&task->alloc_lock);
 	}
-	if (!mm)
-		return -ENOENT;
+	if (!mm) {
+		cb_ret.r0 = -ENOENT;
+		return cb_ret;
+	}
 
 	work = bpf_mmap_unlock_guard_get();
 	if (IS_ERR(work)) {
@@ -815,8 +833,13 @@ BPF_CALL_5(bpf_find_vma, struct task_struct *, task, u64, start,
 		 * verifier checks it as an RCU read-side critical section.
 		 */
 		rcu_read_lock();
-		callback_fn((u64)(long)task, (u64)(long)vma,
-			    (u64)(long)callback_ctx, 0, 0);
+		if (unwind)
+			cb_ret = ((bpf_unwind_callback_t)callback_fn)((u64)(long)task,
+								      (u64)(long)vma,
+								      (u64)(long)callback_ctx, 0, 0);
+		else
+			((bpf_callback_t)callback_fn)((u64)(long)task, (u64)(long)vma,
+						      (u64)(long)callback_ctx, 0, 0);
 		rcu_read_unlock();
 		ret = 0;
 	}
@@ -826,11 +849,26 @@ out:
 	if (mmput_needed)
 		mmput_async(mm);
 #endif
-	return ret;
+	cb_ret.r0 = ret;
+	return cb_ret;
+}
+
+BPF_CALL_5(bpf_find_vma, struct task_struct *, task, u64, start,
+	   bpf_callback_t, callback_fn, void *, callback_ctx, u64, flags)
+{
+	return __bpf_find_vma(task, start, callback_fn, callback_ctx, flags, false).r0;
+}
+
+static struct bpf_cb_ret bpf_find_vma_unwind(u64 task, u64 start, u64 callback_fn,
+					     u64 callback_ctx, u64 flags)
+{
+	return __bpf_find_vma((struct task_struct *)(long)task, start, (void *)(long)callback_fn,
+			      (void *)(long)callback_ctx, flags, true);
 }
 
 const struct bpf_func_proto bpf_find_vma_proto = {
 	.func		= bpf_find_vma,
+	.func_unwind	= bpf_find_vma_unwind,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_BTF_ID,
 	.arg1_btf_id	= &btf_tracing_ids[BTF_TRACING_TYPE_TASK],
