@@ -1812,9 +1812,26 @@ struct bpf_fdesc_res {
 	};
 };
 
+enum {
+	BPF_FDESC_LOC_REG,	/* off is a register number */
+	BPF_FDESC_LOC_STACK,	/* off is a frame pointer relative stack offset */
+};
+
+#define BPF_FDESC_F_NULLABLE	BIT(0)	/* the location may hold NULL instead */
+
+/* One resource of a frame: the value at a location, or a stack object at it. */
+struct bpf_fdesc_ent {
+	u8 loc;
+	u8 flags;
+	u16 res;	/* index into the program's resource classes */
+	s16 off;
+	s16 order;	/* release order within the frame, lower first */
+};
+
 struct bpf_fdesc {
 	u32 size;	/* total size in bytes, including this header */
 	u32 nent;	/* number of entries that follow */
+	struct bpf_fdesc_ent ent[];
 };
 
 /* One throw site of a JITed function. */
@@ -1837,6 +1854,8 @@ struct bpf_fdesc_tab {
 /* Owned by the main program and shared by its subprograms. */
 struct bpf_fdesc_pool {
 	u32 cnt;
+	u32 res_cnt;
+	struct bpf_fdesc_res *res;
 	struct bpf_fdesc *desc[];
 };
 

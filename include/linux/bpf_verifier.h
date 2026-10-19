@@ -1127,6 +1127,8 @@ struct bpf_verifier_env {
 	u32 fdesc_res_cnt;
 	u32 fdesc_visits;			/* paths merged into frame descriptors */
 	u32 fdesc_conflicts;
+	u32 fdesc_sites;			/* table entries */
+	u32 fdesc_bytes;			/* tables, descriptors and resource classes */
 	void *fdesc_scratch;
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2049,6 +2051,9 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in fdesc.c */
 int bpf_fdesc_site(struct bpf_verifier_env *env, enum bpf_fdesc_site site);
+int bpf_fdesc_build_tables(struct bpf_verifier_env *env);
+void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,
+			     u32 len);
 void bpf_fdesc_build_free(struct bpf_insn_aux_data *aux);
 void bpf_fdesc_env_free(struct bpf_verifier_env *env);
 int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env);

@@ -15,6 +15,7 @@
 #include <linux/bpf_verifier.h>
 #include <linux/btf.h>
 #include <linux/kallsyms.h>
+#include <linux/sort.h>
 
 #define verbose(env, fmt, args...) bpf_verifier_log_write(env, fmt, ##args)
 
@@ -85,6 +86,17 @@ void bpf_fdesc_build_free(struct bpf_insn_aux_data *aux)
 {
 	kvfree(aux->fdesc);
 	aux->fdesc = NULL;
+}
+
+/* The subprog insn @idx belongs to. */
+static int fdesc_insn_subprog(struct bpf_verifier_env *env, u32 idx)
+{
+	int s;
+
+	for (s = 0; s < env->subprog_cnt; s++)
+		if (idx < env->subprog_info[s + 1].start)
+			return s;
+	return -1;
 }
 
 void bpf_fdesc_env_free(struct bpf_verifier_env *env)
@@ -395,6 +407,157 @@ static int fdesc_merge(struct bpf_fdesc_loc *loc, int class, u16 res)
 		/* fdesc_choose() never lists a location an earlier path used otherwise. */
 		return class == FDESC_CLASS_RES ? -EINVAL : 0;
 	}
+}
+
+static int fdesc_ent_cmp(const void *a, const void *b)
+{
+	const struct bpf_fdesc_ent *x = a, *y = b;
+
+	if (x->loc != y->loc)
+		return x->loc - y->loc;
+	return x->off - y->off;
+}
+
+/* Lay out the entries of one descriptor: every listed location of the frame. */
+static u32 fdesc_build_body(const struct bpf_fdesc_build *b, struct bpf_fdesc *d)
+{
+	u32 n = 0, i;
+
+	for (i = 0; i < BPF_REG_10 + b->nr_slots; i++) {
+		const struct bpf_fdesc_loc *loc = i < BPF_REG_10 ? &b->regs[i] :
+								   &b->slots[i - BPF_REG_10];
+		struct bpf_fdesc_ent *ent;
+
+		if (loc->state != FDESC_LOC_RES)
+			continue;
+		if (!d) {
+			n++;
+			continue;
+		}
+		ent = &d->ent[n++];
+		ent->loc = i < BPF_REG_10 ? BPF_FDESC_LOC_REG : BPF_FDESC_LOC_STACK;
+		ent->off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
+		ent->flags = loc->nullable ? BPF_FDESC_F_NULLABLE : 0;
+		ent->res = loc->res;
+		ent->order = 0;
+	}
+	if (d) {
+		d->nent = n;
+		d->size = struct_size(d, ent, n);
+		sort(d->ent, n, sizeof(d->ent[0]), fdesc_ent_cmp, NULL);
+	}
+	return n;
+}
+
+/* Add the descriptor of @b to the pool, sharing an identical earlier one. */
+static int fdesc_pool_add(struct bpf_verifier_env *env, const struct bpf_fdesc_build *b)
+{
+	struct bpf_fdesc_pool *pool = env->fdesc_pool;
+	struct bpf_fdesc *d;
+	u32 i, n = fdesc_build_body(b, NULL);
+
+	d = kvzalloc(struct_size(d, ent, n), GFP_KERNEL_ACCOUNT);
+	if (!d)
+		return -ENOMEM;
+	fdesc_build_body(b, d);
+	for (i = 0; i < pool->cnt; i++) {
+		if (pool->desc[i]->size == d->size && !memcmp(pool->desc[i], d, d->size)) {
+			kvfree(d);
+			return i;
+		}
+	}
+	pool = kvrealloc(pool, struct_size(pool, desc, pool->cnt + 1), GFP_KERNEL_ACCOUNT);
+	if (!pool) {
+		kvfree(d);
+		return -ENOMEM;
+	}
+	env->fdesc_pool = pool;
+	pool->desc[pool->cnt] = d;
+	env->fdesc_bytes += d->size;
+	return pool->cnt++;
+}
+
+/*
+ * After all instruction rewrites, turn the descriptors attached to instructions
+ * into the per subprogram tables the unwinder uses, keyed by instruction index
+ * until the JIT fills in native offsets. Identical descriptors share a body.
+ */
+int bpf_fdesc_build_tables(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_fdesc_pool *pool;
+	int i, s, ret;
+
+	if (!env->fdesc_visits)
+		return 0;
+	pool = kvzalloc(struct_size(pool, desc, 0), GFP_KERNEL_ACCOUNT);
+	if (!pool)
+		return -ENOMEM;
+	env->fdesc_pool = pool;
+	for (s = 0; s < env->subprog_cnt; s++) {
+		u32 start = env->subprog_info[s].start, end = env->subprog_info[s + 1].start;
+		struct bpf_fdesc_tab *tab;
+		u32 cnt = 0;
+
+		for (i = start; i < end; i++)
+			cnt += !!aux[i].fdesc;
+		if (!cnt)
+			continue;
+		tab = kvzalloc(struct_size(tab, pc, cnt), GFP_KERNEL_ACCOUNT);
+		if (!tab)
+			return -ENOMEM;
+		env->subprog_info[s].fdesc_tab = tab;
+		env->fdesc_bytes += struct_size(tab, pc, cnt);
+		for (i = start; i < end; i++) {
+			if (!aux[i].fdesc)
+				continue;
+			if (verifier_bug_if(!bpf_pseudo_call(&env->prog->insnsi[i]) &&
+					    !bpf_pseudo_kfunc_call(&env->prog->insnsi[i]), env,
+					    "frame descriptor at insn %d is not at a call", i))
+				return -EFAULT;
+			ret = fdesc_pool_add(env, aux[i].fdesc);
+			if (ret < 0)
+				return ret;
+			tab->pc[tab->cnt++] = (struct bpf_fdesc_pc) { .off = i - start, .desc = ret };
+			env->fdesc_sites++;
+		}
+	}
+	env->fdesc_pool->res = env->fdesc_res;
+	env->fdesc_pool->res_cnt = env->fdesc_res_cnt;
+	env->fdesc_bytes += env->fdesc_res_cnt * sizeof(*env->fdesc_res);
+	env->fdesc_res = NULL;
+	/* A program without BPF-to-BPF calls is JITed whole: hand it the main table. */
+	if (env->subprog_cnt == 1) {
+		env->prog->aux->fdesc_tab = env->subprog_info[0].fdesc_tab;
+		env->subprog_info[0].fdesc_tab = NULL;
+	}
+	return 0;
+}
+
+/*
+ * The tables key sites by instruction index until the JIT fills them. A patch
+ * of @len insns at @off after they were built, which only constant blinding
+ * does, moves the sites of that subprog behind the patch, and the patched
+ * instruction's own site with it, as its aux data moves to the end of the
+ * patch. @prog is the patched program; the one the env still points at may
+ * have been freed by the patch.
+ */
+void bpf_fdesc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,
+			     u32 len)
+{
+	int s = fdesc_insn_subprog(env, off);
+	struct bpf_fdesc_tab *tab;
+	u32 i, rel;
+
+	if (len == 1 || s < 0)
+		return;
+	tab = env->subprog_cnt == 1 ? prog->aux->fdesc_tab : env->subprog_info[s].fdesc_tab;
+	if (!tab || tab->filled)
+		return;
+	rel = off - env->subprog_info[s].start;
+	for (i = 0; i < tab->cnt; i++)
+		if (tab->pc[i].off >= rel)
+			tab->pc[i].off += len - 1;
 }
 
 /*
