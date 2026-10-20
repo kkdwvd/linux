@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/linkage.h>
+#include <linux/bpf_throw.h>
 #include <asm/nospec-branch.h>
 
 	.code64
@@ -34,9 +35,10 @@ SYM_FUNC_START(bpf_throw_entry)
 	pushq %rdi	/* R1 */
 	pushq %rax	/* R0 */
 
-	/* bpf_throw_unwind(regs, cookie); the cookie is R1 of the caller. */
+	/* bpf_throw_unwind(regs, cookie, BPF_THROW_CALL); the cookie is R1 of the caller. */
 	movq %rdi, %rsi
 	movq %rsp, %rdi
+	movl $BPF_THROW_CALL, %edx
 
 	/* Emit call depth accounting for call below. */
 	CALL_DEPTH_ACCOUNT

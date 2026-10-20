@@ -3562,6 +3562,13 @@ bool __weak bpf_jit_supports_timed_may_goto(void)
 	return false;
 }
 
+/* Can the kernel cancel a running program on this architecture? */
+bool bpf_jit_supports_cancellation(void)
+{
+	return bpf_jit_supports_exceptions() && bpf_jit_supports_timed_may_goto() &&
+	       bpf_arch_throw_entry();
+}
+
 u64 __weak arch_bpf_timed_may_goto(void)
 {
 	return 0;

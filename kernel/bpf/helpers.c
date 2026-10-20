@@ -3462,9 +3462,10 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
  * register file of the throw site, or NULL when the architecture has no native
  * entry and the kfunc was called directly; with it, the callee-saved registers
  * of the frames unwound are restored for the callback, without it the main
- * program's prologue has saved them all.
+ * program's prologue has saved them all. @kind says how the throw site was
+ * reached.
  */
-void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
+void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
 	struct bpf_throw_ctx ctx = { .regs = regs };
 
@@ -3483,13 +3484,16 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
 	 * architectures cannot recover sp while unwinding, so fall back to bp.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
+	/* A throw the kernel raised completes with the program type's default. */
+	if (kind != BPF_THROW_CALL)
+		cookie = ctx.aux->cancel_retval;
 	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }
 
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	bpf_throw_unwind(NULL, cookie);
+	bpf_throw_unwind(NULL, cookie, BPF_THROW_CALL);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)

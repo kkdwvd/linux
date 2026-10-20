@@ -1130,6 +1130,7 @@ struct bpf_verifier_env {
 	u32 fdesc_sites;			/* table entries */
 	u32 fdesc_bytes;			/* tables, descriptors and resource classes */
 	void *fdesc_scratch;
+	bool cancellable;			/* the kernel may cancel this program at implicit sites */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;

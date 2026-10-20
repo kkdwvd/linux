@@ -12,6 +12,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
+#include <linux/pkt_cls.h>
 #include <linux/filter.h>
 #include <net/netlink.h>
 #include <linux/file.h>
@@ -21846,6 +21847,64 @@ again:
 	return 0;
 }
 
+/*
+ * The value the main program returns when the kernel cancels an invocation:
+ * for each program type the outcome that denies, drops or changes nothing.
+ * A program with an exception callback decides for itself, and a struct_ops
+ * program without one cannot be cancelled, since the meaning of its return
+ * value is the operator's.
+ */
+static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_retval_range range;
+
+	*retval = 0;
+	if (env->exception_callback_subprog)
+		return true;
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		*retval = TC_ACT_SHOT;
+		return true;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		*retval = BPF_DROP;
+		return true;
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		switch (prog->expected_attach_type) {
+		case BPF_CGROUP_UDP4_RECVMSG:
+		case BPF_CGROUP_UDP6_RECVMSG:
+		case BPF_CGROUP_UNIX_RECVMSG:
+		case BPF_CGROUP_INET4_GETPEERNAME:
+		case BPF_CGROUP_INET6_GETPEERNAME:
+		case BPF_CGROUP_UNIX_GETPEERNAME:
+		case BPF_CGROUP_INET4_GETSOCKNAME:
+		case BPF_CGROUP_INET6_GETSOCKNAME:
+		case BPF_CGROUP_UNIX_GETSOCKNAME:
+			/* The only value these hooks accept. */
+			*retval = 1;
+			return true;
+		default:
+			return true;
+		}
+	case BPF_PROG_TYPE_LSM:
+		if (prog->expected_attach_type == BPF_LSM_CGROUP)
+			*retval = program_returns_void(env) ? 1 : 0;
+		else if (get_func_retval_range(prog, &range))
+			/* The hook's "no": an errno where it takes one, 0 for a bool hook. */
+			*retval = range.minval < 0 ? -EPERM : range.minval;
+		return true;
+	case BPF_PROG_TYPE_STRUCT_OPS:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static int do_check_main(struct bpf_verifier_env *env)
 {
 	int ret;
@@ -23849,6 +23908,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	env->cancellable = bpf_jit_supports_cancellation() &&
+			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
 	ret = do_check_main(env);
 	ret = ret ?: do_check_subprogs(env);
 
