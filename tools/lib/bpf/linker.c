@@ -59,8 +59,8 @@ struct src_sec {
 };
 
 struct src_obj {
+	/* the file, or archive(member) */
 	const char *filename;
-	int fd;
 	Elf *elf;
 	/* Section header strings section index */
 	size_t shstrs_sec_idx;
@@ -180,6 +180,8 @@ static int init_output_elf(struct bpf_linker *linker);
 
 static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 			       const char *filename);
+static int linker_add_obj(struct bpf_linker *linker, Elf *elf, const char *filename);
+static int linker_add_archive(struct bpf_linker *linker, Elf *ar, int fd, const char *filename);
 
 static int linker_load_obj_file(struct bpf_linker *linker,
 				struct src_obj *obj);
@@ -194,6 +196,7 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 static int linker_append_elf_syms(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 				 Elf64_Sym *sym, const char *sym_name, int src_sym_idx);
+static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name);
 static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_btf(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj);
@@ -514,14 +517,62 @@ static int init_output_elf(struct bpf_linker *linker)
 	return 0;
 }
 
+#define AR_MAGIC "!<arch>\n"
+#define THIN_AR_MAGIC "!<thin>\n"
+#define AR_MAGIC_SZ (sizeof(AR_MAGIC) - 1)
+/* the header of each member, see ar(5) */
+#define AR_HDR_SZ 60
+
+/* Whether the file is a thin archive, which refers to its members by path */
+static bool is_thin_archive(Elf *elf)
+{
+	const char *raw;
+	size_t sz;
+
+	raw = elf_rawfile(elf, &sz);
+	return raw && sz >= AR_MAGIC_SZ && memcmp(raw, THIN_AR_MAGIC, AR_MAGIC_SZ) == 0;
+}
+
 static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 			       const char *filename)
+{
+	Elf *elf;
+	int err;
+
+	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+	if (!elf) {
+		pr_warn_elf("failed to parse ELF file '%s'", filename);
+		return -EINVAL;
+	}
+
+	switch (elf_kind(elf)) {
+	case ELF_K_ELF:
+		err = linker_add_obj(linker, elf, filename);
+		break;
+	case ELF_K_AR:
+		err = linker_add_archive(linker, elf, fd, filename);
+		break;
+	default:
+		if (is_thin_archive(elf))
+			pr_warn("thin archive '%s' is not supported, link a regular one\n",
+				filename);
+		else
+			pr_warn("'%s' is not an ELF object or an archive\n", filename);
+		err = -EINVAL;
+	}
+
+	elf_end(elf);
+	return err;
+}
+
+/* Link the object file that elf describes, which the caller ends */
+static int linker_add_obj(struct bpf_linker *linker, Elf *elf, const char *filename)
 {
 	struct src_obj obj = {};
 	int err = 0;
 
 	obj.filename = filename;
-	obj.fd = fd;
+	obj.elf = elf;
 
 	err = err ?: linker_load_obj_file(linker, &obj);
 	err = err ?: linker_append_sec_data(linker, &obj);
@@ -536,9 +587,345 @@ static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 	btf_ext__free(obj.btf_ext);
 	free(obj.secs);
 	free(obj.sym_map);
-	if (obj.elf)
-		elf_end(obj.elf);
 
+	return err;
+}
+
+/* A member of an archive */
+struct ar_member {
+	/* the member as libelf reads it */
+	Elf *elf;
+	/* the object: elf, or a descriptor of its data past a BSD long name */
+	Elf *obj;
+	char *name;
+	/* offset of the member's header in the archive */
+	size_t off;
+	/* size of the member's data */
+	size_t size;
+};
+
+/*
+ * A symbol that a member defines, as the index of the archive lists it:
+ * what a member can be linked for
+ */
+struct ar_sym {
+	char *name;
+	/* offset of the header of the member in the archive */
+	size_t member_off;
+	/* whether the member is linked, for this symbol or another */
+	bool linked;
+};
+
+struct ar_index {
+	struct ar_sym *syms;
+	size_t sym_cnt, sym_cap;
+};
+
+static void ar_member_close(struct ar_member *m)
+{
+	if (m->obj && m->obj != m->elf)
+		elf_end(m->obj);
+	if (m->elf)
+		elf_end(m->elf);
+	free(m->name);
+	memset(m, 0, sizeof(*m));
+}
+
+/*
+ * Take over the member that libelf positioned the archive ar at. A BSD archive
+ * stores a long name as the first bytes of the member's data ("#1/<len>" in
+ * the header), which libelf doesn't look past, so the object starts after it.
+ * The data is taken from the archive's, which libelf maps or reads once and
+ * frees with the archive: what elf_rawfile() reads for a member of an archive
+ * that isn't mapped, it never frees.
+ */
+static int ar_member_init(struct ar_member *m, Elf *ar, Elf *elf, size_t off,
+			  const char *filename)
+{
+	Elf_Arhdr *hdr;
+
+	m->elf = elf;
+	m->off = off;
+	hdr = elf_getarhdr(elf);
+	if (!hdr) {
+		pr_warn_elf("failed to read the header of the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	m->size = hdr->ar_size;
+
+	if (strncmp(hdr->ar_rawname, "#1/", 3) == 0) {
+		unsigned long len = strtoul(hdr->ar_rawname + 3, NULL, 10);
+		size_t ar_sz, sz = m->size;
+		char *data;
+
+		data = elf_rawfile(ar, &ar_sz);
+		if (!data || off + AR_HDR_SZ + sz > ar_sz || len > sz) {
+			pr_warn("the member at offset %zu of archive '%s' is shorter than its name\n",
+				off, filename);
+			return -EINVAL;
+		}
+		data += off + AR_HDR_SZ;
+		m->name = strndup(data, len);
+		if (!m->name)
+			return -ENOMEM;
+		m->obj = elf_memory(data + len, sz - len);
+		if (!m->obj) {
+			pr_warn_elf("failed to read member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+	} else {
+		m->name = strdup(hdr->ar_name);
+		if (!m->name)
+			return -ENOMEM;
+		m->obj = elf;
+	}
+
+	return 0;
+}
+
+/* The member at offset off of the archive ar, which fd is open on */
+static int ar_member_open(struct ar_member *m, Elf *ar, int fd, size_t off, const char *filename)
+{
+	Elf *elf;
+
+	memset(m, 0, sizeof(*m));
+	if (elf_rand(ar, off) != off) {
+		pr_warn_elf("failed to find the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	elf = elf_begin(fd, ELF_C_READ_MMAP, ar);
+	if (!elf) {
+		pr_warn_elf("failed to read the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	return ar_member_init(m, ar, elf, off, filename);
+}
+
+static int ar_index_add(struct ar_index *idx, const char *name, size_t member_off)
+{
+	struct ar_sym *sym;
+	int err;
+
+	err = libbpf_ensure_mem((void **)&idx->syms, &idx->sym_cap, sizeof(*idx->syms),
+				idx->sym_cnt + 1);
+	if (err)
+		return err;
+	sym = &idx->syms[idx->sym_cnt];
+	sym->name = strdup(name);
+	if (!sym->name)
+		return -ENOMEM;
+	sym->member_off = member_off;
+	idx->sym_cnt++;
+	return 0;
+}
+
+/* The symbols that the archive lists a member for: its defined global ones */
+static int ar_index_scan_member(struct ar_index *idx, struct ar_member *m, const char *filename)
+{
+	Elf_Scn *scn = NULL;
+	Elf64_Shdr *shdr;
+	Elf_Data *data;
+	Elf64_Sym *sym;
+	const char *name;
+	size_t i, n;
+	int err;
+
+	while ((scn = elf_nextscn(m->obj, scn)) != NULL) {
+		shdr = elf64_getshdr(scn);
+		if (!shdr) {
+			pr_warn_elf("failed to get a section header of member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+		if (shdr->sh_type != SHT_SYMTAB)
+			continue;
+		data = elf_getdata(scn, 0);
+		if (!data) {
+			pr_warn_elf("failed to get the symbol table of member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+		sym = data->d_buf;
+		n = shdr->sh_size / sizeof(*sym);
+		for (i = 1; i < n; i++, sym++) {
+			int type = ELF64_ST_TYPE(sym->st_info);
+			int bind = ELF64_ST_BIND(sym->st_info);
+
+			if (bind == STB_LOCAL || sym->st_shndx == SHN_UNDEF ||
+			    type == STT_SECTION || type == STT_FILE)
+				continue;
+			name = elf_strptr(m->obj, shdr->sh_link, sym->st_name);
+			if (!name) {
+				pr_warn_elf("failed to get the name of symbol #%zu of member '%s' "
+					    "of archive '%s'", i, m->name, filename);
+				return -EINVAL;
+			}
+			err = ar_index_add(idx, name, m->off);
+			if (err)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
+/* Whether the member is the index or the names of the archive, not a file in it */
+static bool ar_member_is_meta(const struct ar_member *m)
+{
+	return strcmp(m->name, "/") == 0 || strcmp(m->name, "//") == 0 ||
+	       strcmp(m->name, "/SYM64/") == 0 ||
+	       strncmp(m->name, "__.SYMDEF", sizeof("__.SYMDEF") - 1) == 0;
+}
+
+/*
+ * Build the index of an archive that has none from the symbol tables of its
+ * members, like lld does. Every member has to be an ELF object then.
+ */
+static int ar_index_scan(struct ar_index *idx, Elf *ar, int fd, const char *filename)
+{
+	struct ar_member m = {};
+	size_t off, ar_sz;
+	int err = 0;
+
+	pr_debug("linker: archive '%s' has no index, scanning its members...\n", filename);
+
+	if (!elf_rawfile(ar, &ar_sz)) {
+		pr_warn_elf("failed to read archive '%s'", filename);
+		return -EINVAL;
+	}
+	for (off = AR_MAGIC_SZ; off + AR_HDR_SZ <= ar_sz; ar_member_close(&m)) {
+		err = ar_member_open(&m, ar, fd, off, filename);
+		if (err)
+			break;
+		if (!ar_member_is_meta(&m)) {
+			if (elf_kind(m.obj) != ELF_K_ELF) {
+				pr_warn("member '%s' of archive '%s' is not an ELF object\n",
+					m.name, filename);
+				err = -EINVAL;
+				break;
+			}
+			err = ar_index_scan_member(idx, &m, filename);
+			if (err)
+				break;
+		}
+		/* members start at even offsets */
+		off += AR_HDR_SZ + ((m.size + 1) & ~(size_t)1);
+	}
+	ar_member_close(&m);
+	return err;
+}
+
+/* The index of the archive: the symbols that each member defines */
+static int ar_index_load(struct ar_index *idx, Elf *ar, int fd, const char *filename)
+{
+	Elf_Arsym *arsyms;
+	size_t i, n;
+	int err;
+
+	arsyms = elf_getarsym(ar, &n);
+	if (!arsyms)
+		return ar_index_scan(idx, ar, fd, filename);
+
+	/* the last entry is a sentinel */
+	for (i = 0; i < n && arsyms[i].as_name; i++) {
+		err = ar_index_add(idx, arsyms[i].as_name, arsyms[i].as_off);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static void ar_index_free(struct ar_index *idx)
+{
+	size_t i;
+
+	for (i = 0; i < idx->sym_cnt; i++)
+		free(idx->syms[i].name);
+	free(idx->syms);
+}
+
+/* Link the member at offset off of the archive, as archive(member) */
+static int linker_add_member(struct bpf_linker *linker, Elf *ar, int fd, size_t off,
+			     const char *filename)
+{
+	struct ar_member m;
+	char *name = NULL;
+	int err;
+
+	err = ar_member_open(&m, ar, fd, off, filename);
+	if (err)
+		goto out;
+	if (elf_kind(m.obj) != ELF_K_ELF) {
+		pr_warn("member '%s' of archive '%s' is not an ELF object\n", m.name, filename);
+		err = -EINVAL;
+		goto out;
+	}
+
+	name = malloc(strlen(filename) + strlen(m.name) + sizeof("()"));
+	if (!name) {
+		err = -ENOMEM;
+		goto out;
+	}
+	sprintf(name, "%s(%s)", filename, m.name);
+	err = linker_add_obj(linker, m.obj, name);
+out:
+	free(name);
+	ar_member_close(&m);
+	return err;
+}
+
+/*
+ * Link the members of an archive that the inputs so far need, as ld does: a
+ * member is linked when its index lists it for a symbol that is undefined at
+ * that point, and not only weakly. Linking a member may leave new symbols
+ * undefined, which members anywhere in the archive may define, so go over the
+ * index until a pass links nothing. Symbols that are still undefined when a
+ * later input refers to them stay undefined: an archive satisfies the
+ * references before it only, so it goes after the objects that use it, and
+ * after the archives that use it.
+ */
+static int linker_add_archive(struct bpf_linker *linker, Elf *ar, int fd, const char *filename)
+{
+	struct ar_index idx = {};
+	struct glob_sym *glob_sym;
+	struct ar_sym *sym;
+	bool pulled;
+	size_t i, j;
+	int err;
+
+	pr_debug("linker: adding archive '%s'...\n", filename);
+
+	err = ar_index_load(&idx, ar, fd, filename);
+	if (err)
+		goto out;
+
+	do {
+		pulled = false;
+		for (i = 0; i < idx.sym_cnt; i++) {
+			sym = &idx.syms[i];
+			if (sym->linked)
+				continue;
+			glob_sym = find_glob_sym(linker, sym->name);
+			if (!glob_sym || !glob_sym->is_extern || glob_sym->is_weak)
+				continue;
+			pr_debug("linker: symbol '%s' pulls a member of archive '%s'\n",
+				 sym->name, filename);
+			err = linker_add_member(linker, ar, fd, sym->member_off, filename);
+			if (err)
+				goto out;
+			/* for every symbol it defines */
+			for (j = 0; j < idx.sym_cnt; j++)
+				if (idx.syms[j].member_off == sym->member_off)
+					idx.syms[j].linked = true;
+			pulled = true;
+		}
+	} while (pulled);
+out:
+	ar_index_free(&idx);
 	return err;
 }
 
@@ -717,12 +1104,6 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 
 	pr_debug("linker: adding object file '%s'...\n", obj->filename);
 
-	obj->elf = elf_begin(obj->fd, ELF_C_READ_MMAP, NULL);
-	if (!obj->elf) {
-		pr_warn_elf("failed to parse ELF file '%s'", obj->filename);
-		return -EINVAL;
-	}
-
 	/* Sanity check ELF file high-level properties */
 	ehdr = elf64_getehdr(obj->elf);
 	if (!ehdr) {
@@ -752,7 +1133,7 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 	    || ehdr->e_machine != EM_BPF
 	    || ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
 		err = -EOPNOTSUPP;
-		pr_warn_elf("unsupported kind of ELF file %s", obj->filename);
+		pr_warn("'%s' is not a relocatable 64-bit BPF ELF object\n", obj->filename);
 		return err;
 	}
 
