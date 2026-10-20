@@ -2198,10 +2198,70 @@ add_sym:
 	return 0;
 }
 
+/* Whether the symbol is defined in .jumptables, i.e. is a jump table */
+static bool sym_is_in_jumptables(const struct src_obj *obj, const Elf64_Sym *sym)
+{
+	const struct src_sec *sec;
+
+	if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= obj->sec_cnt)
+		return false;
+	sec = &obj->secs[sym->st_shndx];
+	return sec->sec_name && !sec->ephemeral && !sec->skipped && sec->data &&
+	       strcmp(sec->sec_name, JUMPTABLES_SEC) == 0;
+}
+
+/*
+ * A jump table in .jumptables holds the offsets of its targets in the section
+ * of the function that uses it, which the ld_imm64 of the table's address
+ * relocates. Nothing relocates the entries, so when the section joins its
+ * section of the output further than at its start, they have to move by as
+ * much. The table is in the data of the output already, in the byte order of
+ * the object. Each table is used by one function and moved once.
+ */
+static int linker_fixup_jumptable(struct bpf_linker *linker, struct src_obj *obj,
+				  Elf64_Sym *sym, struct src_sec *code_sec)
+{
+	struct src_sec *jt_sec = &obj->secs[sym->st_shndx];
+	struct dst_sec *dst_sec;
+	__u64 off;
+	size_t i;
+	void *jt;
+
+	if (!code_sec->dst_off)
+		return 0;
+	if (sym->st_size % sizeof(__u64) ||
+	    sym->st_value + sym->st_size > jt_sec->shdr->sh_size) {
+		pr_warn("jump table symbol #%zu is malformed in %s\n",
+			(size_t)(sym - (Elf64_Sym *)obj->secs[obj->symtab_sec_idx].data->d_buf),
+			obj->filename);
+		return -EINVAL;
+	}
+
+	dst_sec = &linker->secs[jt_sec->dst_id];
+	jt = dst_sec->raw_data + jt_sec->dst_off + sym->st_value;
+	for (i = 0; i < sym->st_size; i += sizeof(off)) {
+		memcpy(&off, jt + i, sizeof(off));
+		if (linker->swapped_endian)
+			off = bswap_64(off);
+		off += code_sec->dst_off;
+		if (linker->swapped_endian)
+			off = bswap_64(off);
+		memcpy(jt + i, &off, sizeof(off));
+	}
+	return 0;
+}
+
 static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj)
 {
 	struct src_sec *src_symtab = &obj->secs[obj->symtab_sec_idx];
-	int i, err;
+	size_t sym_cnt = src_symtab->shdr->sh_size / sizeof(Elf64_Sym);
+	bool *jt_moved;
+	int i, err = 0;
+
+	/* the jump tables whose entries have moved, by their symbol */
+	jt_moved = calloc(sym_cnt, sizeof(*jt_moved));
+	if (!jt_moved)
+		return -ENOMEM;
 
 	for (i = 1; i < obj->sec_cnt; i++) {
 		struct src_sec *src_sec, *src_linked_sec;
@@ -2221,16 +2281,19 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
 		if (!dst_sec) {
 			dst_sec = add_dst_sec(linker, src_sec->sec_name);
-			if (!dst_sec)
-				return -ENOMEM;
+			if (!dst_sec) {
+				err = -ENOMEM;
+				goto out;
+			}
 			err = init_sec(linker, dst_sec, src_sec);
 			if (err) {
 				pr_warn("failed to init section '%s'\n", src_sec->sec_name);
-				return err;
+				goto out;
 			}
 		} else if (!secs_match(dst_sec, src_sec)) {
 			pr_warn("sections %s are not compatible\n", src_sec->sec_name);
-			return -EINVAL;
+			err = -EINVAL;
+			goto out;
 		}
 
 		/* shdr->sh_link points to SYMTAB */
@@ -2243,7 +2306,7 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 		src_sec->dst_id = dst_sec->id;
 		err = extend_sec(linker, dst_sec, src_sec);
 		if (err)
-			return err;
+			goto out;
 
 		src_rel = src_sec->data->d_buf;
 		dst_rel = dst_sec->raw_data + src_sec->dst_off;
@@ -2259,6 +2322,16 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 			dst_rel->r_offset += src_linked_sec->dst_off;
 			sym_type = ELF64_R_TYPE(src_rel->r_info);
 			dst_rel->r_info = ELF64_R_INFO(dst_sym_idx, sym_type);
+
+			/* the jump table of a function moves with the function */
+			if ((src_linked_sec->shdr->sh_flags & SHF_EXECINSTR) &&
+			    src_sym_idx < sym_cnt && !jt_moved[src_sym_idx] &&
+			    sym_is_in_jumptables(obj, src_sym)) {
+				err = linker_fixup_jumptable(linker, obj, src_sym, src_linked_sec);
+				if (err)
+					goto out;
+				jt_moved[src_sym_idx] = true;
+			}
 
 			if (ELF64_ST_TYPE(src_sym->st_info) == STT_SECTION) {
 				struct src_sec *sec = &obj->secs[src_sym->st_shndx];
@@ -2299,14 +2372,16 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 					memcpy(ptr, &off, sizeof(off));
 				} else {
 					pr_warn("relocation against STT_SECTION in non-exec section is not supported!\n");
-					return -EINVAL;
+					err = -EINVAL;
+					goto out;
 				}
 			}
 
 		}
 	}
-
-	return 0;
+out:
+	free(jt_moved);
+	return err;
 }
 
 static Elf64_Sym *find_sym_by_name(struct src_obj *obj, size_t sec_idx,
