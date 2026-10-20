@@ -7,6 +7,10 @@
 #include "bpf_helpers.h"
 #include "bpf_tracing.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Below types and maps are internal implementation details of libbpf's USDT
  * support and are subjects to change. Also, bpf_usdt_xxx() API helpers should
  * be considered an unstable API as well and might be adjusted based on user
@@ -102,7 +106,7 @@ int __bpf_usdt_spec_id(struct pt_regs *ctx)
 		long ip = PT_REGS_IP(ctx);
 		int *spec_id_ptr;
 
-		spec_id_ptr = bpf_map_lookup_elem(&__bpf_usdt_ip_to_spec_id, &ip);
+		spec_id_ptr = (int *)bpf_map_lookup_elem(&__bpf_usdt_ip_to_spec_id, &ip);
 		return spec_id_ptr ? *spec_id_ptr : -ESRCH;
 	}
 
@@ -120,7 +124,7 @@ int bpf_usdt_arg_cnt(struct pt_regs *ctx)
 	if (spec_id < 0)
 		return -ESRCH;
 
-	spec = bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
+	spec = (struct __bpf_usdt_spec *)bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
 	if (!spec)
 		return -ESRCH;
 
@@ -141,7 +145,7 @@ int bpf_usdt_arg_size(struct pt_regs *ctx, __u64 arg_num)
 	if (spec_id < 0)
 		return -ESRCH;
 
-	spec = bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
+	spec = (struct __bpf_usdt_spec *)bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
 	if (!spec)
 		return -ESRCH;
 
@@ -177,7 +181,7 @@ int bpf_usdt_arg(struct pt_regs *ctx, __u64 arg_num, long *res)
 	if (spec_id < 0)
 		return -ESRCH;
 
-	spec = bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
+	spec = (struct __bpf_usdt_spec *)bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
 	if (!spec)
 		return -ESRCH;
 
@@ -201,7 +205,7 @@ int bpf_usdt_arg(struct pt_regs *ctx, __u64 arg_num, long *res)
 		 * struct pt_regs. To keep things simple user-space parts
 		 * record offsetof(struct pt_regs, <regname>) in arg_spec->reg_off.
 		 */
-		err = bpf_probe_read_kernel(&val, sizeof(val), (void *)ctx + arg_spec->reg_off);
+		err = bpf_probe_read_kernel(&val, sizeof(val), (char *)ctx + arg_spec->reg_off);
 		if (err)
 			return err;
 		break;
@@ -213,10 +217,10 @@ int bpf_usdt_arg(struct pt_regs *ctx, __u64 arg_num, long *res)
 		 * from pt_regs, then do another user-space probe read to
 		 * fetch argument value itself.
 		 */
-		err = bpf_probe_read_kernel(&val, sizeof(val), (void *)ctx + arg_spec->reg_off);
+		err = bpf_probe_read_kernel(&val, sizeof(val), (char *)ctx + arg_spec->reg_off);
 		if (err)
 			return err;
-		err = bpf_probe_read_user(&val, sizeof(val), (void *)val + arg_spec->val_off);
+		err = bpf_probe_read_user(&val, sizeof(val), (char *)val + arg_spec->val_off);
 		if (err)
 			return err;
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -231,10 +235,10 @@ int bpf_usdt_arg(struct pt_regs *ctx, __u64 arg_num, long *res)
 		 * as base + (index * scale) + offset, and do a user-space
 		 * probe read to fetch the argument value.
 		 */
-		err = bpf_probe_read_kernel(&val, sizeof(val), (void *)ctx + arg_spec->reg_off);
+		err = bpf_probe_read_kernel(&val, sizeof(val), (char *)ctx + arg_spec->reg_off);
 		if (err)
 			return err;
-		err = bpf_probe_read_kernel(&idx, sizeof(idx), (void *)ctx + arg_spec->idx_reg_off);
+		err = bpf_probe_read_kernel(&idx, sizeof(idx), (char *)ctx + arg_spec->idx_reg_off);
 		if (err)
 			return err;
 		err = bpf_probe_read_user(&val, sizeof(val), (void *)(val + (idx << arg_spec->scale_bitshift) + arg_spec->val_off));
@@ -277,7 +281,7 @@ long bpf_usdt_cookie(struct pt_regs *ctx)
 	if (spec_id < 0)
 		return 0;
 
-	spec = bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
+	spec = (struct __bpf_usdt_spec *)bpf_map_lookup_elem(&__bpf_usdt_specs, &spec_id);
 	if (!spec)
 		return 0;
 
@@ -286,18 +290,18 @@ long bpf_usdt_cookie(struct pt_regs *ctx)
 
 /* we rely on ___bpf_apply() and ___bpf_narg() macros already defined in bpf_tracing.h */
 #define ___bpf_usdt_args0() ctx
-#define ___bpf_usdt_args1(x) ___bpf_usdt_args0(), ({ long _x; bpf_usdt_arg(ctx, 0, &_x); _x; })
-#define ___bpf_usdt_args2(x, args...) ___bpf_usdt_args1(args), ({ long _x; bpf_usdt_arg(ctx, 1, &_x); _x; })
-#define ___bpf_usdt_args3(x, args...) ___bpf_usdt_args2(args), ({ long _x; bpf_usdt_arg(ctx, 2, &_x); _x; })
-#define ___bpf_usdt_args4(x, args...) ___bpf_usdt_args3(args), ({ long _x; bpf_usdt_arg(ctx, 3, &_x); _x; })
-#define ___bpf_usdt_args5(x, args...) ___bpf_usdt_args4(args), ({ long _x; bpf_usdt_arg(ctx, 4, &_x); _x; })
-#define ___bpf_usdt_args6(x, args...) ___bpf_usdt_args5(args), ({ long _x; bpf_usdt_arg(ctx, 5, &_x); _x; })
-#define ___bpf_usdt_args7(x, args...) ___bpf_usdt_args6(args), ({ long _x; bpf_usdt_arg(ctx, 6, &_x); _x; })
-#define ___bpf_usdt_args8(x, args...) ___bpf_usdt_args7(args), ({ long _x; bpf_usdt_arg(ctx, 7, &_x); _x; })
-#define ___bpf_usdt_args9(x, args...) ___bpf_usdt_args8(args), ({ long _x; bpf_usdt_arg(ctx, 8, &_x); _x; })
-#define ___bpf_usdt_args10(x, args...) ___bpf_usdt_args9(args), ({ long _x; bpf_usdt_arg(ctx, 9, &_x); _x; })
-#define ___bpf_usdt_args11(x, args...) ___bpf_usdt_args10(args), ({ long _x; bpf_usdt_arg(ctx, 10, &_x); _x; })
-#define ___bpf_usdt_args12(x, args...) ___bpf_usdt_args11(args), ({ long _x; bpf_usdt_arg(ctx, 11, &_x); _x; })
+#define ___bpf_usdt_args1(x) ___bpf_usdt_args0(), ({ long _x; bpf_usdt_arg(ctx, 0, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args2(x, args...) ___bpf_usdt_args1(args), ({ long _x; bpf_usdt_arg(ctx, 1, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args3(x, args...) ___bpf_usdt_args2(args), ({ long _x; bpf_usdt_arg(ctx, 2, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args4(x, args...) ___bpf_usdt_args3(args), ({ long _x; bpf_usdt_arg(ctx, 3, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args5(x, args...) ___bpf_usdt_args4(args), ({ long _x; bpf_usdt_arg(ctx, 4, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args6(x, args...) ___bpf_usdt_args5(args), ({ long _x; bpf_usdt_arg(ctx, 5, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args7(x, args...) ___bpf_usdt_args6(args), ({ long _x; bpf_usdt_arg(ctx, 6, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args8(x, args...) ___bpf_usdt_args7(args), ({ long _x; bpf_usdt_arg(ctx, 7, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args9(x, args...) ___bpf_usdt_args8(args), ({ long _x; bpf_usdt_arg(ctx, 8, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args10(x, args...) ___bpf_usdt_args9(args), ({ long _x; bpf_usdt_arg(ctx, 9, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args11(x, args...) ___bpf_usdt_args10(args), ({ long _x; bpf_usdt_arg(ctx, 10, &_x); ___bpf_cast(_x); })
+#define ___bpf_usdt_args12(x, args...) ___bpf_usdt_args11(args), ({ long _x; bpf_usdt_arg(ctx, 11, &_x); ___bpf_cast(_x); })
 #define ___bpf_usdt_args(args...) ___bpf_apply(___bpf_usdt_args, ___bpf_narg(args))(args)
 
 /*
@@ -307,16 +311,20 @@ long bpf_usdt_cookie(struct pt_regs *ctx)
  */
 #define BPF_USDT(name, args...)						    \
 name(struct pt_regs *ctx);						    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args);				    \
-typeof(name(0)) name(struct pt_regs *ctx)				    \
+__typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
         _Pragma("GCC diagnostic push")					    \
-        _Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	___bpf_diag_ignore_int_conversion					\
         return ____##name(___bpf_usdt_args(args));			    \
         _Pragma("GCC diagnostic pop")					    \
 }									    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args)
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* __USDT_BPF_H__ */
