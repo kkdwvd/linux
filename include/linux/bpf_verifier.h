@@ -384,6 +384,13 @@ struct bpf_func_state {
 	 * callback and its callees run in an RCU read-side critical section.
 	 */
 	bool in_rcu_callback_fn;
+	/*
+	 * RCU read and preemption disabled sections this frame entered and has
+	 * not left: the unwinder leaves them with the frame. A frame leaving a
+	 * section it did not enter leaves one of a caller's.
+	 */
+	u32 rcu_locks;
+	u32 preempt_locks;
 	/* For callback calling functions that limit number of possible
 	 * callback executions (e.g. bpf_loop) keeps track of current
 	 * simulated iteration number.
