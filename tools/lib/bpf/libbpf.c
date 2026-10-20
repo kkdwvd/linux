@@ -8062,6 +8062,35 @@ static int bpf_object__arena_func_copy(struct bpf_object *obj, struct bpf_progra
 }
 
 /*
+ * [WIP] Whether the function does nothing but call __bpf_trap. clang gives the
+ * complete and the deleting destructor of an abstract class such a body, as
+ * nothing can run them, and they are in the vtable of the class. The kernel
+ * refuses a function that reaches the trap, so a copy for arena data can't be
+ * verified. Calling one is undefined behavior, so its slots stay NULL. Goes
+ * away with the design for callx, which verifies a function the data points to
+ * only when it is called.
+ */
+static bool prog_is_trap_only(const struct bpf_object *obj, const struct bpf_program *prog)
+{
+	const struct bpf_insn *insn = prog->insns;
+	int i;
+
+	if (prog->insns_cnt < 1 || prog->insns_cnt > 2)
+		return false;
+	if (insn[0].code != (BPF_JMP | BPF_CALL))
+		return false;
+	if (prog->insns_cnt == 2 && insn[1].code != (BPF_JMP | BPF_EXIT))
+		return false;
+	for (i = 0; i < prog->nr_reloc; i++) {
+		const struct reloc_desc *relo = &prog->reloc_desc[i];
+
+		if (relo->insn_idx == 0 && relo->type == RELO_EXTERN_CALL)
+			return strcmp(obj->externs[relo->ext_idx].name, "__bpf_trap") == 0;
+	}
+	return false;
+}
+
+/*
  * [WIP] A program that the kernel lets call a number with callx, one loaded
  * with BPF_F_ARENA_SCALAR, may call any function whose address is in arena
  * data, if it has callx and refers to arena data. Give it a copy of each of
@@ -8106,6 +8135,13 @@ bpf_object__append_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *m
 		/* the kernel takes a hidden function for a static one */
 		if (subprog->sym_global && !subprog->mark_btf_static)
 			continue;
+
+		/* a call of it would be undefined behavior, and the kernel would refuse the copy */
+		if (prog_is_trap_only(obj, subprog)) {
+			pr_debug("prog '%s': pointer at offset %zu in arena data to '%s', which only traps, is NULL\n",
+				 main_prog->name, p->sec_off, subprog->name);
+			continue;
+		}
 
 		err = bpf_object__arena_func_copy(obj, main_prog, subprog);
 		if (err < 0)
@@ -10311,6 +10347,8 @@ bpf_object__load_progs(struct bpf_object *obj, int log_level)
 			continue;
 		func = find_prog_by_sec_insn(obj, p->func_sec_idx, p->func_off / BPF_INSN_SZ);
 		bpf_object__data_ptr_sec(obj, p->sec_idx, &name);
+		if (func && prog_is_trap_only(obj, func))
+			continue;
 		if (func && func->sym_global && !func->mark_btf_static)
 			pr_warn("map '%s': pointer at offset %zu to global function '%s' is NULL, a program has copies of static and hidden functions only\n",
 				name, p->sec_off, func->name);
