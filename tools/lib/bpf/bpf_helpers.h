@@ -24,6 +24,13 @@ extern "C" {
 #define _Bool bool
 #endif
 
+#ifdef __cplusplus
+#define ___bpf_diag_ignore_int_conversion
+#else
+#define ___bpf_diag_ignore_int_conversion \
+	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")
+#endif
+
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) __typeof__(val) *name
 #define __array(name, val) __typeof__(val) *name[]
@@ -112,11 +119,13 @@ extern "C" {
 #undef offsetof
 #define offsetof(type, member)	((unsigned long)&((type *)0)->member)
 
-/* redefined container_of() to ensure we use the above offsetof() macro */
+/*
+ * Redefine container_of() to ensure we use the above offsetof() macro.
+ */
 #undef container_of
 #define container_of(ptr, type, member)				\
 	({							\
-		void *__mptr = (void *)(ptr);			\
+		char *__mptr = (char *)(ptr);			\
 		((type *)(__mptr - offsetof(type, member)));	\
 	})
 
@@ -213,7 +222,7 @@ enum libbpf_tristate {
 #define __percpu_kptr __attribute__((btf_type_tag("percpu_kptr")))
 #define __uptr __attribute__((btf_type_tag("uptr")))
 
-#if defined (__clang__)
+#if defined(__clang__) || defined(__cplusplus)
 #define bpf_ksym_exists(sym) ({						\
 	_Static_assert(!__builtin_constant_p(!!sym),			\
 		       #sym " should be marked as __weak");		\
@@ -246,23 +255,28 @@ enum libbpf_tristate {
 #define ___bpf_nth(_, _1, _2, _3, _4, _5, _6, _7, _8, _9, _a, _b, _c, N, ...) N
 #endif
 #ifndef ___bpf_narg
+#ifdef __cplusplus
+#define ___bpf_narg(...) \
+	___bpf_nth(_, __VA_ARGS__ __VA_OPT__(,) 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#else
 #define ___bpf_narg(...) \
 	___bpf_nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 #endif
+#endif
 
 #define ___bpf_fill0(arr, p, x) do {} while (0)
-#define ___bpf_fill1(arr, p, x) arr[p] = x
-#define ___bpf_fill2(arr, p, x, args...) arr[p] = x; ___bpf_fill1(arr, p + 1, args)
-#define ___bpf_fill3(arr, p, x, args...) arr[p] = x; ___bpf_fill2(arr, p + 1, args)
-#define ___bpf_fill4(arr, p, x, args...) arr[p] = x; ___bpf_fill3(arr, p + 1, args)
-#define ___bpf_fill5(arr, p, x, args...) arr[p] = x; ___bpf_fill4(arr, p + 1, args)
-#define ___bpf_fill6(arr, p, x, args...) arr[p] = x; ___bpf_fill5(arr, p + 1, args)
-#define ___bpf_fill7(arr, p, x, args...) arr[p] = x; ___bpf_fill6(arr, p + 1, args)
-#define ___bpf_fill8(arr, p, x, args...) arr[p] = x; ___bpf_fill7(arr, p + 1, args)
-#define ___bpf_fill9(arr, p, x, args...) arr[p] = x; ___bpf_fill8(arr, p + 1, args)
-#define ___bpf_fill10(arr, p, x, args...) arr[p] = x; ___bpf_fill9(arr, p + 1, args)
-#define ___bpf_fill11(arr, p, x, args...) arr[p] = x; ___bpf_fill10(arr, p + 1, args)
-#define ___bpf_fill12(arr, p, x, args...) arr[p] = x; ___bpf_fill11(arr, p + 1, args)
+#define ___bpf_fill1(arr, p, x) arr[p] = (unsigned long long)(x)
+#define ___bpf_fill2(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill1(arr, p + 1, args)
+#define ___bpf_fill3(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill2(arr, p + 1, args)
+#define ___bpf_fill4(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill3(arr, p + 1, args)
+#define ___bpf_fill5(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill4(arr, p + 1, args)
+#define ___bpf_fill6(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill5(arr, p + 1, args)
+#define ___bpf_fill7(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill6(arr, p + 1, args)
+#define ___bpf_fill8(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill7(arr, p + 1, args)
+#define ___bpf_fill9(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill8(arr, p + 1, args)
+#define ___bpf_fill10(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill9(arr, p + 1, args)
+#define ___bpf_fill11(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill10(arr, p + 1, args)
+#define ___bpf_fill12(arr, p, x, args...) arr[p] = (unsigned long long)(x); ___bpf_fill11(arr, p + 1, args)
 #define ___bpf_fill(arr, args...) \
 	___bpf_apply(___bpf_fill, ___bpf_narg(args))(arr, 0, args)
 
@@ -284,7 +298,7 @@ enum libbpf_tristate {
 	unsigned long long ___param[___bpf_narg(args)];		\
 								\
 	_Pragma("GCC diagnostic push")				\
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")	\
+	___bpf_diag_ignore_int_conversion			\
 	___bpf_fill(___param, args);				\
 	_Pragma("GCC diagnostic pop")				\
 								\
@@ -302,7 +316,7 @@ enum libbpf_tristate {
 	unsigned long long ___param[___bpf_narg(args)];		\
 								\
 	_Pragma("GCC diagnostic push")				\
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")	\
+	___bpf_diag_ignore_int_conversion			\
 	___bpf_fill(___param, args);				\
 	_Pragma("GCC diagnostic pop")				\
 								\
@@ -333,7 +347,7 @@ enum libbpf_tristate {
 	unsigned long long ___param[___bpf_narg(args)];		\
 								\
 	_Pragma("GCC diagnostic push")				\
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")	\
+	___bpf_diag_ignore_int_conversion			\
 	___bpf_fill(___param, args);				\
 	_Pragma("GCC diagnostic pop")				\
 								\
@@ -347,7 +361,7 @@ enum libbpf_tristate {
 	unsigned long long ___param[___bpf_narg(args)];					\
 											\
 	_Pragma("GCC diagnostic push")							\
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")				\
+	___bpf_diag_ignore_int_conversion						\
 	___bpf_fill(___param, args);							\
 	_Pragma("GCC diagnostic pop")							\
 											\
