@@ -52,7 +52,7 @@ enum bpf_enum_value_kind {
 	bpf_probe_read_kernel(						      \
 			(void *)dst,					      \
 			__CORE_RELO(src, fld, BYTE_SIZE),		      \
-			(const void *)src + __CORE_RELO(src, fld, BYTE_OFFSET))
+			(const char *)src + __CORE_RELO(src, fld, BYTE_OFFSET))
 #else
 /* semantics of LSHIFT_64 assumes loading values into low-ordered bytes, so
  * for big-endian we need to adjust destination pointer accordingly, based on
@@ -60,9 +60,9 @@ enum bpf_enum_value_kind {
  */
 #define __CORE_BITFIELD_PROBE_READ(dst, src, fld)			      \
 	bpf_probe_read_kernel(						      \
-			(void *)dst + (8 - __CORE_RELO(src, fld, BYTE_SIZE)), \
+			(char *)dst + (8 - __CORE_RELO(src, fld, BYTE_SIZE)), \
 			__CORE_RELO(src, fld, BYTE_SIZE),		      \
-			(const void *)src + __CORE_RELO(src, fld, BYTE_OFFSET))
+			(const char *)src + __CORE_RELO(src, fld, BYTE_OFFSET))
 #endif
 
 /*
@@ -92,7 +92,7 @@ enum bpf_enum_value_kind {
  * tracepoints).
  */
 #define BPF_CORE_READ_BITFIELD(s, field) ({				      \
-	const void *p = (const void *)s + __CORE_RELO(s, field, BYTE_OFFSET); \
+	const void *p = (const char *)s + __CORE_RELO(s, field, BYTE_OFFSET); \
 	unsigned long long val;						      \
 									      \
 	/* This is a so-called barrier_var() operation that makes specified   \
@@ -123,7 +123,7 @@ enum bpf_enum_value_kind {
  * This is the inverse of BPF_CORE_WRITE_BITFIELD().
  */
 #define BPF_CORE_WRITE_BITFIELD(s, field, new_val) ({			\
-	void *p = (void *)s + __CORE_RELO(s, field, BYTE_OFFSET);	\
+	void *p = (char *)s + __CORE_RELO(s, field, BYTE_OFFSET);	\
 	unsigned int byte_size = __CORE_RELO(s, field, BYTE_SIZE);	\
 	unsigned int lshift = __CORE_RELO(s, field, LSHIFT_U64);	\
 	unsigned int rshift = __CORE_RELO(s, field, RSHIFT_U64);	\
@@ -392,7 +392,15 @@ extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 #define ___arrow10(a, b, c, d, e, f, g, h, i, j) a->b->c->d->e->f->g->h->i->j
 #define ___arrow(...) ___apply(___arrow, ___narg(__VA_ARGS__))(__VA_ARGS__)
 
-#if defined(__clang__) && (__clang_major__ >= 19)
+#ifdef __cplusplus
+extern "C++" {
+template <typename T> struct ___bpf_unqual { typedef T type; };
+template <typename T> struct ___bpf_unqual<const T> { typedef T type; };
+template <typename T> struct ___bpf_unqual<volatile T> { typedef T type; };
+template <typename T> struct ___bpf_unqual<const volatile T> { typedef T type; };
+}
+#define ___type(...) typename ___bpf_unqual<__typeof__(___arrow(__VA_ARGS__))>::type
+#elif defined(__clang__) && (__clang_major__ >= 19)
 #define ___type(...) __typeof_unqual__(___arrow(__VA_ARGS__))
 #elif defined(__GNUC__) && (__GNUC__ >= 14)
 #define ___type(...) __typeof_unqual__(___arrow(__VA_ARGS__))
@@ -401,7 +409,8 @@ extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 #endif
 
 #define ___read(read_fn, dst, src_type, src, accessor)			    \
-	read_fn((void *)(dst), sizeof(*(dst)), &((src_type)(src))->accessor)
+	read_fn((void *)(dst), sizeof(*(dst)),				    \
+		(const void *)&((src_type)(src))->accessor)
 
 /* "recursively" read a sequence of inner pointers using local __t var */
 #define ___rd_first(fn, src, a) ___read(fn, &__t, ___type(src), src, a);
