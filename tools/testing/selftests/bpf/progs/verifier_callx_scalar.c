@@ -4,6 +4,11 @@
  * to memory and loaded back. The verifier doesn't check what such callx calls.
  * It verifies each function whose address is taken on its own instead. It's a
  * stopgap until there are verified pointers to functions.
+ *
+ * This object has no arena: libbpf binds the arena of an object to every
+ * program in it, and a program with an arena may load through a number under
+ * BPF_F_ARENA_SCALAR, which the tests of a callee's arguments must see refused.
+ * The tests with an arena are in verifier_callx_scalar_arena.c.
  */
 
 #include <linux/bpf.h>
@@ -26,23 +31,8 @@
 	__imm_insn(insn_unwind_exit, \
 		   BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0))
 
-void *bpf_arena_alloc_pages(void *map, void *addr, __u32 page_cnt, int node_id,
-			    __u64 flags) __ksym;
 void bpf_preempt_disable(void) __ksym;
 void bpf_preempt_enable(void) __ksym;
-
-#ifdef __TARGET_ARCH_arm64
-#define ARENA_VM_START (1ull << 32)
-#else
-#define ARENA_VM_START (1ull << 44)
-#endif
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARENA);
-	__uint(map_flags, BPF_F_MMAPABLE);
-	__uint(max_entries, 1);
-	__ulong(map_extra, ARENA_VM_START);
-} arena SEC(".maps");
 
 struct val_with_lock {
 	struct bpf_spin_lock lock;
@@ -55,12 +45,6 @@ struct {
 	__type(key, int);
 	__type(value, struct val_with_lock);
 } map_lock SEC(".maps");
-
-/* BTF FUNC records are not generated for kfuncs referenced from inline assembly */
-void __kfunc_btf_root(void)
-{
-	bpf_arena_alloc_pages(0, 0, 0, 0, 0);
-}
 
 /* the verifier doesn't know what is in there */
 unsigned long fn_slot;
@@ -114,37 +98,6 @@ __naked void callx_scalar_no_flag(void)
 		:
 		: __imm_addr(fn_slot),
 		  __imm_addr(add3)
-		: __clobber_all);
-}
-
-/* the address of add3() is stored to arena and loaded back */
-SEC("syscall")
-__description("callx scalar: address of a function in arena")
-__callx_scalar
-__success __retval(13)
-__naked void callx_scalar_arena(void)
-{
-	asm volatile (
-		"r1 = %[arena] ll;"
-		"r2 = 0;"
-		"r3 = 1;"
-		"r4 = -1;"
-		"r5 = 0;"
-		"call %[bpf_arena_alloc_pages];"
-		"r6 = r0;"
-		"r0 = 100;"
-		"if r6 == 0 goto 1f;"
-		"r1 = %[add3] ll;"
-		"*(u64 *)(r6 + 8) = r1;"
-		"r2 = *(u64 *)(r6 + 8);"
-		"r1 = 10;"
-		"callx r2;"
-	"1:"
-		"exit;"
-		:
-		: __imm_addr(arena),
-		  __imm_addr(add3),
-		  __imm(bpf_arena_alloc_pages)
 		: __clobber_all);
 }
 
@@ -667,41 +620,6 @@ int callx_scalar_c_global(void *ctx)
 {
 	fnptr = mul7;
 	return fnptr(6);
-}
-
-/* like the header of a C++ exception, which keeps the destructor of the object */
-struct exc {
-	void (*dtor)(struct exc *e);
-	long val;
-};
-
-static __noinline void exc_dtor(struct exc *e)
-{
-	e->val += 90;
-}
-
-/* the destructor is called a frame away from where it's stored */
-static __noinline long exc_end(struct exc *e)
-{
-	if (e->dtor)
-		e->dtor(e);
-	return e->val;
-}
-
-SEC("syscall")
-__description("callx scalar: C, destructor in arena")
-__callx_scalar
-__success __retval(99)
-int callx_scalar_c_arena(void *ctx)
-{
-	struct exc *e;
-
-	e = bpf_arena_alloc_pages(&arena, NULL, 1, -1, 0);
-	if (!e)
-		return 1;
-	e->dtor = exc_dtor;
-	e->val = 9;
-	return exc_end(e);
 }
 
 static __noinline int copy_user(int x)
