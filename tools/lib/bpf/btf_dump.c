@@ -95,6 +95,8 @@ struct btf_dump {
 	const char *enclosing_name;
 	/* emit next struct/union definition without its tag name (one-shot) */
 	bool skip_anon_tag;
+	/* emit the names C++ uses where they differ from the C names */
+	bool cpp_names;
 
 	/* per-type auxiliary state */
 	struct btf_dump_type_aux_state *type_states;
@@ -102,6 +104,9 @@ struct btf_dump {
 	/* per-type optional cached unique name, must be freed, if present */
 	const char **cached_names;
 	size_t cached_names_cap;
+	/* per-type optional name for C++, must be freed, if present */
+	const char **cached_cpp_names;
+	size_t cached_cpp_names_cap;
 
 	/* decl tags, sorted by (target ID, tag ID) */
 	struct decl_tag_desc *decl_tags;
@@ -247,6 +252,9 @@ static int btf_dump_resize(struct btf_dump *d)
 	if (libbpf_ensure_mem((void **)&d->cached_names, &d->cached_names_cap,
 			      sizeof(*d->cached_names), last_id + 1))
 		return -ENOMEM;
+	if (libbpf_ensure_mem((void **)&d->cached_cpp_names, &d->cached_cpp_names_cap,
+			      sizeof(*d->cached_cpp_names), last_id + 1))
+		return -ENOMEM;
 
 	if (d->last_id == 0) {
 		/* VOID is special */
@@ -310,6 +318,13 @@ void btf_dump__free(struct btf_dump *d)
 		}
 	}
 	free(d->cached_names);
+	if (d->cached_cpp_names) {
+		for (i = 0; i <= d->last_id; i++) {
+			if (d->cached_cpp_names[i])
+				free((void *)d->cached_cpp_names[i]);
+		}
+	}
+	free(d->cached_cpp_names);
 	free(d->decl_tags);
 	free(d->emit_queue);
 	free(d->decl_stack);
@@ -800,6 +815,176 @@ static bool btf_dump_is_cpp_bool_enum(struct btf_dump *d,
 }
 
 /*
+ * Type names that ISO C and POSIX give the C library's <time.h>, <signal.h>
+ * and <sched.h>. A C++ standard library includes <time.h> for <chrono>, so
+ * every C++ program that uses <atomic> sees them; <time.h> declares the
+ * struct sigevent of <signal.h>, and the pthread_attr_t that one points to
+ * carries the struct sched_param of <sched.h> in some C libraries. The kernel
+ * defines types of its own under these names, with layouts of its own: its
+ * struct tm has a long tm_year and no time zone, its timer_t is an int where
+ * glibc's, musl's and llvm-libc's is a pointer, its sigset_t is one word
+ * against glibc's sixteen. C++ rejects a second definition of a class, and a
+ * typedef that does not name the same type, so the generated header could
+ * not be included beside these headers.
+ *
+ * In C++ the header suffixes these names with ___kernel, which CO-RE strips
+ * when it matches the program's types against the kernel's BTF: a program
+ * that reads the kernel's struct tm names struct tm___kernel, and struct tm
+ * is the C library's. This is what the UAPI does with the __kernel_ prefix
+ * for the POSIX type names it cannot share with the C library (see
+ * include/uapi/asm-generic/posix_types.h). The C output is unchanged.
+ *
+ * The integer typedefs of these headers, clock_t, clockid_t, pid_t, size_t,
+ * time_t and uid_t, are the kernel ABI's types in every C library and may be
+ * redeclared, so they keep their names. The typedefs listed are of the C
+ * library's own types: records, and handles such as timer_t.
+ *
+ * The list is what llvm-libc, the C library of the BPF sysroot, defines under
+ * these names. glibc defines more: a sigval_t typedef of union sigval, and
+ * the fd_set of <sys/select.h>, which <stdlib.h> reaches in C++, collide with
+ * the kernel's typedefs sigval_t and fd_set. Extending the list to glibc's
+ * extensions is left open.
+ */
+static bool btf_is_libc_type_name(const char *name)
+{
+	static const char * const libc_type_names[] = {
+		/* <time.h> */
+		"tm", "timespec", "itimerspec", "timer_t", "locale_t",
+		/* <signal.h> */
+		"sigval", "sigevent", "sigaction", "siginfo_t", "sigset_t",
+		"stack_t", "mcontext_t", "ucontext_t", "pthread_t",
+		"pthread_attr_t",
+		/* <sched.h> */
+		"sched_param",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(libc_type_names); i++) {
+		if (strcmp(name, libc_type_names[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* Whether C++ spells the type's name differently, resolving the name */
+static bool btf_dump_has_cpp_name(struct btf_dump *d, __u32 id)
+{
+	const struct btf_type *t = btf__type_by_id(d->btf, id);
+
+	if (btf_is_typedef(t))
+		btf_dump_ident_name(d, id);
+	else
+		btf_dump_type_name(d, id);
+	return d->cached_cpp_names[id] != NULL;
+}
+
+/*
+ * Whether a declaration of the type names one that C++ spells differently,
+ * so that the declaration has to be emitted once per language. An anonymous
+ * struct or union is defined inline and its members are checked on their
+ * own. The names are resolved in the order the declaration prints them.
+ */
+static bool btf_dump_decl_has_cpp_name(struct btf_dump *d, __u32 id)
+{
+	const struct btf_type *t;
+
+	while (id) {
+		t = btf__type_by_id(d->btf, id);
+		switch (btf_kind(t)) {
+		case BTF_KIND_PTR:
+		case BTF_KIND_CONST:
+		case BTF_KIND_VOLATILE:
+		case BTF_KIND_RESTRICT:
+		case BTF_KIND_TYPE_TAG:
+			id = t->type;
+			break;
+		case BTF_KIND_ARRAY:
+			id = btf_array(t)->type;
+			break;
+		case BTF_KIND_FUNC_PROTO: {
+			const struct btf_param *p = btf_params(t);
+			__u32 i, n = btf_vlen(t);
+
+			if (btf_dump_decl_has_cpp_name(d, t->type))
+				return true;
+			for (i = 0; i < n; i++, p++) {
+				if (btf_dump_decl_has_cpp_name(d, p->type))
+					return true;
+			}
+			return false;
+		}
+		case BTF_KIND_STRUCT:
+		case BTF_KIND_UNION:
+		case BTF_KIND_FWD:
+		case BTF_KIND_TYPEDEF:
+			return t->name_off && btf_dump_has_cpp_name(d, id);
+		default:
+			return false;
+		}
+	}
+	return false;
+}
+
+static void btf_dump_emit_fwd_decl(struct btf_dump *d, __u32 id,
+				   const struct btf_type *t)
+{
+	if (btf_is_fwd(t))
+		btf_dump_emit_fwd_def(d, id, t);
+	else
+		btf_dump_emit_struct_fwd(d, id, t);
+}
+
+/*
+ * Emit a top-level forward declaration, once per language when C++ spells
+ * its name differently.
+ */
+static void btf_dump_emit_fwd(struct btf_dump *d, __u32 id,
+			      const struct btf_type *t)
+{
+	bool per_lang = btf_dump_has_cpp_name(d, id);
+
+	if (per_lang) {
+		btf_dump_printf(d, "#ifdef __cplusplus\n");
+		d->cpp_names = true;
+		btf_dump_emit_fwd_decl(d, id, t);
+		d->cpp_names = false;
+		btf_dump_printf(d, ";\n#else\n");
+	}
+	btf_dump_emit_fwd_decl(d, id, t);
+	btf_dump_printf(d, ";\n");
+	if (per_lang)
+		btf_dump_printf(d, "#endif\n");
+	btf_dump_printf(d, "\n");
+}
+
+/*
+ * Emit a top-level typedef, once per language when C++ spells its name or
+ * one in its declaration differently.
+ */
+static void btf_dump_emit_typedef(struct btf_dump *d, __u32 id,
+				  const struct btf_type *t)
+{
+	bool cpp_guard;
+
+	if (btf_dump_has_cpp_name(d, id) || btf_dump_decl_has_cpp_name(d, t->type)) {
+		btf_dump_printf(d, "#ifdef __cplusplus\n");
+		d->cpp_names = true;
+		btf_dump_emit_typedef_def(d, id, t, 0);
+		d->cpp_names = false;
+		btf_dump_printf(d, ";\n#else\n");
+		btf_dump_emit_typedef_def(d, id, t, 0);
+		btf_dump_printf(d, ";\n#endif\n\n");
+		return;
+	}
+
+	cpp_guard = btf_dump_emit_typedef_def(d, id, t, 0);
+	btf_dump_printf(d, ";\n");
+	if (cpp_guard)
+		btf_dump_printf(d, "#endif /* __cplusplus */\n");
+	btf_dump_printf(d, "\n");
+}
+
+/*
  * Emit C-syntax definitions of types from chains of BTF types.
  *
  * High-level handling of determining necessary forward declarations are handled
@@ -848,8 +1033,7 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 					id);
 				return;
 			}
-			btf_dump_emit_struct_fwd(d, id, t);
-			btf_dump_printf(d, ";\n\n");
+			btf_dump_emit_fwd(d, id, t);
 			tstate->fwd_emitted = 1;
 			break;
 		case BTF_KIND_TYPEDEF:
@@ -858,14 +1042,8 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 			 * was emitted, but it can be used only for "weak"
 			 * references through pointer only, not for embedding
 			 */
-			if (!btf_dump_is_blacklisted(d, id)) {
-				bool g = btf_dump_emit_typedef_def(d, id, t, 0);
-
-				btf_dump_printf(d, ";\n");
-				if (g)
-					btf_dump_printf(d, "#endif /* __cplusplus */\n");
-				btf_dump_printf(d, "\n");
-			}
+			if (!btf_dump_is_blacklisted(d, id))
+				btf_dump_emit_typedef(d, id, t);
 			tstate->fwd_emitted = 1;
 			break;
 		default:
@@ -922,8 +1100,7 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 		btf_dump_emit_type(d, btf_array(t)->type, cont_id);
 		break;
 	case BTF_KIND_FWD:
-		btf_dump_emit_fwd_def(d, id, t);
-		btf_dump_printf(d, ";\n\n");
+		btf_dump_emit_fwd(d, id, t);
 		tstate->emit_state = EMITTED;
 		break;
 	case BTF_KIND_TYPEDEF:
@@ -936,14 +1113,8 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 		 * through pointer), so unless we already did it,
 		 * emit typedef as a forward declaration
 		 */
-		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id)) {
-			bool g = btf_dump_emit_typedef_def(d, id, t, 0);
-
-			btf_dump_printf(d, ";\n");
-			if (g)
-				btf_dump_printf(d, "#endif /* __cplusplus */\n");
-			btf_dump_printf(d, "\n");
-		}
+		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id))
+			btf_dump_emit_typedef(d, id, t);
 		tstate->emit_state = EMITTED;
 		break;
 	case BTF_KIND_STRUCT:
@@ -965,8 +1136,7 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 			for (i = 0; i < vlen; i++, m++)
 				btf_dump_emit_type(d, m->type, new_cont_id);
 		} else if (!tstate->fwd_emitted && id != cont_id) {
-			btf_dump_emit_struct_fwd(d, id, t);
-			btf_dump_printf(d, ";\n\n");
+			btf_dump_emit_fwd(d, id, t);
 			tstate->fwd_emitted = 1;
 		}
 
@@ -1169,7 +1339,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 {
 	const struct btf_member *m = btf_members(t);
 	bool is_struct = btf_is_struct(t);
-	const char *struct_name, *saved_enclosing;
+	const char *struct_name, *cpp_name, *saved_enclosing;
 	bool packed, prev_bitfield = false;
 	bool skip_tag = d->skip_anon_tag;
 	int align, i, off = 0;
@@ -1179,6 +1349,8 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	align = btf__align_of(d->btf, id);
 	packed = is_struct ? btf_is_struct_packed(d->btf, id, t) : 0;
 	struct_name = btf_dump_type_name(d, id);
+	/* the name C++ gives the type instead, now that it is resolved */
+	cpp_name = (t->name_off && !skip_tag) ? d->cached_cpp_names[id] : NULL;
 
 	/*
 	 * Track the enclosing named struct/union so that members of
@@ -1188,19 +1360,25 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 	 */
 	saved_enclosing = d->enclosing_name;
 	if (struct_name[0] && !skip_tag)
-		d->enclosing_name = struct_name;
+		d->enclosing_name = cpp_name ? cpp_name : struct_name;
 
+	if (cpp_name)
+		btf_dump_printf(d, "#ifdef __cplusplus\n%s %s {\n#else\n",
+				is_struct ? "struct" : "union", cpp_name);
 	btf_dump_printf(d, "%s%s%s {",
 			is_struct ? "struct" : "union",
 			(t->name_off && !skip_tag) ? " " : "",
 			skip_tag ? "" : btf_dump_type_name(d, id));
+	if (cpp_name)
+		btf_dump_printf(d, "\n#endif");
 
 	for (i = 0; i < vlen; i++, m++) {
 		const struct btf_type *mt;
 		const char *fname;
 		int m_off, m_sz, m_align;
 		bool in_bitfield;
-		bool needs_cpp_guard;
+		bool needs_cpp_guard, cpp_variant;
+		bool saved_cpp_names = d->cpp_names;
 		bool anon_named = false;
 		__u32 mt_id;
 
@@ -1245,30 +1423,45 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 
 		btf_dump_emit_bit_padding(d, off, m_off, m_align, in_bitfield, lvl + 1);
 
+		/*
+		 * A member whose name, or a name in whose declaration, C++
+		 * spells differently is declared once per language.
+		 */
+		cpp_variant = needs_cpp_guard ||
+			      btf_dump_decl_has_cpp_name(d, m->type);
+
 		if (anon_named) {
 			btf_dump_printf(d, "\n#ifdef __cplusplus");
 			btf_dump_printf(d, "\n%s", pfx(lvl + 1));
 			d->skip_anon_tag = true;
+			d->cpp_names = true;
 			btf_dump_emit_struct_def(d, mt_id, mt, lvl + 1);
+			d->cpp_names = saved_cpp_names;
 			btf_dump_printf(d, ";");
 			btf_dump_printf(d, "\n#else");
-		}
-
-		if (needs_cpp_guard) {
+		} else if (cpp_variant) {
 			static char buf[256];
+			const char *cpp_fname = fname;
 
-			snprintf(buf, sizeof(buf), "%s___cpp", fname);
+			if (needs_cpp_guard) {
+				snprintf(buf, sizeof(buf), "%s___cpp", fname);
+				cpp_fname = buf;
+			}
 			btf_dump_printf(d, "\n#ifdef __cplusplus");
 			btf_dump_printf(d, "\n%s", pfx(lvl + 1));
-			btf_dump_emit_type_decl(d, m->type, buf, lvl + 1);
+			d->cpp_names = true;
+			btf_dump_emit_type_decl(d, m->type, cpp_fname, lvl + 1);
+			d->cpp_names = false;
 			if (m_sz)
 				btf_dump_printf(d, ": %d", m_sz);
+			btf_dump_emit_decl_tags(d, id, i);
 			btf_dump_printf(d, ";");
 			btf_dump_printf(d, "\n#else");
 		}
 
 		btf_dump_printf(d, "\n%s", pfx(lvl + 1));
 		btf_dump_emit_type_decl(d, m->type, fname, lvl + 1);
+		d->cpp_names = saved_cpp_names;
 
 		if (m_sz) {
 			btf_dump_printf(d, ": %d", m_sz);
@@ -1284,7 +1477,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		btf_dump_emit_decl_tags(d, id, i);
 		btf_dump_printf(d, ";");
 
-		if (needs_cpp_guard || anon_named)
+		if (cpp_variant || anon_named)
 			btf_dump_printf(d, "\n#endif");
 	}
 
@@ -2022,6 +2215,37 @@ static size_t btf_dump_name_dups(struct btf_dump *d, struct hashmap *name_map,
 	return dup_cnt;
 }
 
+/*
+ * Cache the name C++ uses for a type where it differs from the C name: the
+ * C library's names take the ___kernel suffix. A duplicate has the ___N suffix
+ * already, which keeps it apart from the C library's type as it is, and CO-RE
+ * strips the suffix after the last triple underscore only: tm___2___kernel
+ * would never match the kernel's struct tm, while tm___2 does.
+ */
+static void btf_dump_resolve_cpp_name(struct btf_dump *d, __u32 id,
+				      const struct btf_type *t, const char *name)
+{
+	const size_t max_len = 256;
+	char cpp_name[max_len];
+
+	if (!btf_is_composite(t) && !btf_is_fwd(t) && !btf_is_typedef(t))
+		return;
+	if (strcmp(name, btf_name_of(d, t->name_off)) != 0 || !btf_is_libc_type_name(name))
+		return;
+
+	snprintf(cpp_name, max_len, "%s___kernel", name);
+	d->cached_cpp_names[id] = strdup(cpp_name);
+}
+
+/* the resolved name of a type in the language being emitted */
+static const char *btf_dump_lang_name(struct btf_dump *d, __u32 id,
+				      const char *orig_name)
+{
+	if (d->cpp_names && d->cached_cpp_names[id])
+		return d->cached_cpp_names[id];
+	return d->cached_names[id] ? d->cached_names[id] : orig_name;
+}
+
 static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 					 struct hashmap *name_map)
 {
@@ -2035,7 +2259,7 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 		return "";
 
 	if (s->name_resolved)
-		return *cached_name ? *cached_name : orig_name;
+		return btf_dump_lang_name(d, id, orig_name);
 
 	if (btf_is_fwd(t) || (btf_is_enum(t) && btf_vlen(t) == 0)) {
 		s->name_resolved = 1;
@@ -2047,7 +2271,8 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 			snprintf(new_name, max_len, "%s___cpp", orig_name);
 			*cached_name = strdup(new_name);
 		}
-		return *cached_name ? *cached_name : orig_name;
+		btf_dump_resolve_cpp_name(d, id, t, *cached_name ? *cached_name : orig_name);
+		return btf_dump_lang_name(d, id, orig_name);
 	}
 
 	dup_cnt = btf_dump_name_dups(d, name_map, orig_name);
@@ -2066,7 +2291,8 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 	}
 
 	s->name_resolved = 1;
-	return *cached_name ? *cached_name : orig_name;
+	btf_dump_resolve_cpp_name(d, id, t, *cached_name ? *cached_name : orig_name);
+	return btf_dump_lang_name(d, id, orig_name);
 }
 
 static const char *btf_dump_type_name(struct btf_dump *d, __u32 id)
