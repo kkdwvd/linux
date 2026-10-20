@@ -40,6 +40,8 @@ struct src_sec {
 	bool skipped;
 	/* whether section is an ephemeral section, not mapped to an ELF section */
 	bool ephemeral;
+	/* whether section belongs to a COMDAT group */
+	bool comdat;
 	/* whether section belongs to a COMDAT group an earlier object provided */
 	bool comdat_dup;
 	/* name of the matching section in the final object file, if not sec_name */
@@ -940,6 +942,7 @@ static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
 				return -EINVAL;
 			}
 			member = &obj->secs[words[j]];
+			member->comdat = true;
 			if (dup) {
 				member->skipped = true;
 				member->comdat_dup = true;
@@ -2584,6 +2587,104 @@ static Elf64_Sym *find_sym_by_name(struct src_obj *obj, size_t sec_idx,
 	return NULL;
 }
 
+/*
+ * The variables of a DATASEC are in the sections of its name, which an object
+ * has several of when COMDAT groups define data in a section with an explicit
+ * name, e.g. two inline variables in SEC(".data.foo"), as each group has a
+ * section of its own. A group may also be one that an earlier object
+ * provided, whose sections are dropped. Give each section a DATASEC with its
+ * own variables, which are then linked with it, like the DATASEC of a single
+ * section is. Static variables are in the section of no group.
+ */
+static int linker_split_datasec(struct src_obj *obj, int type_id, const char *sec_name)
+{
+	struct btf_var_secinfo *vsis = NULL;
+	struct src_sec **var_secs = NULL;
+	struct src_sec *sec, *plain = NULL;
+	const struct btf_type *t;
+	int i, j, n, id, err = 0;
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		sec = &obj->secs[i];
+		if (!sec->ephemeral && !sec->comdat && strcmp(sec->sec_name, sec_name) == 0) {
+			plain = sec;
+			break;
+		}
+	}
+
+	t = btf__type_by_id(obj->btf, type_id);
+	n = btf_vlen(t);
+	vsis = calloc(n, sizeof(*vsis));
+	var_secs = calloc(n, sizeof(*var_secs));
+	if (n && (!vsis || !var_secs)) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memcpy(vsis, btf_var_secinfos(t), n * sizeof(*vsis));
+
+	for (j = 0; j < n; j++) {
+		const struct btf_type *vt = btf__type_by_id(obj->btf, vsis[j].type);
+		const char *var_name = btf__str_by_offset(obj->btf, vt->name_off);
+		Elf64_Sym *sym = NULL;
+
+		if (!btf_is_var(vt) || btf_var(vt)->linkage != BTF_VAR_GLOBAL_ALLOCATED) {
+			var_secs[j] = plain ?: find_src_sec_by_name(obj, sec_name);
+			continue;
+		}
+		for (i = 1; i < obj->sec_cnt && !sym; i++) {
+			sec = &obj->secs[i];
+			if (sec->ephemeral || strcmp(sec->sec_name, sec_name) != 0)
+				continue;
+			sym = find_sym_by_name(obj, sec->sec_idx, STT_OBJECT, var_name);
+			var_secs[j] = sec;
+		}
+		if (!sym) {
+			pr_warn("failed to find symbol for variable '%s' in section '%s'\n",
+				var_name, sec_name);
+			err = -ENOENT;
+			goto out;
+		}
+		vsis[j].offset = sym->st_value;
+	}
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		sec = &obj->secs[i];
+		if (sec->ephemeral || strcmp(sec->sec_name, sec_name) != 0)
+			continue;
+
+		id = btf__add_datasec(obj->btf, sec_name, sec->shdr->sh_size);
+		if (id < 0) {
+			err = id;
+			goto out;
+		}
+		for (j = 0; j < n; j++) {
+			if (var_secs[j] != sec)
+				continue;
+			err = btf__add_datasec_var_info(obj->btf, vsis[j].type, vsis[j].offset,
+							vsis[j].size);
+			if (err)
+				goto out;
+		}
+		sec->sec_type_id = id;
+	}
+out:
+	free(vsis);
+	free(var_secs);
+	return err;
+}
+
+/* Whether the object has another section called like sec */
+static bool sec_name_is_shared(struct src_obj *obj, const struct src_sec *sec)
+{
+	int i;
+
+	for (i = 1; i < obj->sec_cnt; i++)
+		if (&obj->secs[i] != sec && !obj->secs[i].ephemeral &&
+		    strcmp(obj->secs[i].sec_name, sec->sec_name) == 0)
+			return true;
+	return false;
+}
+
 static int linker_fixup_btf(struct src_obj *obj)
 {
 	const char *sec_name;
@@ -2604,6 +2705,17 @@ static int linker_fixup_btf(struct src_obj *obj)
 
 		sec_name = btf__str_by_offset(obj->btf, t->name_off);
 		sec = find_src_sec_by_name(obj, sec_name);
+		if (sec && !sec->ephemeral && sec_name_is_shared(obj, sec)) {
+			/*
+			 * By the name of the section: adding a DATASEC frees the
+			 * strings of the BTF as it was read, which sec_name is in.
+			 */
+			int err = linker_split_datasec(obj, i, sec->sec_name);
+
+			if (err)
+				return err;
+			continue;
+		}
 		if (sec) {
 			/* record actual section size, unless ephemeral */
 			if (sec->shdr)
