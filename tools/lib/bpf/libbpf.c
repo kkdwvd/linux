@@ -445,8 +445,10 @@ struct bpf_light_subprog {
 	__u32 sec_idx;
 	__u32 sec_insn_off;
 	__u32 sub_insn_off;
-	/* [WIP] appended for a pointer in arena data, see bpf_object__fill_arena_func_ptrs() */
+	/* [WIP] for arena data and addresses, see bpf_object__arena_func_copy() */
 	bool arena_func;
+	/* [WIP] called by functions that callx of a number may call */
+	bool num_func;
 };
 
 /*
@@ -476,6 +478,13 @@ struct bpf_program {
 	 * if yes, at which instruction offset.
 	 */
 	size_t sub_insn_off;
+	/*
+	 * [WIP] The same for the copy that functions which callx of a number
+	 * may call, call, see bpf_object__arena_func_copy()
+	 */
+	size_t num_insn_off;
+	/* [WIP] callx of a number may call functions of the program, see prog_reaches_callx() */
+	bool num_callx;
 
 	/* instructions that belong to BPF program; insns[0] is located at
 	 * sec_insn_off instruction within its ELF section in ELF file, so
@@ -879,7 +888,7 @@ struct bpf_object {
 	struct {
 		struct bpf_program *prog;
 		unsigned int sym_off;
-		/* [WIP] the copy of the function, see bpf_object__append_arena_func_copy() */
+		/* [WIP] the copy of the function, see bpf_object__arena_func_copy() */
 		int subprog_idx;
 		int fd;
 	} *jumptable_maps;
@@ -7161,9 +7170,15 @@ static int create_func_ptr_map(struct bpf_object *obj, struct bpf_program *prog,
 		 * the program only if the code refers to it.
 		 */
 		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
+		/*
+		 * The kernel verifies the function with the callx that it finds
+		 * it for, like the code calls it, not the copies for callx of a
+		 * number.
+		 */
 		for (j = 0; j < prog->subprog_cnt; j++)
 			if (prog->subprogs[j].sec_idx == ptrs[i].func_sec_idx &&
-			    prog->subprogs[j].sec_insn_off == sec_insn_off)
+			    prog->subprogs[j].sec_insn_off == sec_insn_off &&
+			    !prog->subprogs[j].arena_func && !prog->subprogs[j].num_func)
 				break;
 		if (j == prog->subprog_cnt) {
 			struct bpf_program *func;
@@ -7654,15 +7669,89 @@ bpf_object__append_subprog_code(struct bpf_object *obj, struct bpf_program *main
 	return 0;
 }
 
-static int
-bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
-		       struct bpf_program *prog)
+/*
+ * The function that the call or ld_imm64 at insn_idx of prog, whose code is
+ * insn, refers to, in *subprog. Returns 1 if it refers to none, e.g. a kfunc.
+ */
+static int find_insn_subprog(struct bpf_object *obj, struct bpf_program *prog, size_t insn_idx,
+			     const struct bpf_insn *insn, struct bpf_program **subprog)
 {
-	size_t sub_sec_idx, sub_insn_idx, insn_idx;
-	struct bpf_program *subprog;
+	size_t sub_sec_idx, sub_insn_idx;
 	struct reloc_desc *relo;
+
+	relo = find_prog_insn_relo(prog, insn_idx);
+	if (relo && relo->type == RELO_EXTERN_CALL)
+		/* kfunc relocations will be handled later
+		 * in bpf_object__relocate_data()
+		 */
+		return 1;
+	if (relo && relo->type != RELO_CALL && relo->type != RELO_SUBPROG_ADDR) {
+		pr_warn("prog '%s': unexpected relo for insn #%zu, type %u\n",
+			prog->name, insn_idx, relo->type);
+		return -LIBBPF_ERRNO__RELOC;
+	}
+	if (relo) {
+		/* sub-program instruction index is a combination of
+		 * an offset of a symbol pointed to by relocation and
+		 * call instruction's imm field; for global functions,
+		 * call always has imm = -1, but for static functions
+		 * relocation is against STT_SECTION and insn->imm
+		 * points to a start of a static function
+		 *
+		 * for subprog addr relocation, the relo->sym_off + insn->imm is
+		 * the byte offset in the corresponding section.
+		 */
+		if (relo->type == RELO_CALL)
+			sub_insn_idx = relo->sym_off / BPF_INSN_SZ + insn->imm + 1;
+		else
+			sub_insn_idx = (relo->sym_off + insn->imm) / BPF_INSN_SZ;
+		sub_sec_idx = relo->sec_idx;
+	} else if (insn_is_pseudo_func((struct bpf_insn *)insn)) {
+		/*
+		 * RELO_SUBPROG_ADDR relo is always emitted even if both
+		 * functions are in the same section, so it shouldn't reach here.
+		 */
+		pr_warn("prog '%s': missing subprog addr relo for insn #%zu\n",
+			prog->name, insn_idx);
+		return -LIBBPF_ERRNO__RELOC;
+	} else {
+		/* if subprogram call is to a static function within
+		 * the same ELF section, there won't be any relocation
+		 * emitted, but it also means there is no additional
+		 * offset necessary, insns->imm is relative to
+		 * instruction's original position within the section
+		 */
+		sub_insn_idx = prog->sec_insn_off + insn_idx + insn->imm + 1;
+		sub_sec_idx = prog->sec_idx;
+	}
+
+	/* we enforce that sub-programs are in .text, see sec_is_text() */
+	*subprog = find_prog_by_sec_insn(obj, sub_sec_idx, sub_insn_idx);
+	if (!*subprog || !prog_is_subprog(obj, *subprog)) {
+		pr_warn("prog '%s': no sub-program found for the call at insn #%zu\n",
+			prog->name, insn_idx);
+		return -LIBBPF_ERRNO__RELOC;
+	}
+	return 0;
+}
+
+static int bpf_object__arena_func_copy(struct bpf_object *obj, struct bpf_program *main_prog,
+				       struct bpf_program *subprog);
+
+/*
+ * Relocate the calls and the addresses of functions in the code of prog, as
+ * it is in main_prog. [WIP] Code that callx of a number may call, num, calls
+ * copies of its own, see bpf_object__arena_func_copy().
+ */
+static int
+bpf_object__reloc_code_in(struct bpf_object *obj, struct bpf_program *main_prog,
+			  struct bpf_program *prog, bool num)
+{
+	struct bpf_program *subprog;
+	size_t insn_idx, code_off;
 	struct bpf_insn *insn;
-	int err;
+	int err, idx;
+	__u32 off;
 
 	err = reloc_prog_func_and_line_info(obj, main_prog, prog);
 	if (err)
@@ -7673,58 +7762,43 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 		if (!insn_is_subprog_call(insn) && !insn_is_pseudo_func(insn))
 			continue;
 
-		relo = find_prog_insn_relo(prog, insn_idx);
-		if (relo && relo->type == RELO_EXTERN_CALL)
-			/* kfunc relocations will be handled later
-			 * in bpf_object__relocate_data()
-			 */
+		err = find_insn_subprog(obj, prog, insn_idx, insn, &subprog);
+		if (err < 0)
+			return err;
+		if (err)
 			continue;
-		if (relo && relo->type != RELO_CALL && relo->type != RELO_SUBPROG_ADDR) {
-			pr_warn("prog '%s': unexpected relo for insn #%zu, type %u\n",
-				prog->name, insn_idx, relo->type);
-			return -LIBBPF_ERRNO__RELOC;
-		}
-		if (relo) {
-			/* sub-program instruction index is a combination of
-			 * an offset of a symbol pointed to by relocation and
-			 * call instruction's imm field; for global functions,
-			 * call always has imm = -1, but for static functions
-			 * relocation is against STT_SECTION and insn->imm
-			 * points to a start of a static function
-			 *
-			 * for subprog addr relocation, the relo->sym_off + insn->imm is
-			 * the byte offset in the corresponding section.
-			 */
-			if (relo->type == RELO_CALL)
-				sub_insn_idx = relo->sym_off / BPF_INSN_SZ + insn->imm + 1;
-			else
-				sub_insn_idx = (relo->sym_off + insn->imm) / BPF_INSN_SZ;
-			sub_sec_idx = relo->sec_idx;
-		} else if (insn_is_pseudo_func(insn)) {
-			/*
-			 * RELO_SUBPROG_ADDR relo is always emitted even if both
-			 * functions are in the same section, so it shouldn't reach here.
-			 */
-			pr_warn("prog '%s': missing subprog addr relo for insn #%zu\n",
-				prog->name, insn_idx);
-			return -LIBBPF_ERRNO__RELOC;
-		} else {
-			/* if subprogram call is to a static function within
-			 * the same ELF section, there won't be any relocation
-			 * emitted, but it also means there is no additional
-			 * offset necessary, insns->imm is relative to
-			 * instruction's original position within the section
-			 */
-			sub_insn_idx = prog->sec_insn_off + insn_idx + insn->imm + 1;
-			sub_sec_idx = prog->sec_idx;
+
+		/*
+		 * [WIP] The address that a program that callx of a number may
+		 * call takes is that of the copy of the function for it, but
+		 * for a global function, which callx can't call that way.
+		 */
+		if (insn_is_pseudo_func(insn) && main_prog->num_callx &&
+		    (!subprog->sym_global || subprog->mark_btf_static)) {
+			idx = bpf_object__arena_func_copy(obj, main_prog, subprog);
+			if (idx < 0)
+				return idx;
+			off = main_prog->subprogs[idx].sub_insn_off;
+			goto relocate;
 		}
 
-		/* we enforce that sub-programs are in .text, see sec_is_text() */
-		subprog = find_prog_by_sec_insn(obj, sub_sec_idx, sub_insn_idx);
-		if (!subprog || !prog_is_subprog(obj, subprog)) {
-			pr_warn("prog '%s': no sub-program found for the call at insn #%zu\n",
-				prog->name, insn_idx);
-			return -LIBBPF_ERRNO__RELOC;
+		/* [WIP] code that callx of a number may call calls copies of its own */
+		if (num) {
+			if (!subprog->num_insn_off) {
+				code_off = subprog->sub_insn_off;
+				idx = main_prog->subprog_cnt;
+				err = bpf_object__append_subprog_code(obj, main_prog, subprog);
+				if (err)
+					return err;
+				main_prog->subprogs[idx].num_func = true;
+				subprog->num_insn_off = subprog->sub_insn_off;
+				err = bpf_object__reloc_code_in(obj, main_prog, subprog, true);
+				subprog->sub_insn_off = code_off;
+				if (err)
+					return err;
+			}
+			off = subprog->num_insn_off;
+			goto relocate;
 		}
 
 		/* if it's the first call instruction calling into this
@@ -7741,11 +7815,13 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 			err = bpf_object__append_subprog_code(obj, main_prog, subprog);
 			if (err)
 				return err;
-			err = bpf_object__reloc_code(obj, main_prog, subprog);
+			err = bpf_object__reloc_code_in(obj, main_prog, subprog, false);
 			if (err)
 				return err;
 		}
+		off = subprog->sub_insn_off;
 
+relocate:
 		/* main_prog->insns memory could have been re-allocated, so
 		 * calculate pointer again
 		 */
@@ -7756,13 +7832,20 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 		 * well), so position of any subprog can be different for
 		 * different main programs
 		 */
-		insn->imm = subprog->sub_insn_off - (prog->sub_insn_off + insn_idx) - 1;
+		insn->imm = off - (prog->sub_insn_off + insn_idx) - 1;
 
-		pr_debug("prog '%s': insn #%zu relocated, imm %d points to subprog '%s' (now at %zu offset)\n",
-			 prog->name, insn_idx, insn->imm, subprog->name, subprog->sub_insn_off);
+		pr_debug("prog '%s': insn #%zu relocated, imm %d points to subprog '%s' (now at %u offset)\n",
+			 prog->name, insn_idx, insn->imm, subprog->name, off);
 	}
 
 	return 0;
+}
+
+static int
+bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
+		       struct bpf_program *prog)
+{
+	return bpf_object__reloc_code_in(obj, main_prog, prog, false);
 }
 
 /* Append to the main program all functions that the data of the map points to */
@@ -7837,20 +7920,15 @@ bpf_object__append_func_ptrs(struct bpf_object *obj, struct bpf_program *prog)
 	return 0;
 }
 
-/*
- * [WIP] Whether code of the program refers to its function at sub_insn_off:
- * calls it, or takes its address with ld_imm64
- */
-static bool prog_code_refers_to(const struct bpf_program *prog, size_t sub_insn_off)
+/* [WIP] Whether code of the program calls its function at sub_insn_off */
+static bool prog_code_calls(const struct bpf_program *prog, size_t sub_insn_off)
 {
 	struct bpf_insn *insn;
 	size_t i;
 
 	for (i = 0; i < prog->insns_cnt; i++) {
 		insn = &prog->insns[i];
-		if (!insn_is_subprog_call(insn) && !insn_is_pseudo_func(insn))
-			continue;
-		if (i + insn->imm + 1 == sub_insn_off)
+		if (insn_is_subprog_call(insn) && i + insn->imm + 1 == sub_insn_off)
 			return true;
 	}
 	return false;
@@ -7870,80 +7948,40 @@ static bool prog_refers_to_arena(const struct bpf_object *obj, const struct bpf_
 	return false;
 }
 
-/* [WIP] Whether the program has a copy of the function for arena data */
-static bool prog_has_arena_func(const struct bpf_program *prog, int sec_idx, size_t sec_insn_off)
+/* [WIP] The copy of the function for arena data and addresses in the program, or -1 */
+static int prog_arena_func(const struct bpf_program *prog, int sec_idx, size_t sec_insn_off)
 {
 	int i;
 
 	for (i = 0; i < prog->subprog_cnt; i++)
 		if (prog->subprogs[i].arena_func && prog->subprogs[i].sec_idx == sec_idx &&
 		    prog->subprogs[i].sec_insn_off == sec_insn_off)
-			return true;
-	return false;
+			return i;
+	return -1;
 }
 
 /*
- * [WIP] Append a copy of the function to the program for arena data, which
- * nothing in the code calls. It's a part of letting callx call a number, the
- * stopgap until callx through a number gets a proper design, and goes away
- * with it. Native code has no counterpart.
- *
- * The case is Base::~Base() in C++, which Derived::~Derived() calls directly,
- * with this on the stack when the object is, and which is in the vtable of
- * Base, from where a virtual call calls it through a number, with this in
- * arena.
- *
- * A function is one block of insns in a program. The kernel verifies a
- * function that only data refers to on its own, with numbers for arguments,
- * for callx of a number, and a function that the code calls with the pointers
- * that the caller passes. The verifier refuses an insn used with different
- * kinds of pointers:
- *
- *	same insn cannot be used with different pointers
- *
- * as it rewrites each insn once, for one kind of access. The copy is reached
- * only through its address in arena data, so the kernel only ever verifies it
- * on its own, and the one that the code calls is only ever called directly.
- * Calls in the code, those in the copy included, go to the copy that the code
- * has, or get one of their own.
- *
- * The copy gets func_info and line_info, and its relocations are applied, like
- * those of any function that is appended. Its func_info gets a BTF FUNC of its
- * own, a static one with the name and the prototype of the function, so that
- * its JITed address is found by its type, see bpf_object__fill_arena_func_ptrs().
- * The kernel would take two func_info records with the same type, but functions
- * that the kernel removes as dead code would leave nothing to tell them apart.
+ * [WIP] Give the copy at subprogs[idx] a BTF FUNC of its own, a static one with
+ * the name and the prototype of the function, so that its JITed address is
+ * found by its type, see bpf_object__fill_arena_func_ptrs(). The kernel would
+ * take two func_info records with the same type, but functions that it
+ * removes as dead code would leave nothing to tell them apart.
  */
-static int bpf_object__append_arena_func_copy(struct bpf_object *obj,
-					      struct bpf_program *main_prog,
-					      struct bpf_program *subprog)
+static int prog_own_func_type(struct bpf_object *obj, struct bpf_program *prog, int idx)
 {
-	size_t code_off = subprog->sub_insn_off;
-	int idx = main_prog->subprog_cnt;
 	struct bpf_func_info_min *rec;
 	const struct btf_type *t;
 	__u32 i, proto_id;
 	char *name;
-	int err, id;
+	int id;
 
-	err = bpf_object__append_subprog_code(obj, main_prog, subprog);
-	if (err)
-		return err;
-	main_prog->subprogs[idx].arena_func = true;
-	err = bpf_object__reloc_code(obj, main_prog, subprog);
-	if (err)
-		return err;
-
-	for (i = 0; i < main_prog->func_info_cnt; i++) {
-		rec = main_prog->func_info + i * main_prog->func_info_rec_size;
-		if (rec->insn_off == subprog->sub_insn_off)
+	for (i = 0; i < prog->func_info_cnt; i++) {
+		rec = prog->func_info + i * prog->func_info_rec_size;
+		if (rec->insn_off == prog->subprogs[idx].sub_insn_off)
 			break;
 	}
-	if (i == main_prog->func_info_cnt) {
-		pr_warn("prog '%s': no func_info for the copy of '%s' for arena data\n",
-			main_prog->name, subprog->name);
+	if (i == prog->func_info_cnt)
 		return -ENOENT;
-	}
 
 	/* adding a string may move the strings of BTF */
 	t = btf__type_by_id(obj->btf, rec->type_id);
@@ -7956,18 +7994,78 @@ static int bpf_object__append_arena_func_copy(struct bpf_object *obj,
 	if (id < 0)
 		return id;
 	rec->type_id = id;
+	return 0;
+}
 
-	pr_debug("prog '%s': added a copy of '%s' for arena data at insn %zu\n",
+/*
+ * [WIP] The copy of the function for arena data and for addresses that the
+ * code takes, which nothing in the code calls. It's a part of letting callx
+ * call a number, the stopgap until callx through a number gets a proper
+ * design, and goes away with it. Native code has no counterpart.
+ *
+ * The case is C++ code like
+ *
+ *	Error e;
+ *	...
+ *	throw e;
+ *
+ * with an out-of-line ~Error(). The code calls ~Error() directly, with the
+ * object on the stack for this. The throw passes its address to __cxa_throw(),
+ * which stores it, and the end of the handler calls it through that number,
+ * with the thrown object, in arena, for this. Likewise Base::~Base(), which
+ * Derived::~Derived() calls directly, is in the vtable of Base, from where a
+ * virtual call calls it through a number.
+ *
+ * A function is one block of insns in a program. The kernel verifies a
+ * function whose address is taken, or that only data refers to, on its own,
+ * with numbers for arguments, for callx of a number, and a function that the
+ * code calls with the pointers that the caller passes. The verifier refuses an
+ * insn used with different kinds of pointers:
+ *
+ *	same insn cannot be used with different pointers
+ *
+ * as it rewrites each insn once, for one kind of access. The copy is reached
+ * only through its address, so the kernel only ever verifies it on its own,
+ * and the one that the code calls is only ever called directly.
+ *
+ * The functions that the copy calls get numbers derived from its arguments:
+ * the destructor of a base or of a member, say, which the code calls on the
+ * stack too. So the copy, and what it calls, calls copies of their own,
+ * num_insn_off, which only such code calls.
+ *
+ * The program gets one such copy of a function, which gets func_info and
+ * line_info and has its relocations applied, like any function that is
+ * appended, and a BTF FUNC of its own, see prog_own_func_type().
+ */
+static int bpf_object__arena_func_copy(struct bpf_object *obj, struct bpf_program *main_prog,
+				       struct bpf_program *subprog)
+{
+	size_t code_off = subprog->sub_insn_off;
+	int idx, err;
+
+	idx = prog_arena_func(main_prog, subprog->sec_idx, subprog->sec_insn_off);
+	if (idx >= 0)
+		return idx;
+
+	idx = main_prog->subprog_cnt;
+	err = bpf_object__append_subprog_code(obj, main_prog, subprog);
+	if (err)
+		return err;
+	main_prog->subprogs[idx].arena_func = true;
+	err = bpf_object__reloc_code_in(obj, main_prog, subprog, true);
+	if (!err)
+		err = prog_own_func_type(obj, main_prog, idx);
+	pr_debug("prog '%s': added a copy of '%s' for arena data and addresses at insn %zu\n",
 		 main_prog->name, subprog->name, subprog->sub_insn_off);
 	subprog->sub_insn_off = code_off;
-	return 0;
+	return err ?: idx;
 }
 
 /*
  * [WIP] A program that the kernel lets call a number with callx, one loaded
  * with BPF_F_ARENA_SCALAR, may call any function whose address is in arena
- * data, if it has callx and refers to arena data. Append a copy of each of
- * them for arena data, see bpf_object__append_arena_func_copy(). The kernel
+ * data, if it has callx and refers to arena data. Give it a copy of each of
+ * them for arena data, see bpf_object__arena_func_copy(). The kernel
  * verifies such copy on its own, with unknown scalar arguments, as a function
  * that callx of a number may call, and its JITed address goes to arena data
  * after load, see bpf_object__fill_arena_func_ptrs(). A global function can't
@@ -7981,21 +8079,15 @@ bpf_object__append_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *m
 	size_t i, sec_insn_off;
 	int err;
 
-	if (!obj->arena_func_ptr_cnt)
+	if (!obj->arena_func_ptr_cnt || !prog_refers_to_arena(obj, main_prog))
 		return 0;
-	if (!obj->data_in_arena && !(main_prog->prog_flags & BPF_F_ARENA_SCALAR))
-		return 0;
-	if (!prog_has_callx(main_prog) || !prog_refers_to_arena(obj, main_prog))
-		return 0;
-	if (obj->gen_loader) {
-		pr_warn("prog '%s': pointers to functions in arena data are not supported by light skeleton\n",
-			main_prog->name);
-		return -ENOTSUP;
-	}
-	/* the kernel finds the functions that only data refers to by func_info */
-	if (!main_prog->func_info) {
-		pr_warn("prog '%s': no BTF func_info, pointers to functions in arena data stay NULL\n",
-			main_prog->name);
+	if (!main_prog->num_callx) {
+		/* the light skeleton doesn't fill the pointers */
+		if (obj->gen_loader && prog_has_callx(main_prog)) {
+			pr_warn("prog '%s': pointers to functions in arena data are not supported by light skeleton\n",
+				main_prog->name);
+			return -ENOTSUP;
+		}
 		return 0;
 	}
 	obj->arena_func_callers = true;
@@ -8014,15 +8106,75 @@ bpf_object__append_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *m
 		/* the kernel takes a hidden function for a static one */
 		if (subprog->sym_global && !subprog->mark_btf_static)
 			continue;
-		/* another pointer to it came first */
-		if (prog_has_arena_func(main_prog, p->func_sec_idx, sec_insn_off))
-			continue;
 
-		err = bpf_object__append_arena_func_copy(obj, main_prog, subprog);
-		if (err)
+		err = bpf_object__arena_func_copy(obj, main_prog, subprog);
+		if (err < 0)
 			return err;
 	}
 	return 0;
+}
+
+/*
+ * [WIP] Whether the kernel lets the program, loaded with BPF_F_ARENA_SCALAR,
+ * call a number with callx: whether it or a function that it calls has callx.
+ * The functions that it calls are the ones that its code calls or takes the
+ * address of, and so on, and those that read-only data with pointers to
+ * functions that it refers to points to.
+ */
+static int prog_reaches_callx(struct bpf_object *obj, struct bpf_program *main_prog)
+{
+	struct bpf_program *prog, *subprog;
+	int i, top = 0, err = 0;
+	struct bpf_map *map;
+	bool *seen, found;
+	size_t j;
+	int *stack;
+
+	seen = calloc(obj->nr_programs, sizeof(*seen));
+	stack = calloc(obj->nr_programs, sizeof(*stack));
+	if (!seen || !stack) {
+		err = -ENOMEM;
+		goto out;
+	}
+	stack[top++] = main_prog - obj->programs;
+	seen[main_prog - obj->programs] = true;
+	found = false;
+	while (top && !found) {
+		prog = &obj->programs[stack[--top]];
+		found = prog_has_callx(prog);
+		for (j = 0; j < prog->insns_cnt && !found; j++) {
+			if (!insn_is_subprog_call(&prog->insns[j]) &&
+			    !insn_is_pseudo_func(&prog->insns[j]))
+				continue;
+			err = find_insn_subprog(obj, prog, j, &prog->insns[j], &subprog);
+			if (err < 0)
+				goto out;
+			if (err || seen[subprog - obj->programs])
+				continue;
+			seen[subprog - obj->programs] = true;
+			stack[top++] = subprog - obj->programs;
+		}
+		for (j = 0; j < prog->nr_reloc && !found; j++) {
+			if (prog->reloc_desc[j].type != RELO_DATA)
+				continue;
+			map = &obj->maps[prog->reloc_desc[j].map_idx];
+			for (i = 0; i < map->func_ptr_cnt; i++) {
+				struct func_ptr *fp = &map->func_ptrs[i];
+
+				subprog = find_prog_by_sec_insn(obj, fp->func_sec_idx,
+								fp->func_off / BPF_INSN_SZ);
+				if (!subprog || seen[subprog - obj->programs])
+					continue;
+				seen[subprog - obj->programs] = true;
+				stack[top++] = subprog - obj->programs;
+			}
+		}
+	}
+	err = found;
+out:
+	free(seen);
+	free(stack);
+	return err;
 }
 
 /*
@@ -8121,6 +8273,20 @@ bpf_object__relocate_calls(struct bpf_object *obj, struct bpf_program *prog)
 			continue;
 
 		subprog->sub_insn_off = 0;
+		subprog->num_insn_off = 0;
+	}
+
+	/*
+	 * [WIP] Functions that callx of a number may call get copies of their
+	 * own, which take func_info, see bpf_object__arena_func_copy()
+	 */
+	prog->num_callx = false;
+	if ((obj->data_in_arena || (prog->prog_flags & BPF_F_ARENA_SCALAR)) &&
+	    !obj->gen_loader && obj->btf_ext && kernel_supports(obj, FEAT_BTF_FUNC)) {
+		err = prog_reaches_callx(obj, prog);
+		if (err < 0)
+			return err;
+		prog->num_callx = err;
 	}
 
 	err = bpf_object__reloc_code(obj, prog, prog);
@@ -9990,8 +10156,8 @@ static int prog_jited_func_addr(const struct bpf_program *prog, const __u64 *ksy
 /*
  * [WIP] Fill the pointers to functions in arena data that are still NULL
  * with the JITed addresses of the functions in the program that has just been
- * loaded, those that libbpf appended for arena data and that nothing in its
- * code refers to. The kernel verified each of them on its own, with unknown
+ * loaded, of their copies for arena data and addresses, which nothing in the
+ * code calls. The kernel verified each of them on its own, with unknown
  * scalar arguments, for callx of a number, which calls the address that it
  * loads from arena data as it is.
  *
@@ -10026,7 +10192,7 @@ static int bpf_object__fill_arena_func_ptrs(struct bpf_object *obj, struct bpf_p
 	for (j = 0; j < prog->subprog_cnt; j++) {
 		struct bpf_light_subprog *sub = &prog->subprogs[j];
 
-		sub->arena_func &= !prog_code_refers_to(prog, sub->sub_insn_off);
+		sub->arena_func &= !prog_code_calls(prog, sub->sub_insn_off);
 		any |= sub->arena_func;
 	}
 	if (!any)
