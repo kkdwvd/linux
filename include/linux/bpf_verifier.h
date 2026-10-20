@@ -1002,6 +1002,10 @@ struct bpf_subprog_info {
 	bool keep_fastcall_stack: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
+	/* [WIP] ld_imm64 takes its address, callx of a number may call it */
+	bool addr_taken: 1;
+	/* [WIP] has callx of a number */
+	bool scalar_callx: 1;
 	u8 arg_slot_cnt:4;
 
 	enum priv_stack_mode priv_stack_mode;
@@ -1150,6 +1154,7 @@ struct bpf_verifier_env {
 	bool test_state_freq;		/* test verifier with different pruning frequency */
 	bool test_reg_invariants;	/* fail verification on register invariants violations */
 	bool arena_scalar;		/* load and store through a number is arena access */
+	bool scalar_callx;		/* [WIP] callx through a number is allowed */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
 	/* Search pruning optimization, array of list_heads for
 	 * lists of struct bpf_verifier_state_list.

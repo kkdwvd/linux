@@ -537,6 +537,42 @@ static int visit_func_ptrs_insn(int t, struct bpf_verifier_env *env,
 	return DONE_EXPLORING;
 }
 
+/*
+ * [WIP] callx of a number may call any function whose address ld_imm64 takes,
+ * see check_scalar_callx() in verifier.c. It's not known here whether callx
+ * calls a number, so every callx is treated as a call of all of them. Explore
+ * them one at a time first like visit_func_ptrs_insn() does.
+ */
+static int visit_scalar_callx_insn(int t, struct bpf_insn *insns, struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subprog = env->subprog_info;
+	int *insn_stack = env->cfg.insn_stack;
+	int *insn_state = env->cfg.insn_state;
+	int i, ret, w;
+
+	ret = visit_func_call_insn(t, insns, env, false);
+	if (ret)
+		return ret;
+
+	for (i = 1; i < env->subprog_cnt; i++) {
+		w = subprog[i].start;
+		if (!subprog[i].addr_taken || insn_state[w])
+			continue;
+
+		if (env->cfg.cur_stack >= env->prog->len)
+			return -E2BIG;
+
+		insn_stack[env->cfg.cur_stack++] = w;
+		insn_state[w] = DISCOVERED;
+		return KEEP_EXPLORING;
+	}
+
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (subprog[i].addr_taken)
+			merge_callee_effects(env, t, subprog[i].start);
+	return DONE_EXPLORING;
+}
+
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
  *  DONE_EXPLORING - the instruction was fully explored
@@ -636,6 +672,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			if (ret == 0 && bpf_is_throw_kfunc(insn))
 				mark_subprog_might_throw(env, t);
 		}
+		if (bpf_is_callx(insn) && env->scalar_callx)
+			return visit_scalar_callx_insn(t, insns, env);
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
 
 	case BPF_JA:

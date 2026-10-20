@@ -434,8 +434,14 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 					return -EFAULT;
 			}
 
-			/* callx calls static subprogs only */
-			if (subprog >= 0 && bpf_subprog_is_global(env, subprog)) {
+			/*
+			 * callx calls static subprogs only, and its next insn is
+			 * the first insn of the callee. [WIP] Unless it's callx
+			 * of a number. It doesn't enter the callee, like a call
+			 * of a global subprog.
+			 */
+			if ((subprog >= 0 && bpf_subprog_is_global(env, subprog)) ||
+			    (bpf_is_callx(insn) && bpf_find_subprog(env, subseq_idx) < 0)) {
 				/* check that jump history doesn't have any
 				 * extra instructions from subprog; the next
 				 * instruction after call to global subprog
