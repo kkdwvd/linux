@@ -1002,8 +1002,13 @@ struct bpf_subprog_info {
 	bool keep_fastcall_stack: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
-	/* [WIP] ld_imm64 takes its address, callx of a number may call it */
+	/*
+	 * [WIP] callx of a number may call it: ld_imm64 takes its address, or
+	 * nothing in the code refers to it (addr_in_data)
+	 */
 	bool addr_taken: 1;
+	/* [WIP] only data, e.g. arena data, may have its address */
+	bool addr_in_data: 1;
 	/* [WIP] has callx of a number */
 	bool scalar_callx: 1;
 	u8 arg_slot_cnt:4;

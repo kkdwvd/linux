@@ -773,6 +773,18 @@ walk_cfg:
 		goto walk_cfg;
 	}
 
+	/* [WIP] a function that only data refers to, see mark_subprogs_addr_in_data() */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int w = env->subprog_info[i].start;
+
+		if (!env->subprog_info[i].addr_in_data || insn_state[w])
+			continue;
+		insn_state[w] = DISCOVERED;
+		insn_stack[0] = w;
+		env->cfg.cur_stack = 1;
+		goto walk_cfg;
+	}
+
 	for (i = 0; i < insn_cnt; i++) {
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 

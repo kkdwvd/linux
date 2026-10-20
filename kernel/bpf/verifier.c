@@ -6133,7 +6133,8 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	 * be done properly.
 	 */
 	for (int i = env->subprog_cnt - 1; i >= 0; i--) {
-		if (!i || si[i].is_async_cb) {
+		/* [WIP] a function that only data refers to may be called from anywhere */
+		if (!i || si[i].is_async_cb || si[i].addr_in_data) {
 			priv_stack_supported = !i && priv_stack_mode == PRIV_STACK_ADAPTIVE;
 			ret = check_max_stack_depth_subprog(env, i, dinfo,
 					priv_stack_supported);
@@ -11923,8 +11924,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 /*
  * [WIP] Functions that callx of a number may call: static functions whose
- * address ld_imm64 takes, other than callbacks. Each of them is verified on
- * its own with unknown scalar arguments, see do_check_common().
+ * address ld_imm64 takes, other than callbacks, and those that only data
+ * refers to. Each of them is verified on its own with unknown scalar
+ * arguments, see do_check_common().
  */
 static bool is_scalar_callx_callee(struct bpf_verifier_env *env, int subprog)
 {
@@ -11945,12 +11947,13 @@ static bool is_scalar_callx_callee(struct bpf_verifier_env *env, int subprog)
  * arguments are. The callee isn't verified in the context of the caller.
  *
  * Instead the call is treated like a call of a global function that can be
- * any of the functions whose address ld_imm64 takes. Each of them is verified
- * on its own with unknown scalar arguments in the context of the call. The
- * caller gets R1-R5 clobbered and R0 unknown. Its stack and references are
- * left alone. The summaries of the callees are merged: the call might sleep,
- * throw, change packet data or unwind if any of them might. The stack depth
- * is accounted after the main pass as if the caller called each of them.
+ * any of the functions whose address ld_imm64 takes, or that only data refers
+ * to. Each of them is verified on its own with unknown scalar arguments in the
+ * context of the call. The caller gets R1-R5 clobbered and R0 unknown. Its
+ * stack and references are left alone. The summaries of the callees are
+ * merged: the call might sleep, throw, change packet data or unwind if any of
+ * them might. The stack depth is accounted after the main pass as if the
+ * caller called each of them.
  */
 static int check_scalar_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int *insn_idx)
@@ -22234,6 +22237,47 @@ static int resolve_func_ptrs(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * [WIP] Only data refers to a static function that no insn calls or takes the
+ * address of: libbpf appends the functions whose addresses are in arena data
+ * to the program and puts their JITed addresses there. Where callx of a number
+ * is allowed, such function is a callee of it, see check_scalar_callx(). It's
+ * verified on its own even when the program has no callx, see
+ * do_check_subprogs(), since another program may call it. Elsewhere it stays
+ * unreachable code.
+ */
+static void mark_subprogs_addr_in_data(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn = env->prog->insnsi;
+	DECLARE_BITMAP(referred, BPF_MAX_SUBPROGS);
+	int i, subprog;
+
+	if (!env->scalar_callx || !env->prog->aux->func_info)
+		return;
+
+	bitmap_zero(referred, BPF_MAX_SUBPROGS);
+	for (i = 0; i < env->prog->len; i++) {
+		if (!bpf_pseudo_call(&insn[i]) && !bpf_pseudo_func(&insn[i]))
+			continue;
+		subprog = bpf_find_subprog(env, i + insn[i].imm + 1);
+		if (subprog >= 0)
+			__set_bit(subprog, referred);
+	}
+	/* a pointer in a read-only map is found by check_cfg() */
+	for (i = 0; i < env->func_ptr_cnt; i++) {
+		subprog = bpf_find_subprog(env, env->func_ptrs[i].xlated_off);
+		if (subprog >= 0)
+			__set_bit(subprog, referred);
+	}
+
+	for (i = 1; i < env->subprog_cnt; i++) {
+		if (test_bit(i, referred) || bpf_subprog_is_global(env, i))
+			continue;
+		env->subprog_info[i].addr_taken = true;
+		env->subprog_info[i].addr_in_data = true;
+	}
+}
+
 /* drop refcnt of maps used by the rejected program */
 static void release_maps(struct bpf_verifier_env *env)
 {
@@ -22599,6 +22643,14 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 		sub_aux = subprog_aux(env, env->exception_callback_subprog);
 		sub_aux->called[env->prog->sleepable] = true;
 	}
+
+	/*
+	 * [WIP] A function that only data refers to is verified in the context
+	 * of the program, and in the contexts of callx of a number if any.
+	 */
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (env->subprog_info[i].addr_in_data)
+			subprog_aux(env, i)->called[env->prog->sleepable] = true;
 
 again:
 	new_cnt = 0;
@@ -24673,6 +24725,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = resolve_func_ptrs(env);
 	if (ret < 0)
 		goto skip_full_check;
+
+	mark_subprogs_addr_in_data(env);
 
 	/* Build kfunc prototypes after resolving program resources. */
 	ret = add_kfuncs(env);
