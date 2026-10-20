@@ -11416,10 +11416,10 @@ static bool helper_has_cb_pad(enum bpf_func_id func_id)
 	}
 }
 
-/* The kfunc calls its callback with a pad. None yet. */
+/* The kfunc calls its callback with a pad */
 static bool kfunc_has_cb_pad(u32 btf_id)
 {
-	return false;
+	return is_bpf_rbtree_add_kfunc(btf_id);
 }
 
 static bool insn_has_cb_pad(struct bpf_insn *insn)
@@ -15506,7 +15506,7 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
-	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
+	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
 	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
@@ -15625,11 +15625,12 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
+	nmi_prog = is_tracing_prog_type(prog_type) ||
+		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
+		    && !env->prog->sleepable);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
-	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && (is_tracing_prog_type(prog_type) ||
-	     /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-	     (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-	      && !env->prog->sleepable))) {
+	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
 
 		struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
@@ -15641,6 +15642,22 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	if (is_bpf_rbtree_add_kfunc(meta.func_id)) {
+		/*
+		 * The pad of the kfunc drops the node when the comparator
+		 * unwinds, the destructors of its fields included, which is a
+		 * bpf_obj_drop() under the rule above.
+		 */
+		if (env->subprog_info[meta.subprogno].can_unwind && nmi_prog) {
+			struct btf_struct_meta *struct_meta;
+
+			struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
+			if (struct_meta && btf_record_has_nmi_unsafe_fields(struct_meta->record)) {
+				verbose(env,
+					"%s with a comparator that unwinds cannot be used in tracing programs on types with NMI unsafe fields\n",
+					func_name);
+				return -EINVAL;
+			}
+		}
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rbtree_add_callback_state);
 		if (err) {
@@ -15748,7 +15765,21 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		id = regs[BPF_REG_2].id;
 		insn_aux->insert_off = regs[BPF_REG_2].var_off.value;
 		insn_aux->kptr_struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
-		ref_convert_owning_non_owning(env, id);
+		/*
+		 * The comparator unwound: the node never went in, and the
+		 * kfunc dropped it on its way to the pad. The comparator was
+		 * handed the node too, and may have unwound with it in r0, so
+		 * every non-owning reference goes. Otherwise the node is in
+		 * the tree now.
+		 */
+		if (env->cur_state->unwound) {
+			invalidate_non_owning_refs(env);
+			err = release_reference(env, id);
+			if (err)
+				return err;
+		} else {
+			ref_convert_owning_non_owning(env, id);
+		}
 	}
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_throw]) {
