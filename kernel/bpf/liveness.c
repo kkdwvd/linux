@@ -395,9 +395,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	 * from the subprogram, which is a hidden edge to its exit. A subprogram
 	 * without an exit insn has no exit to model.
 	 */
-	if (unlikely((bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
-		     (BPF_CLASS(insn->code) == BPF_LD &&
-		      (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND)))) {
+	if (unlikely(bpf_insn_has_hidden_exit(insn))) {
 		u32 exit_idx = bpf_find_containing_subprog(env, idx)->exit_idx;
 
 		if (exit_idx != U32_MAX)

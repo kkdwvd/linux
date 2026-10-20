@@ -11638,6 +11638,12 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	return 0;
 }
 
+/* what do_check() does after an insn, see do_check_insn() */
+enum {
+	PROCESS_BPF_EXIT = 1,
+	INSN_IDX_UPDATED = 2,
+};
+
 static int process_bpf_exit_full(struct bpf_verifier_env *env,
 				 bool *do_print_state, bool exception_exit);
 
@@ -11786,6 +11792,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
+		/*
+		 * The callee may unwind to the pad of the unwind_goto after the
+		 * call, with what it unwinds with in R0, whatever its return type.
+		 */
 		if (env->subprog_info[subprog].can_unwind) {
 			struct bpf_verifier_state *branch;
 
@@ -11797,6 +11807,30 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (IS_ERR(branch))
 				return PTR_ERR(branch);
 			branch->unwound = true;
+			mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+		}
+
+		/*
+		 * The callee doesn't return normally on any path: it throws, or
+		 * it unwinds to the pad. There is nothing to continue with after
+		 * the call, but what the callee throws unwinds through this
+		 * frame, so the site is described like at a call that returns.
+		 * An extension that would return instead is refused, see
+		 * bpf_check_attach_target().
+		 */
+		if (!env->subprog_info[subprog].might_return) {
+			sub_aux->called_as_noreturn = true;
+			if (env->subprog_info[subprog].might_throw) {
+				err = bpf_frame_desc_site(env, false);
+				if (err)
+					return err;
+				return process_bpf_exit_full(env, NULL, true);
+			}
+			/* A cancellation inside the callee unwinds through this frame. */
+			err = check_cancel_site(env, false);
+			if (err)
+				return err;
+			return PROCESS_BPF_EXIT;
 		}
 
 		if (env->subprog_info[subprog].might_throw) {
@@ -14850,6 +14884,12 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 	       insn->imm == special_kfunc_list[KF_bpf_throw];
 }
 
+bool bpf_is_trap_kfunc(struct bpf_insn *insn)
+{
+	return bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
+	       insn->imm == special_kfunc_list[KF___bpf_trap];
+}
+
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
@@ -15729,7 +15769,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "failed to mark s32 range for retval in forked state for lock\n");
 			return err;
 		}
-	} else if (!insn->off && insn->imm == special_kfunc_list[KF___bpf_trap]) {
+	} else if (bpf_is_trap_kfunc(insn)) {
 		verbose(env, "unexpected __bpf_trap() due to uninitialized variable?\n");
 		return -EFAULT;
 	}
@@ -19886,8 +19926,14 @@ static int check_global_subprog_return_code(struct bpf_verifier_env *env)
 	u32 i, nregs;
 	int err;
 
+	/*
+	 * unwind_exit leaves what it unwinds with in R0, and the pad of the
+	 * caller reads it, whatever the subprog returns. The return registers
+	 * of a subprog that returns something are checked below either way.
+	 */
 	if (subprog_returns_void(env, subprog))
-		return 0;
+		return bpf_is_unwind_exit(&env->prog->insnsi[env->insn_idx]) ?
+		       check_global_ret_scalar_reg(env, BPF_REG_0) : 0;
 
 	nregs = bpf_ret_reg_pair(env, subprog) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
@@ -20332,11 +20378,6 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 
 	return 0;
 }
-
-enum {
-	PROCESS_BPF_EXIT = 1,
-	INSN_IDX_UPDATED = 2,
-};
 
 static int process_bpf_exit_full(struct bpf_verifier_env *env,
 				 bool *do_print_state,
@@ -23032,6 +23073,15 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 					"Extension program can unwind, while original does not\n");
 				return -EINVAL;
 			}
+			/*
+			 * An extension returns, even through bpf_throw: its own
+			 * exception callback returns to the caller.
+			 */
+			if (aux->func_info_aux[subprog].called_as_noreturn) {
+				bpf_log(log,
+					"Extension cannot replace a function whose callers expect it not to return\n");
+				return -EINVAL;
+			}
 		}
 		if (!tgt_prog->jited) {
 			bpf_log(log, "Can attach to only JITed progs\n");
@@ -24396,6 +24446,11 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		goto skip_full_check;
 
 	ret = sort_subprogs_topo(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	/* must follow sort_subprogs_topo() */
+	ret = bpf_compute_might_return(env);
 	if (ret < 0)
 		goto skip_full_check;
 

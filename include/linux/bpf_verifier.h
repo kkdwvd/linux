@@ -985,6 +985,11 @@ struct bpf_subprog_info {
 	bool has_tail_call: 1;
 	bool might_throw: 1;
 	bool can_unwind: 1; /* has unwind_exit */
+	/*
+	 * A path from the entry returns normally, see bpf_compute_might_return().
+	 * A subprog that only unwinds or throws does not.
+	 */
+	bool might_return: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
@@ -1806,6 +1811,28 @@ u32 bpf_vlog_alignment(u32 pos);
 const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
+
+/*
+ * A call that does not return may be the last insn of its subprog, see
+ * check_subprogs(). The insn after it belongs to the next subprog.
+ */
+static inline bool bpf_call_ends_subprog(struct bpf_verifier_env *env, int idx)
+{
+	return env->prog->insnsi[idx].code == (BPF_JMP | BPF_CALL) &&
+	       (bpf_find_containing_subprog(env, idx) + 1)->start == idx + 1;
+}
+
+/*
+ * A tail call that is taken and ld_{abs,ind} that fails to load leave the
+ * subprog as if it reached an exit insn.
+ */
+static inline bool bpf_insn_has_hidden_exit(const struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
+	       (BPF_CLASS(insn->code) == BPF_LD &&
+		(BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND));
+}
+
 const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
@@ -1824,12 +1851,14 @@ u32 btf_func_arg_align(const struct btf *btf, const struct btf_type *t);
 
 int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
+bool bpf_is_trap_kfunc(struct bpf_insn *insn);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
 int bpf_check_cfg(struct bpf_verifier_env *env);
 void bpf_free_subprog_jts(struct bpf_verifier_env *env);
 int bpf_compute_postorder(struct bpf_verifier_env *env);
 int bpf_compute_scc(struct bpf_verifier_env *env);
+int bpf_compute_might_return(struct bpf_verifier_env *env);
 
 struct bpf_map_desc {
 	struct bpf_map *ptr;

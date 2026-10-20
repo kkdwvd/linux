@@ -180,12 +180,13 @@ static int propagate_backedges(struct bpf_verifier_env *env, struct bpf_scc_visi
 
 /*
  * Does the path of @st end with an exception exit at its current insn: a call
- * of bpf_throw, or of a global subprog that might throw? See
+ * of bpf_throw, or of a global subprog that may throw or doesn't return? See
  * check_kfunc_call() and check_func_call().
  */
 static bool is_exception_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
 {
 	struct bpf_insn *insn = &env->prog->insnsi[st->insn_idx];
+	struct bpf_subprog_info *callee;
 	int subprog;
 
 	if (bpf_is_throw_kfunc(insn))
@@ -195,7 +196,8 @@ static bool is_exception_exit(struct bpf_verifier_env *env, struct bpf_verifier_
 	subprog = bpf_find_subprog(env, st->insn_idx + insn->imm + 1);
 	if (subprog < 0 || !bpf_subprog_is_global(env, subprog))
 		return false;
-	return env->subprog_info[subprog].might_throw;
+	callee = &env->subprog_info[subprog];
+	return callee->might_throw || !callee->might_return;
 }
 
 /* If callchain for @st exists (@st is in some SCC), make it empty:
