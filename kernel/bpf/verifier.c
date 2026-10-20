@@ -11926,7 +11926,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
  * [WIP] Functions that callx of a number may call: static functions whose
  * address ld_imm64 takes, other than callbacks, and those that only data
  * refers to. Each of them is verified on its own with unknown scalar
- * arguments, see do_check_common().
+ * arguments, see do_check_common(), in the context of the program even when
+ * it has no callx, see do_check_subprogs().
  */
 static bool is_scalar_callx_callee(struct bpf_verifier_env *env, int subprog)
 {
@@ -22645,11 +22646,17 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 	}
 
 	/*
-	 * [WIP] A function that only data refers to is verified in the context
+	 * [WIP] A function that only data refers to, or whose address ld_imm64
+	 * takes where callx of a number is allowed, is verified in the context
 	 * of the program, and in the contexts of callx of a number if any.
+	 * Another program may call it through its address in arena when this
+	 * one has no callx. A callback among them is skipped by
+	 * is_scalar_callx_callee(), once the main pass has found it.
 	 */
 	for (i = 1; i < env->subprog_cnt; i++)
-		if (env->subprog_info[i].addr_in_data)
+		if (env->subprog_info[i].addr_in_data ||
+		    (env->scalar_callx && env->subprog_info[i].addr_taken &&
+		     !bpf_subprog_is_global(env, i)))
 			subprog_aux(env, i)->called[env->prog->sleepable] = true;
 
 again:
