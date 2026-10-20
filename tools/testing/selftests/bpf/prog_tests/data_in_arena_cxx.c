@@ -28,6 +28,7 @@ struct type_info {
 };
 
 #define NODE_F "_ZNK12_GLOBAL__N_14Node1fEv"
+#define ERROR_DTOR "_ZN12_GLOBAL__N_15ErrorD1Ev"
 
 static int run(struct bpf_object *obj, const char *name, struct cxx_ctx *ctx)
 {
@@ -193,7 +194,9 @@ out:
 /*
  * The program calls Node::f() directly, and so does Leaf::f(). The vtable of
  * Node has another copy of it, which nothing calls and has a BTF FUNC of its
- * own: the kernel verifies only that one for callx of a number.
+ * own: the kernel verifies only that one for callx of a number. The copy of
+ * Leaf::f() in the vtable of Leaf calls a third one, of the original type like
+ * the one that the program calls, which only such copies call.
  */
 static void test_destructors(void)
 {
@@ -221,9 +224,58 @@ static void test_destructors(void)
 		goto out;
 	for (i = 0; i < funcs.cnt; i++)
 		copies += funcs.finfo[i].type_id == f_id;
+	ASSERT_EQ(copies, 2, "the copies that the code calls");
+out:
+	bpf_object__close(obj);
+}
+
+/*
+ * The destructor of Error runs on an object on the stack, called directly, and
+ * on the thrown object, through the address that the throw takes, which the
+ * handler calls from arena. The address is that of a copy of the destructor
+ * that nothing calls directly. The kernel verifies a function whose address
+ * is taken on its own, with numbers for arguments, and the one that the code
+ * calls with a pointer to the stack: one copy can't be both.
+ */
+static void test_throws(void)
+{
+	struct bpf_object *obj = NULL;
+	int dtor_id, copies = 0;
+	struct funcs funcs;
+	struct cxx_ctx ctx;
+	__u32 addr_id, i;
+	struct btf *btf;
+
+	/* the prog is there if clang lowers unwinding */
+	btf = btf__parse(OBJ, NULL);
+	if (!ASSERT_OK_PTR(btf, "btf"))
+		return;
+	if (btf__find_by_name_kind(btf, "throws", BTF_KIND_FUNC) < 0) {
+		test__skip();
+		goto out;
+	}
+
+	obj = open_obj("throws");
+	if (!obj || !ASSERT_OK(bpf_object__load(obj), "load"))
+		goto out;
+	ASSERT_EQ(run(obj, "throws", &ctx), 0, "throws");
+	ASSERT_EQ(ctx.area, -1, "caught");
+	ASSERT_EQ(ctx.sides, 12, "dtors");
+
+	/* the address that the throw took is the copy, of a BTF type of its own */
+	dtor_id = btf__find_by_name_kind(bpf_object__btf(obj), ERROR_DTOR, BTF_KIND_FUNC);
+	addr_id = jited_func_type(obj, "throws", ctx.vptr);
+	if (!ASSERT_GT(dtor_id, 0, "dtor") || !ASSERT_NEQ(addr_id, 0, "dtor address"))
+		goto out;
+	ASSERT_NEQ(addr_id, dtor_id, "a copy for the address");
+	if (!ASSERT_TRUE(get_funcs(obj, "throws", &funcs), "funcs"))
+		goto out;
+	for (i = 0; i < funcs.cnt; i++)
+		copies += funcs.finfo[i].type_id == dtor_id;
 	ASSERT_EQ(copies, 1, "the copy that the code calls");
 out:
 	bpf_object__close(obj);
+	btf__free(btf);
 }
 
 /* The offset of variable var in DATASEC sec */
@@ -336,6 +388,8 @@ void test_data_in_arena_cxx(void)
 		test_destructors();
 	if (test__start_subtest("reused_arena"))
 		test_reused_arena();
+	if (test__start_subtest("throws"))
+		test_throws();
 	if (test__start_subtest("virtual_names"))
 		test_virtual_names();
 }
