@@ -176,10 +176,13 @@ ifeq ($(BPF_CC),$(CLANG))
 CXX_OBJS := $(patsubst progs/%.cpp,$(RDIR)/%.bpf.o,$(wildcard progs/*.cpp))
 BPF_OBJS += $(CXX_OBJS)
 
+# with the flags of the prog, e.g. -frtti, after the others
+data_in_arena_cxx-CXXFLAGS := -frtti -std=gnu++20 -fvisibility-global-new-delete=force-hidden
+
 $(CXX_OBJS): $(RDIR)/%.bpf.o: progs/%.cpp progs/*.h | $(RDIR)
 	$(call msg,$(BPF_CC_MSG),$(BINARY),$@)
 	$(Q)$(BPF_CC) -x c++ -g -Wall -Werror -fexceptions -funwind-tables -fno-rtti	\
-		$(BPF_CC_FLAGS) -c $< -o $@ $(call skip_on_fail,BPF)
+		$(BPF_CC_FLAGS) $($*-CXXFLAGS) -c $< -o $@ $(call skip_on_fail,BPF)
 
 ARCHIVES += libcomdat_cxx.a
 libcomdat_cxx.a-deps := comdat_cxx_lib.bpf.o comdat_cxx2.bpf.o
