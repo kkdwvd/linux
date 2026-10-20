@@ -509,6 +509,83 @@ __naked int unwind_goto_after_final_call(void)
 }
 
 /*
+ * The path ends at the exception exit inside the loop, before the verifier
+ * has made a checkpoint in it.
+ */
+SEC("tc")
+__description("noreturn: bpf_throw ends a path inside a loop")
+__arch_x86_64
+__arch_arm64
+__arch_s390x
+__success __retval(3)
+__naked int throw_in_loop(void)
+{
+	asm volatile (
+		"r6 = *(u32 *)(r1 + %[len]);"
+	"1:"
+		"r1 = 3;"
+		"call %[bpf_throw];"
+		"if r6 != 0 goto 1b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_const(len, offsetof(struct __sk_buff, len)),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("noreturn: a call of a global subprog that throws ends a path inside a loop")
+__arch_x86_64
+__arch_arm64
+__arch_s390x
+__success __retval(13)
+__naked int global_throw_in_loop(void)
+{
+	asm volatile (
+		"r6 = *(u32 *)(r1 + %[len]);"
+	"1:"
+		"call global_throws_13;"
+		"if r6 != 0 goto 1b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_const(len, offsetof(struct __sk_buff, len))
+		: __clobber_all
+	);
+}
+
+/*
+ * llvm lays out a block that ends with a call of a function that doesn't
+ * return like any other, here the one at 1, and jumps to it from several
+ * places. The edge after the call is then a loop in the CFG that never runs.
+ */
+SEC("tc")
+__description("noreturn: an edge after a call that doesn't return makes a loop")
+__arch_x86_64
+__arch_arm64
+__arch_s390x
+__success __retval(13)
+__naked int loop_through_noreturn_call(void)
+{
+	asm volatile (
+		"r6 = *(u32 *)(r1 + %[len]);"
+		"if r6 < 100 goto 2f;"
+	"1:"
+		"call throws_7;"
+	"2:"
+		"call global_throws_13;"
+		"if r6 > 200 goto 1b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_const(len, offsetof(struct __sk_buff, len))
+		: __clobber_all
+	);
+}
+
+/*
  * BTF FUNC records are not generated for kfuncs referenced
  * from inline assembly. These records are necessary for
  * libbpf to link the program. The function below is a hack
