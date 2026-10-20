@@ -62,6 +62,7 @@ TEST_GEN_PROGS_EXTENDED = \
 	xskxceiver
 
 TEST_GEN_FILES += $(TEST_KMODS) liburandom_read.so urandom_read sign-file uprobe_multi
+TEST_GEN_FILES += test_bpf_headers_cpp.o
 
 ifneq ($(V),1)
 submake_extras := feature_display=0
@@ -610,6 +611,13 @@ CXXFLAGS := $(subst -std=gnu11,-std=gnu++11,$(CXXFLAGS))
 $(OUTPUT)/test_cpp: test_cpp.cpp $(OUTPUT)/test_core_extern.skel.h $(BPFOBJ)
 	$(call msg,CXX,,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(filter %.a %.o %.cpp,$^) $(LDLIBS) -o $@
+
+# Also check BPF-side headers with the host C++ compiler, including GCC.
+$(OUTPUT)/test_bpf_headers_cpp.o: progs/test_bpf_headers.c $(BPFOBJ) $(HEADERS_FOR_BPF_OBJS)
+	$(call msg,CXX,,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -x c++ -std=c++11 -Wextra \
+		-Wno-unused-parameter -Wno-unused-function -Wno-sign-compare \
+		-c $< -o $@
 
 # Benchmark runner. Every benchs/bench_*.c is compiled and linked in.
 BENCH_OBJS := $(sort $(patsubst benchs/%.c,$(OUTPUT)/%.o,$(wildcard benchs/bench_*.c)))

@@ -83,6 +83,10 @@ vpath %.subskel.h $(RDIR)
 $(RDIR)/resolve_btfids.test.o: $(RESOLVE_BTFIDS) $(RDIR)/btf_data.bpf.o
 $(RDIR)/resolve_btfids.test.o: private TEST_NEEDS_BTFIDS = 1
 
+ifeq ($(BPF_CC),$(CLANG))
+$(RDIR)/bpf_headers.test.o: private override CFLAGS += -DBPF_HEADERS_CXX
+endif
+
 # compile individual test files
 # Note: we cd into output directory to ensure embedded BPF object is found
 # The %.test.d dependency files are a side effect of the -MMD below; the

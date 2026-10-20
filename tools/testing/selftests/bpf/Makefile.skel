@@ -93,6 +93,33 @@ $(BPF_OBJS): $(RDIR)/%.bpf.o: progs/%.c progs/*.h			\
 	$(call msg,$(BPF_CC_MSG),$(BINARY),$@)
 	$(Q)$(cmd_bpf_compile)
 
+# Exercise BPF-side headers in C++11 on both byte orders. GCC's BPF runner
+# has no C++ compiler; its C version of this test is built by the rule above.
+ifeq ($(BPF_CC),$(CLANG))
+CPP_HEADER_OBJS := $(addprefix $(RDIR)/test_bpf_headers_,bpfel.bpf.o bpfeb.bpf.o)
+BPF_OBJS += $(CPP_HEADER_OBJS)
+$(CPP_HEADER_OBJS): $(RDIR)/test_bpf_headers_%.bpf.o: progs/test_bpf_headers.c \
+		$(HEADERS_FOR_BPF_OBJS) | $(RDIR) $(BPFOBJ)
+	$(call msg,CLNG-C++,$(BINARY),$@)
+	$(Q)$(CLANG) $(filter-out -std=gnu11 $(MENDIAN),$(BPF_CFLAGS)) \
+		$(BPF_SYS_INCLUDES) $(BPF_DEFINES) \
+		$(filter-out --target=%,$(BPF_CC_FLAGS)) --target=$* \
+		-x c++ -std=c++11 -fno-exceptions -fno-rtti -c $< -o $@ \
+		$(call skip_on_fail,BPF)
+
+# These architectures use synthetic register types for the first syscall argument.
+CPP_SYSCALL_HEADER_OBJS := $(addprefix $(RDIR)/test_bpf_syscall_headers_, \
+				      s390.bpf.o arm64.bpf.o riscv.bpf.o)
+BPF_OBJS += $(CPP_SYSCALL_HEADER_OBJS)
+$(CPP_SYSCALL_HEADER_OBJS): $(RDIR)/test_bpf_syscall_headers_%.bpf.o: \
+		progs/test_bpf_syscall_headers.cpp $(HEADERS_FOR_BPF_OBJS) | $(RDIR) $(BPFOBJ)
+	$(call msg,CLNG-C++,$(BINARY),$@)
+	$(Q)$(CLANG) $(filter-out -std=gnu11 -D__TARGET_ARCH_%,$(BPF_CFLAGS)) \
+		$(BPF_SYS_INCLUDES) $(BPF_CC_FLAGS) -D__TARGET_ARCH_$* \
+		-x c++ -std=c++11 -fno-exceptions -fno-rtti -c $< -o $@ \
+		$(call skip_on_fail,BPF)
+endif
+
 GEN_SKEL := ./gen_bpf_skel.sh
 
 cmd_bpf_gen_skel = $(call skip_if_missing,SKEL,$<,$(@:.skel.h=.subskel.h))printf \
