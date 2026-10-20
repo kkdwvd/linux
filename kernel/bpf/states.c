@@ -995,6 +995,9 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	if (!old->no_stack_arg_load && cur->no_stack_arg_load)
 		return false;
 
+	if (old->rcu_locks != cur->rcu_locks || old->preempt_locks != cur->preempt_locks)
+		return false;
+
 	if (old->in_rcu_callback_fn != cur->in_rcu_callback_fn)
 		return false;
 

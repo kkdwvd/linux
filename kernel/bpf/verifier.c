@@ -12213,6 +12213,9 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 		state->unwound = true;
 	}
+	/* Sections the callee entered and did not leave are the caller's now. */
+	caller->rcu_locks += callee->rcu_locks;
+	caller->preempt_locks += callee->preempt_locks;
 	if (callee->in_callback_fn && !unwinds) {
 		if (r0->type != SCALAR_VALUE) {
 			verbose(env, "R0 not a scalar value\n");
@@ -15503,6 +15506,21 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/* Leave an RCU or preemption section: the innermost frame that entered one. */
+static void leave_section(struct bpf_verifier_state *st, bool rcu)
+{
+	int f;
+
+	for (f = st->curframe; f >= 0; f--) {
+		u32 *cnt = rcu ? &st->frame[f]->rcu_locks : &st->frame[f]->preempt_locks;
+
+		if (*cnt) {
+			(*cnt)--;
+			return;
+		}
+	}
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
@@ -15705,6 +15723,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (rcu_lock) {
 		env->cur_state->active_rcu_locks++;
+		env->cur_state->frame[env->cur_state->curframe]->rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
 					env->cur_state->active_rcu_locks);
 	} else if (rcu_unlock) {
@@ -15716,12 +15735,14 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_rcu_locks--;
+		leave_section(env->cur_state, true);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
 					env->cur_state->active_rcu_locks);
 		if (!in_rcu_cs(env))
 			invalidate_rcu_protected_refs(env);
 	} else if (preempt_disable) {
 		env->cur_state->active_preempt_locks++;
+		env->cur_state->frame[env->cur_state->curframe]->preempt_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, true,
 					env->cur_state->active_preempt_locks);
 	} else if (preempt_enable) {
@@ -15733,6 +15754,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_preempt_locks--;
+		leave_section(env->cur_state, false);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
 					env->cur_state->active_preempt_locks);
 		if (!in_rcu_cs(env))
