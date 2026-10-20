@@ -45,6 +45,10 @@
 #define check_imm26(imm) check_imm(26, imm)
 
 /* Map BPF registers to A64 registers */
+/* arch/arm64/net/bpf_throw.S: the entries of bpf_throw_unwind(), built with the syscall. */
+extern void bpf_throw_entry(void);
+extern void bpf_throw_fault_entry(void);
+
 static const int bpf2a64[] = {
 	/* return value from in-kernel function, and exit value from eBPF */
 	[BPF_REG_0] = A64_R(8),
@@ -1144,7 +1148,19 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+		if (bpf_prog_report_arena_violation(is_write, addr, regs->pc)) {
+			/*
+			 * The access is a cancellation point: resume the program
+			 * in bpf_throw_fault_entry() instead of after the access.
+			 * The faulting pc travels in a temporary of the JIT that
+			 * no BPF register maps to. The lowering of an access
+			 * writes no BPF register before the access itself, so
+			 * the register file the entry captures is the site's.
+			 */
+			regs->regs[bpf2a64[TMP_REG_1]] = regs->pc;
+			regs->pc = (unsigned long)bpf_throw_fault_entry;
+			return true;
+		}
 	}
 
 	if (dst_reg != DONT_CLEAR)
@@ -3490,6 +3506,11 @@ bool bpf_jit_supports_timed_may_goto(void)
 void *bpf_arch_throw_entry(void)
 {
 	return (void *)bpf_throw_entry;
+}
+
+void *bpf_arch_throw_fault_entry(void)
+{
+	return (void *)bpf_throw_fault_entry;
 }
 #endif
 
