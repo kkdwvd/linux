@@ -1266,16 +1266,35 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 	return 0;
 }
 
-static long bpf_unwind_fixup(u64 lr)
+/*
+ * The verifier made sure that unwind_goto follows a call in a prog. When the
+ * kernel called an async callback, it's exit. A helper that calls a callback
+ * has a pad when it wants one, see bpf_call_cb().
+ */
+u64 bpf_unwind_target(u64 ret_addr)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - 1);
+	e = search_bpf_extables(ret_addr - 1);
+	if (e)
+		return ret_addr + e->fixup;
 	/*
-	 * The verifier made sure that unwind_goto follows a call in a prog. When
-	 * the kernel called an async callback, it's exit.
+	 * The pad of a helper that called a callback with bpf_call_cb(): its
+	 * entries are the EX_TYPE_BPF ones of the kernel tables. Anything else
+	 * at a return address is some caller's own fixup.
 	 */
-	return e ? e->fixup : 0;
+	e = search_exception_tables(ret_addr);
+	if (e && e->type == EX_TYPE_BPF)
+		return (unsigned long)&e->fixup + e->fixup;
+	return ret_addr;
+}
+
+/* The offset that the epilogue adds to LR once it is authenticated */
+static long bpf_unwind_fixup(u64 lr)
+{
+	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
+
+	return bpf_unwind_target(ret_addr) - ret_addr;
 }
 
 /*
