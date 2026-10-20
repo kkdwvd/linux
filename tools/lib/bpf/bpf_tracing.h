@@ -167,7 +167,7 @@ extern "C" {
 
 struct pt_regs___s390 {
 	unsigned long orig_gpr2;
-} __attribute__((preserve_access_index));
+};
 
 /* s390 provides user_pt_regs instead of struct pt_regs to userspace */
 #define __PT_REGS_CAST(x) ((const user_pt_regs *)(x))
@@ -183,7 +183,8 @@ struct pt_regs___s390 {
 #define __PT_PARM4_SYSCALL_REG __PT_PARM4_REG
 #define __PT_PARM5_SYSCALL_REG __PT_PARM5_REG
 #define __PT_PARM6_SYSCALL_REG gprs[7]
-#define PT_REGS_PARM1_SYSCALL(x) (((const struct pt_regs___s390 *)(x))->__PT_PARM1_SYSCALL_REG)
+#define PT_REGS_PARM1_SYSCALL(x) \
+	(*__builtin_preserve_access_index(&((const struct pt_regs___s390 *)(x))->orig_gpr2))
 #define PT_REGS_PARM1_CORE_SYSCALL(x) \
 	BPF_CORE_READ((const struct pt_regs___s390 *)(x), __PT_PARM1_SYSCALL_REG)
 
@@ -226,7 +227,7 @@ struct pt_regs___s390 {
 
 struct pt_regs___arm64 {
 	unsigned long orig_x0;
-} __attribute__((preserve_access_index));
+};
 
 /* arm64 provides struct user_pt_regs instead of struct pt_regs to userspace */
 #define __PT_REGS_CAST(x) ((const struct user_pt_regs *)(x))
@@ -245,7 +246,8 @@ struct pt_regs___arm64 {
 #define __PT_PARM4_SYSCALL_REG __PT_PARM4_REG
 #define __PT_PARM5_SYSCALL_REG __PT_PARM5_REG
 #define __PT_PARM6_SYSCALL_REG __PT_PARM6_REG
-#define PT_REGS_PARM1_SYSCALL(x) (((const struct pt_regs___arm64 *)(x))->__PT_PARM1_SYSCALL_REG)
+#define PT_REGS_PARM1_SYSCALL(x) \
+	(*__builtin_preserve_access_index(&((const struct pt_regs___arm64 *)(x))->orig_x0))
 #define PT_REGS_PARM1_CORE_SYSCALL(x) \
 	BPF_CORE_READ((const struct pt_regs___arm64 *)(x), __PT_PARM1_SYSCALL_REG)
 
@@ -357,7 +359,7 @@ struct pt_regs___arm64 {
 
 struct pt_regs___riscv {
 	unsigned long orig_a0;
-} __attribute__((preserve_access_index));
+};
 
 /* riscv provides struct user_regs_struct instead of struct pt_regs to userspace */
 #define __PT_REGS_CAST(x) ((const struct user_regs_struct *)(x))
@@ -376,7 +378,8 @@ struct pt_regs___riscv {
 #define __PT_PARM4_SYSCALL_REG __PT_PARM4_REG
 #define __PT_PARM5_SYSCALL_REG __PT_PARM5_REG
 #define __PT_PARM6_SYSCALL_REG __PT_PARM6_REG
-#define PT_REGS_PARM1_SYSCALL(x) (((const struct pt_regs___riscv *)(x))->__PT_PARM1_SYSCALL_REG)
+#define PT_REGS_PARM1_SYSCALL(x) \
+	(*__builtin_preserve_access_index(&((const struct pt_regs___riscv *)(x))->orig_a0))
 #define PT_REGS_PARM1_CORE_SYSCALL(x) \
 	BPF_CORE_READ((const struct pt_regs___riscv *)(x), __PT_PARM1_SYSCALL_REG)
 
@@ -643,19 +646,69 @@ struct pt_regs;
 #define ___bpf_narg(...) ___bpf_nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 #endif
 
+#ifdef __cplusplus
+extern "C++" {
+/*
+ * The argument lists of BPF_PROG and BPF_KPROBE contain declarations, so
+ * their types cannot be extracted by the preprocessor. Convert each register
+ * to the parameter type when calling the typed implementation.
+ */
+struct ___bpf_arg_cast {
+	unsigned long long value;
+
+	template <typename T>
+	__always_inline operator T() const { return (T)value; }
+};
+
+template <unsigned int Size> struct ___bpf_reg_type;
+template <> struct ___bpf_reg_type<1> { typedef __u8 type; };
+template <> struct ___bpf_reg_type<2> { typedef __u16 type; };
+template <> struct ___bpf_reg_type<4> { typedef __u32 type; };
+template <> struct ___bpf_reg_type<8> { typedef __u64 type; };
+
+/*
+ * Truncate a register before copying its representation, so arguments smaller
+ * than eight bytes work on either byte order. Bit-casting also handles
+ * aggregate arguments without reading an inactive union member in C++.
+ */
+template <typename T, unsigned int Size = sizeof(T)> struct ___bpf_reg_arg {
+	static constexpr unsigned int count = 1;
+
+	static __always_inline T get(const unsigned long long *ctx)
+	{
+		typename ___bpf_reg_type<Size>::type raw = ctx[0];
+		return __builtin_bit_cast(T, raw);
+	}
+};
+
+template <typename T> struct ___bpf_reg_arg<T, 16> {
+	static constexpr unsigned int count = 2;
+
+	static __always_inline T get(const unsigned long long *ctx)
+	{
+		unsigned long long raw[2] = { ctx[0], ctx[1] };
+		return __builtin_bit_cast(T, raw);
+	}
+};
+}
+#define ___bpf_cast(value) (___bpf_arg_cast{(unsigned long long)(value)})
+#else
+#define ___bpf_cast(value) (value)
+#endif
+
 #define ___bpf_ctx_cast0()            ctx
-#define ___bpf_ctx_cast1(x)           ___bpf_ctx_cast0(), ctx[0]
-#define ___bpf_ctx_cast2(x, args...)  ___bpf_ctx_cast1(args), ctx[1]
-#define ___bpf_ctx_cast3(x, args...)  ___bpf_ctx_cast2(args), ctx[2]
-#define ___bpf_ctx_cast4(x, args...)  ___bpf_ctx_cast3(args), ctx[3]
-#define ___bpf_ctx_cast5(x, args...)  ___bpf_ctx_cast4(args), ctx[4]
-#define ___bpf_ctx_cast6(x, args...)  ___bpf_ctx_cast5(args), ctx[5]
-#define ___bpf_ctx_cast7(x, args...)  ___bpf_ctx_cast6(args), ctx[6]
-#define ___bpf_ctx_cast8(x, args...)  ___bpf_ctx_cast7(args), ctx[7]
-#define ___bpf_ctx_cast9(x, args...)  ___bpf_ctx_cast8(args), ctx[8]
-#define ___bpf_ctx_cast10(x, args...) ___bpf_ctx_cast9(args), ctx[9]
-#define ___bpf_ctx_cast11(x, args...) ___bpf_ctx_cast10(args), ctx[10]
-#define ___bpf_ctx_cast12(x, args...) ___bpf_ctx_cast11(args), ctx[11]
+#define ___bpf_ctx_cast1(x)           ___bpf_ctx_cast0(), ___bpf_cast(ctx[0])
+#define ___bpf_ctx_cast2(x, args...)  ___bpf_ctx_cast1(args), ___bpf_cast(ctx[1])
+#define ___bpf_ctx_cast3(x, args...)  ___bpf_ctx_cast2(args), ___bpf_cast(ctx[2])
+#define ___bpf_ctx_cast4(x, args...)  ___bpf_ctx_cast3(args), ___bpf_cast(ctx[3])
+#define ___bpf_ctx_cast5(x, args...)  ___bpf_ctx_cast4(args), ___bpf_cast(ctx[4])
+#define ___bpf_ctx_cast6(x, args...)  ___bpf_ctx_cast5(args), ___bpf_cast(ctx[5])
+#define ___bpf_ctx_cast7(x, args...)  ___bpf_ctx_cast6(args), ___bpf_cast(ctx[6])
+#define ___bpf_ctx_cast8(x, args...)  ___bpf_ctx_cast7(args), ___bpf_cast(ctx[7])
+#define ___bpf_ctx_cast9(x, args...)  ___bpf_ctx_cast8(args), ___bpf_cast(ctx[8])
+#define ___bpf_ctx_cast10(x, args...) ___bpf_ctx_cast9(args), ___bpf_cast(ctx[9])
+#define ___bpf_ctx_cast11(x, args...) ___bpf_ctx_cast10(args), ___bpf_cast(ctx[10])
+#define ___bpf_ctx_cast12(x, args...) ___bpf_ctx_cast11(args), ___bpf_cast(ctx[11])
 #define ___bpf_ctx_cast(args...)      ___bpf_apply(___bpf_ctx_cast, ___bpf_narg(args))(args)
 
 /*
@@ -680,7 +733,7 @@ ____##name(unsigned long long *ctx, ##args);				    \
 __typeof__(name(0)) name(unsigned long long *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	___bpf_diag_ignore_int_conversion					\
 	return ____##name(___bpf_ctx_cast(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
@@ -692,11 +745,20 @@ ____##name(unsigned long long *ctx, ##args)
 		    _14, _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, N, ...) N
 #endif
 #ifndef ___bpf_narg2
+#ifdef __cplusplus
+#define ___bpf_narg2(...) \
+	___bpf_nth2(_, __VA_ARGS__ __VA_OPT__(,) 12, 12, 11, 11, 10, 10, 9, 9, 8, 8, 7, 7, \
+		   6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0)
+#else
 #define ___bpf_narg2(...)	\
 	___bpf_nth2(_, ##__VA_ARGS__, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8, 7, 7,	\
 		    6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0)
 #endif
+#endif
 
+#ifdef __cplusplus
+#define ___bpf_treg_cnt(t) ___bpf_reg_arg<t>::count
+#else
 #define ___bpf_treg_cnt(t) \
 	__builtin_choose_expr(sizeof(t) == 1, 1,	\
 	__builtin_choose_expr(sizeof(t) == 2, 1,	\
@@ -704,6 +766,7 @@ ____##name(unsigned long long *ctx, ##args)
 	__builtin_choose_expr(sizeof(t) == 8, 1,	\
 	__builtin_choose_expr(sizeof(t) == 16, 2,	\
 			      (void)0)))))
+#endif
 
 #define ___bpf_reg_cnt0()		(0)
 #define ___bpf_reg_cnt1(t, x)		(___bpf_reg_cnt0() + ___bpf_treg_cnt(t))
@@ -720,6 +783,9 @@ ____##name(unsigned long long *ctx, ##args)
 #define ___bpf_reg_cnt12(t, x, args...)	(___bpf_reg_cnt11(args) + ___bpf_treg_cnt(t))
 #define ___bpf_reg_cnt(args...)	 ___bpf_apply(___bpf_reg_cnt, ___bpf_narg2(args))(args)
 
+#ifdef __cplusplus
+#define ___bpf_union_arg(t, x, n) ___bpf_reg_arg<t>::get(&ctx[n])
+#else
 #define ___bpf_union_arg(t, x, n) \
 	__builtin_choose_expr(sizeof(t) == 1, ({ union { __u8 z[1]; t x; } ___t = { .z = {ctx[n]}}; ___t.x; }), \
 	__builtin_choose_expr(sizeof(t) == 2, ({ union { __u16 z[1]; t x; } ___t = { .z = {ctx[n]} }; ___t.x; }), \
@@ -727,6 +793,7 @@ ____##name(unsigned long long *ctx, ##args)
 	__builtin_choose_expr(sizeof(t) == 8, ({ union { __u64 z[1]; t x; } ___t = {.z = {ctx[n]} }; ___t.x; }), \
 	__builtin_choose_expr(sizeof(t) == 16, ({ union { __u64 z[2]; t x; } ___t = {.z = {ctx[n], ctx[n + 1]} }; ___t.x; }), \
 			      (void)0)))))
+#endif
 
 #define ___bpf_ctx_arg0(n, args...)
 #define ___bpf_ctx_arg1(n, t, x)		, ___bpf_union_arg(t, x, n - ___bpf_reg_cnt1(t, x))
@@ -797,14 +864,14 @@ ____##name(unsigned long long *ctx ___bpf_ctx_decl(args))
 struct pt_regs;
 
 #define ___bpf_kprobe_args0()           ctx
-#define ___bpf_kprobe_args1(x)          ___bpf_kprobe_args0(), (unsigned long long)PT_REGS_PARM1(ctx)
-#define ___bpf_kprobe_args2(x, args...) ___bpf_kprobe_args1(args), (unsigned long long)PT_REGS_PARM2(ctx)
-#define ___bpf_kprobe_args3(x, args...) ___bpf_kprobe_args2(args), (unsigned long long)PT_REGS_PARM3(ctx)
-#define ___bpf_kprobe_args4(x, args...) ___bpf_kprobe_args3(args), (unsigned long long)PT_REGS_PARM4(ctx)
-#define ___bpf_kprobe_args5(x, args...) ___bpf_kprobe_args4(args), (unsigned long long)PT_REGS_PARM5(ctx)
-#define ___bpf_kprobe_args6(x, args...) ___bpf_kprobe_args5(args), (unsigned long long)PT_REGS_PARM6(ctx)
-#define ___bpf_kprobe_args7(x, args...) ___bpf_kprobe_args6(args), (unsigned long long)PT_REGS_PARM7(ctx)
-#define ___bpf_kprobe_args8(x, args...) ___bpf_kprobe_args7(args), (unsigned long long)PT_REGS_PARM8(ctx)
+#define ___bpf_kprobe_args1(x)          ___bpf_kprobe_args0(), ___bpf_cast((unsigned long long)PT_REGS_PARM1(ctx))
+#define ___bpf_kprobe_args2(x, args...) ___bpf_kprobe_args1(args), ___bpf_cast((unsigned long long)PT_REGS_PARM2(ctx))
+#define ___bpf_kprobe_args3(x, args...) ___bpf_kprobe_args2(args), ___bpf_cast((unsigned long long)PT_REGS_PARM3(ctx))
+#define ___bpf_kprobe_args4(x, args...) ___bpf_kprobe_args3(args), ___bpf_cast((unsigned long long)PT_REGS_PARM4(ctx))
+#define ___bpf_kprobe_args5(x, args...) ___bpf_kprobe_args4(args), ___bpf_cast((unsigned long long)PT_REGS_PARM5(ctx))
+#define ___bpf_kprobe_args6(x, args...) ___bpf_kprobe_args5(args), ___bpf_cast((unsigned long long)PT_REGS_PARM6(ctx))
+#define ___bpf_kprobe_args7(x, args...) ___bpf_kprobe_args6(args), ___bpf_cast((unsigned long long)PT_REGS_PARM7(ctx))
+#define ___bpf_kprobe_args8(x, args...) ___bpf_kprobe_args7(args), ___bpf_cast((unsigned long long)PT_REGS_PARM8(ctx))
 #define ___bpf_kprobe_args(args...)     ___bpf_apply(___bpf_kprobe_args, ___bpf_narg(args))(args)
 
 /*
@@ -824,7 +891,7 @@ ____##name(struct pt_regs *ctx, ##args);				    \
 __typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	___bpf_diag_ignore_int_conversion					\
 	return ____##name(___bpf_kprobe_args(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
@@ -832,7 +899,7 @@ static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args)
 
 #define ___bpf_kretprobe_args0()       ctx
-#define ___bpf_kretprobe_args1(x)      ___bpf_kretprobe_args0(), (unsigned long long)PT_REGS_RC(ctx)
+#define ___bpf_kretprobe_args1(x)      ___bpf_kretprobe_args0(), ___bpf_cast((unsigned long long)PT_REGS_RC(ctx))
 #define ___bpf_kretprobe_args(args...) ___bpf_apply(___bpf_kretprobe_args, ___bpf_narg(args))(args)
 
 /*
@@ -848,7 +915,7 @@ ____##name(struct pt_regs *ctx, ##args);				    \
 __typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	___bpf_diag_ignore_int_conversion					\
 	return ____##name(___bpf_kretprobe_args(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
@@ -856,24 +923,24 @@ static __always_inline __typeof__(name(0)) ____##name(struct pt_regs *ctx, ##arg
 
 /* If kernel has CONFIG_ARCH_HAS_SYSCALL_WRAPPER, read pt_regs directly */
 #define ___bpf_syscall_args0()           ctx
-#define ___bpf_syscall_args1(x)          ___bpf_syscall_args0(), (unsigned long long)PT_REGS_PARM1_SYSCALL(regs)
-#define ___bpf_syscall_args2(x, args...) ___bpf_syscall_args1(args), (unsigned long long)PT_REGS_PARM2_SYSCALL(regs)
-#define ___bpf_syscall_args3(x, args...) ___bpf_syscall_args2(args), (unsigned long long)PT_REGS_PARM3_SYSCALL(regs)
-#define ___bpf_syscall_args4(x, args...) ___bpf_syscall_args3(args), (unsigned long long)PT_REGS_PARM4_SYSCALL(regs)
-#define ___bpf_syscall_args5(x, args...) ___bpf_syscall_args4(args), (unsigned long long)PT_REGS_PARM5_SYSCALL(regs)
-#define ___bpf_syscall_args6(x, args...) ___bpf_syscall_args5(args), (unsigned long long)PT_REGS_PARM6_SYSCALL(regs)
-#define ___bpf_syscall_args7(x, args...) ___bpf_syscall_args6(args), (unsigned long long)PT_REGS_PARM7_SYSCALL(regs)
+#define ___bpf_syscall_args1(x)          ___bpf_syscall_args0(), ___bpf_cast((unsigned long long)PT_REGS_PARM1_SYSCALL(regs))
+#define ___bpf_syscall_args2(x, args...) ___bpf_syscall_args1(args), ___bpf_cast((unsigned long long)PT_REGS_PARM2_SYSCALL(regs))
+#define ___bpf_syscall_args3(x, args...) ___bpf_syscall_args2(args), ___bpf_cast((unsigned long long)PT_REGS_PARM3_SYSCALL(regs))
+#define ___bpf_syscall_args4(x, args...) ___bpf_syscall_args3(args), ___bpf_cast((unsigned long long)PT_REGS_PARM4_SYSCALL(regs))
+#define ___bpf_syscall_args5(x, args...) ___bpf_syscall_args4(args), ___bpf_cast((unsigned long long)PT_REGS_PARM5_SYSCALL(regs))
+#define ___bpf_syscall_args6(x, args...) ___bpf_syscall_args5(args), ___bpf_cast((unsigned long long)PT_REGS_PARM6_SYSCALL(regs))
+#define ___bpf_syscall_args7(x, args...) ___bpf_syscall_args6(args), ___bpf_cast((unsigned long long)PT_REGS_PARM7_SYSCALL(regs))
 #define ___bpf_syscall_args(args...)     ___bpf_apply(___bpf_syscall_args, ___bpf_narg(args))(args)
 
 /* If kernel doesn't have CONFIG_ARCH_HAS_SYSCALL_WRAPPER, we have to BPF_CORE_READ from pt_regs */
 #define ___bpf_syswrap_args0()           ctx
-#define ___bpf_syswrap_args1(x)          ___bpf_syswrap_args0(), (unsigned long long)PT_REGS_PARM1_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args2(x, args...) ___bpf_syswrap_args1(args), (unsigned long long)PT_REGS_PARM2_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args3(x, args...) ___bpf_syswrap_args2(args), (unsigned long long)PT_REGS_PARM3_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args4(x, args...) ___bpf_syswrap_args3(args), (unsigned long long)PT_REGS_PARM4_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args5(x, args...) ___bpf_syswrap_args4(args), (unsigned long long)PT_REGS_PARM5_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args6(x, args...) ___bpf_syswrap_args5(args), (unsigned long long)PT_REGS_PARM6_CORE_SYSCALL(regs)
-#define ___bpf_syswrap_args7(x, args...) ___bpf_syswrap_args6(args), (unsigned long long)PT_REGS_PARM7_CORE_SYSCALL(regs)
+#define ___bpf_syswrap_args1(x)          ___bpf_syswrap_args0(), ___bpf_cast((unsigned long long)PT_REGS_PARM1_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args2(x, args...) ___bpf_syswrap_args1(args), ___bpf_cast((unsigned long long)PT_REGS_PARM2_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args3(x, args...) ___bpf_syswrap_args2(args), ___bpf_cast((unsigned long long)PT_REGS_PARM3_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args4(x, args...) ___bpf_syswrap_args3(args), ___bpf_cast((unsigned long long)PT_REGS_PARM4_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args5(x, args...) ___bpf_syswrap_args4(args), ___bpf_cast((unsigned long long)PT_REGS_PARM5_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args6(x, args...) ___bpf_syswrap_args5(args), ___bpf_cast((unsigned long long)PT_REGS_PARM6_CORE_SYSCALL(regs))
+#define ___bpf_syswrap_args7(x, args...) ___bpf_syswrap_args6(args), ___bpf_cast((unsigned long long)PT_REGS_PARM7_CORE_SYSCALL(regs))
 #define ___bpf_syswrap_args(args...)     ___bpf_apply(___bpf_syswrap_args, ___bpf_narg(args))(args)
 
 /*
@@ -911,7 +978,7 @@ __typeof__(name(0)) name(struct pt_regs *ctx)				    \
 			       ? (struct pt_regs *)PT_REGS_PARM1(ctx)	    \
 			       : ctx;					    \
 	_Pragma("GCC diagnostic push")					    \
-	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	___bpf_diag_ignore_int_conversion					\
 	if (LINUX_HAS_SYSCALL_WRAPPER)					    \
 		return ____##name(___bpf_syswrap_args(args));		    \
 	else								    \
