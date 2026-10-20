@@ -341,6 +341,62 @@ extern "C" SEC("syscall") int virtual_names(struct ctx *ctx)
 	return 0;
 }
 
+/*
+ * An abstract class with external linkage, whose vtable its key function has
+ * emitted here. clang gives its complete and deleting destructors a body that
+ * is only a call of __bpf_trap, as nothing can run them. [WIP] libbpf leaves
+ * their slots in the vtable NULL and appends no copy of them, which the kernel
+ * would refuse. Hidden, so that the other methods are static to the verifier.
+ */
+struct __attribute__((visibility("hidden"))) Abstract {
+	virtual ~Abstract() = default;
+	virtual long kind() const = 0;
+	virtual const char *name() const;
+};
+
+const char *Abstract::name() const
+{
+	return "abstract";
+}
+
+/* what the pure virtual slot points to */
+extern "C" __attribute__((visibility("hidden"))) void __cxa_pure_virtual()
+{
+}
+
+namespace {
+
+struct Concrete : Abstract {
+	long kind() const override
+	{
+		return 3;
+	}
+	const char *name() const override
+	{
+		return "concrete";
+	}
+};
+
+}
+
+alignas(Concrete) char concrete_buf[sizeof(Concrete)];
+/* offset to top, type_info, ~Abstract() complete and deleting, kind(), name() */
+extern "C" const unsigned long abstract_vtable[6] __asm__("_ZTV8Abstract");
+
+extern "C" SEC("syscall") int abstract_calls(struct ctx *ctx)
+{
+	const unsigned long *vtable = abstract_vtable;
+	Abstract *a = new (concrete_buf) Concrete;
+
+	/* read, not folded to the addresses of the destructors, which the program would then take */
+	asm volatile("" : "+r"(a), "+r"(vtable) : : "memory");
+	ctx->vptr = vtable[2];
+	ctx->static_vptr = vtable[3];
+	ctx->area = a->kind() + (a->name()[0] == 'c');
+	ctx->sides = str_is(a->Abstract::name(), "abstract");
+	return 0;
+}
+
 /* The second program calls the functions of the first one */
 extern "C" SEC("syscall") int virtual_calls2(struct ctx *ctx)
 {
