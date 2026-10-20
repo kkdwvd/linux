@@ -268,11 +268,23 @@ enum libbpf_tristate {
 
 /*
  * Format strings are in a section of their own. When global data of the object
- * is in arena (the object has .arena.data section) libbpf keeps .rodata.str*
- * sections in read-only maps, which is where helpers and kfuncs take strings
- * from.
+ * is in arena (the object has .arena.data section) libbpf keeps .rodata.str in
+ * a read-only map, which is where helpers and kfuncs take strings from, while
+ * the string literals of the program are in arena with the rest of the data.
  */
 #define ___bpf_fmt_sec __attribute__((section(".rodata.str")))
+
+/*
+ * A string that a helper or a kfunc takes as a constant string, e.g. a
+ * __str argument, when global data of the object is in arena: a plain string
+ * literal is in arena then, which they can't read. Yields a pointer to a
+ * copy of the string in .rodata.str.
+ */
+#define BPF_CONST_STR(str)				\
+({							\
+	static const char ___str[] ___bpf_fmt_sec = str;	\
+	(const char *)___str;				\
+})
 
 /*
  * BPF_SEQ_PRINTF to wrap bpf_seq_printf to-be-printed values
