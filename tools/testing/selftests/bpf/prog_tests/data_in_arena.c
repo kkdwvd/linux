@@ -2,6 +2,7 @@
 
 #include <sys/mman.h>
 #include <test_progs.h>
+#include <bpf/btf.h>
 #include "data_in_arena.skel.h"
 #include "data_in_arena_decl.skel.h"
 #include "data_in_arena_fail.skel.h"
@@ -13,6 +14,39 @@ static int run_prog(struct bpf_program *prog)
 	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &topts), "test_run"))
 		return -1;
 	return topts.retval;
+}
+
+/* The BTF type of the function of the loaded program at the JITed address, 0 if none */
+static __u32 jited_func_type(struct bpf_program *prog, unsigned long addr)
+{
+	struct bpf_func_info finfo[16];
+	struct bpf_prog_info info = {};
+	__u32 len = sizeof(info), i;
+	__u64 ksyms[16];
+
+	info.nr_jited_ksyms = ARRAY_SIZE(ksyms);
+	info.jited_ksyms = ptr_to_u64(ksyms);
+	info.nr_func_info = ARRAY_SIZE(finfo);
+	info.func_info_rec_size = sizeof(finfo[0]);
+	info.func_info = ptr_to_u64(finfo);
+	if (bpf_prog_get_info_by_fd(bpf_program__fd(prog), &info, &len) ||
+	    info.nr_jited_ksyms > ARRAY_SIZE(ksyms) || info.nr_jited_ksyms != info.nr_func_info)
+		return 0;
+	for (i = 0; i < info.nr_jited_ksyms; i++)
+		if (ksyms[i] == addr)
+			return finfo[i].type_id;
+	return 0;
+}
+
+/* Whether the address is that of a JITed function of a loaded program of the object */
+static bool jited_func(struct bpf_object *obj, unsigned long addr)
+{
+	struct bpf_program *prog;
+
+	bpf_object__for_each_program(prog, obj)
+		if (bpf_program__fd(prog) >= 0 && jited_func_type(prog, addr))
+			return true;
+	return false;
 }
 
 static void run(struct data_in_arena *skel, int counter)
@@ -68,9 +102,11 @@ static void test_in_arena(void)
 		   "data_rel_ro map");
 	run(skel, 100);
 
-	/* read-only data with pointers to data and to functions, which are NULL */
+	/* read-only data with pointers to data and to functions */
 	ASSERT_EQ(run_prog(skel->progs.use_ops), 42 + 1 + 'e', "use_ops");
 	ASSERT_EQ(skel->data->counter, 102, "counter");
+	/* [WIP] the pointer to a function is a JITed function of a program of the object */
+	ASSERT_TRUE(jited_func(skel->obj, skel->bss->ops_fn), "ops.fn");
 
 	/* alignment of sections and pointers to data in data */
 	ASSERT_EQ((unsigned long)&skel->bss->aligned64 % 64, 0, "alignment");
@@ -82,6 +118,66 @@ static void test_in_arena(void)
 	/* format strings of bpf_printk() and BPF_SNPRINTF() */
 	ASSERT_EQ(run_prog(skel->progs.use_printk), sizeof("43-7"), "use_printk");
 	ASSERT_STREQ(skel->bss->out, "43-7", "out");
+out:
+	data_in_arena__destroy(skel);
+}
+
+/*
+ * [WIP] A program that stores and compares the addresses of functions, and
+ * reads the slots in data that hold them, without calling through them. The
+ * slots are filled with the JITed addresses of copies of the functions in the
+ * program, which have a BTF FUNC of their own, and ld_imm64 in the program
+ * takes the addresses of the same copies, so the addresses compare equal
+ * however they are obtained. The program is the only one loaded, so that the
+ * copies are its own.
+ */
+static void test_func_addrs(void)
+{
+	struct data_in_arena *skel;
+	struct bpf_program *prog;
+	__u32 slot_id;
+	int func_id;
+
+	skel = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel, "open"))
+		return;
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, prog == skel->progs.func_addrs);
+	if (!ASSERT_OK(data_in_arena__load(skel), "load"))
+		goto out;
+
+	ASSERT_EQ(run_prog(skel->progs.func_addrs), 0, "func_addrs");
+	ASSERT_NEQ(skel->bss->handler_initial, 0, "handler initial");
+	ASSERT_EQ(skel->bss->handler_initial, skel->bss->handler_default, "initial is default");
+	ASSERT_EQ(skel->bss->handler_stored, skel->bss->handler_other, "stored is other");
+	ASSERT_NEQ(skel->bss->handler_default, skel->bss->handler_other, "two functions");
+	ASSERT_EQ((unsigned long)skel->data_handler->handler, skel->bss->handler_default,
+		  "slot after run");
+	/* nothing was called */
+	ASSERT_EQ(skel->data->counter, 5, "counter");
+
+	/* the slot held a copy of default_handler, with a FUNC of its own */
+	func_id = btf__find_by_name_kind(bpf_object__btf(skel->obj), "default_handler",
+					 BTF_KIND_FUNC);
+	slot_id = jited_func_type(skel->progs.func_addrs, skel->bss->handler_initial);
+	if (!ASSERT_GT(func_id, 0, "default_handler") || !ASSERT_NEQ(slot_id, 0, "slot func"))
+		goto out;
+	ASSERT_NEQ(slot_id, func_id, "a copy for arena data");
+	ASSERT_STREQ(btf__name_by_offset(bpf_object__btf(skel->obj),
+					 btf__type_by_id(bpf_object__btf(skel->obj), slot_id)->name_off),
+		     "default_handler", "copy name");
+	ASSERT_NEQ(jited_func_type(skel->progs.func_addrs, skel->bss->handler_other), 0,
+		   "other_handler");
+	ASSERT_NEQ(jited_func_type(skel->progs.func_addrs, skel->bss->ops_fn), 0, "ops.fn");
+
+	/* the address of dead_handler is taken in dead code only, and its slot is filled */
+	slot_id = jited_func_type(skel->progs.func_addrs,
+				  (unsigned long)skel->data_handler->dead_slot);
+	if (ASSERT_NEQ(slot_id, 0, "dead_slot"))
+		ASSERT_STREQ(btf__name_by_offset(bpf_object__btf(skel->obj),
+						 btf__type_by_id(bpf_object__btf(skel->obj),
+								 slot_id)->name_off),
+			     "dead_handler", "dead_slot name");
 out:
 	data_in_arena__destroy(skel);
 }
@@ -319,6 +415,8 @@ void test_data_in_arena(void)
 #endif
 	if (test__start_subtest("arena"))
 		test_in_arena();
+	if (test__start_subtest("func_addrs"))
+		test_func_addrs();
 	if (test__start_subtest("declared_arena"))
 		test_declared_arena();
 	if (test__start_subtest("ptr_to_map"))
