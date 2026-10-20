@@ -769,6 +769,101 @@ err_free:
 	return ret;
 }
 
+/*
+ * Does a path from the entry of @subprog reach an exit insn or a hidden exit,
+ * that is, might the subprog return normally? A path ends at unwind_exit,
+ * which returns to the unwind_goto after the call instead, at a call of
+ * bpf_throw, at a call of __bpf_trap, which the main pass rejects when it gets
+ * there, and at a call of a subprog that does not return. If that subprog can
+ * unwind, the path goes on at the pad of the unwind_goto after the call. This
+ * is not the reachability that check_cfg() sees: it keeps the edge to the next
+ * insn after such a call, so that the dead code that follows it in the middle
+ * of a subprog doesn't count as unreachable.
+ *
+ * The paths stay inside @subprog, hence @seen needn't be reset for the next one.
+ */
+static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
+				const unsigned long *done, unsigned long *seen, int *stack)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	struct bpf_iarray *succ;
+	int top = 0, t, i, callee, pad;
+
+	t = env->subprog_info[subprog].start;
+	__set_bit(t, seen);
+	stack[top++] = t;
+	while (top) {
+		struct bpf_insn *insn;
+
+		t = stack[--top];
+		insn = &insns[t];
+		if (bpf_is_unwind_exit(insn))
+			continue;
+		if (insn->code == (BPF_JMP | BPF_EXIT) || bpf_insn_has_hidden_exit(insn))
+			return 1;
+		if (bpf_is_throw_kfunc(insn) || bpf_is_trap_kfunc(insn))
+			continue;
+		if (bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, t + insn->imm + 1);
+			if (verifier_bug_if(callee < 0 || !test_bit(callee, done), env,
+					    "callee of insn %d is not known to return or not", t))
+				return -EFAULT;
+			if (!env->subprog_info[callee].might_return) {
+				if (!env->subprog_info[callee].can_unwind ||
+				    bpf_call_ends_subprog(env, t) ||
+				    !bpf_is_unwind_goto(&insns[t + 1]))
+					continue;
+				/* the callee unwinds to the pad, if it leaves at all */
+				pad = t + 1 + insns[t + 1].off + 1;
+				if (!__test_and_set_bit(pad, seen))
+					stack[top++] = pad;
+				continue;
+			}
+		}
+		succ = bpf_insn_successors(env, t);
+		for (i = 0; i < succ->cnt; i++) {
+			if (__test_and_set_bit(succ->items[i], seen))
+				continue;
+			stack[top++] = succ->items[i];
+		}
+	}
+	return 0;
+}
+
+/*
+ * A subprog might return when a path from its entry leaves it. Callees come
+ * before their callers in the topological order, and there is no recursion,
+ * see sort_subprogs_topo(). So whether a callee might return is known by the
+ * time a call of it is reached.
+ */
+int bpf_compute_might_return(struct bpf_verifier_env *env)
+{
+	DECLARE_BITMAP(done, BPF_MAX_SUBPROGS + 2) = {};
+	int *stack, i, subprog, ret = 0;
+	unsigned long *seen;
+
+	seen = kvcalloc(BITS_TO_LONGS(env->prog->len), sizeof(*seen), GFP_KERNEL_ACCOUNT);
+	stack = kvmalloc_objs(*stack, env->prog->len, GFP_KERNEL_ACCOUNT);
+	if (!seen || !stack) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		subprog = env->subprog_topo_order[i];
+		ret = subprog_might_return(env, subprog, done, seen, stack);
+		if (ret < 0)
+			goto out;
+		env->subprog_info[subprog].might_return = ret;
+		__set_bit(subprog, done);
+	}
+	ret = 0;
+out:
+	kvfree(seen);
+	kvfree(stack);
+	return ret;
+}
+
 struct dfs_state {
 	u32 traversed:1;
 	u32 next_succ:31;
