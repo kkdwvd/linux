@@ -164,17 +164,20 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 				struct bpf_verifier_env *env,
 				bool visit_callee)
 {
-	int ret, insn_sz;
+	int ret = DONE_EXPLORING, insn_sz;
 	int w;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
 
-	mark_prune_point(env, t + insn_sz);
-	/* when we exit from subprog, we need to record non-linear history */
-	mark_jmp_point(env, t + insn_sz);
+		mark_prune_point(env, t + insn_sz);
+		/* when we exit from subprog, we need to record non-linear history */
+		mark_jmp_point(env, t + insn_sz);
+	}
 
 	if (visit_callee) {
 		w = t + insns[t].imm + 1;
