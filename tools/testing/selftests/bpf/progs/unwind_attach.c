@@ -5,7 +5,10 @@
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
 
-/* The targets are global_unwinds() and global_never_unwinds() in verifier_unwind.c */
+/*
+ * The targets are global_unwinds(), global_never_unwinds() and
+ * global_only_unwinds() in verifier_unwind.c
+ */
 
 #define unwind_exit ".8byte %[insn_unwind_exit];"
 #define __imm_unwind_exit \
@@ -68,6 +71,12 @@ SEC("?fexit/bpf_loop")
 int BPF_PROG(fexit_bpf_loop)
 {
 	return 0;
+}
+
+/* global_only_unwinds() never returns, so its callers have nothing after the call */
+SEC("?freplace/global_only_unwinds")
+void freplace_only_unwinds(void)
+{
 }
 
 char _license[] SEC("license") = "GPL";
