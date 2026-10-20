@@ -3487,9 +3487,15 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	 * architectures cannot recover sp while unwinding, so fall back to bp.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	/* A throw the kernel raised completes with the program type's default. */
-	if (kind != BPF_THROW_CALL)
+	/*
+	 * A throw the kernel raised completes with the program type's default,
+	 * and a struct_ops gets to know that one of its operators was cancelled.
+	 */
+	if (kind != BPF_THROW_CALL) {
 		cookie = ctx.aux->cancel_retval;
+		if (ctx.aux->prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+			ctx.aux->st_ops->cancel(ctx.aux->prog);
+	}
 	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }

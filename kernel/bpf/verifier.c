@@ -21895,9 +21895,10 @@ again:
 /*
  * The value the main program returns when the kernel cancels an invocation:
  * for each program type the outcome that denies, drops or changes nothing.
- * A program with an exception callback decides for itself, and a struct_ops
- * program without one cannot be cancelled, since the meaning of its return
- * value is the operator's.
+ * A program with an exception callback decides for itself. The meaning of a
+ * struct_ops program's return value is the operator's: it returns 0, and the
+ * struct_ops is told through its cancel hook, so only a struct_ops with the
+ * hook has cancellable programs.
  */
 static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
 {
@@ -21908,6 +21909,8 @@ static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
 	if (env->exception_callback_subprog)
 		return true;
 	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_STRUCT_OPS:
+		return prog->aux->st_ops->cancel != NULL;
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 		*retval = TC_ACT_SHOT;
@@ -21943,8 +21946,6 @@ static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
 			/* The hook's "no": an errno where it takes one, 0 for a bool hook. */
 			*retval = range.minval < 0 ? -EPERM : range.minval;
 		return true;
-	case BPF_PROG_TYPE_STRUCT_OPS:
-		return false;
 	default:
 		return true;
 	}
