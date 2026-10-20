@@ -485,6 +485,12 @@ struct bpf_program {
 	size_t num_insn_off;
 	/* [WIP] callx of a number may call functions of the program, see prog_reaches_callx() */
 	bool num_callx;
+	/*
+	 * [WIP] Functions are numbers in the program, one loaded with
+	 * BPF_F_ARENA_SCALAR: ld_imm64 of a static function takes the address
+	 * of a copy of it, see bpf_object__arena_func_copy()
+	 */
+	bool func_copies;
 
 	/* instructions that belong to BPF program; insns[0] is located at
 	 * sec_insn_off instruction within its ELF section in ELF file, so
@@ -879,7 +885,7 @@ struct bpf_object {
 		bool filled;
 	} *arena_func_ptrs;
 	size_t arena_func_ptr_cnt;
-	/* [WIP] a program may call them, see bpf_object__append_arena_func_ptrs() */
+	/* [WIP] a program has copies of them, see bpf_object__append_arena_func_ptrs() */
 	bool arena_func_callers;
 
 	void *jumptables_data;
@@ -7769,11 +7775,12 @@ bpf_object__reloc_code_in(struct bpf_object *obj, struct bpf_program *main_prog,
 			continue;
 
 		/*
-		 * [WIP] The address that a program that callx of a number may
-		 * call takes is that of the copy of the function for it, but
-		 * for a global function, which callx can't call that way.
+		 * [WIP] Where functions are numbers, the address that the code
+		 * takes is that of the copy of the function for arena data and
+		 * addresses, but for a global function, which callx of a number
+		 * can't call.
 		 */
-		if (insn_is_pseudo_func(insn) && main_prog->num_callx &&
+		if (insn_is_pseudo_func(insn) && main_prog->func_copies &&
 		    (!subprog->sym_global || subprog->mark_btf_static)) {
 			idx = bpf_object__arena_func_copy(obj, main_prog, subprog);
 			if (idx < 0)
@@ -8099,6 +8106,12 @@ static bool prog_is_trap_only(const struct bpf_object *obj, const struct bpf_pro
  * that callx of a number may call, and its JITed address goes to arena data
  * after load, see bpf_object__fill_arena_func_ptrs(). A global function can't
  * be called that way, and the pointer to one stays NULL.
+ *
+ * A program without callx reads the slots too, and compares them with the
+ * addresses that it takes. It gets copies of the functions whose addresses
+ * its code takes only, see bpf_object__reloc_code_in(), and fills their slots:
+ * a copy of every function in arena data in every program that refers to it
+ * exceeds the limit of subprograms in an object with many vtables.
  */
 static int
 bpf_object__append_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *main_prog)
@@ -8313,12 +8326,20 @@ bpf_object__relocate_calls(struct bpf_object *obj, struct bpf_program *prog)
 	}
 
 	/*
-	 * [WIP] Functions that callx of a number may call get copies of their
-	 * own, which take func_info, see bpf_object__arena_func_copy()
+	 * [WIP] Functions are numbers in a program loaded with
+	 * BPF_F_ARENA_SCALAR, where the kernel lets callx call a number. The
+	 * functions whose addresses its code takes get copies of their own,
+	 * which take func_info, see bpf_object__arena_func_copy(), whether or
+	 * not the program has callx: it compares the addresses with the slots
+	 * in arena data, which it fills with the copies after load, and
+	 * another program with the arena may call them. A program that reaches
+	 * callx gets a copy of every function in arena data as well, see
+	 * bpf_object__append_arena_func_ptrs().
 	 */
+	prog->func_copies = (obj->data_in_arena || (prog->prog_flags & BPF_F_ARENA_SCALAR)) &&
+			    !obj->gen_loader && obj->btf_ext && kernel_supports(obj, FEAT_BTF_FUNC);
 	prog->num_callx = false;
-	if ((obj->data_in_arena || (prog->prog_flags & BPF_F_ARENA_SCALAR)) &&
-	    !obj->gen_loader && obj->btf_ext && kernel_supports(obj, FEAT_BTF_FUNC)) {
+	if (prog->func_copies) {
 		err = prog_reaches_callx(obj, prog);
 		if (err < 0)
 			return err;
@@ -9176,8 +9197,8 @@ static bool sym_is_arena(const struct bpf_object *obj, const Elf64_Sym *sym)
  * frozen map, see create_func_ptr_map(), so a program can't call through
  * a pointer that it loads from arena. There is no address to give it either:
  * a function has one in each program that it is a part of, and the data in
- * arena is the same for all of them. [WIP] Until a program that may call it
- * through a number is loaded, see bpf_object__fill_arena_func_ptrs().
+ * arena is the same for all of them. [WIP] Until a program that has a copy
+ * of it for callx of a number is loaded, see bpf_object__fill_arena_func_ptrs().
  */
 static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo_sec_name,
 					int relo_idx, size_t sec_idx, const Elf64_Rel *rel,
@@ -10178,6 +10199,7 @@ static int prog_jited_func_addr(const struct bpf_program *prog, const __u64 *ksy
 		nth += rec->type_id == type_id;
 	}
 
+	/* the kernel removes a function it didn't verify as dead code, with its func_info */
 	for (i = 0; i < cnt; i++) {
 		if (finfo[i].type_id != type_id)
 			continue;
@@ -10195,7 +10217,10 @@ static int prog_jited_func_addr(const struct bpf_program *prog, const __u64 *ksy
  * loaded, of their copies for arena data and addresses, which nothing in the
  * code calls. The kernel verified each of them on its own, with unknown
  * scalar arguments, for callx of a number, which calls the address that it
- * loads from arena data as it is.
+ * loads from arena data as it is. A program fills them with the copies that
+ * it has, whether or not it has callx: those of the functions whose addresses
+ * its code takes, which it compares with the slots, and of every function in
+ * arena data if it reaches callx, see bpf_object__append_arena_func_ptrs().
  *
  * It's a stopgap until there are verified pointers to functions:
  * - The first program that is loaded with a function wins. The pointer is
@@ -10224,7 +10249,14 @@ static int bpf_object__fill_arena_func_ptrs(struct bpf_object *obj, struct bpf_p
 	void *data;
 	int err;
 
+	/* the pointers that are still NULL */
+	for (i = 0; i < obj->arena_func_ptr_cnt; i++)
+		any |= !obj->arena_func_ptrs[i].filled;
+	if (!any)
+		return 0;
+
 	/* the functions that callx of a number may call in this program */
+	any = false;
 	for (j = 0; j < prog->subprog_cnt; j++) {
 		struct bpf_light_subprog *sub = &prog->subprogs[j];
 
@@ -10281,9 +10313,12 @@ static int bpf_object__fill_arena_func_ptrs(struct bpf_object *obj, struct bpf_p
 
 		err = prog_jited_func_addr(prog, ksyms, finfo, info.nr_func_info,
 					   prog->subprogs[j].sub_insn_off, &addr);
-		if (err)
-			goto out;
 		data = bpf_object__data_ptr_sec(obj, p->sec_idx, &name);
+		if (err) {
+			pr_warn("prog '%s': map '%s': pointer at offset %zu: the kernel has no function at insn %u, the copy for it\n",
+				prog->name, name, p->sec_off, prog->subprogs[j].sub_insn_off);
+			goto out;
+		}
 		memcpy(data + p->sec_off, &addr, sizeof(addr));
 		p->filled = true;
 		pr_debug("prog '%s': map '%s': pointer at offset %zu is the function at insn %u\n",
@@ -10336,7 +10371,9 @@ bpf_object__load_progs(struct bpf_object *obj, int log_level)
 	 * A virtual call through a pointer that stays NULL would call 0. A
 	 * program gets copies of the static and hidden functions that arena
 	 * data refers to, see bpf_object__append_func_ptrs_code(), not of a
-	 * global one. [WIP] A copy only if the program has callx of a number.
+	 * global one. [WIP] A copy of every function in a program that reaches
+	 * callx of a number, and of the functions whose addresses a program
+	 * takes, see bpf_object__append_arena_func_ptrs().
 	 */
 	for (i = 0; i < obj->arena_func_ptr_cnt; i++) {
 		struct arena_func_ptr *p = &obj->arena_func_ptrs[i];
@@ -10353,7 +10390,7 @@ bpf_object__load_progs(struct bpf_object *obj, int log_level)
 			pr_warn("map '%s': pointer at offset %zu to global function '%s' is NULL, a program has copies of static and hidden functions only\n",
 				name, p->sec_off, func->name);
 		else if (obj->arena_func_callers)
-			pr_warn("map '%s': pointer at offset %zu to function '%s' stays NULL: no program has the function for callx of a number\n",
+			pr_warn("map '%s': pointer at offset %zu to function '%s' stays NULL: no program loaded has a copy of it for callx of a number\n",
 				name, p->sec_off, func ? func->name : "<?>");
 	}
 
