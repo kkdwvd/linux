@@ -85,8 +85,8 @@ int use_ptrs(void *ctx)
 		return 3;
 	if (str[0] != 'h' || str[4] != 'o' || str[5])
 		return 4;
-	/* the literal is in a map */
-	if (bpf_strncmp(local, sizeof(local), "abc"))
+	/* a plain literal is in arena, which a helper can't read */
+	if (bpf_strncmp(local, sizeof(local), BPF_CONST_STR("abc")))
 		return 5;
 	return 0;
 }
