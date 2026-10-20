@@ -839,7 +839,10 @@ class PrinterHelpersHeader(Printer):
                 used_attrs.add(attr)
         for attr in sorted(used_attrs):
             print('#ifndef %s' % attr)
-            print('#if __has_attribute(%s)' % ATTRS[attr])
+            if attr == '__bpf_fastcall':
+                print('#if !defined(__cplusplus) && __has_attribute(bpf_fastcall)')
+            else:
+                print('#if __has_attribute(%s)' % ATTRS[attr])
             print('#define %s __attribute__((%s))' % (attr, ATTRS[attr]))
             print('#else')
             print('#define %s' % attr)
@@ -908,7 +911,7 @@ class PrinterHelpersHeader(Printer):
             comma = ', '
             print(one_arg, end='')
 
-        print(') = (__typeof__(%s)) %d;' % (proto['name'], helper.enum_val))
+        print(') = (__typeof__(*%s) *) %d;' % (proto['name'], helper.enum_val))
         print('')
 
 
