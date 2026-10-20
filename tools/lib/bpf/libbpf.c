@@ -573,9 +573,13 @@ struct bpf_struct_ops {
  * size before the object is loaded.
  * Read-only data is in arena too, .data.rel.ro and sections with pointers in
  * them included: a program reaches a vtable through a number that it loads
- * from data, and a frozen map can't be reached from a number. Sections with
- * constant strings stay frozen array maps, with a copy in arena. A constant
- * that a helper or a kfunc takes by pointer has to be in such section.
+ * from data, and a frozen map can't be reached from a number. So are the
+ * string literals of the compiler, in .rodata.str1.<n>: a function called
+ * through a pointer can return one. A constant that a helper or a kfunc takes
+ * by pointer has to be in a frozen map: .rodata.str, where bpf_helpers.h puts
+ * format strings and the strings of BPF_CONST_STR(), and sections named
+ * .rodata.str.<x> stay frozen array maps, with a copy in arena, see
+ * map_is_const_str().
  * Pointers to data that are stored in data become addresses of arena.
  * The load fails if such pointer points to a section that is not in arena,
  * or if the arena is pinned or reused and has no map_extra. Pointers to
@@ -3174,10 +3178,23 @@ static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map)
 	return 0;
 }
 
+/*
+ * The sections of constant strings that stay frozen maps when data is in
+ * arena: .rodata.str, where bpf_helpers.h puts the format strings of
+ * bpf_printk() and the strings of BPF_CONST_STR(), and sections that the
+ * program names .rodata.str.<x>. The .rodata.str1.<n> sections of the string
+ * literals of the compiler go to arena with the rest of the read-only data,
+ * so that a function called through a pointer can return one.
+ */
 static bool map_is_const_str(const struct bpf_map *map)
 {
-	return map->libbpf_type == LIBBPF_MAP_RODATA &&
-	       str_has_pfx(map->real_name, RODATA_SEC ".str");
+	const char *name = map->real_name;
+	char c;
+
+	if (map->libbpf_type != LIBBPF_MAP_RODATA || !str_has_pfx(name, RODATA_SEC ".str"))
+		return false;
+	c = name[sizeof(RODATA_SEC ".str") - 1];
+	return c < '0' || c > '9';
 }
 
 /*
@@ -3185,8 +3202,9 @@ static bool map_is_const_str(const struct bpf_map *map)
  * pointers in it included. A program reaches a vtable, and the type info that
  * it points to, through a number that it loads from data, and a frozen map
  * can't be reached from a number. Const strings that kfuncs and helpers take
- * have to be in a frozen map, so they stay one too, and pointers to them that
- * are stored in data point to a copy of the strings in arena, see
+ * have to be in a frozen map, so .rodata.str and the sections named after it
+ * stay one, see map_is_const_str(), and pointers to them that are stored in
+ * data point to a copy of the strings in arena, see
  * bpf_object__init_arena_data().
  */
 static bool map_data_goes_to_arena(const struct bpf_map *map)
