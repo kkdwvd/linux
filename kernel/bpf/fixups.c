@@ -3177,6 +3177,21 @@ next_insn:
 	return 0;
 }
 
+/*
+ * When the callback can unwind and unwind_goto follows the call of bpf_loop,
+ * unwind_goto follows the call of the callback, and the pad restores r6-r8 and
+ * jumps to the pad after the call of bpf_loop with the r0 of the callback, which
+ * the verifier has checked with the state of that r0. The callback may have no
+ * unwind_exit yet: bpf_insert_recursion_checks() adds the one of the check of a
+ * recursive callback when the loop is inlined already. That pad has to be one the
+ * verifier saw: a loop of no rounds never runs its callback, and an unwind_exit
+ * may sit on a path never taken, so the pad can be dead, and dead code is
+ * removed after the inlining, which sends a jump into it to whatever follows.
+ * The unwind_goto that followed the call of bpf_loop doesn't follow a call
+ * anymore and becomes a no-op jump either way. A loop of no rounds may have no
+ * unwind_goto at all, since the verifier asked for none, and then the insn after
+ * the call is some other insn.
+ */
 static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 			   s32 stack_base, u32 callback_subprogno)
 {
@@ -3186,10 +3201,15 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	int reg_loop_max = BPF_REG_6;
 	int reg_loop_cnt = BPF_REG_7;
 	int reg_loop_ctx = BPF_REG_8;
+	struct bpf_insn *unwind_goto = &env->prog->insnsi[position + 1];
+	bool has_unwind_goto = bpf_is_unwind_goto(unwind_goto);
+	bool pad = has_unwind_goto &&
+		   bpf_subprog_unwinds(&env->subprog_info[callback_subprogno]) &&
+		   env->insn_aux_data[position + 2 + unwind_goto->off].seen;
 
 	struct bpf_insn *insn_buf = env->insn_buf;
 	struct bpf_insn *last;
-	u32 cnt = 0;
+	u32 cnt = 0, call;
 
 	/* This represents an inlined version of bpf_iter.c:bpf_loop,
 	 * be careful to modify this code in sync.
@@ -3198,9 +3218,20 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* Return error and jump to the end of the patch if
 	 * expected number of iterations is too big.
 	 */
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, 2);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, pad ? 6 : 2);
 	insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, -E2BIG);
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, 16);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, pad ? 21 : 16);
+	if (pad) {
+		/*
+		 * The pad: r0 is what the callback unwound with. Nothing falls through to this
+		 * place, so no jump around the pad is needed.
+		 */
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, r6_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_10, r7_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_10, r8_offset);
+		/* to the pad of the caller, the target is set below */
+		insn_buf[cnt++] = BPF_JMP32_A(0);
+	}
 	/* spill R6, R7, R8 to use these as loop vars */
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, r6_offset);
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_7, r7_offset);
@@ -3212,15 +3243,19 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* loop header,
 	 * if reg_loop_cnt >= reg_loop_max skip the loop body
 	 */
-	insn_buf[cnt++] = BPF_JMP_REG(BPF_JGE, reg_loop_cnt, reg_loop_max, 5);
+	insn_buf[cnt++] = BPF_JMP_REG(BPF_JGE, reg_loop_cnt, reg_loop_max, pad ? 6 : 5);
 	/* callback call, the offset is set below */
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_1, reg_loop_cnt);
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_2, reg_loop_ctx);
+	call = cnt;
 	insn_buf[cnt++] = BPF_CALL_REL(0);
+	if (pad)
+		/* to the pad above when the callback left with unwind_exit */
+		insn_buf[cnt++] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, -15, 0);
 	/* increment loop counter */
 	insn_buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, reg_loop_cnt, 1);
 	/* jump to loop header if callback returned 0 */
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, -6);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, pad ? -7 : -6);
 	/* return value of bpf_loop,
 	 * set R0 to the number of iterations
 	 */
@@ -3233,9 +3268,19 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	last = bpf_patch_list_add(env, position, insn_buf, cnt);
 	if (IS_ERR(last))
 		return PTR_ERR(last);
-	/* insn_buf[12] is the BPF_CALL_REL instruction */
-	bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - 12),
+	/* the BPF_CALL_REL instruction */
+	bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - call),
 			    env->subprog_info[callback_subprogno].start, 0);
+	/*
+	 * insn_buf[6] goes where the unwind_goto after the call of bpf_loop goes, whichever side
+	 * of the call that is. A long jump, since an unwind_goto may jump as far as a jump can.
+	 */
+	if (pad)
+		bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - 6),
+				    position + 2 + unwind_goto->off, 0);
+	/* The unwind_goto after the call of bpf_loop follows no call anymore. */
+	if (has_unwind_goto)
+		*unwind_goto = BPF_JMP_A(0);
 	return 0;
 }
 

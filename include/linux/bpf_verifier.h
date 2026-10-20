@@ -1322,6 +1322,8 @@ struct bpf_insn_patch {
 	u32 jmp;		/* 1 + insn of the patch that goes to insn 'jmp_to', 0 if none */
 	u32 jmp_to;
 	u32 jmp_back;		/* or to that many insns in front of the patch of it */
+	u32 jmp2;		/* 1 + one more insn of the patch, which goes to 'jmp2_to' */
+	u32 jmp2_to;
 	struct bpf_insn orig;	/* the replaced insn when the patch was queued */
 };
 
