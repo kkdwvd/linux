@@ -315,6 +315,93 @@ __naked void callx_scalar_callee_called_directly(void)
 		: __clobber_all);
 }
 
+/*
+ * [WIP] No callx here, but another program may call deref_r1() through the
+ * address that is stored to the slot, so it's verified on its own all the
+ * same, with a number for r1.
+ */
+SEC("socket")
+__description("callx scalar: a function whose address is taken is verified without callx")
+__callx_scalar
+__failure __msg("R1 invalid mem access 'scalar'")
+__naked void callx_scalar_addr_taken_no_callx(void)
+{
+	asm volatile (
+		"r6 = %[fn_slot] ll;"
+		"r1 = %[deref_r1] ll;"
+		"*(u64 *)(r6 + 0) = r1;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(fn_slot),
+		  __imm_addr(deref_r1)
+		: __clobber_all);
+}
+
+/* and it's kept: what was stored is a function, not a trap */
+SEC("socket")
+__description("callx scalar: a function whose address is taken is verified without callx, safe")
+__callx_scalar
+__success __retval(7) __log_level(1)
+__msg("Func#1 ('add3') is safe for any scalar args")
+__naked void callx_scalar_addr_taken_no_callx_safe(void)
+{
+	asm volatile (
+		"r6 = %[fn_slot] ll;"
+		"r1 = %[add3] ll;"
+		"*(u64 *)(r6 + 0) = r1;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(fn_slot),
+		  __imm_addr(add3)
+		: __clobber_all);
+}
+
+/*
+ * [WIP] The address is taken in dead code: the verifier doesn't reach the
+ * ld_imm64, and would remove the function with it, but libbpf fills a slot
+ * in arena data with its address. It's verified and kept all the same.
+ */
+SEC("socket")
+__description("callx scalar: a function whose address dead code takes is verified and kept")
+__callx_scalar
+__success __retval(7) __log_level(1)
+__msg("Func#1 ('add3') is safe for any scalar args")
+__naked void callx_scalar_addr_taken_dead(void)
+{
+	asm volatile (
+		"r0 = 7;"
+		"if r0 == 7 goto 1f;"
+		"r6 = %[fn_slot] ll;"
+		"r1 = %[add3] ll;"
+		"*(u64 *)(r6 + 0) = r1;"
+	"1:"
+		"exit;"
+		:
+		: __imm_addr(fn_slot),
+		  __imm_addr(add3)
+		: __clobber_all);
+}
+
+/* without BPF_F_ARENA_SCALAR nothing calls a number, and the function stays unverified */
+SEC("socket")
+__description("callx scalar: a function whose address is taken is not verified without the flag")
+__success __retval(7)
+__naked void callx_scalar_addr_taken_no_flag(void)
+{
+	asm volatile (
+		"r6 = %[fn_slot] ll;"
+		"r1 = %[deref_r1] ll;"
+		"*(u64 *)(r6 + 0) = r1;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(fn_slot),
+		  __imm_addr(deref_r1)
+		: __clobber_all);
+}
+
 /* the callee can't take the lock that the caller holds */
 SEC("tc")
 __description("callx scalar: not under a lock")
