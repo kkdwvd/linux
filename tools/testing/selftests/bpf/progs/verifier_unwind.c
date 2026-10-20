@@ -924,6 +924,7 @@ static unsigned long cb_unwinds(void)
 	);
 }
 
+/* bpf_loop() has a pad for it, so what's missing is the one after the call */
 SEC("tc")
 __description("unwind: callback unwinds")
 __arch_x86_64
