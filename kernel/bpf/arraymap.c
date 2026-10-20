@@ -3,6 +3,7 @@
  * Copyright (c) 2016,2017 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -823,14 +824,18 @@ static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback
 			val = array_map_elem_ptr(array, i);
 		num_elems++;
 		key = i;
-		ret = callback_fn((u64)(long)map, (u64)(long)&key,
-				  (u64)(long)val, (u64)(long)callback_ctx, 0);
+		bpf_call_cb(callback_fn, map, &key, val, callback_ctx, 0, ret, unwound);
 		/* return value: 0 - continue, 1 - stop and return */
 		if (ret)
 			break;
 	}
 
 	return num_elems;
+
+unwound:
+	/* The callback left with unwind_exit: nothing to drop here */
+	bpf_unwind_leave();
+	return ret;
 }
 
 static u64 array_map_mem_usage(const struct bpf_map *map)
