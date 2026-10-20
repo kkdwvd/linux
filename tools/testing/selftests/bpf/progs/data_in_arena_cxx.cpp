@@ -10,6 +10,7 @@
  * vmlinux.h and bpf_helpers.h are not C++.
  */
 #define SEC(name) __attribute__((section(name), used))
+#define __ksym __attribute__((section(".ksyms")))
 #define __noinline __attribute__((noinline))
 
 /* global data of the object is in arena */
@@ -208,6 +209,108 @@ extern "C" SEC("syscall") int destructors(struct ctx *ctx)
 	ctx->sides = dtors;
 	return 0;
 }
+
+#ifdef __BPF_FEATURE_UNWIND
+/*
+ * What is left of the C++ runtime for exceptions. __cxa_throw keeps the
+ * address of the destructor of the thrown object in arena, and the end of
+ * the handler calls it from there, through a number, as the runtime of
+ * std::bpf does.
+ */
+extern "C" {
+int _Unwind_RaiseException(void *exc);
+
+alignas(8) char exc_obj[16];
+/* a destructor doesn't throw */
+void (*exc_dtor)(void *) noexcept;
+
+inline __attribute__((always_inline)) void *__cxa_allocate_exception(unsigned long size) noexcept
+{
+	return exc_obj;
+}
+
+inline __attribute__((always_inline)) void __cxa_throw(void *exc, void *tinfo,
+						       void (*dtor)(void *))
+{
+	exc_dtor = (void (*)(void *) noexcept)dtor;
+	_Unwind_RaiseException(exc);
+}
+
+inline __attribute__((always_inline)) void *__cxa_begin_catch(void *exc) noexcept
+{
+	return exc;
+}
+
+inline __attribute__((always_inline)) void __cxa_end_catch(void) noexcept
+{
+	exc_dtor(exc_obj);
+}
+
+[[noreturn]] void bpf_throw(unsigned long cookie) noexcept __ksym;
+}
+
+namespace std {
+
+/*
+ * clang keeps the unwind edge of a call through a pointer whatever the
+ * pointee's exception specification says, since the kernel checks the call
+ * against every function the pointer could hold. So __cxa_end_catch(), which
+ * is noexcept and calls the destructor through exc_dtor, has a terminate
+ * handler, and the handler calls std::terminate(), which the object has to
+ * define to link. Nothing reaches it: the destructor does not throw. It ends
+ * the program as the runtime of std::bpf does.
+ */
+[[noreturn]] void terminate() noexcept
+{
+	bpf_throw(0);
+}
+
+}
+
+namespace {
+
+/*
+ * Its destructor runs on an object on the stack, called directly, and on the
+ * thrown object, through the address that the throw takes
+ */
+struct Error {
+	long code;
+
+	constexpr Error(long code) : code(code) {}
+	__noinline ~Error()
+	{
+		dtors = dtors * 10 + code;
+	}
+};
+
+}
+
+static __noinline long might_throw(long v)
+{
+	Error e(1);
+
+	asm volatile("" : : "r"(&e) : "memory");
+	if (v > 0)
+		throw Error(2);
+	return v;
+}
+
+extern "C" SEC("syscall") int throws(struct ctx *ctx)
+{
+	long v = 1;
+
+	asm volatile("" : "+r"(v));
+	dtors = 0;
+	try {
+		ctx->area = might_throw(v);
+	} catch (...) {
+		ctx->area = -1;
+	}
+	ctx->vptr = (unsigned long)exc_dtor;
+	ctx->sides = dtors;
+	return 0;
+}
+#endif
 
 static __noinline int str_is(const char *s, const char *expect)
 {
