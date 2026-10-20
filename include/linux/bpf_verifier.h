@@ -1092,6 +1092,7 @@ struct bpf_verifier_env {
 	bool test_reg_invariants;	/* fail verification on register invariants violations */
 	bool arena_scalar;		/* load and store through a number is arena access */
 	bool scalar_callx;		/* [WIP] callx through a number is allowed */
+	bool throw_no_release;		/* [WIP] bpf_throw may leave with resources held */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
 	/* Search pruning optimization, array of list_heads for
 	 * lists of struct bpf_verifier_state_list.

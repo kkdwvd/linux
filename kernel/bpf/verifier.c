@@ -12714,6 +12714,19 @@ static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit
 {
 	int err;
 
+	/*
+	 * [WIP] With BPF_F_THROW_NO_RELEASE an exception exit, a call of
+	 * bpf_throw or of a subprog that throws, may leave the program while it
+	 * holds a lock, IRQs or preemption disabled, the RCU read lock or
+	 * references. A stopgap until bpf_throw releases what the frames of the
+	 * program hold. Until then nothing releases them at run time: locks stay
+	 * taken, IRQs and preemption stay disabled, the RCU read lock stays held,
+	 * and references leak. The exception callback runs with them held too.
+	 * The other checks of a throw still apply.
+	 */
+	if (exception_exit && env->throw_no_release)
+		return 0;
+
 	if (check_lock && env->cur_state->active_locks) {
 		verbose(env, "%s cannot be used inside bpf_spin_lock-ed region\n", prefix);
 		bpf_diag_ctx_active(env, env->insn_idx, prefix, BPF_DIAG_CONTEXT_LOCK,
@@ -20640,7 +20653,10 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		env->jmps_processed++;
 		if (opcode == BPF_CALL) {
-			if (env->cur_state->active_locks) {
+			/* [WIP] it may throw with a lock held, see check_resource_leak() */
+			bool throw_no_release = env->throw_no_release && bpf_is_throw_kfunc(insn);
+
+			if (env->cur_state->active_locks && !throw_no_release) {
 				/* similar to static subprog calls callx is allowed under a lock */
 				if (!bpf_is_callx(insn) &&
 				    ((insn->src_reg == BPF_REG_0 &&
@@ -24406,6 +24422,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
 	/* [WIP] nothing checks what callx of a number calls, see check_scalar_callx() */
 	env->scalar_callx = env->arena_scalar && env->bpf_capable && env->allow_ptr_leaks;
+	/* [WIP] bpf_prog_load() checks the privilege, see check_resource_leak() */
+	env->throw_no_release = attr->prog_flags & BPF_F_THROW_NO_RELEASE;
 
 	env->explored_states = kvzalloc_objs(struct list_head,
 					     state_htab_size(env),
