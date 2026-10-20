@@ -355,6 +355,32 @@ __naked void callx_scalar_addr_taken_no_flag(void)
 		: __clobber_all);
 }
 
+/*
+ * Without CAP_PERFMON, callx of a number is not allowed, whatever the flag
+ * says: a number is a number. With it, the number may be add3(), whose address
+ * is taken. Not run: the number is whatever the helper returns.
+ */
+SEC("socket")
+__description("callx scalar: not without privileges, whatever the flag says")
+__callx_scalar __caps_unpriv(CAP_BPF)
+__success
+__failure_unpriv __msg_unpriv("R1 has type scalar, expected func")
+__naked void callx_scalar_unpriv(void)
+{
+	asm volatile (
+		"r6 = %[add3] ll;"
+		"call %[bpf_get_prandom_u32];"
+		"r1 = r0;"
+		"callx r1;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm_addr(add3)
+		: __clobber_all);
+}
+
+
 /* the callee can't take the lock that the caller holds */
 SEC("tc")
 __description("callx scalar: not under a lock")
