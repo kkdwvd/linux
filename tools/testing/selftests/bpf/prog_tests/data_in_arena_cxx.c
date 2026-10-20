@@ -373,6 +373,26 @@ static void test_virtual_names(void)
 	bpf_object__close(obj);
 }
 
+/*
+ * [WIP] The destructors of an abstract class only trap. Their slots in its
+ * vtable stay NULL, and no copy of them is verified.
+ */
+static void test_abstract(void)
+{
+	struct bpf_object *obj = open_obj("abstract_calls");
+	struct cxx_ctx ctx;
+
+	if (!obj || !ASSERT_OK(bpf_object__load(obj), "load"))
+		goto out;
+	ASSERT_EQ(run(obj, "abstract_calls", &ctx), 0, "abstract_calls");
+	ASSERT_EQ(ctx.vptr, 0, "complete destructor slot");
+	ASSERT_EQ(ctx.static_vptr, 0, "deleting destructor slot");
+	ASSERT_EQ(ctx.area, 4, "kind and name");
+	ASSERT_EQ(ctx.sides, 1, "Abstract::name");
+out:
+	bpf_object__close(obj);
+}
+
 void test_data_in_arena_cxx(void)
 {
 #if !defined(__x86_64__) && !defined(__aarch64__)
@@ -392,4 +412,6 @@ void test_data_in_arena_cxx(void)
 		test_throws();
 	if (test__start_subtest("virtual_names"))
 		test_virtual_names();
+	if (test__start_subtest("abstract"))
+		test_abstract();
 }
