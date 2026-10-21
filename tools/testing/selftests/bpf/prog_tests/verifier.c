@@ -131,6 +131,7 @@
 #include "verifier_uninit.skel.h"
 #include "verifier_unpriv.skel.h"
 #include "verifier_unwind.skel.h"
+#include "verifier_unwind_cb.skel.h"
 #include "verifier_unpriv_perf.skel.h"
 #include "verifier_value_adj_spill.skel.h"
 #include "verifier_value.skel.h"
@@ -322,6 +323,32 @@ void test_verifier_typedef(void)              { RUN(verifier_typedef); }
 void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
+/* The helpers have pads with asm goto outputs only, and the kernel says -ENOTSUPP without */
+static bool cb_pads_supported(void)
+{
+	struct verifier_unwind_cb *skel;
+	struct bpf_program *prog;
+	int err;
+
+	skel = verifier_unwind_cb__open();
+	if (!skel)
+		return true;
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, prog == skel->progs.loop_cb_unwinds);
+	err = verifier_unwind_cb__load(skel);
+	verifier_unwind_cb__destroy(skel);
+	return err != -ENOTSUPP;
+}
+
+void test_verifier_unwind_cb(void)
+{
+	if (!cb_pads_supported()) {
+		printf("%s:SKIP:the helpers have no pads\n", __func__);
+		test__skip();
+		return;
+	}
+	RUN(verifier_unwind_cb);
+}
 void test_verifier_unpriv_perf(void)          { RUN(verifier_unpriv_perf); }
 void test_verifier_value_adj_spill(void)      { RUN(verifier_value_adj_spill); }
 void test_verifier_value(void)                { RUN(verifier_value); }
