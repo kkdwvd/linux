@@ -1541,7 +1541,12 @@ struct ring_buffer;
 struct ring;
 struct user_ring_buffer;
 
-/* Callback-based consumption is unsupported for BPF_F_RB_OVERWRITE maps. */
+/*
+ * Callback-based consumption is unsupported for BPF_F_RB_OVERWRITE maps.
+ *
+ * The callback may be NULL for a ring consumed with the record API (see
+ * ring__next()); callback-based consumption of such a ring fails with -EINVAL.
+ */
 typedef int (*ring_buffer_sample_fn)(void *ctx, void *data, size_t size);
 
 struct ring_buffer_opts {
@@ -1642,6 +1647,118 @@ LIBBPF_API int ring__consume(struct ring *r);
  * @return The number of records consumed, or a negative error code on failure.
  */
 LIBBPF_API int ring__consume_n(struct ring *r, size_t n);
+
+/*
+ * Record API. A BPF ring buffer is a stream of variable-size records written by
+ * BPF programs and consumed in order by one user space consumer. The kernel
+ * tracks a producer position (the end of the reserved records) and a consumer
+ * position (the end of the consumed records); a record is committed once the
+ * program submitted or discarded it. Instead of handing each record to a
+ * callback, the functions below let the consumer fetch records one at a time
+ * and decide itself when they are handed back to the kernel. A ring is used
+ * either through the record API or through the callback API, decided by
+ * whether a sample callback was given when it was set up; the record API
+ * fails with -EINVAL on a ring that has a callback. A ring is used by one
+ * thread at a time.
+ */
+
+/**
+ * struct ring_record describes one record fetched from a ring buffer by
+ * **ring__next()**. Initialize it with LIBBPF_OPTS().
+ */
+struct ring_record {
+	size_t sz;
+	/*
+	 * Record data, 8-byte aligned, in the ring buffer; valid until
+	 * ring__release() or ring__rewind().
+	 */
+	const void *data;
+	/* Logical position of the record in the ring buffer, 8-byte aligned. */
+	unsigned long pos;
+	/* Size of the record data in bytes; may be 0. */
+	__u32 len;
+	/*
+	 * Overwritable ring buffer only: bytes of ring buffer space (records and
+	 * their 8-byte headers) that the producer overwrote between the
+	 * previously fetched record and this one; 0 if nothing was lost. Reported
+	 * again if the record is fetched again after ring__rewind().
+	 */
+	__u64 lost_bytes;
+	size_t :0;
+};
+#define ring_record__last_field lost_bytes
+
+/**
+ * @brief **ring__next()** fetches the next committed record from a ring
+ * buffer.
+ *
+ * Records are fetched in order. Fetching does not consume: the record is only
+ * handed back to the kernel when **ring__release()** publishes the consumer
+ * position. Until then *rec->data* stays valid (for a non-overwritable ring
+ * buffer) and any number of records can be fetched and processed as a batch.
+ * **ring__rewind()** forgets the fetched records instead, so that they are
+ * fetched again by the next call. *rec* is only written when a record is
+ * fetched.
+ *
+ * The producer of an overwritable ring buffer (BPF_F_RB_OVERWRITE) may reuse
+ * the memory of a fetched record at any time; see **ring__check_record()** for how
+ * to consume such a ring buffer.
+ *
+ * The canonical loop, which also implements the wakeup handshake with the
+ * kernel through **ring__release()**, is:
+ *
+ *	LIBBPF_OPTS(ring_record, rec);
+ *	int err;
+ *
+ *	do {
+ *		while ((err = ring__next(r, &rec)) > 0)
+ *			handle(rec.data, rec.len);
+ *	} while (err == 0 && ring__release(r) > 0);
+ *	if (err < 0)
+ *		die();
+ *	// otherwise it is safe to wait for ring__map_fd() to become readable
+ *
+ * @param r A ringbuffer object.
+ * @param rec Record descriptor to fill in; *rec->sz* must be set (use
+ * LIBBPF_OPTS()).
+ * @return 1 if a record was fetched, 0 if no committed record is available
+ * (the oldest unconsumed record may still be being written), or a negative
+ * error code.
+ */
+LIBBPF_API int ring__next(struct ring *r, struct ring_record *rec);
+
+/**
+ * @brief **ring__release()** consumes all records fetched with **ring__next()**
+ * since the previous release, by publishing the consumer position to the
+ * kernel.
+ *
+ * Release in batches when possible: every release includes a full memory
+ * barrier that completes the wakeup handshake with the kernel. Always release
+ * before waiting for the ring buffer to become readable, and fetch again if
+ * this returns 1, otherwise a record committed in the meantime may not produce
+ * a readiness notification. A consumer that fetched records and never
+ * releases keeps the ring buffer readable, so a level-triggered wait returns
+ * immediately, and holds on to ring buffer space (for a non-overwritable ring
+ * buffer).
+ *
+ * @param r A ringbuffer object.
+ * @return 1 if a committed record is already available for the next
+ * **ring__next()**, 0 if there is none, or a negative error code.
+ */
+LIBBPF_API int ring__release(struct ring *r);
+
+/**
+ * @brief **ring__rewind()** forgets the records fetched since the previous
+ * **ring__release()**, so that the next **ring__next()** fetches them again.
+ *
+ * This is how a consumer peeks at records without consuming them, or backs off
+ * when it cannot process the fetched records right now. A consumer that only
+ * ever rewinds keeps the ring buffer readable at all times, see
+ * **ring__release()**.
+ *
+ * @param r A ringbuffer object.
+ */
+LIBBPF_API void ring__rewind(struct ring *r);
 
 struct user_ring_buffer_opts {
 	size_t sz; /* size of this struct, for forward/backward compatibility */

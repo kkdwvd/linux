@@ -30,6 +30,9 @@ struct ring {
 	unsigned long *producer_pos;
 	unsigned long *overwrite_pos;
 	unsigned long mask;
+	/* Record API state: the read cursor and the cached producer position bounding it. */
+	unsigned long next_pos;
+	unsigned long prod_pos;
 	int map_fd;
 	bool overwrite;
 };
@@ -158,6 +161,9 @@ int ring_buffer__add(struct ring_buffer *rb, int map_fd,
 	 */
 	if (r->overwrite)
 		r->overwrite_pos = r->producer_pos + 2;
+	/* Start fetching records where the previous consumer, if any, stopped. */
+	r->next_pos = __atomic_load_n(r->consumer_pos, __ATOMIC_ACQUIRE);
+	r->prod_pos = r->next_pos;
 
 	e = &rb->events[rb->ring_cnt];
 	memset(e, 0, sizeof(*e));
@@ -418,7 +424,7 @@ struct ring *ring_buffer__ring(struct ring_buffer *rb, unsigned int idx)
 
 unsigned long ring__consumer_pos(const struct ring *r)
 {
-	/* Synchronizes with smp_store_release() in ringbuf_process_ring(). */
+	/* Synchronizes with the release stores in ringbuf_process_ring() and ring__release(). */
 	return smp_load_acquire(r->consumer_pos);
 }
 
@@ -473,6 +479,117 @@ int ring__consume_n(struct ring *r, size_t n)
 int ring__consume(struct ring *r)
 {
 	return ring__consume_n(r, INT_MAX);
+}
+
+/*
+ * A ring is consumed either through its sample callback or through the record
+ * API, decided when it was set up: the two keep the consumer position
+ * differently and would corrupt it when mixed.
+ */
+static int ringbuf_record_api_ok(const struct ring *r, const struct ring_record *rec)
+{
+	if (unlikely(r->sample_cb))
+		return -EINVAL;
+	/* The common case is the current layout; older and newer ones go through OPTS_VALID(). */
+	if (!rec || (rec->sz != sizeof(*rec) && !OPTS_VALID(rec, ring_record)))
+		return -EINVAL;
+	return 0;
+}
+
+int ring__next(struct ring *r, struct ring_record *rec)
+{
+	unsigned long pos, prod_pos;
+	__u32 *len_ptr, len, rec_sz;
+	int err;
+
+	err = ringbuf_record_api_ok(r, rec);
+	if (err)
+		return libbpf_err(err);
+
+	pos = r->next_pos;
+	prod_pos = r->prod_pos;
+	for (;;) {
+		if (prod_pos - pos == 0) {
+			/*
+			 * Refresh the window. Synchronizes with smp_store_release()
+			 * in the kernel's __bpf_ringbuf_reserve(), so the headers of
+			 * all records reserved up to prod_pos are visible.
+			 */
+			prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+			r->prod_pos = prod_pos;
+			if (prod_pos - pos == 0)
+				break;
+		}
+
+		len_ptr = r->data + (pos & r->mask);
+		/*
+		 * Synchronizes with the xchg() in the kernel's bpf_ringbuf_commit():
+		 * once the busy bit is clear, the record data is visible.
+		 */
+		len = __atomic_load_n(len_ptr, __ATOMIC_ACQUIRE);
+		/* The oldest record is still being written, nothing to fetch yet. */
+		if (len & BPF_RINGBUF_BUSY_BIT)
+			break;
+
+		rec_sz = roundup_len(len);
+		pos += rec_sz;
+		if (len & BPF_RINGBUF_DISCARD_BIT)
+			continue;
+
+		r->next_pos = pos;
+		OPTS_SET(rec, data, (const void *)len_ptr + BPF_RINGBUF_HDR_SZ);
+		OPTS_SET(rec, pos, pos - rec_sz);
+		OPTS_SET(rec, len, len & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT));
+		OPTS_SET(rec, lost_bytes, 0);
+		return 1;
+	}
+	/* Skipped discarded records are gone for good, do not fetch them again. */
+	r->next_pos = pos;
+	return 0;
+}
+
+int ring__release(struct ring *r)
+{
+	unsigned long pos = r->next_pos, prod_pos;
+	__u32 len;
+
+	if (unlikely(r->sample_cb))
+		return libbpf_err(-EINVAL);
+
+	/*
+	 * Consume everything fetched so far. Pairs with smp_load_acquire() of
+	 * the consumer position in the kernel, both in __bpf_ringbuf_reserve()
+	 * (space accounting) and in bpf_ringbuf_commit() (wakeup decision).
+	 */
+	__atomic_store_n(r->consumer_pos, pos, __ATOMIC_RELEASE);
+
+	/*
+	 * The kernel commits a record with a full barrier (the xchg() in
+	 * bpf_ringbuf_commit()) and then reads the consumer position to decide
+	 * whether to wake us up. Order our published position before the loads
+	 * below, so that we either see the record or the producer sees our
+	 * position; without this StoreLoad barrier both sides can read stale
+	 * values and we would sleep on a non-empty ring.
+	 */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+	r->prod_pos = prod_pos;
+	if (prod_pos - pos == 0)
+		return 0;
+	len = __atomic_load_n((__u32 *)(r->data + (pos & r->mask)), __ATOMIC_ACQUIRE);
+	/* A busy record wakes us up once committed, as we published its position. */
+	return len & BPF_RINGBUF_BUSY_BIT ? 0 : 1;
+}
+
+void ring__rewind(struct ring *r)
+{
+	if (unlikely(r->sample_cb))
+		return;
+
+	r->next_pos = __atomic_load_n(r->consumer_pos, __ATOMIC_ACQUIRE);
+	/* Force ring__next() to re-read the producer position. */
+	r->prod_pos = r->next_pos;
 }
 
 static void user_ringbuf_unmap_ring(struct user_ring_buffer *rb)
