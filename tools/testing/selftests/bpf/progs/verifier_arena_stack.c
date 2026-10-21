@@ -396,6 +396,43 @@ __naked void unwind(void)
 	: __clobber_all);
 }
 
+static __naked __noinline __used long cb_unwinds(void)
+{
+	asm volatile (
+	"r0 = 0;"
+	".8byte %[unwind_exit];"
+	:: __imm_insn(unwind_exit, BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0))
+	: __clobber_all);
+}
+
+/* A helper doesn't keep the register that r12 is in: it is loaded again on the way to the pad */
+SEC("syscall")
+__description("arena stack: r12 in the landing pad after a helper")
+__arch_x86_64
+__success __retval(5)
+__naked void unwind_out_of_helper(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+	".8byte %[st];"		/* *(u64 *)(r12 - 16) = 5 */
+	"r1 = 1;"
+	"r2 = %[cb_unwinds] ll;"
+	"r3 = 0;"
+	"r4 = %[first_r12] ll;"	/* 0, not known to the verifier: bpf_loop() is not inlined */
+	"r4 = *(u64 *)(r4 + 0);"
+	"call %[bpf_loop];"
+	".8byte %[unwind_goto];"
+	"r0 = 1;"
+	"exit;"
+	".8byte %[ldx];"	/* r0 = *(u64 *)(r12 - 16) */
+	"exit;"
+	:
+	: __imm_addr(cb_unwinds), __imm_addr(first_r12), __imm(bpf_loop), __imm_insn(adj, ADJ(16)),
+	  __imm_insn(st, ST(BPF_DW, -16, 5)), __imm_insn(ldx, LDX(BPF_DW, BPF_REG_0, -16)),
+	  __imm_insn(unwind_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 2, 0))
+	: __clobber_all);
+}
+
 #ifdef __BPF_FEATURE_STACK_ARGUMENT
 
 extern __u64 bpf_kfunc_call_stack_arg(__u64 a, __u64 b, __u64 c, __u64 d, __u64 e, __u64 f,
