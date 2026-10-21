@@ -267,6 +267,14 @@ decode_code() {
 }
 
 handle_line() {
+	# BPF programs have no vmlinux symbol; keep their kernel-provided line info.
+	local bpf_prog='(^|[[:space:]:(])bpf_prog_[0-9a-f]{16}(_[[:alnum:]_.]+)?\+0x[0-9a-f]+/0x[0-9a-f]+'
+
+	if [[ $1 =~ $bpf_prog ]]; then
+		printf '%s\n' "$1"
+		return
+	fi
+
 	if [[ $basepath == "auto" && $vmlinux != "" ]] ; then
 		module=""
 		symbol="kernel_init+0x0/0x0"
@@ -346,7 +354,7 @@ handle_line() {
 	echo "${spaces[$last]}${symbol}${module:+ ${module}}${info_str:+ ${info_str}}"
 }
 
-while read line; do
+while read -r line; do
 	# Strip unexpected carriage return at end of line
 	line=${line%$'\r'}
 
