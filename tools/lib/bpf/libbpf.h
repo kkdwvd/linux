@@ -1722,8 +1722,9 @@ struct ring_record {
  * @param rec Record descriptor to fill in; *rec->sz* must be set (use
  * LIBBPF_OPTS()).
  * @return 1 if a record was fetched, 0 if no committed record is available
- * (the oldest unconsumed record may still be being written), or a negative
- * error code.
+ * (the oldest unconsumed record may still be being written, or the producer
+ * of an overwritable ring buffer kept lapping the consumer; in both cases
+ * **ring__release()** says whether to try again), or a negative error code.
  */
 LIBBPF_API int ring__next(struct ring *r, struct ring_record *rec);
 
@@ -1759,6 +1760,38 @@ LIBBPF_API int ring__release(struct ring *r);
  * @param r A ringbuffer object.
  */
 LIBBPF_API void ring__rewind(struct ring *r);
+
+/**
+ * @brief **ring__check_record()** checks that a record fetched from an overwritable
+ * ring buffer (BPF_F_RB_OVERWRITE) was not overwritten while being read.
+ *
+ * The producer of an overwritable ring buffer discards the oldest records
+ * when it runs out of space and may reuse the memory of a fetched record at
+ * any time. A consumer therefore reads or copies the record data first,
+ * without acting on it, and then calls **ring__check_record()**. On success the data
+ * read before the call was intact, and so was that of every record fetched
+ * between this one and the call, because they all lie between it and the
+ * producer position: a batch is verified by fetching it and then checking its
+ * first record, which costs one load of the producer position per batch.
+ * Records fetched after the call need a check of their own. When the check
+ * fails, every record fetched since the previous successful check (or release
+ * or rewind) is invalid too, older and newer alike; the next **ring__next()**
+ * continues from the oldest intact record and reports the lost bytes. Check
+ * records in fetch order: a failed check of an older record also rewinds past
+ * newer records that were already checked, and they are fetched again.
+ *
+ * Records that were already overwritten before they were fetched never show
+ * up; they are reported in *rec->lost_bytes* of the next record. The check
+ * is a no-op on a non-overwritable ring buffer, where a fetched record stays
+ * intact until **ring__release()**. See Documentation/bpf/ringbuf.rst for the
+ * protocol.
+ *
+ * @param r A ringbuffer object.
+ * @param rec A record fetched with **ring__next()** and not released yet.
+ * @return 0 if the record is intact, -EOVERFLOW if it may have been
+ * overwritten, or another negative error code.
+ */
+LIBBPF_API int ring__check_record(struct ring *r, const struct ring_record *rec);
 
 struct user_ring_buffer_opts {
 	size_t sz; /* size of this struct, for forward/backward compatibility */

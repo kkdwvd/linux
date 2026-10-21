@@ -33,9 +33,21 @@ struct ring {
 	/* Record API state: the read cursor and the cached producer position bounding it. */
 	unsigned long next_pos;
 	unsigned long prod_pos;
+	/*
+	 * Overwrite mode: bytes lost to the producer, not yet reported with a
+	 * record, and their value at the last release, which a rewind restores.
+	 */
+	__u64 pending_lost;
+	__u64 released_lost;
 	int map_fd;
 	bool overwrite;
 };
+
+/*
+ * Bound on how often one call re-reads the positions of an overwritable ring
+ * buffer whose producer keeps lapping the consumer before it can read a record.
+ */
+#define RINGBUF_OVERWRITE_RETRIES 8
 
 struct ring_buffer {
 	struct epoll_event *events;
@@ -496,11 +508,47 @@ static int ringbuf_record_api_ok(const struct ring *r, const struct ring_record 
 	return 0;
 }
 
+/*
+ * Overwrite mode: re-read the producer and overwrite positions and move the
+ * cursor past the records the producer discarded. Returns false if the two
+ * positions could not be read consistently.
+ */
+static bool ringbuf_overwrite_resync(struct ring *r, unsigned long *pos, unsigned long *prod_pos)
+{
+	unsigned long prod, over;
+	int i;
+
+	for (i = 0; i < RINGBUF_OVERWRITE_RETRIES; i++) {
+		prod = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+		/*
+		 * The kernel writes overwrite_pos before it publishes producer_pos,
+		 * so this value is at least as recent as prod. It can be more
+		 * recent, in which case the pair is inconsistent: a consistent pair
+		 * is never more than a ring apart.
+		 */
+		over = __atomic_load_n(r->overwrite_pos, __ATOMIC_RELAXED);
+		if (prod - over <= r->mask)
+			goto consistent;
+	}
+	return false;
+
+consistent:
+	/* If the overwrite position is newer than the cursor, the gap is lost. */
+	if (prod - *pos > prod - over) {
+		r->pending_lost += over - *pos;
+		*pos = over;
+	}
+	*prod_pos = prod;
+	r->prod_pos = prod;
+	return true;
+}
+
 int ring__next(struct ring *r, struct ring_record *rec)
 {
 	unsigned long pos, prod_pos;
 	__u32 *len_ptr, len, rec_sz;
-	int err;
+	int retries = 0, err;
+	bool refresh = false, busy = false;
 
 	err = ringbuf_record_api_ok(r, rec);
 	if (err)
@@ -509,14 +557,26 @@ int ring__next(struct ring *r, struct ring_record *rec)
 	pos = r->next_pos;
 	prod_pos = r->prod_pos;
 	for (;;) {
-		if (prod_pos - pos == 0) {
-			/*
-			 * Refresh the window. Synchronizes with smp_store_release()
-			 * in the kernel's __bpf_ringbuf_reserve(), so the headers of
-			 * all records reserved up to prod_pos are visible.
-			 */
-			prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
-			r->prod_pos = prod_pos;
+		/* Out of window, after a skipped record too, or asked to resync. */
+		if (prod_pos - pos == 0 || refresh) {
+			refresh = false;
+			if (!r->overwrite) {
+				/*
+				 * Synchronizes with smp_store_release() in the kernel's
+				 * __bpf_ringbuf_reserve(), so the headers of all records
+				 * reserved up to prod_pos are visible.
+				 */
+				prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+				r->prod_pos = prod_pos;
+			} else if (retries++ == RINGBUF_OVERWRITE_RETRIES ||
+				   !ringbuf_overwrite_resync(r, &pos, &prod_pos)) {
+				/*
+				 * The producer keeps lapping us faster than we can read
+				 * two words. Give up for now; ring__release() reports
+				 * the data as available and the caller comes back.
+				 */
+				break;
+			}
 			if (prod_pos - pos == 0)
 				break;
 		}
@@ -527,11 +587,36 @@ int ring__next(struct ring *r, struct ring_record *rec)
 		 * once the busy bit is clear, the record data is visible.
 		 */
 		len = __atomic_load_n(len_ptr, __ATOMIC_ACQUIRE);
+		rec_sz = roundup_len(len);
+
+		if (r->overwrite) {
+			/*
+			 * The producer may have lapped the cursor, in which case the
+			 * header belongs to a newer record or is data of one. A lap
+			 * already observed by ring__check_record() shows as a window wider
+			 * than the ring; garbage shows as a record that does not fit
+			 * the window; the rest is left to ring__check_record(). Either way,
+			 * resynchronize.
+			 */
+			if (prod_pos - pos > r->mask || rec_sz > prod_pos - pos) {
+				refresh = true;
+				continue;
+			}
+			/*
+			 * A busy record normally means its producer is still writing
+			 * it, but here it may also be a stale header of a lapped
+			 * cursor, which would never clear. Check once.
+			 */
+			if (len & BPF_RINGBUF_BUSY_BIT && !busy) {
+				busy = true;
+				refresh = true;
+				continue;
+			}
+		}
 		/* The oldest record is still being written, nothing to fetch yet. */
 		if (len & BPF_RINGBUF_BUSY_BIT)
 			break;
 
-		rec_sz = roundup_len(len);
 		pos += rec_sz;
 		if (len & BPF_RINGBUF_DISCARD_BIT)
 			continue;
@@ -540,12 +625,64 @@ int ring__next(struct ring *r, struct ring_record *rec)
 		OPTS_SET(rec, data, (const void *)len_ptr + BPF_RINGBUF_HDR_SZ);
 		OPTS_SET(rec, pos, pos - rec_sz);
 		OPTS_SET(rec, len, len & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT));
-		OPTS_SET(rec, lost_bytes, 0);
+		OPTS_SET(rec, lost_bytes, r->pending_lost);
+		r->pending_lost = 0;
 		return 1;
 	}
 	/* Skipped discarded records are gone for good, do not fetch them again. */
 	r->next_pos = pos;
 	return 0;
+}
+
+int ring__check_record(struct ring *r, const struct ring_record *rec)
+{
+	unsigned long prod_pos, cons_pos;
+	int err;
+
+	err = ringbuf_record_api_ok(r, rec);
+	if (err || !OPTS_HAS(rec, pos))
+		return libbpf_err(err ?: -EINVAL);
+	if (!r->overwrite)
+		return 0;
+
+	/*
+	 * Order the caller's reads of the record data before the read of the
+	 * producer position (this is smp_rmb()). Pairs with the smp_wmb() the
+	 * kernel issues after publishing the producer position in overwrite
+	 * mode, which keeps the data of a new record from becoming visible
+	 * before the position that announces it.
+	 */
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+	/* Let ring__next() see the fresh value, so it notices a lap right away. */
+	r->prod_pos = prod_pos;
+
+	/*
+	 * The same rule the kernel uses to advance the overwrite position: the
+	 * record is intact as long as the producer is less than a ring ahead
+	 * of it. Positions only move forward, so this covers every record
+	 * fetched after this one as well.
+	 */
+	if (prod_pos - rec->pos <= r->mask)
+		return 0;
+
+	/*
+	 * Everything fetched from this record on is suspect, including the
+	 * cursor itself: a header read after the lap may have advanced it by
+	 * a garbage length to a position that is no record boundary, possibly
+	 * inside the live window where the window check cannot tell. Go back
+	 * to the record and let ring__next() resynchronize to the overwrite
+	 * position, which also accounts the gap from the record on; the gap
+	 * reported with the record is ahead of the cursor again. Leave the
+	 * cursor alone for a stale descriptor of an already released record.
+	 */
+	cons_pos = __atomic_load_n(r->consumer_pos, __ATOMIC_RELAXED);
+	if (r->next_pos - rec->pos <= r->next_pos - cons_pos) {
+		r->next_pos = rec->pos;
+		r->prod_pos = rec->pos;
+		r->pending_lost = OPTS_GET(rec, lost_bytes, 0);
+	}
+	return libbpf_err(-EOVERFLOW);
 }
 
 int ring__release(struct ring *r)
@@ -572,14 +709,31 @@ int ring__release(struct ring *r)
 	 * values and we would sleep on a non-empty ring.
 	 */
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	/* A gap found but not yet reported is behind the published position now. */
+	r->released_lost = r->pending_lost;
 
 	prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
 	r->prod_pos = prod_pos;
 	if (prod_pos - pos == 0)
 		return 0;
+	/* Lapped: there is data to read from the overwrite position on. */
+	if (r->overwrite && prod_pos - pos > r->mask)
+		return 1;
 	len = __atomic_load_n((__u32 *)(r->data + (pos & r->mask)), __ATOMIC_ACQUIRE);
+	if (!(len & BPF_RINGBUF_BUSY_BIT))
+		return 1;
 	/* A busy record wakes us up once committed, as we published its position. */
-	return len & BPF_RINGBUF_BUSY_BIT ? 0 : 1;
+	if (!r->overwrite)
+		return 0;
+	/*
+	 * Unless the busy bit is a payload byte of a record that lapped us
+	 * between the two loads above, which never clears: the data of a
+	 * lapping record is ordered after its producer position, not before,
+	 * so re-read the position after the header (ordered by its acquire).
+	 */
+	prod_pos = __atomic_load_n(r->producer_pos, __ATOMIC_ACQUIRE);
+	r->prod_pos = prod_pos;
+	return prod_pos - pos > r->mask;
 }
 
 void ring__rewind(struct ring *r)
@@ -590,6 +744,11 @@ void ring__rewind(struct ring *r)
 	r->next_pos = __atomic_load_n(r->consumer_pos, __ATOMIC_ACQUIRE);
 	/* Force ring__next() to re-read the producer position. */
 	r->prod_pos = r->next_pos;
+	/*
+	 * A gap found since the last release is recomputed from the published
+	 * position; one found before it is still owed to the next record.
+	 */
+	r->pending_lost = r->released_lost;
 }
 
 static void user_ringbuf_unmap_ring(struct user_ring_buffer *rb)
