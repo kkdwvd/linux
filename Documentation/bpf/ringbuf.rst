@@ -125,7 +125,9 @@ buffer.  Currently 4 are supported:
 - ``BPF_RB_AVAIL_DATA`` returns amount of unconsumed data in ring buffer;
 - ``BPF_RB_RING_SIZE`` returns the size of ring buffer;
 - ``BPF_RB_CONS_POS``/``BPF_RB_PROD_POS`` returns current logical position
-  of consumer/producer, respectively.
+  of consumer/producer, respectively;
+- ``BPF_RB_OVERWRITE_POS`` returns the logical position of the oldest record
+  that has not been overwritten yet (see `Overwrite mode`_ below).
 
 Returned values are momentarily snapshots of ring buffer state and could be
 off by the time helper returns, so this should be used only for
@@ -204,3 +206,61 @@ buffer. For extreme cases, when BPF program wants more manual control of
 notifications, commit/discard/output helpers accept ``BPF_RB_NO_WAKEUP`` and
 ``BPF_RB_FORCE_WAKEUP`` flags, which give full control over notifications of
 data availability, but require extra caution and diligence in using this API.
+
+Overwrite mode
+--------------
+
+A ring buffer created with the ``BPF_F_RB_OVERWRITE`` map flag never refuses
+a reservation because the consumer is behind. When the buffer is full, the
+producer instead discards the oldest committed records and reuses their memory,
+so the buffer always holds the most recent records. This is the behavior wanted
+for flight-recorder style use cases, where data stays in the kernel until
+something goes wrong and only the last few records are of interest.
+
+The producer page (the second page of the map's mmap() area, mapped read-only
+in user space) holds three ``unsigned long`` positions in this order: the
+producer position, the pending position (the oldest reservation that was not
+committed yet, used only by producers to avoid stepping on each other), and the
+overwrite position. The overwrite position points at the oldest record that has
+not been overwritten. The producer advances it over whole records before it
+publishes a reservation that reuses their memory, so at any point in time the
+distance between the producer position and the overwrite position is less than
+the size of the ring buffer. The overwrite position is written before the
+producer position is published with a store-release, so a consumer that reads
+the producer position with a load-acquire and the overwrite position afterwards
+sees an overwrite position at least as recent as the producer position it read.
+
+Nothing stops the producer while the consumer is reading, so a consumer of an
+overwritable ring buffer has to read optimistically and validate afterwards,
+treating the producer position as the version counter of a seqlock:
+
+1. Read the producer position (load-acquire), then the overwrite position.
+   Start from the consumer position, or from the overwrite position if that is
+   more recent. Everything before the overwrite position is lost.
+2. Read the record header. The header may belong to a newer record or be
+   payload of a newer record if the producer lapped the consumer in between,
+   so the length must be bounds-checked before it is used.
+3. Read or copy the record data, but do not act on it yet.
+4. Execute a read barrier and re-read the producer position. The record is
+   intact if the producer position is less than one ring size ahead of the
+   record's position, which is the same rule the producer uses to advance the
+   overwrite position. Otherwise the producer may have reused the record's
+   memory while it was being read; the data must be discarded and the walk
+   restarted from the current overwrite position.
+
+Because all positions only move forward, checking the oldest record of a batch
+in step 4 validates every record read after it as well.
+
+For this scheme to be sound, the record data a producer writes after
+``bpf_ringbuf_reserve()`` returns must not become visible before the producer
+position that announces the reservation, which is why ``__bpf_ringbuf_reserve()``
+issues a write barrier after publishing the producer position in overwrite mode.
+A store-release orders only the stores before it.
+
+Wakeups work as in the regular mode, so a consumer that keeps up and publishes
+its consumer position can use epoll as usual. A consumer that never consumes
+and only dumps the buffer on demand will find the map file descriptor always
+readable.
+
+On 32-bit systems all positions wrap around; consumers must compare positions
+by subtracting them, never by their magnitude.
