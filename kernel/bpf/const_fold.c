@@ -285,6 +285,15 @@ redo:
 		for (r = BPF_REG_0; r < ARRAY_SIZE(aux->const_reg_vals); r++) {
 			struct const_arg_info *c = &ci[r];
 
+			/*
+			 * The revisit of a call with a callback that unwound
+			 * carries the r0 of the callback, see check_helper_call():
+			 * r0 is no constant of that insn.
+			 */
+			if (r == BPF_REG_0 && i + 1 < insn_cnt &&
+			    bpf_is_sync_callback_calling_insn(&insns[i]) &&
+			    bpf_is_unwind_goto(&insns[i + 1]))
+				continue;
 			switch (c->state) {
 			case CONST_ARG_CONST: {
 				u64 val = c->val;
