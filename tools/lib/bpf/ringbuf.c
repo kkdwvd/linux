@@ -28,6 +28,7 @@ struct ring {
 	void *data;
 	unsigned long *consumer_pos;
 	unsigned long *producer_pos;
+	unsigned long *overwrite_pos;
 	unsigned long mask;
 	int map_fd;
 	bool overwrite;
@@ -150,6 +151,13 @@ int ring_buffer__add(struct ring_buffer *rb, int map_fd,
 	}
 	r->producer_pos = tmp;
 	r->data = tmp + rb->page_size;
+	/*
+	 * The producer page holds the producer position, the pending position
+	 * (only meaningful to producers) and, for overwritable rings, the
+	 * overwrite position, all unsigned long and in this order.
+	 */
+	if (r->overwrite)
+		r->overwrite_pos = r->producer_pos + 2;
 
 	e = &rb->events[rb->ring_cnt];
 	memset(e, 0, sizeof(*e));
@@ -424,11 +432,21 @@ unsigned long ring__producer_pos(const struct ring *r)
 
 size_t ring__avail_data_size(const struct ring *r)
 {
-	unsigned long cons_pos, prod_pos;
+	unsigned long cons_pos, prod_pos, over_pos;
 
 	cons_pos = ring__consumer_pos(r);
 	prod_pos = ring__producer_pos(r);
-	return prod_pos - cons_pos;
+	if (!r->overwrite)
+		return prod_pos - cons_pos;
+
+	/*
+	 * Records behind the overwrite position are gone. The kernel writes the
+	 * overwrite position before it publishes the producer position, so
+	 * reading it after the acquire load above yields a value at least as
+	 * recent as prod_pos. Compare distances, as positions wrap on 32-bit.
+	 */
+	over_pos = __atomic_load_n(r->overwrite_pos, __ATOMIC_RELAXED);
+	return min(prod_pos - cons_pos, prod_pos - over_pos);
 }
 
 size_t ring__size(const struct ring *r)
