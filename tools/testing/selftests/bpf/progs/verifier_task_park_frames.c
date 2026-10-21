@@ -203,8 +203,8 @@ int reference_across_global_subprog_park(void *ctx)
 }
 
 /*
- * No callback may park: not directly, not through a static or a global
- * function.
+ * No callback other than the body of a BPF kthread may park: not directly, not
+ * through a static or a global function.
  */
 static int park_cb(__u32 index, void *data)
 {
