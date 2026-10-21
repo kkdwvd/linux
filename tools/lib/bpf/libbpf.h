@@ -1580,6 +1580,36 @@ LIBBPF_API int ring_buffer__epoll_fd(const struct ring_buffer *rb);
 LIBBPF_API struct ring *ring_buffer__ring(struct ring_buffer *rb,
 					  unsigned int idx);
 
+struct ring_opts {
+	size_t sz;
+	size_t :0;
+};
+#define ring_opts__last_field sz
+
+/**
+ * @brief **ring__new()** sets up a single BPF ring buffer for consumption with
+ * the record API, without a ring buffer manager.
+ *
+ * Use it when the application drives its own event loop: register
+ * **ring__map_fd()** for EPOLLIN (level- or edge-triggered) and drain the ring
+ * with **ring__next()** and **ring__release()** when it becomes readable. Rings
+ * obtained from **ring_buffer__ring()** are owned by their manager and must not
+ * be passed to **ring__free()**.
+ *
+ * @param map_fd File descriptor of a BPF_MAP_TYPE_RINGBUF map; it is not
+ * duplicated and must stay open for as long as the ring is used.
+ * @param opts Options, currently none; pass NULL.
+ * @return A ring object, or NULL with errno set.
+ */
+LIBBPF_API struct ring *ring__new(int map_fd, const struct ring_opts *opts);
+
+/**
+ * @brief **ring__free()** frees a ring created with **ring__new()**.
+ *
+ * @param r A ringbuffer object, may be NULL.
+ */
+LIBBPF_API void ring__free(struct ring *r);
+
 /**
  * @brief **ring__consumer_pos()** returns the current consumer position in the
  * given ringbuffer.
