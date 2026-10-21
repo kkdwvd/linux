@@ -2581,8 +2581,8 @@ static void init_func_state(struct bpf_verifier_env *env,
 
 /* Similar to push_stack(), but for async callbacks */
 static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
-						int insn_idx, int prev_insn_idx,
-						int subprog, bool is_sleepable)
+						int insn_idx, int subprog,
+						bool is_sleepable)
 {
 	struct bpf_verifier_stack_elem *elem;
 	struct bpf_func_state *frame;
@@ -2592,7 +2592,15 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 		return ERR_PTR(-ENOMEM);
 
 	elem->insn_idx = insn_idx;
-	elem->prev_insn_idx = prev_insn_idx;
+	/*
+	 * The callback starts as a program does, with no instruction before
+	 * its first: the call that queues it is not on its path. Backtracking
+	 * for precision stops at the callback's entry and treats what it still
+	 * seeks there as the callback's arguments, as it does for a global
+	 * function; with the call recorded as the previous instruction, it
+	 * would walk into the call and the instructions before it instead.
+	 */
+	elem->prev_insn_idx = -1;
 	elem->next = env->head;
 	elem->log_pos = env->log.end_pos;
 	elem->diag_log_pos = bpf_diag_event_log_save(env);
@@ -2611,6 +2619,8 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 	 */
 	elem->st.branches = 1;
 	elem->st.in_sleepable = is_sleepable;
+	elem->st.first_insn_idx = insn_idx;
+	elem->st.last_insn_idx = -1;
 	frame = kzalloc_obj(*frame, GFP_KERNEL_ACCOUNT);
 	if (!frame)
 		return ERR_PTR(-ENOMEM);
@@ -11680,8 +11690,7 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 
 		/* there is no real recursion here. timer and workqueue callbacks are async */
 		env->subprog_info[subprog].is_async_cb = true;
-		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
-					 insn_idx, subprog,
+		async_cb = push_async_cb(env, env->subprog_info[subprog].start, subprog,
 					 is_async_cb_sleepable(env, insn));
 		if (IS_ERR(async_cb))
 			return PTR_ERR(async_cb);
