@@ -20,6 +20,7 @@
 #include <linux/unaligned.h>
 #include <linux/filter.h>
 #include <linux/rcupdate_trace.h>
+#include <linux/stacktrace.h>
 #include <net/sock.h>
 #include <linux/namei.h>
 #include "bpf_testmod.h"
@@ -244,6 +245,30 @@ __bpf_kfunc void
 bpf_testmod_test_mod_kfunc(int i)
 {
 	*(int *)this_cpu_ptr(&bpf_testmod_ksym_percpu) = i;
+}
+
+__bpf_kfunc int bpf_kfunc_stack_trace(char *buf, u32 buf__sz, bool print)
+{
+#ifdef CONFIG_STACKTRACE
+	unsigned long entries[16];
+	unsigned int nr, i, len = 0;
+
+	nr = stack_trace_save(entries, ARRAY_SIZE(entries), 0);
+	for (i = 0; i < nr && len < buf__sz; i++)
+		len += scnprintf(buf + len, buf__sz - len, "%pB\n", (void *)entries[i]);
+	if (print)
+		dump_stack();
+	return len;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+__bpf_kfunc int bpf_kfunc_stack_trace_symbol(char *buf, u32 buf__sz, u64 addr, bool backtrace)
+{
+	if (backtrace)
+		return snprintf(buf, buf__sz, "%pB", (void *)(unsigned long)addr);
+	return snprintf(buf, buf__sz, "%pS", (void *)(unsigned long)addr);
 }
 
 __bpf_kfunc int bpf_iter_testmod_seq_new(struct bpf_iter_testmod_seq *it, s64 value, int cnt)
@@ -1891,6 +1916,8 @@ __bpf_kfunc void bpf_kfunc_trigger_ctx_check(void)
 
 BTF_KFUNCS_START(bpf_testmod_check_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_testmod_test_mod_kfunc, KF_SPINLOCK_SAFE)
+BTF_ID_FLAGS(func, bpf_kfunc_stack_trace)
+BTF_ID_FLAGS(func, bpf_kfunc_stack_trace_symbol)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test1)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test2)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test3)
