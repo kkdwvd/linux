@@ -1204,6 +1204,8 @@ struct bpf_subprog_info {
 	bool keep_fastcall_stack: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
+	/* some call reachable from this subprog may be bpf_task_park() */
+	bool might_park: 1;
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
@@ -2363,6 +2365,7 @@ static inline bool bpf_is_kfunc_sleepable(struct bpf_call_arg_meta *meta)
 	return meta->kfunc_flags & KF_SLEEPABLE;
 }
 bool bpf_is_kfunc_pkt_changing(struct bpf_call_arg_meta *meta);
+bool bpf_is_task_park_kfunc(struct bpf_call_arg_meta *meta);
 bool bpf_grow_array(struct bpf_verifier_env *env, void *array, u32 *cap, u32 cnt, size_t size);
 struct bpf_iarray *bpf_iarray_realloc(struct bpf_iarray *old, size_t n_elem);
 int bpf_copy_insn_array_uniq(struct bpf_map *map, u32 start, u32 end, u32 *off);
