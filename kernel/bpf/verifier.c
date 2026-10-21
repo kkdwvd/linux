@@ -14366,6 +14366,7 @@ enum special_kfunc_type {
 	KF_bpf_call_rcu_tasks_trace,
 	KF_bpf_kthread_create,
 	KF_bpf_kthread_stop,
+	KF_bpf_kthread_bind,
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
@@ -14461,6 +14462,7 @@ BTF_ID(func, bpf_call_rcu)
 BTF_ID(func, bpf_call_rcu_tasks_trace)
 BTF_ID(func, bpf_kthread_create)
 BTF_ID(func, bpf_kthread_stop)
+BTF_ID(func, bpf_kthread_bind)
 #if defined(CONFIG_MMU) && defined(CONFIG_64BIT)
 BTF_ID(func, bpf_arena_alloc_pages)
 BTF_ID(func, bpf_arena_free_pages)
@@ -14507,7 +14509,8 @@ static bool is_migrating_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_task_park] ||
 	       btf_id == special_kfunc_list[KF_bpf_kthread_create] ||
-	       btf_id == special_kfunc_list[KF_bpf_kthread_stop];
+	       btf_id == special_kfunc_list[KF_bpf_kthread_stop] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_bind];
 }
 
 static bool is_bpf_obj_new_kfunc(u32 func_id)
