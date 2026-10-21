@@ -138,6 +138,20 @@ specifier.
 		(with __builtin_extract_return_addr() translation)
 	%pBb	prev_fn_of_versatile_init+0x88/0x88 [module_name ed5019fdf5e53be37cb1ba7899292d7e143b259e]
 
+For JITed BPF programs with BTF line information, ``S`` and ``B`` also print
+the source filename, line and column::
+
+	%pB	bpf_prog_0123456789abcdef_foo+0x24/0x40 (foo.bpf.c:12:3)
+
+``S`` describes the supplied instruction address, while ``B`` describes the
+instruction preceding the return address.
+
+The filename is a basename, with whitespace, non-printable characters,
+backslashes and delimiters hex-escaped. Long filenames are truncated with
+``...`` while retaining the line and column. Programs without line information
+keep the usual symbol and offset format. ``scripts/decode_stacktrace.sh``
+preserves BPF frames, whose source information is already in the trace.
+
 Probed Pointers from BPF / tracing
 ----------------------------------
 

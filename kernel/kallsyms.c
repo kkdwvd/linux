@@ -495,6 +495,8 @@ static int __sprint_symbol(char *buffer, unsigned long address,
 		if (add_buildid)
 			len += append_buildid(buffer + len, modname, buildid);
 		len += sprintf(buffer + len, "]");
+	} else if (add_offset && !is_ksym_addr(address)) {
+		len += bpf_address_source(buffer + len, KSYM_SYMBOL_LEN - len, address);
 	}
 
 	return len;

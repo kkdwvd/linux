@@ -1651,6 +1651,15 @@ static inline void bpf_jit_prog_release_other(struct bpf_prog *fp, struct bpf_pr
 }
 #endif /* CONFIG_BPF_JIT */
 
+#if defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
+int bpf_address_source(char *buf, size_t size, unsigned long addr);
+#else
+static inline int bpf_address_source(char *buf, size_t size, unsigned long addr)
+{
+	return 0;
+}
+#endif
+
 void bpf_prog_kallsyms_del_all(struct bpf_prog *fp);
 
 #define BPF_ANC		BIT(15)

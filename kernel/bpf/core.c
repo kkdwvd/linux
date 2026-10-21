@@ -23,6 +23,7 @@
 #include <linux/sched/signal.h>
 #include <linux/skbuff.h>
 #include <linux/static_call.h>
+#include <linux/string_helpers.h>
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
 #include <linux/bpf.h>
@@ -3749,42 +3750,49 @@ const struct bpf_line_info *bpf_find_linfo(const struct bpf_prog *prog, u32 insn
 	return &linfo[l];
 }
 
+static const struct bpf_line_info *bpf_prog_find_jited_linfo(const struct bpf_prog *prog,
+							     unsigned long ip)
+{
+	const struct bpf_prog_aux *aux = prog->aux;
+	u32 left = aux->linfo_idx, right = aux->nr_linfo;
+
+	if (!aux->btf || !aux->linfo || !aux->jited_linfo)
+		return NULL;
+
+	if (aux->func) {
+		/* Hidden subprograms have no source information. */
+		if (aux->func_idx >= aux->func_cnt)
+			return NULL;
+		if (aux->func_idx + 1 < aux->func_cnt)
+			right = aux->func[aux->func_idx + 1]->aux->linfo_idx;
+	}
+
+	/* JIT addresses are ordered within each subprogram, not across them. */
+	while (left < right) {
+		u32 mid = left + (right - left) / 2;
+
+		if ((unsigned long)aux->jited_linfo[mid] <= ip)
+			left = mid + 1;
+		else
+			right = mid;
+	}
+	return left == aux->linfo_idx ? NULL : &aux->linfo[left - 1];
+}
+
 int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char **filep,
 			   const char **linep, int *nump)
 {
+	const struct bpf_line_info *linfo;
 	struct bpf_linfo_source src;
-	int idx = -1, insn_start, insn_end, len;
-	struct bpf_line_info *linfo;
-	void **jited_linfo;
-	struct btf *btf;
-	int nr_linfo;
 
-	btf = prog->aux->btf;
-	linfo = prog->aux->linfo;
-	jited_linfo = prog->aux->jited_linfo;
-
-	if (!btf || !linfo || !jited_linfo)
+	if (!prog->aux->btf || !prog->aux->linfo || !prog->aux->jited_linfo)
 		return -EINVAL;
-	len = prog->aux->func ? prog->aux->func[prog->aux->func_idx]->len : prog->len;
-
-	linfo = &prog->aux->linfo[prog->aux->linfo_idx];
-	jited_linfo = &prog->aux->jited_linfo[prog->aux->linfo_idx];
-
-	insn_start = linfo[0].insn_off;
-	insn_end = insn_start + len;
-	nr_linfo = prog->aux->nr_linfo - prog->aux->linfo_idx;
-
-	for (int i = 0; i < nr_linfo &&
-	     linfo[i].insn_off >= insn_start && linfo[i].insn_off < insn_end; i++) {
-		if (jited_linfo[i] >= (void *)ip)
-			break;
-		idx = i;
-	}
-
-	if (idx == -1)
+	/* The stack walker supplies the return address, following the call. */
+	linfo = ip ? bpf_prog_find_jited_linfo(prog, ip - 1) : NULL;
+	if (!linfo)
 		return -ENOENT;
 
-	bpf_get_linfo_source(btf, &linfo[idx], &src);
+	bpf_get_linfo_source(prog->aux->btf, linfo, &src);
 	while (isspace(*src.line))
 		src.line++;
 	if (filep)
@@ -3795,6 +3803,50 @@ int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char *
 		*nump = src.line_num;
 	return 0;
 }
+
+#ifdef CONFIG_BPF_JIT
+int bpf_address_source(char *buf, size_t size, unsigned long addr)
+{
+	char suffix[sizeof(":4194303:1023)")], escaped[4];
+	const struct bpf_line_info *linfo;
+	struct bpf_linfo_source src;
+	struct bpf_prog *prog;
+	int len = 2, suffix_len, n;
+
+	guard(rcu)();
+	prog = bpf_prog_ksym_find(addr);
+	if (!prog)
+		return 0;
+	linfo = bpf_prog_find_jited_linfo(prog, addr);
+	if (!linfo)
+		return 0;
+	bpf_get_linfo_source(prog->aux->btf, linfo, &src);
+	suffix_len = scnprintf(suffix, sizeof(suffix), ":%d:%d)", src.line_num, src.line_col);
+	if (size < len + 3 + suffix_len + 1)
+		return 0;
+
+	buf[0] = ' ';
+	buf[1] = '(';
+	/*
+	 * BTF filenames are supplied by userspace. Escape whitespace, control
+	 * characters and delimiters, and retain the location when truncating.
+	 */
+	while (*src.file) {
+		n = string_escape_mem(src.file, 1, escaped, sizeof(escaped),
+				      ESCAPE_NAP | ESCAPE_HEX | ESCAPE_APPEND, " ():\\");
+		if (len + n + suffix_len + 1 + (src.file[1] ? 3 : 0) > size) {
+			memcpy(buf + len, "...", 3);
+			len += 3;
+			break;
+		}
+		memcpy(buf + len, escaped, n);
+		len += n;
+		src.file++;
+	}
+	memcpy(buf + len, suffix, suffix_len + 1);
+	return len + suffix_len;
+}
+#endif
 
 struct walk_stack_ctx {
 	struct bpf_prog *prog;

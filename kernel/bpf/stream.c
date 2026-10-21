@@ -562,22 +562,30 @@ static bool dump_stack_cb(void *cookie, u64 ip, u64 sp, u64 bp)
 {
 	struct dump_stack_ctx *ctxp = cookie;
 	const char *file = "", *line = "";
+	const struct bpf_ksym *ksym;
 	struct bpf_prog *prog;
-	int num, ret;
+	int num;
 
 	rcu_read_lock();
 	prog = bpf_prog_ksym_find(ip);
 	rcu_read_unlock();
-	if (prog) {
-		ret = bpf_prog_get_file_line(prog, ip, &file, &line, &num);
-		if (ret < 0)
-			goto end;
-		ctxp->err = bpf_stream_stage_printk(ctxp->ss, "%pS\n  %s @ %s:%d\n",
-						    (void *)(long)ip, line, file, num);
+	if (!prog) {
+		ctxp->err = bpf_stream_stage_printk(ctxp->ss, "%pS\n", (void *)(long)ip);
 		return !ctxp->err;
 	}
-end:
-	ctxp->err = bpf_stream_stage_printk(ctxp->ss, "%pS\n", (void *)(long)ip);
+	/*
+	 * Format the symbol directly: %pS would add the source location that
+	 * the stream already prints on the following line.
+	 */
+	ksym = &prog->aux->ksym;
+	if (bpf_prog_get_file_line(prog, ip, &file, &line, &num) < 0)
+		ctxp->err = bpf_stream_stage_printk(ctxp->ss, "%s+%#lx/%#lx\n", ksym->name,
+						    (unsigned long)ip - ksym->start,
+						    ksym->end - ksym->start);
+	else
+		ctxp->err = bpf_stream_stage_printk(ctxp->ss, "%s+%#lx/%#lx\n  %s @ %s:%d\n",
+						    ksym->name, (unsigned long)ip - ksym->start,
+						    ksym->end - ksym->start, line, file, num);
 	return !ctxp->err;
 }
 
