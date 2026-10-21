@@ -3152,6 +3152,12 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
+#ifdef CONFIG_BPF_SYSCALL
+	/* Keep source information alive until kallsyms readers have finished. */
+	btf_put(aux->btf);
+	kvfree(aux->jited_linfo);
+	kvfree(aux->linfo);
+#endif
 	for (i = 0; i < aux->real_func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
