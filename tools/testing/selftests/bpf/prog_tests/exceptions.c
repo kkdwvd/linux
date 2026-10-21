@@ -15,6 +15,30 @@ static void test_exceptions_failure(void)
 	RUN_TESTS(exceptions_fail);
 }
 
+static void check_exception_line_info(struct bpf_program *prog)
+{
+	__u64 jited_ksym = 0, jited_line_info = 0;
+	struct bpf_prog_info info = {
+		.jited_ksyms = ptr_to_u64(&jited_ksym),
+		.nr_jited_ksyms = 1,
+		.jited_line_info = ptr_to_u64(&jited_line_info),
+		.nr_jited_line_info = 1,
+		.jited_line_info_rec_size = sizeof(jited_line_info),
+	};
+	__u32 info_len = sizeof(info);
+	int err;
+
+	err = bpf_prog_get_info_by_fd(bpf_program__fd(prog), &info, &info_len);
+	if (!ASSERT_OK(err, "prog_info") ||
+	    !ASSERT_GT(info.nr_jited_ksyms, 0, "nr_jited_ksyms") ||
+	    !ASSERT_GT(info.nr_jited_line_info, 0, "nr_jited_line_info") ||
+	    !ASSERT_NEQ(jited_ksym, 0, "jited_ksym"))
+		return;
+
+	/* The hidden default exception callback must not overwrite main's line info. */
+	ASSERT_EQ(jited_line_info, jited_ksym, bpf_program__name(prog));
+}
+
 static void test_exceptions_success(void)
 {
 	LIBBPF_OPTS(bpf_test_run_opts, ropts,
@@ -33,6 +57,11 @@ static void test_exceptions_success(void)
 	ret = exceptions__load(skel);
 	if (!ASSERT_OK(ret, "exceptions__load"))
 		goto done;
+
+	if (test__start_subtest("exception_line_info")) {
+		check_exception_line_info(skel->progs.exception_throw_always_1);
+		check_exception_line_info(skel->progs.exception_throw_unwind_1);
+	}
 
 	if (!ASSERT_OK(bpf_map_update_elem(bpf_map__fd(skel->maps.jmp_table), &(int){0},
 					   &(int){bpf_program__fd(skel->progs.exception_tail_call_target)}, BPF_ANY),
