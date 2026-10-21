@@ -7,6 +7,7 @@
 #include <sys/syscall.h>
 #include "task_park.skel.h"
 #include "verifier_task_park.skel.h"
+#include "verifier_task_park_frames.skel.h"
 
 static int run_syscall_prog(struct bpf_program *prog, __u32 *retval)
 {
@@ -205,6 +206,7 @@ void test_task_park(void)
 	struct task_park *skel;
 
 	RUN_TESTS(verifier_task_park);
+	RUN_TESTS(verifier_task_park_frames);
 
 	skel = task_park__open_and_load();
 	if (!ASSERT_OK_PTR(skel, "open_and_load"))
