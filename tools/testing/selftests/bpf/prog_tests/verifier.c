@@ -35,6 +35,8 @@
 #include "verifier_call_large_imm.skel.h"
 #include "verifier_callx.skel.h"
 #include "verifier_callx_rodata.skel.h"
+#include "verifier_callx_scalar.skel.h"
+#include "verifier_callx_scalar_arena.skel.h"
 #include "verifier_cfg.skel.h"
 #include "verifier_cgroup_inv_retcode.skel.h"
 #include "verifier_cgroup_skb.skel.h"
@@ -94,6 +96,7 @@
 #include "verifier_mul.skel.h"
 #include "verifier_netfilter_ctx.skel.h"
 #include "verifier_netfilter_retcode.skel.h"
+#include "verifier_noreturn_call.skel.h"
 #include "verifier_bpf_fastcall.skel.h"
 #include "verifier_or_jmp32_k.skel.h"
 #include "verifier_percpu_addr.skel.h"
@@ -127,10 +130,12 @@
 #include "verifier_subreg.skel.h"
 #include "verifier_tailcall.skel.h"
 #include "verifier_tailcall_jit.skel.h"
+#include "verifier_throw_no_release.skel.h"
 #include "verifier_typedef.skel.h"
 #include "verifier_uninit.skel.h"
 #include "verifier_unpriv.skel.h"
 #include "verifier_unwind.skel.h"
+#include "verifier_unwind_cb.skel.h"
 #include "verifier_unpriv_perf.skel.h"
 #include "verifier_value_adj_spill.skel.h"
 #include "verifier_value.skel.h"
@@ -227,6 +232,8 @@ void test_verifier_btf_unreliable_prog(void)  { RUN(verifier_btf_unreliable_prog
 void test_verifier_call_large_imm(void)       { RUN(verifier_call_large_imm); }
 void test_verifier_callx(void)                { RUN_JITED(verifier_callx); }
 void test_verifier_callx_rodata(void)         { RUN_JITED(verifier_callx_rodata); }
+void test_verifier_callx_scalar(void)         { RUN_JITED(verifier_callx_scalar); }
+void test_verifier_callx_scalar_arena(void)   { RUN_JITED(verifier_callx_scalar_arena); }
 void test_verifier_cfg(void)                  { RUN(verifier_cfg); }
 void test_verifier_cgroup_inv_retcode(void)   { RUN(verifier_cgroup_inv_retcode); }
 void test_verifier_cgroup_skb(void)           { RUN(verifier_cgroup_skb); }
@@ -285,6 +292,7 @@ void test_verifier_movsx(void)                 { RUN(verifier_movsx); }
 void test_verifier_mul(void)                  { RUN(verifier_mul); }
 void test_verifier_netfilter_ctx(void)        { RUN(verifier_netfilter_ctx); }
 void test_verifier_netfilter_retcode(void)    { RUN(verifier_netfilter_retcode); }
+void test_verifier_noreturn_call(void)        { RUN(verifier_noreturn_call); }
 void test_verifier_bpf_fastcall(void)         { RUN(verifier_bpf_fastcall); }
 void test_verifier_or_jmp32_k(void)           { RUN(verifier_or_jmp32_k); }
 void test_verifier_percpu_addr(void)          { RUN(verifier_percpu_addr); }
@@ -318,10 +326,12 @@ void test_verifier_subprog_topo(void)        { RUN(verifier_subprog_topo); }
 void test_verifier_subreg(void)               { RUN(verifier_subreg); }
 void test_verifier_tailcall(void)             { RUN(verifier_tailcall); }
 void test_verifier_tailcall_jit(void)         { RUN(verifier_tailcall_jit); }
+void test_verifier_throw_no_release(void)     { RUN(verifier_throw_no_release); }
 void test_verifier_typedef(void)              { RUN(verifier_typedef); }
 void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
+void test_verifier_unwind_cb(void)            { RUN(verifier_unwind_cb); }
 void test_verifier_unpriv_perf(void)          { RUN(verifier_unpriv_perf); }
 void test_verifier_value_adj_spill(void)      { RUN(verifier_value_adj_spill); }
 void test_verifier_value(void)                { RUN(verifier_value); }

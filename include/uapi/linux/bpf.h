@@ -1363,6 +1363,16 @@ enum bpf_perf_event_type {
  */
 #define BPF_F_ARENA_SCALAR	(1U << 8)
 
+/*
+ * [WIP] bpf_throw() may leave the program while it holds resources: a lock,
+ * IRQs or preemption disabled, the RCU read lock, references. Nothing
+ * releases them when it throws: locks stay taken, IRQs and preemption stay
+ * disabled, the RCU read lock stays held, references leak. A stopgap until
+ * bpf_throw() releases what the frames of the program hold. Needs CAP_BPF
+ * and CAP_PERFMON.
+ */
+#define BPF_F_THROW_NO_RELEASE	(1U << 9)
+
 /* link_create.kprobe_multi.flags used in LINK_CREATE command for
  * BPF_TRACE_KPROBE_MULTI attach type to create return probe.
  */

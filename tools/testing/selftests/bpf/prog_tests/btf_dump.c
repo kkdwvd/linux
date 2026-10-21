@@ -20,6 +20,7 @@ static struct btf_dump_test_case {
 	{"btf_dump: bitfields", "btf_dump_test_case_bitfields", true},
 	{"btf_dump: multidim", "btf_dump_test_case_multidim", false},
 	{"btf_dump: namespacing", "btf_dump_test_case_namespacing", false},
+	{"btf_dump: libc", "btf_dump_test_case_libc", true},
 };
 
 static int btf_dump_all_types(const struct btf *btf, void *ctx)
@@ -270,7 +271,11 @@ static void test_btf_dump_incremental(void)
 	ASSERT_OK(err, "field_ok");
 
 	test_ctx__dump_and_compare(&t,
+"#ifdef __cplusplus\n"
+"enum x : unsigned int;\n"
+"#else\n"
 "enum x;\n"
+"#endif\n"
 "\n"
 "enum x {\n"
 "	X = 1,\n"
@@ -639,6 +644,102 @@ static void test_btf_dump_type_tags(void)
 "	void __attribute__((btf_type_tag(\"void_tag\"))) *p1;\n"
 "	void __attribute__((void_attr)) *p2;\n"
 "	void __attribute__((address_space(1))) __attribute__((btf_type_tag(\"arena\"))) *p3;\n"
+"};\n\n", "dump_and_compare");
+
+	test_ctx__free(&t);
+}
+
+/*
+ * A second type of a name that C++ spells with the ___kernel suffix, struct
+ * tm or timer_t, gets the ___2 suffix of a duplicate, which already keeps it
+ * apart from the C library's type, and no ___kernel on top of it: CO-RE strips
+ * the suffix after the last triple underscore only, so tm___2___kernel would
+ * never match the kernel's struct tm, while tm___2 does.
+ */
+static void test_btf_dump_libc_dups(void)
+{
+	struct test_ctx t = {};
+	struct btf *btf;
+	int id, err;
+
+	if (test_ctx__init(&t))
+		return;
+
+	btf = t.btf;
+
+	/* Generate BTF corresponding to the following C code:
+	 *
+	 * typedef int timer_t;
+	 * typedef long timer_t;
+	 * struct tm { int tm_sec; };
+	 * struct tm { long tm_year; };
+	 * struct user { struct tm *a; struct tm___2 *b; timer_t c; timer_t___2 d; };
+	 */
+	id = btf__add_int(btf, "int", 4, BTF_INT_SIGNED);
+	ASSERT_EQ(id, 1, "int_id");
+	id = btf__add_int(btf, "long", 8, BTF_INT_SIGNED);
+	ASSERT_EQ(id, 2, "long_id");
+	id = btf__add_typedef(btf, "timer_t", 1);
+	ASSERT_EQ(id, 3, "timer_t_id");
+	id = btf__add_typedef(btf, "timer_t", 2);
+	ASSERT_EQ(id, 4, "timer_t_2_id");
+	id = btf__add_struct(btf, "tm", 4);
+	ASSERT_EQ(id, 5, "tm_id");
+	err = btf__add_field(btf, "tm_sec", 1, 0, 0);
+	ASSERT_OK(err, "tm_sec");
+	id = btf__add_struct(btf, "tm", 8);
+	ASSERT_EQ(id, 6, "tm_2_id");
+	err = btf__add_field(btf, "tm_year", 2, 0, 0);
+	ASSERT_OK(err, "tm_year");
+	id = btf__add_ptr(btf, 5);
+	ASSERT_EQ(id, 7, "tm_ptr_id");
+	id = btf__add_ptr(btf, 6);
+	ASSERT_EQ(id, 8, "tm_2_ptr_id");
+	id = btf__add_struct(btf, "user", 32);
+	ASSERT_EQ(id, 9, "user_id");
+	err = btf__add_field(btf, "a", 7, 0, 0);
+	ASSERT_OK(err, "a");
+	err = btf__add_field(btf, "b", 8, 64, 0);
+	ASSERT_OK(err, "b");
+	err = btf__add_field(btf, "c", 3, 128, 0);
+	ASSERT_OK(err, "c");
+	err = btf__add_field(btf, "d", 4, 192, 0);
+	ASSERT_OK(err, "d");
+
+	test_ctx__dump_and_compare(&t,
+"#ifdef __cplusplus\n"
+"typedef int timer_t___kernel;\n"
+"#else\n"
+"typedef int timer_t;\n"
+"#endif\n"
+"\n"
+"typedef long timer_t___2;\n"
+"\n"
+"#ifdef __cplusplus\n"
+"struct tm___kernel {\n"
+"#else\n"
+"struct tm {\n"
+"#endif\n"
+"	int tm_sec;\n"
+"};\n"
+"\n"
+"struct tm___2 {\n"
+"	long tm_year;\n"
+"};\n"
+"\n"
+"struct user {\n"
+"#ifdef __cplusplus\n"
+"	struct tm___kernel *a;\n"
+"#else\n"
+"	struct tm *a;\n"
+"#endif\n"
+"	struct tm___2 *b;\n"
+"#ifdef __cplusplus\n"
+"	timer_t___kernel c;\n"
+"#else\n"
+"	timer_t c;\n"
+"#endif\n"
+"	timer_t___2 d;\n"
 "};\n\n", "dump_and_compare");
 
 	test_ctx__free(&t);
@@ -1390,6 +1491,8 @@ void test_btf_dump() {
 
 	if (test__start_subtest("btf_dump: type_tags"))
 		test_btf_dump_type_tags();
+	if (test__start_subtest("btf_dump: libc_dups"))
+		test_btf_dump_libc_dups();
 
 	btf = libbpf_find_kernel_btf();
 	if (!ASSERT_OK_PTR(btf, "no kernel BTF found"))

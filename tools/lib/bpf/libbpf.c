@@ -74,6 +74,7 @@
 
 static struct bpf_map *bpf_object__add_map(struct bpf_object *obj);
 static bool prog_is_subprog(const struct bpf_object *obj, const struct bpf_program *prog);
+static bool bpf_object__shndx_is_data(const struct bpf_object *obj, int shndx);
 static int map_set_def_max_entries(struct bpf_map *map);
 
 static const char * const attach_type_name[] = {
@@ -388,14 +389,16 @@ struct reloc_desc {
 			int map_idx;
 			unsigned int sym_off;
 			/*
-			 * The following two fields can be unionized, as the
-			 * ext_idx field is used for extern symbols, and the
+			 * The following fields can be unionized, as the
+			 * ext_idx field is used for extern symbols, the
 			 * sym_size is used for jump tables, which are never
-			 * extern
+			 * extern, and the sec_idx is used for calls and
+			 * addresses of subprograms
 			 */
 			union {
 				int ext_idx;
 				int sym_size;
+				int sec_idx;
 			};
 		};
 	};
@@ -439,8 +442,13 @@ struct bpf_sec_def {
 };
 
 struct bpf_light_subprog {
+	__u32 sec_idx;
 	__u32 sec_insn_off;
 	__u32 sub_insn_off;
+	/* [WIP] for arena data and addresses, see bpf_object__arena_func_copy() */
+	bool arena_func;
+	/* [WIP] called by functions that callx of a number may call */
+	bool num_func;
 };
 
 /*
@@ -470,6 +478,19 @@ struct bpf_program {
 	 * if yes, at which instruction offset.
 	 */
 	size_t sub_insn_off;
+	/*
+	 * [WIP] The same for the copy that functions which callx of a number
+	 * may call, call, see bpf_object__arena_func_copy()
+	 */
+	size_t num_insn_off;
+	/* [WIP] callx of a number may call functions of the program, see prog_reaches_callx() */
+	bool num_callx;
+	/*
+	 * [WIP] Functions are numbers in the program, one loaded with
+	 * BPF_F_ARENA_SCALAR: ld_imm64 of a static function takes the address
+	 * of a copy of it, see bpf_object__arena_func_copy()
+	 */
+	bool func_copies;
 
 	/* instructions that belong to BPF program; insns[0] is located at
 	 * sec_insn_off instruction within its ELF section in ELF file, so
@@ -497,6 +518,8 @@ struct bpf_program {
 	bool autoload;
 	bool autoattach;
 	bool sym_global;
+	/* a function that main programs call, see sec_is_text() */
+	bool subprog;
 	/* the program or a function that it calls has callx */
 	bool has_callx;
 	bool mark_btf_static;
@@ -551,6 +574,11 @@ struct bpf_struct_ops {
 #define KSYMS_SEC ".ksyms"
 #define STRUCT_OPS_SEC ".struct_ops"
 #define STRUCT_OPS_LINK_SEC ".struct_ops.link"
+/*
+ * __arena variables. Pointers to them, in them or in other data, become
+ * addresses of arena, see bpf_object__relocate_data_ptrs(). Pointers to
+ * functions in them are NULL.
+ */
 #define ARENA_SEC ".addr_space.1"
 /*
  * An object with this section keeps its global data in arena instead of
@@ -560,12 +588,19 @@ struct bpf_struct_ops {
  * one that is just large enough for the data. bpf_object__find_map_by_name()
  * finds it by the name "arena" and bpf_map__set_max_entries() changes its
  * size before the object is loaded.
- * Read-only sections with pointers to functions and sections with constant
- * strings stay frozen array maps. A constant that a helper or a kfunc takes
- * by pointer has to be in such section.
+ * Read-only data is in arena too, .data.rel.ro and sections with pointers in
+ * them included: a program reaches a vtable through a number that it loads
+ * from data, and a frozen map can't be reached from a number. So are the
+ * string literals of the compiler, in .rodata.str1.<n>: a function called
+ * through a pointer can return one. A constant that a helper or a kfunc takes
+ * by pointer has to be in a frozen map: .rodata.str, where bpf_helpers.h puts
+ * format strings and the strings of BPF_CONST_STR(), and sections named
+ * .rodata.str.<x> stay frozen array maps, with a copy in arena, see
+ * map_is_const_str().
  * Pointers to data that are stored in data become addresses of arena.
  * The load fails if such pointer points to a section that is not in arena,
- * or if the arena is pinned or reused.
+ * or if the arena is pinned or reused and has no map_extra. Pointers to
+ * functions are NULL, see bpf_object__collect_data_ptr().
  *
  * It's for programs written in Rust. There are no address spaces in Rust,
  * the program accesses arena through plain numbers, so programs of the object
@@ -696,18 +731,33 @@ struct module_btf {
 
 enum sec_type {
 	SEC_UNUSED = 0,
+	SEC_TEXT,
 	SEC_RELO,
 	SEC_BSS,
 	SEC_DATA,
 	SEC_RODATA,
 	SEC_ST_OPS,
 	SEC_PERCPU,
+	SEC_ARENA,
 };
 
 struct elf_sec_desc {
 	enum sec_type sec_type;
 	Elf64_Shdr *shdr;
 	Elf_Data *data;
+	/* member of a COMDAT group */
+	bool comdat;
+	/*
+	 * Global data is in map map_name, which is that of section
+	 * map_sec_idx, map_off bytes into it, see bpf_object__layout_data().
+	 * The section with the map has its size and alignment in map_sz and
+	 * map_align.
+	 */
+	const char *map_name;
+	int map_sec_idx;
+	size_t map_off;
+	size_t map_sz;
+	size_t map_align;
 };
 
 struct elf_state {
@@ -724,7 +774,6 @@ struct elf_state {
 	size_t sec_cnt;
 	int btf_maps_shndx;
 	__u32 btf_maps_sec_btf_id;
-	int text_shndx;
 	int symbols_shndx;
 	bool has_st_ops;
 	int arena_data_shndx;
@@ -810,15 +859,34 @@ struct bpf_object {
 	size_t arena_data_off;
 	bool data_in_arena;
 	bool arena_mapped;
-	/* pointers to data in the data of internal maps, when data is in arena */
+	/*
+	 * Pointers to data in __arena variables, in the data of internal maps
+	 * when data is in arena, and pointers to __arena variables in the
+	 * data of other internal maps
+	 */
 	struct data_ptr {
 		int sec_idx;
 		size_t sec_off;
-		int targ_sec_idx;
+		int targ_sec_idx;	/* -1 for __arena variables */
 		size_t targ_off;
 		char *sym_name;
 	} *data_ptrs;
 	size_t data_ptr_cnt;
+	/*
+	 * [WIP] Pointers to functions in arena data. Programs that may call them
+	 * get the functions, and the pointers get their JITed addresses, see
+	 * bpf_object__fill_arena_func_ptrs().
+	 */
+	struct arena_func_ptr {
+		int sec_idx;		/* the section of the map with the pointer */
+		size_t sec_off;		/* offset of the pointer in the map */
+		int func_sec_idx;	/* section of the function, see sec_is_text() */
+		size_t func_off;	/* offset of the function in that section */
+		bool filled;
+	} *arena_func_ptrs;
+	size_t arena_func_ptr_cnt;
+	/* [WIP] a program has copies of them, see bpf_object__append_arena_func_ptrs() */
+	bool arena_func_callers;
 
 	void *jumptables_data;
 	size_t jumptables_data_sz;
@@ -826,6 +894,8 @@ struct bpf_object {
 	struct {
 		struct bpf_program *prog;
 		unsigned int sym_off;
+		/* [WIP] the copy of the function, see bpf_object__arena_func_copy() */
+		int subprog_idx;
 		int fd;
 	} *jumptable_maps;
 	size_t jumptable_map_cnt;
@@ -838,7 +908,8 @@ struct bpf_object {
 	struct func_ptr {
 		int sec_idx;		/* ELF section that contains the pointer */
 		size_t sec_off;		/* offset of the pointer in the section */
-		size_t text_off;	/* offset of the function in .text section */
+		int func_sec_idx;	/* section of the function, see sec_is_text() */
+		size_t func_off;	/* offset of the function in that section */
 	} *func_ptrs;
 	size_t func_ptr_cnt;
 
@@ -989,6 +1060,15 @@ errout:
 	return -ENOMEM;
 }
 
+/*
+ * Whether the functions of the section are subprograms: it is .text or the
+ * code of a COMDAT group, which the static linker joins to .text.
+ */
+static bool sec_is_text(const struct bpf_object *obj, size_t sec_idx)
+{
+	return sec_idx < obj->efile.sec_cnt && obj->efile.secs[sec_idx].sec_type == SEC_TEXT;
+}
+
 static int
 bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 			 const char *sec_name, int sec_idx)
@@ -1029,7 +1109,7 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 			return -LIBBPF_ERRNO__FORMAT;
 		}
 
-		if (sec_idx != obj->efile.text_shndx && ELF64_ST_BIND(sym->st_info) == STB_LOCAL) {
+		if (!sec_is_text(obj, sec_idx) && ELF64_ST_BIND(sym->st_info) == STB_LOCAL) {
 			pr_warn("sec '%s': program '%s' is static and not supported\n", sec_name, name);
 			return -ENOTSUP;
 		}
@@ -1059,6 +1139,8 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 
 		if (ELF64_ST_BIND(sym->st_info) != STB_LOCAL)
 			prog->sym_global = true;
+
+		prog->subprog = sec_is_text(obj, sec_idx);
 
 		/* if function is a global/weak symbol, but has restricted
 		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF FUNC
@@ -2126,11 +2208,25 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	return 0;
 }
 
+/* Copy in the data of the sections in the map of map_sec_idx, see bpf_object__layout_data() */
+static void bpf_object__fill_map_data(struct bpf_object *obj, int map_sec_idx, void *data)
+{
+	struct elf_sec_desc *sec_desc;
+	int sec_idx;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (sec_desc->map_sec_idx != map_sec_idx || !sec_desc->data->d_buf)
+			continue;
+		memcpy(data + sec_desc->map_off, sec_desc->data->d_buf, sec_desc->data->d_size);
+	}
+}
+
 static int bpf_object__init_global_data_maps(struct bpf_object *obj)
 {
 	struct elf_sec_desc *sec_desc;
-	const char *sec_name;
-	int err = 0, sec_idx;
+	enum libbpf_map_type type;
+	int err, sec_idx;
 
 	/*
 	 * Populate obj->maps with libbpf internal maps.
@@ -2138,46 +2234,34 @@ static int bpf_object__init_global_data_maps(struct bpf_object *obj)
 	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
 		sec_desc = &obj->efile.secs[sec_idx];
 
-		/* Skip recognized sections with size 0. */
-		if (!sec_desc->data || sec_desc->data->d_size == 0)
+		/* Skip recognized sections with size 0, and those in another map */
+		if (!sec_desc->data || sec_desc->map_sec_idx != sec_idx || !sec_desc->map_sz)
 			continue;
 
 		switch (sec_desc->sec_type) {
 		case SEC_DATA:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_DATA,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_DATA;
 			break;
 		case SEC_RODATA:
 			obj->has_rodata = true;
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_RODATA,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_RODATA;
 			break;
 		case SEC_BSS:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_BSS,
-							    sec_name, sec_idx,
-							    NULL,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_BSS;
 			break;
 		case SEC_PERCPU:
-			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
-			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_PERCPU,
-							    sec_name, sec_idx,
-							    sec_desc->data->d_buf,
-							    sec_desc->data->d_size);
+			type = LIBBPF_MAP_PERCPU;
 			break;
 		default:
 			/* skip */
-			break;
+			continue;
 		}
+
+		err = bpf_object__init_internal_map(obj, type, sec_desc->map_name, sec_idx, NULL,
+						    sec_desc->map_sz);
 		if (err)
 			return err;
+		bpf_object__fill_map_data(obj, sec_idx, obj->maps[obj->nr_maps - 1].mmaped);
 	}
 	return 0;
 }
@@ -3111,13 +3195,15 @@ static int bpf_object__init_user_btf_map(struct bpf_object *obj,
 	return 0;
 }
 
-static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map,
-			       void *data, size_t data_sz)
+static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map)
 {
-	obj->arena_data = malloc(data_sz);
+	/* all sections of __arena variables, see bpf_object__layout_data() */
+	size_t data_sz = obj->efile.secs[obj->efile.arena_data_shndx].map_sz;
+
+	obj->arena_data = calloc(1, data_sz);
 	if (!obj->arena_data)
 		return -ENOMEM;
-	memcpy(obj->arena_data, data, data_sz);
+	bpf_object__fill_map_data(obj, obj->efile.arena_data_shndx, obj->arena_data);
 	obj->arena_data_sz = data_sz;
 
 	/* make bpf_map__init_value() work for ARENA maps */
@@ -3126,59 +3212,58 @@ static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map,
 	return 0;
 }
 
+/*
+ * The sections of constant strings that stay frozen maps when data is in
+ * arena: .rodata.str, where bpf_helpers.h puts the format strings of
+ * bpf_printk() and the strings of BPF_CONST_STR(), and sections that the
+ * program names .rodata.str.<x>. The .rodata.str1.<n> sections of the string
+ * literals of the compiler go to arena with the rest of the read-only data,
+ * so that a function called through a pointer can return one.
+ */
 static bool map_is_const_str(const struct bpf_map *map)
 {
-	return map->libbpf_type == LIBBPF_MAP_RODATA &&
-	       str_has_pfx(map->real_name, RODATA_SEC ".str");
+	const char *name = map->real_name;
+	char c;
+
+	if (map->libbpf_type != LIBBPF_MAP_RODATA || !str_has_pfx(name, RODATA_SEC ".str"))
+		return false;
+	c = name[sizeof(RODATA_SEC ".str") - 1];
+	return c < '0' || c > '9';
 }
 
-static bool map_data_goes_to_arena(const struct bpf_object *obj, const struct bpf_map *map)
+/*
+ * All global data goes to arena when data is in arena, read-only data with
+ * pointers in it included. A program reaches a vtable, and the type info that
+ * it points to, through a number that it loads from data, and a frozen map
+ * can't be reached from a number. Const strings that kfuncs and helpers take
+ * have to be in a frozen map, so .rodata.str and the sections named after it
+ * stay one, see map_is_const_str(), and pointers to them that are stored in
+ * data point to a copy of the strings in arena, see
+ * bpf_object__init_arena_data().
+ */
+static bool map_data_goes_to_arena(const struct bpf_map *map)
 {
-	int i;
-
 	switch (map->libbpf_type) {
 	case LIBBPF_MAP_DATA:
 	case LIBBPF_MAP_BSS:
-		return true;
 	case LIBBPF_MAP_RODATA:
-		break;
+		return true;
 	default:
 		return false;
 	}
-
-	/*
-	 * Const strings that kfuncs and helpers take have to be in a frozen
-	 * map. Pointers to them that are stored in data point to a copy of
-	 * the strings that is in arena.
-	 */
-	if (map_is_const_str(map))
-		return true;
-	/*
-	 * Read-only data with pointers stays a frozen map: the kernel
-	 * recognizes pointers to functions in it.
-	 */
-	if (str_has_pfx(map->real_name, DATA_REL_RO_SEC))
-		return false;
-	for (i = 0; i < obj->efile.sec_cnt; i++) {
-		const struct elf_sec_desc *sec = &obj->efile.secs[i];
-
-		if (sec->sec_type == SEC_RELO && sec->shdr->sh_info == map->sec_idx)
-			return false;
-	}
-	return true;
 }
 
 /* Returns the offset of the data of the map in arena data that is sz bytes so far */
 static size_t map_arena_off(const struct bpf_object *obj, const struct bpf_map *map, size_t sz)
 {
-	size_t align = obj->efile.secs[map->sec_idx].shdr->sh_addralign;
+	size_t align = obj->efile.secs[map->sec_idx].map_align;
 
 	return roundup(sz, max(align, sizeof(__u64)));
 }
 
 /*
- * Make .data, .bss and .rodata a part of arena data. They follow __arena
- * variables of the object, if there are any.
+ * Make .data, .bss and .rodata, of any name, a part of arena data. They follow
+ * __arena variables of the object, if there are any.
  */
 static int bpf_object__init_arena_data(struct bpf_object *obj)
 {
@@ -3193,7 +3278,7 @@ static int bpf_object__init_arena_data(struct bpf_object *obj)
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		map = &obj->maps[i];
-		if (map_data_goes_to_arena(obj, map))
+		if (map_data_goes_to_arena(map))
 			sz = map_arena_off(obj, map, sz) + map->def.value_size;
 	}
 	if (sz == obj->arena_data_sz)
@@ -3235,7 +3320,7 @@ static int bpf_object__init_arena_data(struct bpf_object *obj)
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		map = &obj->maps[i];
-		if (!map_data_goes_to_arena(obj, map))
+		if (!map_data_goes_to_arena(map))
 			continue;
 		sz = map_arena_off(obj, map, sz);
 		map->arena_off = sz;
@@ -3319,8 +3404,7 @@ static int bpf_object__init_user_btf_maps(struct bpf_object *obj, bool strict,
 		obj->arena_map_idx = i;
 
 		if (obj->efile.arena_data) {
-			err = init_arena_map_data(obj, map, obj->efile.arena_data->d_buf,
-						  obj->efile.arena_data->d_size);
+			err = init_arena_map_data(obj, map);
 			if (err)
 				return err;
 		}
@@ -3651,6 +3735,25 @@ static int compare_vsi_off(const void *_a, const void *_b)
 	return a->offset - b->offset;
 }
 
+/*
+ * The section of global data with the map called name, see
+ * bpf_object__layout_data(), or that of the name in no group if plain
+ */
+static int sec_by_map_name(const struct bpf_object *obj, const char *name, bool plain)
+{
+	const struct elf_sec_desc *sec_desc;
+	int sec_idx;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (!sec_desc->map_name || strcmp(sec_desc->map_name, name) != 0)
+			continue;
+		if (plain ? !sec_desc->comdat : sec_desc->map_sec_idx == sec_idx)
+			return sec_idx;
+	}
+	return 0;
+}
+
 static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 			     struct btf_type *t)
 {
@@ -3658,7 +3761,8 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 	const char *sec_name = btf__name_by_offset(btf, t->name_off);
 	struct btf_var_secinfo *vsi;
 	bool fixup_offsets = false;
-	int err;
+	size_t static_off = 0;
+	int err, sec_idx;
 
 	if (!sec_name) {
 		pr_debug("No name found in string section for DATASEC kind.\n");
@@ -3683,7 +3787,14 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 	 * symbol matching just once.
 	 */
 	if (t->size == 0) {
-		err = find_elf_sec_sz(obj, sec_name, &size);
+		/* that of a map of global data covers all its sections */
+		sec_idx = sec_by_map_name(obj, sec_name, false);
+		if (sec_idx) {
+			size = obj->efile.secs[sec_idx].map_sz;
+			err = 0;
+		} else {
+			err = find_elf_sec_sz(obj, sec_name, &size);
+		}
 		if (err || !size) {
 			pr_debug("sec '%s': failed to determine size from ELF: size %u, err %s\n",
 				 sec_name, size, errstr(err));
@@ -3692,6 +3803,14 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 
 		t->size = size;
 		fixup_offsets = true;
+
+		/*
+		 * Clang gives the offsets of static variables, in the section
+		 * of the name that is in no group
+		 */
+		sec_idx = sec_by_map_name(obj, sec_name, true);
+		if (sec_idx)
+			static_off = obj->efile.secs[sec_idx].map_off;
 	}
 
 	for (i = 0, vsi = btf_var_secinfos(t); i < vars; i++, vsi++) {
@@ -3707,6 +3826,8 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 		}
 
 		var = btf_var(t_var);
+		if (var->linkage == BTF_VAR_STATIC && fixup_offsets)
+			vsi->offset += static_off;
 		if (var->linkage == BTF_VAR_STATIC || var->linkage == BTF_VAR_GLOBAL_EXTERN)
 			continue;
 
@@ -3724,8 +3845,12 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 			return -ENOENT;
 		}
 
-		if (fixup_offsets)
+		/* the offset in the map, see bpf_object__layout_data() */
+		if (fixup_offsets) {
 			vsi->offset = sym->st_value;
+			if (sym->st_shndx < obj->efile.sec_cnt)
+				vsi->offset += obj->efile.secs[sym->st_shndx].map_off;
+		}
 
 		/* if variable is a global/weak symbol, but has restricted
 		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF VAR
@@ -3741,6 +3866,52 @@ static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
 
 sort_vars:
 	qsort(btf_var_secinfos(t), vars, sizeof(*vsi), compare_vsi_off);
+	return 0;
+}
+
+/*
+ * The variables of a COMDAT member that is named after its symbol are in
+ * the map of its base section, see bpf_object__layout_data(), at the offsets
+ * that btf_fixup_datasec() gave them. Move them to the DATASEC of the map,
+ * as the static linker does, which is created if the object has none.
+ */
+static int btf_layout_datasecs(struct bpf_object *obj)
+{
+	const struct elf_sec_desc *sec_desc;
+	const char *sec_name, *map_name;
+	int sec_idx, src_id, dst_id, err;
+	struct btf_type *t;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		map_name = sec_desc->map_name;
+		sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+		if (!map_name || !sec_name || strcmp(sec_name, map_name) == 0)
+			continue;
+		src_id = btf__find_by_name_kind(obj->btf, sec_name, BTF_KIND_DATASEC);
+		if (src_id < 0)
+			continue;
+
+		dst_id = btf__find_by_name_kind(obj->btf, map_name, BTF_KIND_DATASEC);
+		if (dst_id < 0) {
+			dst_id = btf__add_datasec(obj->btf, map_name, 0);
+			if (dst_id < 0)
+				return dst_id;
+		}
+
+		err = btf_datasec_move_vars(obj->btf, dst_id, src_id);
+		if (err) {
+			pr_warn("sec '%s': failed to move variables to DATASEC '%s': %s\n",
+				sec_name, map_name, errstr(err));
+			return err;
+		}
+
+		t = btf_type_by_id(obj->btf, dst_id);
+		t->size = obj->efile.secs[sec_desc->map_sec_idx].map_sz;
+		qsort(btf_var_secinfos(t), btf_vlen(t), sizeof(struct btf_var_secinfo),
+		      compare_vsi_off);
+	}
+
 	return 0;
 }
 
@@ -3767,7 +3938,7 @@ static int bpf_object_fixup_btf(struct bpf_object *obj)
 		}
 	}
 
-	return 0;
+	return btf_layout_datasecs(obj);
 }
 
 static bool prog_needs_vmlinux_btf(struct bpf_program *prog)
@@ -4092,6 +4263,10 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	if (hdr->sh_type == SHT_LLVM_ADDRSIG)
 		return true;
 
+	/* one object has no other copy of a COMDAT group to drop */
+	if (hdr->sh_type == SHT_GROUP)
+		return true;
+
 	/* no subprograms will lead to an empty .text section, ignore it */
 	if (hdr->sh_type == SHT_PROGBITS && hdr->sh_size == 0 &&
 	    strcmp(name, ".text") == 0)
@@ -4101,10 +4276,18 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	if (is_sec_name_dwarf(name))
 		return true;
 
+	/* unwind tables, which BPF has no use for */
+	if (strcmp(name, ".eh_frame") == 0)
+		return true;
+
 	if (str_has_pfx(name, ".rel")) {
 		name += sizeof(".rel") - 1;
 		/* DWARF section relocations */
 		if (is_sec_name_dwarf(name))
+			return true;
+
+		/* and those of the unwind tables */
+		if (strcmp(name, ".eh_frame") == 0)
 			return true;
 
 		/* .BTF and .BTF.ext don't need relocations */
@@ -4114,6 +4297,155 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	}
 
 	return false;
+}
+
+/*
+ * C++ defines an inline function that is not inlined everywhere, an inline
+ * variable or a template instance in every translation unit that uses it,
+ * each time in a COMDAT group of its own: .text.foo for code, .rodata.foo,
+ * .data.foo or .bss.foo for data, and their relocations. The static linker
+ * keeps the first copy of a group. An object has only one, so mark its
+ * members and ignore the group.
+ */
+static int bpf_object__collect_group(struct bpf_object *obj, Elf_Scn *scn, Elf64_Shdr *sh)
+{
+	size_t i, n, idx = elf_ndxscn(scn);
+	Elf_Data *data;
+	__u32 *words;
+
+	data = elf_sec_data(obj, scn);
+	if (!data)
+		return -LIBBPF_ERRNO__FORMAT;
+
+	words = data->d_buf;
+	n = data->d_size / sizeof(*words);
+	if (sh->sh_entsize != sizeof(*words) || n == 0) {
+		pr_warn("elf: group section(%zu) is malformed in %s\n", idx, obj->path);
+		return -LIBBPF_ERRNO__FORMAT;
+	}
+
+	/* only COMDAT groups say something about their members */
+	if (!(words[0] & GRP_COMDAT))
+		return 0;
+
+	for (i = 1; i < n; i++) {
+		if (!words[i] || words[i] >= obj->efile.sec_cnt) {
+			pr_warn("elf: group section(%zu) has invalid member section(%u) in %s\n",
+				idx, words[i], obj->path);
+			return -LIBBPF_ERRNO__FORMAT;
+		}
+		obj->efile.secs[words[i]].comdat = true;
+	}
+	return 0;
+}
+
+/* Whether section sec_idx defines a symbol called name */
+static bool sec_defines_sym(const struct bpf_object *obj, int sec_idx, const char *name)
+{
+	size_t i, n = obj->efile.symbols->d_size / sizeof(Elf64_Sym);
+	const Elf64_Sym *sym;
+	const char *sym_name;
+
+	for (i = 1; i < n; i++) {
+		sym = elf_sym_by_idx(obj, i);
+		if (sym->st_shndx != sec_idx || ELF64_ST_TYPE(sym->st_info) == STT_SECTION)
+			continue;
+		sym_name = elf_sym_str(obj, sym->st_name);
+		if (sym_name && strcmp(sym_name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The sections that the static linker joins the data of COMDAT groups to,
+ * as it joins their code to .text
+ */
+static const char * const comdat_data_bases[] = {
+	/* ahead of .data, which would match it */
+	DATA_REL_RO_SEC,
+	RODATA_SEC,
+	DATA_SEC,
+	BSS_SEC,
+};
+
+/*
+ * The section that the data of a COMDAT group member joins, when the
+ * compiler named the member after the symbol that it defines: .rodata.foo
+ * of an inline variable foo joins .rodata. Other names are explicit, e.g.
+ * SEC(".data.foo") of an inline variable bar, and are their own sections,
+ * as without a group. An explicit name that is the one the compiler would
+ * give, e.g. SEC(".data.foo") of foo, can't be told apart and joins the
+ * base section too. The static linker does the same, see group_base().
+ */
+static const char *comdat_data_base(const struct bpf_object *obj, int sec_idx,
+				    const char *sec_name)
+{
+	size_t i, len;
+
+	for (i = 0; i < ARRAY_SIZE(comdat_data_bases); i++) {
+		len = strlen(comdat_data_bases[i]);
+		if (strncmp(sec_name, comdat_data_bases[i], len) != 0 || sec_name[len] != '.')
+			continue;
+		if (!sec_defines_sym(obj, sec_idx, sec_name + len + 1))
+			return NULL;
+		return comdat_data_bases[i];
+	}
+	return NULL;
+}
+
+/*
+ * The static linker places the sections of a name one after another, in
+ * the order of the object, and a member of a COMDAT group that is named
+ * after its symbol, e.g. .rodata.foo, with its base section, see
+ * comdat_data_base(). Lay out global data in maps in the same way: a map
+ * for each name, which the first section of the name has, rather than for
+ * each section. The maps are then those of the linked object, the sections
+ * of a name that several groups have are one map like they are one section
+ * after linking, and inline variables and templates don't use up the maps
+ * that a program may use. The sections of __arena variables, which groups
+ * have too, are laid out in arena data in the same way.
+ */
+static void bpf_object__layout_data(struct bpf_object *obj)
+{
+	struct elf_sec_desc *sec_desc, *map_desc;
+	int sec_idx, map_idx;
+	const char *name;
+	size_t align;
+
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+		if (!bpf_object__shndx_is_data(obj, sec_idx) && sec_desc->sec_type != SEC_ARENA)
+			continue;
+
+		name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+		sec_desc->map_name = sec_desc->comdat ? comdat_data_base(obj, sec_idx, name) : NULL;
+		if (!sec_desc->map_name)
+			sec_desc->map_name = name;
+
+		for (map_idx = 1; map_idx < sec_idx; map_idx++) {
+			map_desc = &obj->efile.secs[map_idx];
+			if (map_desc->map_sec_idx == map_idx &&
+			    map_desc->sec_type == sec_desc->sec_type &&
+			    strcmp(map_desc->map_name, sec_desc->map_name) == 0)
+				break;
+		}
+		if (map_idx == sec_idx) {
+			sec_desc->map_sec_idx = sec_idx;
+			sec_desc->map_sz = sec_desc->data->d_size;
+			sec_desc->map_align = sec_desc->shdr->sh_addralign ?: 1;
+			continue;
+		}
+
+		/* aligned as the static linker aligns it */
+		align = max(map_desc->map_align, sec_desc->shdr->sh_addralign);
+		sec_desc->map_sec_idx = map_idx;
+		sec_desc->map_off = roundup(map_desc->map_sz, align);
+		map_desc->map_sz = sec_desc->map_off + sec_desc->data->d_size;
+		map_desc->map_align = align;
+		pr_debug("elf: section(%d) %s is in map '%s' of section(%d) at offset %zu\n",
+			 sec_idx, name, sec_desc->map_name, map_idx, sec_desc->map_off);
+	}
 }
 
 static int cmp_progs(const void *_a, const void *_b)
@@ -4154,14 +4486,21 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 	if (!obj->efile.secs)
 		return -ENOMEM;
 
-	/* a bunch of ELF parsing functionality depends on processing symbols,
-	 * so do the first pass and find the symbol table
+	/*
+	 * A bunch of ELF parsing functionality depends on processing symbols,
+	 * so do the first pass and find the symbol table, and members of groups.
 	 */
 	scn = NULL;
 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
 		sh = elf_sec_hdr(obj, scn);
 		if (!sh)
 			return -LIBBPF_ERRNO__FORMAT;
+
+		if (sh->sh_type == SHT_GROUP) {
+			err = bpf_object__collect_group(obj, scn, sh);
+			if (err)
+				return err;
+		}
 
 		/* the second pass has to know it when it sees relocations of data */
 		name = elf_sec_str(obj, sh->sh_name);
@@ -4242,8 +4581,12 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			/* already processed during the first pass above */
 		} else if (sh->sh_type == SHT_PROGBITS && data->d_size > 0) {
 			if (sh->sh_flags & SHF_EXECINSTR) {
-				if (strcmp(name, ".text") == 0)
-					obj->efile.text_shndx = idx;
+				if (strcmp(name, ".text") == 0 ||
+				    (sec_desc->comdat && str_has_pfx(name, ".text."))) {
+					sec_desc->sec_type = SEC_TEXT;
+					sec_desc->shdr = sh;
+					sec_desc->data = data;
+				}
 				err = bpf_object__add_programs(obj, data, name, idx);
 				if (err)
 					return err;
@@ -4282,8 +4625,17 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 				sec_desc->data = data;
 				obj->efile.has_st_ops = true;
 			} else if (strcmp(name, ARENA_SEC) == 0) {
-				obj->efile.arena_data = data;
-				obj->efile.arena_data_shndx = idx;
+				/*
+				 * COMDAT groups have one each, which are laid
+				 * out after the first, see bpf_object__layout_data()
+				 */
+				sec_desc->sec_type = SEC_ARENA;
+				sec_desc->shdr = sh;
+				sec_desc->data = data;
+				if (!obj->efile.arena_data) {
+					obj->efile.arena_data = data;
+					obj->efile.arena_data_shndx = idx;
+				}
 			} else if (strcmp(name, ARENA_DATA_SEC) == 0) {
 				/* the marker, see the first pass */
 			} else if (strcmp(name, JUMPTABLES_SEC) == 0) {
@@ -4306,13 +4658,14 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 
 			/*
 			 * Only do relo for section with exec instructions,
-			 * struct_ops, maps, and read-only data that might
-			 * have pointers to functions.
+			 * struct_ops, maps, read-only data that might have
+			 * pointers to functions, and data that might have
+			 * pointers to arena.
 			 */
 			if (!section_have_execinstr(obj, targ_sec_idx) &&
-			    !(obj->data_in_arena &&
-			      (!strcmp(name, ".rel" DATA_SEC) ||
-			       str_has_pfx(name, ".rel" DATA_SEC "."))) &&
+			    strcmp(name, ".rel" DATA_SEC) &&
+			    !str_has_pfx(name, ".rel" DATA_SEC ".") &&
+			    strcmp(name, ".rel" ARENA_SEC) &&
 			    strcmp(name, ".rel" RODATA_SEC) &&
 			    !str_has_pfx(name, ".rel" RODATA_SEC ".") &&
 			    strcmp(name, ".rel" DATA_REL_RO_SEC) &&
@@ -4347,6 +4700,8 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 		return -LIBBPF_ERRNO__FORMAT;
 	}
 
+	bpf_object__layout_data(obj);
+
 	/* change BPF program insns to native endianness for introspection */
 	if (!is_native_endianness(obj))
 		bpf_object_bswap_progs(obj);
@@ -4369,13 +4724,13 @@ static bool sym_is_extern(const Elf64_Sym *sym)
 	       ELF64_ST_TYPE(sym->st_info) == STT_NOTYPE;
 }
 
-static bool sym_is_subprog(const Elf64_Sym *sym, int text_shndx)
+static bool sym_is_subprog(const struct bpf_object *obj, const Elf64_Sym *sym)
 {
 	int bind = ELF64_ST_BIND(sym->st_info);
 	int type = ELF64_ST_TYPE(sym->st_info);
 
-	/* in .text section */
-	if (sym->st_shndx != text_shndx)
+	/* in a section of subprograms */
+	if (!sec_is_text(obj, sym->st_shndx))
 		return false;
 
 	/* local function */
@@ -4789,7 +5144,7 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 
 static bool prog_is_subprog(const struct bpf_object *obj, const struct bpf_program *prog)
 {
-	return prog->sec_idx == obj->efile.text_shndx;
+	return prog->subprog;
 }
 
 struct bpf_program *
@@ -4894,6 +5249,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	size_t map_idx, nr_maps = prog->obj->nr_maps;
 	struct bpf_object *obj = prog->obj;
 	__u32 shdr_idx = sym->st_shndx;
+	struct elf_sec_desc *sec_desc;
 	enum libbpf_map_type type;
 	const char *sym_sec_name;
 	struct bpf_map *map;
@@ -4936,8 +5292,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 			pr_warn("prog '%s': incorrect bpf_call opcode\n", prog->name);
 			return -LIBBPF_ERRNO__RELOC;
 		}
-		/* text_shndx can be 0, if no default "main" program exists */
-		if (!shdr_idx || shdr_idx != obj->efile.text_shndx) {
+		if (!sec_is_text(obj, shdr_idx)) {
 			sym_sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, shdr_idx));
 			pr_warn("prog '%s': bad call relo against '%s' in section '%s'\n",
 				prog->name, sym_name, sym_sec_name);
@@ -4950,6 +5305,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		}
 		reloc_desc->type = RELO_CALL;
 		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->sec_idx = shdr_idx;
 		reloc_desc->sym_off = sym->st_value;
 		return 0;
 	}
@@ -4961,7 +5317,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	}
 
 	/* loading subprog addresses */
-	if (sym_is_subprog(sym, obj->efile.text_shndx)) {
+	if (sym_is_subprog(obj, sym)) {
 		/* global_func: sym->st_value = offset in the section, insn->imm = 0.
 		 * local_func: sym->st_value = 0, insn->imm = offset in the section.
 		 */
@@ -4973,6 +5329,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 
 		reloc_desc->type = RELO_SUBPROG_ADDR;
 		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->sec_idx = shdr_idx;
 		reloc_desc->sym_off = sym->st_value;
 		return 0;
 	}
@@ -4981,7 +5338,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	sym_sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, shdr_idx));
 
 	/* arena data relocation */
-	if (shdr_idx == obj->efile.arena_data_shndx) {
+	if (obj->efile.secs[shdr_idx].sec_type == SEC_ARENA) {
 		if (obj->arena_map_idx < 0) {
 			pr_warn("prog '%s': bad arena data relocation at insn %u, no arena maps defined\n",
 				prog->name, insn_idx);
@@ -4990,7 +5347,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		reloc_desc->type = RELO_DATA;
 		reloc_desc->insn_idx = insn_idx;
 		reloc_desc->map_idx = obj->arena_map_idx;
-		reloc_desc->sym_off = sym->st_value;
+		reloc_desc->sym_off = obj->efile.secs[shdr_idx].map_off + sym->st_value;
 
 		map = &obj->maps[obj->arena_map_idx];
 		pr_debug("prog '%s': found arena map %d (%s, sec %d, off %zu) for insn %u\n",
@@ -5045,9 +5402,10 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 			prog->name, sym_sec_name);
 		return -LIBBPF_ERRNO__RELOC;
 	}
+	sec_desc = &obj->efile.secs[shdr_idx];
 	for (map_idx = 0; map_idx < nr_maps; map_idx++) {
 		map = &obj->maps[map_idx];
-		if (map->libbpf_type != type || map->sec_idx != sym->st_shndx)
+		if (map->libbpf_type != type || map->sec_idx != sec_desc->map_sec_idx)
 			continue;
 		pr_debug("prog '%s': found data map %zu (%s, sec %d, off %zu) for insn %u\n",
 			 prog->name, map_idx, map->name, map->sec_idx,
@@ -5063,7 +5421,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	reloc_desc->type = RELO_DATA;
 	reloc_desc->insn_idx = insn_idx;
 	reloc_desc->map_idx = map_idx;
-	reloc_desc->sym_off = sym->st_value;
+	reloc_desc->sym_off = sec_desc->map_off + sym->st_value;
 	if (map->in_arena) {
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off += map->arena_off;
@@ -6616,7 +6974,8 @@ static void poison_kfunc_call(struct bpf_program *prog, int relo_idx,
 	insn->imm = POISON_CALL_KFUNC_BASE + ext_idx;
 }
 
-static int find_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigned int sym_off)
+static int find_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigned int sym_off,
+		       int subprog_idx)
 {
 	size_t i;
 
@@ -6627,14 +6986,16 @@ static int find_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigne
 		 * different programs different maps should be created.
 		 */
 		if (obj->jumptable_maps[i].sym_off == sym_off &&
-		    obj->jumptable_maps[i].prog == prog)
+		    obj->jumptable_maps[i].prog == prog &&
+		    obj->jumptable_maps[i].subprog_idx == subprog_idx)
 			return obj->jumptable_maps[i].fd;
 	}
 
 	return -ENOENT;
 }
 
-static int add_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigned int sym_off, int map_fd)
+static int add_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigned int sym_off,
+		      int subprog_idx, int map_fd)
 {
 	size_t cnt = obj->jumptable_map_cnt;
 	size_t size = sizeof(obj->jumptable_maps[0]);
@@ -6647,6 +7008,7 @@ static int add_jt_map(struct bpf_object *obj, struct bpf_program *prog, unsigned
 	obj->jumptable_maps = tmp;
 	obj->jumptable_maps[cnt].prog = prog;
 	obj->jumptable_maps[cnt].sym_off = sym_off;
+	obj->jumptable_maps[cnt].subprog_idx = subprog_idx;
 	obj->jumptable_maps[cnt].fd = map_fd;
 	obj->jumptable_map_cnt++;
 
@@ -6679,7 +7041,16 @@ static int create_jt_map(struct bpf_object *obj, struct bpf_program *prog, struc
 	__u64 *jt;
 	__u32 i;
 
-	map_fd = find_jt_map(obj, prog, sym_off);
+	if (relo->insn_idx < 0 || relo->insn_idx >= prog->insns_cnt) {
+		pr_warn("map '.jumptables': invalid instruction index %d\n", relo->insn_idx);
+		return -EINVAL;
+	}
+	subprog_idx = -1; /* main program */
+	if (prog->subprogs)
+		subprog_idx = find_subprog_idx(prog, relo->insn_idx);
+
+	/* the function may be in the program twice, with a table each */
+	map_fd = find_jt_map(obj, prog, sym_off, subprog_idx);
 	if (map_fd >= 0)
 		return map_fd;
 
@@ -6711,15 +7082,6 @@ static int create_jt_map(struct bpf_object *obj, struct bpf_program *prog, struc
 		err = -EINVAL;
 		goto err_close;
 	}
-
-	subprog_idx = -1; /* main program */
-	if (relo->insn_idx < 0 || relo->insn_idx >= prog->insns_cnt) {
-		pr_warn("map '.jumptables': invalid instruction index %d\n", relo->insn_idx);
-		err = -EINVAL;
-		goto err_close;
-	}
-	if (prog->subprogs)
-		subprog_idx = find_subprog_idx(prog, relo->insn_idx);
 
 	jt = (__u64 *)(obj->jumptables_data + sym_off);
 	for (i = 0; i < max_entries; i++) {
@@ -6756,7 +7118,7 @@ static int create_jt_map(struct bpf_object *obj, struct bpf_program *prog, struc
 	if (err)
 		goto err_close;
 
-	err = add_jt_map(obj, prog, sym_off, map_fd);
+	err = add_jt_map(obj, prog, sym_off, subprog_idx, map_fd);
 	if (err)
 		goto err_close;
 
@@ -6809,16 +7171,28 @@ static int create_func_ptr_map(struct bpf_object *obj, struct bpf_program *prog,
 			goto err_free;
 		}
 		/*
-		 * Static functions were appended by bpf_object__append_func_ptrs_code().
-		 * A global function is in the program only if the code refers to it.
+		 * Static and hidden functions were appended by
+		 * bpf_object__append_func_ptrs_code(). A global function is in
+		 * the program only if the code refers to it.
 		 */
-		sec_insn_off = ptrs[i].text_off / BPF_INSN_SZ;
+		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
+		/*
+		 * The kernel verifies the function with the callx that it finds
+		 * it for, like the code calls it, not the copies for callx of a
+		 * number.
+		 */
 		for (j = 0; j < prog->subprog_cnt; j++)
-			if (prog->subprogs[j].sec_insn_off == sec_insn_off)
+			if (prog->subprogs[j].sec_idx == ptrs[i].func_sec_idx &&
+			    prog->subprogs[j].sec_insn_off == sec_insn_off &&
+			    !prog->subprogs[j].arena_func && !prog->subprogs[j].num_func)
 				break;
 		if (j == prog->subprog_cnt) {
-			pr_debug("prog '%s': map '%s': no function for the pointer at offset %zu, it's NULL\n",
-				 prog->name, map->name, ptrs[i].sec_off);
+			struct bpf_program *func;
+
+			/* a virtual call through it would be a call of NULL */
+			func = find_prog_by_sec_insn(obj, ptrs[i].func_sec_idx, sec_insn_off);
+			pr_warn("prog '%s': map '%s': pointer at offset %zu to global function '%s' is NULL, callx calls static and hidden functions only\n",
+				prog->name, map->name, ptrs[i].sec_off, func ? func->name : "<?>");
 			val = 0;
 		} else {
 			val = (__u64)prog->subprogs[j].sub_insn_off * BPF_INSN_SZ;
@@ -7252,6 +7626,8 @@ static int save_subprog_offsets(struct bpf_program *main_prog, struct bpf_progra
 		return -ENOMEM;
 
 	main_prog->subprogs = tmp;
+	memset(&main_prog->subprogs[cnt], 0, size);
+	main_prog->subprogs[cnt].sec_idx = subprog->sec_idx;
 	main_prog->subprogs[cnt].sec_insn_off = subprog->sec_insn_off;
 	main_prog->subprogs[cnt].sub_insn_off = subprog->sub_insn_off;
 	main_prog->subprog_cnt++;
@@ -7299,15 +7675,89 @@ bpf_object__append_subprog_code(struct bpf_object *obj, struct bpf_program *main
 	return 0;
 }
 
-static int
-bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
-		       struct bpf_program *prog)
+/*
+ * The function that the call or ld_imm64 at insn_idx of prog, whose code is
+ * insn, refers to, in *subprog. Returns 1 if it refers to none, e.g. a kfunc.
+ */
+static int find_insn_subprog(struct bpf_object *obj, struct bpf_program *prog, size_t insn_idx,
+			     const struct bpf_insn *insn, struct bpf_program **subprog)
 {
-	size_t sub_insn_idx, insn_idx;
-	struct bpf_program *subprog;
+	size_t sub_sec_idx, sub_insn_idx;
 	struct reloc_desc *relo;
+
+	relo = find_prog_insn_relo(prog, insn_idx);
+	if (relo && relo->type == RELO_EXTERN_CALL)
+		/* kfunc relocations will be handled later
+		 * in bpf_object__relocate_data()
+		 */
+		return 1;
+	if (relo && relo->type != RELO_CALL && relo->type != RELO_SUBPROG_ADDR) {
+		pr_warn("prog '%s': unexpected relo for insn #%zu, type %u\n",
+			prog->name, insn_idx, relo->type);
+		return -LIBBPF_ERRNO__RELOC;
+	}
+	if (relo) {
+		/* sub-program instruction index is a combination of
+		 * an offset of a symbol pointed to by relocation and
+		 * call instruction's imm field; for global functions,
+		 * call always has imm = -1, but for static functions
+		 * relocation is against STT_SECTION and insn->imm
+		 * points to a start of a static function
+		 *
+		 * for subprog addr relocation, the relo->sym_off + insn->imm is
+		 * the byte offset in the corresponding section.
+		 */
+		if (relo->type == RELO_CALL)
+			sub_insn_idx = relo->sym_off / BPF_INSN_SZ + insn->imm + 1;
+		else
+			sub_insn_idx = (relo->sym_off + insn->imm) / BPF_INSN_SZ;
+		sub_sec_idx = relo->sec_idx;
+	} else if (insn_is_pseudo_func((struct bpf_insn *)insn)) {
+		/*
+		 * RELO_SUBPROG_ADDR relo is always emitted even if both
+		 * functions are in the same section, so it shouldn't reach here.
+		 */
+		pr_warn("prog '%s': missing subprog addr relo for insn #%zu\n",
+			prog->name, insn_idx);
+		return -LIBBPF_ERRNO__RELOC;
+	} else {
+		/* if subprogram call is to a static function within
+		 * the same ELF section, there won't be any relocation
+		 * emitted, but it also means there is no additional
+		 * offset necessary, insns->imm is relative to
+		 * instruction's original position within the section
+		 */
+		sub_insn_idx = prog->sec_insn_off + insn_idx + insn->imm + 1;
+		sub_sec_idx = prog->sec_idx;
+	}
+
+	/* we enforce that sub-programs are in .text, see sec_is_text() */
+	*subprog = find_prog_by_sec_insn(obj, sub_sec_idx, sub_insn_idx);
+	if (!*subprog || !prog_is_subprog(obj, *subprog)) {
+		pr_warn("prog '%s': no sub-program found for the call at insn #%zu\n",
+			prog->name, insn_idx);
+		return -LIBBPF_ERRNO__RELOC;
+	}
+	return 0;
+}
+
+static int bpf_object__arena_func_copy(struct bpf_object *obj, struct bpf_program *main_prog,
+				       struct bpf_program *subprog);
+
+/*
+ * Relocate the calls and the addresses of functions in the code of prog, as
+ * it is in main_prog. [WIP] Code that callx of a number may call, num, calls
+ * copies of its own, see bpf_object__arena_func_copy().
+ */
+static int
+bpf_object__reloc_code_in(struct bpf_object *obj, struct bpf_program *main_prog,
+			  struct bpf_program *prog, bool num)
+{
+	struct bpf_program *subprog;
+	size_t insn_idx, code_off;
 	struct bpf_insn *insn;
-	int err;
+	int err, idx;
+	__u32 off;
 
 	err = reloc_prog_func_and_line_info(obj, main_prog, prog);
 	if (err)
@@ -7318,56 +7768,44 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 		if (!insn_is_subprog_call(insn) && !insn_is_pseudo_func(insn))
 			continue;
 
-		relo = find_prog_insn_relo(prog, insn_idx);
-		if (relo && relo->type == RELO_EXTERN_CALL)
-			/* kfunc relocations will be handled later
-			 * in bpf_object__relocate_data()
-			 */
+		err = find_insn_subprog(obj, prog, insn_idx, insn, &subprog);
+		if (err < 0)
+			return err;
+		if (err)
 			continue;
-		if (relo && relo->type != RELO_CALL && relo->type != RELO_SUBPROG_ADDR) {
-			pr_warn("prog '%s': unexpected relo for insn #%zu, type %u\n",
-				prog->name, insn_idx, relo->type);
-			return -LIBBPF_ERRNO__RELOC;
-		}
-		if (relo) {
-			/* sub-program instruction index is a combination of
-			 * an offset of a symbol pointed to by relocation and
-			 * call instruction's imm field; for global functions,
-			 * call always has imm = -1, but for static functions
-			 * relocation is against STT_SECTION and insn->imm
-			 * points to a start of a static function
-			 *
-			 * for subprog addr relocation, the relo->sym_off + insn->imm is
-			 * the byte offset in the corresponding section.
-			 */
-			if (relo->type == RELO_CALL)
-				sub_insn_idx = relo->sym_off / BPF_INSN_SZ + insn->imm + 1;
-			else
-				sub_insn_idx = (relo->sym_off + insn->imm) / BPF_INSN_SZ;
-		} else if (insn_is_pseudo_func(insn)) {
-			/*
-			 * RELO_SUBPROG_ADDR relo is always emitted even if both
-			 * functions are in the same section, so it shouldn't reach here.
-			 */
-			pr_warn("prog '%s': missing subprog addr relo for insn #%zu\n",
-				prog->name, insn_idx);
-			return -LIBBPF_ERRNO__RELOC;
-		} else {
-			/* if subprogram call is to a static function within
-			 * the same ELF section, there won't be any relocation
-			 * emitted, but it also means there is no additional
-			 * offset necessary, insns->imm is relative to
-			 * instruction's original position within the section
-			 */
-			sub_insn_idx = prog->sec_insn_off + insn_idx + insn->imm + 1;
+
+		/*
+		 * [WIP] Where functions are numbers, the address that the code
+		 * takes is that of the copy of the function for arena data and
+		 * addresses, but for a global function, which callx of a number
+		 * can't call.
+		 */
+		if (insn_is_pseudo_func(insn) && main_prog->func_copies &&
+		    (!subprog->sym_global || subprog->mark_btf_static)) {
+			idx = bpf_object__arena_func_copy(obj, main_prog, subprog);
+			if (idx < 0)
+				return idx;
+			off = main_prog->subprogs[idx].sub_insn_off;
+			goto relocate;
 		}
 
-		/* we enforce that sub-programs should be in .text section */
-		subprog = find_prog_by_sec_insn(obj, obj->efile.text_shndx, sub_insn_idx);
-		if (!subprog) {
-			pr_warn("prog '%s': no .text section found yet sub-program call exists\n",
-				prog->name);
-			return -LIBBPF_ERRNO__RELOC;
+		/* [WIP] code that callx of a number may call calls copies of its own */
+		if (num) {
+			if (!subprog->num_insn_off) {
+				code_off = subprog->sub_insn_off;
+				idx = main_prog->subprog_cnt;
+				err = bpf_object__append_subprog_code(obj, main_prog, subprog);
+				if (err)
+					return err;
+				main_prog->subprogs[idx].num_func = true;
+				subprog->num_insn_off = subprog->sub_insn_off;
+				err = bpf_object__reloc_code_in(obj, main_prog, subprog, true);
+				subprog->sub_insn_off = code_off;
+				if (err)
+					return err;
+			}
+			off = subprog->num_insn_off;
+			goto relocate;
 		}
 
 		/* if it's the first call instruction calling into this
@@ -7384,11 +7822,13 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 			err = bpf_object__append_subprog_code(obj, main_prog, subprog);
 			if (err)
 				return err;
-			err = bpf_object__reloc_code(obj, main_prog, subprog);
+			err = bpf_object__reloc_code_in(obj, main_prog, subprog, false);
 			if (err)
 				return err;
 		}
+		off = subprog->sub_insn_off;
 
+relocate:
 		/* main_prog->insns memory could have been re-allocated, so
 		 * calculate pointer again
 		 */
@@ -7399,13 +7839,20 @@ bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
 		 * well), so position of any subprog can be different for
 		 * different main programs
 		 */
-		insn->imm = subprog->sub_insn_off - (prog->sub_insn_off + insn_idx) - 1;
+		insn->imm = off - (prog->sub_insn_off + insn_idx) - 1;
 
-		pr_debug("prog '%s': insn #%zu relocated, imm %d points to subprog '%s' (now at %zu offset)\n",
-			 prog->name, insn_idx, insn->imm, subprog->name, subprog->sub_insn_off);
+		pr_debug("prog '%s': insn #%zu relocated, imm %d points to subprog '%s' (now at %u offset)\n",
+			 prog->name, insn_idx, insn->imm, subprog->name, off);
 	}
 
 	return 0;
+}
+
+static int
+bpf_object__reloc_code(struct bpf_object *obj, struct bpf_program *main_prog,
+		       struct bpf_program *prog)
+{
+	return bpf_object__reloc_code_in(obj, main_prog, prog, false);
 }
 
 /* Append to the main program all functions that the data of the map points to */
@@ -7421,19 +7868,22 @@ bpf_object__append_func_ptrs_code(struct bpf_object *obj, struct bpf_program *ma
 	ptrs = map->func_ptrs;
 	cnt = map->func_ptr_cnt;
 	for (i = 0; i < cnt; i++) {
-		sec_insn_off = ptrs[i].text_off / BPF_INSN_SZ;
-		subprog = find_prog_by_sec_insn(obj, obj->efile.text_shndx, sec_insn_off);
+		sec_insn_off = ptrs[i].func_off / BPF_INSN_SZ;
+		subprog = find_prog_by_sec_insn(obj, ptrs[i].func_sec_idx, sec_insn_off);
 		if (!subprog || subprog->sec_insn_off != sec_insn_off) {
-			pr_warn("prog '%s': map '%s': no function at .text+%zu for the pointer at offset %zu\n",
-				main_prog->name, map->name, ptrs[i].text_off, ptrs[i].sec_off);
+			pr_warn("prog '%s': map '%s': no function at section(%d)+%zu for the pointer at offset %zu\n",
+				main_prog->name, map->name, ptrs[i].func_sec_idx, ptrs[i].func_off,
+				ptrs[i].sec_off);
 			return -LIBBPF_ERRNO__RELOC;
 		}
 
 		/*
-		 * callx can't call global functions. Don't add one to the
-		 * program only because the data points to it.
+		 * callx can't call global functions. A hidden one is static
+		 * to the verifier, see bpf_object__sanitize_and_load_btf().
+		 * Don't add a global one to the program only because the data
+		 * points to it.
 		 */
-		if (subprog->sym_global)
+		if (subprog->sym_global && !subprog->mark_btf_static)
 			continue;
 
 		/* see the comment in bpf_object__reloc_code() */
@@ -7475,6 +7925,305 @@ bpf_object__append_func_ptrs(struct bpf_object *obj, struct bpf_program *prog)
 			return err;
 	}
 	return 0;
+}
+
+/* [WIP] Whether code of the program calls its function at sub_insn_off */
+static bool prog_code_calls(const struct bpf_program *prog, size_t sub_insn_off)
+{
+	struct bpf_insn *insn;
+	size_t i;
+
+	for (i = 0; i < prog->insns_cnt; i++) {
+		insn = &prog->insns[i];
+		if (insn_is_subprog_call(insn) && i + insn->imm + 1 == sub_insn_off)
+			return true;
+	}
+	return false;
+}
+
+/* [WIP] Whether the program, or a function that it calls, refers to arena data */
+static bool prog_refers_to_arena(const struct bpf_object *obj, const struct bpf_program *prog)
+{
+	size_t i;
+
+	if (obj->arena_map_idx < 0)
+		return false;
+	for (i = 0; i < prog->nr_reloc; i++)
+		if (prog->reloc_desc[i].type == RELO_DATA &&
+		    prog->reloc_desc[i].map_idx == obj->arena_map_idx)
+			return true;
+	return false;
+}
+
+/* [WIP] The copy of the function for arena data and addresses in the program, or -1 */
+static int prog_arena_func(const struct bpf_program *prog, int sec_idx, size_t sec_insn_off)
+{
+	int i;
+
+	for (i = 0; i < prog->subprog_cnt; i++)
+		if (prog->subprogs[i].arena_func && prog->subprogs[i].sec_idx == sec_idx &&
+		    prog->subprogs[i].sec_insn_off == sec_insn_off)
+			return i;
+	return -1;
+}
+
+/*
+ * [WIP] Give the copy at subprogs[idx] a BTF FUNC of its own, a static one with
+ * the name and the prototype of the function, so that its JITed address is
+ * found by its type, see bpf_object__fill_arena_func_ptrs(). The kernel would
+ * take two func_info records with the same type, but functions that it
+ * removes as dead code would leave nothing to tell them apart.
+ */
+static int prog_own_func_type(struct bpf_object *obj, struct bpf_program *prog, int idx)
+{
+	struct bpf_func_info_min *rec;
+	const struct btf_type *t;
+	__u32 i, proto_id;
+	char *name;
+	int id;
+
+	for (i = 0; i < prog->func_info_cnt; i++) {
+		rec = prog->func_info + i * prog->func_info_rec_size;
+		if (rec->insn_off == prog->subprogs[idx].sub_insn_off)
+			break;
+	}
+	if (i == prog->func_info_cnt)
+		return -ENOENT;
+
+	/* adding a string may move the strings of BTF */
+	t = btf__type_by_id(obj->btf, rec->type_id);
+	proto_id = t->type;
+	name = strdup(btf__name_by_offset(obj->btf, t->name_off));
+	if (!name)
+		return -ENOMEM;
+	id = btf__add_func(obj->btf, name, BTF_FUNC_STATIC, proto_id);
+	free(name);
+	if (id < 0)
+		return id;
+	rec->type_id = id;
+	return 0;
+}
+
+/*
+ * [WIP] The copy of the function for arena data and for addresses that the
+ * code takes, which nothing in the code calls. It's a part of letting callx
+ * call a number, the stopgap until callx through a number gets a proper
+ * design, and goes away with it. Native code has no counterpart.
+ *
+ * The case is C++ code like
+ *
+ *	Error e;
+ *	...
+ *	throw e;
+ *
+ * with an out-of-line ~Error(). The code calls ~Error() directly, with the
+ * object on the stack for this. The throw passes its address to __cxa_throw(),
+ * which stores it, and the end of the handler calls it through that number,
+ * with the thrown object, in arena, for this. Likewise Base::~Base(), which
+ * Derived::~Derived() calls directly, is in the vtable of Base, from where a
+ * virtual call calls it through a number.
+ *
+ * A function is one block of insns in a program. The kernel verifies a
+ * function whose address is taken, or that only data refers to, on its own,
+ * with numbers for arguments, for callx of a number, and a function that the
+ * code calls with the pointers that the caller passes. The verifier refuses an
+ * insn used with different kinds of pointers:
+ *
+ *	same insn cannot be used with different pointers
+ *
+ * as it rewrites each insn once, for one kind of access. The copy is reached
+ * only through its address, so the kernel only ever verifies it on its own,
+ * and the one that the code calls is only ever called directly.
+ *
+ * The functions that the copy calls get numbers derived from its arguments:
+ * the destructor of a base or of a member, say, which the code calls on the
+ * stack too. So the copy, and what it calls, calls copies of their own,
+ * num_insn_off, which only such code calls.
+ *
+ * The program gets one such copy of a function, which gets func_info and
+ * line_info and has its relocations applied, like any function that is
+ * appended, and a BTF FUNC of its own, see prog_own_func_type().
+ */
+static int bpf_object__arena_func_copy(struct bpf_object *obj, struct bpf_program *main_prog,
+				       struct bpf_program *subprog)
+{
+	size_t code_off = subprog->sub_insn_off;
+	int idx, err;
+
+	idx = prog_arena_func(main_prog, subprog->sec_idx, subprog->sec_insn_off);
+	if (idx >= 0)
+		return idx;
+
+	idx = main_prog->subprog_cnt;
+	err = bpf_object__append_subprog_code(obj, main_prog, subprog);
+	if (err)
+		return err;
+	main_prog->subprogs[idx].arena_func = true;
+	err = bpf_object__reloc_code_in(obj, main_prog, subprog, true);
+	if (!err)
+		err = prog_own_func_type(obj, main_prog, idx);
+	pr_debug("prog '%s': added a copy of '%s' for arena data and addresses at insn %zu\n",
+		 main_prog->name, subprog->name, subprog->sub_insn_off);
+	subprog->sub_insn_off = code_off;
+	return err ?: idx;
+}
+
+/*
+ * [WIP] Whether the function does nothing but call __bpf_trap. clang gives the
+ * complete and the deleting destructor of an abstract class such a body, as
+ * nothing can run them, and they are in the vtable of the class. The kernel
+ * refuses a function that reaches the trap, so a copy for arena data can't be
+ * verified. Calling one is undefined behavior, so its slots stay NULL. Goes
+ * away with the design for callx, which verifies a function the data points to
+ * only when it is called.
+ */
+static bool prog_is_trap_only(const struct bpf_object *obj, const struct bpf_program *prog)
+{
+	const struct bpf_insn *insn = prog->insns;
+	int i;
+
+	if (prog->insns_cnt < 1 || prog->insns_cnt > 2)
+		return false;
+	if (insn[0].code != (BPF_JMP | BPF_CALL))
+		return false;
+	if (prog->insns_cnt == 2 && insn[1].code != (BPF_JMP | BPF_EXIT))
+		return false;
+	for (i = 0; i < prog->nr_reloc; i++) {
+		const struct reloc_desc *relo = &prog->reloc_desc[i];
+
+		if (relo->insn_idx == 0 && relo->type == RELO_EXTERN_CALL)
+			return strcmp(obj->externs[relo->ext_idx].name, "__bpf_trap") == 0;
+	}
+	return false;
+}
+
+/*
+ * [WIP] A program that the kernel lets call a number with callx, one loaded
+ * with BPF_F_ARENA_SCALAR, may call any function whose address is in arena
+ * data, if it has callx and refers to arena data. Give it a copy of each of
+ * them for arena data, see bpf_object__arena_func_copy(). The kernel
+ * verifies such copy on its own, with unknown scalar arguments, as a function
+ * that callx of a number may call, and its JITed address goes to arena data
+ * after load, see bpf_object__fill_arena_func_ptrs(). A global function can't
+ * be called that way, and the pointer to one stays NULL.
+ *
+ * A program without callx reads the slots too, and compares them with the
+ * addresses that it takes. It gets copies of the functions whose addresses
+ * its code takes only, see bpf_object__reloc_code_in(), and fills their slots:
+ * a copy of every function in arena data in every program that refers to it
+ * exceeds the limit of subprograms in an object with many vtables.
+ */
+static int
+bpf_object__append_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *main_prog)
+{
+	struct bpf_program *subprog;
+	struct arena_func_ptr *p;
+	size_t i, sec_insn_off;
+	int err;
+
+	if (!obj->arena_func_ptr_cnt || !prog_refers_to_arena(obj, main_prog))
+		return 0;
+	if (!main_prog->num_callx) {
+		/* the light skeleton doesn't fill the pointers */
+		if (obj->gen_loader && prog_has_callx(main_prog)) {
+			pr_warn("prog '%s': pointers to functions in arena data are not supported by light skeleton\n",
+				main_prog->name);
+			return -ENOTSUP;
+		}
+		return 0;
+	}
+	obj->arena_func_callers = true;
+
+	for (i = 0; i < obj->arena_func_ptr_cnt; i++) {
+		p = &obj->arena_func_ptrs[i];
+		sec_insn_off = p->func_off / BPF_INSN_SZ;
+		subprog = find_prog_by_sec_insn(obj, p->func_sec_idx, sec_insn_off);
+		if (!subprog || subprog->sec_insn_off != sec_insn_off ||
+		    !prog_is_subprog(obj, subprog)) {
+			pr_warn("prog '%s': no function at section(%d)+%zu for the pointer at offset %zu in arena data\n",
+				main_prog->name, p->func_sec_idx, p->func_off, p->sec_off);
+			return -LIBBPF_ERRNO__RELOC;
+		}
+
+		/* the kernel takes a hidden function for a static one */
+		if (subprog->sym_global && !subprog->mark_btf_static)
+			continue;
+
+		/* a call of it would be undefined behavior, and the kernel would refuse the copy */
+		if (prog_is_trap_only(obj, subprog)) {
+			pr_debug("prog '%s': pointer at offset %zu in arena data to '%s', which only traps, is NULL\n",
+				 main_prog->name, p->sec_off, subprog->name);
+			continue;
+		}
+
+		err = bpf_object__arena_func_copy(obj, main_prog, subprog);
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}
+
+/*
+ * [WIP] Whether the kernel lets the program, loaded with BPF_F_ARENA_SCALAR,
+ * call a number with callx: whether it or a function that it calls has callx.
+ * The functions that it calls are the ones that its code calls or takes the
+ * address of, and so on, and those that read-only data with pointers to
+ * functions that it refers to points to.
+ */
+static int prog_reaches_callx(struct bpf_object *obj, struct bpf_program *main_prog)
+{
+	struct bpf_program *prog, *subprog;
+	int i, top = 0, err = 0;
+	struct bpf_map *map;
+	bool *seen, found;
+	size_t j;
+	int *stack;
+
+	seen = calloc(obj->nr_programs, sizeof(*seen));
+	stack = calloc(obj->nr_programs, sizeof(*stack));
+	if (!seen || !stack) {
+		err = -ENOMEM;
+		goto out;
+	}
+	stack[top++] = main_prog - obj->programs;
+	seen[main_prog - obj->programs] = true;
+	found = false;
+	while (top && !found) {
+		prog = &obj->programs[stack[--top]];
+		found = prog_has_callx(prog);
+		for (j = 0; j < prog->insns_cnt && !found; j++) {
+			if (!insn_is_subprog_call(&prog->insns[j]) &&
+			    !insn_is_pseudo_func(&prog->insns[j]))
+				continue;
+			err = find_insn_subprog(obj, prog, j, &prog->insns[j], &subprog);
+			if (err < 0)
+				goto out;
+			if (err || seen[subprog - obj->programs])
+				continue;
+			seen[subprog - obj->programs] = true;
+			stack[top++] = subprog - obj->programs;
+		}
+		for (j = 0; j < prog->nr_reloc && !found; j++) {
+			if (prog->reloc_desc[j].type != RELO_DATA)
+				continue;
+			map = &obj->maps[prog->reloc_desc[j].map_idx];
+			for (i = 0; i < map->func_ptr_cnt; i++) {
+				struct func_ptr *fp = &map->func_ptrs[i];
+
+				subprog = find_prog_by_sec_insn(obj, fp->func_sec_idx,
+								fp->func_off / BPF_INSN_SZ);
+				if (!subprog || seen[subprog - obj->programs])
+					continue;
+				seen[subprog - obj->programs] = true;
+				stack[top++] = subprog - obj->programs;
+			}
+		}
+	}
+	err = found;
+out:
+	free(seen);
+	free(stack);
+	return err;
 }
 
 /*
@@ -7573,13 +8322,39 @@ bpf_object__relocate_calls(struct bpf_object *obj, struct bpf_program *prog)
 			continue;
 
 		subprog->sub_insn_off = 0;
+		subprog->num_insn_off = 0;
+	}
+
+	/*
+	 * [WIP] Functions are numbers in a program loaded with
+	 * BPF_F_ARENA_SCALAR, where the kernel lets callx call a number. The
+	 * functions whose addresses its code takes get copies of their own,
+	 * which take func_info, see bpf_object__arena_func_copy(), whether or
+	 * not the program has callx: it compares the addresses with the slots
+	 * in arena data, which it fills with the copies after load, and
+	 * another program with the arena may call them. A program that reaches
+	 * callx gets a copy of every function in arena data as well, see
+	 * bpf_object__append_arena_func_ptrs().
+	 */
+	prog->func_copies = (obj->data_in_arena || (prog->prog_flags & BPF_F_ARENA_SCALAR)) &&
+			    !obj->gen_loader && obj->btf_ext && kernel_supports(obj, FEAT_BTF_FUNC);
+	prog->num_callx = false;
+	if (prog->func_copies) {
+		err = prog_reaches_callx(obj, prog);
+		if (err < 0)
+			return err;
+		prog->num_callx = err;
 	}
 
 	err = bpf_object__reloc_code(obj, prog, prog);
 	if (err)
 		return err;
 
-	return bpf_object__append_func_ptrs(obj, prog);
+	err = bpf_object__append_func_ptrs(obj, prog);
+	if (err)
+		return err;
+
+	return bpf_object__append_arena_func_ptrs(obj, prog);
 }
 
 static void
@@ -8027,14 +8802,49 @@ err_out:
 }
 
 /*
- * Turn pointers to data that are stored in data into addresses of arena.
- * The arena is created here, ahead of the other maps: the address has to be
- * known before the maps that hold the pointers are created.
+ * The data of the map of section sec_idx, which has pointers to data, where
+ * libbpf keeps it until the object is loaded, and the name of the map. NULL
+ * if the data is not loaded. __arena variables are at the start of arena
+ * data, which is the map of the first of their sections, see
+ * bpf_object__layout_data(). The sections are gone when the object is
+ * loaded.
+ */
+static void *bpf_object__data_ptr_sec(struct bpf_object *obj, int sec_idx, const char **name)
+{
+	struct bpf_map *map;
+
+	if (sec_idx == obj->efile.arena_data_shndx) {
+		*name = ARENA_SEC;
+		/* the arena has the data once libbpf maps it */
+		if (obj->arena_data)
+			return obj->arena_data;
+		return obj->maps[obj->arena_map_idx].mmaped + obj->arena_data_off;
+	}
+
+	map = bpf_object__sec_map(obj, sec_idx);
+	if (!map || (!map->in_arena && !map->autocreate))
+		return NULL;
+	*name = map->real_name;
+	return map->mmaped;
+}
+
+/*
+ * Turn pointers to data that are stored in data into addresses of arena,
+ * the addresses that the kernel gives programs for the data: the user
+ * address of the arena plus the offset of the data. The address has to be
+ * known before the maps that hold the pointers are created. An arena with
+ * map_extra is at map_extra whoever creates it, a pinned arena included:
+ * libbpf reuses a pinned map only if its map_extra is the same. Without
+ * map_extra the first mmap() of the arena picks the address, so libbpf
+ * creates and maps the arena here, ahead of the other maps. It can't know
+ * the address of such arena that it doesn't create.
  */
 static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 {
-	struct bpf_map *arena, *map, *targ;
-	__u64 addr, val;
+	struct bpf_map *arena, *targ;
+	__u64 base, addr, val;
+	const char *name;
+	void *data;
 	size_t i;
 	int err;
 
@@ -8044,15 +8854,12 @@ static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 	for (i = 0; i < obj->data_ptr_cnt; i++) {
 		struct data_ptr *p = &obj->data_ptrs[i];
 
-		if (p->targ_sec_idx < 0)
+		if (p->targ_sec_idx < 0 || !bpf_object__data_ptr_sec(obj, p->sec_idx, &name))
 			continue;
-		map = bpf_object__sec_map(obj, p->sec_idx);
 		targ = bpf_object__sec_map(obj, p->targ_sec_idx);
-		if (map && (map->in_arena || map->autocreate) &&
-		    (!targ || (!targ->in_arena && !targ->arena_copy))) {
+		if (!targ || (!targ->in_arena && !targ->arena_copy)) {
 			pr_warn("sec '%s': pointer to '%s' at offset %zu can't be resolved: sec '%s' is not in arena\n",
-				map->real_name, p->sym_name, p->sec_off,
-				targ ? targ->real_name : "<?>");
+				name, p->sym_name, p->sec_off, targ ? targ->real_name : "<?>");
 			return -LIBBPF_ERRNO__RELOC;
 		}
 	}
@@ -8068,35 +8875,37 @@ static int bpf_object__relocate_data_ptrs(struct bpf_object *obj)
 	arena = &obj->maps[obj->arena_map_idx];
 	if (!arena->autocreate)
 		return 0;
-	/* libbpf doesn't mmap an arena that it didn't create, so the address is not known */
-	if (arena->reused || arena->pin_path) {
-		pr_warn("map '%s': pointers to data in data are not supported with pinned or reused arena\n",
+	if (arena->map_extra) {
+		base = arena->map_extra;
+	} else if (arena->reused || arena->pin_path) {
+		pr_warn("map '%s': pointers to data in data need the address of pinned or reused arena, set its map_extra\n",
 			arena->name);
 		return -ENOTSUP;
+	} else {
+		err = bpf_object__create_map(obj, arena, false);
+		err = err ?: bpf_object__mmap_arena(obj, arena);
+		if (err) {
+			pr_warn("map '%s': failed to create: %s\n", arena->name, errstr(err));
+			return err;
+		}
+		obj->arena_mapped = true;
+		base = (__u64)(unsigned long)arena->mmaped;
 	}
-
-	err = bpf_object__create_map(obj, arena, false);
-	err = err ?: bpf_object__mmap_arena(obj, arena);
-	if (err) {
-		pr_warn("map '%s': failed to create: %s\n", arena->name, errstr(err));
-		return err;
-	}
-	obj->arena_mapped = true;
 
 	for (i = 0; i < obj->data_ptr_cnt; i++) {
 		struct data_ptr *p = &obj->data_ptrs[i];
 
-		map = bpf_object__sec_map(obj, p->sec_idx);
-		if (!map || (!map->in_arena && !map->autocreate))
+		data = bpf_object__data_ptr_sec(obj, p->sec_idx, &name);
+		if (!data)
 			continue;
 
-		addr = (__u64)(unsigned long)arena->mmaped + obj->arena_data_off + p->targ_off;
+		addr = base + obj->arena_data_off + p->targ_off;
 		if (p->targ_sec_idx >= 0)
 			addr += bpf_object__sec_map(obj, p->targ_sec_idx)->arena_off;
 
-		memcpy(&val, map->mmaped + p->sec_off, sizeof(val));
+		memcpy(&val, data + p->sec_off, sizeof(val));
 		val += addr;
-		memcpy(map->mmaped + p->sec_off, &val, sizeof(val));
+		memcpy(data + p->sec_off, &val, sizeof(val));
 	}
 	return 0;
 }
@@ -8371,10 +9180,25 @@ static int bpf_object__collect_map_relos(struct bpf_object *obj,
 	return 0;
 }
 
+/* Whether the symbol is an __arena variable */
+static bool sym_is_arena(const struct bpf_object *obj, const Elf64_Sym *sym)
+{
+	return sym->st_shndx < obj->efile.sec_cnt &&
+	       obj->efile.secs[sym->st_shndx].sec_type == SEC_ARENA;
+}
+
 /*
- * A pointer to data that is stored in data. When data is in arena
- * the program dereferences what it loads from data, so the pointer has
- * to be the address of the target in arena.
+ * A pointer to data that is stored in data, where either the data or what
+ * it points to is in arena. The program dereferences what it loads from
+ * the data, so the pointer has to be the address of the target in arena.
+ *
+ * A pointer to a function in arena data, e.g. in a vtable that is in arena,
+ * is NULL. The verifier knows a pointer to a function only by its value in a
+ * frozen map, see create_func_ptr_map(), so a program can't call through
+ * a pointer that it loads from arena. There is no address to give it either:
+ * a function has one in each program that it is a part of, and the data in
+ * arena is the same for all of them. [WIP] Until a program that has a copy
+ * of it for callx of a number is loaded, see bpf_object__fill_arena_func_ptrs().
  */
 static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo_sec_name,
 					int relo_idx, size_t sec_idx, const Elf64_Rel *rel,
@@ -8382,15 +9206,21 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 {
 	Elf_Data *scn_data = obj->efile.secs[sec_idx].data;
 	const char *sym_name = elf_sym_str(obj, sym->st_name) ?: "<?>";
+	const struct elf_sec_desc *targ;
 	struct data_ptr *ptrs;
+	bool in_arena, func;
 
 	if (ELF64_ST_TYPE(sym->st_info) == STT_SECTION && sym->st_shndx < obj->efile.sec_cnt)
 		sym_name = elf_sec_name(obj, elf_sec_by_idx(obj, sym->st_shndx)) ?: "<?>";
 
+	/* all global data is in arena when data is, see map_data_goes_to_arena() */
+	in_arena = obj->efile.secs[sec_idx].sec_type == SEC_ARENA || obj->data_in_arena;
+	func = sym->st_shndx < obj->efile.sec_cnt && section_have_execinstr(obj, sym->st_shndx);
+
 	if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
 	    sym->st_shndx >= obj->efile.sec_cnt ||
-	    (sym->st_shndx != obj->efile.arena_data_shndx &&
-	     !bpf_object__shndx_is_data(obj, sym->st_shndx)) ||
+	    (obj->efile.secs[sym->st_shndx].sec_type != SEC_ARENA &&
+	     !bpf_object__shndx_is_data(obj, sym->st_shndx) && !(in_arena && func)) ||
 	    rel->r_offset >= scn_data->d_size ||
 	    scn_data->d_size - rel->r_offset < sizeof(__u64)) {
 		pr_warn("sec '%s': relo #%d: can't resolve pointer to '%s' at offset %zu when data is in arena\n",
@@ -8398,17 +9228,51 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 		return -LIBBPF_ERRNO__RELOC;
 	}
 
+	if (func) {
+		const struct elf_sec_desc *sec_desc = &obj->efile.secs[sec_idx];
+		struct arena_func_ptr *fptrs, *fptr;
+		const char *name;
+		__u64 addend;
+		void *data;
+
+		/* in the map of the section, see bpf_object__layout_data() */
+		data = bpf_object__data_ptr_sec(obj, sec_desc->map_sec_idx, &name);
+		data += sec_desc->map_off + rel->r_offset;
+		memcpy(&addend, data, sizeof(addend));
+		if (!is_native_endianness(obj))
+			addend = bswap_64(addend);
+		memset(data, 0, sizeof(__u64));
+		pr_debug("sec '%s': relo #%d: pointer at offset %zu to function '%s' is NULL in arena\n",
+			 relo_sec_name, relo_idx, (size_t)rel->r_offset, sym_name);
+
+		/* [WIP] until a program has the function, see bpf_object__fill_arena_func_ptrs() */
+		if ((sym->st_value + addend) % BPF_INSN_SZ)
+			return 0;
+		fptrs = libbpf_reallocarray(obj->arena_func_ptrs, obj->arena_func_ptr_cnt + 1,
+					    sizeof(*fptrs));
+		if (!fptrs)
+			return -ENOMEM;
+		obj->arena_func_ptrs = fptrs;
+		fptr = &fptrs[obj->arena_func_ptr_cnt++];
+		fptr->sec_idx = sec_desc->map_sec_idx;
+		fptr->sec_off = sec_desc->map_off + rel->r_offset;
+		fptr->func_sec_idx = sym->st_shndx;
+		fptr->func_off = sym->st_value + addend;
+		fptr->filled = false;
+		return 0;
+	}
+
 	ptrs = libbpf_reallocarray(obj->data_ptrs, obj->data_ptr_cnt + 1, sizeof(*ptrs));
 	if (!ptrs)
 		return -ENOMEM;
 	obj->data_ptrs = ptrs;
 
-	ptrs[obj->data_ptr_cnt].sec_idx = sec_idx;
-	ptrs[obj->data_ptr_cnt].sec_off = rel->r_offset;
+	ptrs[obj->data_ptr_cnt].sec_idx = obj->efile.secs[sec_idx].map_sec_idx;
+	ptrs[obj->data_ptr_cnt].sec_off = obj->efile.secs[sec_idx].map_off + rel->r_offset;
 	/* __arena variables are at the start of arena data */
-	ptrs[obj->data_ptr_cnt].targ_sec_idx =
-		sym->st_shndx == obj->efile.arena_data_shndx ? -1 : sym->st_shndx;
-	ptrs[obj->data_ptr_cnt].targ_off = sym->st_value;
+	targ = &obj->efile.secs[sym->st_shndx];
+	ptrs[obj->data_ptr_cnt].targ_sec_idx = targ->sec_type == SEC_ARENA ? -1 : targ->map_sec_idx;
+	ptrs[obj->data_ptr_cnt].targ_off = targ->map_off + sym->st_value;
 	ptrs[obj->data_ptr_cnt].sym_name = strdup(sym_name);
 	if (!ptrs[obj->data_ptr_cnt].sym_name)
 		return -ENOMEM;
@@ -8419,11 +9283,17 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 	return 0;
 }
 
-/* Collect pointers in a data section that went to arena */
+/*
+ * Collect pointers in a data section that is in arena: __arena variables, or
+ * any data section, read-only or not, when data is in arena. Other data
+ * sections have only their pointers to __arena variables relocated. The rest
+ * of their relocations were never applied.
+ */
 static int bpf_object__collect_data_relos(struct bpf_object *obj,
 					  Elf64_Shdr *shdr, Elf_Data *data)
 {
 	int i, err, nrels = shdr->sh_size / shdr->sh_entsize;
+	bool in_arena = obj->data_in_arena || obj->efile.secs[shdr->sh_info].sec_type == SEC_ARENA;
 	const char *relo_sec_name;
 	Elf64_Sym *sym;
 	Elf64_Rel *rel;
@@ -8435,6 +9305,11 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
 		if (!sym) {
 			pr_warn("sec '%s': failed to get relo #%d\n", relo_sec_name, i);
 			return -LIBBPF_ERRNO__FORMAT;
+		}
+		if (!in_arena && !sym_is_arena(obj, sym)) {
+			pr_debug("sec '%s': relo #%d: not a pointer to arena, skipping...\n",
+				 relo_sec_name, i);
+			continue;
 		}
 		err = bpf_object__collect_data_ptr(obj, relo_sec_name, i, shdr->sh_info, rel, sym);
 		if (err)
@@ -8448,13 +9323,14 @@ static int bpf_object__collect_data_relos(struct bpf_object *obj,
  * R_BPF_64_ABS64 relocations against .text section, where the offset of
  * a static function in the section is stored in place. Relocations in data
  * sections were ignored before pointers to functions were supported. Those
- * that are something else, e.g. pointers to data, still are, unless data
- * is in arena.
+ * that are something else, e.g. pointers to data, still are, unless they
+ * point to arena. When data is in arena, so is read-only data, and its
+ * relocations are collected by bpf_object__collect_data_relos().
  */
 static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 					    Elf64_Shdr *shdr, Elf_Data *data)
 {
-	size_t sec_idx = shdr->sh_info, sym_idx;
+	size_t sec_idx = shdr->sh_info, sym_idx, map_off;
 	int i, nrels = shdr->sh_size / shdr->sh_entsize;
 	const char *relo_sec_name;
 	struct func_ptr *ptrs;
@@ -8484,10 +9360,10 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		}
 
 		if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
-		    !sym_is_subprog(sym, obj->efile.text_shndx)) {
+		    !sym_is_subprog(obj, sym)) {
 			int err;
 
-			if (obj->data_in_arena) {
+			if (sym_is_arena(obj, sym)) {
 				err = bpf_object__collect_data_ptr(obj, relo_sec_name, i,
 								   sec_idx, rel, sym);
 				if (err)
@@ -8500,7 +9376,8 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 		}
 
 		/* the kernel finds aligned pointers only */
-		if (rel->r_offset % sizeof(__u64) || rel->r_offset >= scn_data->d_size ||
+		map_off = obj->efile.secs[sec_idx].map_off + rel->r_offset;
+		if (map_off % sizeof(__u64) || rel->r_offset >= scn_data->d_size ||
 		    scn_data->d_size - rel->r_offset < sizeof(__u64)) {
 			pr_debug("sec '%s': relo #%d: unsupported offset 0x%zx, skipping...\n",
 				 relo_sec_name, i, (size_t)rel->r_offset);
@@ -8522,13 +9399,16 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 			return -ENOMEM;
 		obj->func_ptrs = ptrs;
 
-		ptrs[obj->func_ptr_cnt].sec_idx = sec_idx;
-		ptrs[obj->func_ptr_cnt].sec_off = rel->r_offset;
-		ptrs[obj->func_ptr_cnt].text_off = sym->st_value + addend;
+		ptrs[obj->func_ptr_cnt].sec_idx = obj->efile.secs[sec_idx].map_sec_idx;
+		ptrs[obj->func_ptr_cnt].sec_off = map_off;
+		ptrs[obj->func_ptr_cnt].func_sec_idx = sym->st_shndx;
+		ptrs[obj->func_ptr_cnt].func_off = sym->st_value + addend;
 		obj->func_ptr_cnt++;
 
-		pr_debug("sec '%s': relo #%d: pointer at offset %zu to a function at .text+%zu\n",
-			 relo_sec_name, i, (size_t)rel->r_offset, (size_t)(sym->st_value + addend));
+		pr_debug("sec '%s': relo #%d: pointer at offset %zu to a function at %s+%zu\n",
+			 relo_sec_name, i, (size_t)rel->r_offset,
+			 elf_sec_name(obj, elf_sec_by_idx(obj, sym->st_shndx)) ?: "<?>",
+			 (size_t)(sym->st_value + addend));
 	}
 	return 0;
 }
@@ -8567,9 +9447,12 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 			return -LIBBPF_ERRNO__INTERNAL;
 		}
 
-		if (obj->efile.secs[idx].sec_type == SEC_RODATA)
+		/* read-only data is in arena when data is */
+		if (obj->efile.secs[idx].sec_type == SEC_RODATA && !obj->data_in_arena)
 			err = bpf_object__collect_rodata_relos(obj, shdr, data);
-		else if (obj->efile.secs[idx].sec_type == SEC_DATA)
+		else if (obj->efile.secs[idx].sec_type == SEC_DATA ||
+			 obj->efile.secs[idx].sec_type == SEC_RODATA ||
+			 obj->efile.secs[idx].sec_type == SEC_ARENA)
 			err = bpf_object__collect_data_relos(obj, shdr, data);
 		else if (obj->efile.secs[idx].sec_type == SEC_ST_OPS)
 			err = bpf_object__collect_st_ops_relos(obj, shdr, data);
@@ -9289,6 +10172,167 @@ static int bpf_program_record_relos(struct bpf_program *prog)
 	return 0;
 }
 
+/*
+ * [WIP] The JITed address of the function at sub_insn_off of the loaded
+ * program, from the JITed addresses of its functions and their func_info,
+ * which the kernel lists in the same order. A function is found by its BTF
+ * type, of which a linked object may give several functions one.
+ */
+static int prog_jited_func_addr(const struct bpf_program *prog, const __u64 *ksyms,
+				const struct bpf_func_info *finfo, __u32 cnt, size_t sub_insn_off,
+				__u64 *addr)
+{
+	const struct bpf_func_info_min *rec;
+	__u32 i, type_id = 0, nth = 0;
+
+	for (i = 0; i < prog->func_info_cnt; i++) {
+		rec = prog->func_info + i * prog->func_info_rec_size;
+		if (rec->insn_off == sub_insn_off) {
+			type_id = rec->type_id;
+			break;
+		}
+	}
+	if (!type_id)
+		return -ENOENT;
+	while (i--) {
+		rec = prog->func_info + i * prog->func_info_rec_size;
+		nth += rec->type_id == type_id;
+	}
+
+	/* the kernel removes a function it didn't verify as dead code, with its func_info */
+	for (i = 0; i < cnt; i++) {
+		if (finfo[i].type_id != type_id)
+			continue;
+		if (!nth--) {
+			*addr = ksyms[i];
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/*
+ * [WIP] Fill the pointers to functions in arena data that are still NULL
+ * with the JITed addresses of the functions in the program that has just been
+ * loaded, of their copies for arena data and addresses, which nothing in the
+ * code calls. The kernel verified each of them on its own, with unknown
+ * scalar arguments, for callx of a number, which calls the address that it
+ * loads from arena data as it is. A program fills them with the copies that
+ * it has, whether or not it has callx: those of the functions whose addresses
+ * its code takes, which it compares with the slots, and of every function in
+ * arena data if it reaches callx, see bpf_object__append_arena_func_ptrs().
+ *
+ * It's a stopgap until there are verified pointers to functions:
+ * - The first program that is loaded with a function wins. The pointer is
+ *   into the image of that program, so it's valid only while the program is
+ *   loaded. Other programs that call through it call into that image.
+ * - Kernel addresses are in arena data, which user space and every program
+ *   that has the arena can read.
+ * - The addresses are jited_ksyms of bpf_prog_info, which the kernel gives
+ *   only to those who may see kernel addresses, see bpf_dump_raw_ok().
+ * - They go where libbpf keeps arena data: into the mapping of an arena that
+ *   it created, or into the image that bpf_map__initial_value() returns for
+ *   an arena that it reuses, which whoever maps that arena copies in. A pinned
+ *   arena that is reused has its data already, with the addresses of the
+ *   object that created it, which are valid while its programs are loaded.
+ */
+static int bpf_object__fill_arena_func_ptrs(struct bpf_object *obj, struct bpf_program *prog)
+{
+	struct bpf_func_info *finfo = NULL;
+	struct bpf_prog_info info;
+	__u32 len = sizeof(info);
+	struct arena_func_ptr *p;
+	__u64 *ksyms = NULL, addr;
+	size_t i, j, sec_insn_off;
+	bool any = false;
+	const char *name;
+	void *data;
+	int err;
+
+	/* the pointers that are still NULL */
+	for (i = 0; i < obj->arena_func_ptr_cnt; i++)
+		any |= !obj->arena_func_ptrs[i].filled;
+	if (!any)
+		return 0;
+
+	/* the functions that callx of a number may call in this program */
+	any = false;
+	for (j = 0; j < prog->subprog_cnt; j++) {
+		struct bpf_light_subprog *sub = &prog->subprogs[j];
+
+		sub->arena_func &= !prog_code_calls(prog, sub->sub_insn_off);
+		any |= sub->arena_func;
+	}
+	if (!any)
+		return 0;
+
+	memset(&info, 0, sizeof(info));
+	err = bpf_prog_get_info_by_fd(prog->fd, &info, &len);
+	if (err)
+		goto out;
+	if (info.nr_jited_ksyms != info.nr_func_info ||
+	    info.func_info_rec_size != sizeof(*finfo)) {
+		err = -EINVAL;
+		goto out;
+	}
+	ksyms = calloc(info.nr_jited_ksyms, sizeof(*ksyms));
+	finfo = calloc(info.nr_func_info, sizeof(*finfo));
+	if (!ksyms || !finfo) {
+		err = -ENOMEM;
+		goto out;
+	}
+	len = info.nr_jited_ksyms;
+	memset(&info, 0, sizeof(info));
+	info.nr_jited_ksyms = len;
+	info.jited_ksyms = ptr_to_u64(ksyms);
+	info.nr_func_info = len;
+	info.func_info_rec_size = sizeof(*finfo);
+	info.func_info = ptr_to_u64(finfo);
+	len = sizeof(info);
+	err = bpf_prog_get_info_by_fd(prog->fd, &info, &len);
+	if (err)
+		goto out;
+	/* the kernel doesn't show kernel addresses to everyone */
+	if (!info.jited_ksyms) {
+		err = -EPERM;
+		goto out;
+	}
+
+	for (i = 0; i < obj->arena_func_ptr_cnt; i++) {
+		p = &obj->arena_func_ptrs[i];
+		if (p->filled)
+			continue;
+		sec_insn_off = p->func_off / BPF_INSN_SZ;
+		for (j = 0; j < prog->subprog_cnt; j++)
+			if (prog->subprogs[j].arena_func &&
+			    prog->subprogs[j].sec_idx == p->func_sec_idx &&
+			    prog->subprogs[j].sec_insn_off == sec_insn_off)
+				break;
+		if (j == prog->subprog_cnt)
+			continue;
+
+		err = prog_jited_func_addr(prog, ksyms, finfo, info.nr_func_info,
+					   prog->subprogs[j].sub_insn_off, &addr);
+		data = bpf_object__data_ptr_sec(obj, p->sec_idx, &name);
+		if (err) {
+			pr_warn("prog '%s': map '%s': pointer at offset %zu: the kernel has no function at insn %u, the copy for it\n",
+				prog->name, name, p->sec_off, prog->subprogs[j].sub_insn_off);
+			goto out;
+		}
+		memcpy(data + p->sec_off, &addr, sizeof(addr));
+		p->filled = true;
+		pr_debug("prog '%s': map '%s': pointer at offset %zu is the function at insn %u\n",
+			 prog->name, name, p->sec_off, prog->subprogs[j].sub_insn_off);
+	}
+out:
+	if (err)
+		pr_warn("prog '%s': failed to put the addresses of its functions into arena data: %s\n",
+			prog->name, errstr(err));
+	free(ksyms);
+	free(finfo);
+	return err;
+}
+
 static int
 bpf_object__load_progs(struct bpf_object *obj, int log_level)
 {
@@ -9315,6 +10359,39 @@ bpf_object__load_progs(struct bpf_object *obj, int log_level)
 			pr_warn("prog '%s': failed to load: %s\n", prog->name, errstr(err));
 			return err;
 		}
+
+		if (!obj->gen_loader) {
+			err = bpf_object__fill_arena_func_ptrs(obj, prog);
+			if (err)
+				return err;
+		}
+	}
+
+	/*
+	 * A virtual call through a pointer that stays NULL would call 0. A
+	 * program gets copies of the static and hidden functions that arena
+	 * data refers to, see bpf_object__append_func_ptrs_code(), not of a
+	 * global one. [WIP] A copy of every function in a program that reaches
+	 * callx of a number, and of the functions whose addresses a program
+	 * takes, see bpf_object__append_arena_func_ptrs().
+	 */
+	for (i = 0; i < obj->arena_func_ptr_cnt; i++) {
+		struct arena_func_ptr *p = &obj->arena_func_ptrs[i];
+		struct bpf_program *func;
+		const char *name;
+
+		if (p->filled)
+			continue;
+		func = find_prog_by_sec_insn(obj, p->func_sec_idx, p->func_off / BPF_INSN_SZ);
+		bpf_object__data_ptr_sec(obj, p->sec_idx, &name);
+		if (func && prog_is_trap_only(obj, func))
+			continue;
+		if (func && func->sym_global && !func->mark_btf_static)
+			pr_warn("map '%s': pointer at offset %zu to global function '%s' is NULL, a program has copies of static and hidden functions only\n",
+				name, p->sec_off, func->name);
+		else if (obj->arena_func_callers)
+			pr_warn("map '%s': pointer at offset %zu to function '%s' stays NULL: no program loaded has a copy of it for callx of a number\n",
+				name, p->sec_off, func ? func->name : "<?>");
 	}
 
 	bpf_object__free_relocs(obj);
@@ -10645,6 +11722,7 @@ void bpf_object__close(struct bpf_object *obj)
 	for (i = 0; i < obj->data_ptr_cnt; i++)
 		zfree(&obj->data_ptrs[i].sym_name);
 	zfree(&obj->data_ptrs);
+	zfree(&obj->arena_func_ptrs);
 
 	if (obj->btf_module_allowlist) {
 		for (i = 0; i < obj->btf_module_allowlist_cnt; i++)

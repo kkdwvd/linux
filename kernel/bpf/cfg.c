@@ -164,17 +164,20 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 				struct bpf_verifier_env *env,
 				bool visit_callee)
 {
-	int ret, insn_sz;
+	int ret = DONE_EXPLORING, insn_sz;
 	int w;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
 
-	mark_prune_point(env, t + insn_sz);
-	/* when we exit from subprog, we need to record non-linear history */
-	mark_jmp_point(env, t + insn_sz);
+		mark_prune_point(env, t + insn_sz);
+		/* when we exit from subprog, we need to record non-linear history */
+		mark_jmp_point(env, t + insn_sz);
+	}
 
 	if (visit_callee) {
 		w = t + insns[t].imm + 1;
@@ -534,6 +537,42 @@ static int visit_func_ptrs_insn(int t, struct bpf_verifier_env *env,
 	return DONE_EXPLORING;
 }
 
+/*
+ * [WIP] callx of a number may call any function whose address ld_imm64 takes,
+ * see check_scalar_callx() in verifier.c. It's not known here whether callx
+ * calls a number, so every callx is treated as a call of all of them. Explore
+ * them one at a time first like visit_func_ptrs_insn() does.
+ */
+static int visit_scalar_callx_insn(int t, struct bpf_insn *insns, struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subprog = env->subprog_info;
+	int *insn_stack = env->cfg.insn_stack;
+	int *insn_state = env->cfg.insn_state;
+	int i, ret, w;
+
+	ret = visit_func_call_insn(t, insns, env, false);
+	if (ret)
+		return ret;
+
+	for (i = 1; i < env->subprog_cnt; i++) {
+		w = subprog[i].start;
+		if (!subprog[i].addr_taken || insn_state[w])
+			continue;
+
+		if (env->cfg.cur_stack >= env->prog->len)
+			return -E2BIG;
+
+		insn_stack[env->cfg.cur_stack++] = w;
+		insn_state[w] = DISCOVERED;
+		return KEEP_EXPLORING;
+	}
+
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (subprog[i].addr_taken)
+			merge_callee_effects(env, t, subprog[i].start);
+	return DONE_EXPLORING;
+}
+
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
  *  DONE_EXPLORING - the instruction was fully explored
@@ -633,6 +672,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			if (ret == 0 && bpf_is_throw_kfunc(insn))
 				mark_subprog_might_throw(env, t);
 		}
+		if (bpf_is_callx(insn) && env->scalar_callx)
+			return visit_scalar_callx_insn(t, insns, env);
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
 
 	case BPF_JA:
@@ -732,6 +773,18 @@ walk_cfg:
 		goto walk_cfg;
 	}
 
+	/* [WIP] a function that only data refers to, see mark_subprogs_addr_in_data() */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int w = env->subprog_info[i].start;
+
+		if (!env->subprog_info[i].addr_in_data || insn_state[w])
+			continue;
+		insn_state[w] = DISCOVERED;
+		insn_stack[0] = w;
+		env->cfg.cur_stack = 1;
+		goto walk_cfg;
+	}
+
 	for (i = 0; i < insn_cnt; i++) {
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
@@ -766,6 +819,101 @@ err_free:
 	kvfree(insn_state);
 	kvfree(insn_stack);
 	env->cfg.insn_state = env->cfg.insn_stack = NULL;
+	return ret;
+}
+
+/*
+ * Does a path from the entry of @subprog reach an exit insn or a hidden exit,
+ * that is, might the subprog return normally? A path ends at unwind_exit,
+ * which returns to the unwind_goto after the call instead, at a call of
+ * bpf_throw, at a call of __bpf_trap, which the main pass rejects when it gets
+ * there, and at a call of a subprog that does not return. If that subprog can
+ * unwind, the path goes on at the pad of the unwind_goto after the call. This
+ * is not the reachability that check_cfg() sees: it keeps the edge to the next
+ * insn after such a call, so that the dead code that follows it in the middle
+ * of a subprog doesn't count as unreachable.
+ *
+ * The paths stay inside @subprog, hence @seen needn't be reset for the next one.
+ */
+static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
+				const unsigned long *done, unsigned long *seen, int *stack)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	struct bpf_iarray *succ;
+	int top = 0, t, i, callee, pad;
+
+	t = env->subprog_info[subprog].start;
+	__set_bit(t, seen);
+	stack[top++] = t;
+	while (top) {
+		struct bpf_insn *insn;
+
+		t = stack[--top];
+		insn = &insns[t];
+		if (bpf_is_unwind_exit(insn))
+			continue;
+		if (insn->code == (BPF_JMP | BPF_EXIT) || bpf_insn_has_hidden_exit(insn))
+			return 1;
+		if (bpf_is_throw_kfunc(insn) || bpf_is_trap_kfunc(insn))
+			continue;
+		if (bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, t + insn->imm + 1);
+			if (verifier_bug_if(callee < 0 || !test_bit(callee, done), env,
+					    "callee of insn %d is not known to return or not", t))
+				return -EFAULT;
+			if (!env->subprog_info[callee].might_return) {
+				if (!env->subprog_info[callee].can_unwind ||
+				    bpf_call_ends_subprog(env, t) ||
+				    !bpf_is_unwind_goto(&insns[t + 1]))
+					continue;
+				/* the callee unwinds to the pad, if it leaves at all */
+				pad = t + 1 + insns[t + 1].off + 1;
+				if (!__test_and_set_bit(pad, seen))
+					stack[top++] = pad;
+				continue;
+			}
+		}
+		succ = bpf_insn_successors(env, t);
+		for (i = 0; i < succ->cnt; i++) {
+			if (__test_and_set_bit(succ->items[i], seen))
+				continue;
+			stack[top++] = succ->items[i];
+		}
+	}
+	return 0;
+}
+
+/*
+ * A subprog might return when a path from its entry leaves it. Callees come
+ * before their callers in the topological order, and there is no recursion,
+ * see sort_subprogs_topo(). So whether a callee might return is known by the
+ * time a call of it is reached.
+ */
+int bpf_compute_might_return(struct bpf_verifier_env *env)
+{
+	DECLARE_BITMAP(done, BPF_MAX_SUBPROGS + 2) = {};
+	int *stack, i, subprog, ret = 0;
+	unsigned long *seen;
+
+	seen = kvcalloc(BITS_TO_LONGS(env->prog->len), sizeof(*seen), GFP_KERNEL_ACCOUNT);
+	stack = kvmalloc_objs(*stack, env->prog->len, GFP_KERNEL_ACCOUNT);
+	if (!seen || !stack) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		subprog = env->subprog_topo_order[i];
+		ret = subprog_might_return(env, subprog, done, seen, stack);
+		if (ret < 0)
+			goto out;
+		env->subprog_info[subprog].might_return = ret;
+		__set_bit(subprog, done);
+	}
+	ret = 0;
+out:
+	kvfree(seen);
+	kvfree(stack);
 	return ret;
 }
 

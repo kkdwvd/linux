@@ -25,6 +25,7 @@
 #include "btf.h"
 #include "libbpf_internal.h"
 #include "strset.h"
+#include "hashmap.h"
 
 #define BTF_EXTERN_SEC ".extern"
 
@@ -40,6 +41,12 @@ struct src_sec {
 	bool skipped;
 	/* whether section is an ephemeral section, not mapped to an ELF section */
 	bool ephemeral;
+	/* whether section belongs to a COMDAT group */
+	bool comdat;
+	/* whether section belongs to a COMDAT group an earlier object provided */
+	bool comdat_dup;
+	/* name of the matching section in the final object file, if not sec_name */
+	const char *dst_name;
 
 	/* ELF info */
 	size_t sec_idx;
@@ -52,8 +59,8 @@ struct src_sec {
 };
 
 struct src_obj {
+	/* the file, or archive(member) */
 	const char *filename;
-	int fd;
 	Elf *elf;
 	/* Section header strings section index */
 	size_t shstrs_sec_idx;
@@ -147,6 +154,7 @@ struct bpf_linker {
 	int sec_cnt;
 
 	struct strset *strtab_strs; /* STRTAB unique strings */
+	struct strset *comdat_sigs; /* signatures of the COMDAT groups linked */
 	size_t strtab_sec_idx; /* STRTAB section index */
 	size_t symtab_sec_idx; /* SYMTAB section index */
 
@@ -156,6 +164,8 @@ struct bpf_linker {
 	/* global (including extern) ELF symbols */
 	int glob_sym_cnt;
 	struct glob_sym *glob_syms;
+	/* their index in glob_syms by name_off, the offset of their name in strtab_strs */
+	struct hashmap *glob_sym_map;
 
 	bool fd_is_owned;
 };
@@ -163,14 +173,20 @@ struct bpf_linker {
 #define pr_warn_elf(fmt, ...)									\
 	libbpf_print(LIBBPF_WARN, "libbpf: " fmt ": %s\n", ##__VA_ARGS__, elf_errmsg(-1))
 
+static size_t glob_sym_hash_fn(long key, void *ctx);
+static bool glob_sym_equal_fn(long k1, long k2, void *ctx);
+static bool sym_is_in_jumptables(const struct src_obj *obj, const Elf64_Sym *sym);
 static int init_output_elf(struct bpf_linker *linker);
 
 static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 			       const char *filename);
+static int linker_add_obj(struct bpf_linker *linker, Elf *elf, const char *filename);
+static int linker_add_archive(struct bpf_linker *linker, Elf *ar, int fd, const char *filename);
 
 static int linker_load_obj_file(struct bpf_linker *linker,
 				struct src_obj *obj);
 static int linker_sanity_check_elf(struct src_obj *obj);
+static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_sanity_check_elf_symtab(struct src_obj *obj, struct src_sec *sec);
 static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *sec);
 static int linker_sanity_check_btf(struct src_obj *obj);
@@ -180,6 +196,7 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 static int linker_append_elf_syms(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 				 Elf64_Sym *sym, const char *sym_name, int src_sym_idx);
+static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name);
 static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_btf(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj);
@@ -203,6 +220,7 @@ void bpf_linker__free(struct bpf_linker *linker)
 		close(linker->fd);
 
 	strset__free(linker->strtab_strs);
+	strset__free(linker->comdat_sigs);
 
 	btf__free(linker->btf);
 	btf_ext__free(linker->btf_ext);
@@ -221,6 +239,7 @@ void bpf_linker__free(struct bpf_linker *linker)
 	free(linker->secs);
 
 	free(linker->glob_syms);
+	hashmap__free(linker->glob_sym_map);
 	free(linker);
 }
 
@@ -386,6 +405,17 @@ static int init_output_elf(struct bpf_linker *linker)
 	if (libbpf_get_error(linker->strtab_strs))
 		return libbpf_get_error(linker->strtab_strs);
 
+	linker->comdat_sigs = strset__new(INT_MAX, "", sizeof(""));
+	if (libbpf_get_error(linker->comdat_sigs))
+		return libbpf_get_error(linker->comdat_sigs);
+
+	linker->glob_sym_map = hashmap__new(glob_sym_hash_fn, glob_sym_equal_fn, NULL);
+	if (IS_ERR(linker->glob_sym_map)) {
+		err = PTR_ERR(linker->glob_sym_map);
+		linker->glob_sym_map = NULL;
+		return err;
+	}
+
 	sec = add_dst_sec(linker, ".strtab");
 	if (!sec)
 		return -ENOMEM;
@@ -487,14 +517,62 @@ static int init_output_elf(struct bpf_linker *linker)
 	return 0;
 }
 
+#define AR_MAGIC "!<arch>\n"
+#define THIN_AR_MAGIC "!<thin>\n"
+#define AR_MAGIC_SZ (sizeof(AR_MAGIC) - 1)
+/* the header of each member, see ar(5) */
+#define AR_HDR_SZ 60
+
+/* Whether the file is a thin archive, which refers to its members by path */
+static bool is_thin_archive(Elf *elf)
+{
+	const char *raw;
+	size_t sz;
+
+	raw = elf_rawfile(elf, &sz);
+	return raw && sz >= AR_MAGIC_SZ && memcmp(raw, THIN_AR_MAGIC, AR_MAGIC_SZ) == 0;
+}
+
 static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 			       const char *filename)
+{
+	Elf *elf;
+	int err;
+
+	elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+	if (!elf) {
+		pr_warn_elf("failed to parse ELF file '%s'", filename);
+		return -EINVAL;
+	}
+
+	switch (elf_kind(elf)) {
+	case ELF_K_ELF:
+		err = linker_add_obj(linker, elf, filename);
+		break;
+	case ELF_K_AR:
+		err = linker_add_archive(linker, elf, fd, filename);
+		break;
+	default:
+		if (is_thin_archive(elf))
+			pr_warn("thin archive '%s' is not supported, link a regular one\n",
+				filename);
+		else
+			pr_warn("'%s' is not an ELF object or an archive\n", filename);
+		err = -EINVAL;
+	}
+
+	elf_end(elf);
+	return err;
+}
+
+/* Link the object file that elf describes, which the caller ends */
+static int linker_add_obj(struct bpf_linker *linker, Elf *elf, const char *filename)
 {
 	struct src_obj obj = {};
 	int err = 0;
 
 	obj.filename = filename;
-	obj.fd = fd;
+	obj.elf = elf;
 
 	err = err ?: linker_load_obj_file(linker, &obj);
 	err = err ?: linker_append_sec_data(linker, &obj);
@@ -509,9 +587,345 @@ static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 	btf_ext__free(obj.btf_ext);
 	free(obj.secs);
 	free(obj.sym_map);
-	if (obj.elf)
-		elf_end(obj.elf);
 
+	return err;
+}
+
+/* A member of an archive */
+struct ar_member {
+	/* the member as libelf reads it */
+	Elf *elf;
+	/* the object: elf, or a descriptor of its data past a BSD long name */
+	Elf *obj;
+	char *name;
+	/* offset of the member's header in the archive */
+	size_t off;
+	/* size of the member's data */
+	size_t size;
+};
+
+/*
+ * A symbol that a member defines, as the index of the archive lists it:
+ * what a member can be linked for
+ */
+struct ar_sym {
+	char *name;
+	/* offset of the header of the member in the archive */
+	size_t member_off;
+	/* whether the member is linked, for this symbol or another */
+	bool linked;
+};
+
+struct ar_index {
+	struct ar_sym *syms;
+	size_t sym_cnt, sym_cap;
+};
+
+static void ar_member_close(struct ar_member *m)
+{
+	if (m->obj && m->obj != m->elf)
+		elf_end(m->obj);
+	if (m->elf)
+		elf_end(m->elf);
+	free(m->name);
+	memset(m, 0, sizeof(*m));
+}
+
+/*
+ * Take over the member that libelf positioned the archive ar at. A BSD archive
+ * stores a long name as the first bytes of the member's data ("#1/<len>" in
+ * the header), which libelf doesn't look past, so the object starts after it.
+ * The data is taken from the archive's, which libelf maps or reads once and
+ * frees with the archive: what elf_rawfile() reads for a member of an archive
+ * that isn't mapped, it never frees.
+ */
+static int ar_member_init(struct ar_member *m, Elf *ar, Elf *elf, size_t off,
+			  const char *filename)
+{
+	Elf_Arhdr *hdr;
+
+	m->elf = elf;
+	m->off = off;
+	hdr = elf_getarhdr(elf);
+	if (!hdr) {
+		pr_warn_elf("failed to read the header of the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	m->size = hdr->ar_size;
+
+	if (strncmp(hdr->ar_rawname, "#1/", 3) == 0) {
+		unsigned long len = strtoul(hdr->ar_rawname + 3, NULL, 10);
+		size_t ar_sz, sz = m->size;
+		char *data;
+
+		data = elf_rawfile(ar, &ar_sz);
+		if (!data || off + AR_HDR_SZ + sz > ar_sz || len > sz) {
+			pr_warn("the member at offset %zu of archive '%s' is shorter than its name\n",
+				off, filename);
+			return -EINVAL;
+		}
+		data += off + AR_HDR_SZ;
+		m->name = strndup(data, len);
+		if (!m->name)
+			return -ENOMEM;
+		m->obj = elf_memory(data + len, sz - len);
+		if (!m->obj) {
+			pr_warn_elf("failed to read member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+	} else {
+		m->name = strdup(hdr->ar_name);
+		if (!m->name)
+			return -ENOMEM;
+		m->obj = elf;
+	}
+
+	return 0;
+}
+
+/* The member at offset off of the archive ar, which fd is open on */
+static int ar_member_open(struct ar_member *m, Elf *ar, int fd, size_t off, const char *filename)
+{
+	Elf *elf;
+
+	memset(m, 0, sizeof(*m));
+	if (elf_rand(ar, off) != off) {
+		pr_warn_elf("failed to find the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	elf = elf_begin(fd, ELF_C_READ_MMAP, ar);
+	if (!elf) {
+		pr_warn_elf("failed to read the member at offset %zu of archive '%s'",
+			    off, filename);
+		return -EINVAL;
+	}
+	return ar_member_init(m, ar, elf, off, filename);
+}
+
+static int ar_index_add(struct ar_index *idx, const char *name, size_t member_off)
+{
+	struct ar_sym *sym;
+	int err;
+
+	err = libbpf_ensure_mem((void **)&idx->syms, &idx->sym_cap, sizeof(*idx->syms),
+				idx->sym_cnt + 1);
+	if (err)
+		return err;
+	sym = &idx->syms[idx->sym_cnt];
+	sym->name = strdup(name);
+	if (!sym->name)
+		return -ENOMEM;
+	sym->member_off = member_off;
+	idx->sym_cnt++;
+	return 0;
+}
+
+/* The symbols that the archive lists a member for: its defined global ones */
+static int ar_index_scan_member(struct ar_index *idx, struct ar_member *m, const char *filename)
+{
+	Elf_Scn *scn = NULL;
+	Elf64_Shdr *shdr;
+	Elf_Data *data;
+	Elf64_Sym *sym;
+	const char *name;
+	size_t i, n;
+	int err;
+
+	while ((scn = elf_nextscn(m->obj, scn)) != NULL) {
+		shdr = elf64_getshdr(scn);
+		if (!shdr) {
+			pr_warn_elf("failed to get a section header of member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+		if (shdr->sh_type != SHT_SYMTAB)
+			continue;
+		data = elf_getdata(scn, 0);
+		if (!data) {
+			pr_warn_elf("failed to get the symbol table of member '%s' of archive '%s'",
+				    m->name, filename);
+			return -EINVAL;
+		}
+		sym = data->d_buf;
+		n = shdr->sh_size / sizeof(*sym);
+		for (i = 1; i < n; i++, sym++) {
+			int type = ELF64_ST_TYPE(sym->st_info);
+			int bind = ELF64_ST_BIND(sym->st_info);
+
+			if (bind == STB_LOCAL || sym->st_shndx == SHN_UNDEF ||
+			    type == STT_SECTION || type == STT_FILE)
+				continue;
+			name = elf_strptr(m->obj, shdr->sh_link, sym->st_name);
+			if (!name) {
+				pr_warn_elf("failed to get the name of symbol #%zu of member '%s' "
+					    "of archive '%s'", i, m->name, filename);
+				return -EINVAL;
+			}
+			err = ar_index_add(idx, name, m->off);
+			if (err)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
+/* Whether the member is the index or the names of the archive, not a file in it */
+static bool ar_member_is_meta(const struct ar_member *m)
+{
+	return strcmp(m->name, "/") == 0 || strcmp(m->name, "//") == 0 ||
+	       strcmp(m->name, "/SYM64/") == 0 ||
+	       strncmp(m->name, "__.SYMDEF", sizeof("__.SYMDEF") - 1) == 0;
+}
+
+/*
+ * Build the index of an archive that has none from the symbol tables of its
+ * members, like lld does. Every member has to be an ELF object then.
+ */
+static int ar_index_scan(struct ar_index *idx, Elf *ar, int fd, const char *filename)
+{
+	struct ar_member m = {};
+	size_t off, ar_sz;
+	int err = 0;
+
+	pr_debug("linker: archive '%s' has no index, scanning its members...\n", filename);
+
+	if (!elf_rawfile(ar, &ar_sz)) {
+		pr_warn_elf("failed to read archive '%s'", filename);
+		return -EINVAL;
+	}
+	for (off = AR_MAGIC_SZ; off + AR_HDR_SZ <= ar_sz; ar_member_close(&m)) {
+		err = ar_member_open(&m, ar, fd, off, filename);
+		if (err)
+			break;
+		if (!ar_member_is_meta(&m)) {
+			if (elf_kind(m.obj) != ELF_K_ELF) {
+				pr_warn("member '%s' of archive '%s' is not an ELF object\n",
+					m.name, filename);
+				err = -EINVAL;
+				break;
+			}
+			err = ar_index_scan_member(idx, &m, filename);
+			if (err)
+				break;
+		}
+		/* members start at even offsets */
+		off += AR_HDR_SZ + ((m.size + 1) & ~(size_t)1);
+	}
+	ar_member_close(&m);
+	return err;
+}
+
+/* The index of the archive: the symbols that each member defines */
+static int ar_index_load(struct ar_index *idx, Elf *ar, int fd, const char *filename)
+{
+	Elf_Arsym *arsyms;
+	size_t i, n;
+	int err;
+
+	arsyms = elf_getarsym(ar, &n);
+	if (!arsyms)
+		return ar_index_scan(idx, ar, fd, filename);
+
+	/* the last entry is a sentinel */
+	for (i = 0; i < n && arsyms[i].as_name; i++) {
+		err = ar_index_add(idx, arsyms[i].as_name, arsyms[i].as_off);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static void ar_index_free(struct ar_index *idx)
+{
+	size_t i;
+
+	for (i = 0; i < idx->sym_cnt; i++)
+		free(idx->syms[i].name);
+	free(idx->syms);
+}
+
+/* Link the member at offset off of the archive, as archive(member) */
+static int linker_add_member(struct bpf_linker *linker, Elf *ar, int fd, size_t off,
+			     const char *filename)
+{
+	struct ar_member m;
+	char *name = NULL;
+	int err;
+
+	err = ar_member_open(&m, ar, fd, off, filename);
+	if (err)
+		goto out;
+	if (elf_kind(m.obj) != ELF_K_ELF) {
+		pr_warn("member '%s' of archive '%s' is not an ELF object\n", m.name, filename);
+		err = -EINVAL;
+		goto out;
+	}
+
+	name = malloc(strlen(filename) + strlen(m.name) + sizeof("()"));
+	if (!name) {
+		err = -ENOMEM;
+		goto out;
+	}
+	sprintf(name, "%s(%s)", filename, m.name);
+	err = linker_add_obj(linker, m.obj, name);
+out:
+	free(name);
+	ar_member_close(&m);
+	return err;
+}
+
+/*
+ * Link the members of an archive that the inputs so far need, as ld does: a
+ * member is linked when its index lists it for a symbol that is undefined at
+ * that point, and not only weakly. Linking a member may leave new symbols
+ * undefined, which members anywhere in the archive may define, so go over the
+ * index until a pass links nothing. Symbols that are still undefined when a
+ * later input refers to them stay undefined: an archive satisfies the
+ * references before it only, so it goes after the objects that use it, and
+ * after the archives that use it.
+ */
+static int linker_add_archive(struct bpf_linker *linker, Elf *ar, int fd, const char *filename)
+{
+	struct ar_index idx = {};
+	struct glob_sym *glob_sym;
+	struct ar_sym *sym;
+	bool pulled;
+	size_t i, j;
+	int err;
+
+	pr_debug("linker: adding archive '%s'...\n", filename);
+
+	err = ar_index_load(&idx, ar, fd, filename);
+	if (err)
+		goto out;
+
+	do {
+		pulled = false;
+		for (i = 0; i < idx.sym_cnt; i++) {
+			sym = &idx.syms[i];
+			if (sym->linked)
+				continue;
+			glob_sym = find_glob_sym(linker, sym->name);
+			if (!glob_sym || !glob_sym->is_extern || glob_sym->is_weak)
+				continue;
+			pr_debug("linker: symbol '%s' pulls a member of archive '%s'\n",
+				 sym->name, filename);
+			err = linker_add_member(linker, ar, fd, sym->member_off, filename);
+			if (err)
+				goto out;
+			/* for every symbol it defines */
+			for (j = 0; j < idx.sym_cnt; j++)
+				if (idx.syms[j].member_off == sym->member_off)
+					idx.syms[j].linked = true;
+			pulled = true;
+		}
+	} while (pulled);
+out:
+	ar_index_free(&idx);
 	return err;
 }
 
@@ -624,10 +1038,18 @@ static bool is_ignored_sec(struct src_sec *sec)
 	if (is_dwarf_sec_name(sec->sec_name))
 		return true;
 
+	/* unwind tables, which BPF has no use for */
+	if (strcmp(name, ".eh_frame") == 0)
+		return true;
+
 	if (strncmp(name, ".rel", sizeof(".rel") - 1) == 0) {
 		name += sizeof(".rel") - 1;
 		/* DWARF section relocations */
 		if (is_dwarf_sec_name(name))
+			return true;
+
+		/* and those of the unwind tables */
+		if (strcmp(name, ".eh_frame") == 0)
 			return true;
 
 		/* .BTF and .BTF.ext don't need relocations */
@@ -682,12 +1104,6 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 
 	pr_debug("linker: adding object file '%s'...\n", obj->filename);
 
-	obj->elf = elf_begin(obj->fd, ELF_C_READ_MMAP, NULL);
-	if (!obj->elf) {
-		pr_warn_elf("failed to parse ELF file '%s'", obj->filename);
-		return -EINVAL;
-	}
-
 	/* Sanity check ELF file high-level properties */
 	ehdr = elf64_getehdr(obj->elf);
 	if (!ehdr) {
@@ -717,7 +1133,7 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 	    || ehdr->e_machine != EM_BPF
 	    || ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
 		err = -EOPNOTSUPP;
-		pr_warn_elf("unsupported kind of ELF file %s", obj->filename);
+		pr_warn("'%s' is not a relocatable 64-bit BPF ELF object\n", obj->filename);
 		return err;
 	}
 
@@ -810,6 +1226,10 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 		case SHT_REL:
 			/* relocations */
 			break;
+		case SHT_GROUP:
+			/* the members are linked, see linker_load_groups() */
+			sec->skipped = true;
+			break;
 		default:
 			pr_warn("unrecognized section #%zu (%s) in %s\n",
 				sec_idx, sec_name, obj->filename);
@@ -819,11 +1239,164 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 	}
 
 	err = err ?: linker_sanity_check_elf(obj);
+	err = err ?: linker_load_groups(linker, obj);
 	err = err ?: linker_sanity_check_btf(obj);
 	err = err ?: linker_sanity_check_btf_ext(obj);
 	err = err ?: linker_fixup_btf(obj);
 
 	return err;
+}
+
+/* the sections that members of COMDAT groups join, and their relocations */
+static const struct {
+	const char *name;
+	const char *rel_name;
+} group_bases[] = {
+	{ ".text", ".rel.text" },
+	/* ahead of .data, which would match it */
+	{ ".data.rel.ro", ".rel.data.rel.ro" },
+	{ ".data", ".rel.data" },
+	{ ".rodata", ".rel.rodata" },
+	{ ".bss", ".rel.bss" },
+};
+
+/* Whether section sec defines a symbol called name */
+static bool sec_defines_sym(struct src_obj *obj, const struct src_sec *sec, const char *name)
+{
+	struct src_sec *symtab = &obj->secs[obj->symtab_sec_idx];
+	const Elf64_Sym *sym = symtab->data->d_buf;
+	size_t i, n = symtab->shdr->sh_size / sizeof(*sym);
+	const char *sym_name;
+
+	for (i = 1; i < n; i++) {
+		if (sym[i].st_shndx != sec->sec_idx || ELF64_ST_TYPE(sym[i].st_info) == STT_SECTION)
+			continue;
+		sym_name = elf_strptr(obj->elf, symtab->shdr->sh_link, sym[i].st_name);
+		if (sym_name && strcmp(sym_name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The section that a member of a COMDAT group joins: .text for code, which
+ * is all subprograms, and the base section of data that the compiler named
+ * after the symbol that it defines, e.g. .rodata.foo of an inline variable
+ * foo. Other data has an explicit name, e.g. SEC(".data.foo") of an inline
+ * variable bar, and is linked by name, as without a group. An explicit name
+ * that is the one the compiler would give, e.g. SEC(".data.foo") of foo,
+ * can't be told apart and joins the base section too. The loader places the
+ * members of an object that is not linked in the same way.
+ */
+static int group_base(struct src_obj *obj, const struct src_sec *sec)
+{
+	int i;
+
+	for (i = 0; i < sizeof(group_bases) / sizeof(group_bases[0]); i++) {
+		size_t len = strlen(group_bases[i].name);
+
+		if (strncmp(sec->sec_name, group_bases[i].name, len) != 0 ||
+		    sec->sec_name[len] != '.')
+			continue;
+		if ((sec->shdr->sh_flags & SHF_EXECINSTR) ||
+		    sec_defines_sym(obj, sec, sec->sec_name + len + 1))
+			return i;
+		return -1;
+	}
+	return -1;
+}
+
+/*
+ * A COMDAT group holds a definition that every object using it carries, such
+ * as an inline function that was not inlined everywhere or an inline
+ * variable. The first group with a signature is linked and the members of
+ * every later one are dropped, their global symbols resolving to the
+ * definitions of the first. A member joins the section that group_base()
+ * says, if any, and relocations follow.
+ */
+static int linker_load_groups(struct bpf_linker *linker, struct src_obj *obj)
+{
+	struct src_sec *symtab = &obj->secs[obj->symtab_sec_idx];
+	size_t sym_cnt = symtab->shdr->sh_size / sizeof(Elf64_Sym);
+	int i, err;
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *sec = &obj->secs[i];
+		const Elf64_Sym *sym;
+		const __u32 *words;
+		const char *sig;
+		size_t j, n;
+		bool dup;
+
+		if (sec->ephemeral || sec->shdr->sh_type != SHT_GROUP)
+			continue;
+
+		words = sec->data->d_buf;
+		n = sec->shdr->sh_size / sizeof(*words);
+		if (sec->shdr->sh_entsize != sizeof(*words) || n == 0 ||
+		    sec->shdr->sh_link != obj->symtab_sec_idx ||
+		    sec->shdr->sh_info >= sym_cnt) {
+			pr_warn("ELF group section #%zu is malformed in %s\n",
+				sec->sec_idx, obj->filename);
+			return -EINVAL;
+		}
+		/* only a COMDAT group asks the linker to do anything */
+		if (!(words[0] & GRP_COMDAT))
+			continue;
+
+		sym = symtab->data->d_buf;
+		sig = elf_strptr(obj->elf, symtab->shdr->sh_link, sym[sec->shdr->sh_info].st_name);
+		if (!sig) {
+			pr_warn_elf("failed to get the signature of group section #%zu in %s",
+				    sec->sec_idx, obj->filename);
+			return -EINVAL;
+		}
+
+		dup = strset__find_str(linker->comdat_sigs, sig) >= 0;
+		if (!dup) {
+			err = strset__add_str(linker->comdat_sigs, sig);
+			if (err < 0)
+				return err;
+		}
+
+		for (j = 1; j < n; j++) {
+			struct src_sec *member;
+
+			if (!words[j] || words[j] >= obj->sec_cnt) {
+				pr_warn("ELF group section #%zu points to missing section #%u in %s\n",
+					sec->sec_idx, words[j], obj->filename);
+				return -EINVAL;
+			}
+			member = &obj->secs[words[j]];
+			member->comdat = true;
+			if (dup) {
+				member->skipped = true;
+				member->comdat_dup = true;
+			} else if (member->shdr->sh_type != SHT_REL) {
+				int base = group_base(obj, member);
+
+				if (base >= 0)
+					member->dst_name = group_bases[base].name;
+			}
+		}
+	}
+
+	/* relocations follow the section they relocate */
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *sec = &obj->secs[i];
+		const struct src_sec *target;
+		int j;
+
+		if (sec->ephemeral || sec->skipped || sec->shdr->sh_type != SHT_REL ||
+		    sec->shdr->sh_info >= obj->sec_cnt)
+			continue;
+		target = &obj->secs[sec->shdr->sh_info];
+		for (j = 0; j < sizeof(group_bases) / sizeof(group_bases[0]); j++)
+			if (target->dst_name == group_bases[j].name)
+				sec->dst_name = group_bases[j].rel_name;
+	}
+
+	return 0;
 }
 
 static int linker_sanity_check_elf(struct src_obj *obj)
@@ -897,6 +1470,8 @@ static int linker_sanity_check_elf(struct src_obj *obj)
 				return err;
 			break;
 		case SHT_LLVM_ADDRSIG:
+			break;
+		case SHT_GROUP:
 			break;
 		default:
 			pr_warn("ELF section #%zu (%s) has unrecognized type %zu in %s\n",
@@ -1167,13 +1742,16 @@ static int init_sec(struct bpf_linker *linker, struct dst_sec *dst_sec, struct s
 	dst_sec->data = data;
 	dst_sec->sec_idx = elf_ndxscn(scn);
 
-	name_off = strset__add_str(linker->strtab_strs, src_sec->sec_name);
+	name_off = strset__add_str(linker->strtab_strs, dst_sec->sec_name);
 	if (name_off < 0)
 		return name_off;
 
 	shdr->sh_name = name_off;
 	shdr->sh_type = src_sec->shdr->sh_type;
-	shdr->sh_flags = src_sec->shdr->sh_flags;
+	shdr->sh_flags = src_sec->shdr->sh_flags & ~SHF_GROUP;
+	/* the linker always fills in sh_info of relocations */
+	if (shdr->sh_type == SHT_REL)
+		shdr->sh_flags |= SHF_INFO_LINK;
 	shdr->sh_size = 0;
 	/* sh_link and sh_info have different meaning for different types of
 	 * sections, so we leave it up to the caller code to fill them in, if
@@ -1208,8 +1786,15 @@ static struct dst_sec *find_dst_sec_by_name(struct bpf_linker *linker, const cha
 	return NULL;
 }
 
+static const char *dst_sec_name(const struct src_sec *sec)
+{
+	return sec->dst_name ?: sec->sec_name;
+}
+
 static bool secs_match(struct dst_sec *dst, struct src_sec *src)
 {
+	Elf64_Xword ignored_flags;
+
 	if (dst->ephemeral || src->ephemeral)
 		return true;
 
@@ -1217,7 +1802,14 @@ static bool secs_match(struct dst_sec *dst, struct src_sec *src)
 		pr_warn("sec %s types mismatch\n", dst->sec_name);
 		return false;
 	}
-	if (dst->shdr->sh_flags != src->shdr->sh_flags) {
+	/*
+	 * A member of a group lands in a section that is in none, and its
+	 * relocations come without SHF_INFO_LINK.
+	 */
+	ignored_flags = SHF_GROUP;
+	if (src->shdr->sh_type == SHT_REL)
+		ignored_flags |= SHF_INFO_LINK;
+	if ((dst->shdr->sh_flags & ~ignored_flags) != (src->shdr->sh_flags & ~ignored_flags)) {
 		pr_warn("sec %s flags mismatch\n", dst->sec_name);
 		return false;
 	}
@@ -1362,9 +1954,9 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 		if (!is_data_sec(src_sec))
 			continue;
 
-		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
+		dst_sec = find_dst_sec_by_name(linker, dst_sec_name(src_sec));
 		if (!dst_sec) {
-			dst_sec = add_dst_sec(linker, src_sec->sec_name);
+			dst_sec = add_dst_sec(linker, dst_sec_name(src_sec));
 			if (!dst_sec)
 				return -ENOMEM;
 			err = init_sec(linker, dst_sec, src_sec);
@@ -1443,24 +2035,33 @@ static Elf64_Sym *get_sym_by_idx(struct bpf_linker *linker, size_t sym_idx)
 	return &syms[sym_idx];
 }
 
-static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name)
+/*
+ * The name of a global symbol is in strtab_strs once, so its offset there
+ * is its key
+ */
+static size_t glob_sym_hash_fn(long key, void *ctx)
 {
-	struct glob_sym *glob_sym;
-	const char *name;
-	int i;
-
-	for (i = 0; i < linker->glob_sym_cnt; i++) {
-		glob_sym = &linker->glob_syms[i];
-		name = strset__data(linker->strtab_strs) + glob_sym->name_off;
-
-		if (strcmp(name, sym_name) == 0)
-			return glob_sym;
-	}
-
-	return NULL;
+	return key;
 }
 
-static struct glob_sym *add_glob_sym(struct bpf_linker *linker)
+static bool glob_sym_equal_fn(long k1, long k2, void *ctx)
+{
+	return k1 == k2;
+}
+
+static struct glob_sym *find_glob_sym(struct bpf_linker *linker, const char *sym_name)
+{
+	long idx;
+	int name_off;
+
+	name_off = strset__find_str(linker->strtab_strs, sym_name);
+	if (name_off < 0 || !hashmap__find(linker->glob_sym_map, name_off, &idx))
+		return NULL;
+	return &linker->glob_syms[idx];
+}
+
+/* Add the global symbol whose name is at name_off in strtab_strs, and has none yet */
+static struct glob_sym *add_glob_sym(struct bpf_linker *linker, int name_off)
 {
 	struct glob_sym *syms, *sym;
 
@@ -1468,12 +2069,15 @@ static struct glob_sym *add_glob_sym(struct bpf_linker *linker)
 				   sizeof(*linker->glob_syms));
 	if (!syms)
 		return NULL;
+	linker->glob_syms = syms;
 
 	sym = &syms[linker->glob_sym_cnt];
 	memset(sym, 0, sizeof(*sym));
 	sym->var_idx = -1;
+	sym->name_off = name_off;
 
-	linker->glob_syms = syms;
+	if (hashmap__add(linker->glob_sym_map, name_off, linker->glob_sym_cnt))
+		return NULL;
 	linker->glob_sym_cnt++;
 
 	return sym;
@@ -2016,6 +2620,17 @@ static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 		}
 	} else if (sym->st_shndx < SHN_LORESERVE) {
 		src_sec = &obj->secs[sym->st_shndx];
+		if (src_sec->comdat_dup && sym_bind != STB_LOCAL) {
+			/* the group linked first defines it */
+			glob_sym = find_glob_sym(linker, sym_name);
+			if (!glob_sym) {
+				pr_warn("symbol '%s' of a duplicate COMDAT group is not in the first one in '%s'\n",
+					sym_name, obj->filename);
+				return -EINVAL;
+			}
+			obj->sym_map[src_sym_idx] = glob_sym->sym_idx;
+			return 0;
+		}
 		if (src_sec->skipped)
 			return 0;
 		dst_sec = &linker->secs[src_sec->dst_id];
@@ -2175,8 +2790,12 @@ add_sym:
 		dst_sym->st_value = 0;
 	}
 
-	if (sym_bind != STB_LOCAL) {
-		glob_sym = add_glob_sym(linker);
+	/*
+	 * A jump table is global in its object only: the compiler names those
+	 * of every object alike, and the linker keeps each object's, see above.
+	 */
+	if (sym_bind != STB_LOCAL && !sym_is_in_jumptables(obj, sym)) {
+		glob_sym = add_glob_sym(linker, name_off);
 		if (!glob_sym)
 			return -ENOMEM;
 
@@ -2188,7 +2807,6 @@ add_sym:
 		 * associated with it, so dst_sec->id == dst_sec->sec_idx == 0.
 		 */
 		glob_sym->sec_id = dst_sec ? dst_sec->id : 0;
-		glob_sym->name_off = name_off;
 		/* we will fill btf_id in during BTF merging step */
 		glob_sym->btf_id = 0;
 		glob_sym->is_extern = sym_is_extern;
@@ -2198,10 +2816,70 @@ add_sym:
 	return 0;
 }
 
+/* Whether the symbol is defined in .jumptables, i.e. is a jump table */
+static bool sym_is_in_jumptables(const struct src_obj *obj, const Elf64_Sym *sym)
+{
+	const struct src_sec *sec;
+
+	if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= obj->sec_cnt)
+		return false;
+	sec = &obj->secs[sym->st_shndx];
+	return sec->sec_name && !sec->ephemeral && !sec->skipped && sec->data &&
+	       strcmp(sec->sec_name, JUMPTABLES_SEC) == 0;
+}
+
+/*
+ * A jump table in .jumptables holds the offsets of its targets in the section
+ * of the function that uses it, which the ld_imm64 of the table's address
+ * relocates. Nothing relocates the entries, so when the section joins its
+ * section of the output further than at its start, they have to move by as
+ * much. The table is in the data of the output already, in the byte order of
+ * the object. Each table is used by one function and moved once.
+ */
+static int linker_fixup_jumptable(struct bpf_linker *linker, struct src_obj *obj,
+				  Elf64_Sym *sym, struct src_sec *code_sec)
+{
+	struct src_sec *jt_sec = &obj->secs[sym->st_shndx];
+	struct dst_sec *dst_sec;
+	__u64 off;
+	size_t i;
+	void *jt;
+
+	if (!code_sec->dst_off)
+		return 0;
+	if (sym->st_size % sizeof(__u64) ||
+	    sym->st_value + sym->st_size > jt_sec->shdr->sh_size) {
+		pr_warn("jump table symbol #%zu is malformed in %s\n",
+			(size_t)(sym - (Elf64_Sym *)obj->secs[obj->symtab_sec_idx].data->d_buf),
+			obj->filename);
+		return -EINVAL;
+	}
+
+	dst_sec = &linker->secs[jt_sec->dst_id];
+	jt = dst_sec->raw_data + jt_sec->dst_off + sym->st_value;
+	for (i = 0; i < sym->st_size; i += sizeof(off)) {
+		memcpy(&off, jt + i, sizeof(off));
+		if (linker->swapped_endian)
+			off = bswap_64(off);
+		off += code_sec->dst_off;
+		if (linker->swapped_endian)
+			off = bswap_64(off);
+		memcpy(jt + i, &off, sizeof(off));
+	}
+	return 0;
+}
+
 static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj)
 {
 	struct src_sec *src_symtab = &obj->secs[obj->symtab_sec_idx];
-	int i, err;
+	size_t sym_cnt = src_symtab->shdr->sh_size / sizeof(Elf64_Sym);
+	bool *jt_moved;
+	int i, err = 0;
+
+	/* the jump tables whose entries have moved, by their symbol */
+	jt_moved = calloc(sym_cnt, sizeof(*jt_moved));
+	if (!jt_moved)
+		return -ENOMEM;
 
 	for (i = 1; i < obj->sec_cnt; i++) {
 		struct src_sec *src_sec, *src_linked_sec;
@@ -2218,19 +2896,22 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 		if (src_linked_sec->skipped)
 			continue;
 
-		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
+		dst_sec = find_dst_sec_by_name(linker, dst_sec_name(src_sec));
 		if (!dst_sec) {
-			dst_sec = add_dst_sec(linker, src_sec->sec_name);
-			if (!dst_sec)
-				return -ENOMEM;
+			dst_sec = add_dst_sec(linker, dst_sec_name(src_sec));
+			if (!dst_sec) {
+				err = -ENOMEM;
+				goto out;
+			}
 			err = init_sec(linker, dst_sec, src_sec);
 			if (err) {
 				pr_warn("failed to init section '%s'\n", src_sec->sec_name);
-				return err;
+				goto out;
 			}
 		} else if (!secs_match(dst_sec, src_sec)) {
 			pr_warn("sections %s are not compatible\n", src_sec->sec_name);
-			return -EINVAL;
+			err = -EINVAL;
+			goto out;
 		}
 
 		/* shdr->sh_link points to SYMTAB */
@@ -2243,7 +2924,7 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 		src_sec->dst_id = dst_sec->id;
 		err = extend_sec(linker, dst_sec, src_sec);
 		if (err)
-			return err;
+			goto out;
 
 		src_rel = src_sec->data->d_buf;
 		dst_rel = dst_sec->raw_data + src_sec->dst_off;
@@ -2256,9 +2937,42 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 			src_sym = src_symtab->data->d_buf + sizeof(*src_sym) * src_sym_idx;
 
 			dst_sym_idx = obj->sym_map[src_sym_idx];
+			/*
+			 * A global symbol of a COMDAT group that an earlier object
+			 * provided resolves to that object's. Nothing else of a
+			 * discarded section is in the output, so a relocation
+			 * against it can't be, like for ld and lld.
+			 */
+			if (src_sym_idx && !dst_sym_idx &&
+			    src_sym->st_shndx < obj->sec_cnt &&
+			    obj->secs[src_sym->st_shndx].comdat_dup) {
+				const struct src_sec *sym_sec = &obj->secs[src_sym->st_shndx];
+				const char *sym_name;
+
+				if (ELF64_ST_TYPE(src_sym->st_info) == STT_SECTION)
+					sym_name = sym_sec->sec_name;
+				else
+					sym_name = elf_strptr(obj->elf, src_symtab->shdr->sh_link,
+							      src_sym->st_name) ?: "<?>";
+				pr_warn("relocation #%d in section '%s' refers to symbol '%s' in section '%s', which is in a discarded COMDAT group, in %s\n",
+					j, src_linked_sec->sec_name, sym_name, sym_sec->sec_name,
+					obj->filename);
+				err = -EINVAL;
+				goto out;
+			}
 			dst_rel->r_offset += src_linked_sec->dst_off;
 			sym_type = ELF64_R_TYPE(src_rel->r_info);
 			dst_rel->r_info = ELF64_R_INFO(dst_sym_idx, sym_type);
+
+			/* the jump table of a function moves with the function */
+			if ((src_linked_sec->shdr->sh_flags & SHF_EXECINSTR) &&
+			    src_sym_idx < sym_cnt && !jt_moved[src_sym_idx] &&
+			    sym_is_in_jumptables(obj, src_sym)) {
+				err = linker_fixup_jumptable(linker, obj, src_sym, src_linked_sec);
+				if (err)
+					goto out;
+				jt_moved[src_sym_idx] = true;
+			}
 
 			if (ELF64_ST_TYPE(src_sym->st_info) == STT_SECTION) {
 				struct src_sec *sec = &obj->secs[src_sym->st_shndx];
@@ -2279,13 +2993,13 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 						insn->imm += sec->dst_off / sizeof(struct bpf_insn);
 					else
 						insn->imm += sec->dst_off;
-				} else if (sym_type == R_BPF_64_ABS64 &&
-					   (sec->shdr->sh_flags & SHF_EXECINSTR)) {
+				} else if (sym_type == R_BPF_64_ABS64) {
 					/*
-					 * A pointer to a static function in a data section,
-					 * which is stored in place as an offset of the
-					 * function in its section. Data sections are kept
-					 * in the byte order of the object.
+					 * A pointer to a static function or variable in a
+					 * data section, which is stored in place as an
+					 * offset in the section of the function or the
+					 * variable. Data sections are kept in the byte
+					 * order of the object.
 					 */
 					void *ptr = dst_linked_sec->raw_data + dst_rel->r_offset;
 					__u64 off;
@@ -2299,14 +3013,16 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 					memcpy(ptr, &off, sizeof(off));
 				} else {
 					pr_warn("relocation against STT_SECTION in non-exec section is not supported!\n");
-					return -EINVAL;
+					err = -EINVAL;
+					goto out;
 				}
 			}
 
 		}
 	}
-
-	return 0;
+out:
+	free(jt_moved);
+	return err;
 }
 
 static Elf64_Sym *find_sym_by_name(struct src_obj *obj, size_t sec_idx,
@@ -2337,6 +3053,104 @@ static Elf64_Sym *find_sym_by_name(struct src_obj *obj, size_t sec_idx,
 	return NULL;
 }
 
+/*
+ * The variables of a DATASEC are in the sections of its name, which an object
+ * has several of when COMDAT groups define data in a section with an explicit
+ * name, e.g. two inline variables in SEC(".data.foo"), as each group has a
+ * section of its own. A group may also be one that an earlier object
+ * provided, whose sections are dropped. Give each section a DATASEC with its
+ * own variables, which are then linked with it, like the DATASEC of a single
+ * section is. Static variables are in the section of no group.
+ */
+static int linker_split_datasec(struct src_obj *obj, int type_id, const char *sec_name)
+{
+	struct btf_var_secinfo *vsis = NULL;
+	struct src_sec **var_secs = NULL;
+	struct src_sec *sec, *plain = NULL;
+	const struct btf_type *t;
+	int i, j, n, id, err = 0;
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		sec = &obj->secs[i];
+		if (!sec->ephemeral && !sec->comdat && strcmp(sec->sec_name, sec_name) == 0) {
+			plain = sec;
+			break;
+		}
+	}
+
+	t = btf__type_by_id(obj->btf, type_id);
+	n = btf_vlen(t);
+	vsis = calloc(n, sizeof(*vsis));
+	var_secs = calloc(n, sizeof(*var_secs));
+	if (n && (!vsis || !var_secs)) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memcpy(vsis, btf_var_secinfos(t), n * sizeof(*vsis));
+
+	for (j = 0; j < n; j++) {
+		const struct btf_type *vt = btf__type_by_id(obj->btf, vsis[j].type);
+		const char *var_name = btf__str_by_offset(obj->btf, vt->name_off);
+		Elf64_Sym *sym = NULL;
+
+		if (!btf_is_var(vt) || btf_var(vt)->linkage != BTF_VAR_GLOBAL_ALLOCATED) {
+			var_secs[j] = plain ?: find_src_sec_by_name(obj, sec_name);
+			continue;
+		}
+		for (i = 1; i < obj->sec_cnt && !sym; i++) {
+			sec = &obj->secs[i];
+			if (sec->ephemeral || strcmp(sec->sec_name, sec_name) != 0)
+				continue;
+			sym = find_sym_by_name(obj, sec->sec_idx, STT_OBJECT, var_name);
+			var_secs[j] = sec;
+		}
+		if (!sym) {
+			pr_warn("failed to find symbol for variable '%s' in section '%s'\n",
+				var_name, sec_name);
+			err = -ENOENT;
+			goto out;
+		}
+		vsis[j].offset = sym->st_value;
+	}
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		sec = &obj->secs[i];
+		if (sec->ephemeral || strcmp(sec->sec_name, sec_name) != 0)
+			continue;
+
+		id = btf__add_datasec(obj->btf, sec_name, sec->shdr->sh_size);
+		if (id < 0) {
+			err = id;
+			goto out;
+		}
+		for (j = 0; j < n; j++) {
+			if (var_secs[j] != sec)
+				continue;
+			err = btf__add_datasec_var_info(obj->btf, vsis[j].type, vsis[j].offset,
+							vsis[j].size);
+			if (err)
+				goto out;
+		}
+		sec->sec_type_id = id;
+	}
+out:
+	free(vsis);
+	free(var_secs);
+	return err;
+}
+
+/* Whether the object has another section called like sec */
+static bool sec_name_is_shared(struct src_obj *obj, const struct src_sec *sec)
+{
+	int i;
+
+	for (i = 1; i < obj->sec_cnt; i++)
+		if (&obj->secs[i] != sec && !obj->secs[i].ephemeral &&
+		    strcmp(obj->secs[i].sec_name, sec->sec_name) == 0)
+			return true;
+	return false;
+}
+
 static int linker_fixup_btf(struct src_obj *obj)
 {
 	const char *sec_name;
@@ -2357,6 +3171,17 @@ static int linker_fixup_btf(struct src_obj *obj)
 
 		sec_name = btf__str_by_offset(obj->btf, t->name_off);
 		sec = find_src_sec_by_name(obj, sec_name);
+		if (sec && !sec->ephemeral && sec_name_is_shared(obj, sec)) {
+			/*
+			 * By the name of the section: adding a DATASEC frees the
+			 * strings of the BTF as it was read, which sec_name is in.
+			 */
+			int err = linker_split_datasec(obj, i, sec->sec_name);
+
+			if (err)
+				return err;
+			continue;
+		}
 		if (sec) {
 			/* record actual section size, unless ephemeral */
 			if (sec->shdr)
@@ -2675,6 +3500,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->func_info.rec_sz == 0)
@@ -2704,6 +3531,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->line_info.rec_sz == 0)
@@ -2746,6 +3575,8 @@ static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
 			pr_warn("can't find section '%s' referenced from .BTF.ext\n", sec_name);
 			return -EINVAL;
 		}
+		if (src_sec->comdat_dup)
+			continue;
 		dst_sec = &linker->secs[src_sec->dst_id];
 
 		if (dst_sec->core_relo_info.rec_sz == 0)
@@ -2965,6 +3796,14 @@ static int finalize_btf(struct bpf_linker *linker)
 	return 0;
 }
 
+/* .BTF.ext records start with the offset of their instruction */
+static int cmp_btf_ext_rec_insn_off(const void *a, const void *b)
+{
+	__u32 off_a = *(const __u32 *)a, off_b = *(const __u32 *)b;
+
+	return off_a < off_b ? -1 : off_a > off_b;
+}
+
 static int emit_btf_ext_data(struct bpf_linker *linker, void *output,
 			     const char *sec_name, struct btf_ext_sec_data *sec_data)
 {
@@ -2987,6 +3826,13 @@ static int emit_btf_ext_data(struct bpf_linker *linker, void *output,
 
 	sz = sec_data->rec_cnt * sec_data->rec_sz;
 	memcpy(cur, sec_data->recs, sz);
+	/*
+	 * The records of a section go in the order of the instructions, as
+	 * the loader and the kernel expect. Sections of an object are appended
+	 * in their order, but records in the order of .BTF.ext, which differ
+	 * when COMDAT code joins .text, see linker_load_groups().
+	 */
+	qsort(cur, sec_data->rec_cnt, sec_data->rec_sz, cmp_btf_ext_rec_insn_off);
 	cur += sz;
 
 	return cur - output;

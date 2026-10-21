@@ -2972,6 +2972,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 				 BPF_F_XDP_DEV_BOUND_ONLY |
 				 BPF_F_TEST_REG_INVARIANTS |
 				 BPF_F_ARENA_SCALAR |
+				 BPF_F_THROW_NO_RELEASE |
 				 BPF_F_TOKEN_FD))
 		return -EINVAL;
 
@@ -3002,6 +3003,14 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	if (!IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) &&
 	    (attr->prog_flags & BPF_F_ANY_ALIGNMENT) &&
 	    !bpf_cap)
+		goto put_token;
+
+	/*
+	 * [WIP] A throw may leave locks taken, IRQs disabled and references
+	 * leaked. Ask for what a loader that may see kernel pointers needs.
+	 */
+	if ((attr->prog_flags & BPF_F_THROW_NO_RELEASE) &&
+	    (!bpf_cap || !bpf_token_capable(token, CAP_PERFMON)))
 		goto put_token;
 
 	/* Intent here is for unprivileged_bpf_disabled to block BPF program

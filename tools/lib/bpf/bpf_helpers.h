@@ -2,6 +2,10 @@
 #ifndef __BPF_HELPERS__
 #define __BPF_HELPERS__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Note that bpf programs need to include either
  * vmlinux.h (auto-generated from BTF) or linux/types.h
@@ -10,9 +14,19 @@
  */
 #include "bpf_helper_defs.h"
 
+/* _Static_assert is a C11 keyword, C++ uses static_assert */
+#if defined(__cplusplus) && !defined(_Static_assert)
+#define _Static_assert static_assert
+#endif
+
+/* _Bool is a C99 keyword, C++ uses bool */
+#if defined(__cplusplus) && !defined(_Bool)
+#define _Bool bool
+#endif
+
 #define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define __array(name, val) typeof(val) *name[]
+#define __type(name, val) __typeof__(val) *name
+#define __array(name, val) __typeof__(val) *name[]
 #define __ulong(name, val) enum { ___bpf_concat(__unique_value, __COUNTER__) = val } name
 
 #ifndef likely
@@ -76,7 +90,11 @@
  * them on their own. So as a convenience, provide such definitions here.
  */
 #ifndef NULL
+#ifdef __cplusplus
+#define NULL nullptr
+#else
 #define NULL ((void *)0)
+#endif
 #endif
 
 #ifndef KERNEL_VERSION
@@ -250,11 +268,23 @@ enum libbpf_tristate {
 
 /*
  * Format strings are in a section of their own. When global data of the object
- * is in arena (the object has .arena.data section) libbpf keeps .rodata.str*
- * sections in read-only maps, which is where helpers and kfuncs take strings
- * from.
+ * is in arena (the object has .arena.data section) libbpf keeps .rodata.str in
+ * a read-only map, which is where helpers and kfuncs take strings from, while
+ * the string literals of the program are in arena with the rest of the data.
  */
 #define ___bpf_fmt_sec __attribute__((section(".rodata.str")))
+
+/*
+ * A string that a helper or a kfunc takes as a constant string, e.g. a
+ * __str argument, when global data of the object is in arena: a plain string
+ * literal is in arena then, which they can't read. Yields a pointer to a
+ * copy of the string in .rodata.str.
+ */
+#define BPF_CONST_STR(str)				\
+({							\
+	static const char ___str[] ___bpf_fmt_sec = str;	\
+	(const char *)___str;				\
+})
 
 /*
  * BPF_SEQ_PRINTF to wrap bpf_seq_printf to-be-printed values
@@ -350,9 +380,9 @@ enum libbpf_tristate {
 
 struct bpf_iter_num;
 
-extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __weak __ksym;
-extern int *bpf_iter_num_next(struct bpf_iter_num *it) __weak __ksym;
-extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
+extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __bpf_noexcept __weak __ksym;
+extern int *bpf_iter_num_next(struct bpf_iter_num *it) __bpf_noexcept __weak __ksym;
+extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __bpf_noexcept __weak __ksym;
 
 #ifndef bpf_for_each
 /* bpf_for_each(iter_type, cur_elem, args...) provides generic construct for
@@ -391,7 +421,8 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 					bpf_iter_##type##_new(&___it, ##args),			\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_##type##_destroy() when used from cleanup() attribute */		\
-					(void)bpf_iter_##type##_destroy, (void *)0);		\
+					(void)bpf_iter_##type##_destroy,			\
+					(struct bpf_iter_##type *)0);				\
 	/* iteration and termination check */							\
 	(((cur) = bpf_iter_##type##_next(&___it)));						\
 )
@@ -420,7 +451,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 				bpf_iter_num_new(&___it, (start), (end)),			\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_num_destroy() when used from cleanup() attribute */			\
-				(void)bpf_iter_num_destroy, (void *)0);				\
+				(void)bpf_iter_num_destroy, (struct bpf_iter_num *)0);		\
 	({											\
 		/* iteration step */								\
 		int *___t = bpf_iter_num_next(&___it);						\
@@ -445,10 +476,14 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 				bpf_iter_num_new(&___it, 0, (N)),				\
 	/* this is a workaround for Clang bug: it currently doesn't emit BTF */			\
 	/* for bpf_iter_num_destroy() when used from cleanup() attribute */			\
-				(void)bpf_iter_num_destroy, (void *)0);				\
+				(void)bpf_iter_num_destroy, (struct bpf_iter_num *)0);		\
 	bpf_iter_num_next(&___it);								\
 	/* nothing here  */									\
 )
 #endif /* bpf_repeat */
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif

@@ -2,6 +2,10 @@
 #ifndef __BPF_TRACING_H__
 #define __BPF_TRACING_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "bpf_helpers.h"
 
 /* Scan the ARCH passed in from ARCH env variable (see Makefile) */
@@ -671,16 +675,16 @@ struct pt_regs;
  */
 #define BPF_PROG(name, args...)						    \
 name(unsigned long long *ctx);						    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(unsigned long long *ctx, ##args);				    \
-typeof(name(0)) name(unsigned long long *ctx)				    \
+__typeof__(name(0)) name(unsigned long long *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
 	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
 	return ____##name(___bpf_ctx_cast(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(unsigned long long *ctx, ##args)
 
 #ifndef ___bpf_nth2
@@ -781,13 +785,13 @@ ____##name(unsigned long long *ctx, ##args)
  */
 #define BPF_PROG2(name, args...)						\
 name(unsigned long long *ctx);							\
-static __always_inline typeof(name(0))						\
+static __always_inline __typeof__(name(0))						\
 ____##name(unsigned long long *ctx ___bpf_ctx_decl(args));			\
-typeof(name(0)) name(unsigned long long *ctx)					\
+__typeof__(name(0)) name(unsigned long long *ctx)					\
 {										\
 	return ____##name(ctx ___bpf_ctx_arg(args));				\
 }										\
-static __always_inline typeof(name(0))						\
+static __always_inline __typeof__(name(0))						\
 ____##name(unsigned long long *ctx ___bpf_ctx_decl(args))
 
 struct pt_regs;
@@ -815,16 +819,16 @@ struct pt_regs;
  */
 #define BPF_KPROBE(name, args...)					    \
 name(struct pt_regs *ctx);						    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args);				    \
-typeof(name(0)) name(struct pt_regs *ctx)				    \
+__typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
 	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
 	return ____##name(___bpf_kprobe_args(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args)
 
 #define ___bpf_kretprobe_args0()       ctx
@@ -839,16 +843,16 @@ ____##name(struct pt_regs *ctx, ##args)
  */
 #define BPF_KRETPROBE(name, args...)					    \
 name(struct pt_regs *ctx);						    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args);				    \
-typeof(name(0)) name(struct pt_regs *ctx)				    \
+__typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
 	_Pragma("GCC diagnostic push")					    \
 	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
 	return ____##name(___bpf_kretprobe_args(args));			    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
-static __always_inline typeof(name(0)) ____##name(struct pt_regs *ctx, ##args)
+static __always_inline __typeof__(name(0)) ____##name(struct pt_regs *ctx, ##args)
 
 /* If kernel has CONFIG_ARCH_HAS_SYSCALL_WRAPPER, read pt_regs directly */
 #define ___bpf_syscall_args0()           ctx
@@ -899,9 +903,9 @@ static __always_inline typeof(name(0)) ____##name(struct pt_regs *ctx, ##args)
 #define BPF_KSYSCALL(name, args...)					    \
 name(struct pt_regs *ctx);						    \
 extern _Bool LINUX_HAS_SYSCALL_WRAPPER __kconfig;			    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args);				    \
-typeof(name(0)) name(struct pt_regs *ctx)				    \
+__typeof__(name(0)) name(struct pt_regs *ctx)				    \
 {									    \
 	struct pt_regs *regs = LINUX_HAS_SYSCALL_WRAPPER		    \
 			       ? (struct pt_regs *)PT_REGS_PARM1(ctx)	    \
@@ -914,7 +918,7 @@ typeof(name(0)) name(struct pt_regs *ctx)				    \
 		return ____##name(___bpf_syscall_args(args));		    \
 	_Pragma("GCC diagnostic pop")					    \
 }									    \
-static __always_inline typeof(name(0))					    \
+static __always_inline __typeof__(name(0))					    \
 ____##name(struct pt_regs *ctx, ##args)
 
 #define BPF_KPROBE_SYSCALL BPF_KSYSCALL
@@ -925,5 +929,9 @@ ____##name(struct pt_regs *ctx, ##args)
  */
 #define BPF_UPROBE(name, args...)  BPF_KPROBE(name, ##args)
 #define BPF_URETPROBE(name, args...)  BPF_KRETPROBE(name, ##args)
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif

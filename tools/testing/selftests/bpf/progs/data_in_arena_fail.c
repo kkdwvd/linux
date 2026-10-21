@@ -6,15 +6,14 @@
 /* global data of the object is in arena */
 char data_in_arena SEC(".arena.data");
 
-int x = 42;
-/* the table is read-only data with pointers. It's not in arena. */
-int *const volatile tbl[1] SEC(".data.rel.ro") = { &x };
-int *const volatile *pp = tbl;
+/* per-CPU data is a map of its own, not a part of arena */
+int x SEC(".percpu") = 42;
+int *px = &x;
 
 SEC("syscall")
 int ptr_to_map(void *ctx)
 {
-	return **pp;
+	return *px;
 }
 
 char _license[] SEC("license") = "GPL";

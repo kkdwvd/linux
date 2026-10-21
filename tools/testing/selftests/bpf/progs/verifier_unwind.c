@@ -896,12 +896,13 @@ static unsigned long cb_unwinds(void)
 	);
 }
 
+/* bpf_loop() has a pad for it, so what's missing is the one after the call */
 SEC("tc")
 __description("unwind: callback unwinds")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure __msg("callback cannot unwind")
+__failure __msg("no unwind_goto after the call of bpf_loop()")
 __naked int callback_unwinds(void)
 {
 	asm volatile (
@@ -918,8 +919,9 @@ __naked int callback_unwinds(void)
 	);
 }
 
+/* r0 = 0 is what a timer callback returns */
 __naked __noinline __used
-static unsigned long async_cb_unwinds(void)
+static int async_cb_unwinds(void *map, int *key, void *value)
 {
 	asm volatile (
 		"r0 = 0;"
@@ -927,6 +929,51 @@ static unsigned long async_cb_unwinds(void)
 		:
 		: __imm_unwind_exit
 	);
+}
+
+/* exit is clean, unwind_exit leaks. Not naked: the branch keeps exit reachable. */
+__noinline __used
+static int async_cb_leaks(void *map, int *key, void *value)
+{
+	bpf_rcu_read_lock();
+	if (value)
+		asm volatile ("r0 = 0;" unwind_exit :: __imm_unwind_exit : "r0");
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* The callback doesn't look at its arguments. The pad returns 2. */
+__naked __noinline __used
+static unsigned long calls_async_cb(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"r2 = 0;"
+		"r3 = 0;"
+		"call async_cb_unwinds;"
+		unwind_goto(2)
+		"r0 = 1;"
+		"exit;"
+		"r0 = 2;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+	);
+}
+
+static __always_inline int arm_timer(void *cb)
+{
+	struct timer_elem *val;
+	int key = 0;
+
+	val = bpf_map_lookup_elem(&timer_map, &key);
+	if (!val)
+		return -1;
+
+	bpf_timer_init(&val->t, &timer_map, 0);
+	bpf_timer_set_callback(&val->t, cb);
+	bpf_timer_start(&val->t, 0, 0);
+	return 0;
 }
 
 /* The kernel calls it. It's the top frame like the main prog: unwind_exit is exit. */
@@ -938,17 +985,56 @@ __load_if_JITed()
 __success __retval(0)
 int async_callback_unwinds(void *ctx)
 {
-	struct timer_elem *val;
-	int key = 0;
+	return arm_timer(async_cb_unwinds);
+}
 
-	val = bpf_map_lookup_elem(&timer_map, &key);
-	if (!val)
+SEC("tc")
+__description("unwind: async callback unwinds with the wrong r0")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("At async callback return the register R0 has smin=5 smax=5 should have been in [0, 0]")
+int async_callback_unwinds_r0(void *ctx)
+{
+	return arm_timer(always_unwinds);
+}
+
+SEC("tc")
+__description("unwind: async callback unwinds with rcu_read_lock held")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("BPF_EXIT instruction in main prog cannot be used inside bpf_rcu_read_lock-ed region")
+int async_callback_leaks(void *ctx)
+{
+	return arm_timer(async_cb_leaks);
+}
+
+/* BPF code calls the same callback: that returns to the pad */
+SEC("tc")
+__description("unwind: async callback called from BPF code")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(2)
+int async_callback_called(void *ctx)
+{
+	if (arm_timer(async_cb_unwinds))
 		return 0;
+	return calls_async_cb();
+}
 
-	bpf_timer_init(&val->t, &timer_map, 0);
-	bpf_timer_set_callback(&val->t, (void *)async_cb_unwinds);
-	bpf_timer_start(&val->t, 0, 0);
-	return 0;
+SEC("tc")
+__description("unwind: async callback called from BPF code without unwind_goto")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("unwind_exit, but no unwind_goto after the call at insn")
+int async_callback_called_no_pad(void *ctx)
+{
+	if (arm_timer(async_cb_unwinds))
+		return 0;
+	return async_cb_unwinds(NULL, NULL, NULL);
 }
 
 /* Not naked: the argument has to have a name in BTF */
@@ -1235,6 +1321,74 @@ void __kfunc_btf_root(void)
 {
 	bpf_rcu_read_lock();
 	bpf_rcu_read_unlock();
+}
+
+/*
+ * This one only unwinds, and returns nothing. The pad of the caller reads what
+ * it unwinds with in r0 all the same.
+ */
+__naked __noinline __used
+void global_only_unwinds(void)
+{
+	asm volatile (
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+/* This one unwinds without saying with what */
+__naked __noinline __used
+void global_unwinds_uninit(void)
+{
+	asm volatile (
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+/*
+ * The callee never returns normally, so nothing follows the call but the pad,
+ * which llvm then places right after it. The path that would continue after
+ * the call isn't checked: it has no r0.
+ */
+SEC("tc")
+__description("unwind: a global subprog that only unwinds")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(15)
+__naked int calls_global_only_unwinds(void)
+{
+	asm volatile (
+		"call global_only_unwinds;"
+		unwind_goto(0)
+		"r0 += 10;"
+		"exit;"
+		:
+		: __imm_unwind_goto(0)
+		: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog unwinds with nothing in r0")
+__arch_x86_64
+__arch_arm64
+__failure __msg("R0 !read_ok")
+__naked int calls_global_unwinds_uninit(void)
+{
+	asm volatile (
+		"call global_unwinds_uninit;"
+		unwind_goto(0)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_unwind_goto(0)
+		: __clobber_all
+	);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -2,9 +2,10 @@
 /*
  * C++ exceptions. llvm lowers unwinding to two insns:
  *   invoke foo unwind pad    call foo; unwind_goto pad
- *   resume                   r0 = 0; unwind_exit
+ *   resume                   r0 = exception; unwind_exit
  * so 'throw' is a jump or an exit, 'catch (...)' and the destructors that run on
- * the way are ordinary blocks.
+ * the way are ordinary blocks. The exception that _Unwind_RaiseException() is
+ * given is in r0 at every pad and at the unwind_exit out of a prog.
  *
  * vmlinux.h and bpf_helpers.h are not C++.
  */
@@ -28,7 +29,14 @@ void bpf_preempt_enable(void) noexcept __ksym;
 /* Starts an unwind. Not a kfunc: llvm lowers the call and it doesn't come back. */
 int _Unwind_RaiseException(void *exc);
 
-/* All that is left of the C++ runtime. Nobody looks at the exception object. */
+/*
+ * All that is left of the C++ runtime. Nobody looks at the exception object.
+ * The exception that unwinds is a number, as an object in arena would be: a
+ * global subprog can't unwind with a pointer to a map value in r0, and the
+ * number is what a prog that doesn't catch returns.
+ */
+#define EXCEPTION 77
+
 static char exc_obj[16];
 
 __always_inline void *__cxa_allocate_exception(unsigned long size) noexcept
@@ -38,12 +46,12 @@ __always_inline void *__cxa_allocate_exception(unsigned long size) noexcept
 
 __always_inline void __cxa_throw(void *exc, void *tinfo, void (*dtor)(void *))
 {
-	_Unwind_RaiseException(exc);
+	_Unwind_RaiseException((void *)EXCEPTION);
 }
 
 __always_inline void *__cxa_begin_catch(void *exc) noexcept
 {
-	return exc;
+	return exc_obj;
 }
 
 __always_inline void __cxa_end_catch(void) noexcept
@@ -127,7 +135,7 @@ extern "C" SEC("tc") int catches(struct __sk_buff *skb)
 	}
 }
 
-/* The exception leaves the prog: it returns 0 */
+/* The exception leaves the prog, which returns it */
 extern "C" SEC("tc") int does_not_catch(struct __sk_buff *skb)
 {
 	return middle(skb->len);

@@ -123,6 +123,19 @@ int exception_throw_from_void_global(struct __sk_buff *ctx)
 	return 0;
 }
 
+/* The caller has nothing to continue with, an extension can't replace it */
+__noinline int exception_noreturn_global(struct __sk_buff *ctx)
+{
+	bpf_throw(16);
+	return 0;
+}
+
+SEC("tc")
+int exception_noreturn_call(struct __sk_buff *ctx)
+{
+	return exception_noreturn_global(ctx) + 1;
+}
+
 __noinline int exception_ext_global(struct __sk_buff *ctx)
 {
 	volatile int ret = 0;

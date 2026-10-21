@@ -405,7 +405,7 @@
 	BPF_EXIT_INSN(),
 	},
 	.prog_type = BPF_PROG_TYPE_TRACEPOINT,
-	.errstr = "last insn is not an exit or jmp",
+	.errstr = "last insn 0 of func#0 calls func#1 (''), which might return",
 	.result = REJECT,
 },
 {

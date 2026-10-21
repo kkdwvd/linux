@@ -178,6 +178,28 @@ static int maybe_enter_scc(struct bpf_verifier_env *env, struct bpf_verifier_sta
 
 static int propagate_backedges(struct bpf_verifier_env *env, struct bpf_scc_visit *visit);
 
+/*
+ * Does the path of @st end with an exception exit at its current insn: a call
+ * of bpf_throw, or of a global subprog that may throw or doesn't return? See
+ * check_kfunc_call() and check_func_call().
+ */
+static bool is_exception_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[st->insn_idx];
+	struct bpf_subprog_info *callee;
+	int subprog;
+
+	if (bpf_is_throw_kfunc(insn))
+		return true;
+	if (!bpf_pseudo_call(insn))
+		return false;
+	subprog = bpf_find_subprog(env, st->insn_idx + insn->imm + 1);
+	if (subprog < 0 || !bpf_subprog_is_global(env, subprog))
+		return false;
+	callee = &env->subprog_info[subprog];
+	return callee->might_throw || !callee->might_return;
+}
+
 /* If callchain for @st exists (@st is in some SCC), make it empty:
  * - set visit->entry_state to NULL;
  * - flush accumulated backedges.
@@ -193,17 +215,21 @@ static int maybe_exit_scc(struct bpf_verifier_env *env, struct bpf_verifier_stat
 	if (!visit) {
 		/*
 		 * If path traversal stops inside an SCC, corresponding bpf_scc_visit
-		 * must exist for non-speculative paths. For non-speculative paths
-		 * traversal stops when:
+		 * must exist for non-speculative paths, unless the path ends with an
+		 * exception exit. For non-speculative paths traversal stops when:
 		 * a. Verification error is found, maybe_exit_scc() is not called.
 		 * b. Top level BPF_EXIT is reached. Top level BPF_EXIT is not a member
 		 *    of any SCC.
 		 * c. A checkpoint is reached and matched. Checkpoints are created by
 		 *    is_state_visited(), which calls maybe_enter_scc(), which allocates
 		 *    bpf_scc_visit instances for checkpoints within SCCs.
-		 * (c) is the only case that can reach this point.
+		 * d. An exception exit is reached. It leaves the program from any
+		 *    insn, also from an SCC that no checkpoint has been made for yet.
+		 *    The state is not a checkpoint, hence not the entry state of any
+		 *    bpf_scc_visit, and there is nothing to exit.
+		 * Of these, only (d) can get here.
 		 */
-		if (!st->speculative) {
+		if (!st->speculative && !is_exception_exit(env, st)) {
 			verifier_bug(env, "scc exit: no visit info for call chain %s",
 				     format_callchain(env, callchain));
 			return -EFAULT;

@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
@@ -3331,6 +3332,13 @@ static void find_subprog_properties(struct bpf_verifier_env *env)
 				subprog[cur_subprog].has_ld_abs = true;
 			if (bpf_is_callx(&insn[i]))
 				env->has_callx = true;
+			/* [WIP] callx of a number may call it, see check_scalar_callx() */
+			if (bpf_pseudo_func(&insn[i])) {
+				int sidx = bpf_find_subprog(env, i + insn[i].imm + 1);
+
+				if (sidx > 0)
+					subprog[sidx].addr_taken = true;
+			}
 		}
 	}
 }
@@ -3374,17 +3382,23 @@ next:
 			/*
 			 * To avoid fall-through from one subprog into another,
 			 * the last insn of the subprog should be either exit
-			 * or unconditional jump back or bpf_throw call.
+			 * or unconditional jump back or a call that doesn't
+			 * return: of bpf_throw, of __bpf_trap, which the main
+			 * pass rejects if it gets there, or of a subprog that
+			 * doesn't return, see check_final_calls().
 			 */
 			if (code != (BPF_JMP | BPF_EXIT) &&
 			    code != (BPF_JMP32 | BPF_JA) &&
 			    code != (BPF_JMP | BPF_JA) &&
-			    !insn_is_gotox(&insn[i])) {
+			    !insn_is_gotox(&insn[i]) &&
+			    !bpf_pseudo_call(&insn[i]) &&
+			    !bpf_is_throw_kfunc(&insn[i]) &&
+			    !bpf_is_trap_kfunc(&insn[i])) {
 				verbose(env, "last insn is not an exit or jmp\n");
 				bpf_diag_program_structure(
 					env, i, "subprogram can fall through",
-					"End each subprogram with an exit or an explicit jump that keeps control flow inside the subprogram.",
-					"Subprogram %d reaches its last instruction %d without an exit or jump, so control could continue into the next subprogram.",
+					"End each subprogram with an exit, an explicit jump that keeps control flow inside the subprogram, or a call that does not return.",
+					"Subprogram %d reaches its last instruction %d without an exit, a jump or a call that does not return, so control could continue into the next subprogram.",
 					cur_subprog, i);
 				return -EINVAL;
 			}
@@ -3393,6 +3407,40 @@ next:
 			if (cur_subprog < env->subprog_cnt)
 				subprog_end = subprog[cur_subprog + 1].start;
 		}
+	}
+	return 0;
+}
+
+/*
+ * check_subprogs() lets a call of a subprog end a subprog. There is no insn
+ * after the call to return to, so the callee must not return.
+ */
+static int check_final_calls(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn = env->prog->insnsi;
+	int i, last, callee;
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		last = env->subprog_info[i + 1].start - 1;
+		if (!bpf_pseudo_call(&insn[last]))
+			continue;
+		callee = bpf_find_subprog(env, last + insn[last].imm + 1);
+		if (verifier_bug_if(callee < 0, env, "no subprog starts at the target of insn %d",
+				    last))
+			return -EFAULT;
+		if (!env->subprog_info[callee].might_return &&
+		    !env->subprog_info[callee].can_unwind)
+			continue;
+		verbose(env, "last insn %d of func#%d calls func#%d ('%s'), which might %s\n",
+			last, i, callee, bpf_subprog_name(env, callee),
+			env->subprog_info[callee].might_return ? "return" : "unwind");
+		bpf_diag_program_structure(
+			env, last, "subprogram ends with a call that might return",
+			"End the subprogram with an exit or a jump after the call, or call a function that does not return on any path.",
+			"Subprogram %d ends with the call at instruction %d of subprogram %d, which might return. "
+			"There is no instruction after the call to return to, so control could continue into the next subprogram.",
+			i, last, callee);
+		return -EINVAL;
 	}
 	return 0;
 }
@@ -3432,9 +3480,37 @@ static int next_callx_callee(struct bpf_verifier_env *env, int caller, int from)
 }
 
 /*
+ * What the callee of a callx may do, the caller may do too, like for a direct
+ * call, see merge_callee_effects(). The callees are known after the main pass,
+ * and the attach checks rely on the summaries of the subprogs, e.g. that
+ * bpf_throw can't run with the frame of a subprog on the stack. Callees come
+ * before their callers in the topological order, which sort_subprogs_topo()
+ * has recomputed with the callx edges.
+ */
+static void merge_callx_callee_effects(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *caller, *callee;
+	int i, c, subprog;
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		subprog = env->subprog_topo_order[i];
+		caller = &env->subprog_info[subprog];
+		for (c = next_callx_callee(env, subprog, 0); c >= 0;
+		     c = next_callx_callee(env, subprog, c + 1)) {
+			callee = &env->subprog_info[c];
+			caller->changes_pkt_data |= callee->changes_pkt_data;
+			caller->might_sleep |= callee->might_sleep;
+			caller->might_throw |= callee->might_throw;
+		}
+	}
+}
+
+/*
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
+ * The call may be of a helper or a kfunc that calls a callback: it leaves like
+ * the callback did, see check_cb_unwind().
  */
 static int check_unwind_insns(struct bpf_verifier_env *env)
 {
@@ -3450,8 +3526,12 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 		if (!bpf_is_unwind_goto(insn))
 			continue;
 		seen = true;
-		if (!i || !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1))) {
-			verbose(env, "unwind_goto at insn %d doesn't follow a call of a subprog\n",
+		/* the call that ends the previous subprog doesn't return here */
+		if (bpf_find_subprog(env, i) >= 0 ||
+		    !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1) ||
+		      bpf_is_sync_callback_calling_insn(insn - 1))) {
+			verbose(env,
+				"unwind_goto at insn %d doesn't follow a call of a subprog or of a helper with a callback\n",
 				i);
 			return -EINVAL;
 		}
@@ -4650,6 +4730,9 @@ static int check_stack_arg_read(struct bpf_verifier_env *env, struct bpf_func_st
 	if (spi + 1 > bpf_in_stack_arg_cnt(subprog)) {
 		verbose(env, "invalid read from stack arg off %d depth %d\n",
 			off, bpf_in_stack_arg_cnt(subprog) * BPF_REG_SIZE);
+		if (!subprog->args_cached)
+			verbose(env, "the arguments of %s() are not known from its BTF, which the stack args need\n",
+				bpf_subprog_name(env, state->subprogno));
 		return -EACCES;
 	}
 
@@ -6034,7 +6117,8 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	 * be done properly.
 	 */
 	for (int i = env->subprog_cnt - 1; i >= 0; i--) {
-		if (!i || si[i].is_async_cb) {
+		/* [WIP] a function that only data refers to may be called from anywhere */
+		if (!i || si[i].is_async_cb || si[i].addr_in_data) {
 			priv_stack_supported = !i && priv_stack_mode == PRIV_STACK_ADAPTIVE;
 			ret = check_max_stack_depth_subprog(env, i, dinfo,
 					priv_stack_supported);
@@ -11397,6 +11481,63 @@ static int btf_check_subprog_call(struct bpf_verifier_env *env, int subprog)
 	return err;
 }
 
+/* The helper calls its callback with a pad, see bpf_call_cb() */
+static bool helper_has_cb_pad(enum bpf_func_id func_id)
+{
+	switch (func_id) {
+	case BPF_FUNC_loop:
+	case BPF_FUNC_for_each_map_elem:
+	case BPF_FUNC_find_vma:
+	case BPF_FUNC_user_ringbuf_drain:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* The kfunc calls its callback with a pad */
+static bool kfunc_has_cb_pad(u32 btf_id)
+{
+	return is_bpf_rbtree_add_kfunc(btf_id);
+}
+
+static bool insn_has_cb_pad(struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && helper_has_cb_pad(insn->imm)) ||
+	       (bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm));
+}
+
+/*
+ * A sync callback is called by a helper or a kfunc, a C frame between the
+ * callback and the BPF code that called it. unwind_exit of the callback returns
+ * to the pad of its caller when there is one, and a helper or a kfunc that
+ * calls a callback has one where BPF_HAS_CB_PADS and insn_has_cb_pad(): it
+ * calls the callback with bpf_call_cb(), drops what it holds when the callback
+ * unwinds and leaves to the pad of its own caller with the r0 of the callback.
+ * So a call with such a callback that can unwind is a call of something that
+ * can unwind, and unwind_goto has to follow it.
+ */
+static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			   int insn_idx, int subprog)
+{
+	if (!env->subprog_info[subprog].can_unwind)
+		return 0;
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn)) {
+		verbose(env, "callback cannot unwind\n");
+		return -EINVAL;
+	}
+	if (!bpf_is_unwind_goto(insn + 1)) {
+		if (bpf_helper_call(insn))
+			verbose(env, "no unwind_goto after the call of %s()\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env, "no unwind_goto after the call of the kfunc at insn %d\n",
+				insn_idx);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int insn_idx, int subprog,
 			      set_callee_state_fn set_callee_state_cb)
@@ -11406,6 +11547,15 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	int err;
 
 	caller = state->frame[state->curframe];
+	/*
+	 * The callback unwound, and the call is visited once more for the
+	 * effects of the helper, see prepare_func_exit(): no more rounds, and
+	 * the next call with a callback in this frame starts from its first.
+	 */
+	if (state->unwound) {
+		caller->callback_depth = 0;
+		return 0;
+	}
 	err = btf_check_subprog_call(env, subprog);
 	if (err == -EFAULT)
 		return err;
@@ -11459,6 +11609,10 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	if (err)
 		return err;
 
+	err = check_cb_unwind(env, insn, insn_idx, subprog);
+	if (err)
+		return err;
+
 	/* for callback functions enqueue entry to callback and
 	 * proceed with next instruction within current frame.
 	 */
@@ -11476,6 +11630,12 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	caller->callback_depth = 0;
 	return 0;
 }
+
+/* what do_check() does after an insn, see do_check_insn() */
+enum {
+	PROCESS_BPF_EXIT = 1,
+	INSN_IDX_UPDATED = 2,
+};
 
 static int process_bpf_exit_full(struct bpf_verifier_env *env,
 				 bool *do_print_state, bool exception_exit);
@@ -11625,9 +11785,18 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
+		/*
+		 * The callee may unwind to the pad of the unwind_goto after the
+		 * call, with what it unwinds with in R0, whatever its return type.
+		 */
 		if (env->subprog_info[subprog].can_unwind) {
 			struct bpf_verifier_state *branch;
 
+			/* check_final_calls() lets only a callee that doesn't unwind end a subprog */
+			if (verifier_bug_if(bpf_call_ends_subprog(env, *insn_idx), env,
+					    "global func#%d called at the end of a subprog can unwind",
+					    subprog))
+				return -EFAULT;
 			if (!bpf_is_unwind_goto(insn + 1)) {
 				verbose(env, "no unwind_goto after the call of %s()\n", sub_name);
 				return -EINVAL;
@@ -11636,7 +11805,27 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (IS_ERR(branch))
 				return PTR_ERR(branch);
 			branch->unwound = true;
+			mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
 		}
+
+		/*
+		 * The callee doesn't return normally on any path: it throws, or
+		 * it unwinds to the pad. There is nothing to continue with after
+		 * the call. An extension that would return instead is refused,
+		 * see bpf_check_attach_target().
+		 */
+		if (!env->subprog_info[subprog].might_return) {
+			sub_aux->called_as_noreturn = true;
+			if (env->subprog_info[subprog].might_throw)
+				return process_bpf_exit_full(env, NULL, true);
+			return PROCESS_BPF_EXIT;
+		}
+
+		/* check_final_calls() lets only a callee that doesn't return end a subprog */
+		if (verifier_bug_if(bpf_call_ends_subprog(env, *insn_idx), env,
+				    "global func#%d called at the end of a subprog might return",
+				    subprog))
+			return -EFAULT;
 
 		if (env->subprog_info[subprog].might_throw) {
 			struct bpf_verifier_state *branch;
@@ -11654,6 +11843,132 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	return check_static_func_call(env, subprog, insn_idx);
+}
+
+/*
+ * [WIP] Functions that callx of a number may call: static functions whose
+ * address ld_imm64 takes, other than callbacks, and those that only data
+ * refers to. Each of them is verified on its own with unknown scalar
+ * arguments, see do_check_common(), in the context of the program even when
+ * it has no callx, see do_check_subprogs().
+ */
+static bool is_scalar_callx_callee(struct bpf_verifier_env *env, int subprog)
+{
+	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+
+	return sub->addr_taken && !sub->is_cb && !sub->is_async_cb && !sub->is_exception_cb &&
+	       !bpf_subprog_is_global(env, subprog);
+}
+
+/*
+ * [WIP] callx dst_reg, where dst_reg is a number. A stopgap until there are
+ * verified pointers to functions.
+ *
+ * The C++ runtime keeps the destructor of a thrown object in the header of
+ * the exception in arena and calls it when the last handler ends. The address
+ * of the function is a number when it's loaded from there. Nothing checks
+ * that the number is the address of a function of the program, or what the
+ * arguments are. The callee isn't verified in the context of the caller.
+ *
+ * Instead the call is treated like a call of a global function that can be
+ * any of the functions whose address ld_imm64 takes, or that only data refers
+ * to. Each of them is verified on its own with unknown scalar arguments in the
+ * context of the call. The caller gets R1-R5 clobbered and R0 unknown. Its
+ * stack and references are left alone. The summaries of the callees are
+ * merged: the call might sleep, throw, change packet data or unwind if any of
+ * them might. The stack depth is accounted after the main pass as if the
+ * caller called each of them.
+ */
+static int check_scalar_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			      int *insn_idx)
+{
+	bool might_sleep = false, might_throw = false, can_unwind = false, changes_pkt = false;
+	struct bpf_func_state *caller = cur_func(env);
+	struct bpf_verifier_state *branch;
+	struct bpf_reg_state *reg;
+	struct bpf_subprog_info *sub;
+	enum bpf_func_context ctx;
+	int i, cnt = 0, err;
+
+	reg = reg_state(env, insn->dst_reg);
+	if (tnum_is_const(reg->var_off)) {
+		verbose(env, "R%d is %lld, not the address of a function\n", insn->dst_reg,
+			(s64)reg->var_off.value);
+		return -EACCES;
+	}
+
+	/* ld_imm64 doesn't take the address of a global function */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		sub = &env->subprog_info[i];
+		if (!sub->addr_taken || bpf_subprog_is_global(env, i))
+			continue;
+		might_sleep |= sub->might_sleep;
+		might_throw |= sub->might_throw;
+		can_unwind |= sub->can_unwind;
+		changes_pkt |= sub->changes_pkt_data;
+		cnt++;
+	}
+	if (!cnt) {
+		verbose(env, "R%d is a number, and no function has its address taken\n",
+			insn->dst_reg);
+		return -EACCES;
+	}
+
+	if (env->cur_state->active_locks) {
+		verbose(env, "callx of a number is not allowed while holding a lock\n");
+		return -EINVAL;
+	}
+
+	if (might_sleep && !in_sleepable_context(env)) {
+		verbose(env, "callx of a number may call a sleepable function in %s\n",
+			non_sleepable_context_description(env));
+		return -EINVAL;
+	}
+
+	err = require_callx_jit(env);
+	if (err)
+		return err;
+
+	if (in_sleepable_context(env))
+		ctx = BPF_FUNC_CTX_SLEEPABLE;
+	else if (has_rcu_read_lock(env))
+		ctx = BPF_FUNC_CTX_NON_SLEEPABLE;
+	else
+		ctx = BPF_FUNC_CTX_NO_RCU_LOCK;
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (env->subprog_info[i].addr_taken && !bpf_subprog_is_global(env, i))
+			subprog_aux(env, i)->called[ctx] = true;
+	env->subprog_info[caller->subprogno].scalar_callx = true;
+
+	if (changes_pkt)
+		clear_all_pkt_pointers(env);
+	clear_caller_saved_regs(env, caller->regs);
+	invalidate_outgoing_stack_args(env, caller);
+	bpf_diag_mod_begin(env, &caller->regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	mark_reg_unknown(env, caller->regs, BPF_REG_0);
+	bpf_diag_mod_end(env);
+
+	if (can_unwind) {
+		if (!bpf_is_unwind_goto(insn + 1)) {
+			verbose(env, "no unwind_goto after callx of a number that may unwind\n");
+			return -EINVAL;
+		}
+		branch = push_stack(env, *insn_idx + 1, *insn_idx, false);
+		if (IS_ERR(branch))
+			return PTR_ERR(branch);
+		branch->unwound = true;
+		/* what the callee unwinds with */
+		mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+	}
+
+	if (might_throw) {
+		branch = push_stack(env, *insn_idx + 1, *insn_idx, false);
+		if (IS_ERR(branch))
+			return PTR_ERR(branch);
+		return process_bpf_exit_full(env, NULL, true);
+	}
+
+	return 0;
 }
 
 /*
@@ -11680,6 +11995,8 @@ static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	reg = reg_state(env, insn->dst_reg);
+	if (reg->type == SCALAR_VALUE && env->scalar_callx)
+		return check_scalar_callx(env, insn, insn_idx);
 	if (reg->type != PTR_TO_FUNC) {
 		verbose(env, "R%d has type %s, expected func\n", insn->dst_reg,
 			reg_type_str(env, reg->type));
@@ -12090,7 +12407,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	struct bpf_verifier_state *state = env->cur_state, *prev_st;
 	struct bpf_func_state *caller, *callee;
 	struct bpf_reg_state *r0;
-	bool in_callback_fn;
+	bool in_callback_fn, unwinds;
 	u32 i, nregs;
 	int err;
 
@@ -12111,12 +12428,21 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	}
 
 	caller = state->frame[state->curframe - 1];
-	if (bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx])) {
-		/* the helper or the kfunc that called it doesn't expect that */
-		if (callee->in_callback_fn) {
-			verbose(env, "callback cannot unwind\n");
-			return -EINVAL;
-		}
+	/* The callee of a call that ends its subprog doesn't return, see check_final_calls() */
+	if (verifier_bug_if(bpf_call_ends_subprog(env, callee->callsite), env,
+			    "return to the call at insn %d that ends its subprog",
+			    callee->callsite))
+		return -EFAULT;
+	unwinds = bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx]);
+	if (unwinds) {
+		/*
+		 * A callback returns into the helper that called it, and to the
+		 * pad of the helper when the helper has one. check_cb_unwind()
+		 * has seen to that, and to the unwind_goto after the call of
+		 * the helper, where the helper leaves to right away, with the
+		 * r0 of the callback as it is: the pad gets its state, as the
+		 * pad after a subprog call does.
+		 */
 		if (!bpf_is_unwind_goto(&env->prog->insnsi[callee->callsite + 1])) {
 			verbose(env, "unwind_exit, but no unwind_goto after the call at insn %d\n",
 				callee->callsite);
@@ -12124,7 +12450,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 		state->unwound = true;
 	}
-	if (callee->in_callback_fn) {
+	if (callee->in_callback_fn && !unwinds) {
 		if (r0->type != SCALAR_VALUE) {
 			verbose(env, "R0 not a scalar value\n");
 			return -EACCES;
@@ -12171,6 +12497,14 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * there function call logic would reschedule callback visit. If iteration
 	 * converges is_state_visited() would prune that visit eventually.
 	 */
+	/*
+	 * A callback that unwound goes back to the call too: the helper has
+	 * effects of its own to apply, such as releasing what it consumed. With
+	 * the state marked unwound it is the last round, and r0 is still what
+	 * the callback unwound with after the call, with the effects of the
+	 * helper applied to it. See push_callback_call(), check_helper_call()
+	 * and check_kfunc_call().
+	 */
 	in_callback_fn = callee->in_callback_fn;
 	if (in_callback_fn)
 		*insn_idx = callee->callsite;
@@ -12201,7 +12535,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * This is similar to what is done in process_iter_next_call() for open
 	 * coded iterators.
 	 */
-	prev_st = in_callback_fn ? find_prev_entry(env, state, *insn_idx) : NULL;
+	prev_st = in_callback_fn && !unwinds ? find_prev_entry(env, state, *insn_idx) : NULL;
 	if (prev_st) {
 		err = widen_imprecise_scalars(env, prev_st, state);
 		if (err)
@@ -12379,6 +12713,19 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit, bool check_lock, const char *prefix)
 {
 	int err;
+
+	/*
+	 * [WIP] With BPF_F_THROW_NO_RELEASE an exception exit, a call of
+	 * bpf_throw or of a subprog that throws, may leave the program while it
+	 * holds a lock, IRQs or preemption disabled, the RCU read lock or
+	 * references. A stopgap until bpf_throw releases what the frames of the
+	 * program hold. Until then nothing releases them at run time: locks stay
+	 * taken, IRQs and preemption stay disabled, the RCU read lock stays held,
+	 * and references leak. The exception callback runs with them held too.
+	 * The other checks of a throw still apply.
+	 */
+	if (exception_exit && env->throw_no_release)
+		return 0;
 
 	if (check_lock && env->cur_state->active_locks) {
 		verbose(env, "%s cannot be used inside bpf_spin_lock-ed region\n", prefix);
@@ -12614,7 +12961,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	const struct bpf_func_proto *fn = NULL;
 	enum bpf_return_type ret_type;
 	enum bpf_type_flag ret_flag;
-	struct bpf_reg_state *regs;
+	struct bpf_reg_state *regs, unwound_r0;
 	struct bpf_call_arg_meta meta;
 	const char *operation;
 	int insn_idx = *insn_idx_p;
@@ -12870,12 +13217,25 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 
 	/* reset caller saved regs */
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/*
+	 * The callback unwound: the helper leaves to the pad after the call
+	 * with the r0 of the callback, which prepare_func_exit() put here and
+	 * which the effects of the helper above apply to like to any register.
+	 * There is no return, and r0 isn't written.
+	 */
+	if (env->cur_state->unwound)
+		unwound_r0 = regs[BPF_REG_0];
+	else
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		bpf_mark_reg_not_init(env, &regs[caller_saved[i]]);
 		check_reg_arg(env, caller_saved[i], DST_OP_NO_MARK);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* update return register (already marked as written above) */
 	ret_type = fn->ret_type;
@@ -13063,7 +13423,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 
 	bpf_diag_mod_end(env);
-
+unwound:
 	err = check_map_func_compatibility(env, meta.map.ptr, func_id);
 	if (err)
 		return err;
@@ -14645,6 +15005,12 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 	       insn->imm == special_kfunc_list[KF_bpf_throw];
 }
 
+bool bpf_is_trap_kfunc(struct bpf_insn *insn)
+{
+	return bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
+	       insn->imm == special_kfunc_list[KF___bpf_trap];
+}
+
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
@@ -15398,7 +15764,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
 	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
-	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_call_arg_meta meta;
@@ -15461,7 +15827,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "failed to mark s32 range for retval in forked state for lock\n");
 			return err;
 		}
-	} else if (!insn->off && insn->imm == special_kfunc_list[KF___bpf_trap]) {
+	} else if (bpf_is_trap_kfunc(insn)) {
 		verbose(env, "unexpected __bpf_trap() due to uninitialized variable?\n");
 		return -EFAULT;
 	}
@@ -15638,7 +16004,21 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		id = regs[BPF_REG_2].id;
 		insn_aux->insert_off = regs[BPF_REG_2].var_off.value;
 		insn_aux->kptr_struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
-		ref_convert_owning_non_owning(env, id);
+		/*
+		 * The comparator unwound: the node never went in, and the
+		 * kfunc dropped it on its way to the pad. The comparator was
+		 * handed the node too, and may have unwound with it in r0, so
+		 * every non-owning reference goes. Otherwise the node is in
+		 * the tree now.
+		 */
+		if (env->cur_state->unwound) {
+			invalidate_non_owning_refs(env);
+			err = release_reference(env, id);
+			if (err)
+				return err;
+		} else {
+			ref_convert_owning_non_owning(env, id);
+		}
 	}
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_throw]) {
@@ -15660,13 +16040,23 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/* The callback unwound: r0 is the callback's, see check_helper_call() */
+	if (env->cur_state->unwound) {
+		unwound_r0 = regs[BPF_REG_0];
+		ret_nregs = 0;
+	} else {
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	}
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		u32 regno = caller_saved[i];
 
 		bpf_mark_reg_not_init(env, &regs[regno]);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* Check return type */
 	t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
@@ -15851,6 +16241,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+unwound:
 	if (is_kfunc_dynptr_write(&meta) ?
 	    dynptr_write_changes_pkt_data(meta.dynptr_write_type) :
 	    bpf_is_kfunc_pkt_changing(&meta))
@@ -19569,8 +19960,14 @@ static int check_global_subprog_return_code(struct bpf_verifier_env *env)
 	u32 i, nregs;
 	int err;
 
+	/*
+	 * unwind_exit leaves what it unwinds with in R0, and the pad of the
+	 * caller reads it, whatever the subprog returns. The return registers
+	 * of a subprog that returns something are checked below either way.
+	 */
 	if (subprog_returns_void(env, subprog))
-		return 0;
+		return bpf_is_unwind_exit(&env->prog->insnsi[env->insn_idx]) ?
+		       check_global_ret_scalar_reg(env, BPF_REG_0) : 0;
 
 	nregs = bpf_ret_reg_pair(env, subprog) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
@@ -19761,7 +20158,8 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
 	 * rX = *(u64 *)(r10 - Y)
 	 */
 	for (i = 1, off = lowest_off; i <= ARRAY_SIZE(caller_saved); ++i, off += BPF_REG_SIZE) {
-		if (insn_idx - i < 0 || insn_idx + i >= env->prog->len)
+		/* a call that doesn't return may be the last insn of the subprog */
+		if (insn_idx - i < 0 || insn_idx + i >= (subprog + 1)->start)
 			break;
 		/* stx/ldx/call must not be a jump targets, a jump to the first stx is fine */
 		if (bpf_is_jump_target(env, insn_idx - i + 1) ||
@@ -20016,11 +20414,6 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 	return 0;
 }
 
-enum {
-	PROCESS_BPF_EXIT = 1,
-	INSN_IDX_UPDATED = 2,
-};
-
 static int process_bpf_exit_full(struct bpf_verifier_env *env,
 				 bool *do_print_state,
 				 bool exception_exit)
@@ -20260,7 +20653,10 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		env->jmps_processed++;
 		if (opcode == BPF_CALL) {
-			if (env->cur_state->active_locks) {
+			/* [WIP] it may throw with a lock held, see check_resource_leak() */
+			bool throw_no_release = env->throw_no_release && bpf_is_throw_kfunc(insn);
+
+			if (env->cur_state->active_locks && !throw_no_release) {
 				/* similar to static subprog calls callx is allowed under a lock */
 				if (!bpf_is_callx(insn) &&
 				    ((insn->src_reg == BPF_REG_0 &&
@@ -20589,7 +20985,8 @@ static int do_check(struct bpf_verifier_env *env)
 		}
 
 		if (bpf_is_jmp_point(env, env->insn_idx)) {
-			err = bpf_push_jmp_history(env, state, 0, 0, 0, NULL, 0);
+			err = bpf_push_jmp_history(env, state, state->unwound ? INSN_F_UNWOUND : 0,
+						   0, 0, NULL, 0);
 			if (err)
 				return err;
 		}
@@ -20678,6 +21075,15 @@ static int do_check(struct bpf_verifier_env *env)
 		} else if (err == INSN_IDX_UPDATED) {
 		} else if (err == 0) {
 			env->insn_idx++;
+			/* only a call that doesn't return may end a subprog */
+			if (BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_CALL) {
+				u32 end = env->subprog_info[cur_func(env)->subprogno + 1].start;
+
+				if (verifier_bug_if(env->insn_idx == end, env,
+						    "insn %d falls through to the next subprog",
+						    prev_insn_idx))
+					return -EFAULT;
+			}
 		}
 
 		if (state->speculative && insn_aux->nospec_result) {
@@ -21638,6 +22044,47 @@ static int resolve_func_ptrs(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * [WIP] Only data refers to a static function that no insn calls or takes the
+ * address of: libbpf appends the functions whose addresses are in arena data
+ * to the program and puts their JITed addresses there. Where callx of a number
+ * is allowed, such function is a callee of it, see check_scalar_callx(). It's
+ * verified on its own even when the program has no callx, see
+ * do_check_subprogs(), since another program may call it. Elsewhere it stays
+ * unreachable code.
+ */
+static void mark_subprogs_addr_in_data(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn = env->prog->insnsi;
+	DECLARE_BITMAP(referred, BPF_MAX_SUBPROGS);
+	int i, subprog;
+
+	if (!env->scalar_callx || !env->prog->aux->func_info)
+		return;
+
+	bitmap_zero(referred, BPF_MAX_SUBPROGS);
+	for (i = 0; i < env->prog->len; i++) {
+		if (!bpf_pseudo_call(&insn[i]) && !bpf_pseudo_func(&insn[i]))
+			continue;
+		subprog = bpf_find_subprog(env, i + insn[i].imm + 1);
+		if (subprog >= 0)
+			__set_bit(subprog, referred);
+	}
+	/* a pointer in a read-only map is found by check_cfg() */
+	for (i = 0; i < env->func_ptr_cnt; i++) {
+		subprog = bpf_find_subprog(env, env->func_ptrs[i].xlated_off);
+		if (subprog >= 0)
+			__set_bit(subprog, referred);
+	}
+
+	for (i = 1; i < env->subprog_cnt; i++) {
+		if (test_bit(i, referred) || bpf_subprog_is_global(env, i))
+			continue;
+		env->subprog_info[i].addr_taken = true;
+		env->subprog_info[i].addr_in_data = true;
+	}
+}
+
 /* drop refcnt of maps used by the rejected program */
 static void release_maps(struct bpf_verifier_env *env)
 {
@@ -21782,7 +22229,20 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 	state->last_insn_idx = -1;
 
 	regs = state->frame[state->curframe]->regs;
-	if (subprog || env->prog->type == BPF_PROG_TYPE_EXT) {
+	if (subprog && !bpf_subprog_is_global(env, subprog)) {
+		/* [WIP] a callee of callx of a number, see check_scalar_callx() */
+		if (env->log.level & BPF_LOG_LEVEL)
+			verbose(env, "Validating %s() func#%d for callx of a number...\n",
+				bpf_subprog_name(env, subprog), subprog);
+		if (bpf_in_stack_arg_cnt(sub)) {
+			verbose(env, "callx of a number cannot pass arguments on the stack to %s()\n",
+				bpf_subprog_name(env, subprog));
+			ret = -EINVAL;
+			goto out;
+		}
+		for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+			mark_reg_unknown(env, regs, i);
+	} else if (subprog || env->prog->type == BPF_PROG_TYPE_EXT) {
 		const char *sub_name = bpf_subprog_name(env, subprog);
 		struct bpf_subprog_arg_info *arg;
 		struct bpf_reg_state *reg;
@@ -21922,6 +22382,36 @@ out:
 	return ret;
 }
 
+/*
+ * [WIP] The stack depth and the absence of recursion are checked as if each
+ * function that has callx of a number called every function it may call, see
+ * check_max_stack_depth().
+ */
+static int add_scalar_callx_edges(struct bpf_verifier_env *env)
+{
+	int caller, callee, cnt, err;
+
+	for (caller = 0; caller < env->subprog_cnt; caller++) {
+		if (!env->subprog_info[caller].scalar_callx)
+			continue;
+		cnt = 0;
+		for (callee = 1; callee < env->subprog_cnt; callee++) {
+			if (!is_scalar_callx_callee(env, callee))
+				continue;
+			err = record_callx_edge(env, caller, callee);
+			if (err)
+				return err;
+			cnt++;
+		}
+		if (!cnt) {
+			verbose(env, "callx of a number in %s(), but only callbacks have their address taken\n",
+				bpf_subprog_name(env, caller));
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /* Lazily verify all global functions based on their BTF, if they are called
  * from main BPF program or any of subprograms transitively.
  * BPF global subprogs called from dead code are not validated.
@@ -21947,6 +22437,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 	struct bpf_prog_aux *aux = env->prog->aux;
 	struct bpf_func_info_aux *sub_aux;
 	int context, i, ret, new_cnt;
+	bool callees = false;
 
 	if (!aux->func_info)
 		return 0;
@@ -21960,10 +22451,24 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 		sub_aux->called[env->prog->sleepable] = true;
 	}
 
+	/*
+	 * [WIP] A function that only data refers to, or whose address ld_imm64
+	 * takes where callx of a number is allowed, is verified in the context
+	 * of the program, and in the contexts of callx of a number if any.
+	 * Another program may call it through its address in arena when this
+	 * one has no callx. A callback among them is skipped by
+	 * is_scalar_callx_callee(), once the main pass has found it.
+	 */
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (env->subprog_info[i].addr_in_data ||
+		    (env->scalar_callx && env->subprog_info[i].addr_taken &&
+		     !bpf_subprog_is_global(env, i)))
+			subprog_aux(env, i)->called[env->prog->sleepable] = true;
+
 again:
 	new_cnt = 0;
 	for (i = 1; i < env->subprog_cnt; i++) {
-		if (!bpf_subprog_is_global(env, i))
+		if (callees ? !is_scalar_callx_callee(env, i) : !bpf_subprog_is_global(env, i))
 			continue;
 
 		sub_aux = subprog_aux(env, i);
@@ -21977,9 +22482,9 @@ again:
 			if (ret)
 				return ret;
 			if (env->log.level & BPF_LOG_LEVEL)
-				verbose(env, "Func#%d ('%s') is safe for any args "
-					"that match its prototype\n",
-					i, bpf_subprog_name(env, i));
+				verbose(env, "Func#%d ('%s') is safe for any %s\n",
+					i, bpf_subprog_name(env, i),
+					callees ? "scalar args" : "args that match its prototype");
 
 			sub_aux->verified[context] = true;
 			new_cnt++;
@@ -21990,10 +22495,21 @@ again:
 	 * We can't loop forever as each pass verifies at least one new context,
 	 * and there are only three contexts per global subprog.
 	 */
-	if (new_cnt)
+	if (new_cnt) {
+		callees = false;
 		goto again;
+	}
 
-	return 0;
+	/*
+	 * [WIP] Then the callees of callx of a number, once all global
+	 * functions are verified and it's known which functions are callbacks.
+	 */
+	if (!callees) {
+		callees = true;
+		goto again;
+	}
+
+	return add_scalar_callx_edges(env);
 }
 
 static int do_check_main(struct bpf_verifier_env *env)
@@ -22559,6 +23075,18 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
 			return -EINVAL;
 		}
+		/*
+		 * bpf_throw unwinds to the frame of the main program, over the
+		 * trampoline that called the subprog for fexit, which then never
+		 * returns. The walk of the stack doesn't get past the trampoline
+		 * either, see bpf_stack_walker(). An fentry trampoline has
+		 * returned by the time the subprog runs.
+		 */
+		if (aux->func && subprog && aux->func[subprog]->aux->might_throw &&
+		    !prog_extension && prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			bpf_log(log, "Only fentry can attach to %s, which might throw\n", tname);
+			return -EINVAL;
+		}
 		conservative = aux->func_info_aux[subprog].unreliable;
 		if (prog_extension) {
 			if (aux->func_info_aux[subprog].linkage != BTF_FUNC_GLOBAL ||
@@ -22610,6 +23138,15 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			if (prog->aux->can_unwind && !tgt_can_unwind) {
 				bpf_log(log,
 					"Extension program can unwind, while original does not\n");
+				return -EINVAL;
+			}
+			/*
+			 * An extension returns, even through bpf_throw: its own
+			 * exception callback returns to the caller.
+			 */
+			if (aux->func_info_aux[subprog].called_as_noreturn) {
+				bpf_log(log,
+					"Extension cannot replace a function whose callers expect it not to return\n");
 				return -EINVAL;
 			}
 		}
@@ -23883,6 +24420,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
+	/* [WIP] nothing checks what callx of a number calls, see check_scalar_callx() */
+	env->scalar_callx = env->arena_scalar && env->bpf_capable && env->allow_ptr_leaks;
+	/* [WIP] bpf_prog_load() checks the privilege, see check_resource_leak() */
+	env->throw_no_release = attr->prog_flags & BPF_F_THROW_NO_RELEASE;
 
 	env->explored_states = kvzalloc_objs(struct list_head,
 					     state_htab_size(env),
@@ -23931,6 +24472,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	mark_subprogs_addr_in_data(env);
+
 	/* Build kfunc prototypes after resolving program resources. */
 	ret = add_kfuncs(env);
 	if (ret < 0)
@@ -23971,6 +24514,15 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		goto skip_full_check;
 
 	ret = sort_subprogs_topo(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	/* must follow sort_subprogs_topo() */
+	ret = bpf_compute_might_return(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = check_final_calls(env);
 	if (ret < 0)
 		goto skip_full_check;
 
@@ -24020,6 +24572,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	/* reject recursion through the callx edges found by the main pass */
 	if (ret == 0 && env->callx_edges)
 		ret = sort_subprogs_topo(env);
+	if (ret == 0 && env->callx_edges)
+		merge_callx_callee_effects(env);
 
 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
 		ret = bpf_prog_offload_finalize(env);

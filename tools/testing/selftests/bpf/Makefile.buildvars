@@ -86,6 +86,9 @@ ifneq ($(LLVM),)
 CLANG_WARN_CFLAGS := -Wno-unused-command-line-argument
 endif
 
+# The archiver of BPF objects, whichever compiler built them
+LLVM_AR ?= $(LLVM_PREFIX)llvm-ar$(LLVM_SUFFIX)
+
 # Check whether clang supports BPF address sanitizer (requires LLVM 22+).
 # This runs after ../lib.mk has resolved CLANG from LLVM=<suffix or path>,
 # so it probes the compiler that builds the BPF objects.
