@@ -4276,19 +4276,63 @@ static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, i
 	bpf_diag_memory(env, env->insn_idx, problem, reason, suggestion);
 }
 
+BTF_ID_LIST(dynptr_data_btf_ids)
+BTF_ID(struct, sk_buff)
+BTF_ID(struct, xdp_buff)
+
+/*
+ * The data pointer of a dynptr over a packet is the sk_buff or xdp_buff it
+ * was built from. That object is trusted for as long as the program runs,
+ * and the dynptr can only have been built from it or cloned from such a
+ * dynptr, so the loaded pointer is trusted too. It is NULL when the
+ * constructor failed. The data pointer of any other dynptr is a scalar.
+ */
+static void mark_reg_dynptr_data(struct bpf_verifier_env *env, struct bpf_reg_state *regs,
+				 int regno, enum bpf_dynptr_type type)
+{
+	u32 btf_id;
+
+	switch (type) {
+	case BPF_DYNPTR_TYPE_SKB:
+	case BPF_DYNPTR_TYPE_SKB_META:
+		btf_id = dynptr_data_btf_ids[0];
+		break;
+	case BPF_DYNPTR_TYPE_XDP:
+		btf_id = dynptr_data_btf_ids[1];
+		break;
+	default:
+		btf_id = 0;
+		break;
+	}
+	mark_reg_unknown(env, regs, regno);
+	if (!btf_id || IS_ERR_OR_NULL(btf_vmlinux))
+		return;
+	mark_reg_known_zero(env, regs, regno);
+	regs[regno].type = PTR_TO_BTF_ID | PTR_TRUSTED | PTR_MAYBE_NULL;
+	regs[regno].btf = btf_vmlinux;
+	regs[regno].btf_id = btf_id;
+	regs[regno].id = ++env->id_gen;
+}
+
 /*
  * A load from the stack slots of an initialized dynptr. They hold a struct
  * bpf_dynptr_kern: the data pointer in the first slot, then the size word,
  * which carries the type and the read-only bit above the size, then the
- * offset of the view into the data. The program sees scalars; a program that
- * reads them is implementing dynptr operations itself and knows the layout.
+ * offset of the view into the data. A whole load of the data pointer gives
+ * what mark_reg_dynptr_data() says, everything else is a scalar; a program
+ * that reads them is implementing dynptr operations itself and knows the
+ * layout.
  */
 static void mark_reg_dynptr_read(struct bpf_verifier_env *env, struct bpf_func_state *ptr_state,
 				 int off, int size, int dst_regno)
 {
-	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state *regs = cur_regs(env), *slot;
 
-	mark_reg_unknown(env, regs, dst_regno);
+	slot = &bpf_stack_slot(ptr_state, (-off - 1) / BPF_REG_SIZE)->spilled_ptr;
+	if (size == BPF_REG_SIZE && slot->dynptr.first_slot)
+		mark_reg_dynptr_data(env, regs, dst_regno, slot->dynptr.type);
+	else
+		mark_reg_unknown(env, regs, dst_regno);
 }
 
 /*
@@ -4324,6 +4368,10 @@ static int check_dynptr_ptr_access(struct bpf_verifier_env *env, struct bpf_reg_
 			off, size);
 		return -EACCES;
 	}
+	/*
+	 * The dynptr type of a global subprogram's argument stands for any
+	 * type the callers hand in, so the data pointer is a scalar here.
+	 */
 	if (value_regno >= 0)
 		mark_reg_unknown(env, regs, value_regno);
 	return 0;
