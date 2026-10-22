@@ -884,14 +884,15 @@ static __always_inline u32 bpf_prog_run(const struct bpf_prog *prog, const void 
  * invocation of a BPF program does not require reentrancy protection
  * against a BPF program which is invoked from a preempting task.
  *
- * A syscall program may call bpf_task_park(), which lifts the pin for the
- * duration of its sleep and restores it before returning to the program,
- * so such a program may resume on another CPU. Nothing on this path keeps
- * per-CPU state across the program. __bpf_prog_run() picks the stats of
- * the CPU the program returns on, and takes the run time as the difference
- * of two sched_clock() readings around the program: the time includes the
- * sleep, and after a migration it compares the clocks of two CPUs, which
- * need not agree where sched_clock() is unstable.
+ * A syscall program may call bpf_task_park(), or a BPF kthread kfunc that
+ * waits for another task, which lift the pin for the duration of the sleep
+ * or wait and restore it before returning to the program, so such a program
+ * may resume on another CPU. Nothing on this path keeps per-CPU state
+ * across the program. __bpf_prog_run() picks the stats of the CPU the
+ * program returns on, and takes the run time as the difference of two
+ * sched_clock() readings around the program: the time includes the sleep,
+ * and after a migration it compares the clocks of two CPUs, which need not
+ * agree where sched_clock() is unstable.
  */
 static inline u32 bpf_prog_run_pin_on_cpu(const struct bpf_prog *prog,
 					  const void *ctx)
