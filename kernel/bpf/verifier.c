@@ -4276,6 +4276,59 @@ static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, i
 	bpf_diag_memory(env, env->insn_idx, problem, reason, suggestion);
 }
 
+/*
+ * A load from the stack slots of an initialized dynptr. They hold a struct
+ * bpf_dynptr_kern: the data pointer in the first slot, then the size word,
+ * which carries the type and the read-only bit above the size, then the
+ * offset of the view into the data. The program sees scalars; a program that
+ * reads them is implementing dynptr operations itself and knows the layout.
+ */
+static void mark_reg_dynptr_read(struct bpf_verifier_env *env, struct bpf_func_state *ptr_state,
+				 int off, int size, int dst_regno)
+{
+	struct bpf_reg_state *regs = cur_regs(env);
+
+	mark_reg_unknown(env, regs, dst_regno);
+}
+
+/*
+ * A load through a const dynptr pointer, the view a global subprogram gets of
+ * its caller's dynptr: the 16 bytes of struct bpf_dynptr_kern, at a fixed
+ * offset and naturally aligned, read-only. The value is what a load from the
+ * dynptr's own stack slots would give, see mark_reg_dynptr_read().
+ */
+static int check_dynptr_ptr_access(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+				   argno_t argno, int off, int size, enum bpf_access_type t,
+				   int value_regno)
+{
+	struct bpf_reg_state *regs = cur_regs(env);
+
+	if (t == BPF_WRITE) {
+		verbose(env, "%s cannot write into %s\n", reg_arg_name(env, argno),
+			reg_type_str(env, reg->type));
+		return -EACCES;
+	}
+	if (!env->allow_ptr_leaks) {
+		verbose(env, "%s access is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
+			reg_type_str(env, reg->type));
+		return -EPERM;
+	}
+	if (!tnum_is_const(reg->var_off)) {
+		verbose(env, "variable offset %s access prohibited\n",
+			reg_type_str(env, reg->type));
+		return -EACCES;
+	}
+	off += reg->var_off.value;
+	if (off < 0 || off % size || off + size > BPF_DYNPTR_SIZE) {
+		verbose(env, "invalid %s access off=%d size=%d\n", reg_type_str(env, reg->type),
+			off, size);
+		return -EACCES;
+	}
+	if (value_regno >= 0)
+		mark_reg_unknown(env, regs, value_regno);
+	return 0;
+}
+
 /* Read the stack at 'off' and put the results into the register indicated by
  * 'dst_regno'. It handles reg filling if the addressed stack slot is a
  * spilled reg.
@@ -4410,6 +4463,8 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 			return -EACCES;
 		}
 	} else {
+		bool dynptr = false;
+
 		for (i = 0; i < size; i++) {
 			type = stype[(slot - i) % BPF_REG_SIZE];
 			if (type == STACK_MISC)
@@ -4418,6 +4473,16 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				continue;
 			if (type == STACK_INVALID && env->allow_uninit_stack)
 				continue;
+			/*
+			 * A load may read the state of an initialized dynptr,
+			 * see mark_reg_dynptr_read(). Helpers may not consume
+			 * it as memory, and the bytes hold a kernel pointer.
+			 */
+			if (type == STACK_DYNPTR && dst_regno >= 0 &&
+			    env->allow_ptr_leaks) {
+				dynptr = true;
+				continue;
+			}
 			if (type == STACK_POISON) {
 				verbose(env, "reading from stack off %d+%d size %d, slot poisoned by dead code elimination\n",
 					off, i, size);
@@ -4428,7 +4493,9 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 			}
 			return -EACCES;
 		}
-		if (dst_regno >= 0) {
+		if (dynptr) {
+			mark_reg_dynptr_read(env, reg_state, off, size, dst_regno);
+		} else if (dst_regno >= 0) {
 			err = mark_reg_stack_read(env, reg_state, off, off + size, dst_regno);
 			if (err)
 				return err;
@@ -7458,6 +7525,8 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 	} else if (reg->type == PTR_TO_ARENA) {
 		if (t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
+	} else if (reg->type == CONST_PTR_TO_DYNPTR) {
+		err = check_dynptr_ptr_access(env, reg, argno, off, size, t, value_regno);
 	} else {
 		enum bpf_diag_invalid_deref_kind kind = BPF_DIAG_DEREF_INVALID_PTR;
 
