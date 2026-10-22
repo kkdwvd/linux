@@ -1444,6 +1444,16 @@ enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,
 };
 
+/* BPF_ALU64 | BPF_MOV | BPF_X with off == BPF_TYPE_CAST: dst = (T *)src, where
+ * T is the kernel type whose BTF ID is imm, or, when imm is 0, the constant
+ * held in dst before the move; the ID 0 is void. The value is copied as is;
+ * the verifier treats the result as a pointer it cannot trust, so loads
+ * through it cannot fault the kernel.
+ */
+enum bpf_type_cast {
+	BPF_TYPE_CAST = 2,
+};
+
 /* flags for BPF_MAP_UPDATE_ELEM command */
 enum {
 	BPF_ANY		= 0, /* create new element or update existing */

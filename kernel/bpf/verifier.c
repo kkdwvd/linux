@@ -17842,6 +17842,61 @@ int bpf_reg_union(struct bpf_verifier_env *env, struct bpf_reg_state *acc,
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
+/*
+ * dst = (T *)src for a BPF_TYPE_CAST mov, with T the kernel type whose BTF ID
+ * is imm, or, when imm is 0, the constant in dst before the move, which lets
+ * a program pass a CO-RE relocated type ID; the ID 0 is void. Any value
+ * converts, so the result is an untrusted pointer, as bpf_rdonly_cast()
+ * returns: loads through it are probe loads that cannot fault the kernel,
+ * loads of a struct's pointer members give untrusted pointers in turn, and a
+ * void pointer carries no bounds, so any offset may be added and read. The
+ * value itself is copied as is.
+ */
+static int check_type_cast(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	struct bpf_reg_state *regs = cur_regs(env), *dst_reg = regs + insn->dst_reg;
+	u32 btf_id = insn->imm;
+	const struct btf_type *t;
+
+	if (IS_ERR_OR_NULL(btf_vmlinux)) {
+		verbose(env, "type_cast insn requires kernel BTF\n");
+		return -EINVAL;
+	}
+	if (!btf_id) {
+		if (dst_reg->type != SCALAR_VALUE || !tnum_is_const(dst_reg->var_off)) {
+			verbose(env, "type_cast insn needs a constant BTF type ID in R%d\n",
+				insn->dst_reg);
+			return -EINVAL;
+		}
+		btf_id = dst_reg->var_off.value;
+		if (btf_id != dst_reg->var_off.value) {
+			verbose(env, "type_cast insn BTF type ID in R%d is out of range\n",
+				insn->dst_reg);
+			return -EINVAL;
+		}
+	}
+	t = btf_type_by_id(btf_vmlinux, btf_id);
+	if (!t) {
+		verbose(env, "type_cast insn to unknown BTF type ID %u\n", btf_id);
+		return -EINVAL;
+	}
+	mark_reg_unknown(env, regs, insn->dst_reg);
+	mark_reg_known_zero(env, regs, insn->dst_reg);
+	if (btf_type_is_struct(t)) {
+		dst_reg->type = PTR_TO_BTF_ID | PTR_UNTRUSTED;
+		dst_reg->btf = btf_vmlinux;
+		dst_reg->btf_id = btf_id;
+	} else if (btf_type_is_void(t)) {
+		dst_reg->type = PTR_TO_MEM | MEM_RDONLY | PTR_UNTRUSTED;
+		dst_reg->mem_size = 0;
+	} else {
+		verbose(env, "type_cast insn BTF type ID %u is not a struct or void\n",
+			btf_id);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
@@ -17876,6 +17931,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 
 	} else if (opcode == BPF_MOV) {
 
+		/* check_alu_fields() left the type cast off to the register form */
+		if (insn->off == BPF_TYPE_CAST && !env->allow_ptr_leaks) {
+			verbose(env, "type_cast insn requires CAP_PERFMON or CAP_SYS_ADMIN\n");
+			return -EPERM;
+		}
 		if (BPF_SRC(insn->code) == BPF_X) {
 			if (insn->off == BPF_ADDR_SPACE_CAST) {
 				if (!env->prog->aux->arena) {
@@ -17900,7 +17960,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			struct bpf_reg_state *dst_reg = regs + insn->dst_reg;
 
 			if (BPF_CLASS(insn->code) == BPF_ALU64) {
-				if (insn->imm) {
+				if (insn->off == BPF_TYPE_CAST) {
+					err = check_type_cast(env, insn);
+					if (err)
+						return err;
+				} else if (insn->imm) {
 					/* off == BPF_ADDR_SPACE_CAST */
 					mark_reg_unknown(env, regs, insn->dst_reg);
 					if (insn->imm == 1) /* cast from as(1) to as(0) */
@@ -21297,6 +21361,8 @@ static int check_alu_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					verbose(env, "addr_space_cast insn can only convert between address space 1 and 0\n");
 					return -EINVAL;
 				}
+			} else if (insn->off == BPF_TYPE_CAST) {
+				/* imm is a BTF type ID, checked by check_type_cast() */
 			} else if ((insn->off != 0 && insn->off != 8 &&
 				    insn->off != 16 && insn->off != 32) || insn->imm) {
 				verbose(env, "BPF_MOV uses reserved fields\n");

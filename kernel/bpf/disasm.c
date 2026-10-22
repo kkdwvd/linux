@@ -175,6 +175,13 @@ static bool is_addr_space_cast(const struct bpf_insn *insn)
 		insn->off == BPF_ADDR_SPACE_CAST;
 }
 
+/* Local because this file is built for user space too, without linux/bpf.h. */
+static bool is_type_cast(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
+		insn->off == BPF_TYPE_CAST;
+}
+
 /* Special (internal-only) form of mov, used to resolve per-CPU addrs:
  * dst_reg = src_reg + <percpu_base_off>
  * BPF_ADDR_PERCPU is used as a special insn->off value.
@@ -208,6 +215,9 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 			verbose(cbs->private_data, "(%02x) r%d = addr_space_cast(r%d, %u, %u)",
 				insn->code, insn->dst_reg,
 				insn->src_reg, ((u32)insn->imm) >> 16, (u16)insn->imm);
+		} else if (is_type_cast(insn)) {
+			verbose(cbs->private_data, "(%02x) r%d = type_cast(r%d, %u)",
+				insn->code, insn->dst_reg, insn->src_reg, (u32)insn->imm);
 		} else if (is_mov_percpu_addr(insn)) {
 			verbose(cbs->private_data, "(%02x) r%d = &(void __percpu *)(r%d)",
 				insn->code, insn->dst_reg, insn->src_reg);

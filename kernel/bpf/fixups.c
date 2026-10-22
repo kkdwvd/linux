@@ -1876,6 +1876,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			goto next_insn;
 		}
 
+		if (bpf_is_type_cast(insn)) {
+			/* The cast changed only the verifier's view of the value. */
+			insn->off = 0;
+			insn->imm = 0;
+		}
+
 		if (env->insn_aux_data[i + delta].needs_zext)
 			/* Convert BPF_CLASS(insn->code) == BPF_ALU64 to 32-bit ALU */
 			insn->code = BPF_ALU | BPF_OP(insn->code) | BPF_SRC(insn->code);
