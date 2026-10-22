@@ -131,6 +131,52 @@ int wake_waiter(void *ctx)
 	return ret;
 }
 
+/* Set by the test: the thread whose events wake the waiter. */
+__u32 waker_tid;
+/* What the last wake from a tracing program returned. */
+int tracing_wake_ret = -1;
+
+/*
+ * The same wake from a tracing program, on an event of the thread the test
+ * names. The task kptr read under bpf_rcu_read_lock() is what bpf_task_wake()
+ * accepts, so the event takes no reference.
+ */
+static __always_inline void wake_waiter_on_event(struct task_struct *task)
+{
+	struct park_elem *elem = lookup_elem();
+	struct task_struct *waiter;
+
+	if (!elem || task->pid != waker_tid)
+		return;
+	bpf_rcu_read_lock();
+	waiter = elem->task;
+	if (waiter) {
+		WRITE_ONCE(elem->state, WOKEN);
+		tracing_wake_ret = bpf_task_wake(waiter, 0);
+	}
+	bpf_rcu_read_unlock();
+}
+
+/* The wake from process context: task_rename fires from prctl(). */
+SEC("tp_btf/task_rename")
+int BPF_PROG(wake_on_rename, struct task_struct *task, const char *comm)
+{
+	wake_waiter_on_event(task);
+	return 0;
+}
+
+/*
+ * The wake from under the scheduler's locks: sched_waking fires inside
+ * try_to_wake_up() with the woken task's pi_lock held and IRQs disabled,
+ * where the wake cannot be issued, so it is queued for irq_work and reports 0.
+ */
+SEC("tp_btf/sched_waking")
+int BPF_PROG(wake_on_waking, struct task_struct *p)
+{
+	wake_waiter_on_event(p);
+	return 0;
+}
+
 /* Nothing wakes this task: the park sleeps 1 ms and times out. */
 SEC("syscall")
 int park_timeout(void *ctx)
