@@ -147,13 +147,20 @@ out:
  * A task that is not parked keeps the pending wake until its next
  * bpf_task_park(), which then returns at once.
  *
+ * The wake takes the task's pi_lock and a runqueue lock, which the kernel
+ * code a tracing program interrupts may already hold, and it may not be
+ * issued in NMI context at all. Both run with IRQs disabled, so a call with
+ * IRQs disabled is refused before anything is marked pending.
+ *
  * Return: 1 when @task was asleep and is now runnable, 0 when it was not,
- * -EINVAL when @flags is not 0.
+ * -EINVAL when @flags is not 0, -EOPNOTSUPP when called with IRQs disabled.
  */
 __bpf_kfunc int bpf_task_wake(struct task_struct *task, u64 flags)
 {
 	if (flags)
 		return -EINVAL;
+	if (irqs_disabled())
+		return -EOPNOTSUPP;
 
 	/*
 	 * The release orders the program's stores before this call, its
@@ -169,16 +176,35 @@ __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(bpf_task_park_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_task_park, KF_SLEEPABLE)
-BTF_ID_FLAGS(func, bpf_task_wake, KF_RCU)
 BTF_KFUNCS_END(bpf_task_park_kfunc_ids)
+
+BTF_KFUNCS_START(bpf_task_wake_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_task_wake, KF_RCU)
+BTF_KFUNCS_END(bpf_task_wake_kfunc_ids)
 
 static const struct btf_kfunc_id_set bpf_task_park_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set = &bpf_task_park_kfunc_ids,
 };
 
+static const struct btf_kfunc_id_set bpf_task_wake_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_task_wake_kfunc_ids,
+};
+
+/*
+ * The park stays with syscall programs, whose runner holds the program across
+ * the sleep. The wake touches only the task, so tracing and kprobe programs
+ * have it too, to wake a parked task from the kernel event that makes it
+ * worth waking.
+ */
 static int __init bpf_task_park_kfunc_init(void)
 {
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_task_park_kfunc_set);
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_task_park_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_task_wake_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_task_wake_kfunc_set);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_KPROBE, &bpf_task_wake_kfunc_set);
 }
 late_initcall(bpf_task_park_kfunc_init);

@@ -459,11 +459,23 @@ int park_from_non_syscall(void *ctx)
 	return bpf_task_park(0, 0);
 }
 
-SEC("tp/syscalls/sys_enter_nanosleep")
+/* The wake is registered for tracing and kprobe programs besides; other types lack it. */
+SEC("xdp")
 __failure __msg("calling kernel function bpf_task_wake is not allowed")
-int wake_from_non_syscall(void *ctx)
+int wake_from_xdp(void *ctx)
 {
-	return bpf_task_wake(bpf_get_current_task_btf(), 0);
+	struct park_elem *elem = lookup_elem();
+	struct task_struct *task;
+	int ret = 0;
+
+	if (!elem)
+		return 0;
+	bpf_rcu_read_lock();
+	task = elem->task;
+	if (task)
+		ret = bpf_task_wake(task, 0);
+	bpf_rcu_read_unlock();
+	return ret;
 }
 
 /* bpf_task_wake() takes a referenced, trusted or RCU-protected task that is not NULL. */
