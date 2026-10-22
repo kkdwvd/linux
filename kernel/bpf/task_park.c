@@ -301,6 +301,13 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *au
  * for irq_work on the calling CPU, which issues it once IRQs are enabled
  * again. Such a call cannot tell whether the task was asleep and returns 2.
  *
+ * The irq_work issues the wake through try_to_wake_up(), with IRQs disabled.
+ * A program attached to code on that path, such as an fentry program on
+ * try_to_wake_up(), runs again from there. If it calls bpf_task_wake() every
+ * time it runs, each deferred wake queues the next and the CPU serves little
+ * else. Such a program has to tell the wakes it caused from the ones it
+ * reacts to.
+ *
  * Return: 1 when @task was asleep and is now runnable, 0 when it was not, 2
  * when the wake was deferred, -EINVAL when @flags is not 0.
  */
@@ -331,13 +338,31 @@ BTF_KFUNCS_START(bpf_task_park_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_task_park, KF_SLEEPABLE | KF_IMPLICIT_ARGS)
 BTF_KFUNCS_END(bpf_task_park_kfunc_ids)
 
+BTF_KFUNCS_START(bpf_task_wake_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_task_wake, KF_RCU)
+BTF_KFUNCS_END(bpf_task_wake_kfunc_ids)
+
 static const struct btf_kfunc_id_set bpf_task_park_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set = &bpf_task_park_kfunc_ids,
 };
 
+static const struct btf_kfunc_id_set bpf_task_wake_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_task_wake_kfunc_ids,
+};
+
+/*
+ * The park stays with syscall programs, whose runner holds the program across
+ * the sleep. The wake touches only the task and defers itself where it cannot
+ * be issued, so every program type has it, to wake a parked task from the
+ * kernel event that makes it worth waking.
+ */
 static int __init bpf_task_park_kfunc_init(void)
 {
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_task_park_kfunc_set);
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_task_park_kfunc_set);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_task_wake_kfunc_set);
 }
 late_initcall(bpf_task_park_kfunc_init);
