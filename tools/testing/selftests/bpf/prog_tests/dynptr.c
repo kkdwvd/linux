@@ -45,6 +45,11 @@ static struct {
 	{"test_dynptr_skb_no_buff", SETUP_SKB_PROG},
 	{"test_dynptr_skb_strcmp", SETUP_SKB_PROG},
 	{"test_dynptr_skb_tp_btf", SETUP_SKB_PROG_TP},
+	{"test_dynptr_skb_inline", SETUP_SKB_PROG},
+	{"test_dynptr_skb_inline_nonlinear", SETUP_SKB_PROG_NONLINEAR},
+	{"test_dynptr_local_inline", SETUP_SYSCALL_SLEEP},
+	{"test_dynptr_xdp_inline", SETUP_XDP_PROG},
+	{"test_dynptr_skb_meta_inline", SETUP_SKB_PROG},
 	{"test_probe_read_user_dynptr", SETUP_XDP_PROG},
 	{"test_probe_read_kernel_dynptr", SETUP_XDP_PROG},
 	{"test_probe_read_user_str_dynptr", SETUP_XDP_PROG},
@@ -191,6 +196,71 @@ cleanup:
 	dynptr_success__destroy(skel);
 }
 
+/*
+ * The read-only operations in bpf_dynptr.h compile to loads: the only call
+ * left in the program is the kfunc building the dynptr, and the type casts
+ * became plain register moves.
+ */
+static void verify_inline_pure(void)
+{
+	__u32 cnt, i, kfunc_calls = 0, other_calls = 0, casts = 0;
+	struct bpf_insn *insns = NULL;
+	struct dynptr_success *skel;
+	struct bpf_program *prog;
+	int err, prog_fd;
+	char buf[64];
+	LIBBPF_OPTS(bpf_test_run_opts, topts,
+		    .data_in = &pkt_v4,
+		    .data_size_in = sizeof(pkt_v4),
+		    .data_out = buf,
+		    .data_size_out = sizeof(buf),
+		    .repeat = 1,
+	);
+
+	skel = dynptr_success__open();
+	if (!ASSERT_OK_PTR(skel, "dynptr_success__open"))
+		return;
+
+	prog = bpf_object__find_program_by_name(skel->obj, "test_dynptr_skb_inline_pure");
+	if (!ASSERT_OK_PTR(prog, "bpf_object__find_program_by_name"))
+		goto cleanup;
+	bpf_program__set_autoload(prog, true);
+
+	err = dynptr_success__load(skel);
+	if (!ASSERT_OK(err, "dynptr_success__load"))
+		goto cleanup;
+
+	prog_fd = bpf_program__fd(prog);
+	err = bpf_prog_test_run_opts(prog_fd, &topts);
+	if (!ASSERT_OK(err, "test_run"))
+		goto cleanup;
+	ASSERT_EQ(skel->bss->err, 0, "err");
+
+	err = get_xlated_program(prog_fd, &insns, &cnt);
+	if (!ASSERT_OK(err, "get_xlated_program"))
+		goto cleanup;
+	for (i = 0; i < cnt; i++) {
+		struct bpf_insn *insn = &insns[i];
+
+		if (insn->code == (BPF_JMP | BPF_CALL)) {
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+				kfunc_calls++;
+			else
+				other_calls++;
+		}
+		if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) && insn->off == BPF_TYPE_CAST)
+			casts++;
+		if (insn->code == (BPF_LD | BPF_IMM | BPF_DW))
+			i++;
+	}
+	ASSERT_EQ(kfunc_calls, 1, "one kfunc call, bpf_dynptr_from_skb");
+	ASSERT_EQ(other_calls, 0, "no helper or subprog call");
+	ASSERT_EQ(casts, 0, "no type cast left");
+	free(insns);
+cleanup:
+	dynptr_success__destroy(skel);
+}
+
 void test_dynptr(void)
 {
 	int i;
@@ -201,6 +271,9 @@ void test_dynptr(void)
 
 		verify_success(success_tests[i].prog_name, success_tests[i].type);
 	}
+
+	if (test__start_subtest("test_dynptr_skb_inline_pure"))
+		verify_inline_pure();
 
 	RUN_TESTS(dynptr_fail);
 }

@@ -7,6 +7,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "bpf_misc.h"
+#include <bpf/bpf_endian.h>
+#include "bpf_dynptr.h"
 #include "errno.h"
 
 #define PAGE_SIZE_64K 65536
@@ -1154,4 +1156,314 @@ int test_copy_from_user_task_str_dynptr(void *ctx)
 {
 	test_dynptr_probe_str(user_ptr, bpf_copy_data_from_user_task_str);
 	return 0;
+}
+
+/*
+ * The read-only dynptr operations implemented in BPF, see bpf_dynptr.h,
+ * against the kfuncs and helpers they follow.
+ */
+
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
+
+/* A global subprogram sees the caller's dynptr through a const pointer */
+__noinline __u64 dynptr_size_global(struct bpf_dynptr *p)
+{
+	return bpf_dynptr_size_inline(p);
+}
+
+static __always_inline int check_pkt_v4_headers(const struct ethhdr *eth, const struct iphdr *iph,
+						const struct tcphdr *tcp)
+{
+	if (!eth || !iph || !tcp)
+		return 1;
+	if (eth->h_proto != bpf_htons(ETH_P_IP))
+		return 2;
+	if (iph->protocol != IPPROTO_TCP)
+		return 3;
+	if (tcp->urg_ptr != 123 || tcp->doff != 5)
+		return 4;
+	return 0;
+}
+
+SEC("?tc")
+int test_dynptr_skb_inline(struct __sk_buff *skb)
+{
+	char buf[sizeof(struct iphdr)], buf_k[sizeof(struct iphdr)];
+	const struct ethhdr *eth, *eth_k;
+	const struct iphdr *iph, *iph_k;
+	const struct tcphdr *tcp, *tcp_k;
+	struct bpf_dynptr ptr, bad;
+	struct sk_buff *s;
+	__u64 size;
+	int i;
+
+	err = 1;
+	if (bpf_dynptr_from_skb(skb, 0, &ptr))
+		return 1;
+
+	/* The queries answer what the kfuncs answer */
+	err = 2;
+	if (bpf_dynptr_is_null_inline(&ptr) != bpf_dynptr_is_null(&ptr) ||
+	    bpf_dynptr_is_rdonly_inline(&ptr) != bpf_dynptr_is_rdonly(&ptr))
+		return 1;
+	size = bpf_dynptr_size_inline(&ptr);
+	err = 3;
+	if (size != bpf_dynptr_size(&ptr) || size != skb->len)
+		return 1;
+	err = 4;
+	if (dynptr_size_global(&ptr) != size)
+		return 1;
+
+	/* The slices of the headers are the bytes the kfunc returns */
+	eth = bpf_dynptr_slice_inline(&ptr, 0, sizeof(*eth));
+	iph = bpf_dynptr_slice_inline(&ptr, sizeof(*eth), sizeof(*iph));
+	tcp = bpf_dynptr_slice_inline(&ptr, sizeof(*eth) + sizeof(*iph), sizeof(*tcp));
+	eth_k = bpf_dynptr_slice(&ptr, 0, NULL, sizeof(*eth));
+	iph_k = bpf_dynptr_slice(&ptr, sizeof(*eth), NULL, sizeof(*iph));
+	tcp_k = bpf_dynptr_slice(&ptr, sizeof(*eth) + sizeof(*iph), NULL, sizeof(*tcp));
+	err = 5;
+	if (!eth_k || !iph_k || !tcp_k)
+		return 1;
+	err = 6;
+	if (eth != eth_k || iph != iph_k || tcp != tcp_k)
+		return 1;
+	err = 7;
+	if (check_pkt_v4_headers(eth, iph, tcp))
+		return 1;
+
+	/* The slice over a dynptr known to be over an skb reads the skb directly */
+	err = 8;
+	if (bpf_dynptr_skb_slice_inline(&ptr, sizeof(*eth), sizeof(*iph)) != iph)
+		return 1;
+
+	/* A range past the end is NULL for both */
+	err = 9;
+	if (bpf_dynptr_slice_inline(&ptr, size - 1, 2) || bpf_dynptr_slice(&ptr, size - 1, NULL, 2))
+		return 1;
+
+	/* The data pointer is the skb itself */
+	err = 10;
+	s = __bpf_dynptr_kern(&ptr)->data;
+	if (!s || s->len != skb->len)
+		return 1;
+
+	/* The view the kfunc adjusts is the view the operations see */
+	err = 11;
+	if (bpf_dynptr_adjust(&ptr, sizeof(*eth), size))
+		return 1;
+	err = 12;
+	if (bpf_dynptr_size_inline(&ptr) != size - sizeof(*eth) ||
+	    bpf_dynptr_slice_inline(&ptr, 0, sizeof(*iph)) != iph)
+		return 1;
+
+	/* A read copies what the helper copies */
+	err = 13;
+	if (bpf_dynptr_read_inline(buf, sizeof(buf), &ptr, 0) ||
+	    bpf_dynptr_read(buf_k, sizeof(buf_k), &ptr, 0, 0))
+		return 1;
+	err = 14;
+	for (i = 0; i < sizeof(buf); i++)
+		if (buf[i] != buf_k[i])
+			return 1;
+
+	/* A failed constructor leaves a null dynptr */
+	err = 15;
+	if (bpf_dynptr_from_skb(skb, 123, &bad) != -EINVAL)
+		return 1;
+	err = 16;
+	if (!bpf_dynptr_is_null_inline(&bad) || bpf_dynptr_is_rdonly_inline(&bad) ||
+	    bpf_dynptr_size_inline(&bad) != bpf_dynptr_size(&bad) ||
+	    bpf_dynptr_slice_inline(&bad, 0, 1))
+		return 1;
+
+	err = 0;
+	return 1;
+}
+
+SEC("?tc")
+int test_dynptr_skb_inline_nonlinear(struct __sk_buff *skb)
+{
+	struct tcphdr tcp, tcp_k;
+	struct bpf_dynptr ptr;
+
+	err = 1;
+	if (bpf_dynptr_from_skb(skb, 0, &ptr))
+		return 1;
+
+	/* The headers in the linear part slice, the TCP header in a fragment does not */
+	err = 2;
+	if (!bpf_dynptr_slice_inline(&ptr, 0, TEST_SKB_LINEAR_SIZE))
+		return 1;
+	err = 3;
+	if (bpf_dynptr_slice_inline(&ptr, TEST_SKB_LINEAR_SIZE, sizeof(tcp)) ||
+	    bpf_dynptr_slice(&ptr, TEST_SKB_LINEAR_SIZE, NULL, sizeof(tcp)))
+		return 1;
+
+	/* A read of it falls back to the helper */
+	err = 4;
+	if (bpf_dynptr_read_inline(&tcp, sizeof(tcp), &ptr, TEST_SKB_LINEAR_SIZE) ||
+	    bpf_dynptr_read(&tcp_k, sizeof(tcp_k), &ptr, TEST_SKB_LINEAR_SIZE, 0))
+		return 1;
+	err = 5;
+	if (tcp.urg_ptr != 123 || tcp.doff != 5 || tcp_k.urg_ptr != tcp.urg_ptr)
+		return 1;
+
+	err = 0;
+	return 1;
+}
+
+SEC("?tp/syscalls/sys_enter_nanosleep")
+int test_dynptr_local_inline(void *ctx)
+{
+	char data[16] = "inline dynptr!!";
+	struct bpf_dynptr ptr, mem;
+	const char *s, *s_k;
+	__u32 key = 0, *map_val;
+	int i;
+
+	if (bpf_get_current_pid_tgid() >> 32 != pid)
+		return 0;
+
+	err = 1;
+	if (bpf_ringbuf_reserve_dynptr(&ringbuf, sizeof(data), 0, &ptr))
+		goto out;
+	err = 2;
+	if (bpf_dynptr_write(&ptr, 0, data, sizeof(data), 0))
+		goto out;
+
+	/* A ringbuf dynptr is writable memory of the reserved size */
+	err = 3;
+	if (bpf_dynptr_is_null_inline(&ptr) || bpf_dynptr_is_rdonly_inline(&ptr) ||
+	    bpf_dynptr_size_inline(&ptr) != sizeof(data))
+		goto out;
+
+	/* The slice is the record itself, where bpf_dynptr_data() points */
+	s = bpf_dynptr_slice_inline(&ptr, 4, 8);
+	s_k = bpf_dynptr_data(&ptr, 4, 8);
+	err = 4;
+	if (!s_k || s != s_k)
+		goto out;
+	err = 5;
+	for (i = 0; i < 8; i++)
+		if (s[i] != data[4 + i])
+			goto out;
+
+	/* A dynptr over a map value */
+	map_val = bpf_map_lookup_elem(&array_map, &key);
+	err = 6;
+	if (!map_val)
+		goto out;
+	*map_val = 0xdeadbeef;
+	err = 7;
+	if (bpf_dynptr_from_mem(map_val, sizeof(*map_val), 0, &mem))
+		goto out;
+	err = 8;
+	if (bpf_dynptr_size_inline(&mem) != sizeof(*map_val) || bpf_dynptr_is_rdonly_inline(&mem))
+		goto out;
+	err = 9;
+	s = bpf_dynptr_slice_inline(&mem, 0, sizeof(*map_val));
+	if (!s || *(const __u32 *)s != 0xdeadbeef)
+		goto out;
+
+	err = 0;
+out:
+	bpf_ringbuf_discard_dynptr(&ptr, 0);
+	return 0;
+}
+
+SEC("?xdp")
+int test_dynptr_xdp_inline(struct xdp_md *xdp)
+{
+	__u32 linear = xdp->data_end - xdp->data;
+	struct bpf_dynptr ptr;
+	const void *s, *s_k;
+	__u64 size;
+
+	err = 1;
+	if (bpf_dynptr_from_xdp(xdp, 0, &ptr))
+		return XDP_PASS;
+
+	/* The packet has fragments */
+	size = bpf_dynptr_size_inline(&ptr);
+	err = 2;
+	if (size != bpf_dynptr_size(&ptr) || size <= linear)
+		return XDP_PASS;
+
+	/* A slice in the linear area is the kfunc's */
+	s = bpf_dynptr_slice_inline(&ptr, 0, 64);
+	s_k = bpf_dynptr_slice(&ptr, 0, NULL, 64);
+	err = 3;
+	if (!s_k || s != s_k)
+		return XDP_PASS;
+
+	/* One that crosses into the fragments is NULL for both */
+	err = 4;
+	if (bpf_dynptr_slice_inline(&ptr, linear - 32, 64) ||
+	    bpf_dynptr_slice(&ptr, linear - 32, NULL, 64))
+		return XDP_PASS;
+
+	/*
+	 * One within a fragment is NULL here, while the kfunc can return it:
+	 * the kernel can address the fragment's page, the program cannot.
+	 */
+	err = 5;
+	if (bpf_dynptr_slice_inline(&ptr, linear + 64, 64) ||
+	    !bpf_dynptr_slice(&ptr, linear + 64, NULL, 64))
+		return XDP_PASS;
+
+	err = 0;
+	return XDP_PASS;
+}
+
+SEC("?tc")
+int test_dynptr_skb_meta_inline(struct __sk_buff *skb)
+{
+	struct bpf_dynptr meta;
+	const void *s, *s_k;
+
+	err = 1;
+	if (bpf_dynptr_from_skb_meta(skb, 0, &meta))
+		return 1;
+
+	/* Without metadata the dynptr is empty, and the empty slice at its start */
+	err = 2;
+	if (bpf_dynptr_size_inline(&meta) != bpf_dynptr_size(&meta))
+		return 1;
+	s = bpf_dynptr_slice_inline(&meta, 0, 0);
+	s_k = bpf_dynptr_slice(&meta, 0, NULL, 0);
+	err = 3;
+	if (!s_k || s != s_k)
+		return 1;
+
+	err = 0;
+	return 1;
+}
+
+/*
+ * Only the read-only operations: the kfunc building the dynptr is the only
+ * call left in the program.
+ */
+SEC("?cgroup_skb/egress")
+int test_dynptr_skb_inline_pure(struct __sk_buff *skb)
+{
+	const struct iphdr *iph;
+	struct bpf_dynptr ptr;
+
+	err = 1;
+	if (bpf_dynptr_from_skb(skb, 0, &ptr))
+		return 1;
+	/* the dynptr of a cgroup_skb program is read-only */
+	err = 2;
+	if (bpf_dynptr_is_null_inline(&ptr) || !bpf_dynptr_is_rdonly_inline(&ptr) ||
+	    bpf_dynptr_size_inline(&ptr) != skb->len)
+		return 1;
+	/* and starts at the network header */
+	iph = bpf_dynptr_slice_inline(&ptr, 0, sizeof(*iph));
+	err = 3;
+	if (!iph || iph->protocol != IPPROTO_TCP)
+		return 1;
+	err = 0;
+	return 1;
 }

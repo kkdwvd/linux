@@ -9,6 +9,14 @@
 
 #define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
 
+/*
+ * Convert any value into a pointer to a kernel struct the program reads
+ * through probe loads, as bpf_core_cast() does, with the type cast
+ * instruction in place of the kfunc call: see bpf_type_cast_id().
+ */
+#define bpf_type_cast(ptr, type)						\
+	((typeof(type) *)bpf_type_cast_id(ptr, bpf_core_type_id_kernel(type)))
+
 /* Convenience macro to wrap over bpf_obj_new */
 #define bpf_obj_new(type) ((type *)bpf_obj_new(bpf_core_type_id_local(type)))
 

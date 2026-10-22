@@ -84,7 +84,7 @@ write_forbidden(struct bpf_dynptr *dynptr, void *context)
  * not be able to write to that pointer.
  */
 SEC("?raw_tp")
-__failure __msg("invalid mem access 'dynptr_ptr'")
+__failure __msg("cannot write into dynptr_ptr")
 int user_ringbuf_callback_write_forbidden(void *ctx)
 {
 	bpf_user_ringbuf_drain(&user_ringbuf, write_forbidden, NULL, 0);

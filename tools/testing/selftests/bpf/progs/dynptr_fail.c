@@ -557,19 +557,15 @@ int global(void *ctx)
 	return 0;
 }
 
-/* A direct read should fail */
+/* A direct read of the dynptr state is allowed, see bpf_dynptr.h */
 SEC("?raw_tp")
-__failure __msg("invalid read from stack")
-__msg("Verification failed: Memory Safety: Direct read of dynptr stack state")
-__msg("verifier-managed dynptr state")
-__msg("Use dynptr helpers or kfuncs")
-int invalid_read1(void *ctx)
+__success
+int dynptr_slot_read1(void *ctx)
 {
 	struct bpf_dynptr ptr;
 
 	bpf_ringbuf_reserve_dynptr(&ringbuf, 64, 0, &ptr);
 
-	/* this should fail */
 	val = *(int *)&ptr;
 
 	bpf_ringbuf_discard_dynptr(&ptr, 0);
@@ -593,17 +589,16 @@ int invalid_read2(void *ctx)
 	return 0;
 }
 
-/* A direct read at an offset into the lower stack slot should fail */
+/* A direct read at an offset into the lower stack slot is allowed */
 SEC("?raw_tp")
-__failure __msg("invalid read from stack")
-int invalid_read3(void *ctx)
+__success
+int dynptr_slot_read3(void *ctx)
 {
 	struct bpf_dynptr ptr1, ptr2;
 
 	bpf_ringbuf_reserve_dynptr(&ringbuf, 16, 0, &ptr1);
 	bpf_ringbuf_reserve_dynptr(&ringbuf, 16, 0, &ptr2);
 
-	/* this should fail */
 	memcpy(&val, (void *)&ptr1 + 8, sizeof(val));
 
 	bpf_ringbuf_discard_dynptr(&ptr1, 0);
@@ -612,24 +607,23 @@ int invalid_read3(void *ctx)
 	return 0;
 }
 
-static int invalid_read4_callback(__u32 index, void *data)
+static int dynptr_slot_read4_callback(__u32 index, void *data)
 {
-	/* this should fail */
 	val = *(__u32 *)data;
 
 	return 0;
 }
 
-/* A direct read within a callback function should fail */
+/* A direct read within a callback function is allowed */
 SEC("?raw_tp")
-__failure __msg("invalid read from stack")
-int invalid_read4(void *ctx)
+__success
+int dynptr_slot_read4(void *ctx)
 {
 	struct bpf_dynptr ptr;
 
 	bpf_ringbuf_reserve_dynptr(&ringbuf, 64, 0, &ptr);
 
-	bpf_loop(10, invalid_read4_callback, &ptr, 0);
+	bpf_loop(10, dynptr_slot_read4_callback, &ptr, 0);
 
 	bpf_ringbuf_submit_dynptr(&ptr, 0);
 
@@ -2278,4 +2272,40 @@ int dynptr_overwrite_ref_clone_slice_valid(void *ctx)
 	bpf_ringbuf_discard_dynptr(&clone, 0);
 
 	return 0;
+}
+
+__noinline int const_dynptr_read_oob(struct bpf_dynptr *p)
+{
+	return *(int *)((void *)p + 16);
+}
+
+/* A load through a const dynptr pointer must stay within the dynptr */
+SEC("?raw_tp")
+__failure __msg("invalid dynptr_ptr access off=16 size=4")
+int const_dynptr_oob(void *ctx)
+{
+	struct bpf_dynptr ptr;
+
+	get_map_val_dynptr(&ptr);
+
+	return const_dynptr_read_oob(&ptr);
+}
+
+__noinline int const_dynptr_store(struct bpf_dynptr *p)
+{
+	/* volatile, or the compiler drops the call: the dynptr is dead after it */
+	*(volatile int *)((void *)p + 8) = 0;
+	return 0;
+}
+
+/* A const dynptr pointer cannot be written through */
+SEC("?raw_tp")
+__failure __msg("cannot write into dynptr_ptr")
+int const_dynptr_write(void *ctx)
+{
+	struct bpf_dynptr ptr;
+
+	get_map_val_dynptr(&ptr);
+
+	return const_dynptr_store(&ptr);
 }

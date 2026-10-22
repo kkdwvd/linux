@@ -206,6 +206,32 @@
 #define __imm_ptr(name) [name]"r"(&name)
 #define __imm_insn(name, expr) [name]"i"(*(long *)&(expr))
 
+/*
+ * r1 = (T *)r2 with T the kernel type whose BTF ID r1 holds, see BPF_TYPE_CAST:
+ * BPF_ALU64 | BPF_MOV | BPF_X, dst_reg 1, src_reg 2, off BPF_TYPE_CAST, imm 0.
+ */
+#define __bpf_type_cast_insn (0xbfULL | (1ULL << 8) | (2ULL << 12) | (2ULL << 16))
+
+/*
+ * Convert any value into a pointer to the kernel type with BTF ID type_id,
+ * void for 0, which the program may read through probe loads: a void pointer
+ * at any offset, a struct along its members. The verifier takes the type ID
+ * from the constant in r1, so a CO-RE relocated ID works.
+ */
+#define bpf_type_cast_id(ptr, type_id) ({					\
+	void *__ptr;								\
+	asm volatile ("r1 = %[__id];\n"						\
+		      "r2 = %[__val];\n"					\
+		      ".8byte %[__insn];\n"					\
+		      "%[__ptr] = r1"						\
+		      : [__ptr]"=r"(__ptr)					\
+		      : [__id]"ri"((__u64)(type_id)), [__val]"r"((__u64)(ptr)),	\
+			[__insn]"i"(__bpf_type_cast_insn)			\
+		      : "r1", "r2");						\
+	__ptr;									\
+})
+#define bpf_void_cast(ptr) bpf_type_cast_id(ptr, 0)
+
 #define sizeof_field(TYPE, MEMBER) sizeof((((TYPE *)0)->MEMBER))
 #define offsetofend(TYPE, MEMBER) \
 	(offsetof(TYPE, MEMBER) + sizeof_field(TYPE, MEMBER))
