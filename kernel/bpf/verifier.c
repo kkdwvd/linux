@@ -537,6 +537,7 @@ static bool is_call_rcu_kfunc(u32 btf_id);
 static bool is_callback_calling_kfunc(u32 btf_id);
 
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id);
+static bool is_bpf_kthread_create_kfunc(u32 btf_id);
 static bool is_task_work_add_kfunc(u32 func_id);
 
 static bool is_sync_callback_calling_function(enum bpf_func_id func_id)
@@ -580,9 +581,10 @@ static bool is_async_cb_sleepable(struct bpf_verifier_env *env, struct bpf_insn 
 	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 && is_call_rcu_kfunc(insn->imm))
 		return false;
 
-	/* bpf_wq and bpf_task_work callbacks are always sleepable. */
+	/* bpf_wq, bpf_task_work and bpf_kthread callbacks are always sleepable. */
 	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
-	    (is_bpf_wq_set_callback_kfunc(insn->imm) || is_task_work_add_kfunc(insn->imm)))
+	    (is_bpf_wq_set_callback_kfunc(insn->imm) || is_task_work_add_kfunc(insn->imm) ||
+	     is_bpf_kthread_create_kfunc(insn->imm)))
 		return true;
 
 	verifier_bug(env, "unhandled async callback in is_async_cb_sleepable");
@@ -11322,6 +11324,7 @@ BTF_SET_START(park_safe_acquire_ids)
 BTF_ID(func, bpf_task_acquire)
 BTF_ID(func, bpf_task_from_pid)
 BTF_ID(func, bpf_task_from_vpid)
+BTF_ID(func, bpf_kthread_create)
 #ifdef CONFIG_CGROUPS
 BTF_ID(func, bpf_cgroup_acquire)
 BTF_ID(func, bpf_cgroup_ancestor)
@@ -12740,6 +12743,32 @@ static int set_task_work_schedule_callback_state(struct bpf_verifier_env *env,
 	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
 	callee->in_async_callback_fn = true;
 	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	return 0;
+}
+
+static int set_kthread_callback_state(struct bpf_verifier_env *env,
+				      struct bpf_func_state *caller,
+				      struct bpf_func_state *callee,
+				      int insn_idx)
+{
+	/*
+	 * bpf_kthread_create(int (callback_fn)(u64 arg), u64 arg, u64 flags);
+	 * callback_fn(u64 arg);
+	 */
+	bpf_mark_reg_unknown(&callee->regs[BPF_REG_1]);
+
+	/* unused */
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_2]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_3]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_4]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
+	callee->in_async_callback_fn = true;
+	/*
+	 * The callback returns an int, which comes back in the low 32 bits of
+	 * R0: compare those, as for a global function.
+	 */
+	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	callee->callback_ret_range.return_32bit = true;
 	return 0;
 }
 
@@ -14426,6 +14455,8 @@ enum special_kfunc_type {
 	KF_bpf_task_work_schedule_resume,
 	KF_bpf_call_rcu,
 	KF_bpf_call_rcu_tasks_trace,
+	KF_bpf_kthread_create,
+	KF_bpf_kthread_stop,
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
@@ -14519,6 +14550,8 @@ BTF_ID(func, bpf_task_work_schedule_signal)
 BTF_ID(func, bpf_task_work_schedule_resume)
 BTF_ID(func, bpf_call_rcu)
 BTF_ID(func, bpf_call_rcu_tasks_trace)
+BTF_ID(func, bpf_kthread_create)
+BTF_ID(func, bpf_kthread_stop)
 #if defined(CONFIG_MMU) && defined(CONFIG_64BIT)
 BTF_ID(func, bpf_arena_alloc_pages)
 BTF_ID(func, bpf_arena_free_pages)
@@ -14563,7 +14596,9 @@ static bool is_bpf_task_park_kfunc(u32 btf_id)
 /* The kfuncs that sleep or wait with migration enabled. */
 static bool is_migrating_kfunc(u32 btf_id)
 {
-	return btf_id == special_kfunc_list[KF_bpf_task_park];
+	return btf_id == special_kfunc_list[KF_bpf_task_park] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_create] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_stop];
 }
 
 static bool is_bpf_obj_new_kfunc(u32 func_id)
@@ -15414,6 +15449,7 @@ static bool is_sync_callback_calling_kfunc(u32 btf_id)
 static bool is_async_callback_calling_kfunc(u32 btf_id)
 {
 	return is_bpf_wq_set_callback_kfunc(btf_id) ||
+	       is_bpf_kthread_create_kfunc(btf_id) ||
 	       is_task_work_add_kfunc(btf_id) ||
 	       is_call_rcu_kfunc(btf_id);
 }
@@ -15427,6 +15463,11 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
+}
+
+static bool is_bpf_kthread_create_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_kthread_create];
 }
 
 static bool is_callback_calling_kfunc(u32 btf_id)
@@ -16338,6 +16379,25 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return -EACCES;
 	}
 
+	/*
+	 * A BPF kthread is a kernel thread, and the program places it: it starts
+	 * in the root cgroup, moves to any cgroup the program names and binds to
+	 * any CPU its cpuset allows, and neither the thread nor its stack is
+	 * charged to whoever loaded the program. CAP_BPF does not stand for that.
+	 * Neither does a token, which speaks for its own user namespace only,
+	 * hence capable(). The check is made at load, as for the destructive
+	 * kfuncs: at run time the caller may be the thread itself.
+	 */
+	if (meta.btf == btf_vmlinux && bpf_is_kthread_kfunc(meta.func_id) &&
+	    !capable(CAP_SYS_ADMIN)) {
+		verbose(env, "%s requires CAP_SYS_ADMIN\n", func_name);
+		operation = bpf_diag_fmt(env, "kfunc %s", func_name);
+		bpf_diag_policy(env, insn_idx, operation,
+				"the BPF kthread kfuncs require CAP_SYS_ADMIN",
+				"Load the program with CAP_SYS_ADMIN, or avoid the kfunc.");
+		return -EPERM;
+	}
+
 	if (is_kfunc_perfmon(&meta) && !env->allow_ptr_leaks) {
 		verbose(env, "%s is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
 			func_name);
@@ -16444,6 +16504,16 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (is_call_rcu_kfunc(meta.func_id)) {
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rcu_callback_state);
+		if (err) {
+			verbose(env, "kfunc %s#%d failed callback verification\n",
+				func_name, meta.func_id);
+			return err;
+		}
+	}
+
+	if (is_bpf_kthread_create_kfunc(meta.func_id)) {
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+					 set_kthread_callback_state);
 		if (err) {
 			verbose(env, "kfunc %s#%d failed callback verification\n",
 				func_name, meta.func_id);
