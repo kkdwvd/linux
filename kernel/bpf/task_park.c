@@ -8,6 +8,7 @@
 #include <linux/filter.h>
 #include <linux/hrtimer.h>
 #include <linux/irq_work.h>
+#include <linux/kthread.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -165,9 +166,18 @@ static int __init bpf_task_wake_init(void)
 }
 subsys_initcall(bpf_task_wake_init);
 
-/* What ends a park besides a wake and the timeout. */
+/*
+ * What ends a park besides a wake and the timeout: a stop or park request for
+ * a kthread, or a signal. Both are checked for every caller, since a kthread
+ * that allowed signals has them too, and the kthread checks are false for a
+ * user task. The request is reported apart from a signal because nothing
+ * clears it while the thread's function runs: every later park fails the same
+ * way, so the caller has to return.
+ */
 static int bpf_task_park_interrupted(void)
 {
+	if (kthread_should_stop_or_park())
+		return -ESHUTDOWN;
 	if (signal_pending(current))
 		return -EINTR;
 	return 0;
@@ -182,14 +192,17 @@ __bpf_kfunc_start_defs();
  * @aux: the calling program, set by the verifier
  *
  * Returns at once if a wake is pending from a bpf_task_wake() that found the
- * task running. Otherwise sleeps interruptibly until a wake, the timeout or
- * a signal. Every return past the argument check consumes the pending wake,
- * and a wake takes precedence over a timeout or a signal noticed at the same
- * time, since the waker may already have accounted for it. Any return hands
- * control back to the program's own check of its condition, and spurious
- * returns are possible. A @timeout_ns of 0 polls: it reports a pending wake,
- * then a pending signal as -EINTR, and otherwise -ETIMEDOUT, without
- * sleeping.
+ * task running. Otherwise sleeps interruptibly until a wake, the timeout, a
+ * signal, or a stop or park request for a kthread. A wake takes precedence
+ * over a timeout or a signal noticed at the same time, since the waker may
+ * already have accounted for it, and a return for any of the three consumes
+ * the pending wake. A stop or park request takes precedence over all of
+ * them, as a kernel thread tests kthread_should_stop() before it looks for
+ * work: the call returns -ESHUTDOWN and leaves a pending wake pending. Any
+ * return hands control back to the program's own check of its condition, and
+ * spurious returns are possible. A @timeout_ns of 0 polls: it reports a stop
+ * or park request as -ESHUTDOWN, then a pending wake, a pending signal as
+ * -EINTR, and otherwise -ETIMEDOUT, without sleeping.
  *
  * Every call past the argument check leaves the read section the program
  * runs under and lets the task migrate until it returns, whether it sleeps or
@@ -198,9 +211,12 @@ __bpf_kfunc_start_defs();
  * and begins the next: the slice starts over when the call returns.
  *
  * Return: 0 when a wake was consumed or the sleep ended for no recorded
- * reason, -ETIMEDOUT when the timeout passed, -EINTR when a signal is
- * pending, whether it was found before the sleep or ended it, even if the
- * timeout passed meanwhile, -EINVAL when @flags is not 0.
+ * reason, -ETIMEDOUT when the timeout passed, -ESHUTDOWN when a stop or park
+ * request for a kthread is pending and -EINTR when a signal is, whether it
+ * was found before the sleep or ended it, even if the timeout passed
+ * meanwhile, -EINVAL when @flags is not 0. Nothing clears a stop or park
+ * request while the thread's function runs, so once a call has returned
+ * -ESHUTDOWN, every later one does too.
  */
 __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *aux)
 {
@@ -227,14 +243,14 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *au
 	 * where the caller of a tail call holds it through this very read
 	 * section; the time slice of may_goto, kept per CPU as well, starts
 	 * over when the call returns. The verifier confines the call to
-	 * such contexts: the main body of a syscall program and the functions it
-	 * calls directly, never a callback, and never a region that pins the
-	 * CPU, a lock, a saved IRQ state or an RCU read section. It also
-	 * invalidates every pointer the program holds across the call except its
-	 * stack, its context, maps it references directly and the values of its
-	 * arrays, arena memory and verifier-tracked references. What remains is
-	 * that the program may resume on another CPU, which is part of the
-	 * contract.
+	 * such contexts: the main body of a syscall program or of a BPF kthread
+	 * and the functions either calls directly, never any other callback,
+	 * and never a region that pins the CPU, a lock, a saved IRQ state or an
+	 * RCU read section. It also invalidates every pointer the program holds
+	 * across the call except its stack, its context, maps it references
+	 * directly and the values of its arrays, arena memory and
+	 * verifier-tracked references. What remains is that the program may
+	 * resume on another CPU, which is part of the contract.
 	 *
 	 * Both are dropped on every call, also on one that finds a wake or a
 	 * signal pending and does not sleep. The verifier treats every call
@@ -248,8 +264,9 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *au
 	 * set_current_state() is a full barrier that pairs with the one in
 	 * try_to_wake_up() after the waker's store of bpf_wake_pending:
 	 * either this task observes the pending wake below or the waker
-	 * observes it sleeping and wakes it. Signal delivery sets its flag
-	 * and wakes the task in the same way, so the same ordering covers it.
+	 * observes it sleeping and wakes it. kthread_stop(), kthread_park()
+	 * and signal delivery set their flag and wake the task in the same
+	 * way, so the same ordering covers them.
 	 */
 	set_current_state(TASK_INTERRUPTIBLE);
 	ret = bpf_task_park_interrupted();
@@ -259,10 +276,11 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *au
 		/*
 		 * A NULL expiry sleeps without a timer; a zero one returns at
 		 * once. schedule_hrtimeout() tells an expiry from an early
-		 * return, but not a wake from a signal, so check for a signal
-		 * again, as before the sleep. It wins over an expiry that fired
-		 * at the same time, since it stays pending and the timeout does
-		 * not; a wake, consumed below, wins over both.
+		 * return, but not a wake from a signal or a stop or park
+		 * request, so read the flags again, as before the sleep. They
+		 * win over an expiry that fired at the same time, since they
+		 * stay pending and the timeout does not; a wake, consumed
+		 * below, wins over a signal and the expiry.
 		 */
 		if (!schedule_hrtimeout(timeout_ns == U64_MAX ? NULL : &expires, HRTIMER_MODE_REL))
 			ret = -ETIMEDOUT;
@@ -278,9 +296,12 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *au
 	 * Consume the wake. xchg() is fully ordered, so the condition loads
 	 * the program makes after the return see the stores the waker made
 	 * before its bpf_task_wake(). A wake that raced with the timeout or
-	 * the signal wins: the waker may have accounted for it.
+	 * the signal wins: the waker may have accounted for it. A stop or park
+	 * request wins over the wake and leaves it pending, the way a kernel
+	 * thread's loop tests the stop before it looks for work. The thread is
+	 * on its way out, and what it was handed is for its stopper to see to.
 	 */
-	if (xchg(&current->bpf_wake_pending, 0))
+	if (ret != -ESHUTDOWN && xchg(&current->bpf_wake_pending, 0))
 		ret = 0;
 	return ret;
 }
