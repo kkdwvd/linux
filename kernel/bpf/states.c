@@ -522,6 +522,7 @@ bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_veri
 		fa = a->frame[fr];
 		fb = b->frame[fr];
 		if (memcmp(&fa->join_key, &fb->join_key, sizeof(fa->join_key)) ||
+		    fa->in_kthread_fn != fb->in_kthread_fn ||
 		    fa->loop_stack_cnt != fb->loop_stack_cnt)
 			return false;
 		for (i = 0; i < fa->loop_stack_cnt; i++) {
@@ -570,6 +571,8 @@ u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verif
 	for (fr = 0; fr <= st->curframe; fr++) {
 		f = st->frame[fr];
 		hash = bpf_hash64(&f->join_key, sizeof(f->join_key), hash);
+		if (f->in_kthread_fn)
+			hash = bpf_hash64(&f->in_kthread_fn, sizeof(f->in_kthread_fn), hash);
 		for (i = 0, e = f->loop_stack; i < f->loop_stack_cnt; i++, e++) {
 			trip = e->peeled ? e->trip : -1;
 			hash = bpf_hash64(&trip, sizeof(trip), hash);

@@ -514,6 +514,14 @@ struct bpf_func_state {
 	);
 	bool no_stack_arg_load;
 	/*
+	 * The body of a BPF kthread: an async callback whose kernel caller,
+	 * bpf_kthread_fn(), keeps nothing across it that the sleep in
+	 * bpf_task_park() could invalidate, so the park is allowed in it.
+	 * Like loop_stack_cnt, a part of the join_key that is outside of it,
+	 * see bpf_same_join_key(): the join_key has no holes and no room left.
+	 */
+	bool in_kthread_fn;
+	/*
 	 * Unique diagnostic identity for this function invocation. Frame depth is
 	 * reused after returns, while this ID is preserved across state clones.
 	 */
