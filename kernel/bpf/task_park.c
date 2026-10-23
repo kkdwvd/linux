@@ -163,9 +163,10 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags)
 	 * invocation, so that the program's own memory needs no grace period,
 	 * and where nothing on the run path keeps per-CPU state across the
 	 * program. The verifier confines the call to such contexts: the main
-	 * body of a syscall program and the functions it calls directly, never
-	 * a callback, and never a region that pins the CPU, a lock, a saved
-	 * IRQ state or an RCU read section. It also invalidates every pointer
+	 * body of a syscall program or of a BPF kthread and the functions
+	 * either calls directly, never any other callback, and never a region
+	 * that pins the CPU, a lock, a saved IRQ state or an RCU read section.
+	 * It also invalidates every pointer
 	 * the program holds across the call except its stack, its context,
 	 * maps it references directly and the values of its arrays, arena
 	 * memory and verifier-tracked references. What remains is that the

@@ -1059,6 +1059,13 @@ static bool states_equal(struct bpf_verifier_env *env,
 		insn_idx = bpf_frame_insn_idx(old, i);
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
+		/*
+		 * The body of a BPF kthread may park where another async
+		 * callback of the same subprog may not, so a state verified
+		 * in one role must not prune the other.
+		 */
+		if (old->frame[i]->in_kthread_fn != cur->frame[i]->in_kthread_fn)
+			return false;
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
