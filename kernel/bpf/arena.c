@@ -10,6 +10,7 @@
 #include <linux/btf_ids.h>
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
+#include <linux/pgalloc.h>
 #include <asm/tlbflush.h>
 #include "range_tree.h"
 
@@ -34,6 +35,13 @@
  * where r12 == kern_vm_start and off is s16.
  * Hence allocate 4Gb + GUARD_SZ/2 on each side.
  *
+ * The arena frees the PTE tables of its band when the map is destroyed, so
+ * the PMD slots the band touches must belong to this arena alone: a slot
+ * shared with a neighbouring vmalloc area would hold that neighbour's PTEs in
+ * the same table. get_vm_area() only page-aligns, so the area is 2 * PMD_SIZE
+ * larger than needed and kern_vm_start is rounded up to PMD_SIZE, which keeps
+ * the lower guard and every slot the band touches inside the area.
+ *
  * Initially kernel vm_area and user vma are not populated.
  * User space can fault-in any address which will insert the page
  * into kernel and user vma.
@@ -44,7 +52,8 @@
 
 /* number of bytes addressable by LDX/STX insn with 16-bit 'off' field */
 #define GUARD_SZ round_up(1ull << sizeof_field(struct bpf_insn, off) * 8, PAGE_SIZE << 1)
-#define KERN_VM_SZ (SZ_4G + GUARD_SZ)
+/* 4G + guards, plus the slack to make the band's PMD slots exclusive, see above */
+#define KERN_VM_SZ (SZ_4G + GUARD_SZ + 2 * PMD_SIZE)
 
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
 
@@ -80,7 +89,7 @@ struct arena_free_span {
 
 u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena)
 {
-	return arena ? (u64) (long) arena->kern_vm->addr + GUARD_SZ / 2 : 0;
+	return arena ? ALIGN((u64) (long) arena->kern_vm->addr + GUARD_SZ / 2, PMD_SIZE) : 0;
 }
 
 u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena)
@@ -345,31 +354,115 @@ err:
 	return ERR_PTR(err);
 }
 
-static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
+/*
+ * The PMD entry of @addr's slot. The levels above the PTE tables are populated
+ * at map creation and never freed before destruction, so this neither
+ * allocates nor fails, except for the slots a failed creation left without
+ * upper levels.
+ */
+static pmd_t *arena_pmd_offset(unsigned long addr)
 {
-	struct bpf_arena *arena = data;
-	struct page *page;
-	pte_t pte;
+	pgd_t *pgd = pgd_offset_k(addr);
+	p4d_t *p4d;
+	pud_t *pud;
 
-	pte = ptep_get(ptep);
-	if (!pte_present(pte)) /* sanity check */
-		return 0;
+	if (pgd_none(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud))
+		return NULL;
+	return pmd_offset(pud, addr);
+}
+
+/* Free the data page a PTE of a detached table maps, if any. */
+static void arena_free_pte_page(struct bpf_arena *arena, pte_t pte)
+{
+	struct page *page;
+
+	if (!pte_present(pte))
+		return;
 	page = pte_page(pte);
 	/*
 	 * Skip the scratch page. The walk is page-table-driven, not range-tree-driven,
 	 * so it can visit scratch PTEs at uaddrs the BPF program never allocated.
 	 */
 	if (page == arena->scratch_page)
-		return 0;
-	/*
-	 * We do not update pte here:
-	 * 1. Nobody should be accessing bpf_arena's range outside of a kernel bug
-	 * 2. TLB flushing is batched or deferred. Even if we clear pte,
-	 * the TLB entries can stick around and continue to permit access to
-	 * the freed page. So it all relies on 1.
-	 */
+		return;
 	__free_page(page);
-	return 0;
+}
+
+/* Free a table that was detached from its PMD entry and whose translations were flushed. */
+static void arena_free_pt(struct bpf_arena *arena, pte_t *table)
+{
+	unsigned long i;
+
+	for (i = 0; i < PTRS_PER_PTE; i++)
+		arena_free_pte_page(arena, ptep_get(&table[i]));
+	pte_free_kernel(&init_mm, table);
+}
+
+/*
+ * Detach and free every PTE table of the band, with the data pages they still
+ * map. Nothing else is alive: no program runs, no user vma exists (the caller
+ * checks) and the deferred frees have been drained, so a plain pmd_clear()
+ * detaches a table and the kernel-fault handler cannot interfere. Clear every
+ * slot first, flush the whole band once, and only then free anything: no stale
+ * TLB entry or paging-structure-cache entry can reach a freed data page or a
+ * freed table. The tables are remembered in an array rather than through
+ * their struct pages, whose list fields belong to the architecture's table
+ * allocator where tables are fragments of a page (s390). Without the array
+ * each slot is flushed on its own, slower but correct.
+ */
+static void arena_free_pgtables(struct bpf_arena *arena)
+{
+	unsigned long start = bpf_arena_get_kern_vm_start(arena);
+	unsigned long end = start + SZ_4G + GUARD_SZ / 2;
+	unsigned long area_start = (unsigned long)arena->kern_vm->addr;
+	unsigned long area_end = area_start + get_vm_area_size(arena->kern_vm);
+	unsigned long addr, i, nr = 0;
+	pte_t **tables;
+
+	tables = kvmalloc_array(DIV_ROUND_UP(end - start, PMD_SIZE) + 1, sizeof(*tables),
+				GFP_KERNEL);
+
+	for (addr = start; addr != end; addr = pmd_addr_end(addr, end)) {
+		unsigned long slot = addr & PMD_MASK;
+		pmd_t *pmdp = arena_pmd_offset(addr);
+		pte_t *table;
+		pmd_t pmd;
+
+		if (!pmdp)
+			continue;
+		pmd = pmdp_get(pmdp);
+		if (pmd_none(pmd))
+			continue;
+		/*
+		 * The band is placed so that every slot it touches lies inside
+		 * the arena's own area. A table in a slot shared with a
+		 * neighbouring vmalloc area could hold that neighbour's PTEs;
+		 * it must be left alone.
+		 */
+		if (WARN_ON_ONCE(slot < area_start || slot + PMD_SIZE > area_end))
+			continue;
+		table = (pte_t *)pmd_page_vaddr(pmd);
+		pmd_clear(pmdp);
+		if (tables) {
+			tables[nr++] = table;
+			continue;
+		}
+		flush_tlb_kernel_range(slot, slot + PMD_SIZE);
+		arena_free_pt(arena, table);
+	}
+
+	if (!tables)
+		return;
+	flush_tlb_kernel_range(start, ALIGN(end, PMD_SIZE));
+	for (i = 0; i < nr; i++)
+		arena_free_pt(arena, tables[i]);
+	kvfree(tables);
 }
 
 static void arena_map_free(struct bpf_map *map)
@@ -390,13 +483,11 @@ static void arena_map_free(struct bpf_map *map)
 	flush_work(&arena->free_work);
 
 	/*
-	 * free_vm_area() calls remove_vm_area() that calls free_unmap_vmap_area().
-	 * It unmaps everything from vmalloc area and clears pgtables.
-	 * Call apply_to_existing_page_range() first to find populated ptes and
-	 * free those pages.
+	 * Free the band's PTE tables and the pages they map, then the area:
+	 * free_vm_area() finds only empty PMD slots and leaves the upper levels
+	 * to vmalloc.
 	 */
-	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				     SZ_4G + GUARD_SZ / 2, existing_page_cb, arena);
+	arena_free_pgtables(arena);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
 	__free_page(arena->scratch_page);
