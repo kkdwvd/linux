@@ -45,10 +45,22 @@ static int run(struct bpf_program *prog, const char *name)
 	return 0;
 }
 
+/*
+ * The usage counts the data pages and the PTE tables that map them. A table is
+ * allocated when a page in its PMD slot is first mapped, and kept until the map
+ * is destroyed, so it stays in the count after its pages are freed. The arena's
+ * fixed overhead, the scratch page and the scratch PTE table, is not counted.
+ *
+ * Every page below lies in the first slot: the first allocation lands at page
+ * offset 0, the arena's kernel band is aligned to the slot size, and the
+ * smallest slot on any architecture holds more than 17 pages. So exactly one
+ * table (pt) is ever allocated here.
+ */
 void serial_test_arena_mem_usage(void)
 {
 	struct arena_mem_usage *skel;
 	const long ps = PAGE_SIZE;
+	const long pt = PAGE_SIZE;
 	char *base;
 	size_t sz;
 	int fd, i;
@@ -58,10 +70,10 @@ void serial_test_arena_mem_usage(void)
 		return;
 	fd = bpf_map__fd(skel->maps.arena);
 
-	/* Fresh arena: no data pages, and the scratch page is not counted. */
+	/* Fresh arena: no data pages, no tables; the scratch page and table are overhead. */
 	ASSERT_EQ(map_memlock(fd), 0, "initial");
 
-	/* BPF-side allocation of 17 pages. */
+	/* BPF-side allocation of 17 pages, plus the table of their slot. */
 	skel->bss->alloc_cnt = 17;
 	if (run(skel->progs.alloc, "alloc"))
 		goto out;
@@ -72,40 +84,41 @@ void serial_test_arena_mem_usage(void)
 	 */
 	if (!ASSERT_OK_PTR(skel->bss->ptr, "arena_alloc_pages"))
 		goto out;
-	ASSERT_EQ(map_memlock(fd), 17 * ps, "after_alloc");
+	ASSERT_EQ(map_memlock(fd), 17 * ps + pt, "after_alloc");
 
 	/* Free a single page (arena_free_pages page_cnt==1 path). */
 	skel->bss->free_byte_off = 0;
 	skel->bss->free_cnt = 1;
 	if (run(skel->progs.free_pages, "free_one"))
 		goto out;
-	ASSERT_EQ(map_memlock(fd), 16 * ps, "after_free_one");
+	ASSERT_EQ(map_memlock(fd), 16 * ps + pt, "after_free_one");
 
 	/* Free ten pages in one call (bulk path); only the freed pages count. */
 	skel->bss->free_byte_off = 1 * ps;
 	skel->bss->free_cnt = 10;
 	if (run(skel->progs.free_pages, "free_bulk"))
 		goto out;
-	ASSERT_EQ(map_memlock(fd), 6 * ps, "after_free_bulk");
+	ASSERT_EQ(map_memlock(fd), 6 * ps + pt, "after_free_bulk");
 
-	/* Free the remaining six -> arena empty again. */
+	/* Free the remaining six -> no data pages; the table stays. */
 	skel->bss->free_byte_off = 11 * ps;
 	skel->bss->free_cnt = 6;
 	if (run(skel->progs.free_pages, "free_rest"))
 		goto out;
-	ASSERT_EQ(map_memlock(fd), 0, "after_free_rest");
+	ASSERT_EQ(map_memlock(fd), pt, "after_free_rest");
 
 	/*
 	 * User-space fault-in: touching unallocated arena pages allocates them
 	 * through arena_vm_fault(). libbpf mmap()s the arena at map_extra during
-	 * load, so bpf_map__initial_value() hands back that base.
+	 * load, so bpf_map__initial_value() hands back that base. The pages
+	 * reuse the table above.
 	 */
 	base = bpf_map__initial_value(skel->maps.arena, &sz);
 	if (!ASSERT_OK_PTR(base, "arena_base"))
 		goto out;
 	for (i = 0; i < 8; i++)
 		base[i * ps] = 1;
-	ASSERT_EQ(map_memlock(fd), 8 * ps, "after_faultin");
+	ASSERT_EQ(map_memlock(fd), 8 * ps + pt, "after_faultin");
 
 	/*
 	 * Free the faulted-in pages from BPF. They are mapped into the user vma
@@ -116,7 +129,7 @@ void serial_test_arena_mem_usage(void)
 	skel->bss->free_cnt = 8;
 	if (run(skel->progs.free_pages, "free_faulted"))
 		goto out;
-	ASSERT_EQ(map_memlock(fd), 0, "after_free_faulted");
+	ASSERT_EQ(map_memlock(fd), pt, "after_free_faulted");
 out:
 	arena_mem_usage__destroy(skel);
 }
