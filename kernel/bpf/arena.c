@@ -57,7 +57,24 @@
 /* the part of the band kernel-fault recovery covers: 4G + the upper half-guard */
 #define RECOVERY_SZ (SZ_4G + GUARD_SZ / 2)
 
+/*
+ * PTE tables are allocated on demand wherever every writer of the band can get
+ * a table into an empty PMD slot. The kernel-fault handler is the lockless
+ * writer and needs pmdp_try_populate_kernel(); architectures without
+ * ptep_try_set() never reach the fault handler and are served by the generic
+ * helpers under the arena lock. What remains (arm64 with two page-table levels,
+ * 32-bit x86) populates every table at map creation as before, through the
+ * arena's own allocator so that the tables are charged, counted and freed like
+ * the on-demand ones.
+ */
+#if defined(pmdp_try_populate_kernel) || !defined(ptep_try_set)
+#define ARENA_LAZY_PT 1
+#else
+#define ARENA_LAZY_PT 0
+#endif
+
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
+static void arena_free_pgtables(struct bpf_arena *arena);
 
 struct bpf_arena {
 	struct bpf_map map;
@@ -68,10 +85,12 @@ struct bpf_arena {
 	/* a PTE table whose every entry maps scratch_page, see arena_install_scratch() */
 	pte_t *scratch_pt;
 	struct range_tree rt;
-	/* protects rt and nr_pages */
+	/* protects rt, nr_pages and nr_pt_pages */
 	rqspinlock_t spinlock;
 	/* number of pages currently populated in the arena */
 	u64 nr_pages;
+	/* number of PTE tables allocated for the band, scratch_pt excluded */
+	u64 nr_pt_pages;
 	struct list_head vma_list;
 	/* protects vma_list */
 	struct mutex lock;
@@ -175,9 +194,6 @@ static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
 	struct page *page;
 	pte_t pteval;
 
-	if (!data)
-		return 0;
-
 	node = READ_ONCE(d->pages->first);
 	if (WARN_ON_ONCE(!node))
 		return -EINVAL;
@@ -264,8 +280,6 @@ static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
  * never freed before the map is destroyed, so a table named by a PMD entry can
  * be used without holding anything.
  */
-/* Until PTE tables go on demand, only the scratch table is allocated this way. */
-#ifdef pmdp_try_populate_kernel
 static pte_t *arena_alloc_pt(struct bpf_arena *arena, bool sleepable)
 {
 	struct page *page = bpf_alloc_page(arena->map.numa_node, sleepable);
@@ -279,7 +293,6 @@ static pte_t *arena_alloc_pt(struct bpf_arena *arena, bool sleepable)
 	ptdesc_set_kernel(ptdesc);
 	return ptdesc_address(ptdesc);
 }
-#endif
 
 /*
  * Free a table that was never installed, or that was detached from its PMD
@@ -399,7 +412,11 @@ static int arena_walk_slot(pte_t *table, unsigned long addr, unsigned long end,
 
 /*
  * Make the slot of @addr hold a real PTE table and return it, or NULL if none
- * could be found. A new table comes from @tables, preallocated by the caller.
+ * could be allocated. A new table comes from @tables, preallocated by a
+ * sleepable caller outside the lock, or else from the non-blocking allocator,
+ * which can fail: the non-sleepable callers can already fail for their data
+ * pages and handle NULL, and a new table is only needed the first time a 2 MB
+ * slot is touched.
  *
  * Runs under the arena spinlock. The only writer of PMD entries that does not
  * take the lock is the kernel-fault handler, and it only turns a none slot into
@@ -430,17 +447,23 @@ static pte_t *arena_ensure_pt(struct bpf_arena *arena, pmd_t *pmdp, unsigned lon
 		return (pte_t *)pmd_page_vaddr(pmd);
 
 	node = tables ? llist_del_first(tables) : NULL;
-	if (!node)
-		return NULL;
-	new = page_address(llist_entry(node, struct page, pcp_llist));
+	if (node) {
+		new = page_address(llist_entry(node, struct page, pcp_llist));
+	} else {
+		new = arena_alloc_pt(arena, false);
+		if (!new)
+			return NULL;
+	}
 
 	for (;;) {
 		if (pmd_none(pmd)) {
-			if (pmdp_try_populate_kernel(&init_mm, pmdp, new))
+			if (pmdp_try_populate_kernel(&init_mm, pmdp, new)) {
+				WRITE_ONCE(arena->nr_pt_pages, arena->nr_pt_pages + 1);
 				return new;
+			}
 		} else if (WARN_ON_ONCE(!arena_pmd_is_scratch(arena, pmd))) {
-			/* a real table cannot appear under the lock; give the page back */
-			llist_add(node, tables);
+			/* a real table cannot appear under the lock */
+			arena_discard_pt(new);
 			return (pte_t *)pmd_page_vaddr(pmd);
 		} else if (pmdp_try_clear(pmdp, pmd)) {
 			flush_tlb_before_set_range(slot, slot + PMD_SIZE);
@@ -451,16 +474,15 @@ static pte_t *arena_ensure_pt(struct bpf_arena *arena, pmd_t *pmdp, unsigned lon
 
 /*
  * Call @fn on every PTE of [start, end), one PMD slot at a time. Without
- * @create, slots that hold no real table are skipped: a none slot has nothing
+ * @tables, slots that hold no real table are skipped: a none slot has nothing
  * to visit, and the scratch table must not be visited at all, as clearing its
- * entries would corrupt it for every other slot it serves. With @create, such
- * a slot gets a real table first, see arena_ensure_pt(); no table is available
- * yet, so that fails with -ENOMEM, which the callers that map pages rely on to
- * not lose any. Neither state arises while every table is populated at map
- * creation.
+ * entries would corrupt it for every other slot it serves. With @tables, such
+ * a slot gets a real table first, see arena_ensure_pt(), and the walk fails
+ * with -ENOMEM if it cannot, which the callers that map pages rely on to not
+ * lose any.
  */
 static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigned long end,
-			   bool create, arena_pte_fn_t fn, void *data)
+			   struct llist_head *tables, arena_pte_fn_t fn, void *data)
 {
 	unsigned long addr = start, next;
 	pte_t *table;
@@ -471,10 +493,10 @@ static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigne
 		pmd_t pmd;
 
 		next = pmd_addr_end(addr, end);
-		if (!pmdp)
+		if (WARN_ON_ONCE(!pmdp))
 			return -EINVAL;
-		if (create) {
-			table = arena_ensure_pt(arena, pmdp, addr, NULL);
+		if (tables) {
+			table = arena_ensure_pt(arena, pmdp, addr, tables);
 			if (!table)
 				return -ENOMEM;
 		} else {
@@ -483,11 +505,64 @@ static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigne
 				continue;
 			table = (pte_t *)pmd_page_vaddr(pmd);
 		}
+		if (!fn)
+			continue;
 		err = arena_walk_slot(table, addr, next, fn, data);
 		if (err)
 			return err;
 	} while (addr = next, addr != end);
 	return 0;
+}
+
+/* The slots of [start, end) without a real table. Lockless, so a hint. */
+static unsigned int arena_count_missing_pts(struct bpf_arena *arena, unsigned long start,
+					    unsigned long end)
+{
+	unsigned long addr;
+	unsigned int n = 0;
+
+	for (addr = start; addr != end; addr = pmd_addr_end(addr, end)) {
+		pmd_t *pmdp = arena_pmd_offset(addr);
+		pmd_t pmd;
+
+		if (!pmdp)
+			continue;
+		pmd = pmdp_get(pmdp);
+		if (pmd_none(pmd) || arena_pmd_is_scratch(arena, pmd))
+			n++;
+	}
+	return n;
+}
+
+/*
+ * Preallocate, outside the lock, the tables that mapping [start, end) is
+ * expected to need, for sleepable callers: a sleeping allocation can reclaim,
+ * which the non-blocking one inside the walk cannot. The count is an upper
+ * bound taken without the lock: a concurrent allocation only adds tables, and
+ * a concurrent kernel fault turns a none slot into a scratch slot, which needs
+ * a table just the same. The walk falls back to the non-blocking allocator if
+ * the list runs dry and the caller frees what is left over.
+ */
+static void arena_prealloc_pts(struct bpf_arena *arena, unsigned long start, unsigned long end,
+			       struct llist_head *tables)
+{
+	unsigned int n = arena_count_missing_pts(arena, start, end);
+
+	while (n--) {
+		pte_t *pt = arena_alloc_pt(arena, true);
+
+		if (!pt)
+			break;
+		llist_add(&virt_to_page(pt)->pcp_llist, tables);
+	}
+}
+
+static void arena_free_pts(struct llist_head *tables)
+{
+	struct llist_node *pos, *t;
+
+	llist_for_each_safe(pos, t, __llist_del_all(tables))
+		arena_discard_pt(page_address(llist_entry(pos, struct page, pcp_llist)));
 }
 
 /*
@@ -523,42 +598,107 @@ static struct page *arena_lookup_page(struct bpf_arena *arena, unsigned long add
  * access retry succeeds. Seeing the scratch table already in place is fine as
  * well: the fault came from a stale "not mapped" TLB entry or a lost race, and
  * the retry resolves it. No TLB flush: stale "not mapped" entries just cause
- * one extra re-fault through this same path.
+ * one extra re-fault through this same path. Returns false only if the slot
+ * cannot be made valid at all, in which case the fault must not be retried.
  */
-static void arena_install_scratch(struct bpf_arena *arena, unsigned long addr)
+static bool arena_install_scratch(struct bpf_arena *arena, unsigned long addr)
 {
 	pmd_t *pmdp = arena_pmd_offset(addr);
 	pmd_t pmd;
 	pte_t *pte;
 
 	if (!pmdp)
-		return;
+		return false;
 	pmd = pmdp_get(pmdp);
 	if (pmd_none(pmd)) {
 #ifdef pmdp_try_populate_kernel
 		pmdp_try_populate_kernel(&init_mm, pmdp, arena->scratch_pt);
-#endif
+		return true;
+#else
 		/*
 		 * Without an atomic installer there is no scratch table either,
 		 * and none is needed: a none slot is never hit by a recovered
 		 * kernel access here, because the fault handler is either not
 		 * reached at all or every table is populated at map creation.
 		 */
-		return;
+		return false;
+#endif
 	}
 	if (arena_pmd_is_scratch(arena, pmd))
-		return;
+		return true;
 	pte = arena_pte_offset(pmd, addr);
 	if (!pte_none(ptep_get(pte)))
-		return;
+		return true;
 	ptep_try_set(pte, mk_pte(arena->scratch_page, PAGE_KERNEL));
+	return true;
 }
 
-static int populate_pgtable_except_pte(struct bpf_arena *arena)
+/*
+ * Populate the levels above the PTE tables for the recovery band, so that no
+ * walk ever allocates above the PTE level: those allocations sleep and take
+ * init_mm.page_table_lock, which the arena's writers cannot do. This is about
+ * 24 KB for 4 GB, left to vmalloc like any other vmalloc page table. Track the
+ * modified levels the way mm/pgalloc-track.h does and sync them where the
+ * architecture needs it: on x86-64 a new P4D or PUD table under init_mm must
+ * be copied into every process pgd (sync_global_pgds()), which
+ * apply_to_page_range() did on the arena's behalf until now.
+ */
+static int arena_populate_upper_levels(struct bpf_arena *arena)
 {
-	/* Populate intermediates for the recovery range (4 GiB + upper half-guard). */
-	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				   RECOVERY_SZ, apply_range_set_cb, NULL);
+	unsigned long start = bpf_arena_get_kern_vm_start(arena), end = start + RECOVERY_SZ;
+	pgtbl_mod_mask mask = 0;
+	unsigned long addr;
+	int err = 0;
+
+	for (addr = start; addr != end; addr = pmd_addr_end(addr, end)) {
+		pgd_t *pgd = pgd_offset_k(addr);
+		p4d_t *p4d;
+		pud_t *pud;
+
+		if (pgd_none(*pgd)) {
+			if (__p4d_alloc(&init_mm, pgd, addr)) {
+				err = -ENOMEM;
+				break;
+			}
+			mask |= PGTBL_PGD_MODIFIED;
+		}
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d)) {
+			if (__pud_alloc(&init_mm, p4d, addr)) {
+				err = -ENOMEM;
+				break;
+			}
+			mask |= PGTBL_P4D_MODIFIED;
+		}
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud)) {
+			if (__pmd_alloc(&init_mm, pud, addr)) {
+				err = -ENOMEM;
+				break;
+			}
+			mask |= PGTBL_PUD_MODIFIED;
+		}
+	}
+	if (mask & ARCH_PAGE_TABLE_SYNC_MASK)
+		arch_sync_kernel_mappings(start, end);
+	return err;
+}
+
+static int arena_populate_pgtables(struct bpf_arena *arena)
+{
+	unsigned long start = bpf_arena_get_kern_vm_start(arena), end = start + RECOVERY_SZ;
+	LLIST_HEAD(tables);
+	int err;
+
+	err = arena_populate_upper_levels(arena);
+	if (err || ARENA_LAZY_PT)
+		return err;
+
+	/* every slot gets its table now; nothing runs concurrently at creation */
+	arena_prealloc_pts(arena, start, end, &tables);
+	err = arena_walk_ptes(arena, start, end, &tables, NULL, NULL);
+	arena_free_pts(&tables);
+	return err;
 }
 
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
@@ -624,13 +764,14 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	mutex_init(&arena->lock);
 	mutex_init(&arena->zap_mutex);
 	raw_res_spin_lock_init(&arena->spinlock);
-	err = populate_pgtable_except_pte(arena);
+	err = arena_populate_pgtables(arena);
 	if (err)
-		goto err_destroy_rt;
+		goto err_free_pgtables;
 
 	return &arena->map;
 
-err_destroy_rt:
+err_free_pgtables:
+	arena_free_pgtables(arena);
 	range_tree_destroy(&arena->rt);
 err_free_scratch_pt:
 	if (arena->scratch_pt)
@@ -661,14 +802,22 @@ static void arena_free_pte_page(struct bpf_arena *arena, pte_t pte)
 	__free_page(page);
 }
 
-/* Free a table that was detached from its PMD entry and whose translations were flushed. */
+/*
+ * Free a table that was detached from its PMD entry and whose translations
+ * were flushed. The table is a page the arena allocated, so it goes through
+ * pagetable_dtor_free() rather than pte_free_kernel(): the same call on x86
+ * and arm64, but where the architecture allocates PTE tables as fragments of
+ * a page (s390, powerpc) pte_free_kernel() expects one of its own. The kernel
+ * page-table mark set at allocation keeps the kernel's freeing policy
+ * (asynchronous after an IOMMU invalidation where configured).
+ */
 static void arena_free_pt(struct bpf_arena *arena, pte_t *table)
 {
 	unsigned long i;
 
 	for (i = 0; i < PTRS_PER_PTE; i++)
 		arena_free_pte_page(arena, ptep_get(&table[i]));
-	pte_free_kernel(&init_mm, table);
+	pagetable_dtor_free(virt_to_ptdesc(table));
 }
 
 /*
@@ -679,14 +828,14 @@ static void arena_free_pt(struct bpf_arena *arena, pte_t *table)
  * slot first, flush the whole band once, and only then free anything: no stale
  * TLB entry or paging-structure-cache entry can reach a freed data page or a
  * freed table. The tables are remembered in an array rather than through
- * their struct pages, whose list fields belong to the architecture's table
- * allocator where tables are fragments of a page (s390). Without the array
- * each slot is flushed on its own, slower but correct.
+ * their struct pages; without the array each slot is flushed on its own,
+ * slower but correct. Also used to undo a failed map creation, where some
+ * slots may lack their upper levels.
  */
 static void arena_free_pgtables(struct bpf_arena *arena)
 {
 	unsigned long start = bpf_arena_get_kern_vm_start(arena);
-	unsigned long end = start + SZ_4G + GUARD_SZ / 2;
+	unsigned long end = start + RECOVERY_SZ;
 	unsigned long area_start = (unsigned long)arena->kern_vm->addr;
 	unsigned long area_end = area_start + get_vm_area_size(arena->kern_vm);
 	unsigned long addr, i, nr = 0;
@@ -761,7 +910,7 @@ static void arena_map_free(struct bpf_map *map)
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
 	if (arena->scratch_pt)
-		arena_discard_pt(arena->scratch_pt);
+		pagetable_dtor_free(virt_to_ptdesc(arena->scratch_pt));
 	__free_page(arena->scratch_page);
 	bpf_map_area_free(arena);
 }
@@ -787,7 +936,8 @@ static u64 arena_map_mem_usage(const struct bpf_map *map)
 {
 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
 
-	return (u64)READ_ONCE(arena->nr_pages) << PAGE_SHIFT;
+	/* data pages and the PTE tables that map them; the scratch page and table are overhead */
+	return (READ_ONCE(arena->nr_pages) + READ_ONCE(arena->nr_pt_pages)) << PAGE_SHIFT;
 }
 
 struct vma_list {
@@ -850,6 +1000,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
 	struct mem_cgroup *new_memcg, *old_memcg;
 	LLIST_HEAD(pages);
+	LLIST_HEAD(tables);
 	struct page *page, *new_page = NULL;
 	struct apply_range_data data;
 	vm_fault_t fault_ret;
@@ -864,13 +1015,15 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 	if (!page && !(arena->map.map_flags & BPF_F_SEGV_ON_FAULT)) {
 		/*
 		 * Preallocate outside the lock so the allocation can reclaim;
-		 * __GFP_RETRY_MAYFAIL keeps the OOM killer out of it.
+		 * __GFP_RETRY_MAYFAIL keeps the OOM killer out of it. The same
+		 * goes for the PTE table the page may need.
 		 */
 		bpf_map_memcg_enter(&arena->map, &old_memcg, &new_memcg);
 		new_page = alloc_pages_node(map->numa_node,
 					    GFP_KERNEL | __GFP_ZERO |
 					    __GFP_ACCOUNT | __GFP_NOWARN |
 					    __GFP_RETRY_MAYFAIL, 0);
+		arena_prealloc_pts(arena, kaddr, kaddr + PAGE_SIZE, &tables);
 		bpf_map_memcg_exit(old_memcg, new_memcg);
 	}
 
@@ -882,6 +1035,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		 */
 		if (new_page)
 			free_pages_nolock(new_page, 0);
+		arena_free_pts(&tables);
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -936,7 +1090,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 	data.pages = &pages;
 	data.i = 0;
 
-	ret = arena_walk_ptes(arena, kaddr, kaddr + PAGE_SIZE, true, apply_range_set_cb, &data);
+	ret = arena_walk_ptes(arena, kaddr, kaddr + PAGE_SIZE, &tables, apply_range_set_cb, &data);
 	if (ret) {
 		llist_del_first(&pages);
 		range_tree_set(&arena->rt, vmf->pgoff, 1);
@@ -953,6 +1107,7 @@ out:
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 	if (new_page)
 		free_pages_nolock(new_page, 0);
+	arena_free_pts(&tables);
 
 	/*
 	 * A free clears the kernel pte and then takes the page lock before it
@@ -976,6 +1131,7 @@ out_err_locked:
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 	if (new_page)
 		free_pages_nolock(new_page, 0);
+	arena_free_pts(&tables);
 	return fault_ret;
 }
 
@@ -1130,6 +1286,7 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	struct mem_cgroup *new_memcg, *old_memcg;
 	struct apply_range_data data;
 	LLIST_HEAD(pages);
+	LLIST_HEAD(tables);
 	long mapped = 0;
 	unsigned long flags;
 	long pgoff = 0;
@@ -1158,6 +1315,29 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	if (ret)
 		goto out_memcg;
 
+	if (sleepable) {
+		/*
+		 * Preallocate the PTE tables the range may need, like the pages.
+		 * The address-less variant learns its range only under the lock:
+		 * ask the range tree where the pages would land now. The answer
+		 * can change before the walk runs, so the count is a hint; the
+		 * walk falls back to the non-blocking allocator if it runs dry.
+		 */
+		long peek = pgoff;
+
+		if (!uaddr) {
+			if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
+				goto out_free_pages;
+			peek = range_tree_find(&arena->rt, page_cnt);
+			raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+		}
+		if (peek >= 0) {
+			u64 start = kern_vm_start + (u32)(arena->user_vm_start + peek * PAGE_SIZE);
+
+			arena_prealloc_pts(arena, start, start + (page_cnt << PAGE_SHIFT), &tables);
+		}
+	}
+
 	data.arena = arena;
 	data.pages = &pages;
 	data.i = 0;
@@ -1182,7 +1362,7 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	 * lower 32-bit and it's ok.
 	 */
 	ret = arena_walk_ptes(arena, kern_vm_start + uaddr32,
-			      kern_vm_start + uaddr32 + (page_cnt << PAGE_SHIFT), true,
+			      kern_vm_start + uaddr32 + (page_cnt << PAGE_SHIFT), &tables,
 			      apply_range_set_cb, &data);
 	mapped = data.i;
 	if (ret)
@@ -1207,6 +1387,8 @@ out_free_pages:
 	bpf_free_pages(&pages);
 
 out_memcg:
+	/* the tables the walk did not need */
+	arena_free_pts(&tables);
 	bpf_map_memcg_exit(old_memcg, new_memcg);
 
 	return addr;
@@ -1310,7 +1492,7 @@ static int arena_free_range(struct bpf_arena *arena, long uaddr, long page_cnt)
 	cdata.arena = arena;
 	cdata.free_pages = &free_pages;
 	/* clear ptes and collect struct pages */
-	arena_walk_ptes(arena, kaddr, kaddr + (page_cnt << PAGE_SHIFT), false,
+	arena_walk_ptes(arena, kaddr, kaddr + (page_cnt << PAGE_SHIFT), NULL,
 			apply_range_clear_cb, &cdata);
 
 	/* drop the lock to do the tlb flush and zap pages */
@@ -1591,7 +1773,8 @@ bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned lon
 	if (page_addr < kbase || page_addr >= kbase + RECOVERY_SZ)
 		return false;
 
-	arena_install_scratch(arena, page_addr);
+	if (!arena_install_scratch(arena, page_addr))
+		return false;
 	flush_vmap_cache(page_addr, PAGE_SIZE);
 	__bpf_prog_report_arena_violation(prog, is_write, page_addr - kbase, fault_ip);
 	return true;
