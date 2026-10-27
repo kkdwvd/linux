@@ -1094,6 +1094,58 @@ static inline void flush_tlb_before_set(unsigned long addr)
 }
 #endif
 
+#ifndef pmdp_try_clear
+/**
+ * pmdp_try_clear - atomically clear a kernel PMD entry that still holds @old
+ * @pmdp: page middle directory entry
+ * @old: the value the caller observed in *@pmdp
+ *
+ * Set *@pmdp to none iff it still holds @old. Return true on success, false if
+ * the entry changed. This is the break half of a break-before-make replacement
+ * of a PTE table installed by pmdp_try_populate_kernel(): the caller follows a
+ * successful clear with flush_tlb_before_set_range() over the entry's range
+ * before installing the new table.
+ *
+ * For special kernel page tables only - never user page tables, and never a
+ * leaf (huge) entry. The caller must prevent concurrent teardown of @pmdp.
+ *
+ * Architectures with a lockless installer (pmdp_try_populate_kernel()) provide
+ * a cmpxchg-based override and define pmdp_try_clear as an identity macro. The
+ * generic version is a plain compare and clear, which is only correct when the
+ * caller serializes every writer of the entry.
+ */
+static inline bool pmdp_try_clear(pmd_t *pmdp, pmd_t old)
+{
+	pmd_t pmd = pmdp_get(pmdp); /* pmd_val() wants an lvalue on m68k */
+
+	if (pmd_val(pmd) != pmd_val(old))
+		return false;
+	pmd_clear(pmdp);
+	return true;
+}
+#endif
+
+#ifndef flush_tlb_before_set_range
+/**
+ * flush_tlb_before_set_range - invalidate a cleared kernel PMD's translations
+ * @start: start of the virtual range the cleared entry covered
+ * @end: end of that range
+ *
+ * The range counterpart of flush_tlb_before_set(): called after a PTE table
+ * was detached from a kernel PMD with pmdp_try_clear() and before a different
+ * table is installed in its place. Architectures that mandate break-before-make
+ * for page-table entries (e.g. arm64) invalidate every translation of the
+ * range, including walk-cache entries for the detached table; the generic
+ * version does nothing.
+ *
+ * This is only for the kernel page-table installers that use
+ * pmdp_try_populate_kernel(). It must be callable with interrupts disabled.
+ */
+static inline void flush_tlb_before_set_range(unsigned long start, unsigned long end)
+{
+}
+#endif
+
 #ifndef wrprotect_ptes
 /**
  * wrprotect_ptes - Write-protect PTEs that map consecutive pages of the same

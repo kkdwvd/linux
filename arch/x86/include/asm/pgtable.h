@@ -1296,6 +1296,15 @@ static inline bool ptep_try_set(pte_t *ptep, pte_t new_pte)
 }
 #define ptep_try_set ptep_try_set
 
+#ifdef CONFIG_X86_64
+/* Break half of break-before-make for a table installed by pmdp_try_populate_kernel(). */
+static inline bool pmdp_try_clear(pmd_t *pmdp, pmd_t old)
+{
+	return try_cmpxchg(&pmdp->pmd, &old.pmd, (pmdval_t)0);
+}
+#define pmdp_try_clear pmdp_try_clear
+#endif
+
 #define flush_tlb_fix_spurious_fault(vma, address, ptep) do { } while (0)
 
 #define  __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
