@@ -65,6 +65,8 @@ struct bpf_arena {
 	u64 user_vm_end;
 	struct vm_struct *kern_vm;
 	struct page *scratch_page;
+	/* a PTE table whose every entry maps scratch_page, see arena_install_scratch() */
+	pte_t *scratch_pt;
 	struct range_tree rt;
 	/* protects rt and nr_pages */
 	rqspinlock_t spinlock;
@@ -255,6 +257,91 @@ static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
 }
 
 /*
+ * PTE tables.
+ *
+ * The arena allocates its own PTE tables: plain zeroed pages with the page-table
+ * constructor applied, charged to the map's memcg like its data pages. They are
+ * never freed before the map is destroyed, so a table named by a PMD entry can
+ * be used without holding anything.
+ */
+/* Until PTE tables go on demand, only the scratch table is allocated this way. */
+#ifdef pmdp_try_populate_kernel
+static pte_t *arena_alloc_pt(struct bpf_arena *arena, bool sleepable)
+{
+	struct page *page = bpf_alloc_page(arena->map.numa_node, sleepable);
+	struct ptdesc *ptdesc;
+
+	if (!page)
+		return NULL;
+	ptdesc = page_ptdesc(page);
+	/* init_mm tables have no split ptlock, so the constructor cannot fail */
+	pagetable_pte_ctor(&init_mm, ptdesc);
+	ptdesc_set_kernel(ptdesc);
+	return ptdesc_address(ptdesc);
+}
+#endif
+
+/*
+ * Free a table that was never installed, or that was detached from its PMD
+ * entry and whose translations were flushed. Safe in any context, like the
+ * allocation.
+ */
+static void arena_discard_pt(pte_t *pt)
+{
+	struct ptdesc *ptdesc = virt_to_ptdesc(pt);
+
+	pagetable_dtor(ptdesc);
+	ptdesc_clear_kernel(ptdesc);
+	free_pages_nolock(ptdesc_page(ptdesc), 0);
+}
+
+/*
+ * A PMD slot of the band is in one of three states: none, holding the arena's
+ * scratch table, or holding a real table. The scratch table maps every page of
+ * its slot to the scratch page. Kernel-fault recovery installs it into a none
+ * slot, which keeps that path allocation-free: it runs from any context,
+ * including NMI, under memory exhaustion and with the arena lock held, and must
+ * never oops. The price is that one stray kernel access to an empty slot now
+ * backs 2 MB with scratch rather than one page; nothing real can live there,
+ * because a real page is only ever installed into a real table.
+ */
+static bool arena_pmd_is_scratch(struct bpf_arena *arena, pmd_t pmd)
+{
+	return (pte_t *)pmd_page_vaddr(pmd) == arena->scratch_pt;
+}
+
+/*
+ * The scratch table exists where the fault handler can install it, which is
+ * where pmdp_try_populate_kernel() is the lockless installer. Elsewhere a none
+ * slot is never hit by a recovered kernel access, either because the fault
+ * handler is not reached at all or because every table is populated at map
+ * creation, and scratch_pt stays NULL. The table is filled with set_pte(), the
+ * writer those architectures use for their own not-yet-live tables; it is not
+ * generic (powerpc, sparc64 and 32-bit arm only provide set_ptes()), hence the
+ * same #ifdef as the installer.
+ */
+static int arena_alloc_scratch_pt(struct bpf_arena *arena)
+{
+#ifdef pmdp_try_populate_kernel
+	pte_t pteval = mk_pte(arena->scratch_page, PAGE_KERNEL);
+	unsigned long i;
+
+	arena->scratch_pt = arena_alloc_pt(arena, true);
+	if (!arena->scratch_pt)
+		return -ENOMEM;
+	for (i = 0; i < PTRS_PER_PTE; i++)
+		set_pte(&arena->scratch_pt[i], pteval);
+	/*
+	 * The table is published much later, by the atomic PMD install in the
+	 * fault handler, which orders these stores before the entry becomes
+	 * visible. Make that explicit here, where the table is filled.
+	 */
+	smp_wmb();
+#endif
+	return 0;
+}
+
+/*
  * Page-table walks.
  *
  * The arena writes the PTEs of its band itself, under its spinlock or, for the
@@ -311,15 +398,72 @@ static int arena_walk_slot(pte_t *table, unsigned long addr, unsigned long end,
 }
 
 /*
- * Call @fn on every PTE of [start, end), one PMD slot at a time. A slot without
- * a PTE table is skipped, or fails the walk with -ENOMEM when @create is set,
- * which the callers that map pages rely on to not lose any. Neither can happen
- * while every table is populated at map creation.
+ * Make the slot of @addr hold a real PTE table and return it, or NULL if none
+ * could be found. A new table comes from @tables, preallocated by the caller.
+ *
+ * Runs under the arena spinlock. The only writer of PMD entries that does not
+ * take the lock is the kernel-fault handler, and it only turns a none slot into
+ * a scratch slot. So a real table, once seen, stays; a none slot is filled with
+ * a none->table exchange and the loop re-reads the slot if a concurrent fault
+ * won; and a scratch slot is replaced with break-before-make: a scratch->none
+ * exchange, a flush of the slot's translations where the architecture needs
+ * one (arm64), then the install. x86 cannot flush a kernel range with
+ * interrupts disabled and does not try: its stale translations only exist
+ * after the program already touched the slot by mistake, and the only
+ * consequence is that the misbehaving program may see scratch instead of its
+ * real pages in this slot until the entries are evicted, as with the per-PTE
+ * replacement in apply_range_set_cb(). A deferred flush could close that
+ * window later. The loop ends because every iteration makes progress unless a
+ * concurrent fault re-installed scratch, which requires the misbehaving
+ * program to keep faulting.
+ */
+static pte_t *arena_ensure_pt(struct bpf_arena *arena, pmd_t *pmdp, unsigned long addr,
+			      struct llist_head *tables)
+{
+	unsigned long slot = addr & PMD_MASK;
+	struct llist_node *node;
+	pte_t *new;
+	pmd_t pmd;
+
+	pmd = pmdp_get(pmdp);
+	if (!pmd_none(pmd) && !arena_pmd_is_scratch(arena, pmd))
+		return (pte_t *)pmd_page_vaddr(pmd);
+
+	node = tables ? llist_del_first(tables) : NULL;
+	if (!node)
+		return NULL;
+	new = page_address(llist_entry(node, struct page, pcp_llist));
+
+	for (;;) {
+		if (pmd_none(pmd)) {
+			if (pmdp_try_populate_kernel(&init_mm, pmdp, new))
+				return new;
+		} else if (WARN_ON_ONCE(!arena_pmd_is_scratch(arena, pmd))) {
+			/* a real table cannot appear under the lock; give the page back */
+			llist_add(node, tables);
+			return (pte_t *)pmd_page_vaddr(pmd);
+		} else if (pmdp_try_clear(pmdp, pmd)) {
+			flush_tlb_before_set_range(slot, slot + PMD_SIZE);
+		}
+		pmd = pmdp_get(pmdp);
+	}
+}
+
+/*
+ * Call @fn on every PTE of [start, end), one PMD slot at a time. Without
+ * @create, slots that hold no real table are skipped: a none slot has nothing
+ * to visit, and the scratch table must not be visited at all, as clearing its
+ * entries would corrupt it for every other slot it serves. With @create, such
+ * a slot gets a real table first, see arena_ensure_pt(); no table is available
+ * yet, so that fails with -ENOMEM, which the callers that map pages rely on to
+ * not lose any. Neither state arises while every table is populated at map
+ * creation.
  */
 static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigned long end,
 			   bool create, arena_pte_fn_t fn, void *data)
 {
 	unsigned long addr = start, next;
+	pte_t *table;
 	int err;
 
 	do {
@@ -329,13 +473,17 @@ static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigne
 		next = pmd_addr_end(addr, end);
 		if (!pmdp)
 			return -EINVAL;
-		pmd = pmdp_get(pmdp);
-		if (pmd_none(pmd)) {
-			if (create)
+		if (create) {
+			table = arena_ensure_pt(arena, pmdp, addr, NULL);
+			if (!table)
 				return -ENOMEM;
-			continue;
+		} else {
+			pmd = pmdp_get(pmdp);
+			if (pmd_none(pmd) || arena_pmd_is_scratch(arena, pmd))
+				continue;
+			table = (pte_t *)pmd_page_vaddr(pmd);
 		}
-		err = arena_walk_slot((pte_t *)pmd_page_vaddr(pmd), addr, next, fn, data);
+		err = arena_walk_slot(table, addr, next, fn, data);
 		if (err)
 			return err;
 	} while (addr = next, addr != end);
@@ -344,8 +492,12 @@ static int arena_walk_ptes(struct bpf_arena *arena, unsigned long start, unsigne
 
 /*
  * The page mapped at kernel address @addr, or NULL. Replaces vmalloc_to_page()
- * for the arena: the same answer today, but the lookup is arena-owned so that
- * it can tell the arena's own page-table states apart later.
+ * for the arena, which cannot tell the arena's page-table states apart: a
+ * scratch slot is reported as unmapped (NULL), not as the scratch page, so that
+ * a user fault there proceeds with its lazy allocation instead of treating the
+ * whole slot as poisoned. Only a per-PTE scratch entry in a real table is
+ * reported as the scratch page, which keeps the page poisoned for user faults
+ * as before.
  */
 static struct page *arena_lookup_page(struct bpf_arena *arena, unsigned long addr)
 {
@@ -356,13 +508,23 @@ static struct page *arena_lookup_page(struct bpf_arena *arena, unsigned long add
 	if (!pmdp)
 		return NULL;
 	pmd = pmdp_get(pmdp);
-	if (pmd_none(pmd))
+	if (pmd_none(pmd) || arena_pmd_is_scratch(arena, pmd))
 		return NULL;
 	pte = ptep_get(arena_pte_offset(pmd, addr));
 	return pte_present(pte) ? pte_page(pte) : NULL;
 }
 
-/* Kernel-fault recovery: back the faulting page with the scratch page. */
+/*
+ * Kernel-fault recovery: back the faulting page with the scratch page. Lockless
+ * and allocation-free, from any context. A slot without a table gets the whole
+ * scratch table; a slot with a real table gets a scratch PTE. Either install is
+ * best effort: losing the race to another installer (a real allocation or a
+ * concurrent fault) is fine, because the winner's entry is valid too and the
+ * access retry succeeds. Seeing the scratch table already in place is fine as
+ * well: the fault came from a stale "not mapped" TLB entry or a lost race, and
+ * the retry resolves it. No TLB flush: stale "not mapped" entries just cause
+ * one extra re-fault through this same path.
+ */
 static void arena_install_scratch(struct bpf_arena *arena, unsigned long addr)
 {
 	pmd_t *pmdp = arena_pmd_offset(addr);
@@ -372,19 +534,23 @@ static void arena_install_scratch(struct bpf_arena *arena, unsigned long addr)
 	if (!pmdp)
 		return;
 	pmd = pmdp_get(pmdp);
-	if (pmd_none(pmd))
+	if (pmd_none(pmd)) {
+#ifdef pmdp_try_populate_kernel
+		pmdp_try_populate_kernel(&init_mm, pmdp, arena->scratch_pt);
+#endif
+		/*
+		 * Without an atomic installer there is no scratch table either,
+		 * and none is needed: a none slot is never hit by a recovered
+		 * kernel access here, because the fault handler is either not
+		 * reached at all or every table is populated at map creation.
+		 */
+		return;
+	}
+	if (arena_pmd_is_scratch(arena, pmd))
 		return;
 	pte = arena_pte_offset(pmd, addr);
 	if (!pte_none(ptep_get(pte)))
 		return;
-	/*
-	 * Best-effort install. ptep_try_set() returns false only if another
-	 * installer (real allocation or concurrent fault) won the cmpxchg.
-	 * Their PTE is already valid, so the access retry succeeds.
-	 *
-	 * No flush_tlb_kernel_range() needed. Stale "not mapped" entries just
-	 * cause one extra re-fault through this same path.
-	 */
 	ptep_try_set(pte, mk_pte(arena->scratch_page, PAGE_KERNEL));
 }
 
@@ -447,11 +613,14 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	arena->scratch_page = bpf_alloc_page(NUMA_NO_NODE, true);
 	if (!arena->scratch_page)
 		goto err_free_arena;
+	err = arena_alloc_scratch_pt(arena);
+	if (err)
+		goto err_free_scratch;
 
 	range_tree_init(&arena->rt);
 	err = range_tree_set(&arena->rt, 0, attr->max_entries);
 	if (err)
-		goto err_free_scratch;
+		goto err_free_scratch_pt;
 	mutex_init(&arena->lock);
 	mutex_init(&arena->zap_mutex);
 	raw_res_spin_lock_init(&arena->spinlock);
@@ -463,6 +632,9 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 
 err_destroy_rt:
 	range_tree_destroy(&arena->rt);
+err_free_scratch_pt:
+	if (arena->scratch_pt)
+		arena_discard_pt(arena->scratch_pt);
 err_free_scratch:
 	__free_page(arena->scratch_page);
 err_free_arena:
@@ -544,6 +716,9 @@ static void arena_free_pgtables(struct bpf_arena *arena)
 			continue;
 		table = (pte_t *)pmd_page_vaddr(pmd);
 		pmd_clear(pmdp);
+		/* the scratch table is only detached here; the caller frees it once */
+		if (arena_pmd_is_scratch(arena, pmd))
+			continue;
 		if (tables) {
 			tables[nr++] = table;
 			continue;
@@ -585,6 +760,8 @@ static void arena_map_free(struct bpf_map *map)
 	arena_free_pgtables(arena);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
+	if (arena->scratch_pt)
+		arena_discard_pt(arena->scratch_pt);
 	__free_page(arena->scratch_page);
 	bpf_map_area_free(arena);
 }
