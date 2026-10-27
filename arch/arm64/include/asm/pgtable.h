@@ -1805,6 +1805,28 @@ static inline void flush_tlb_before_set(unsigned long addr)
 }
 #define flush_tlb_before_set flush_tlb_before_set
 
+#if CONFIG_PGTABLE_LEVELS > 2
+/* Break half of break-before-make for a table installed by pmdp_try_populate_kernel(). */
+static inline bool pmdp_try_clear(pmd_t *pmdp, pmd_t old)
+{
+	return try_cmpxchg(&pmd_val(*pmdp), &pmd_val(old), (pmdval_t)0);
+}
+#define pmdp_try_clear pmdp_try_clear
+#endif
+
+/*
+ * Break-before-make at table granularity: after a PTE table was detached from a
+ * kernel PMD, invalidate every translation it provided, including the walk-cache
+ * entry for the table itself, before another table takes its place. The
+ * non-last-level TLBI covers all levels (flush_tlb_kernel_range() would keep the
+ * walk-cache entry), and the broadcast TLBI is safe with interrupts disabled.
+ */
+static inline void flush_tlb_before_set_range(unsigned long start, unsigned long end)
+{
+	flush_tlb_kernel_pgtable_range(start, end);
+}
+#define flush_tlb_before_set_range flush_tlb_before_set_range
+
 #define test_and_clear_young_ptes test_and_clear_young_ptes
 static inline bool test_and_clear_young_ptes(struct vm_area_struct *vma,
 		unsigned long addr, pte_t *ptep, unsigned int nr)

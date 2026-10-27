@@ -73,6 +73,27 @@ static inline void pmd_populate_kernel_safe(struct mm_struct *mm,
 	set_pmd_safe(pmd, __pmd(__pa(pte) | _PAGE_TABLE));
 }
 
+#ifdef CONFIG_X86_64
+/*
+ * Lockless variant of pmd_populate_kernel() for the kernel page-table
+ * installers that pair with ptep_try_set(). The exchange compares against the
+ * value just read rather than against zero: pmd_none() tolerates stray
+ * accessed/dirty bits (_PAGE_KNL_ERRATUM_MASK), and a strict-zero compare
+ * could spin forever on such an entry.
+ */
+static inline bool pmdp_try_populate_kernel(struct mm_struct *mm, pmd_t *pmd,
+					    pte_t *pte)
+{
+	pmdval_t old = READ_ONCE(pmd->pmd);
+
+	if (!pmd_none(__pmd(old)))
+		return false;
+	paravirt_alloc_pte(mm, __pa(pte) >> PAGE_SHIFT);
+	return try_cmpxchg(&pmd->pmd, &old, __pa(pte) | _PAGE_TABLE);
+}
+#define pmdp_try_populate_kernel pmdp_try_populate_kernel
+#endif
+
 static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
 				struct page *pte)
 {

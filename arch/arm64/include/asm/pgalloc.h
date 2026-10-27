@@ -121,4 +121,32 @@ pmd_populate(struct mm_struct *mm, pmd_t *pmdp, pgtable_t ptep)
 		       PMD_TYPE_TABLE | PMD_TABLE_AF | PMD_TABLE_PXN);
 }
 
+#if CONFIG_PGTABLE_LEVELS > 2
+/*
+ * Lockless variant of pmd_populate_kernel() for the kernel page-table
+ * installers that pair with ptep_try_set(). Two-level configurations keep
+ * their (folded) PMD entries in swapper_pg_dir, which is read-only and written
+ * through the fixmap under a lock, so they have no lockless installer.
+ */
+static inline bool pmdp_try_populate_kernel(struct mm_struct *mm, pmd_t *pmdp,
+					    pte_t *ptep)
+{
+	pmdval_t old = 0;
+	pmdval_t new = __phys_to_pmd_val(__pa(ptep)) |
+		       PMD_TYPE_TABLE | PMD_TABLE_AF | PMD_TABLE_UXN;
+
+	if (!try_cmpxchg(&pmd_val(*pmdp), &old, new))
+		return false;
+
+	/*
+	 * The table must be visible to the walker on return, and the caller may
+	 * be in lazy MMU mode, where set_pmd() would defer the barriers. Issue
+	 * them directly, as ptep_try_set() does.
+	 */
+	emit_pte_barriers();
+	return true;
+}
+#define pmdp_try_populate_kernel pmdp_try_populate_kernel
+#endif	/* CONFIG_PGTABLE_LEVELS > 2 */
+
 #endif
