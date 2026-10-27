@@ -1094,6 +1094,23 @@ static inline void flush_tlb_before_set(unsigned long addr)
 }
 #endif
 
+#ifndef flush_tlb_kernel_pgtable_range
+/*
+ * flush_tlb_kernel_pgtable_range - invalidate a kernel range whose PTE tables
+ * were detached
+ * @start: start of the range
+ * @end: end of the range
+ *
+ * After the PTE tables mapping [@start, @end) were detached from their PMD
+ * entries and before they are freed or replaced: invalidate the leaf
+ * translations of the range and the walk-cache (paging-structure-cache)
+ * entries that name the detached tables. flush_tlb_kernel_range() does both on
+ * most architectures; the ones where it is a last-level invalidation (arm64)
+ * override this.
+ */
+#define flush_tlb_kernel_pgtable_range(start, end) flush_tlb_kernel_range(start, end)
+#endif
+
 #ifndef wrprotect_ptes
 /**
  * wrprotect_ptes - Write-protect PTEs that map consecutive pages of the same

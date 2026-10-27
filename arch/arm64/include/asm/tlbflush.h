@@ -165,6 +165,11 @@ static __always_inline void vaale1is(u64 arg)
 	__tlbi(vaale1is, arg);
 }
 
+static __always_inline void vaae1is(u64 arg)
+{
+	__tlbi(vaae1is, arg);
+}
+
 static __always_inline void ipas2e1(u64 arg)
 {
 	__tlbi(ipas2e1, arg);
@@ -470,6 +475,11 @@ static __always_inline void rvaale1is(u64 arg)
 	__tlbi(rvaale1is, arg);
 }
 
+static __always_inline void rvaae1is(u64 arg)
+{
+	__tlbi(rvaae1is, arg);
+}
+
 static __always_inline void ripas2e1is(u64 arg)
 {
 	__tlbi(ripas2e1is, arg);
@@ -696,6 +706,36 @@ static inline void __flush_tlb_kernel_pgtable(unsigned long kaddr)
 	__tlbi_sync_s1ish_kernel();
 	isb();
 }
+
+/*
+ * The range form of __flush_tlb_kernel_pgtable(): invalidate every translation
+ * of [start, end), leaf and intermediate, after the PTE tables mapping the range
+ * were detached from their kernel PMDs and before they are replaced or freed.
+ * flush_tlb_kernel_range() would not do: its last-level invalidation leaves the
+ * walk-cache entries that point at the detached tables in place.
+ */
+static inline void flush_tlb_kernel_pgtable_range(unsigned long start, unsigned long end)
+{
+	const unsigned long stride = PAGE_SIZE;
+	unsigned long pages;
+
+	start = round_down(start, stride);
+	end = round_up(end, stride);
+	pages = (end - start) >> PAGE_SHIFT;
+
+	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_NXP_ERR050104) ||
+	    __flush_tlb_range_limit_excess(pages, stride)) {
+		flush_tlb_all();
+		return;
+	}
+
+	dsb(ishst);
+	__flush_s1_tlb_range_op(vaae1is, start, pages, stride, 0,
+				TLBI_TTL_UNKNOWN);
+	__tlbi_sync_s1ish_kernel();
+	isb();
+}
+#define flush_tlb_kernel_pgtable_range flush_tlb_kernel_pgtable_range
 
 static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
 		struct mm_struct *mm, unsigned long start, unsigned long end)
