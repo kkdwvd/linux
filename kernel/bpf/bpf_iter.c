@@ -5,6 +5,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/filter.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/rcupdate_trace.h>
 
 struct bpf_iter_target_info {
@@ -733,11 +734,32 @@ int bpf_iter_run_prog(struct bpf_prog *prog, void *ctx)
 	return ret == 0 ? 0 : -EAGAIN;
 }
 
-BPF_CALL_4(bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
+/*
+ * The op has a pad for the callback and leaves like a callback does when it is
+ * taken, so it is called like one, with the kCFI check for its own type. The
+ * verifier calls the op directly when it knows the map.
+ */
+BPF_CB_PAD_TYPE(__bpf_for_each_op, typeof(*((struct bpf_map_ops *)0)->map_for_each_callback));
+
+BPF_CALL_x(4, noinline notrace, bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
 	   void *, callback_ctx, u64, flags)
 {
+#if BPF_HAS_CB_PADS
+	u64 ret;
+
+	__bpf_call_cb(__bpf_for_each_op, map->ops->map_for_each_callback, map, callback_fn,
+		      callback_ctx, flags, 0, ret, unwound);
+	return ret;
+
+unwound:
+	bpf_unwind_leave();
+	return ret;
+#else
+	/* The plain call, with the type of the op: the fallback of bpf_call_cb() has a callback's */
 	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx, flags);
+#endif
 }
+NOKPROBE_SYMBOL(bpf_for_each_map_elem);
 
 const struct bpf_func_proto bpf_for_each_map_elem_proto = {
 	.func		= bpf_for_each_map_elem,
@@ -749,7 +771,7 @@ const struct bpf_func_proto bpf_for_each_map_elem_proto = {
 	.arg4_type	= ARG_ANYTHING,
 };
 
-BPF_CALL_4(bpf_loop, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
+BPF_CALL_x(4, noinline notrace, bpf_loop, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
 	   u64, flags)
 {
 	bpf_callback_t callback = (bpf_callback_t)callback_fn;
@@ -766,14 +788,20 @@ BPF_CALL_4(bpf_loop, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
 		return -E2BIG;
 
 	for (i = 0; i < nr_loops; i++) {
-		ret = callback((u64)i, (u64)(long)callback_ctx, 0, 0, 0);
+		bpf_call_cb(callback, i, callback_ctx, 0, 0, 0, ret, unwound);
 		/* return value: 0 - continue, 1 - stop and return */
 		if (ret)
 			return i + 1;
 	}
 
 	return i;
+
+unwound:
+	/* The callback left with unwind_exit: the loop is over, and so is the helper */
+	bpf_unwind_leave();
+	return ret;
 }
+NOKPROBE_SYMBOL(bpf_loop);
 
 const struct bpf_func_proto bpf_loop_proto = {
 	.func		= bpf_loop,

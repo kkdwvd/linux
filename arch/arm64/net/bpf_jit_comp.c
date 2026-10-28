@@ -81,6 +81,8 @@ struct jit_ctx {
 	int epilogue_offset;
 	int *offset;
 	int exentry_idx;
+	int *landing_ex;	/* the extable entry of each landing, see build_landings() */
+	int landing_idx;
 	int nr_used_callee_reg;
 	u8 used_callee_reg[8]; /* r6~r9, fp, arena_vm_start */
 	__le32 *image;
@@ -1227,19 +1229,24 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
+/* unwind_goto after the call of a helper or a kfunc, which return r0 in x0 alone */
+static bool unwind_goto_after_helper(const struct bpf_insn *insn)
+{
+	const struct bpf_insn *call = insn - 1;
+
+	return call->code == (BPF_JMP | BPF_CALL) && call->src_reg != BPF_PSEUDO_CALL;
+}
+
 /*
  * There is no branch for unwind_goto, only an extable entry
- *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }
- * where ret_addr is the return address of the call in front of it. unwind_exit
- * adds .fixup to its LR.
+ *   { .insn = ret_addr - 1, .fixup = target - ret_addr }
+ * where ret_addr is the return address of the call in front of it, and target
+ * the pad, or the way into it. unwind_exit adds .fixup to its LR.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
- * 'bl foo; mov x8, x0' is in front of unwind_goto. The pad doesn't miss the mov:
- * r0 is x8 and the epilogue of the callee copies it to x0 and leaves x8 as it is.
  */
-static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
+static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
 {
-	int ret_addr = ctx->idx - 1;
 	struct exception_table_entry *ex;
 	off_t ins_offset;
 
@@ -1259,23 +1266,79 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 	/* switch ex to rw buffer for writing */
 	ex = (void *)ctx->image + ((void *)ex - (void *)ctx->ro_image);
 	ex->insn = ins_offset;
-	ex->fixup = (ctx->offset[pad] - ret_addr) * AARCH64_INSN_SIZE;
+	ex->fixup = (target - ret_addr) * AARCH64_INSN_SIZE;
 	ex->type = EX_TYPE_BPF;
 
 	ctx->exentry_idx++;
 	return 0;
 }
 
-static long bpf_unwind_fixup(u64 lr)
+/*
+ * The landings of the pads after the calls of helpers and kfuncs, past the
+ * epilogue, where nothing falls into them: 'mov x8, x0; b pad' each, see the
+ * unwind_goto case of build_insn(). They go in after the body, when the pads
+ * are placed and the entries are in, and each fills in the fixup of its entry.
+ */
+static int build_landings(struct jit_ctx *ctx)
+{
+	const struct bpf_prog *prog = ctx->prog;
+	int i, k = 0;
+
+	for (i = 1; i < prog->len; i++) {
+		const struct bpf_insn *insn = &prog->insnsi[i];
+		int ret_addr, jmp_offset;
+
+		if (!bpf_is_unwind_goto(insn) || !unwind_goto_after_helper(insn))
+			continue;
+		ret_addr = ctx->offset[i] - 1;
+		if (ctx->image) {
+			struct exception_table_entry *ex;
+
+			ex = &prog->aux->extable[ctx->landing_ex[k]];
+			ex = (void *)ctx->image + ((void *)ex - (void *)ctx->ro_image);
+			ex->fixup = (ctx->idx - ret_addr) * AARCH64_INSN_SIZE;
+		}
+		k++;
+		emit(A64_MOV(1, bpf2a64[BPF_REG_0], A64_R(0)), ctx);
+		jmp_offset = ctx->offset[i + 1 + insn->off] - ctx->idx;
+		check_imm26(jmp_offset);
+		emit(A64_B(jmp_offset), ctx);
+	}
+	return 0;
+}
+
+/*
+ * The verifier made sure that unwind_goto follows a call in a prog. When the
+ * kernel called an async callback, it's exit. A helper that calls a callback
+ * has a pad when it wants one, see bpf_call_cb().
+ */
+u64 bpf_unwind_target(u64 ret_addr)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - 1);
+	e = search_bpf_extables(ret_addr - 1);
+	if (e)
+		return ret_addr + e->fixup;
 	/*
-	 * The verifier made sure that unwind_goto follows a call in a prog. When
-	 * the kernel called an async callback, it's exit.
+	 * The pad of a helper that called a callback with bpf_call_cb(): its
+	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
+	 * Anything else at a return address is some caller's own fixup, and
+	 * what a JIT keyed there is a fixup of the insn after the call.
 	 */
-	return e ? e->fixup : 0;
+	e = search_kernel_exception_table(ret_addr);
+	if (!e)
+		e = search_module_extables(ret_addr);
+	if (e && e->type == EX_TYPE_BPF)
+		return (unsigned long)&e->fixup + e->fixup;
+	return ret_addr;
+}
+
+/* The offset that the epilogue adds to LR once it is authenticated */
+static long bpf_unwind_fixup(u64 lr)
+{
+	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
+
+	return bpf_unwind_target(ret_addr) - ret_addr;
 }
 
 /*
@@ -1879,10 +1942,27 @@ emit_cond_jmp:
 		break;
 	/* unwind_goto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
-		ret = add_unwind_exentry(ctx, i + 1 + off);
+	{
+		int ret_addr = ctx->idx - 1;
+		int target = ctx->offset[i + 1 + off];
+
+		/*
+		 * 'bl foo; mov x8, x0' is in front. After the call of a subprog
+		 * the pad doesn't miss the mov: r0 is x8 in the subprog too, its
+		 * epilogue copies x8 to x0 and leaves x8 as it is. A helper that
+		 * leaves to the pad returns r0 in x0 alone, so the pad after its
+		 * call is entered through a landing past the epilogue, see
+		 * build_landings(), which fills in the fixup of the entry.
+		 */
+		if (unwind_goto_after_helper(insn)) {
+			ctx->landing_ex[ctx->landing_idx++] = ctx->exentry_idx;
+			target = ret_addr;
+		}
+		ret = add_unwind_exentry(ctx, ret_addr, target);
 		if (ret)
 			return ret;
 		break;
+	}
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
 		if (bpf_is_unwind_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
@@ -2320,7 +2400,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	u8 *ro_image_ptr;
 	int body_idx;
 	int exentry_idx;
+	int nr_landings = 0;
 	int out_cnt;
+	int i;
 
 	if (!prog->jit_requested)
 		return prog;
@@ -2365,6 +2447,16 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	if (ctx.offset == NULL)
 		goto out_off;
 
+	for (i = 1; i < prog->len; i++)
+		if (bpf_is_unwind_goto(&prog->insnsi[i]) &&
+		    unwind_goto_after_helper(&prog->insnsi[i]))
+			nr_landings++;
+	if (nr_landings) {
+		ctx.landing_ex = kvzalloc_objs(int, nr_landings);
+		if (ctx.landing_ex == NULL)
+			goto out_off;
+	}
+
 	if (bpf_prog_uses_arena_insns(prog)) {
 		ctx.user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 		ctx.arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
@@ -2394,6 +2486,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 
 	ctx.epilogue_offset = ctx.idx;
 	build_epilogue(&ctx, was_classic, false);
+	if (build_landings(&ctx))
+		goto out_off;
 	build_plt(&ctx);
 
 	extable_align = __alignof__(struct exception_table_entry);
@@ -2427,6 +2521,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 skip_init_ctx:
 	ctx.idx = 0;
 	ctx.exentry_idx = 0;
+	ctx.landing_idx = 0;
 	ctx.write = true;
 
 	build_prologue(&ctx, was_classic);
@@ -2442,6 +2537,7 @@ skip_init_ctx:
 
 	ctx.epilogue_offset = ctx.idx;
 	ctx.exentry_idx = exentry_idx;
+	ctx.landing_idx = 0;
 	ctx.idx = body_idx;
 	ctx.write = true;
 
@@ -2451,6 +2547,8 @@ skip_init_ctx:
 		goto out_free_hdr;
 
 	build_epilogue(&ctx, was_classic, false);
+	if (build_landings(&ctx))
+		goto out_free_hdr;
 	build_plt(&ctx);
 
 	/* Extra pass to validate JITed code. */
@@ -2492,8 +2590,6 @@ skip_init_ctx:
 	prog->jited_len = prog_size - cfi_get_offset();
 
 	if (!prog->is_func || extra_pass) {
-		int i;
-
 		/* offset[prog->len] is the size of program */
 		for (i = 0; i <= prog->len; i++)
 			ctx.offset[i] *= AARCH64_INSN_SIZE;
@@ -2511,6 +2607,7 @@ out_off:
 			prog->aux->priv_stack_ptr = NULL;
 		}
 		kvfree(ctx.offset);
+		kvfree(ctx.landing_ex);
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;
@@ -3569,6 +3666,8 @@ void bpf_jit_free(struct bpf_prog *prog)
 		 */
 		if (jit_data) {
 			bpf_jit_binary_pack_finalize(jit_data->ro_header, jit_data->header);
+			kvfree(jit_data->ctx.offset);
+			kvfree(jit_data->ctx.landing_ex);
 			kfree(jit_data);
 		}
 		prog->bpf_func = (void *)prog->bpf_func - cfi_get_offset();
