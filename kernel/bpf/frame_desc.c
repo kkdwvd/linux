@@ -89,6 +89,7 @@ struct scratch {
 	u16 nr_fixed[MAX_CALL_FRAMES];
 	u8 held_above[MAX_CALL_FRAMES];	/* HELD_* of the frames above each frame */
 	bool in_section[MAX_CALL_FRAMES];	/* a section is held by the frame or one above */
+	u32 consumed_refs[MAX_CALL_FRAMES]; /* references released by helper pads */
 };
 
 /* Make room for @nr_slots stack slots in the descriptor of insn @pc, which @b is or NULL. */
@@ -968,8 +969,9 @@ static int place_section(struct bpf_verifier_env *env, struct scratch *s, int f,
  * these are released in order: the verifier keeps locks and IRQ flags in
  * acquisition order, and the unwinder releases inner frames first, so the
  * ranks placed in a frame must all follow those of its callers. Every path
- * must place exactly the same entries in every frame. What the frames above
- * a frame hold limits what it may release, which held_above records.
+ * must place exactly the same entries in every frame. A callback unwinds
+ * through its helper's pad before its callers. Those callers still hold
+ * their resources during callback cleanup, which held_above records.
  */
 static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 {
@@ -1002,6 +1004,11 @@ static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 		struct bpf_frame_desc_build *b = s->builds[f];
 		size_t sz = s->nr_fixed[f] * sizeof(s->fixed[f][0]);
 
+		/* The helper's implicit RCU section lasts through callback cleanup. */
+		if (st->frame[f]->in_rcu_callback_fn) {
+			held |= HELD_SECTION;
+			section = true;
+		}
 		s->held_above[f] = held;
 		section |= st->frame[f]->rcu_locks || st->frame[f]->preempt_locks;
 		s->in_section[f] = section;
@@ -1136,6 +1143,17 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 	return -EINVAL;
 }
 
+/* Helper pads release their consumed references before unwinding their callers. */
+static bool callback_releases_ref(struct scratch *s, int curframe, int id)
+{
+	int f;
+
+	for (f = 1; f <= curframe; f++)
+		if (s->consumed_refs[f] == id)
+			return true;
+	return false;
+}
+
 /*
  * Record the state at a site where the program may be unwound. @regs_saved
  * says that the entry the unwinder is reached through saves R0-R9 of the
@@ -1143,6 +1161,9 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
  * its stack, as every caller frame does. Pointer locations must be live,
  * while stack-backed resources
  * remain live for cleanup until destroyed, as in verifier state pruning.
+ * Include callers below callback
+ * boundaries: a callback can change their resources before cancellation,
+ * and each helper pad resumes unwinding at that caller's call instruction.
  */
 static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 {
@@ -1162,6 +1183,12 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 		struct bpf_func_state *frame = st->frame[f];
 		u32 nr_slots = frame->allocated_stack / BPF_REG_SIZE;
 
+		s->consumed_refs[f] = 0;
+		if (f && frame->in_callback_fn) {
+			ret = bpf_check_callback_site(env, f, &s->consumed_refs[f]);
+			if (ret)
+				return ret;
+		}
 		s->pcs[f] = f == st->curframe ? env->insn_idx : st->frame[f + 1]->callsite;
 		s->live_regs[f] = env->insn_aux_data[s->pcs[f]].live_regs_before;
 		if (f != st->curframe || !regs_saved)
@@ -1182,7 +1209,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 		const struct bpf_reference_state *ref = &st->refs[i];
 		bool borrowed = false;
 
-		if (ref->type != REF_TYPE_PTR)
+		if (ref->type != REF_TYPE_PTR || callback_releases_ref(s, st->curframe, ref->id))
 			continue;
 		nr = 0;
 		for (f = 0; f <= st->curframe; f++) {
@@ -1460,6 +1487,36 @@ int bpf_frame_desc_emit_slots(struct bpf_verifier_env *env)
 			     env->insn_aux_data[i + delta + cnt - 2]);
 		env->ref_spills += cnt - 1;
 		delta += cnt - 1;
+	}
+	return 0;
+}
+
+/*
+ * The bpf_loop() call at insn @from was inlined: its callback is an ordinary
+ * callee now, called from insn @to, and the frame is unwound through there
+ * instead of stopping at the callback. The loop keeps R6, R7 and R8 in the
+ * stack slots from @r6_off up while it runs, so what the descriptor listed in
+ * those registers is listed in the slots.
+ */
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 from, u32 to, s16 r6_off)
+{
+	struct bpf_frame_desc_build *b = env->insn_aux_data[from].frame_desc;
+	int r;
+
+	if (!b)
+		return 0;
+	env->insn_aux_data[from].frame_desc = NULL;
+	env->insn_aux_data[to].frame_desc = b;
+	for (r = BPF_REG_6; r <= BPF_REG_8; r++) {
+		u32 spi = -(r6_off + (r - BPF_REG_6) * BPF_REG_SIZE) / BPF_REG_SIZE - 1;
+
+		if (b->regs[r].state != LOC_RES)
+			continue;
+		b = build_grow(env, to, b, spi + 1);
+		if (!b)
+			return -ENOMEM;
+		b->slots[spi] = b->regs[r];
+		b->regs[r].state = LOC_OTHER;
 	}
 	return 0;
 }
