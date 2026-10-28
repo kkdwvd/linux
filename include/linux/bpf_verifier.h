@@ -1303,6 +1303,7 @@ struct bpf_verifier_env {
 	struct bpf_ref_release *ref_releases;	/* releases, for the unique slots */
 	u32 ref_release_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
