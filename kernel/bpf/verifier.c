@@ -22228,6 +22228,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
 		env->peak_states, env->longest_mark_read_walk);
+	if (env->log.level & BPF_LOG_STATS)
+		verbose(env, "frame descriptors: sites %u visits %u classes %u bytes %u slots %u spills %u\n",
+			env->frame_desc_sites, env->frame_desc_visits,
+			env->frame_desc_pool ? env->frame_desc_pool->resource_cnt : env->resource_cnt,
+			env->frame_desc_bytes, env->ref_slots, env->ref_spills);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
