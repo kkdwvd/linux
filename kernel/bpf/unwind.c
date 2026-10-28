@@ -83,7 +83,7 @@ void bpf_frame_desc_pool_free(struct bpf_frame_desc_pool *pool)
  * Release the resource an entry describes, at run time. Not inlined so that
  * every release of an unwind can be observed by attaching to this function.
  */
-noinline void bpf_unwind_release(const struct bpf_resource *res, void *loc)
+noinline void bpf_unwind_release(const struct bpf_resource *res, void *loc, void *flags)
 {
 	void *obj;
 
@@ -93,6 +93,29 @@ noinline void bpf_unwind_release(const struct bpf_resource *res, void *loc)
 		return;
 	case BPF_RESOURCE_ITER:
 		res->dtor(loc);
+		return;
+	case BPF_RESOURCE_IRQ_FLAG:
+		bpf_local_irq_restore(loc);
+		return;
+	case BPF_RESOURCE_IRQ_FLAG_LOCK:
+		/* Restored together with the lock that saved it. */
+		return;
+	case BPF_RESOURCE_RCU:
+		bpf_rcu_read_unlock();
+		return;
+	case BPF_RESOURCE_PREEMPT:
+		bpf_preempt_enable();
+		return;
+	case BPF_RESOURCE_SPIN_LOCK:
+	case BPF_RESOURCE_RES_LOCK:
+	case BPF_RESOURCE_RES_LOCK_IRQ:
+		obj = loc ? *(void **)loc + res->delta : res->addr;
+		if (res->kind == BPF_RESOURCE_SPIN_LOCK)
+			bpf_spin_unlock_proto.func((u64)(long)obj, 0, 0, 0, 0);
+		else if (res->kind == BPF_RESOURCE_RES_LOCK)
+			bpf_res_spin_unlock(obj);
+		else
+			bpf_res_spin_unlock_irqrestore(obj, flags);
 		return;
 	default:
 		break;
@@ -134,6 +157,7 @@ void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
 {
 	const struct bpf_frame_desc_pool *pool = prog->aux->frame_desc_pool;
 	const struct bpf_frame_desc *d;
+	void *flags = NULL;
 	u32 i;
 
 	if (!prog->aux->frame_desc_table)
@@ -146,7 +170,15 @@ void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
 		const struct bpf_resource *res = &pool->resources[ent->res];
 		void *loc;
 		u64 reg;
+		int n;
 
+		if (ent->loc == BPF_FRAME_LOC_NONE) {
+			for (n = ent->off; n; n--)
+				bpf_unwind_release(res, NULL, flags);
+			if (res->kind == BPF_RESOURCE_RES_LOCK_IRQ)
+				flags = NULL;
+			continue;
+		}
 		if (ent->loc == BPF_FRAME_LOC_STACK) {
 			loc = (void *)(long)(fp + ent->off);
 		} else if (ent->off >= BPF_REG_6) {
@@ -160,7 +192,12 @@ void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
 				  prog->aux->name);
 			continue;
 		}
-		bpf_unwind_release(res, loc);
+		/* The flags of an irqsave lock precede the lock, which restores them. */
+		if (res->kind == BPF_RESOURCE_IRQ_FLAG_LOCK)
+			flags = loc;
+		bpf_unwind_release(res, loc, flags);
+		if (res->kind == BPF_RESOURCE_RES_LOCK_IRQ)
+			flags = NULL;
 	}
 }
 
