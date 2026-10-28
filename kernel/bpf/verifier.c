@@ -22302,8 +22302,9 @@ again:
  * for each program type the outcome that denies, drops or changes nothing.
  * A program with an exception callback of its own receives it as the cookie
  * and decides for itself, unless the cancellation hit inside that callback.
- * A struct_ops program cannot be cancelled, since the meaning of its return
- * value is the operator's.
+ * The meaning of a struct_ops program's return value is the operator's: it
+ * returns 0, and the struct_ops is told through its cancel hook, so only a
+ * struct_ops with the hook has cancellable programs.
  */
 static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
 {
@@ -22311,9 +22312,10 @@ static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
 	struct bpf_retval_range range;
 
 	*retval = 0;
+	if (resolve_prog_type(prog) == BPF_PROG_TYPE_STRUCT_OPS)
+		return prog->type == BPF_PROG_TYPE_STRUCT_OPS && prog->aux->st_ops &&
+		       prog->aux->st_ops->cancel;
 	switch (resolve_prog_type(prog)) {
-	case BPF_PROG_TYPE_STRUCT_OPS:
-		return false;
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 		*retval = TC_ACT_SHOT;
