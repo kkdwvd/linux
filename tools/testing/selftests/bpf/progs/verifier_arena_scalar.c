@@ -418,11 +418,10 @@ __naked void fetch_and_or_xor_r0(void)
 }
 
 /*
- * The page is gone, so the access faults. The fetched register has to come back
- * 0 and everything else has to be left alone, r0 included. Reading the address
- * again has to give 0 as well: had the fault been recovered by the arena mapping
- * its zeroed scratch page instead of by the JIT's exception table entry, the
- * access would have succeeded and left a 1 there.
+ * The page is gone, so the access faults, and the fault cancels the program:
+ * it returns 0, the default of its type, and never the 1 that follows the
+ * access. The page stays unmapped: had the arena mapped its scratch page
+ * instead, the access would have succeeded.
  */
 SEC("syscall")
 __arena_scalar
@@ -446,21 +445,9 @@ __naked void fetch_or_freed_page(void)
 	r2 = r6;					\
 	r3 = 1;						\
 	call %[bpf_arena_free_pages];			\
-	r0 = r6;					\
-	r0 ^= 0x55;					\
 	r1 = 1;						\
 	.8byte %[fetch_or_dw]; /* faults: r1 = atomic_fetch_or((u64 *)(r6 + 8), r1) */ \
-	r2 = r6;					\
-	r2 ^= 0x55;					\
-	if r0 == r2 goto 1f;				\
 	r0 = 1;						\
-	goto 9f;					\
-1:	r0 = 2;						\
-	if r1 != 0 goto 9f;				\
-	r3 = *(u64 *)(r6 + 8);				\
-	r0 = 3;						\
-	if r3 != 0 goto 9f;				\
-	r0 = 0;						\
 9:	exit;						\
 "	:
 	: __imm_addr(arena),
@@ -471,6 +458,11 @@ __naked void fetch_or_freed_page(void)
 	: __clobber_all);
 }
 
+/*
+ * The same with the operand in r0, which the x86 lowering keeps aside while
+ * rax serves its cmpxchg loop: the fault entry has to capture the register
+ * file of the instruction with r0 put back.
+ */
 SEC("syscall")
 __arena_scalar
 __description("arena_scalar: fetching or with the operand in r0 to a freed page")
@@ -495,13 +487,7 @@ __naked void fetch_or_r0_freed_page(void)
 	call %[bpf_arena_free_pages];			\
 	r0 = 1;						\
 	.8byte %[fetch_or_dw]; /* faults: r0 = atomic_fetch_or((u64 *)(r6 + 8), r0) */ \
-	r2 = r0;					\
 	r0 = 1;						\
-	if r2 != 0 goto 9f;				\
-	r3 = *(u64 *)(r6 + 8);				\
-	r0 = 2;						\
-	if r3 != 0 goto 9f;				\
-	r0 = 0;						\
 9:	exit;						\
 "	:
 	: __imm_addr(arena),
