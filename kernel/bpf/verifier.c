@@ -11979,6 +11979,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
+		/* A cancellation inside the callee unwinds through this frame. */
+		err = check_cancel_site(env, false);
+		if (err)
+			return err;
 
 		/* continue with next insn after call */
 		return 0;
@@ -19511,6 +19515,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		int idx = *insn_idx;
 
 		prev_st = find_prev_entry(env, cur_st->parent, idx);
+
+		/* A timed out may_goto cancels the program instead of branching. */
+		err = check_cancel_site(env, true);
+		if (err)
+			return err;
 
 		/* branch out 'fallthrough' insn as a new state to explore */
 		queued_st = push_stack(env, idx + 1, idx, false);
