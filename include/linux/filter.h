@@ -1330,7 +1330,7 @@ u32 bpf_jit_plan_arg_moves(const struct bpf_jit_arg_abi *abi,
 u64 bpf_arch_uaddress_limit(void);
 void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie);
 u64 arch_bpf_timed_may_goto(void);
-u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *);
+u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p, unsigned long ra);
 bool bpf_helper_changes_pkt_data(enum bpf_func_id func_id);
 
 static inline bool bpf_dump_raw_ok(const struct cred *cred)

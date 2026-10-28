@@ -12,7 +12,13 @@
  * macros rather than an enum. The kernel raised every kind but a call.
  */
 #define BPF_THROW_CALL		0	/* a call to bpf_throw() */
-#define BPF_THROW_CANCEL	2	/* the helper that ran a cancelled callback */
+#define BPF_THROW_CANCEL	2	/* a timed may_goto, or the helper that ran a cancelled callback */
+
+/*
+ * Returned by bpf_check_timed_may_goto() in place of a loop count when the
+ * program is to be cancelled; the slow path then enters bpf_throw_unwind().
+ */
+#define BPF_TIMED_MAY_GOTO_CANCEL	-1
 
 /*
  * The callee-saved registers of the architecture that no BPF register maps
