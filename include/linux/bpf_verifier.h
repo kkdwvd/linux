@@ -835,6 +835,8 @@ struct bpf_insn_aux_data {
 	struct btf_struct_meta *kptr_struct_meta;
 	/* frame descriptor of the frame this insn is executed or waited in, see frame_desc.c */
 	struct bpf_frame_desc_build *frame_desc;
+	/* the same for the may_goto the verifier adds in front of the insn, see bpf_insert_loop_guards() */
+	struct bpf_frame_desc_build *guard_desc;
 	/* unique slot of the reference this insn acquires, and the slot it clears as a release */
 	u8 ref_slot;		/* BPF_REF_SLOT_* */
 	bool ref_slot_needed;	/* a site lists the reference from its slot only */
@@ -1033,6 +1035,8 @@ struct bpf_subprog_info {
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
 	/* throw sites of this subprogram, moved to the JITed function's aux by jit_subprogs() */
 	struct bpf_frame_desc_table *frame_desc_table;
+	/* frame descriptor of the may_goto at the entry of a recursive subprog, see frame_desc.c */
+	struct bpf_frame_desc_build *entry_guard;
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -2251,6 +2255,7 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
+int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot);
 int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite);
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int id);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
@@ -2260,6 +2265,7 @@ int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call,
 void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
+void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);
 void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux);
 void bpf_frame_desc_reset(struct bpf_verifier_env *env);
 void bpf_frame_desc_env_free(struct bpf_verifier_env *env);

@@ -800,6 +800,9 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			continue;
 		r = zero[i] ? 3 + hweight16(zero[i]) : 1;
 		aux[i + n].live_regs_before = aux[i + n + r].live_regs_before;
+		/* The frame descriptor of the guard, which the main pass gave to the insn. */
+		aux[i + n].frame_desc = aux[i + n + r].guard_desc;
+		aux[i + n + r].guard_desc = NULL;
 		n += r;
 	}
 out:
@@ -912,12 +915,17 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 	err = bpf_patch_list_commit(env);
 	if (err)
 		return err;
-	/* may_goto keeps the address of its count in a register that is dead: R0 */
+	/*
+	 * may_goto keeps the address of its count in a register that is dead: R0.
+	 * And it is a site, with the frame descriptor the main pass made at the entry.
+	 */
 	for (s = 1; s < env->subprog_cnt; s++) {
 		if (!si[s].recursive)
 			continue;
 		n = si[s].start + is_arena_sp_adj(&env->prog->insnsi[si[s].start]);
 		env->insn_aux_data[n].live_regs_before = (u16)~BIT(BPF_REG_0);
+		env->insn_aux_data[n].frame_desc = si[s].entry_guard;
+		si[s].entry_guard = NULL;
 	}
 	return 0;
 }
@@ -2815,6 +2823,14 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			cnt = may_goto_expand_timed(insn_buf, insn->off, may_goto_off(env, insn, i),
 						    tmg, reg, save_off);
 
+			/*
+			 * The unwinder sees a cancelled may_goto through its slow path
+			 * call, which the store of the count follows, and the reload of
+			 * the saved R0.
+			 */
+			ret = bpf_frame_desc_move_site(env, i, cnt - (save_off ? 3 : 2));
+			if (ret)
+				return ret;
 			insn = bpf_patch_list_add(env, i, insn_buf, cnt);
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);

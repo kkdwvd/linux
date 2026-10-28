@@ -87,10 +87,11 @@ struct scratch {
 	int first;	/* the outermost frame the unwinder reaches from this site */
 };
 
-/* Make room for @nr_slots stack slots in the descriptor of insn @pc, which @b is or NULL. */
+/* Make room for @nr_slots stack slots in the descriptor at @slot, of insn @pc. */
 static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32 pc,
-					       struct bpf_frame_desc_build *b, u32 nr_slots)
+					       struct bpf_frame_desc_build **slot, u32 nr_slots)
 {
+	struct bpf_frame_desc_build *b = *slot;
 	u32 old = b ? b->nr_slots : 0;
 
 	if (b && old >= nr_slots)
@@ -103,16 +104,18 @@ static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32
 	memset(&b->slots[old], 0, (nr_slots - old) * sizeof(b->slots[0]));
 	b->pc = pc;
 	b->nr_slots = nr_slots;
-	env->insn_aux_data[pc].frame_desc = b;
+	*slot = b;
 	return b;
 }
 
-static struct bpf_frame_desc_build *build_get(struct bpf_verifier_env *env, u32 pc, u32 nr_slots)
+/* The descriptor of insn @pc, which @slot holds, or the aux data of the insn when NULL. */
+static struct bpf_frame_desc_build *build_get(struct bpf_verifier_env *env, u32 pc, u32 nr_slots,
+					      struct bpf_frame_desc_build **slot)
 {
-	return build_grow(env, pc, env->insn_aux_data[pc].frame_desc, nr_slots);
+	return build_grow(env, pc, slot ?: &env->insn_aux_data[pc].frame_desc, nr_slots);
 }
 
-static void build_destroy(struct bpf_frame_desc_build *b)
+void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b)
 {
 	if (!b)
 		return;
@@ -124,8 +127,10 @@ static void build_destroy(struct bpf_frame_desc_build *b)
 
 void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux)
 {
-	build_destroy(aux->frame_desc);
+	bpf_frame_desc_build_destroy(aux->frame_desc);
+	bpf_frame_desc_build_destroy(aux->guard_desc);
 	aux->frame_desc = NULL;
+	aux->guard_desc = NULL;
 }
 
 /* The subprog insn @idx belongs to. */
@@ -154,6 +159,10 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 		aux[i].ref_slot_needed = false;
 		aux[i].ref_slot_resource = 0;
 	}
+	for (i = 0; i < env->subprog_cnt; i++) {
+		bpf_frame_desc_build_destroy(env->subprog_info[i].entry_guard);
+		env->subprog_info[i].entry_guard = NULL;
+	}
 	kvfree(env->resources);
 	kvfree(env->ref_releases);
 	env->resources = NULL;
@@ -165,6 +174,10 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 
 void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 {
+	int i;
+
+	for (i = 0; i < env->subprog_cnt; i++)
+		bpf_frame_desc_build_destroy(env->subprog_info[i].entry_guard);
 	kvfree(env->resources);
 	kvfree(env->frame_desc_scratch);
 	kvfree(env->ref_releases);
@@ -777,6 +790,11 @@ int bpf_frame_desc_build_tables(struct bpf_verifier_env *env)
 			env->frame_desc_sites++;
 		}
 	}
+	/* a guard whose may_goto was not added after all, see check_recursion() */
+	for (s = 0; s < env->subprog_cnt; s++) {
+		bpf_frame_desc_build_destroy(env->subprog_info[s].entry_guard);
+		env->subprog_info[s].entry_guard = NULL;
+	}
 	env->frame_desc_pool->resources = env->resources;
 	env->frame_desc_pool->resource_cnt = env->resource_cnt;
 	env->frame_desc_bytes += env->resource_cnt * sizeof(*env->resources);
@@ -1261,7 +1279,8 @@ static int first_frame(struct bpf_verifier_state *st)
  * states it joins agree on every live location, and so do a state and one it
  * is within.
  */
-static int site_do(struct bpf_verifier_env *env, bool regs_saved)
+static int site_do(struct bpf_verifier_env *env, bool regs_saved,
+		   struct bpf_frame_desc_build **slot)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct scratch *s = env->frame_desc_scratch;
@@ -1287,7 +1306,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 		memset(s->class[f], 0, sizeof(s->class[f]));
 		if (f < s->first)
 			continue;
-		s->builds[f] = build_get(env, s->pcs[f], nr_slots);
+		s->builds[f] = build_get(env, s->pcs[f], nr_slots, f == st->curframe ? slot : NULL);
 		if (!s->builds[f])
 			return -ENOMEM;
 		s->builds[f]->regs_saved = f == st->curframe && regs_saved;
@@ -1384,10 +1403,13 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 
 /*
  * Describe the state at a site where the program may be unwound: a bpf_throw()
- * call, a call to a global subprog, or a point at which the kernel may cancel
- * the program. A site that cannot be described rejects the program.
+ * call, a call to a subprog verified on its own, or a point at which the kernel
+ * may cancel the program. A site that cannot be described rejects the program.
+ * The descriptor of the innermost frame goes to the aux data of the insn, or to
+ * @slot: the site of a may_goto the verifier adds is the insn it goes in front
+ * of, and the descriptor is moved onto the may_goto once it is there.
  */
-int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved)
+static int site(struct bpf_verifier_env *env, bool regs_saved, struct bpf_frame_desc_build **slot)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	int first, ret;
@@ -1401,7 +1423,18 @@ int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved)
 		if (ret)
 			return ret;
 	}
-	return site_do(env, regs_saved);
+	return site_do(env, regs_saved, slot);
+}
+
+int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved)
+{
+	return site(env, regs_saved, NULL);
+}
+
+/* The timed may_goto slow path saves R0-R9, like the entry of bpf_throw(). */
+int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot)
+{
+	return site(env, true, slot);
 }
 
 /*
@@ -1479,8 +1512,13 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 		aux[r->rel].ref_slot_clear_off = aux[r->acq].ref_slot_off;
 	}
 
-	for (i = 0; i < len; i++) {
-		struct bpf_frame_desc_build *b = aux[i].frame_desc;
+	/*
+	 * Every descriptor, those of the may_goto the verifier adds included:
+	 * the loop guards are in place, the entry guards are not yet.
+	 */
+	for (i = 0; i < len + env->subprog_cnt; i++) {
+		struct bpf_frame_desc_build *b = i < len ? aux[i].frame_desc :
+						 env->subprog_info[i - len].entry_guard;
 		int l;
 
 		if (!b)
@@ -1648,7 +1686,7 @@ int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call,
 
 		if (b->regs[r].state != LOC_RES)
 			continue;
-		b = build_grow(env, off, b, spi + 1);
+		b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
 		if (!b)
 			return -ENOMEM;
 		b->slots[spi] = b->regs[r];

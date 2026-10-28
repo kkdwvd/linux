@@ -7713,6 +7713,18 @@ static int check_cancel_site(struct bpf_verifier_env *env, bool regs_saved)
 	return bpf_frame_desc_site(env, regs_saved);
 }
 
+/*
+ * The may_goto the verifier adds in front of the insn is a cancellation point
+ * too. Its descriptor is kept in @slot until the may_goto is there.
+ */
+static int check_cancel_guard(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot)
+{
+	if (!env->cancellable)
+		return 0;
+	env->seen_exception = true;
+	return bpf_frame_desc_guard_site(env, slot);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -12041,13 +12053,15 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (func_is_on_its_own(env, state, subprog)) {
 		/*
 		 * The sites inside the callee know nothing of this frame, which
-		 * a throw inside it unwinds through: the call is a site of it.
+		 * a throw or a cancellation inside it unwinds through: the call
+		 * is a site of it.
 		 */
-		if (callee_info->might_throw) {
+		if (callee_info->might_throw)
 			err = bpf_frame_desc_site(env, false);
-			if (err)
-				return err;
-		}
+		else
+			err = check_cancel_site(env, false);
+		if (err)
+			return err;
 		return call_func_on_its_own(env, subprog, *insn_idx);
 	}
 
@@ -12196,6 +12210,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
+		/* A cancellation inside the callee unwinds through this frame. */
+		err = check_cancel_site(env, false);
+		if (err)
+			return err;
 
 		/* continue with next insn after call */
 		return 0;
@@ -19939,6 +19957,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		struct bpf_verifier_state *queued_st;
 		int idx = *insn_idx;
 
+		/* A timed out may_goto cancels the program instead of branching. */
+		err = check_cancel_site(env, true);
+		if (err)
+			return err;
+
 		/* branch out 'fallthrough' insn as a new state to explore */
 		queued_st = push_stack(env, idx + 1, idx, false);
 		if (IS_ERR(queued_st))
@@ -22021,6 +22044,13 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 	if (!entry->guarded && !bpf_loop_walk_may_give_up(entry))
 		return 0;
 
+	/* A timed out may_goto cancels the program instead of leaving. */
+	if (loop->guarded) {
+		err = check_cancel_guard(env, &aux->guard_desc);
+		if (err)
+			return err;
+	}
+
 	/* the device runs the insns that the driver was given, without may_goto */
 	if (bpf_prog_is_offloaded(env->prog->aux)) {
 		verbose(env, "loop at insn %d has no known bound in an offloaded program\n", h);
@@ -22104,9 +22134,14 @@ static int flow_drain(struct bpf_verifier_env *env)
 static int check_recursion_guard(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[cur_func(env)->subprogno];
+	int err;
 
 	if (!sub->recursive || env->insn_idx != sub->start)
 		return 0;
+	/* A timed out may_goto cancels the program instead of returning. */
+	err = check_cancel_guard(env, &sub->entry_guard);
+	if (err)
+		return err;
 	return push_budget_exit(env);
 }
 
