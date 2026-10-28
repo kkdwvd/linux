@@ -1492,8 +1492,6 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->token = prog->aux->token;
-		if (!i)
-			func[i]->aux->exception_boundary = env->seen_exception;
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -1601,7 +1599,6 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
-	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
