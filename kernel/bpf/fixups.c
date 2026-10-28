@@ -536,6 +536,8 @@ int bpf_patch_list_commit(struct bpf_verifier_env *env)
 
 	patch_list_remap_aux(env, &img, data);
 	data = NULL;
+	/* A site may follow another insn of its patch than the aux data did. */
+	bpf_frame_desc_remap_aux(env, &img);
 	/* the frame descriptor tables key sites by insn, relative to the old subprog starts */
 	bpf_frame_desc_remap_tables(env, &img);
 	patch_list_remap_subprogs(env, &img);
@@ -2086,6 +2088,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
+		func[i]->aux->async_cb = env->subprog_info[i].is_async_cb;
 		func[i]->aux->token = prog->aux->token;
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
@@ -2195,6 +2198,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
+	if (env->cancel_callback_subprog)
+		prog->aux->bpf_cancel_cb = (void *)func[env->cancel_callback_subprog]->bpf_func;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
@@ -2539,7 +2544,14 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
 	s16 may_goto_slot = 0;
 
-	if (env->seen_exception && !env->exception_callback_subprog) {
+	/*
+	 * A program that may be unwound needs the exception callback the
+	 * unwinder transfers to from the main frame, which returns the cookie
+	 * unless the program has one of its own, and a cancellable program
+	 * needs one that returns the cookie from the frame of a callback,
+	 * which is the default one unless the program has its own.
+	 */
+	if (env->seen_exception && (!env->exception_callback_subprog || env->cancellable)) {
 		struct bpf_insn *patch = insn_buf;
 
 		*patch++ = env->prog->insnsi[insn_cnt - 1];
@@ -2551,9 +2563,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		prog = env->prog;
 		insn = prog->insnsi;
 
-		env->exception_callback_subprog = env->subprog_cnt - 1;
+		if (!env->exception_callback_subprog)
+			env->exception_callback_subprog = env->subprog_cnt - 1;
+		if (env->cancellable)
+			env->cancel_callback_subprog = env->subprog_cnt - 1;
 		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
-		bpf_mark_subprog_exc_cb(env, env->exception_callback_subprog);
+		bpf_mark_subprog_exc_cb(env, env->subprog_cnt - 1);
 	}
 
 	for (i = 0; i < insn_cnt;) {
@@ -3577,6 +3592,14 @@ int bpf_optimize_bpf_loop(struct bpf_verifier_env *env)
 			}
 			err = inline_bpf_loop(env, i, loop_off - 2 * BPF_REG_SIZE,
 					      inline_state->callback_subprogno);
+			if (err)
+				return err;
+			/*
+			 * The callback is an ordinary callee now, so the frame is
+			 * unwound through at the inlined call, insn 12 of the patch,
+			 * with R6-R8 in the slots the loop spilled them to.
+			 */
+			err = bpf_frame_desc_inlined_loop(env, i, 12, loop_off - 2 * BPF_REG_SIZE);
 			if (err)
 				return err;
 		}

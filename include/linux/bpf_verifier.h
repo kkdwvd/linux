@@ -1265,6 +1265,12 @@ struct bpf_stack_init {
 	s32 imm;
 };
 
+/* The site at insn 'off' follows insn 'k' of the patch that replaces it, see bpf_frame_desc_move_site(). */
+struct bpf_frame_desc_move {
+	u32 off;
+	u32 k;
+};
+
 struct bpf_verifier_env {
 	u32 insn_idx;
 	u32 prev_insn_idx;
@@ -1303,8 +1309,11 @@ struct bpf_verifier_env {
 	struct bpf_ref_release *ref_releases;	/* releases, for the unique slots */
 	u32 ref_release_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
+	u32 frame_desc_move_cnt;
 	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
+	int cancel_callback_subprog;	/* returns the cookie from the frame of a cancelled callback */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -2242,9 +2251,13 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite);
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int id);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit_slots(struct bpf_verifier_env *env);
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off);
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux);
