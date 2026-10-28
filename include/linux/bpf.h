@@ -2047,6 +2047,10 @@ struct bpf_prog_aux {
 	s16 frame_fp_off;
 	/* With a private stack, the frame's R10 is this far into this CPU's priv_stack_ptr. */
 	u32 priv_frame_off;
+	/* Return value of the main program when the kernel cancels an invocation. */
+	s32 cancel_retval;
+	/* The kernel cancels this program at its cancellation points, which it described. */
+	bool cancellable;
 #ifdef CONFIG_SECURITY
 	void *security;
 #endif
