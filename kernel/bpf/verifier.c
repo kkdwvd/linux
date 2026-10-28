@@ -7725,6 +7725,19 @@ static int check_cancel_guard(struct bpf_verifier_env *env, struct bpf_frame_des
 	return bpf_frame_desc_guard_site(env, slot);
 }
 
+/*
+ * An access through an arena pointer faults when the page is not mapped,
+ * which cancels the program. The site is the access itself, described with
+ * the state before it takes effect, since the fault precedes any write of
+ * its result.
+ */
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	if (reg->type != PTR_TO_ARENA)
+		return 0;
+	return check_cancel_site(env, true);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -7754,6 +7767,9 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	src_reg_type = regs[insn->src_reg].type;
+	err = check_arena_site(env, &regs[insn->src_reg]);
+	if (err)
+		return err;
 
 	/*
 	 * check_stack_read_fixed_off() may refine the modification's origin to
@@ -7812,6 +7828,9 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	dst_reg_type = regs[insn->dst_reg].type;
+	err = check_arena_site(env, &regs[insn->dst_reg]);
+	if (err)
+		return err;
 
 	/* Check if (dst_reg + off) is writeable. */
 	err = check_mem_access(env, env->insn_idx, regs + insn->dst_reg,
@@ -7870,6 +7889,11 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 			reg_type_str(env, reg_state(env, insn->dst_reg)->type));
 		return -EACCES;
 	}
+
+	/* load_reg may be dst_reg. Look at dst_reg before it's marked as unknown. */
+	err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+	if (err)
+		return err;
 
 	load_reg = bpf_atomic_load_reg(insn);
 	if (load_reg >= 0) {
@@ -21369,6 +21393,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			return err;
 
 		dst_reg_type = cur_regs(env)[insn->dst_reg].type;
+		err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+		if (err)
+			return err;
 
 		err = check_mem_access(env, env->insn_idx, cur_regs(env) + insn->dst_reg,
 				       argno_from_reg(insn->dst_reg),
