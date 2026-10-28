@@ -546,6 +546,16 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	for (i = 0; i < a->acquired_refs; i++) {
 		if (a->refs[i].type != b->refs[i].type)
 			return false;
+		/*
+		 * The frame descriptors tell the references to objects apart by the
+		 * insn that acquired them, see frame_desc.c, and the result keeps the
+		 * insns of 'a'. Not those of what the callers of a function that is
+		 * verified on its own hold: the callers release it, see
+		 * func_is_on_its_own().
+		 */
+		if (a->refs[i].type == REF_TYPE_PTR && i >= a->frame[0]->entry_refs &&
+		    a->refs[i].insn_idx != b->refs[i].insn_idx)
+			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
 		case REF_TYPE_IRQ:

@@ -590,6 +590,16 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
 		    old->refs[i].type != cur->refs[i].type)
 			return false;
+		/*
+		 * The frame descriptors tell the references to objects apart by the
+		 * insn that acquired them, see frame_desc.c: a state doesn't stand
+		 * for one that acquired its references elsewhere. Not for what the
+		 * callers of a function verified on its own hold: the callers
+		 * release it, see func_is_on_its_own().
+		 */
+		if (old->refs[i].type == REF_TYPE_PTR && i >= old->frame[0]->entry_refs &&
+		    old->refs[i].insn_idx != cur->refs[i].insn_idx)
+			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
 			if (!check_ids(old->refs[i].parent_id, cur->refs[i].parent_id, idmap))

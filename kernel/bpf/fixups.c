@@ -536,6 +536,8 @@ int bpf_patch_list_commit(struct bpf_verifier_env *env)
 
 	patch_list_remap_aux(env, &img, data);
 	data = NULL;
+	/* the frame descriptor tables key sites by insn, relative to the old subprog starts */
+	bpf_frame_desc_remap_tables(env, &img);
 	patch_list_remap_subprogs(env, &img);
 	for (i = 0; i < env->insn_array_map_cnt; i++)
 		bpf_insn_array_remap(env->insn_array_maps[i], img.new_off,
@@ -1013,6 +1015,7 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 			kvfree(aux_data[i].loop);
 			aux_data[i].loop = NULL;
 		}
+		bpf_frame_desc_build_free(&aux_data[i]);
 	}
 }
 

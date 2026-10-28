@@ -11107,6 +11107,9 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
 	int err;
 
+	err = bpf_frame_desc_record_release(env, id);
+	if (err)
+		return err;
 	err = __release_reference_nomark(env->cur_state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
@@ -11722,6 +11725,14 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		return false;
 	if (state->speculative)
 		return false;
+	/*
+	 * A site inside the subprog would have to say which of its frames
+	 * releases what the callers hold, which a subprog on its own cannot
+	 * tell, see frame_desc.c: a call that holds a reference, a lock or
+	 * IRQ flags is verified in the context of its caller.
+	 */
+	if (env->describe_frames && state->acquired_refs)
+		return false;
 	if (sub->releases_inherited &&
 	    (state->acquired_refs || state->active_rcu_locks || state->active_preempt_locks))
 		return false;
@@ -12012,8 +12023,18 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
-	if (func_is_on_its_own(env, state, subprog))
+	if (func_is_on_its_own(env, state, subprog)) {
+		/*
+		 * The sites inside the callee know nothing of this frame, which
+		 * a throw inside it unwinds through: the call is a site of it.
+		 */
+		if (callee_info->might_throw) {
+			err = bpf_frame_desc_site(env, false);
+			if (err)
+				return err;
+		}
 		return call_func_on_its_own(env, subprog, *insn_idx);
+	}
 
 	/*
 	 * For regular function entry setup new frame and continue
@@ -12155,6 +12176,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				verbose(env, "failed to push state for global subprog exception path\n");
 				return PTR_ERR(branch);
 			}
+			err = bpf_frame_desc_site(env, false);
+			if (err)
+				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
 
@@ -12944,6 +12968,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	int i;
 
 	if (!exception_exit && cur_func(env)->frameno)
+		return 0;
+	/* The unwinder releases what the frame descriptors of the throw site list. */
+	if (exception_exit && bpf_arch_throw_entry())
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -21302,8 +21329,14 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				if (err)
 					return err;
 			}
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (bpf_is_throw_kfunc(insn)) {
+					err = bpf_frame_desc_site(env, true);
+					if (err)
+						return err;
+				}
 				return check_kfunc_call(env, insn, &env->insn_idx);
+			}
 			return check_helper_call(env, insn, &env->insn_idx);
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
@@ -23583,6 +23616,7 @@ static int do_check_all(struct bpf_verifier_env *env)
 		bpf_vlog_reset(&env->log, min(log_pos, env->log.end_pos));
 		for (i = 0; i < env->prog->len; i++)
 			env->insn_aux_data[i].seen = 0;
+		bpf_frame_desc_reset(env);
 		for (i = 1; env->prog->aux->func_info && i < env->subprog_cnt; i++) {
 			sub_aux = subprog_aux(env, i);
 			memset(sub_aux->called, 0, sizeof(sub_aux->called));
@@ -25591,6 +25625,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = bpf_check_cfg(env);
 	if (ret < 0)
 		goto skip_full_check;
+	/* A program that may throw gets frame descriptors, see frame_desc.c. */
+	for (i = 0; i < env->subprog_cnt; i++)
+		env->describe_frames |= env->subprog_info[i].might_throw;
 
 	ret = check_unwind_insns(env);
 	if (ret < 0)
@@ -25706,6 +25743,17 @@ skip_full_check:
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
+	/*
+	 * Every frame is described, including those of global subprogs, and the
+	 * stack is final: resolve the sites and reserve the unique slots.
+	 */
+	if (ret == 0)
+		ret = bpf_frame_desc_resolve(env);
+
+	/* Account for the unique slots reserved by frame descriptor resolution. */
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
 	/* instruction rewrites happen after this point */
 	if (ret == 0)
 		ret = bpf_optimize_bpf_loop(env);
@@ -25736,6 +25784,9 @@ skip_full_check:
 		ret = bpf_convert_ctx_accesses(env);
 
 	if (ret == 0)
+		ret = bpf_frame_desc_emit_slots(env);
+
+	if (ret == 0)
 		ret = bpf_do_misc_fixups(env);
 
 	/* do 32-bit optimization after insn patching has done so those patched
@@ -25746,6 +25797,9 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
+
+	if (ret == 0)
+		ret = bpf_frame_desc_build_tables(env);
 
 	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
@@ -25864,6 +25918,7 @@ err_free_env:
 		kfree(env->func_sets[i]);
 	kfree(env->func_sets);
 	kvfree(env->stack_inits);
+	bpf_frame_desc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);
