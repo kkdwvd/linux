@@ -2632,6 +2632,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	priv_stack_ptr = bpf_prog->aux->priv_stack_ptr;
 	if (priv_stack_ptr) {
 		priv_frame_ptr = priv_stack_ptr + PRIV_STACK_GUARD_SZ + round_up(stack_depth, 8);
+		bpf_prog->aux->priv_frame_off = PRIV_STACK_GUARD_SZ + round_up(stack_depth, 8);
 		stack_depth = 0;
 	}
 
