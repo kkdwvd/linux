@@ -631,9 +631,18 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 			priv_stack_ptr = prog->aux->priv_stack_ptr + PRIV_STACK_GUARD_SZ;
 			emit_percpu_ptr(priv_sp, priv_stack_ptr, ctx);
 			emit(A64_ADD_I(1, fp, priv_sp, ctx->stack_size), ctx);
+			/* Where the exception unwinder finds this frame's BPF stack. */
+			prog->aux->priv_frame_off = PRIV_STACK_GUARD_SZ + ctx->stack_size;
 		} else {
 			/* Set up BPF prog stack base register */
 			emit(A64_MOV(1, fp, A64_SP), ctx);
+			/*
+			 * Where the exception unwinder finds this frame's BPF stack:
+			 * below the frame record, the tail call count pair and the
+			 * pairs push_callee_regs() pushed.
+			 */
+			prog->aux->frame_fp_off = -16 -
+						   16 * DIV_ROUND_UP(ctx->nr_used_callee_reg, 2);
 		}
 	}
 
