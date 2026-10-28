@@ -199,8 +199,11 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 		/* The symbol of a program JITed as a set of functions covers its first function. */
 		const struct bpf_prog_aux *fn = !prog->is_func && prog->aux->func ?
 						prog->aux->func[0]->aux : prog->aux;
-		u64 fp = bp;
+		u64 fp = bp + fn->frame_fp_off;
 
+		/* With a private stack, the frame's R10 is this CPU's private frame. */
+		if (fn->priv_stack_ptr)
+			fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
 		/*
 		 * Release what this frame holds. Every frame is at a call, whose
 		 * return address is the first byte of the next instruction. Then
