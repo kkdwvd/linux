@@ -7,6 +7,14 @@
 #define _LINUX_BPF_THROW_H
 
 /*
+ * How control reached bpf_throw_unwind(). The architecture entries are
+ * written in assembly and pass the kind as an immediate, so these are
+ * macros rather than an enum. The kernel raised every kind but a call.
+ */
+#define BPF_THROW_CALL		0	/* a call to bpf_throw() */
+#define BPF_THROW_CANCEL	2	/* a cancellation point the kernel raised */
+
+/*
  * The callee-saved registers of the architecture that no BPF register maps
  * to, which the unwinder restores along with R6..R9 when it discards frames:
  * r12 on x86-64, which holds the arena base, and x23..x28 on arm64, of which
@@ -42,7 +50,7 @@ struct bpf_throw_regs {
 };
 static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 
-void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie);
+void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind);
 /* The native entry of bpf_throw(), on an architecture that has one. */
 void bpf_throw_entry(void);
 void *bpf_arch_throw_entry(void);

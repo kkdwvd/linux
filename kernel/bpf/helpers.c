@@ -3420,7 +3420,7 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	bpf_throw_unwind(NULL, cookie);
+	bpf_throw_unwind(NULL, cookie, BPF_THROW_CALL);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)
