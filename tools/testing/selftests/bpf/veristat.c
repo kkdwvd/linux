@@ -52,6 +52,12 @@ enum stat_id {
 	PROG_TYPE,
 	ATTACH_TYPE,
 	MEMORY_PEAK,
+	FRAME_DESC_SITES,
+	FRAME_DESC_VISITS,
+	FRAME_DESC_CLASSES,
+	FRAME_DESC_BYTES,
+	FRAME_DESC_SLOTS,
+	FRAME_DESC_SPILLS,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -812,13 +818,15 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 16,
+	.spec_cnt = 25,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
 		MAX_STATES_PER_INSN, MARK_READ_MAX_LEN,
 		SIZE, JITED_SIZE, PROG_TYPE, ATTACH_TYPE,
 		STACK, MAX_STACK, MEMORY_PEAK,
+		FRAME_DESC_SITES, FRAME_DESC_VISITS, FRAME_DESC_CLASSES, FRAME_DESC_BYTES,
+		FRAME_DESC_SLOTS, FRAME_DESC_SPILLS,
 	},
 };
 
@@ -861,6 +869,12 @@ static struct stat_def {
 	[PROG_TYPE] = { "Program type", {"prog_type"}, },
 	[ATTACH_TYPE] = { "Attach type", {"attach_type", }, },
 	[MEMORY_PEAK] = { "Peak memory (MiB)", {"mem_peak", }, },
+	[FRAME_DESC_SITES] = { "Frame desc sites", {"frame_desc_sites", }, },
+	[FRAME_DESC_VISITS] = { "Frame desc visits", {"frame_desc_visits", }, },
+	[FRAME_DESC_CLASSES] = { "Frame desc classes", {"frame_desc_classes", }, },
+	[FRAME_DESC_BYTES] = { "Frame desc bytes", {"frame_desc_bytes", }, },
+	[FRAME_DESC_SLOTS] = { "Frame desc slots", {"ref_slots", }, },
+	[FRAME_DESC_SPILLS] = { "Frame desc spills", {"ref_spills", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1047,6 +1061,15 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				&s->stats[TOTAL_STATES],
 				&s->stats[PEAK_STATES],
 				&s->stats[MARK_READ_MAX_LEN]))
+			continue;
+		/* Only kernels with frame descriptors print this line. */
+		if (6 == sscanf(cur, "frame descriptors: sites %ld visits %ld classes %ld bytes %ld slots %ld spills %ld",
+				&s->stats[FRAME_DESC_SITES],
+				&s->stats[FRAME_DESC_VISITS],
+				&s->stats[FRAME_DESC_CLASSES],
+				&s->stats[FRAME_DESC_BYTES],
+				&s->stats[FRAME_DESC_SLOTS],
+				&s->stats[FRAME_DESC_SPILLS]))
 			continue;
 
 		/*
@@ -2348,6 +2371,12 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case PEAK_STATES:
 	case MAX_STATES_PER_INSN:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_SLOTS:
+	case FRAME_DESC_SPILLS:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2579,6 +2608,12 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case SIZE:
 	case JITED_SIZE:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_SLOTS:
+	case FRAME_DESC_SPILLS:
 		*val = s ? s->stats[id] : 0;
 		break;
 	default:
@@ -2666,6 +2701,12 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case SIZE:
 	case JITED_SIZE:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_SLOTS:
+	case FRAME_DESC_SPILLS:
 	case STACK:
 	case MAX_STACK: {
 		long val;
