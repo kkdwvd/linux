@@ -745,11 +745,19 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 
 /*
  * Is @insn, after all rewrites, what the unwinder sees a site through: a call,
- * direct or through a function pointer.
+ * direct or through a function pointer, or the probed access of an arena site.
  */
 static bool site_insn_ok(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn);
+	u8 class = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
+
+	if (insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn))
+		return true;
+	if (class == BPF_LDX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
+	if (class == BPF_STX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC;
+	return class == BPF_ST && mode == BPF_PROBE_MEM32;
 }
 
 /*
@@ -1303,7 +1311,9 @@ static int first_frame(struct bpf_verifier_state *st)
  * Record the state at a site where the program may be unwound. @regs_saved
  * says that the entry the unwinder is reached through saves R0-R9 of the
  * innermost frame; otherwise it is waiting in a call and only keeps R6-R9 and
- * its stack, as every caller frame does. Only live locations are considered, which keeps the
+ * its stack, as every caller frame does. At an arena access that is the
+ * state before the access takes effect, since the fault precedes any write
+ * of its result. Only live locations are considered, which keeps the
  * descriptors consistent with state pruning: two states the verifier treats
  * as equivalent agree on every live location.
  */
