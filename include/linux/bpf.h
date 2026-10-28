@@ -2380,6 +2380,13 @@ struct bpf_struct_ops {
 	void (*unreg)(void *kdata, struct bpf_link *link);
 	int (*update)(void *kdata, void *old_kdata, struct bpf_link *link);
 	int (*validate)(void *kdata);
+	/*
+	 * The kernel cancelled an invocation of @prog, an operator of this
+	 * struct_ops, and is about to return 0 from it. A struct_ops whose
+	 * operators' return values mean more than that disables the attached
+	 * object here.
+	 */
+	void (*cancel)(const struct bpf_prog *prog);
 	void *cfi_stubs;
 	struct module *owner;
 	const char *name;
