@@ -5,6 +5,7 @@
 #include <bpf/bpf_core_read.h>
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
+#include <bpf_arena_common.h>
 
 #define MAX_RES 8
 #define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
@@ -23,6 +24,14 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 4096);
 } ringbuf SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARENA);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 1); /* number of pages */
+} arena SEC(".maps");
+
+void *arena_ptr;
 
 private(A) struct bpf_spin_lock glock;
 private(B) struct bpf_res_spin_lock grlock;
@@ -657,6 +666,151 @@ int throw_irq(struct __sk_buff *ctx)
 	return 0;
 }
 
+/* An address the arena has no page for: an access to it faults. */
+static __always_inline int __arena *unmapped_arena_addr(void)
+{
+	arena_ptr = &arena;
+	return (int __arena *)0xdeadbee0;
+}
+
+/* Keep the access to @addr behind everything before it, so that the fault is not hoisted. */
+#define access_barrier(addr) asm volatile("" : "+r"(addr) : : "memory")
+
+/* An arena page fault cancels the program and releases what it holds. */
+SEC("tc")
+int cancel_arena_read(struct __sk_buff *ctx)
+{
+	int __arena *addr = unmapped_arena_addr();
+	struct foo *f;
+	int v;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	access_barrier(addr);
+	v = *addr;
+	bpf_obj_drop(f);
+	return v;
+}
+
+SEC("tc")
+int cancel_arena_write(struct __sk_buff *ctx)
+{
+	int __arena *addr = unmapped_arena_addr();
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	access_barrier(addr);
+	*addr = 1;
+	bpf_obj_drop(f);
+	return 0;
+}
+
+static __noinline int fault_in_subprog(struct __sk_buff *ctx)
+{
+	int __arena *addr = unmapped_arena_addr();
+	__u64 a = ctx->len * 3, b = ctx->len * 5, c = ctx->len * 7;
+
+	access_barrier(addr);
+	*addr = 1;
+	return a + b + c;
+}
+
+/* The fault hits in a static subprog while the caller holds the object. */
+SEC("tc")
+int cancel_arena_caller(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	fault_in_subprog(ctx);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * The object is only in R0 at a fetching atomic. The x86 lowering keeps R0
+ * aside while RAX serves its CMPXCHG loop, so the fault handler has to put it
+ * back before the register file is captured.
+ */
+SEC("tc")
+int cancel_arena_fetch_r0(struct __sk_buff *ctx)
+{
+	static const struct bpf_insn fetch_or_insn = {
+		.code	 = 0xc3,	/* BPF_STX | BPF_ATOMIC | BPF_W */
+		.dst_reg = 1,		/* BPF_REG_1 */
+		.src_reg = 2,		/* BPF_REG_2 */
+		.off	 = 0,
+		.imm	 = 0x41,	/* BPF_OR | BPF_FETCH */
+	};
+	int __arena *addr = unmapped_arena_addr();
+	struct foo *f, *g;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	asm volatile (
+		"r0 = %[f];"
+		"r1 = %[addr];"
+		"r1 = addr_space_cast(r1, 0x0, 0x1);"
+		"r2 = 1;"
+		".8byte %[fetch_or_insn];" /* r2 = atomic_fetch_or((u32 *)(r1 + 0), r2) */
+		"%[g] = r0;"
+		: [g] "=r" (g)
+		: [f] "r" (f), [addr] "r" (addr),
+		  __imm_insn(fetch_or_insn, fetch_or_insn)
+		: "r0", "r1", "r2", "memory"
+	);
+	bpf_obj_drop(g);
+	return 0;
+}
+
+static int fault_cb(u32 i, void *ctx)
+{
+	int __arena *addr = unmapped_arena_addr();
+
+	access_barrier(addr);
+	*addr = 1;
+	return 0;
+}
+
+/* The fault hits in an inlined bpf_loop() callback, and in one the helper runs. */
+SEC("tc")
+int cancel_arena_loop(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(1, fault_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+SEC("tc")
+int cancel_arena_loop_helper(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(loops, fault_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
 __noinline int global_spin(void)
 {
 	spin();
@@ -789,6 +943,30 @@ __naked int cancel_may_goto_priv_stack(void)
 	  __imm(bpf_ringbuf_discard),
 	  __imm_insn(may_goto, may_goto_insn)
 	: __clobber_all);
+}
+
+__noinline int global_fault(void)
+{
+	int __arena *addr = unmapped_arena_addr();
+
+	access_barrier(addr);
+	return *addr;
+}
+
+/* The fault hits in a global subprog while the caller holds the object. */
+SEC("tc")
+int cancel_arena_global(struct __sk_buff *ctx)
+{
+	struct foo *f;
+	int ret;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	ret = global_fault();
+	bpf_obj_drop(f);
+	return ret;
 }
 
 struct {

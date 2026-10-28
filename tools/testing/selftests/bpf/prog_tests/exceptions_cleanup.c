@@ -176,6 +176,14 @@ static void run_suite(const char *prefix)
 	snprintf(name, sizeof(name), "%scancel_may_goto_timer", prefix);
 	if (test__start_subtest(name))
 		run_timer(skel);
+	/* An arena page fault cancels the program as a may_goto timeout does. */
+	CANCEL(cancel_arena_read, 1, 0);
+	CANCEL(cancel_arena_write, 1, 0);
+	CANCEL(cancel_arena_caller, 1, 0);
+	CANCEL(cancel_arena_global, 1, 0);
+	CANCEL(cancel_arena_fetch_r0, 1, 0);
+	CANCEL(cancel_arena_loop, 1, 0);
+	CANCEL(cancel_arena_loop_helper, 1, 0);
 #undef CANCEL
 #undef THROW
 #undef RUN
