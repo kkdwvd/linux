@@ -1568,6 +1568,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
 		func[i]->aux->linfo_idx = env->subprog_info[i].linfo_idx;
+		/* The table is freed with func[i], the pool with the main prog. */
+		func[i]->aux->frame_desc_table = env->subprog_info[i].frame_desc_table;
+		env->subprog_info[i].frame_desc_table = NULL;
+		func[i]->aux->frame_desc_pool = env->frame_desc_pool;
 		func[i]->aux->arena = prog->aux->arena;
 		func[i]->aux->uses_arena_insns = bpf_prog_has_arena_insns(func[i]);
 		func[i]->aux->used_maps = env->used_maps;
@@ -1701,6 +1705,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->jited_len = func[0]->jited_len;
 	prog->aux->extable = func[0]->aux->extable;
 	prog->aux->num_exentries = func[0]->aux->num_exentries;
+	prog->aux->frame_desc_table = func[0]->aux->frame_desc_table;
 	prog->aux->func = func;
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;

@@ -293,6 +293,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		kfree(fp->aux->poke_tab);
+		bpf_frame_desc_table_free(fp->aux->frame_desc_table);
 		kfree(fp->aux);
 	}
 	free_percpu(fp->stats);
@@ -3148,6 +3149,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
+	bpf_frame_desc_pool_free(aux->frame_desc_pool);
 	for (i = 0; i < aux->real_func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
@@ -3157,6 +3159,8 @@ static void bpf_prog_free_images(struct work_struct *work)
 		bpf_jit_free(aux->func[i]);
 	}
 	if (aux->real_func_cnt) {
+		/* The main prog's frame_desc_table is func[0]'s and was released with it. */
+		aux->frame_desc_table = NULL;
 		kfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);
 	} else {
