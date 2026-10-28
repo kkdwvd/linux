@@ -208,7 +208,8 @@ struct bpf_verifier_stack_elem {
 
 #define BPF_PRIV_STACK_MIN_SIZE		64
 
-static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id);
+static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id,
+			     u32 frameno);
 static int __release_reference_nomark(struct bpf_verifier_state *state, int id);
 static int release_reference_nomark(struct bpf_verifier_env *env, int id);
 static int release_reference(struct bpf_verifier_env *env, int id);
@@ -805,7 +806,7 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 			 * object for the referenced dynptr. Freeing a referenced dynptr
 			 * through helpers/kfuncs will invalidate all clones.
 			 */
-			id = acquire_reference(env, insn_idx, parent_id);
+			id = acquire_reference(env, insn_idx, parent_id, state->frameno);
 			if (id < 0)
 				return id;
 
@@ -865,22 +866,38 @@ static void mark_reg_invalid(const struct bpf_verifier_env *env, struct bpf_reg_
 		__mark_reg_unknown(env, reg);
 }
 
-static int dynptr_ref_cnt(struct bpf_verifier_env *env, int v_parent_id)
+/* Keep ownership in its frame while a clone remains there, otherwise transfer it. */
+static int dynptr_ref_survivors(struct bpf_verifier_env *env,
+			       const struct bpf_stack_state *dying)
 {
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_reference_state *ref = NULL;
 	struct bpf_stack_state *stack;
 	struct bpf_func_state *state;
 	struct bpf_reg_state *reg;
-	int ref_cnt = 0;
+	u32 owner = MAX_CALL_FRAMES;
+	int i, ref_cnt = 0;
 
-	bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, stack, 1 << STACK_DYNPTR, ({
-		if (!stack || stack->slot_type[0] != STACK_DYNPTR)
+	for (i = 0; i < vstate->acquired_refs; i++)
+		if (vstate->refs[i].type == REF_TYPE_PTR &&
+		    vstate->refs[i].id == dying->spilled_ptr.parent_id) {
+			ref = &vstate->refs[i];
+			break;
+		}
+	if (WARN_ON_ONCE(!ref))
+		return 0;
+
+	bpf_for_each_reg_in_vstate_mask(vstate, state, reg, stack, 1 << STACK_DYNPTR, ({
+		if (!stack || stack == dying || stack->slot_type[0] != STACK_DYNPTR ||
+		    !reg->dynptr.first_slot || reg->parent_id != ref->id)
 			continue;
-		if (!stack->spilled_ptr.dynptr.first_slot)
-			continue;
-		if (stack->spilled_ptr.parent_id == v_parent_id)
-			ref_cnt++;
+		if (state->frameno == ref->frameno ||
+		    (owner != ref->frameno && state->frameno < owner))
+			owner = state->frameno;
+		ref_cnt++;
 	}));
-
+	if (ref_cnt)
+		ref->frameno = owner;
 	return ref_cnt;
 }
 
@@ -910,7 +927,7 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	 * ensuring the reference can still be properly released.
 	 */
 	if (dynptr_type_referenced(slot->spilled_ptr.dynptr.type) &&
-	    dynptr_ref_cnt(env, slot->spilled_ptr.parent_id) <= 1) {
+	    !dynptr_ref_survivors(env, slot)) {
 		verbose(env, "cannot overwrite referenced dynptr\n");
 		bpf_diag_res(
 			env, env->insn_idx, "referenced dynptr overwrite",
@@ -1040,7 +1057,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 	if (spi < 0)
 		return spi;
 
-	id = acquire_reference(env, insn_idx, 0);
+	id = acquire_reference(env, insn_idx, 0, state->frameno);
 	if (id < 0)
 		return id;
 
@@ -1158,7 +1175,8 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 	return 0;
 }
 
-static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx);
+static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx,
+			     u32 frameno, int kfunc_class);
 static int release_irq_state(struct bpf_verifier_env *env, int id);
 
 static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
@@ -1175,7 +1193,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	if (spi < 0)
 		return spi;
 
-	id = acquire_irq_state(env, insn_idx);
+	id = acquire_irq_state(env, insn_idx, state->frameno, kfunc_class);
 	if (id < 0)
 		return id;
 
@@ -1534,11 +1552,13 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 	if (err)
 		return NULL;
 	state->refs[new_ofs].insn_idx = insn_idx;
+	state->refs[new_ofs].frameno = state->curframe;
 
 	return &state->refs[new_ofs];
 }
 
-static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id)
+static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id,
+			     u32 frameno)
 {
 	struct bpf_reference_state *s;
 
@@ -1548,6 +1568,7 @@ static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int par
 	s->type = REF_TYPE_PTR;
 	s->id = ++env->id_gen;
 	s->parent_id = parent_id;
+	s->frameno = frameno;
 	bpf_diag_record_ref_acquire(env, insn_idx, s->id);
 	return s->id;
 }
@@ -1573,15 +1594,28 @@ static int acquire_lock_state(struct bpf_verifier_env *env, int insn_idx, enum r
 	return 0;
 }
 
-static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx)
+static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx,
+			     u32 frameno, int kfunc_class)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_reference_state *s;
+
+	/* The irqsave lock and its flags are released together from one frame. */
+	if (kfunc_class == IRQ_LOCK_KFUNC) {
+		if (!state->acquired_refs)
+			return -EFAULT;
+		s = &state->refs[state->acquired_refs - 1];
+		if (s->type != REF_TYPE_RES_LOCK_IRQ || s->insn_idx != insn_idx ||
+		    s->id != state->active_lock_id || s->ptr != state->active_lock_ptr)
+			return -EFAULT;
+		s->frameno = frameno;
+	}
 
 	s = acquire_reference_state(env, insn_idx);
 	if (!s)
 		return -ENOMEM;
 	s->type = REF_TYPE_IRQ;
+	s->frameno = frameno;
 	s->id = ++env->id_gen;
 
 	state->active_irq_id = s->id;
@@ -11046,6 +11080,9 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
 	int err;
 
+	err = bpf_frame_desc_record_release(env, id);
+	if (err)
+		return err;
 	err = __release_reference_nomark(env->cur_state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
@@ -11726,6 +11763,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				verbose(env, "failed to push state for global subprog exception path\n");
 				return PTR_ERR(branch);
 			}
+			err = bpf_frame_desc_site(env, false);
+			if (err)
+				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
 
@@ -12283,6 +12323,11 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		verbose(env, "to caller at %d:\n", *insn_idx);
 		print_verifier_state(env, state, caller->frameno, true);
 	}
+	/* Passing an alias keeps its owner; returning transfers surviving ownership. */
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].frameno == callee->frameno)
+			state->refs[i].frameno = caller->frameno;
+
 	account_processed_insns(env, callee, caller);
 	/* clear everything in the callee. In case of exceptional exits using
 	 * bpf_throw, this will be done by copy_verifier_state for extra frames. */
@@ -12457,6 +12502,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	int i;
 
 	if (!exception_exit && cur_func(env)->frameno)
+		return 0;
+	/* The unwinder releases what the frame descriptors of the throw site list. */
+	if (exception_exit && bpf_arch_throw_entry())
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -13160,7 +13208,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		regs[BPF_REG_0].type &= ~PTR_MAYBE_NULL;
 		regs[BPF_REG_0].id = meta.ref_obj.id;
 	} else if (is_acquire_function(func_id, meta.map.ptr)) {
-		int id = acquire_reference(env, insn_idx, 0);
+		int id = acquire_reference(env, insn_idx, 0, env->cur_state->curframe);
 
 		if (id < 0)
 			return id;
@@ -16003,7 +16051,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			regs[BPF_REG_0].id = ++env->id_gen;
 		}
 		if (is_kfunc_acquire(&meta)) {
-			id = acquire_reference(env, insn_idx, 0);
+			id = acquire_reference(env, insn_idx, 0, env->cur_state->curframe);
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
@@ -20458,8 +20506,14 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				return check_func_callx(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (bpf_is_throw_kfunc(insn)) {
+					err = bpf_frame_desc_site(env, true);
+					if (err)
+						return err;
+				}
 				return check_kfunc_call(env, insn, &env->insn_idx);
+			}
 			return check_helper_call(env, insn, &env->insn_idx);
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
@@ -22066,7 +22120,8 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 	/* Acquire references for struct_ops program arguments tagged with "__ref" */
 	if (!subprog && env->prog->type == BPF_PROG_TYPE_STRUCT_OPS) {
 		for (i = 0; i < aux->ctx_arg_info_size; i++) {
-			ret = aux->ctx_arg_info[i].refcounted ? acquire_reference(env, 0, 0) : 0;
+			ret = aux->ctx_arg_info[i].refcounted ?
+			      acquire_reference(env, 0, 0, state->curframe) : 0;
 			if (ret < 0)
 				goto out;
 
@@ -24216,6 +24271,17 @@ skip_full_check:
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
+	/*
+	 * Every frame is described, including those of global subprogs, and the
+	 * stack is final: resolve the sites and reserve the unique slots.
+	 */
+	if (ret == 0)
+		ret = bpf_frame_desc_resolve(env);
+
+	/* Account for the unique slots reserved by frame descriptor resolution. */
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
 	/* instruction rewrites happen after this point */
 	if (ret == 0)
 		ret = bpf_optimize_bpf_loop(env);
@@ -24237,6 +24303,9 @@ skip_full_check:
 		ret = bpf_convert_ctx_accesses(env);
 
 	if (ret == 0)
+		ret = bpf_frame_desc_emit_slots(env);
+
+	if (ret == 0)
 		ret = bpf_do_misc_fixups(env);
 
 	/* do 32-bit optimization after insn patching has done so those patched
@@ -24247,6 +24316,9 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
+
+	if (ret == 0)
+		ret = bpf_frame_desc_build_tables(env);
 
 	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
@@ -24356,6 +24428,7 @@ err_free_env:
 	kvfree(env->callx_edges);
 	kvfree(env->func_ptrs);
 	kvfree(env->stack_inits);
+	bpf_frame_desc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

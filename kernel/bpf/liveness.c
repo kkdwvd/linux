@@ -1748,6 +1748,19 @@ static int record_call_access(struct bpf_verifier_env *env,
 	struct bpf_call_summary cs;
 	int r, err, callee, arg_slot_cnt = 5;
 
+	/*
+	 * bpf_throw() never returns: the unwinder reads whichever stack slots of
+	 * any frame hold resources at the call, so none is dead there.
+	 */
+	if (bpf_is_throw_kfunc(insn)) {
+		for (r = 0; r <= instance->depth; r++) {
+			err = mark_stack_read_all(env, instance, r, insn_idx);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+
 	if (bpf_pseudo_call(insn)) {
 		/*
 		 * analyze_subprog() handles static callees. For global callees,
@@ -2644,6 +2657,12 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 */
 			if (bpf_is_sync_callback_calling_insn(insn) && bpf_is_unwind_goto(insn + 1))
 				use |= r0;
+			/*
+			 * bpf_throw() never returns: the unwinder reads whichever
+			 * registers hold resources at the call, so none is dead there.
+			 */
+			if (bpf_is_throw_kfunc(insn))
+				use = mask_widen(GENMASK(BPF_REG_9, BPF_REG_0));
 			break;
 		default:
 			def = 0;

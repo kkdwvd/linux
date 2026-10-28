@@ -912,7 +912,9 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 
 	for (i = 0; i < old->acquired_refs; i++) {
 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
-		    old->refs[i].type != cur->refs[i].type)
+		    old->refs[i].type != cur->refs[i].type ||
+		    old->refs[i].frameno != cur->refs[i].frameno ||
+		    old->refs[i].insn_idx != cur->refs[i].insn_idx)
 			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
