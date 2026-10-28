@@ -3473,18 +3473,18 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 }
 
 /*
- * Unwind the stack to the exception callback of the main program. @regs holds
- * the callee-saved registers of the throw site, or is NULL when the
- * architecture has no native entry and the kfunc was called directly; with it,
- * the callee-saved registers of the frames unwound are restored for the
- * callback, without it the main program's prologue has saved them all.
+ * Unwind the stack to the exception callback of the main program. @regs is the
+ * register file of the throw site, or NULL when the architecture has no native
+ * entry and the kfunc was called directly; with it, the callee-saved registers
+ * of the frames unwound are restored for the callback, without it the main
+ * program's prologue has saved them all.
  */
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
 {
 	struct bpf_throw_ctx ctx = { .regs = regs };
 
 	if (regs)
-		memcpy(ctx.saved, regs->saved, sizeof(ctx.saved));
+		memcpy(ctx.saved, &regs->r[BPF_REG_6], sizeof(ctx.saved));
 	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
 	WARN_ON_ONCE(!ctx.aux);
 	WARN_ON_ONCE(!ctx.bp);

@@ -24,19 +24,21 @@
 #endif
 /* The callee-saved registers the unwinder tracks: R6..R9, then the extra ones. */
 #define BPF_THROW_NR_CALLEE_SAVED	(4 + BPF_THROW_NR_EXTRA)
-/* The size of struct bpf_throw_regs, for the entries. */
-#define BPF_THROW_REGS_SIZE		(8 * BPF_THROW_NR_CALLEE_SAVED)
+/* The size of struct bpf_throw_regs, for the entries: R0..R9 and the extra ones. */
+#define BPF_THROW_REGS_SIZE		(8 * (10 + BPF_THROW_NR_EXTRA))
 
 #ifndef __ASSEMBLER__
 #include <linux/build_bug.h>
 #include <linux/types.h>
+#include <uapi/linux/bpf.h>
 
 /*
- * The callee-saved registers captured at a throw site, R6..R9 then the extra
- * ones of the architecture, indexed like bpf_prog_aux::callee_reg_off.
+ * The register file captured at a throw site: the BPF registers R0..R9, then
+ * the extra callee-saved registers of the architecture; from R6 on, indexed
+ * like bpf_prog_aux::callee_reg_off.
  */
 struct bpf_throw_regs {
-	u64 saved[BPF_THROW_NR_CALLEE_SAVED];
+	u64 r[BPF_REG_10 + BPF_THROW_NR_EXTRA];
 };
 static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 
