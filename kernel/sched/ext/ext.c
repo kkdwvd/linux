@@ -9055,6 +9055,21 @@ static struct sched_ext_ops __bpf_ops_sched_ext_ops = {
 	.dump_task		= sched_ext_ops__dump_task,
 };
 
+/*
+ * The kernel cancelled an operator of the scheduler, which then returned 0: as
+ * fatal to the scheduler as scx_bpf_error() is.
+ */
+static void bpf_scx_cancel(const struct bpf_prog *prog)
+{
+	struct scx_sched *sch;
+
+	guard(rcu)();
+
+	sch = scx_prog_sched(prog->aux);
+	if (likely(sch))
+		scx_error(sch, "operator %s was cancelled", prog->aux->name);
+}
+
 static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.verifier_ops = &bpf_scx_verifier_ops,
 	.reg = bpf_scx_reg,
@@ -9064,6 +9079,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.cancel = bpf_scx_cancel,
 	.name = "sched_ext_ops",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops
@@ -9141,6 +9157,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops_cid = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.cancel = bpf_scx_cancel,
 	.name = "sched_ext_ops_cid",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops_cid
