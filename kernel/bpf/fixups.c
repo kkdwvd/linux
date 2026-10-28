@@ -367,6 +367,7 @@ static struct bpf_prog *__bpf_patch_insn_data(struct bpf_verifier_env *env, u32 
 		return NULL;
 	}
 	adjust_insn_aux_data(env, new_prog, off, len, &original_insn, mode);
+	bpf_frame_desc_adjust_tables(env, new_prog, off, len);
 	adjust_subprog_starts(env, off, len);
 	adjust_insn_arrays(env, first, len);
 	bpf_adjust_func_ptrs(env, off, len);
@@ -696,6 +697,7 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 			kvfree(aux_data[i].loop);
 			aux_data[i].loop = NULL;
 		}
+		bpf_frame_desc_build_free(&aux_data[i]);
 	}
 }
 
