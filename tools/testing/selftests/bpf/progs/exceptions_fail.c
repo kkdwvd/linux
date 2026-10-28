@@ -145,7 +145,7 @@ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
 }
 
 SEC("?tc")
-__failure __msg("cannot unwind from the callback of bpf_rbtree_add()")
+__failure __msg("cannot be called from callback subprog")
 int reject_with_rbtree_add_throw(void *ctx)
 {
 	struct foo *f;
@@ -348,5 +348,39 @@ int reject_obj_under_caller_lock(struct __sk_buff *ctx)
 	return 0;
 }
 
+
+/* The same at a may_goto: the kernel would cancel the program there. */
+static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
+
+	for (;;)
+		cond_break;
+	return n;
+}
+
+SEC("?tc")
+__failure __msg("cannot be released under a lock a caller holds")
+int reject_may_goto_under_caller_lock(struct __sk_buff *ctx)
+{
+	struct bpf_list_node *n;
+	struct locked_list *l;
+	struct lfoo *f;
+	int key = 0;
+
+	l = bpf_map_lookup_elem(&locked_list_map, &key);
+	if (!l)
+		return 1;
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	bpf_spin_lock(&l->lock);
+	bpf_list_push_back(&l->head, &f->node);
+	n = pop_and_spin(l);
+	if (n)
+		bpf_list_push_back(&l->head, n);
+	bpf_spin_unlock(&l->lock);
+	return 0;
+}
 
 char _license[] SEC("license") = "GPL";
