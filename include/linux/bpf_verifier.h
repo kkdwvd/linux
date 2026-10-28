@@ -1098,6 +1098,8 @@ struct bpf_frame_desc_build {
 	u32 visits;
 	u16 nr_slots;
 	bool regs_saved;	/* the entry saves R0-R9 of this frame; otherwise it waits in a call */
+	u16 nr_fixed;
+	struct bpf_frame_desc_entry *fixed;	/* locks, IRQ flags and sections, equal on every path */
 	u16 nr_slot_acqs;
 	u32 *slot_acqs;	/* acquisitions whose unique slot this frame releases */
 	u16 nr_spills;
