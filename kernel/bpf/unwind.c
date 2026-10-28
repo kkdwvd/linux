@@ -459,8 +459,11 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 		return !ctx->cnt;
 	if (ctx->regs) {
 		const struct bpf_prog_aux *fn = bpf_unwind_fn(prog);
-		u64 fp = bp;
+		u64 fp = bp + fn->frame_fp_off;
 
+		/* With a private stack, the frame's R10 is this CPU's private frame. */
+		if (fn->priv_stack_ptr)
+			fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
 		/*
 		 * Record the frame for the releases once the walk is over. Every
 		 * frame is at a call, whose return address is the first byte of
