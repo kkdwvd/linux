@@ -49,3 +49,21 @@ SYM_FUNC_START(bpf_throw_entry)
 	save_bpf_regs
 	throw_unwind "movq %rdi, %rsi", BPF_THROW_CALL
 SYM_FUNC_END(bpf_throw_entry)
+
+/*
+ * Entry of a cancellation after the pad of the helper that ran the cancelled
+ * callback. The unwinder made it the helper's return address, and the return
+ * address of the call in the program, which the callback left in r0, is what
+ * the pad returns. Pushing it gives the stack the shape of a call from there:
+ * the frame below looks like that of bpf_throw_entry, with the callee-saved
+ * registers the helper's epilogue restored, which are all the program has
+ * live after a call.
+ */
+SYM_CODE_START(bpf_cancel_entry)
+	UNWIND_HINT_UNDEFINED
+	ANNOTATE_NOENDBR
+	pushq %rax
+	UNWIND_HINT_FUNC
+	save_bpf_regs
+	throw_unwind "xorl %esi, %esi", BPF_THROW_CANCEL
+SYM_CODE_END(bpf_cancel_entry)

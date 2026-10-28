@@ -3,7 +3,7 @@
  * The exception unwinder: from a throw site, release what each BPF frame
  * holds according to its frame descriptor, recover the callee-saved
  * registers the discarded frames saved, and transfer to the frame the kernel
- * entered, which returns.
+ * entered, which returns, or leaves into the pad of the helper that ran it.
  */
 #include <linux/bpf.h>
 #include <linux/filter.h>
@@ -211,10 +211,19 @@ struct bpf_throw_ctx {
 	/*
 	 * The callee-saved registers of the frame being walked, R6-R9 then the
 	 * architecture's own: what the throw site had, then what each frame
-	 * recovered of its caller's. After the main frame they are the ones
-	 * its caller expects back.
+	 * recovered of its caller's. After the frame the unwinder stops at they
+	 * are the ones its caller expects back.
 	 */
 	u64 saved[BPF_THROW_NR_CALLEE_SAVED];
+	/*
+	 * When that frame is a callback a helper ran: the pad of the helper, the
+	 * frame pointer of the last kernel frame passed, the return address of
+	 * the outermost helper into the program and where the helper keeps it.
+	 */
+	u64 pad;
+	u64 kernel_bp;
+	u64 site;
+	u64 *slot;
 };
 
 static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
@@ -231,8 +240,33 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	rcu_read_lock();
 	prog = bpf_prog_ksym_find(ip);
 	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
+	/*
+	 * The kernel frames below the first BPF frame are the unwinder's own.
+	 * The first one above a subprog's frame is the kernel code that ran
+	 * the subprog as a callback, where the unwinder stops: when it is a
+	 * helper with a pad, see bpf_call_cb(), the callback leaves into the
+	 * pad and the walk goes on, through the helpers the helper called with
+	 * pads of their own, to the frame of the program that called it, where
+	 * the return address of the outermost helper is found.
+	 */
+	if (!prog) {
+		if (!ctx->cnt)
+			return true;
+		if (!ctx->pad) {
+			ctx->pad = bpf_unwind_target(ip);
+			if (ctx->pad == ip) {
+				ctx->pad = 0;
+				return false;
+			}
+		}
+		ctx->kernel_bp = bp;
+		return true;
+	}
+	if (ctx->pad) {
+		ctx->site = ip;
+		ctx->slot = bpf_arch_ret_slot(ctx->kernel_bp, sp);
+		return false;
+	}
 	if (ctx->regs) {
 		/* The symbol of a program JITed as a set of functions covers its first function. */
 		const struct bpf_prog_aux *fn = !prog->is_func && prog->aux->func ?
@@ -255,26 +289,38 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 				ctx->saved[i] = *(u64 *)(long)(bp + fn->callee_reg_off[i]);
 	}
 	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
 	ctx->prog = prog;
 	ctx->sp = sp;
 	ctx->bp = bp;
-	return false;
+	/*
+	 * A program that is not a subprog was entered from the kernel or by a
+	 * tail call and is the frame the unwinder stops at; a tail called
+	 * program thus completes into the program that called it. A subprog
+	 * is unwound through, unless the kernel ran it as a callback.
+	 */
+	return bpf_is_subprog(prog);
 }
 
 /*
- * Unwind the stack to the exception callback of the main program. @regs is the
- * register file of the throw site, or NULL when the architecture has no native
- * entry and the kfunc was called directly; with it, the callee-saved registers
- * of the frames unwound are restored for the callback, without it the main
- * program's prologue has saved them all. @kind says how the throw site was
- * reached.
+ * Unwind the BPF frames above the throw site up to the one the kernel
+ * entered: the main program, which its exception callback returns from, or
+ * a callback. A callback a helper ran leaves into the pad of the helper the
+ * way unwind_exit does, with the return address of the call in the program
+ * as its r0; the helper drops what it holds and returns, with that r0, to
+ * bpf_cancel_entry(), which the unwinder made its return address, and the
+ * cancellation goes on from the call. A callback the kernel ran returns the
+ * program's cancel value to it. @regs is the register file of the throw
+ * site, or NULL when the architecture has no native entry and the kfunc was
+ * called directly; with it, the callee-saved registers of the frames unwound
+ * are restored for the callback, without it the main program's prologue has
+ * saved them all. @kind says how the throw site was reached.
  */
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
 	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
-	struct bpf_prog_aux *aux;
+	bool kernel = kind != BPF_THROW_CALL;
+	struct bpf_prog_aux *aux, *main_aux;
+	u64 (*cb)(u64, u64, u64, u64, u64);
 
 	if (regs)
 		memcpy(ctx.saved, &regs->r[BPF_REG_6], sizeof(ctx.saved));
@@ -289,10 +335,35 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	 * architectures cannot recover sp while unwinding, so fall back to bp.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	/* A throw the kernel raised completes with the program type's default. */
+	/*
+	 * The main program completes with the cookie, or with the program
+	 * type's default when the kernel raised the throw. A site in the
+	 * exception callback completes the way a kernel throw does, since the
+	 * callback cannot be run a second time. A callback a helper ran leaves
+	 * into the pad of the helper, and the cancellation goes on from the
+	 * call to it, where the program's main frame is reached in turn; a
+	 * callback the kernel ran returns the cancel value, which the kernel
+	 * code ignores.
+	 */
 	aux = ctx.prog->aux;
-	if (kind != BPF_THROW_CALL)
-		cookie = aux->cancel_retval;
-	aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
+	main_aux = aux->main_prog_aux;
+	if (ctx.pad) {
+		if (!WARN_ON_ONCE(!ctx.slot || *ctx.slot != ctx.site))
+			*ctx.slot = (u64)(long)bpf_arch_cancel_entry();
+		bpf_arch_set_ret_addr(ctx.bp, ctx.pad);
+		cookie = ctx.site;
+		cb = main_aux->bpf_cancel_cb;
+	} else if (aux->exception_cb || bpf_is_subprog(ctx.prog)) {
+		/* The verifier lets a helper run a callback with a site only with a pad. */
+		WARN_ON_ONCE(!aux->exception_cb && !aux->async_cb);
+		cookie = main_aux->cancel_retval;
+		cb = main_aux->bpf_cancel_cb;
+	} else {
+		if (kernel)
+			cookie = main_aux->cancel_retval;
+		cb = main_aux->bpf_exception_cb;
+	}
+	WARN_ON_ONCE(!cb);
+	cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }

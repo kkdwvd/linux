@@ -7524,6 +7524,20 @@ static struct bpf_reg_state *mem_access_reg(struct bpf_verifier_env *env, int re
 	return arena;
 }
 
+/*
+ * A point at which the kernel may cancel the program, if it can cancel it at
+ * all: the frames are described for the unwinder, and the program needs the
+ * exception boundary the unwinder transfers to. @regs_saved says whether the
+ * entry the unwinder is reached through saves R0-R9 of the innermost frame.
+ */
+static int check_cancel_site(struct bpf_verifier_env *env, bool regs_saved)
+{
+	if (!env->cancellable)
+		return 0;
+	env->seen_exception = true;
+	return bpf_frame_desc_site(env, regs_saved);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -15531,11 +15545,59 @@ static void leave_section(struct bpf_verifier_state *st, bool rcu)
 	}
 }
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+static bool nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
+/*
+ * A throw site inside a callback that a helper or a kfunc runs, called at insn
+ * @callsite. The unwinder stops at the callback, which leaves into the pad of
+ * its caller the way unwind_exit does, so the caller needs one, see
+ * bpf_call_cb(). The pad of bpf_rbtree_add() drops the node, which is a
+ * bpf_obj_drop() under the rule above.
+ */
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[callsite];
+	struct btf_struct_meta *meta;
+
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn)) {
+		if (bpf_helper_call(insn))
+			verbose(env,
+				"the callback of %s() cannot be cancelled: the helper has no pad\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env,
+				"the callback of the kfunc at insn %d cannot be cancelled: it has no pad\n",
+				callsite);
+		return -EINVAL;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) || !is_bpf_rbtree_add_kfunc(insn->imm) ||
+	    !nmi_unsafe_prog(env))
+		return 0;
+	meta = env->insn_aux_data[callsite].kptr_struct_meta;
+	if (meta && btf_record_has_nmi_unsafe_fields(meta->record)) {
+		verbose(env,
+			"bpf_rbtree_add with a comparator that can be cancelled cannot be used in tracing programs on types with NMI unsafe fields\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -15653,10 +15715,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
@@ -20477,9 +20536,23 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 					if (err)
 						return err;
 				}
-				return check_kfunc_call(env, insn, &env->insn_idx);
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			} else {
+				err = check_helper_call(env, insn, &env->insn_idx);
 			}
-			return check_helper_call(env, insn, &env->insn_idx);
+			if (err)
+				return err;
+			/*
+			 * A callback the helper or the kfunc ran was cancelled: it left
+			 * into the pad of its caller, which returned to the entry of
+			 * the cancellation with the return address of this call, and
+			 * the cancellation goes on from here, with the effects of the
+			 * call on this frame applied. The revisit of the call after
+			 * the callback unwound is on its way to the pad instead.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && !env->cur_state->unwound)
+				return check_cancel_site(env, false);
+			return 0;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);

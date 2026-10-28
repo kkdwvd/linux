@@ -12,7 +12,7 @@
  * macros rather than an enum. The kernel raised every kind but a call.
  */
 #define BPF_THROW_CALL		0	/* a call to bpf_throw() */
-#define BPF_THROW_CANCEL	2	/* a cancellation point the kernel raised */
+#define BPF_THROW_CANCEL	2	/* the helper that ran a cancelled callback */
 
 /*
  * The callee-saved registers of the architecture that no BPF register maps
@@ -51,9 +51,23 @@ struct bpf_throw_regs {
 static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind);
-/* The native entry of bpf_throw(), on an architecture that has one. */
+/*
+ * The native entry of bpf_throw(), on an architecture that has one, and the
+ * entry the helper that ran a cancelled callback returns to, to go on with
+ * the cancellation from the call of the helper.
+ */
 void bpf_throw_entry(void);
+void bpf_cancel_entry(void);
 void *bpf_arch_throw_entry(void);
+void *bpf_arch_cancel_entry(void);
+/*
+ * Where a kernel frame the stack walker passed keeps its return address, given
+ * the frame pointer the walker reported for it and the stack pointer it
+ * reported for the frame above, and the way to make the JITed frame whose
+ * frame pointer is @bp return to @to.
+ */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp);
+void bpf_arch_set_ret_addr(u64 bp, u64 to);
 #endif /* __ASSEMBLER__ */
 
 #endif /* _LINUX_BPF_THROW_H */

@@ -1169,6 +1169,7 @@ struct bpf_verifier_env {
 	u32 ref_release_cnt;
 	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
+	int cancel_callback_subprog;	/* returns the cookie from the frame of a cancelled callback */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -2089,10 +2090,12 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite);
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int id);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit_slots(struct bpf_verifier_env *env);
 void bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 from, u32 to);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 from, u32 to, s16 r6_off);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,
 			     u32 len);

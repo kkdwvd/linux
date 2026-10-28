@@ -36,6 +36,7 @@
 #include <linux/perf_event.h>
 #include <linux/extable.h>
 #include <linux/log2.h>
+#include <linux/bpf_unwind.h>
 #include <linux/bpf_verifier.h>
 #include <linux/nodemask.h>
 #include <linux/nospec.h>
@@ -3636,14 +3637,36 @@ bool __weak bpf_jit_supports_timed_may_goto(void)
 }
 
 /*
+ * The entry the helper that ran a cancelled callback returns to, to go on with
+ * the cancellation, or NULL; and where the unwinder finds the return address of
+ * a kernel frame and how it changes that of a JITed one, on an architecture
+ * with the entries.
+ */
+void * __weak bpf_arch_cancel_entry(void)
+{
+	return NULL;
+}
+
+u64 * __weak bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return NULL;
+}
+
+void __weak bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+}
+
+/*
  * Can the kernel cancel a running program on this architecture? It needs the
  * entries of every kind of cancellation point, so that a site the verifier
- * described is one the kernel can unwind from.
+ * described is one the kernel can unwind from, and the pads of the helpers
+ * that run callbacks, which a cancelled callback leaves through.
  */
 bool bpf_jit_supports_cancellation(void)
 {
-	return bpf_jit_supports_exceptions() && bpf_jit_supports_timed_may_goto() &&
-	       bpf_arch_throw_entry();
+	return BPF_HAS_CB_PADS && bpf_jit_supports_exceptions() &&
+	       bpf_jit_supports_timed_may_goto() && bpf_arch_throw_entry() &&
+	       bpf_arch_cancel_entry();
 }
 
 u64 __weak arch_bpf_timed_may_goto(void)

@@ -5266,6 +5266,26 @@ void *bpf_arch_throw_entry(void)
 {
 	return (void *)bpf_throw_entry;
 }
+
+void *bpf_arch_cancel_entry(void)
+{
+	return (void *)bpf_cancel_entry;
+}
+
+/*
+ * The return address of a kernel frame the walker passed sits below the stack
+ * pointer ORC reports for the frame above, which is its canonical frame address.
+ */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return (u64 *)(long)(next_sp - 8);
+}
+
+/* JITed code keeps a frame pointer, with the return address above it. */
+void bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+	*(u64 *)(long)(bp + 8) = to;
+}
 #endif
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
