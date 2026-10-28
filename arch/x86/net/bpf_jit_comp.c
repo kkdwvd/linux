@@ -1902,11 +1902,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+--------+-----------+---------+----------+
- * | 31        | 30          | 29-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+--------+-----------+---------+----------+
+ * +-----------+-------------+-------------+-----------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29          | 28        | 27-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |             |           |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | R0_ON_STACK | R0_IN_AX  | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+-------------+-----------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far past the faulting insn to resume. That is its own length
  *                      for a single-insn access, but the distance to the end of the whole
@@ -1922,6 +1922,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                        It is independent of DST_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
  * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
+ * - R0_IN_AX, R0_ON_STACK (1 bit each): Where R0 is while the faulting insn runs, when it is not
+ *                                       in RAX: the CMPXCHG loop of a fetching AND/OR/XOR keeps
+ *                                       it in BPF_REG_AX, or pushed on the stack when that holds
+ *                                       the address. The handler puts it back before it cancels
+ *                                       the program, which captures the register file.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1939,6 +1944,8 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_IN_AX	BIT(28)
+#define FIXUP_ARENA_R0_ON_STACK	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
 #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
@@ -1957,7 +1964,26 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		arena_reg = FIELD_GET(FIXUP_ARENA_REG_MASK, x->fixup);
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
+		if (bpf_prog_report_arena_violation(is_write, addr, regs->ip)) {
+			/*
+			 * The access is a cancellation point: resume the program
+			 * in bpf_throw_fault_entry() instead of after the access.
+			 * The stub captures the BPF register file, so R0 goes
+			 * back into RAX when the lowering of the access kept it
+			 * elsewhere. The faulting ip travels in r11, a temporary
+			 * of the JIT. The fault returns by iret, so the stub runs
+			 * on the stack the program had at the access, which no
+			 * return address was pushed to: the stub pushes r11 to
+			 * make its frame look like that of a call from the access.
+			 */
+			if (x->fixup & FIXUP_ARENA_R0_IN_AX)
+				regs->ax = regs->r10;
+			else if (x->fixup & FIXUP_ARENA_R0_ON_STACK)
+				regs->ax = *(unsigned long *)regs->sp;
+			regs->r11 = regs->ip;
+			regs->ip = (unsigned long)bpf_throw_fault_entry;
+			return true;
+		}
 	}
 
 	/* jump over the faulting access, or the sequence it is part of, and clear dest register */
@@ -1972,11 +1998,11 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
  * Record an arena access that may fault. @fault_ip is the address of the
  * faulting insn in the RO image, @resume_off how far past it execution has to
  * resume: for a multi-insn lowering that is the end of the whole sequence, not
- * the end of the one insn.
+ * the end of the one insn. @flags are the FIXUP_ARENA_* bits of the entry.
  */
 static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image,
 			      int *excnt, u8 *fault_ip, u32 resume_off,
-			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off)
+			      u32 fixup_reg, u32 arena_reg, u32 flags, s16 off)
 {
 	struct exception_table_entry *ex;
 	s64 delta;
@@ -1999,9 +2025,7 @@ static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image
 	ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, resume_off) |
 		    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
 		    FIELD_PREP(FIXUP_REG_MASK, fixup_reg) |
-		    FIXUP_ARENA_ACCESS;
-	if (is_write)
-		ex->fixup |= FIXUP_ARENA_WRITE;
+		    FIXUP_ARENA_ACCESS | flags;
 
 	return 0;
 }
@@ -3245,8 +3269,8 @@ populate_extable:
 
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
-							 prog - start_of_ldx, fixup_reg,
-							 arena_reg, is_write, insn->off);
+							 prog - start_of_ldx, fixup_reg, arena_reg,
+							 is_write ? FIXUP_ARENA_WRITE : 0, insn->off);
 				if (err)
 					return err;
 			}
@@ -3479,7 +3503,8 @@ populate_extable:
 				/*
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
-				 * since the BPF insn is a read-modify-write.
+				 * since the BPF insn is a read-modify-write, and both
+				 * say where R0 is kept while RAX serves the CMPXCHG.
 				 */
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
@@ -3489,7 +3514,10 @@ populate_extable:
 								 resume - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 true, insn->off);
+								 FIXUP_ARENA_WRITE |
+								 (r0_on_stack ? FIXUP_ARENA_R0_ON_STACK :
+										FIXUP_ARENA_R0_IN_AX),
+								 insn->off);
 					if (err)
 						return err;
 				}
@@ -5265,6 +5293,11 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 void *bpf_arch_throw_entry(void)
 {
 	return (void *)bpf_throw_entry;
+}
+
+void *bpf_arch_throw_fault_entry(void)
+{
+	return (void *)bpf_throw_fault_entry;
 }
 
 void *bpf_arch_cancel_entry(void)

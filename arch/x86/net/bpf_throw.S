@@ -67,3 +67,22 @@ SYM_CODE_START(bpf_cancel_entry)
 	save_bpf_regs
 	throw_unwind "xorl %esi, %esi", BPF_THROW_CANCEL
 SYM_CODE_END(bpf_cancel_entry)
+
+/*
+ * Entry of a cancellation at an arena page fault in JITed code. The exception
+ * table handler leaves the faulting ip in r11, a temporary of the JIT that no
+ * BPF register maps to, and returns to the interrupted context with its ip
+ * pointing here. That return is an iret, so the stack is the one the program
+ * had at the access, and pushing r11 gives it the shape of a call from the
+ * faulting instruction: the frame below looks like that of bpf_throw_entry
+ * and the unwinder finds the program's frame through the return address, at
+ * the exact ip of the access.
+ */
+SYM_CODE_START(bpf_throw_fault_entry)
+	UNWIND_HINT_UNDEFINED
+	ANNOTATE_NOENDBR
+	pushq %r11
+	UNWIND_HINT_FUNC
+	save_bpf_regs
+	throw_unwind "xorl %esi, %esi", BPF_THROW_FAULT
+SYM_CODE_END(bpf_throw_fault_entry)

@@ -12,6 +12,7 @@
  * macros rather than an enum. The kernel raised every kind but a call.
  */
 #define BPF_THROW_CALL		0	/* a call to bpf_throw() */
+#define BPF_THROW_FAULT		1	/* an arena fault: the innermost frame is at the faulting insn */
 #define BPF_THROW_CANCEL	2	/* a timed may_goto, or the helper that ran a cancelled callback */
 
 /*
@@ -58,13 +59,16 @@ static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind);
 /*
- * The native entry of bpf_throw(), on an architecture that has one, and the
- * entry the helper that ran a cancelled callback returns to, to go on with
- * the cancellation from the call of the helper.
+ * The native entry of bpf_throw(), on an architecture that has one, the entry
+ * a fault at an arena access of JITed code is redirected to, and the entry
+ * the helper that ran a cancelled callback returns to, to go on with the
+ * cancellation from the call of the helper.
  */
 void bpf_throw_entry(void);
+void bpf_throw_fault_entry(void);
 void bpf_cancel_entry(void);
 void *bpf_arch_throw_entry(void);
+void *bpf_arch_throw_fault_entry(void);
 void *bpf_arch_cancel_entry(void);
 /*
  * Where a kernel frame the stack walker passed keeps its return address, given
