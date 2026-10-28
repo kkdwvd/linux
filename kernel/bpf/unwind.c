@@ -584,7 +584,9 @@ static void bpf_unwind_sections(struct bpf_throw_ctx *ctx)
 static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 {
 	struct bpf_throw_ctx *ctx = cookie;
+	const struct bpf_prog_aux *fn;
 	struct bpf_prog *prog;
+	u64 fp;
 
 	/*
 	 * The RCU read lock is held to safely traverse the latch tree, but we
@@ -596,14 +598,19 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	rcu_read_unlock();
 	if (!prog)
 		return !ctx->cnt;
+	fn = bpf_unwind_fn(prog);
+	fp = bp + fn->frame_fp_off;
+	/* With a private stack, the frame's R10 is this CPU's private frame. */
+	if (fn->priv_stack_ptr)
+		fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
 	/*
 	 * Note the frame, to release what it holds of this walk's phase once
 	 * its callers are known. Every frame is at a call, whose return
 	 * address is the first byte of the next instruction. Then recover the
 	 * caller's callee-saved registers from the frame.
 	 */
-	bpf_unwind_note(ctx, prog, ip - 1, bp, bp, true);
-	bpf_unwind_recover(bpf_unwind_fn(prog), bp, ctx->saved, BPF_THROW_NR_CALLEE_SAVED);
+	bpf_unwind_note(ctx, prog, ip - 1, bp, fp, true);
+	bpf_unwind_recover(fn, bp, ctx->saved, BPF_THROW_NR_CALLEE_SAVED);
 	ctx->cnt++;
 	if (bpf_is_subprog(prog))
 		return true;
