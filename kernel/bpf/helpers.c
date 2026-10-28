@@ -3487,8 +3487,6 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
 		memcpy(ctx.saved, regs->saved, sizeof(ctx.saved));
 	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
 	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
 	WARN_ON_ONCE(!ctx.bp);
 	WARN_ON_ONCE(!ctx.cnt);
 	/*
