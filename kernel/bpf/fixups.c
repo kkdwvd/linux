@@ -966,6 +966,8 @@ apply_patch_buffer:
 		new_prog = bpf_patch_insn_data(env, adj_idx, patch, patch_len);
 		if (!new_prog)
 			return -ENOMEM;
+		/* The patched insn stays first; an arena site's descriptor belongs to it. */
+		bpf_frame_desc_move_site(env, adj_idx + patch_len - 1, adj_idx);
 		env->prog = new_prog;
 		insns = new_prog->insnsi;
 		aux = env->insn_aux_data;
