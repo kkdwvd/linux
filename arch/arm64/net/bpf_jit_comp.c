@@ -46,6 +46,11 @@
 #define check_imm26(imm) check_imm(26, imm)
 
 /* Map BPF registers to A64 registers */
+/* arch/arm64/net/bpf_throw.S: the entries of bpf_throw_unwind(), built with the syscall. */
+extern void bpf_throw_entry(void);
+extern void bpf_throw_fault_entry(void);
+extern void bpf_cancel_entry(void);
+
 static const int bpf2a64[] = {
 	/* return value from in-kernel function, and exit value from eBPF */
 	[BPF_REG_0] = A64_R(8),
@@ -1152,7 +1157,19 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+		if (bpf_prog_report_arena_violation(is_write, addr, regs->pc)) {
+			/*
+			 * The access is a cancellation point: resume the program
+			 * in bpf_throw_fault_entry() instead of after the access.
+			 * The faulting pc travels in a temporary of the JIT that
+			 * no BPF register maps to. The lowering of an access
+			 * writes no BPF register before the access itself, so
+			 * the register file the entry captures is the site's.
+			 */
+			regs->regs[bpf2a64[TMP_REG_1]] = regs->pc;
+			regs->pc = (unsigned long)bpf_throw_fault_entry;
+			return true;
+		}
 	}
 
 	if (dst_reg != DONT_CLEAR)
@@ -3669,6 +3686,39 @@ bool bpf_jit_supports_timed_may_goto(void)
 void *bpf_arch_throw_entry(void)
 {
 	return (void *)bpf_throw_entry;
+}
+
+void *bpf_arch_throw_fault_entry(void)
+{
+	return (void *)bpf_throw_fault_entry;
+}
+
+void *bpf_arch_cancel_entry(void)
+{
+	return (void *)bpf_cancel_entry;
+}
+
+/* The return address of a kernel frame the walker passed is in its frame record. */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return (u64 *)(long)(bp + 8);
+}
+
+/*
+ * JITed code signs the return address in its frame record with the stack
+ * pointer at entry, which is the address above the record, see
+ * build_prologue().
+ */
+void bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
+	register u64 x17 asm("x17") = to;
+	register u64 x16 asm("x16") = bp + 16;
+
+	asm("pacia1716" : "+r"(x17) : "r"(x16));
+	to = x17;
+#endif
+	*(u64 *)(long)(bp + 8) = to;
 }
 #endif
 
