@@ -20214,10 +20214,12 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	 * prepare_func_exit to handle the case when
 	 * state->curframe > 0, it may be a callback function,
 	 * for which reference_state must match caller reference
-	 * state when it exits.
+	 * state when it exits. An unwinder that releases resources
+	 * leaves locks and sections too.
 	 */
 	int err = check_resource_leak(env, exception_exit,
-				      exception_exit || !env->cur_state->curframe,
+				      exception_exit ? !bpf_arch_throw_entry() :
+				      !env->cur_state->curframe,
 				      exception_exit ? "bpf_throw" :
 				      "BPF_EXIT instruction in main prog");
 	if (err)
@@ -20450,7 +20452,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				      insn->imm != BPF_FUNC_spin_unlock &&
 				      insn->imm != BPF_FUNC_kptr_xchg) ||
 				     (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
-				      !kfunc_spin_allowed(env, insn->imm, insn->off)))) {
+				      !kfunc_spin_allowed(env, insn->imm, insn->off) &&
+				      !(bpf_is_throw_kfunc(insn) && bpf_arch_throw_entry())))) {
 					verbose(env,
 						"function calls are not allowed while holding a lock\n");
 					bpf_diag_ctx_active(

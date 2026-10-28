@@ -53,6 +53,15 @@ enum {
 
 #define CALLEE_SAVED_REGS	(BIT(BPF_REG_6) | BIT(BPF_REG_7) | BIT(BPF_REG_8) | BIT(BPF_REG_9))
 #define FRAME_LOCS		(BPF_REG_10 + MAX_BPF_STACK_SLOTS)
+#define MAX_FIXED		32	/* locks, IRQ flags and sections a frame may hold */
+/* Release ranks of the entries without an acquisition order, see entry_cmp(). */
+#define ORDER_RCU_OBJ		-1
+#define ORDER_SECTION		-2
+#define ORDER_OBJ		-3
+
+/* What the frames above a frame hold, which limits what the frame may release. */
+#define HELD_SECTION		BIT(0)	/* an RCU or preemption section, or IRQ flags */
+#define HELD_LOCK		BIT(1)
 
 /* A candidate location of one reference on the current path. */
 struct cand {
@@ -71,6 +80,10 @@ struct scratch {
 	struct bpf_frame_desc_build *builds[MAX_CALL_FRAMES];
 	u32 pcs[MAX_CALL_FRAMES];
 	u32 live_regs[MAX_CALL_FRAMES];
+	struct bpf_frame_desc_entry fixed[MAX_CALL_FRAMES][MAX_FIXED];
+	u16 nr_fixed[MAX_CALL_FRAMES];
+	u8 held_above[MAX_CALL_FRAMES];	/* HELD_* of the frames above each frame */
+	bool in_section[MAX_CALL_FRAMES];	/* a section is held by the frame or one above */
 };
 
 /* Make room for @nr_slots stack slots in the descriptor of insn @pc, which @b is or NULL. */
@@ -102,6 +115,7 @@ static void build_destroy(struct bpf_frame_desc_build *b)
 {
 	if (!b)
 		return;
+	kvfree(b->fixed);
 	kvfree(b->slot_acqs);
 	kvfree(b->spills);
 	kvfree(b);
@@ -271,6 +285,11 @@ static int resource_of_iter(struct bpf_verifier_env *env, const struct bpf_reg_s
 	struct bpf_resource res;
 	int ret;
 
+	if (reg->type & PTR_UNTRUSTED) {
+		verbose(env,
+			"frame_desc: cannot release an iterator after its RCU protection ended\n");
+		return -EOPNOTSUPP;
+	}
 	memset(&res, 0, sizeof(res));
 	res.kind = BPF_RESOURCE_ITER;
 	res.btf = reg->iter.btf;
@@ -278,6 +297,11 @@ static int resource_of_iter(struct bpf_verifier_env *env, const struct bpf_reg_s
 	ret = resource_registry(env, reg->iter.btf, reg->iter.btf_id, &res, "iterator");
 	if (ret)
 		return ret;
+	res.rcu = reg->type & MEM_RCU;
+	if (res.rcu && res.sleeps) {
+		verbose(env, "frame_desc: RCU-protected iterator has a sleepable destructor\n");
+		return -EOPNOTSUPP;
+	}
 	return resource_intern(env, &res);
 }
 
@@ -327,6 +351,106 @@ static int stack_slot_ref(struct bpf_verifier_env *env, const struct bpf_stack_s
 	default:
 		return -ENOENT;
 	}
+}
+
+static bool resource_is_lock(const struct bpf_resource *res)
+{
+	return res->kind == BPF_RESOURCE_SPIN_LOCK || res->kind == BPF_RESOURCE_RES_LOCK ||
+	       res->kind == BPF_RESOURCE_RES_LOCK_IRQ;
+}
+
+static u8 lock_kind(enum ref_state_type type)
+{
+	switch (type) {
+	case REF_TYPE_LOCK:
+		return BPF_RESOURCE_SPIN_LOCK;
+	case REF_TYPE_RES_LOCK:
+		return BPF_RESOURCE_RES_LOCK;
+	default:
+		return BPF_RESOURCE_RES_LOCK_IRQ;
+	}
+}
+
+/* Offset of the lock of kind @kind in the object @rec describes. */
+static int lock_off(const struct btf_record *rec, u8 kind)
+{
+	if (kind == BPF_RESOURCE_SPIN_LOCK)
+		return btf_record_has_field(rec, BPF_SPIN_LOCK) ? rec->spin_lock_off : -ENOENT;
+	return btf_record_has_field(rec, BPF_RES_SPIN_LOCK) ? rec->res_spin_lock_off : -ENOENT;
+}
+
+/*
+ * Does @reg point into the object whose lock @ref holds? Any constant offset
+ * will do: the lock is found from the pointer value by a fixed delta.
+ */
+static bool reg_is_lock(const struct bpf_reg_state *reg, const struct bpf_reference_state *ref)
+{
+	if (reg->type == NOT_INIT || reg->type == SCALAR_VALUE || reg->id != ref->id ||
+	    !tnum_is_const(reg->var_off))
+		return false;
+	if (reg->type == PTR_TO_MAP_VALUE)
+		return reg->map_ptr == ref->ptr;
+	return base_type(reg->type) == PTR_TO_BTF_ID && (type_flag(reg->type) & MEM_ALLOC) &&
+	       reg->btf == ref->ptr;
+}
+
+/* The class of a lock of kind @kind reached from the pointer in @reg. */
+static int resource_of_lock(struct bpf_verifier_env *env, const struct bpf_reg_state *reg, u8 kind)
+{
+	const struct btf_record *rec;
+	struct bpf_resource res;
+	s64 delta;
+	int off;
+
+	if (reg->type == PTR_TO_MAP_VALUE) {
+		rec = reg->map_ptr->record;
+	} else {
+		struct btf_struct_meta *meta = btf_find_struct_meta(reg->btf, reg->btf_id);
+
+		rec = meta ? meta->record : NULL;
+	}
+	off = lock_off(rec, kind);
+	if (off < 0)
+		return off;
+	delta = off - (s64)reg->var_off.value;
+	if (delta != (s16)delta)
+		return -ERANGE;
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	res.delta = delta;
+	return resource_intern(env, &res);
+}
+
+/*
+ * A lock in the value of a single element array map, that is in a global
+ * variable, has a fixed address: no location of the program needs to point at
+ * it. The verifier tracks such a lock without an id; a lock without an id in
+ * any other map cannot be told from the locks of the other elements.
+ */
+static int resource_of_global_lock(struct bpf_verifier_env *env,
+				   const struct bpf_reference_state *ref, u8 kind)
+{
+	struct bpf_map *map = NULL;
+	struct bpf_resource res;
+	u64 addr;
+	int i, off;
+
+	for (i = 0; i < env->used_map_cnt; i++)
+		if (env->used_maps[i] == ref->ptr)
+			map = env->used_maps[i];
+	if (!map || map->map_type != BPF_MAP_TYPE_ARRAY || map->max_entries != 1 ||
+	    !map->ops->map_direct_value_addr) {
+		verbose(env, "frame_desc: cannot tell which element holds the lock acquired at insn %d\n",
+			ref->insn_idx);
+		return -EINVAL;
+	}
+	off = lock_off(map->record, kind);
+	if (off < 0 || map->ops->map_direct_value_addr(map, &addr, off))
+		return -EINVAL;
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	res.addr = (void *)(long)(addr + off);
+	return resource_intern(env, &res);
 }
 
 /* Can a reference of class @res live in a unique slot: a pointer released from a register. */
@@ -484,11 +608,13 @@ static int merge(struct bpf_verifier_env *env, struct bpf_frame_desc_loc *loc, i
 	}
 }
 
-/* Entries are sorted so that equal descriptors compare equal. */
+/* Release order: locks and IRQ flags, RCU objects, sections, then other objects. */
 static int entry_cmp(const void *a, const void *b)
 {
 	const struct bpf_frame_desc_entry *x = a, *y = b;
 
+	if (x->order != y->order)
+		return y->order - x->order;
 	if (x->loc != y->loc)
 		return x->loc - y->loc;
 	if (x->off != y->off)
@@ -496,11 +622,17 @@ static int entry_cmp(const void *a, const void *b)
 	return x->res - y->res;
 }
 
+static s16 resource_order(const struct bpf_verifier_env *env, u16 res)
+{
+	return env->resources[res].rcu ? ORDER_RCU_OBJ : ORDER_OBJ;
+}
+
 /*
- * Lay out the entries of one descriptor: every listed location of the frame
- * and the unique slots it owns.
+ * Lay out the entries of one descriptor: every listed location of the frame,
+ * the locks, IRQ flags and sections it holds, and the unique slots it owns.
  */
-static u32 build_body(const struct bpf_frame_desc_build *b, struct bpf_frame_desc *d)
+static u32 build_body(const struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
+		      struct bpf_frame_desc *d)
 {
 	u32 n = 0, i;
 
@@ -520,15 +652,18 @@ static u32 build_body(const struct bpf_frame_desc_build *b, struct bpf_frame_des
 		ent->off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
 		ent->flags = loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0;
 		ent->res = loc->res;
+		ent->order = resource_order(env, loc->res);
 	}
 	if (d) {
+		for (i = 0; i < b->nr_fixed; i++)
+			d->ent[n++] = b->fixed[i];
 		for (i = 0; i < b->nr_spills; i++)
 			d->ent[n++] = b->spills[i];
 		d->nent = n;
 		d->size = struct_size(d, ent, n);
 		sort(d->ent, n, sizeof(d->ent[0]), entry_cmp, NULL);
 	} else {
-		n += b->nr_spills;
+		n += b->nr_fixed + b->nr_spills;
 	}
 	return n;
 }
@@ -538,12 +673,12 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 {
 	struct bpf_frame_desc_pool *pool = env->frame_desc_pool;
 	struct bpf_frame_desc *d;
-	u32 i, n = build_body(b, NULL);
+	u32 i, n = build_body(env, b, NULL);
 
 	d = kvzalloc(struct_size(d, ent, n), GFP_KERNEL_ACCOUNT);
 	if (!d)
 		return -ENOMEM;
-	build_body(b, d);
+	build_body(env, b, d);
 	for (i = 0; i < pool->cnt; i++) {
 		if (pool->desc[i]->size == d->size && !memcmp(pool->desc[i], d, d->size)) {
 			kvfree(d);
@@ -651,6 +786,288 @@ void bpf_frame_desc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog 
 			tab->site[i].off += len - 1;
 }
 
+/* Append a lock, IRQ flag or section entry of frame @f on this path. */
+static int fixed_add(struct bpf_verifier_env *env, struct scratch *s, int f,
+		     struct bpf_frame_desc_entry ent)
+{
+	if (s->nr_fixed[f] >= MAX_FIXED) {
+		verbose(env, "frame_desc: frame%d holds too many locks and sections\n", f);
+		return -E2BIG;
+	}
+	s->fixed[f][s->nr_fixed[f]++] = ent;
+	return 0;
+}
+
+/* The entry an earlier path listed for the lock or IRQ flag of rank @order, and its frame. */
+static const struct bpf_frame_desc_entry *fixed_find(struct scratch *s, int curframe, s16 order,
+						     int *frame)
+{
+	int f, i;
+
+	for (f = 0; f <= curframe; f++) {
+		struct bpf_frame_desc_build *b = s->builds[f];
+
+		for (i = 0; i < b->nr_fixed; i++) {
+			if (b->fixed[i].order == order) {
+				*frame = f;
+				return &b->fixed[i];
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Place a held lock: at its fixed address when it has one, else at a live
+ * location holding a pointer into its object. An earlier path's choice must
+ * be reused, as the entries have to agree. Locks are the innermost resources,
+ * so prefer the innermost frame, then a stack slot or callee-saved register.
+ */
+static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
+		      const struct bpf_reference_state *ref, s16 order)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_frame_desc_entry ent = { .order = order };
+	u8 kind = lock_kind(ref->type);
+	const struct bpf_frame_desc_entry *prev;
+	const struct cand *c;
+	int f, k, nr = 0, prev_frame, chosen = -1, best = INT_MAX, ret;
+
+	if (!ref->id) {
+		ret = resource_of_global_lock(env, ref, kind);
+		if (ret < 0)
+			return ret;
+		ent.loc = BPF_FRAME_LOC_NONE;
+		ent.off = 1;
+		ent.res = ret;
+		return fixed_add(env, s, st->curframe, ent);
+	}
+	for (f = st->curframe; f >= 0; f--) {
+		struct bpf_func_state *frame = st->frame[f];
+		const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+
+		for (k = 0; k < BPF_REG_10; k++) {
+			if (!(s->live_regs[f] & BIT(k)) || !reg_is_lock(&frame->regs[k], ref))
+				continue;
+			ret = resource_of_lock(env, &frame->regs[k], kind);
+			if (ret < 0)
+				return ret;
+			s->cands[nr++] = (struct cand) { f, 0, k, ret };
+		}
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+			if (!test_bit(k, live_stack) || !bpf_is_spilled_reg(slot) ||
+			    !reg_is_lock(&slot->spilled_ptr, ref))
+				continue;
+			ret = resource_of_lock(env, &slot->spilled_ptr, kind);
+			if (ret < 0)
+				return ret;
+			s->cands[nr++] = (struct cand) { f, 1, k, ret };
+		}
+	}
+	prev = fixed_find(s, st->curframe, order, &prev_frame);
+	for (k = 0; k < nr; k++) {
+		int rank;
+
+		c = &s->cands[k];
+		if (prev) {
+			if (c->frameno == prev_frame && c->res == prev->res &&
+			    prev->loc == (c->is_slot ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG) &&
+			    prev->off == (c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx)) {
+				chosen = k;
+				break;
+			}
+			continue;
+		}
+		rank = (st->curframe - c->frameno) * 4;
+		rank += c->is_slot ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
+		if (rank < best) {
+			best = rank;
+			chosen = k;
+		}
+	}
+	if (chosen < 0) {
+		verbose(env, "frame_desc: %s to release the lock acquired at insn %d from\n",
+			prev ? "another path uses a different location" : "no location",
+			ref->insn_idx);
+		return -EINVAL;
+	}
+	c = &s->cands[chosen];
+	ent.loc = c->is_slot ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG;
+	ent.off = c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx;
+	ent.res = c->res;
+	return fixed_add(env, s, c->frameno, ent);
+}
+
+/*
+ * Place saved IRQ flags: the stack slot they live in. The flags of an irqsave
+ * lock are restored by the lock, so they must sit in the lock's frame.
+ */
+static int place_irq(struct bpf_verifier_env *env, struct scratch *s,
+		     const struct bpf_reference_state *ref, s16 order)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_frame_desc_entry ent = { .order = order, .loc = BPF_FRAME_LOC_STACK };
+	struct bpf_resource res;
+	int f, k, ret;
+
+	for (f = st->curframe; f >= 0; f--) {
+		struct bpf_func_state *frame = st->frame[f];
+		const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+			bool lock = slot->spilled_ptr.irq.kfunc_class == IRQ_LOCK_KFUNC;
+
+			if (slot->slot_type[BPF_REG_SIZE - 1] != STACK_IRQ_FLAG ||
+			    slot->spilled_ptr.id != ref->id)
+				continue;
+			if (!test_bit(k, live_stack)) {
+				verbose(env, "frame_desc: the irq flags saved at insn %d are dead\n",
+					ref->insn_idx);
+				return -EINVAL;
+			}
+			if (lock && (!s->nr_fixed[f] ||
+				     s->fixed[f][s->nr_fixed[f] - 1].order != order - 1)) {
+				verbose(env, "frame_desc: the lock of the irq flags saved at insn %d is not in their frame\n",
+					ref->insn_idx);
+				return -EINVAL;
+			}
+			memset(&res, 0, sizeof(res));
+			res.kind = lock ? BPF_RESOURCE_IRQ_FLAG_LOCK : BPF_RESOURCE_IRQ_FLAG;
+			ret = resource_intern(env, &res);
+			if (ret < 0)
+				return ret;
+			ent.off = -(k + 1) * BPF_REG_SIZE;
+			ent.res = ret;
+			return fixed_add(env, s, f, ent);
+		}
+	}
+	verbose(env, "frame_desc: no stack slot holds the irq flags saved at insn %d\n", ref->insn_idx);
+	return -EINVAL;
+}
+
+/* Sections have no location; the frame that entered them leaves them. */
+static int place_section(struct bpf_verifier_env *env, struct scratch *s, int f, u8 kind,
+			 u32 count)
+{
+	struct bpf_frame_desc_entry ent = { .order = ORDER_SECTION, .loc = BPF_FRAME_LOC_NONE };
+	struct bpf_resource res;
+	int ret;
+
+	if (!count)
+		return 0;
+	if (count > S16_MAX) {
+		verbose(env, "frame_desc: frame%d is in too many nested sections\n", f);
+		return -E2BIG;
+	}
+	memset(&res, 0, sizeof(res));
+	res.kind = kind;
+	ret = resource_intern(env, &res);
+	if (ret < 0)
+		return ret;
+	ent.off = count;
+	ent.res = ret;
+	return fixed_add(env, s, f, ent);
+}
+
+/*
+ * Place the locks, IRQ flags and sections held on this path. Unlike objects,
+ * these are released in order: the verifier keeps locks and IRQ flags in
+ * acquisition order, and the unwinder releases inner frames first, so the
+ * ranks placed in a frame must all follow those of its callers. Every path
+ * must place exactly the same entries in every frame. What the frames above
+ * a frame hold limits what it may release, which held_above records.
+ */
+static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int i, f, k, order = 0, last = -1, held = 0, ret;
+	bool section = false;
+
+	memset(s->nr_fixed, 0, sizeof(s->nr_fixed));
+	for (i = 0; i < st->acquired_refs; i++) {
+		const struct bpf_reference_state *ref = &st->refs[i];
+
+		if (ref->type & REF_TYPE_LOCK_MASK)
+			ret = place_lock(env, s, ref, order++);
+		else if (ref->type == REF_TYPE_IRQ)
+			ret = place_irq(env, s, ref, order++);
+		else
+			continue;
+		if (ret)
+			return ret;
+	}
+	for (f = 0; f <= st->curframe; f++) {
+		ret = place_section(env, s, f, BPF_RESOURCE_RCU, st->frame[f]->rcu_locks);
+		ret = ret ?: place_section(env, s, f, BPF_RESOURCE_PREEMPT,
+					   st->frame[f]->preempt_locks);
+		if (ret)
+			return ret;
+	}
+
+	for (f = 0; f <= st->curframe; f++) {
+		struct bpf_frame_desc_build *b = s->builds[f];
+		size_t sz = s->nr_fixed[f] * sizeof(s->fixed[f][0]);
+
+		s->held_above[f] = held;
+		section |= st->frame[f]->rcu_locks || st->frame[f]->preempt_locks;
+		s->in_section[f] = section;
+		for (k = 0; k < s->nr_fixed[f]; k++)
+			held |= resource_is_lock(&env->resources[s->fixed[f][k].res]) ?
+				HELD_LOCK : HELD_SECTION;
+		sort(s->fixed[f], s->nr_fixed[f], sizeof(s->fixed[f][0]), entry_cmp, NULL);
+		/* Sorted latest first: the last ranked entry has the lowest rank. */
+		for (k = s->nr_fixed[f] - 1; k >= 0; k--) {
+			if (s->fixed[f][k].order < 0)
+				continue;
+			if (s->fixed[f][k].order <= last) {
+				verbose(env, "frame_desc: frame%d insn %d: holds a lock or irq flags acquired before a caller's\n",
+					f, s->pcs[f]);
+				return -EINVAL;
+			}
+			last = s->fixed[f][0].order;
+			break;
+		}
+		if (!b->visits) {
+			/* A visit that failed in a later frame may have placed these already. */
+			kvfree(b->fixed);
+			b->fixed = sz ? kvmemdup(s->fixed[f], sz, GFP_KERNEL_ACCOUNT) : NULL;
+			if (sz && !b->fixed)
+				return -ENOMEM;
+			b->nr_fixed = s->nr_fixed[f];
+		} else if (b->nr_fixed != s->nr_fixed[f] ||
+			   (sz && memcmp(b->fixed, s->fixed[f], sz))) {
+			verbose(env, "frame_desc: frame%d insn %d: holds different locks or sections on another path\n",
+				f, s->pcs[f]);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
+ * May frame @f release an object of class @res? Objects are released after
+ * their frame's locks, RCU-protected objects before its sections and other
+ * objects after them. The frames above still hold their resources, so a
+ * caller's lock forbids any release, as the program could call none there, a
+ * caller's section or IRQ flags forbid a destructor that sleeps, and in a
+ * sleepable program an RCU-protected object needs a section around it.
+ */
+static const char *release_blocker(struct bpf_verifier_env *env, struct scratch *s, int f, u16 res)
+{
+	const struct bpf_resource *r = &env->resources[res];
+
+	if (s->held_above[f] & HELD_LOCK)
+		return "cannot be released under a lock a caller holds";
+	if (r->sleeps && (s->held_above[f] & HELD_SECTION))
+		return "has a sleeping destructor and a caller holds a section or irq flags";
+	if (r->rcu && env->cur_state->in_sleepable && !s->in_section[f])
+		return "is RCU protected and no section covers its release";
+	return NULL;
+}
+
 /* The frame of @sub on the stack of the current state, or -1 once it has returned. */
 static int frame_of_subprog(struct bpf_verifier_env *env, int sub)
 {
@@ -667,8 +1084,8 @@ static int frame_of_subprog(struct bpf_verifier_env *env, int sub)
  * List reference @ref, of class @res with @nr candidate locations on this
  * path. A reference acquired by a call is listed from the unique slot of the
  * acquiring frame, which must be on the stack, and at a location the paths
- * agree on as a fallback; when the location cannot be found, the slot is
- * required. A reference no live location holds
+ * agree on as a fallback; when the location cannot be found or a frame may
+ * not release it, the slot is required. A reference no live location holds
  * can never be released by the program, which the verifier rejects for the
  * leak when the path ends, so it is left out here.
  */
@@ -694,7 +1111,8 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		}
 	}
 	if (aux->ref_slot == BPF_REF_SLOT_WANTED) {
-		why = af < 0 ? "was acquired in a subprog that returned" : NULL;
+		why = af < 0 ? "was acquired in a subprog that returned" :
+		      release_blocker(env, s, af, res);
 		if (why) {
 			if (aux->ref_slot_needed) {
 				verbose(env, "frame_desc: the reference acquired at insn %d %s, and no location describes it on every path\n",
@@ -714,7 +1132,7 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 	why = chosen == -ENOENT ? "has no location free to be released from" :
 	      chosen == -EEXIST ? "is at different locations on different paths" :
 	      chosen == -EINVAL ? "shares a location with another resource on another path" :
-	      NULL;
+	      release_blocker(env, s, s->cands[chosen].frameno, res);
 	for (k = 0; k < nr; k++) {
 		const struct cand *c = &s->cands[k];
 		int idx = c->is_slot ? BPF_REG_10 + c->idx : c->idx;
@@ -770,6 +1188,10 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 			return -ENOMEM;
 		s->builds[f]->regs_saved = f == st->curframe && regs_saved;
 	}
+
+	ret = place_fixed(env, s);
+	if (ret)
+		return ret;
 
 	/* Place every reference at one live location. */
 	for (i = 0; i < st->acquired_refs; i++) {
@@ -955,6 +1377,7 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 			b->spills[b->nr_spills++] = (struct bpf_frame_desc_entry) {
 				.loc = BPF_FRAME_LOC_STACK, .flags = BPF_FRAME_ENT_NULLABLE,
 				.res = aux[acq].ref_slot_resource, .off = aux[acq].ref_slot_off,
+				.order = resource_order(env, aux[acq].ref_slot_resource),
 			};
 		}
 	}
