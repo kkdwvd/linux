@@ -1840,7 +1840,7 @@ struct bpf_frame_desc_entry {
 	u8 flags;
 	u16 res;	/* index into the program's resource classes */
 	s16 off;
-	s16 order;	/* acquisition rank or one of the negative ranks in frame_desc.c */
+	s16 order;	/* rank in the frame, or one of the negative ranks in frame_desc.c */
 };
 
 struct bpf_frame_desc {
