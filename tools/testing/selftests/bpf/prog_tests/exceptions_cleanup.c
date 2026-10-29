@@ -141,6 +141,7 @@ static void run_suite(const char *prefix)
 	THROW(throw_obj_caller, 1);
 	THROW(throw_obj_callx_caller, 1);
 	THROW(throw_obj_unconditional, 1);
+	THROW(throw_obj_dead_caller, 1);
 	THROW(throw_obj_subprog, 1);
 	THROW(throw_obj_global_caller, 1);
 	THROW(throw_slot, 1);

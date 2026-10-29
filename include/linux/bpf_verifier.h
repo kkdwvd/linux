@@ -782,6 +782,10 @@ struct bpf_insn_aux_data {
 	u16 ref_slot_resource;
 	s16 ref_slot_off;
 	s16 ref_slot_clear_off;
+	/* the type the call at this insn returned the reference it acquired as, NOT_INIT if none */
+	u32 acq_type;
+	u32 acq_btf_id;
+	struct btf *acq_btf;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	/*
 	 * Per-instruction summary of stack slots in the current frame

@@ -1553,6 +1553,21 @@ static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int par
 	return s->id;
 }
 
+/*
+ * Keep the type a call returns the reference it acquires as: a frame
+ * descriptor classifies the reference from it when no live location holds
+ * the reference, see place_ref() in frame_desc.c.
+ */
+static void record_acquired_type(struct bpf_verifier_env *env, int insn_idx,
+				 const struct bpf_reg_state *reg)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+
+	aux->acq_type = reg->type;
+	aux->acq_btf = reg->btf;
+	aux->acq_btf_id = reg->btf_id;
+}
+
 static int acquire_lock_state(struct bpf_verifier_env *env, int insn_idx, enum ref_state_type type,
 			      int id, void *ptr)
 {
@@ -13216,6 +13231,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		record_acquired_type(env, insn_idx, &regs[BPF_REG_0]);
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -16102,6 +16118,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			record_acquired_type(env, insn_idx, &regs[BPF_REG_0]);
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}

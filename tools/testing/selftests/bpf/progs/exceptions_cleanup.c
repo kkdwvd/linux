@@ -300,6 +300,29 @@ int throw_obj_unconditional(struct __sk_buff *ctx)
 	return 0;
 }
 
+static __noinline int throw_unconditionally(void)
+{
+	bpf_throw(0xeB9F);
+	return 0;
+}
+
+/*
+ * The callee's throw is unconditional, so the caller never reads the object
+ * again and no live location of its frame holds it at the call: the object
+ * is released from the unique slot of its acquisition.
+ */
+SEC("tc")
+int throw_obj_dead_caller(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	return throw_unconditionally();
+}
+
 static __noinline int subprog_acquire_throw(struct __sk_buff *ctx)
 {
 	struct foo *f;
