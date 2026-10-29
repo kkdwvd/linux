@@ -134,16 +134,6 @@ int ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
 }
 EXPORT_SYMBOL_GPL(ip_local_out);
 
-static inline int ip_select_ttl(const struct inet_sock *inet,
-				const struct dst_entry *dst)
-{
-	int ttl = READ_ONCE(inet->uc_ttl);
-
-	if (ttl < 0)
-		ttl = ip4_dst_hoplimit(dst);
-	return ttl;
-}
-
 /*
  *		Add an ip header to a skbuff and send it out.
  *

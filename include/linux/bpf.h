@@ -885,12 +885,16 @@ enum bpf_type_flag {
 	/* DYNPTR points to file */
 	DYNPTR_TYPE_FILE	= BIT(20 + BPF_BASE_TYPE_BITS),
 
+	/* DYNPTR points to an xdp_frame the program owns */
+	DYNPTR_TYPE_XDP_FRAME	= BIT(21 + BPF_BASE_TYPE_BITS),
+
 	__BPF_TYPE_FLAG_MAX,
 	__BPF_TYPE_LAST_FLAG	= __BPF_TYPE_FLAG_MAX - 1,
 };
 
 #define DYNPTR_TYPE_FLAG_MASK	(DYNPTR_TYPE_LOCAL | DYNPTR_TYPE_RINGBUF | DYNPTR_TYPE_SKB \
-				 | DYNPTR_TYPE_XDP | DYNPTR_TYPE_SKB_META | DYNPTR_TYPE_FILE)
+				 | DYNPTR_TYPE_XDP | DYNPTR_TYPE_SKB_META | DYNPTR_TYPE_FILE \
+				 | DYNPTR_TYPE_XDP_FRAME)
 
 /* Max number of base types. */
 #define BPF_BASE_TYPE_LIMIT	(1UL << BPF_BASE_TYPE_BITS)
@@ -1580,6 +1584,8 @@ enum bpf_dynptr_type {
 	BPF_DYNPTR_TYPE_SKB_META,
 	/* Underlying data is a file */
 	BPF_DYNPTR_TYPE_FILE,
+	/* Underlying data is an xdp_frame the program owns */
+	BPF_DYNPTR_TYPE_XDP_FRAME,
 };
 
 int bpf_dynptr_check_size(u64 size);
@@ -1993,6 +1999,7 @@ struct bpf_prog_aux {
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
+	bool xdp_consume; /* may take ownership of frames, see XDP_CONSUME */
 	bool exception_cb;
 	bool jits_use_priv_stack;
 	bool priv_stack_requested;

@@ -1612,6 +1612,26 @@ __bpf_kfunc static u32 bpf_kfunc_call_test_static_unused_arg(u32 arg, u32 unused
 	return arg;
 }
 
+/* Hold process ownership while another thread drives the receive path. */
+__bpf_kfunc int bpf_kfunc_hold_sock(int fd, struct sock_hold_test *state)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+	struct socket *socket;
+	int err;
+
+	socket = sockfd_lookup(fd, &err);
+	if (!socket)
+		return err;
+	lock_sock(socket->sk);
+	WRITE_ONCE(state->entered, 1);
+	while (!READ_ONCE(state->release) && time_before(jiffies, deadline))
+		msleep(1);
+	err = READ_ONCE(state->release) ? 0 : -ETIMEDOUT;
+	release_sock(socket->sk);
+	sockfd_put(socket);
+	return err;
+}
+
 __bpf_kfunc void bpf_kfunc_call_test_sleepable(void)
 {
 }
@@ -2023,6 +2043,7 @@ BTF_ID_FLAGS(func, bpf_kfunc_call_test_destructive, KF_DESTRUCTIVE)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test_static_unused_arg)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test_offset)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test_sleepable, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_kfunc_hold_sock, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kfunc_call_test_call_rcu_tasks_trace)
 BTF_ID_FLAGS(func, bpf_kfunc_init_sock, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kfunc_close_sock, KF_SLEEPABLE)

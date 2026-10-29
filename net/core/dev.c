@@ -4983,7 +4983,8 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 
 	tcx_set_ingress(skb, false);
 #ifdef CONFIG_NET_EGRESS
-	if (static_branch_unlikely(&egress_needed_key)) {
+	/* The sender may have asked for the hooks to be left out, see skb_set_skip_egress(). */
+	if (static_branch_unlikely(&egress_needed_key) && !skb->skip_egress) {
 		bool skip_txq;
 
 		if (nf_hook_egress_active()) {
@@ -6200,6 +6201,7 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 		skb_reset_transport_header(skb);
 #endif
 	skb_reset_mac_len(skb);
+	skb_clear_skip_egress(skb);
 
 	pt_prev = NULL;
 

@@ -783,6 +783,32 @@ void tcp_synack_rtt_meas(struct sock *sk, struct request_sock *req);
 void tcp_done_with_error(struct sock *sk, int err);
 void tcp_reset(struct sock *sk, struct sk_buff *skb);
 void tcp_fin(struct sock *sk);
+
+/* tcp_input.c internals shared with the XDP fast path in tcp_xdp.c */
+void tcp_rcv_rtt_measure_ts(struct sock *sk, const struct sk_buff *skb);
+void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb);
+void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq);
+bool tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr *th);
+void __tcp_ack_snd_check(struct sock *sk, bool ofo_pending);
+bool tcp_xdp_replace_ts_recent(struct tcp_sock *tp, s32 tstamp_delta);
+void tcp_xdp_ack(struct sock *sk, const struct sk_buff *skb, bool ts_progress);
+void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb);
+void tcp_data_ecn_check(struct sock *sk, const struct sk_buff *skb);
+void tcp_grow_window(struct sock *sk, const struct sk_buff *skb, bool adjust);
+void tcp_dsack_set(struct sock *sk, u32 seq, u32 end_seq);
+void tcp_dsack_extend(struct sock *sk, u32 seq, u32 end_seq);
+
+/*
+ * A socket served from XDP transmits through af_ops of tcp_xdp.c's; disconnect
+ * gives them back. tcp_xdp.o is built with BPF_SYSCALL and the JIT, as the
+ * arena kfuncs need the latter.
+ */
+#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_BPF_JIT)
+void tcp_xdp_disconnect(struct sock *sk);
+#else
+static inline void tcp_xdp_disconnect(struct sock *sk) { }
+#endif
+void tcp_sack_new_ofo_skb(struct sock *sk, u32 seq, u32 end_seq);
 void __tcp_check_space(struct sock *sk);
 
 /* Mirror of SOCK_NOSPACE in tcp_sock, maintained by sk_set_nospace()
@@ -2009,7 +2035,9 @@ static inline void tcp_fast_path_check(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
+	/* SACK blocks with the queue empty are frames an XDP program holds, see bpf_xdp_tcp_hold(). */
 	if (RB_EMPTY_ROOT(&tp->out_of_order_queue) &&
+	    !tp->rx_opt.num_sacks &&
 	    tp->rcv_wnd &&
 	    atomic_read(&sk->sk_rmem_alloc) < sk->sk_rcvbuf &&
 	    !tp->urg_data)

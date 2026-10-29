@@ -770,6 +770,8 @@ struct sk_filter {
 };
 
 DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
+/* On while a program that may take ownership of XDP frames is loaded, see XDP_CONSUME. */
+DECLARE_STATIC_KEY_FALSE(bpf_xdp_consume_enabled_key);
 
 extern struct mutex nf_conn_btf_access_lock;
 extern int (*nfct_btf_struct_access)(struct bpf_verifier_log *log,
@@ -876,8 +878,11 @@ struct bpf_nh_params {
 #define BPF_RI_F_CPU_MAP_INIT	BIT(2)
 #define BPF_RI_F_DEV_MAP_INIT	BIT(3)
 #define BPF_RI_F_XSK_MAP_INIT	BIT(4)
+#define BPF_RI_F_XDP_CONSUMED	BIT(5)	/* the program owns the frame, see XDP_CONSUME */
+#define BPF_RI_F_XDP_LIVE_RUN	BIT(6)	/* a live test run, which completes redirects itself */
 
 struct bpf_redirect_info {
+	struct xdp_frame *consumed_frame;
 	u64 tgt_index;
 	void *tgt_value;
 	struct bpf_map *map;
@@ -1982,6 +1987,8 @@ int __bpf_sock_ops_load_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
 int __bpf_sock_ops_store_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
 				 const void *from, u32 len, u64 flags);
 
+struct xdp_frame;
+
 #ifdef CONFIG_NET
 int __bpf_skb_load_bytes(const struct sk_buff *skb, u32 offset, void *to, u32 len);
 int __bpf_skb_store_bytes(struct sk_buff *skb, u32 offset, const void *from,
@@ -1991,6 +1998,11 @@ int __bpf_xdp_store_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len);
 void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len);
 void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
 		      void *buf, unsigned long len, bool flush);
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len);
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len);
+void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len);
+void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+			    unsigned long len, bool flush);
 int __bpf_skb_meta_store_bytes(struct sk_buff *skb, u32 offset,
 			       const void *from, u32 len, u64 flags);
 void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset);
@@ -2029,6 +2041,28 @@ static inline void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off, voi
 {
 }
 
+static inline int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf,
+					     u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf,
+					      u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len)
+{
+	return NULL;
+}
+
+static inline void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+					  unsigned long len, bool flush)
+{
+}
+
 static inline int __bpf_skb_meta_store_bytes(struct sk_buff *skb, u32 offset,
 					     const void *from, u32 len,
 					     u64 flags)
@@ -2041,5 +2075,24 @@ static inline void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset)
 	return ERR_PTR(-EOPNOTSUPP);
 }
 #endif /* CONFIG_NET */
+
+/*
+ * XDP_CONSUME: a kfunc such as bpf_xdp_frame_steal() converted the frame and
+ * made the program its owner, recording that in the redirect info. The driver
+ * is told to redirect, which xdp_do_redirect() completes without touching the
+ * frame, so the driver's existing contract keeps it from recycling the buffer.
+ * Whatever the program returned, a frame it took is a frame it keeps. The mark
+ * in the redirect info decides, not the program that returned: the frame may
+ * have been taken by a program it tail called or by an extension of it. The
+ * static key says whether any loaded program takes frames at all. Returning
+ * XDP_CONSUME without having taken the frame is a program bug and aborts.
+ */
+static __always_inline u32 bpf_xdp_consume_fixup(const struct bpf_prog *prog, u32 act)
+{
+	if (static_branch_unlikely(&bpf_xdp_consume_enabled_key) &&
+	    (bpf_net_ctx_get_ri()->kern_flags & BPF_RI_F_XDP_CONSUMED))
+		return XDP_REDIRECT;
+	return act == XDP_CONSUME ? XDP_ABORTED : act;
+}
 
 #endif /* __LINUX_FILTER_H__ */
