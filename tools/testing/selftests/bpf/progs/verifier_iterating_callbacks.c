@@ -520,18 +520,22 @@ int cond_break3(const void *ctx)
 	return loop();
 }
 
+/*
+ * A timed out may_goto cancels the program, which then returns the default
+ * of its type, 0 for a socket filter, rather than breaking out of the loop.
+ */
 SEC("socket")
-__success __retval(1)
+__success __retval(0)
 int cond_break4(const void *ctx)
 {
 	int cnt = zero;
 
 	for (;;) {
-		/* should eventually break out of the loop */
+		/* should eventually be cancelled */
 		cond_break;
 		cnt++;
 	}
-	/* if we looped a bit, it's a success */
+	/* unreachable: cancellation does not continue here */
 	return cnt > 1 ? 1 : 0;
 }
 
@@ -548,7 +552,7 @@ static __noinline int static_subprog(void)
 }
 
 SEC("socket")
-__success __retval(1)
+__success __retval(0)
 int cond_break5(const void *ctx)
 {
 	int cnt1 = zero, cnt2;
@@ -560,7 +564,7 @@ int cond_break5(const void *ctx)
 
 	cnt2 = static_subprog();
 
-	/* main and subprog have to loop a bit */
+	/* unreachable: the first loop cancels the program */
 	return cnt1 > 1 && cnt2 > 1 ? 1 : 0;
 }
 

@@ -2,6 +2,7 @@
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
  */
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/cgroup.h>
@@ -2761,17 +2762,20 @@ __bpf_kfunc struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
 	return (struct bpf_rb_node *)n;
 }
 
-/* Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
- * program
+/*
+ * Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
+ * program. The pad leaves from the frame that the BPF code called, so the body
+ * is inlined into both spellings of the kfunc.
  */
-static int __bpf_rbtree_add(struct bpf_rb_root *root,
-			    struct bpf_rb_node_kern *node,
-			    void *less, struct btf_record *rec, u64 off)
+static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
+					     struct bpf_rb_node_kern *node,
+					     void *less, struct btf_record *rec, u64 off)
 {
 	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
 	struct rb_node *parent = NULL, *n = &node->rb_node;
 	bpf_callback_t cb = (bpf_callback_t)less;
 	bool leftmost = true;
+	u64 r0;
 
 	/* node->owner != NULL implies !RB_EMPTY_NODE(n), no need to separately
 	 * check the latter
@@ -2784,7 +2788,8 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 
 	while (*link) {
 		parent = *link;
-		if (cb((uintptr_t)node, (uintptr_t)parent, 0, 0, 0)) {
+		bpf_call_cb(cb, node, parent, 0, 0, 0, r0, unwound);
+		if (r0) {
 			link = &parent->rb_left;
 		} else {
 			link = &parent->rb_right;
@@ -2796,6 +2801,17 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 	rb_insert_color_cached(n, (struct rb_root_cached *)root, leftmost);
 	WRITE_ONCE(node->owner, root);
 	return 0;
+
+unwound:
+	/*
+	 * The comparator left with unwind_exit. The node is not in the tree, and
+	 * the caller has let go of it: unlink it for whoever else holds it, as
+	 * bpf_rb_root_free() does, and drop it, as the error path above does.
+	 */
+	smp_store_release(&node->owner, NULL);
+	__bpf_obj_drop_impl((void *)n - off, rec, false);
+	bpf_unwind_leave();
+	return r0;
 }
 
 /**
@@ -2809,25 +2825,31 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
  * Insert @node into @root using @less. The verifier rewrites @meta and @off;
  * BPF programs do not set them.
  *
- * Return: 0 on success, or %-EINVAL if @node is already linked in a tree.
+ * Return: 0 on success, or %-EINVAL if @node is already linked in a tree. When
+ * @less unwinds, what it unwound with, to the pad after the call.
  */
-__bpf_kfunc int bpf_rbtree_add(struct bpf_rb_root *root,
-			       struct bpf_rb_node *node,
-			       bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-			       struct btf_struct_meta *meta,
-			       u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add(struct bpf_rb_root *root,
+				struct bpf_rb_node *node,
+				bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				struct btf_struct_meta *meta,
+				u64 off)
 {
 	struct bpf_rb_node_kern *n = (void *)node;
 
 	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add);
 
-__bpf_kfunc int bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
-				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-				    void *meta__ign, u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				     bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				     void *meta__ign, u64 off)
 {
-	return bpf_rbtree_add(root, node, less, meta__ign, off);
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+
+	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add_impl);
 
 __bpf_kfunc struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root)
 {
@@ -3396,56 +3418,9 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
-struct bpf_throw_ctx {
-	struct bpf_prog_aux *aux;
-	u64 sp;
-	u64 bp;
-	int cnt;
-};
-
-static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
-{
-	struct bpf_throw_ctx *ctx = cookie;
-	struct bpf_prog *prog;
-
-	/*
-	 * The RCU read lock is held to safely traverse the latch tree, but we
-	 * don't need its protection when accessing the prog, since it has an
-	 * active stack frame on the current stack trace, and won't disappear.
-	 */
-	rcu_read_lock();
-	prog = bpf_prog_ksym_find(ip);
-	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
-	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
-	ctx->aux = prog->aux;
-	ctx->sp = sp;
-	ctx->bp = bp;
-	return false;
-}
-
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	struct bpf_throw_ctx ctx = {};
-
-	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
-	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
-	WARN_ON_ONCE(!ctx.bp);
-	WARN_ON_ONCE(!ctx.cnt);
-	/*
-	 * Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
-	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
-	 * which skips compiler generated instrumentation to do the same. Some
-	 * architectures cannot recover sp while unwinding, so fall back to bp.
-	 */
-	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp + ctx.aux->stack_arg_sp_adjust, ctx.bp, 0, 0);
-	WARN(1, "A call to BPF exception callback should never return\n");
+	bpf_throw_unwind(NULL, cookie, BPF_THROW_CALL);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)
@@ -3658,6 +3633,12 @@ __bpf_kfunc void bpf_iter_bits_destroy(struct bpf_iter_bits *it)
 		return;
 	bpf_mem_free(&bpf_global_ma, kit->bits);
 }
+
+__bpf_kfunc void bpf_iter_bits_destroy_dtor(void *it)
+{
+	bpf_iter_bits_destroy(it);
+}
+CFI_NOSEAL(bpf_iter_bits_destroy_dtor);
 
 /**
  * bpf_copy_from_user_str() - Copy a string from an unsafe user address
@@ -4436,6 +4417,12 @@ __bpf_kfunc void bpf_key_put(struct bpf_key *bkey)
 	kfree(bkey);
 }
 
+__bpf_kfunc void bpf_key_put_dtor(void *bkey)
+{
+	bpf_key_put(bkey);
+}
+CFI_NOSEAL(bpf_key_put_dtor);
+
 /**
  * bpf_verify_pkcs7_signature - verify a PKCS#7 signature
  * @data_p: data to verify
@@ -5139,12 +5126,29 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
 	.set   = &generic_btf_ids,
 };
 
-BTF_ID_LIST(generic_dtor_ids)
-BTF_ID(struct, task_struct)
-BTF_ID(func, bpf_task_release_dtor)
+/* A type, its void (*)(void *) destructor, and the kfunc a program calls to release it */
+BPF_DTOR_ID_LIST(task_dtor_ids, task_struct, bpf_task_release_dtor, bpf_task_release)
+BPF_DTOR_ID_LIST(iter_num_dtor_ids, bpf_iter_num, bpf_iter_num_destroy_dtor, bpf_iter_num_destroy)
+BPF_DTOR_ID_LIST(iter_task_dtor_ids, bpf_iter_task, bpf_iter_task_destroy_dtor,
+		 bpf_iter_task_destroy)
+BPF_DTOR_ID_LIST(iter_task_vma_dtor_ids, bpf_iter_task_vma, bpf_iter_task_vma_destroy_dtor,
+		 bpf_iter_task_vma_destroy)
+BPF_DTOR_ID_LIST(iter_bits_dtor_ids, bpf_iter_bits, bpf_iter_bits_destroy_dtor,
+		 bpf_iter_bits_destroy)
+BPF_DTOR_ID_LIST(iter_kmem_cache_dtor_ids, bpf_iter_kmem_cache, bpf_iter_kmem_cache_destroy_dtor,
+		 bpf_iter_kmem_cache_destroy)
 #ifdef CONFIG_CGROUPS
-BTF_ID(struct, cgroup)
-BTF_ID(func, bpf_cgroup_release_dtor)
+BPF_DTOR_ID_LIST(cgroup_dtor_ids, cgroup, bpf_cgroup_release_dtor, bpf_cgroup_release)
+BPF_DTOR_ID_LIST(iter_css_dtor_ids, bpf_iter_css, bpf_iter_css_destroy_dtor, bpf_iter_css_destroy)
+BPF_DTOR_ID_LIST(iter_css_task_dtor_ids, bpf_iter_css_task, bpf_iter_css_task_destroy_dtor,
+		 bpf_iter_css_task_destroy)
+#endif
+#ifdef CONFIG_KEYS
+BPF_DTOR_ID_LIST(key_dtor_ids, bpf_key, bpf_key_put_dtor, bpf_key_put)
+#endif
+#ifdef CONFIG_DMA_SHARED_BUFFER
+BPF_DTOR_ID_LIST(iter_dmabuf_dtor_ids, bpf_iter_dmabuf, bpf_iter_dmabuf_destroy_dtor,
+		 bpf_iter_dmabuf_destroy)
 #endif
 
 BTF_KFUNCS_START(common_btf_ids)
@@ -5253,15 +5257,22 @@ static int __init kfunc_init(void)
 {
 	int ret;
 	const struct btf_id_dtor_kfunc generic_dtors[] = {
-		{
-			.btf_id       = generic_dtor_ids[0],
-			.kfunc_btf_id = generic_dtor_ids[1]
-		},
+		BPF_DTOR_ENTRY(task_dtor_ids, BPF_DTOR_KPTR | BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_num_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_task_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_task_vma_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_bits_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_kmem_cache_dtor_ids, BPF_DTOR_CLEANUP),
 #ifdef CONFIG_CGROUPS
-		{
-			.btf_id       = generic_dtor_ids[2],
-			.kfunc_btf_id = generic_dtor_ids[3]
-		},
+		BPF_DTOR_ENTRY(cgroup_dtor_ids, BPF_DTOR_KPTR | BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_css_dtor_ids, BPF_DTOR_CLEANUP),
+		BPF_DTOR_ENTRY(iter_css_task_dtor_ids, BPF_DTOR_CLEANUP),
+#endif
+#ifdef CONFIG_KEYS
+		BPF_DTOR_ENTRY(key_dtor_ids, BPF_DTOR_CLEANUP),
+#endif
+#ifdef CONFIG_DMA_SHARED_BUFFER
+		BPF_DTOR_ENTRY(iter_dmabuf_dtor_ids, BPF_DTOR_CLEANUP),
 #endif
 	};
 
@@ -5271,10 +5282,10 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SKB, &generic_kfunc_set);
-	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
-						  ARRAY_SIZE(generic_dtors),
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &common_kfunc_set);
+	/* The destructors refer to release kfuncs of both sets, so they come last */
+	return ret ?: register_btf_id_dtor_kfuncs(generic_dtors, ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
-	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &common_kfunc_set);
 }
 
 late_initcall(kfunc_init);

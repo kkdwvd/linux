@@ -36,6 +36,7 @@
 #include <linux/perf_event.h>
 #include <linux/extable.h>
 #include <linux/log2.h>
+#include <linux/bpf_unwind.h>
 #include <linux/bpf_verifier.h>
 #include <linux/nodemask.h>
 #include <linux/nospec.h>
@@ -293,6 +294,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		kfree(fp->aux->poke_tab);
+		bpf_frame_desc_table_free(fp->aux->frame_desc_table);
 		kfree(fp->aux);
 	}
 	free_percpu(fp->stats);
@@ -3148,6 +3150,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
+	bpf_frame_desc_pool_free(aux->frame_desc_pool);
 	for (i = 0; i < aux->real_func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
@@ -3157,6 +3160,8 @@ static void bpf_prog_free_images(struct work_struct *work)
 		bpf_jit_free(aux->func[i]);
 	}
 	if (aux->real_func_cnt) {
+		/* The main prog's frame_desc_table is func[0]'s and was released with it. */
+		aux->frame_desc_table = NULL;
 		kfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);
 	} else {
@@ -3406,6 +3411,16 @@ bool __weak bpf_jit_supports_unwind(void)
 }
 
 /*
+ * Where unwind_exit returns: to the pad of the caller when the caller has one,
+ * and where exit would otherwise. The JITs that support unwinding have the real
+ * one. Without it no callback unwinds, so a helper never asks.
+ */
+u64 __weak bpf_unwind_target(u64 ret_addr)
+{
+	return ret_addr;
+}
+
+/*
  * How this arch places a by-value kfunc argument, or NULL for one that has
  * not opted in and so only takes an argument of a single eightbyte, which
  * every convention places in slot order.
@@ -3607,9 +3622,61 @@ void __weak arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp,
 {
 }
 
+/*
+ * The native entry of bpf_throw(), which captures the BPF register file of
+ * the throw site, or NULL when the architecture calls the kfunc directly.
+ */
+void * __weak bpf_arch_throw_entry(void)
+{
+	return NULL;
+}
+
+/*
+ * The entry a fault at an arena access of JITed code is redirected to, which
+ * captures the BPF register file of the access, or NULL when the architecture
+ * resumes the program after such a fault.
+ */
+void * __weak bpf_arch_throw_fault_entry(void)
+{
+	return NULL;
+}
+
 bool __weak bpf_jit_supports_timed_may_goto(void)
 {
 	return false;
+}
+
+/*
+ * The entry the helper that ran a cancelled callback returns to, to go on with
+ * the cancellation, or NULL; and where the unwinder finds the return address of
+ * a kernel frame and how it changes that of a JITed one, on an architecture
+ * with the entries.
+ */
+void * __weak bpf_arch_cancel_entry(void)
+{
+	return NULL;
+}
+
+u64 * __weak bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return NULL;
+}
+
+void __weak bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+}
+
+/*
+ * Can the kernel cancel a running program on this architecture? It needs the
+ * entries of every kind of cancellation point, so that a site the verifier
+ * described is one the kernel can unwind from, and the pads of the helpers
+ * that run callbacks, which a cancelled callback leaves through.
+ */
+bool bpf_jit_supports_cancellation(void)
+{
+	return BPF_HAS_CB_PADS && bpf_jit_supports_exceptions() &&
+	       bpf_jit_supports_timed_may_goto() && bpf_arch_throw_entry() &&
+	       bpf_arch_throw_fault_entry() && bpf_arch_cancel_entry();
 }
 
 u64 __weak arch_bpf_timed_may_goto(void)
@@ -3617,23 +3684,25 @@ u64 __weak arch_bpf_timed_may_goto(void)
 	return 0;
 }
 
-static noinline void bpf_prog_report_may_goto_violation(void)
-{
 #ifdef CONFIG_BPF_SYSCALL
+static noinline void bpf_prog_report_may_goto_violation(struct bpf_prog *prog, bool cancel)
+{
 	struct bpf_stream_stage ss;
-	struct bpf_prog *prog;
 
-	prog = bpf_prog_find_from_stack();
-	if (!prog)
-		return;
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
-		bpf_stream_printk(ss, "ERROR: Timeout detected for may_goto instruction\n");
+		bpf_stream_printk(ss, "ERROR: Timeout detected for may_goto instruction%s\n",
+				  cancel ? ", cancelling program" : "");
 		bpf_stream_dump_stack(ss);
 	}));
-#endif
 }
+#endif
 
-u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
+/*
+ * @ra is the return address of the slow path into the program, which says
+ * which program exhausted its count. A timeout cancels the invocation of a
+ * cancellable program instead of taking the branch.
+ */
+u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p, unsigned long ra)
 {
 	u64 time = ktime_get_mono_fast_ns();
 
@@ -3644,8 +3713,19 @@ u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
 	}
 	/* Check if we've exhausted our time slice, and zero count. */
 	if (unlikely(time - p->timestamp >= (NSEC_PER_SEC / 4))) {
-		bpf_prog_report_may_goto_violation();
-		return 0;
+		bool cancel = false;
+#ifdef CONFIG_BPF_SYSCALL
+		struct bpf_prog *prog;
+
+		rcu_read_lock();
+		prog = bpf_prog_ksym_find(ra);
+		rcu_read_unlock();
+		if (prog) {
+			cancel = prog->aux->main_prog_aux->cancellable;
+			bpf_prog_report_may_goto_violation(prog->aux->main_prog_aux->prog, cancel);
+		}
+#endif
+		return cancel ? BPF_TIMED_MAY_GOTO_CANCEL : 0;
 	}
 	/* Refresh the count for the stack frame. */
 	return BPF_MAX_TIMED_LOOPS;

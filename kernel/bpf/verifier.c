@@ -10,8 +10,10 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
+#include <linux/pkt_cls.h>
 #include <linux/filter.h>
 #include <net/netlink.h>
 #include <linux/file.h>
@@ -1549,6 +1551,21 @@ static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int par
 	s->parent_id = parent_id;
 	bpf_diag_record_ref_acquire(env, insn_idx, s->id);
 	return s->id;
+}
+
+/*
+ * Keep the type a call returns the reference it acquires as: a frame
+ * descriptor classifies the reference from it when no live location holds
+ * the reference, see place_ref() in frame_desc.c.
+ */
+static void record_acquired_type(struct bpf_verifier_env *env, int insn_idx,
+				 const struct bpf_reg_state *reg)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+
+	aux->acq_type = reg->type;
+	aux->acq_btf = reg->btf;
+	aux->acq_btf_id = reg->btf_id;
 }
 
 static int acquire_lock_state(struct bpf_verifier_env *env, int insn_idx, enum ref_state_type type,
@@ -3435,6 +3452,8 @@ static int next_callx_callee(struct bpf_verifier_env *env, int caller, int from)
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
+ * The call may be of a helper or a kfunc that calls a callback: it leaves like
+ * the callback did, see check_cb_unwind().
  */
 static int check_unwind_insns(struct bpf_verifier_env *env)
 {
@@ -3450,8 +3469,10 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 		if (!bpf_is_unwind_goto(insn))
 			continue;
 		seen = true;
-		if (!i || !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1))) {
-			verbose(env, "unwind_goto at insn %d doesn't follow a call of a subprog\n",
+		if (!i || !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1) ||
+			    bpf_is_sync_callback_calling_insn(insn - 1))) {
+			verbose(env,
+				"unwind_goto at insn %d doesn't follow a call of a subprog or of a helper with a callback\n",
 				i);
 			return -EINVAL;
 		}
@@ -7518,6 +7539,33 @@ static struct bpf_reg_state *mem_access_reg(struct bpf_verifier_env *env, int re
 	return arena;
 }
 
+/*
+ * A point at which the kernel may cancel the program, if it can cancel it at
+ * all: the frames are described for the unwinder, and the program needs the
+ * exception boundary the unwinder transfers to. @regs_saved says whether the
+ * entry the unwinder is reached through saves R0-R9 of the innermost frame.
+ */
+static int check_cancel_site(struct bpf_verifier_env *env, bool regs_saved)
+{
+	if (!env->cancellable)
+		return 0;
+	env->seen_exception = true;
+	return bpf_frame_desc_site(env, regs_saved);
+}
+
+/*
+ * An access through an arena pointer faults when the page is not mapped,
+ * which cancels the program. The site is the access itself, described with
+ * the state before it takes effect, since the fault precedes any write of
+ * its result.
+ */
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	if (reg->type != PTR_TO_ARENA)
+		return 0;
+	return check_cancel_site(env, true);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -7549,6 +7597,9 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	src_reg = mem_access_reg(env, insn->src_reg, &arena);
 	src_reg_type = src_reg->type;
+	err = check_arena_site(env, src_reg);
+	if (err)
+		return err;
 
 	/*
 	 * check_stack_read_fixed_off() may refine the modification's origin to
@@ -7608,6 +7659,9 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
 	dst_reg_type = dst_reg->type;
+	err = check_arena_site(env, dst_reg);
+	if (err)
+		return err;
 
 	/* Check if (dst_reg + off) is writeable. */
 	err = check_mem_access(env, env->insn_idx, dst_reg, argno_from_reg(insn->dst_reg),
@@ -7668,6 +7722,9 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 
 	/* load_reg may be dst_reg. Look at dst_reg before it's marked as unknown. */
 	dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
+	err = check_arena_site(env, dst_reg);
+	if (err)
+		return err;
 
 	load_reg = bpf_atomic_load_reg(insn);
 	if (load_reg >= 0) {
@@ -11041,6 +11098,9 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
 	int err;
 
+	err = bpf_frame_desc_record_release(env, id);
+	if (err)
+		return err;
 	err = __release_reference_nomark(env->cur_state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
@@ -11397,6 +11457,68 @@ static int btf_check_subprog_call(struct bpf_verifier_env *env, int subprog)
 	return err;
 }
 
+/* The helper calls its callback with a pad, see bpf_call_cb() */
+static bool helper_has_cb_pad(enum bpf_func_id func_id)
+{
+	switch (func_id) {
+	case BPF_FUNC_loop:
+	case BPF_FUNC_for_each_map_elem:
+	case BPF_FUNC_find_vma:
+	case BPF_FUNC_user_ringbuf_drain:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* The kfunc calls its callback with a pad */
+static bool kfunc_has_cb_pad(u32 btf_id)
+{
+	return is_bpf_rbtree_add_kfunc(btf_id);
+}
+
+static bool insn_has_cb_pad(struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && helper_has_cb_pad(insn->imm)) ||
+	       (bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm));
+}
+
+/*
+ * A sync callback is called by a helper or a kfunc, a C frame between the
+ * callback and the BPF code that called it. unwind_exit of the callback returns
+ * to the pad of its caller when there is one, and a helper or a kfunc that
+ * calls a callback has one where BPF_HAS_CB_PADS and insn_has_cb_pad(): it
+ * calls the callback with bpf_call_cb(), drops what it holds when the callback
+ * unwinds and leaves to the pad of its own caller with the r0 of the callback.
+ * So a call with such a callback that can unwind is a call of something that
+ * can unwind, and unwind_goto has to follow it.
+ */
+static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			   int insn_idx, int subprog)
+{
+	if (!env->subprog_info[subprog].can_unwind)
+		return 0;
+	if (!bpf_is_unwind_goto(insn + 1)) {
+		if (bpf_helper_call(insn))
+			verbose(env, "no unwind_goto after the call of %s()\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env, "no unwind_goto after the call of the kfunc at insn %d\n",
+				insn_idx);
+		return -EINVAL;
+	}
+	/* The helpers have pads with asm goto outputs only, see bpf_call_cb() */
+	if (!BPF_HAS_CB_PADS) {
+		verbose(env, "callback cannot unwind: the helpers have no pads\n");
+		return -ENOTSUPP;
+	}
+	if (!insn_has_cb_pad(insn)) {
+		verbose(env, "callback cannot unwind\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int insn_idx, int subprog,
 			      set_callee_state_fn set_callee_state_cb)
@@ -11406,6 +11528,15 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	int err;
 
 	caller = state->frame[state->curframe];
+	/*
+	 * The callback unwound, and the call is visited once more for the
+	 * effects of the helper, see prepare_func_exit(): no more rounds, and
+	 * the next call with a callback in this frame starts from its first.
+	 */
+	if (state->unwound) {
+		caller->callback_depth = 0;
+		return 0;
+	}
 	err = btf_check_subprog_call(env, subprog);
 	if (err == -EFAULT)
 		return err;
@@ -11456,6 +11587,10 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	 * known here what is called.
 	 */
 	err = record_callx_edge(env, caller->subprogno, subprog);
+	if (err)
+		return err;
+
+	err = check_cb_unwind(env, insn, insn_idx, subprog);
 	if (err)
 		return err;
 
@@ -11646,8 +11781,15 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				verbose(env, "failed to push state for global subprog exception path\n");
 				return PTR_ERR(branch);
 			}
+			err = bpf_frame_desc_site(env, false);
+			if (err)
+				return err;
 			return process_bpf_exit_full(env, NULL, true);
 		}
+		/* A cancellation inside the callee unwinds through this frame. */
+		err = check_cancel_site(env, false);
+		if (err)
+			return err;
 
 		/* continue with next insn after call */
 		return 0;
@@ -12090,13 +12232,18 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	struct bpf_verifier_state *state = env->cur_state, *prev_st;
 	struct bpf_func_state *caller, *callee;
 	struct bpf_reg_state *r0;
-	bool in_callback_fn;
+	bool in_callback_fn, unwinds;
 	u32 i, nregs;
 	int err;
 
 	callee = state->frame[state->curframe];
 	r0 = &callee->regs[BPF_REG_0];
-	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
+	/*
+	 * A callback returns r0 alone, to the helper, and unwinds with r0 alone,
+	 * through the pad of the helper, whatever its prototype says: r2 stays the
+	 * caller's, where the revisit of the call reads the arguments.
+	 */
+	nregs = !callee->in_callback_fn && bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
 		if (callee->regs[ret_regs[i]].type != PTR_TO_STACK)
 			continue;
@@ -12111,12 +12258,16 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	}
 
 	caller = state->frame[state->curframe - 1];
-	if (bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx])) {
-		/* the helper or the kfunc that called it doesn't expect that */
-		if (callee->in_callback_fn) {
-			verbose(env, "callback cannot unwind\n");
-			return -EINVAL;
-		}
+	unwinds = bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx]);
+	if (unwinds) {
+		/*
+		 * A callback returns into the helper that called it, and to the
+		 * pad of the helper when the helper has one. check_cb_unwind()
+		 * has seen to that, and to the unwind_goto after the call of
+		 * the helper, where the helper leaves to right away, with the
+		 * r0 of the callback as it is: the pad gets its state, as the
+		 * pad after a subprog call does.
+		 */
 		if (!bpf_is_unwind_goto(&env->prog->insnsi[callee->callsite + 1])) {
 			verbose(env, "unwind_exit, but no unwind_goto after the call at insn %d\n",
 				callee->callsite);
@@ -12124,7 +12275,10 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 		state->unwound = true;
 	}
-	if (callee->in_callback_fn) {
+	/* Sections the callee entered and did not leave are the caller's now. */
+	caller->rcu_locks += callee->rcu_locks;
+	caller->preempt_locks += callee->preempt_locks;
+	if (callee->in_callback_fn && !unwinds) {
 		if (r0->type != SCALAR_VALUE) {
 			verbose(env, "R0 not a scalar value\n");
 			return -EACCES;
@@ -12171,6 +12325,14 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * there function call logic would reschedule callback visit. If iteration
 	 * converges is_state_visited() would prune that visit eventually.
 	 */
+	/*
+	 * A callback that unwound goes back to the call too: the helper has
+	 * effects of its own to apply, such as releasing what it consumed. With
+	 * the state marked unwound it is the last round, and r0 is still what
+	 * the callback unwound with after the call, with the effects of the
+	 * helper applied to it. See push_callback_call(), check_helper_call()
+	 * and check_kfunc_call().
+	 */
 	in_callback_fn = callee->in_callback_fn;
 	if (in_callback_fn)
 		*insn_idx = callee->callsite;
@@ -12201,7 +12363,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * This is similar to what is done in process_iter_next_call() for open
 	 * coded iterators.
 	 */
-	prev_st = in_callback_fn ? find_prev_entry(env, state, *insn_idx) : NULL;
+	prev_st = in_callback_fn && !unwinds ? find_prev_entry(env, state, *insn_idx) : NULL;
 	if (prev_st) {
 		err = widen_imprecise_scalars(env, prev_st, state);
 		if (err)
@@ -12357,6 +12519,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	int i;
 
 	if (!exception_exit && cur_func(env)->frameno)
+		return 0;
+	/* The unwinder releases what the frame descriptors of the throw site list. */
+	if (exception_exit && bpf_arch_throw_entry())
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -12614,7 +12779,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	const struct bpf_func_proto *fn = NULL;
 	enum bpf_return_type ret_type;
 	enum bpf_type_flag ret_flag;
-	struct bpf_reg_state *regs;
+	struct bpf_reg_state *regs, unwound_r0;
 	struct bpf_call_arg_meta meta;
 	const char *operation;
 	int insn_idx = *insn_idx_p;
@@ -12870,12 +13035,25 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 
 	/* reset caller saved regs */
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/*
+	 * The callback unwound: the helper leaves to the pad after the call
+	 * with the r0 of the callback, which prepare_func_exit() put here and
+	 * which the effects of the helper above apply to like to any register.
+	 * There is no return, and r0 isn't written.
+	 */
+	if (env->cur_state->unwound)
+		unwound_r0 = regs[BPF_REG_0];
+	else
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		bpf_mark_reg_not_init(env, &regs[caller_saved[i]]);
 		check_reg_arg(env, caller_saved[i], DST_OP_NO_MARK);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* update return register (already marked as written above) */
 	ret_type = fn->ret_type;
@@ -13053,6 +13231,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		record_acquired_type(env, insn_idx, &regs[BPF_REG_0]);
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -13063,7 +13242,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 
 	bpf_diag_mod_end(env);
-
+unwound:
 	err = check_map_func_compatibility(env, meta.map.ptr, func_id);
 	if (err)
 		return err;
@@ -15393,12 +15572,75 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/* Leave an RCU or preemption section: the innermost frame that entered one. */
+static void leave_section(struct bpf_verifier_state *st, bool rcu)
+{
+	int f;
+
+	for (f = st->curframe; f >= 0; f--) {
+		u32 *cnt = rcu ? &st->frame[f]->rcu_locks : &st->frame[f]->preempt_locks;
+
+		if (*cnt) {
+			(*cnt)--;
+			return;
+		}
+	}
+}
+
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+static bool nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
+/*
+ * A throw site inside a callback that a helper or a kfunc runs, called at insn
+ * @callsite. The unwinder stops at the callback, which leaves into the pad of
+ * its caller the way unwind_exit does, so the caller needs one, see
+ * bpf_call_cb(). The pad of bpf_rbtree_add() drops the node, which is a
+ * bpf_obj_drop() under the rule above.
+ */
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[callsite];
+	struct btf_struct_meta *meta;
+
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn)) {
+		if (bpf_helper_call(insn))
+			verbose(env,
+				"the callback of %s() cannot be cancelled: the helper has no pad\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env,
+				"the callback of the kfunc at insn %d cannot be cancelled: it has no pad\n",
+				callsite);
+		return -EINVAL;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) || !is_bpf_rbtree_add_kfunc(insn->imm) ||
+	    !nmi_unsafe_prog(env))
+		return 0;
+	meta = env->insn_aux_data[callsite].kptr_struct_meta;
+	if (meta && btf_record_has_nmi_unsafe_fields(meta->record)) {
+		verbose(env,
+			"bpf_rbtree_add with a comparator that can be cancelled cannot be used in tracing programs on types with NMI unsafe fields\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
-	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
-	struct bpf_reg_state *regs = cur_regs(env);
+	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
+	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_call_arg_meta meta;
@@ -15515,11 +15757,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
+	nmi_prog = nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
-	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && (is_tracing_prog_type(prog_type) ||
-	     /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-	     (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-	      && !env->prog->sleepable))) {
+	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
 
 		struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
@@ -15531,6 +15771,22 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	if (is_bpf_rbtree_add_kfunc(meta.func_id)) {
+		/*
+		 * The pad of the kfunc drops the node when the comparator
+		 * unwinds, the destructors of its fields included, which is a
+		 * bpf_obj_drop() under the rule above.
+		 */
+		if (env->subprog_info[meta.subprogno].can_unwind && nmi_prog) {
+			struct btf_struct_meta *struct_meta;
+
+			struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
+			if (struct_meta && btf_record_has_nmi_unsafe_fields(struct_meta->record)) {
+				verbose(env,
+					"%s with a comparator that unwinds cannot be used in tracing programs on types with NMI unsafe fields\n",
+					func_name);
+				return -EINVAL;
+			}
+		}
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rbtree_add_callback_state);
 		if (err) {
@@ -15578,6 +15834,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (rcu_lock) {
 		env->cur_state->active_rcu_locks++;
+		env->cur_state->frame[env->cur_state->curframe]->rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
 					env->cur_state->active_rcu_locks);
 	} else if (rcu_unlock) {
@@ -15589,12 +15846,14 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_rcu_locks--;
+		leave_section(env->cur_state, true);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
 					env->cur_state->active_rcu_locks);
 		if (!in_rcu_cs(env))
 			invalidate_rcu_protected_refs(env);
 	} else if (preempt_disable) {
 		env->cur_state->active_preempt_locks++;
+		env->cur_state->frame[env->cur_state->curframe]->preempt_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, true,
 					env->cur_state->active_preempt_locks);
 	} else if (preempt_enable) {
@@ -15606,6 +15865,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_preempt_locks--;
+		leave_section(env->cur_state, false);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
 					env->cur_state->active_preempt_locks);
 		if (!in_rcu_cs(env))
@@ -15638,7 +15898,21 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		id = regs[BPF_REG_2].id;
 		insn_aux->insert_off = regs[BPF_REG_2].var_off.value;
 		insn_aux->kptr_struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
-		ref_convert_owning_non_owning(env, id);
+		/*
+		 * The comparator unwound: the node never went in, and the
+		 * kfunc dropped it on its way to the pad. The comparator was
+		 * handed the node too, and may have unwound with it in r0, so
+		 * every non-owning reference goes. Otherwise the node is in
+		 * the tree now.
+		 */
+		if (env->cur_state->unwound) {
+			invalidate_non_owning_refs(env);
+			err = release_reference(env, id);
+			if (err)
+				return err;
+		} else {
+			ref_convert_owning_non_owning(env, id);
+		}
 	}
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_throw]) {
@@ -15660,13 +15934,23 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/* The callback unwound: r0 is the callback's, see check_helper_call() */
+	if (env->cur_state->unwound) {
+		unwound_r0 = regs[BPF_REG_0];
+		ret_nregs = 0;
+	} else {
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	}
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		u32 regno = caller_saved[i];
 
 		bpf_mark_reg_not_init(env, &regs[regno]);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* Check return type */
 	t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
@@ -15834,6 +16118,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			record_acquired_type(env, insn_idx, &regs[BPF_REG_0]);
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -15851,6 +16136,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+unwound:
 	if (is_kfunc_dynptr_write(&meta) ?
 	    dynptr_write_changes_pkt_data(meta.dynptr_write_type) :
 	    bpf_is_kfunc_pkt_changing(&meta))
@@ -18849,6 +19135,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 
 		prev_st = find_prev_entry(env, cur_st->parent, idx);
 
+		/* A timed out may_goto cancels the program instead of branching. */
+		err = check_cancel_site(env, true);
+		if (err)
+			return err;
+
 		/* branch out 'fallthrough' insn as a new state to explore */
 		queued_st = push_stack(env, idx + 1, idx, false);
 		if (IS_ERR(queued_st))
@@ -20031,10 +20322,12 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	 * prepare_func_exit to handle the case when
 	 * state->curframe > 0, it may be a callback function,
 	 * for which reference_state must match caller reference
-	 * state when it exits.
+	 * state when it exits. An unwinder that releases resources
+	 * leaves locks and sections too.
 	 */
 	int err = check_resource_leak(env, exception_exit,
-				      exception_exit || !env->cur_state->curframe,
+				      exception_exit ? !bpf_arch_throw_entry() :
+				      !env->cur_state->curframe,
 				      exception_exit ? "bpf_throw" :
 				      "BPF_EXIT instruction in main prog");
 	if (err)
@@ -20245,6 +20538,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
 		dst_reg_type = dst_reg->type;
+		err = check_arena_site(env, dst_reg);
+		if (err)
+			return err;
 
 		err = check_mem_access(env, env->insn_idx, dst_reg, argno_from_reg(insn->dst_reg),
 				       insn->off, BPF_SIZE(insn->code),
@@ -20267,7 +20563,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				      insn->imm != BPF_FUNC_spin_unlock &&
 				      insn->imm != BPF_FUNC_kptr_xchg) ||
 				     (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
-				      !kfunc_spin_allowed(env, insn->imm, insn->off)))) {
+				      !kfunc_spin_allowed(env, insn->imm, insn->off) &&
+				      !(bpf_is_throw_kfunc(insn) && bpf_arch_throw_entry())))) {
 					verbose(env,
 						"function calls are not allowed while holding a lock\n");
 					bpf_diag_ctx_active(
@@ -20284,9 +20581,29 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				return check_func_callx(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
-				return check_kfunc_call(env, insn, &env->insn_idx);
-			return check_helper_call(env, insn, &env->insn_idx);
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (bpf_is_throw_kfunc(insn)) {
+					err = bpf_frame_desc_site(env, true);
+					if (err)
+						return err;
+				}
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			} else {
+				err = check_helper_call(env, insn, &env->insn_idx);
+			}
+			if (err)
+				return err;
+			/*
+			 * A callback the helper or the kfunc ran was cancelled: it left
+			 * into the pad of its caller, which returned to the entry of
+			 * the cancellation with the return address of this call, and
+			 * the cancellation goes on from here, with the effects of the
+			 * call on this frame applied. The revisit of the call after
+			 * the callback unwound is on its way to the pad instead.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && !env->cur_state->unwound)
+				return check_cancel_site(env, false);
+			return 0;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);
@@ -20589,7 +20906,8 @@ static int do_check(struct bpf_verifier_env *env)
 		}
 
 		if (bpf_is_jmp_point(env, env->insn_idx)) {
-			err = bpf_push_jmp_history(env, state, 0, 0, 0, NULL, 0);
+			err = bpf_push_jmp_history(env, state, state->unwound ? INSN_F_UNWOUND : 0,
+						   0, 0, NULL, 0);
 			if (err)
 				return err;
 		}
@@ -21996,6 +22314,65 @@ again:
 	return 0;
 }
 
+/*
+ * The value the main program returns when the kernel cancels an invocation:
+ * for each program type the outcome that denies, drops or changes nothing.
+ * A program with an exception callback of its own receives it as the cookie
+ * and decides for itself, unless the cancellation hit inside that callback.
+ * The meaning of a struct_ops program's return value is the operator's: it
+ * returns 0, and the struct_ops is told through its cancel hook, so only a
+ * struct_ops with the hook has cancellable programs.
+ */
+static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_retval_range range;
+
+	*retval = 0;
+	if (resolve_prog_type(prog) == BPF_PROG_TYPE_STRUCT_OPS)
+		return prog->type == BPF_PROG_TYPE_STRUCT_OPS && prog->aux->st_ops &&
+		       prog->aux->st_ops->cancel;
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		*retval = TC_ACT_SHOT;
+		return true;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		*retval = BPF_DROP;
+		return true;
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		switch (prog->expected_attach_type) {
+		case BPF_CGROUP_UDP4_RECVMSG:
+		case BPF_CGROUP_UDP6_RECVMSG:
+		case BPF_CGROUP_UNIX_RECVMSG:
+		case BPF_CGROUP_INET4_GETPEERNAME:
+		case BPF_CGROUP_INET6_GETPEERNAME:
+		case BPF_CGROUP_UNIX_GETPEERNAME:
+		case BPF_CGROUP_INET4_GETSOCKNAME:
+		case BPF_CGROUP_INET6_GETSOCKNAME:
+		case BPF_CGROUP_UNIX_GETSOCKNAME:
+			/* The only value these hooks accept. */
+			*retval = 1;
+			return true;
+		default:
+			return true;
+		}
+	case BPF_PROG_TYPE_LSM:
+		if (prog->expected_attach_type == BPF_LSM_CGROUP)
+			*retval = program_returns_void(env) ? 1 : 0;
+		else if (get_func_retval_range(prog, &range))
+			/* The hook's "no": an errno where it takes one, 0 for a bool hook. */
+			*retval = range.minval < 0 ? -EPERM : range.minval;
+		return true;
+	default:
+		return true;
+	}
+}
+
 static int do_check_main(struct bpf_verifier_env *env)
 {
 	int ret;
@@ -22035,6 +22412,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
 		env->peak_states, env->longest_mark_read_walk);
+	if (env->log.level & BPF_LOG_STATS)
+		verbose(env, "frame descriptors: sites %u visits %u classes %u bytes %u slots %u spills %u\n",
+			env->frame_desc_sites, env->frame_desc_visits,
+			env->frame_desc_pool ? env->frame_desc_pool->resource_cnt : env->resource_cnt,
+			env->frame_desc_bytes, env->ref_slots, env->ref_spills);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
@@ -23263,6 +23645,11 @@ static int specialize_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_desc 
 	} else if (func_id == special_kfunc_list[KF_bpf_arena_free_pages]) {
 		if (env->insn_aux_data[insn_idx].non_sleepable)
 			addr = (unsigned long)bpf_arena_free_pages_non_sleepable;
+	} else if (func_id == special_kfunc_list[KF_bpf_throw]) {
+		void *entry = bpf_arch_throw_entry();
+
+		if (entry)
+			addr = (unsigned long)entry;
 	}
 	desc->addr = addr;
 	return 0;
@@ -24014,6 +24401,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	/* The entries the unwinder is reached through are only called from JITed code. */
+	env->cancellable = bpf_jit_supports_cancellation() && env->prog->jit_requested &&
+			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
 	ret = do_check_main(env);
 	ret = ret ?: do_check_subprogs(env);
 
@@ -24033,6 +24423,17 @@ skip_full_check:
 	if (ret == 0)
 		ret = bpf_remove_fastcall_spills_fills(env);
 
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
+	/*
+	 * Every frame is described, including those of global subprogs, and the
+	 * stack is final: resolve the sites and reserve the unique slots.
+	 */
+	if (ret == 0)
+		ret = bpf_frame_desc_resolve(env);
+
+	/* Account for the unique slots reserved by frame descriptor resolution. */
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
@@ -24057,6 +24458,9 @@ skip_full_check:
 		ret = bpf_convert_ctx_accesses(env);
 
 	if (ret == 0)
+		ret = bpf_frame_desc_emit_slots(env);
+
+	if (ret == 0)
 		ret = bpf_do_misc_fixups(env);
 
 	/* do 32-bit optimization after insn patching has done so those patched
@@ -24067,6 +24471,9 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
+
+	if (ret == 0)
+		ret = bpf_frame_desc_build_tables(env);
 
 	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
@@ -24127,6 +24534,11 @@ skip_full_check:
 	if (env->prog->type == BPF_PROG_TYPE_EXT)
 		env->prog->expected_attach_type = 0;
 
+	/* The program owns the frame descriptors from here on. */
+	env->prog->aux->frame_desc_pool = env->frame_desc_pool;
+	env->frame_desc_pool = NULL;
+	env->prog->aux->cancellable = env->cancellable;
+
 	env->prog = __bpf_prog_select_runtime(env, env->prog, &ret);
 
 err_release_maps:
@@ -24155,6 +24567,9 @@ err_prep:
 	release_btfs(env);
 err_free_env:
 	bpf_free_subprog_jts(env);
+	for (i = 0; i < env->subprog_cnt; i++)
+		bpf_frame_desc_table_free(env->subprog_info[i].frame_desc_table);
+	bpf_frame_desc_pool_free(env->frame_desc_pool);
 	if (env->insn_aux_data)
 		bpf_clear_insn_aux_data(env, 0, env->insn_aux_data_len);
 	vfree(env->insn_aux_data);
@@ -24168,6 +24583,8 @@ err_free_env:
 	kvfree(env->gotox_tmp_buf);
 	kvfree(env->callx_edges);
 	kvfree(env->func_ptrs);
+	kvfree(env->stack_inits);
+	bpf_frame_desc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_throw.h>
 #include <linux/cfi.h>
 #include <linux/extable.h>
 #include <linux/filter.h>
@@ -45,6 +46,11 @@
 #define check_imm26(imm) check_imm(26, imm)
 
 /* Map BPF registers to A64 registers */
+/* arch/arm64/net/bpf_throw.S: the entries of bpf_throw_unwind(), built with the syscall. */
+extern void bpf_throw_entry(void);
+extern void bpf_throw_fault_entry(void);
+extern void bpf_cancel_entry(void);
+
 static const int bpf2a64[] = {
 	/* return value from in-kernel function, and exit value from eBPF */
 	[BPF_REG_0] = A64_R(8),
@@ -81,6 +87,8 @@ struct jit_ctx {
 	int epilogue_offset;
 	int *offset;
 	int exentry_idx;
+	int *landing_ex;	/* the extable entry of each landing, see build_landings() */
+	int landing_idx;
 	int nr_used_callee_reg;
 	u8 used_callee_reg[8]; /* r6~r9, fp, arena_vm_start */
 	__le32 *image;
@@ -422,69 +430,86 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 	ctx->nr_used_callee_reg = i;
 }
 
-/* Save callee-saved registers */
+/*
+ * Offset from the frame pointer of the @idx-th register pushed by push_callee_regs(). The
+ * frame record sits at the frame pointer, the tail call count pair right below it, and
+ * then the pushed pairs, each 16 bytes with its first register at the lower address.
+ */
+static int callee_reg_slot_off(int idx)
+{
+	return -32 - 16 * (idx / 2) + 8 * (idx % 2);
+}
+
+/*
+ * Record where the prologue saved the caller's callee-saved registers, relative to
+ * the frame pointer that arch_bpf_stack_walk() reports for this frame, for the
+ * exception unwinder. The registers are x19..x28 in the order of struct
+ * bpf_throw_regs, R6..R9 first: the tail call count pointer is saved with the frame
+ * record, the others where push_callee_regs() put them, and x23 and x24 nowhere,
+ * since JITed code leaves them alone.
+ */
+static void record_callee_reg_off(struct jit_ctx *ctx)
+{
+	struct bpf_prog_aux *aux = ctx->prog->aux;
+	int i, j;
+
+	BUILD_BUG_ON(BPF_THROW_NR_CALLEE_SAVED != 10);
+	for (i = 0; i < BPF_THROW_NR_CALLEE_SAVED; i++) {
+		u8 reg = A64_R(19 + i);
+
+		aux->callee_reg_off[i] = 0;
+		if (reg == bpf2a64[TCCNT_PTR]) {
+			aux->callee_reg_off[i] = -8;
+			continue;
+		}
+		for (j = 0; j < ctx->nr_used_callee_reg; j++) {
+			if (ctx->used_callee_reg[j] != reg)
+				continue;
+			aux->callee_reg_off[i] = callee_reg_slot_off(j);
+			break;
+		}
+	}
+}
+
+/*
+ * Save the callee-saved registers this function uses. An exception boundary
+ * saves nothing more: the unwinder recovers the registers of the frames it
+ * discards and hands them to the exception callback.
+ */
 static void push_callee_regs(struct jit_ctx *ctx)
 {
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary should save all ARM64
-	 * Callee-saved registers as the exception callback needs to recover
-	 * all ARM64 Callee-saved registers in its epilogue.
-	 */
-	if (ctx->prog->aux->exception_boundary) {
-		emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
-		ctx->fp_used = true;
-	} else {
-		find_used_callee_regs(ctx);
-		for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
-			reg1 = ctx->used_callee_reg[i];
-			reg2 = ctx->used_callee_reg[i + 1];
-			emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
-		}
-		if (i < ctx->nr_used_callee_reg) {
-			reg1 = ctx->used_callee_reg[i];
-			/* keep SP 16-byte aligned */
-			emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
-		}
+	find_used_callee_regs(ctx);
+	for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
+		reg1 = ctx->used_callee_reg[i];
+		reg2 = ctx->used_callee_reg[i + 1];
+		emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
 	}
+	if (i < ctx->nr_used_callee_reg) {
+		reg1 = ctx->used_callee_reg[i];
+		/* keep SP 16-byte aligned */
+		emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
+	}
+	record_callee_reg_off(ctx);
 }
 
 /* Restore callee-saved registers */
 static void pop_callee_regs(struct jit_ctx *ctx)
 {
-	struct bpf_prog_aux *aux = ctx->prog->aux;
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary pushes R23 and R24 in addition
-	 * to BPF callee-saved registers. Exception callback uses the boundary
-	 * program's stack frame, so recover these extra registers in the above
-	 * two cases.
-	 */
-	if (aux->exception_boundary || aux->exception_cb) {
-		emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
-		emit(A64_POP(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_POP(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_POP(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_POP(A64_R(19), A64_R(20), A64_SP), ctx);
-	} else {
-		i = ctx->nr_used_callee_reg - 1;
-		if (ctx->nr_used_callee_reg % 2 != 0) {
-			reg1 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
-			i--;
-		}
-		while (i > 0) {
-			reg1 = ctx->used_callee_reg[i - 1];
-			reg2 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, reg2, A64_SP), ctx);
-			i -= 2;
-		}
+	i = ctx->nr_used_callee_reg - 1;
+	if (ctx->nr_used_callee_reg % 2 != 0) {
+		reg1 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
+		i--;
+	}
+	while (i > 0) {
+		reg1 = ctx->used_callee_reg[i - 1];
+		reg2 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, reg2, A64_SP), ctx);
+		i -= 2;
 	}
 }
 
@@ -585,24 +610,22 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 			/* BTI landing pad for the tail call, done with a BR */
 			emit_bti(A64_BTI_J, ctx);
 		}
-		push_callee_regs(ctx);
 	} else {
 		/*
-		 * Exception callback receives FP of Main Program as third
-		 * parameter
+		 * The exception callback receives the main program's frame
+		 * pointer as its third parameter and, as its fourth, the
+		 * callee-saved registers x19..x28 the unwinder recovered from
+		 * the frames it discarded: the values the main program's caller
+		 * expects back. Load them, then build the rest of the frame
+		 * below the main program's frame record like any function.
 		 */
+		for (int i = 0; i < BPF_THROW_NR_CALLEE_SAVED; i++)
+			emit(A64_LDR64I(A64_R(19 + i), A64_R(3), 8 * i), ctx);
 		emit(A64_MOV(1, A64_FP, A64_R(2)), ctx);
-		/*
-		 * Main Program already pushed the frame record and the
-		 * callee-saved registers. The exception callback will not push
-		 * anything and re-use the main program's stack.
-		 *
-		 * 12 registers are on the stack
-		 */
-		emit(A64_SUB_I(1, A64_SP, A64_FP, 96), ctx);
-		/* The callback may use its own BPF stack, set up fp for it. */
-		ctx->fp_used = true;
+		emit(A64_MOV(1, A64_SP, A64_FP), ctx);
+		prepare_bpf_tail_call_cnt(ctx);
 	}
+	push_callee_regs(ctx);
 
 	/* Stack must be multiples of 16B */
 	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
@@ -613,9 +636,18 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 			priv_stack_ptr = prog->aux->priv_stack_ptr + PRIV_STACK_GUARD_SZ;
 			emit_percpu_ptr(priv_sp, priv_stack_ptr, ctx);
 			emit(A64_ADD_I(1, fp, priv_sp, ctx->stack_size), ctx);
+			/* Where the exception unwinder finds this frame's BPF stack. */
+			prog->aux->priv_frame_off = PRIV_STACK_GUARD_SZ + ctx->stack_size;
 		} else {
 			/* Set up BPF prog stack base register */
 			emit(A64_MOV(1, fp, A64_SP), ctx);
+			/*
+			 * Where the exception unwinder finds this frame's BPF stack:
+			 * below the frame record, the tail call count pair and the
+			 * pairs push_callee_regs() pushed.
+			 */
+			prog->aux->frame_fp_off = -16 -
+						   16 * DIV_ROUND_UP(ctx->nr_used_callee_reg, 2);
 		}
 	}
 
@@ -1125,7 +1157,19 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+		if (bpf_prog_report_arena_violation(is_write, addr, regs->pc)) {
+			/*
+			 * The access is a cancellation point: resume the program
+			 * in bpf_throw_fault_entry() instead of after the access.
+			 * The faulting pc travels in a temporary of the JIT that
+			 * no BPF register maps to. The lowering of an access
+			 * writes no BPF register before the access itself, so
+			 * the register file the entry captures is the site's.
+			 */
+			regs->regs[bpf2a64[TMP_REG_1]] = regs->pc;
+			regs->pc = (unsigned long)bpf_throw_fault_entry;
+			return true;
+		}
 	}
 
 	if (dst_reg != DONT_CLEAR)
@@ -1227,19 +1271,24 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
+/* unwind_goto after the call of a helper or a kfunc, which return r0 in x0 alone */
+static bool unwind_goto_after_helper(const struct bpf_insn *insn)
+{
+	const struct bpf_insn *call = insn - 1;
+
+	return call->code == (BPF_JMP | BPF_CALL) && call->src_reg != BPF_PSEUDO_CALL;
+}
+
 /*
  * There is no branch for unwind_goto, only an extable entry
- *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }
- * where ret_addr is the return address of the call in front of it. unwind_exit
- * adds .fixup to its LR.
+ *   { .insn = ret_addr - 1, .fixup = target - ret_addr }
+ * where ret_addr is the return address of the call in front of it, and target
+ * the pad, or the way into it. unwind_exit adds .fixup to its LR.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
- * 'bl foo; mov x8, x0' is in front of unwind_goto. The pad doesn't miss the mov:
- * r0 is x8 and the epilogue of the callee copies it to x0 and leaves x8 as it is.
  */
-static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
+static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
 {
-	int ret_addr = ctx->idx - 1;
 	struct exception_table_entry *ex;
 	off_t ins_offset;
 
@@ -1259,23 +1308,79 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 	/* switch ex to rw buffer for writing */
 	ex = (void *)ctx->image + ((void *)ex - (void *)ctx->ro_image);
 	ex->insn = ins_offset;
-	ex->fixup = (ctx->offset[pad] - ret_addr) * AARCH64_INSN_SIZE;
+	ex->fixup = (target - ret_addr) * AARCH64_INSN_SIZE;
 	ex->type = EX_TYPE_BPF;
 
 	ctx->exentry_idx++;
 	return 0;
 }
 
-static long bpf_unwind_fixup(u64 lr)
+/*
+ * The landings of the pads after the calls of helpers and kfuncs, past the
+ * epilogue, where nothing falls into them: 'mov x8, x0; b pad' each, see the
+ * unwind_goto case of build_insn(). They go in after the body, when the pads
+ * are placed and the entries are in, and each fills in the fixup of its entry.
+ */
+static int build_landings(struct jit_ctx *ctx)
+{
+	const struct bpf_prog *prog = ctx->prog;
+	int i, k = 0;
+
+	for (i = 1; i < prog->len; i++) {
+		const struct bpf_insn *insn = &prog->insnsi[i];
+		int ret_addr, jmp_offset;
+
+		if (!bpf_is_unwind_goto(insn) || !unwind_goto_after_helper(insn))
+			continue;
+		ret_addr = ctx->offset[i] - 1;
+		if (ctx->image) {
+			struct exception_table_entry *ex;
+
+			ex = &prog->aux->extable[ctx->landing_ex[k]];
+			ex = (void *)ctx->image + ((void *)ex - (void *)ctx->ro_image);
+			ex->fixup = (ctx->idx - ret_addr) * AARCH64_INSN_SIZE;
+		}
+		k++;
+		emit(A64_MOV(1, bpf2a64[BPF_REG_0], A64_R(0)), ctx);
+		jmp_offset = ctx->offset[i + 1 + insn->off] - ctx->idx;
+		check_imm26(jmp_offset);
+		emit(A64_B(jmp_offset), ctx);
+	}
+	return 0;
+}
+
+/*
+ * The verifier made sure that unwind_goto follows a call in a prog. When the
+ * kernel called an async callback, it's exit. A helper that calls a callback
+ * has a pad when it wants one, see bpf_call_cb().
+ */
+u64 bpf_unwind_target(u64 ret_addr)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - 1);
+	e = search_bpf_extables(ret_addr - 1);
+	if (e)
+		return ret_addr + e->fixup;
 	/*
-	 * The verifier made sure that unwind_goto follows a call in a prog. When
-	 * the kernel called an async callback, it's exit.
+	 * The pad of a helper that called a callback with bpf_call_cb(): its
+	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
+	 * Anything else at a return address is some caller's own fixup, and
+	 * what a JIT keyed there is a fixup of the insn after the call.
 	 */
-	return e ? e->fixup : 0;
+	e = search_kernel_exception_table(ret_addr);
+	if (!e)
+		e = search_module_extables(ret_addr);
+	if (e && e->type == EX_TYPE_BPF)
+		return (unsigned long)&e->fixup + e->fixup;
+	return ret_addr;
+}
+
+/* The offset that the epilogue adds to LR once it is authenticated */
+static long bpf_unwind_fixup(u64 lr)
+{
+	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
+
+	return bpf_unwind_target(ret_addr) - ret_addr;
 }
 
 /*
@@ -1879,10 +1984,27 @@ emit_cond_jmp:
 		break;
 	/* unwind_goto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
-		ret = add_unwind_exentry(ctx, i + 1 + off);
+	{
+		int ret_addr = ctx->idx - 1;
+		int target = ctx->offset[i + 1 + off];
+
+		/*
+		 * 'bl foo; mov x8, x0' is in front. After the call of a subprog
+		 * the pad doesn't miss the mov: r0 is x8 in the subprog too, its
+		 * epilogue copies x8 to x0 and leaves x8 as it is. A helper that
+		 * leaves to the pad returns r0 in x0 alone, so the pad after its
+		 * call is entered through a landing past the epilogue, see
+		 * build_landings(), which fills in the fixup of the entry.
+		 */
+		if (unwind_goto_after_helper(insn)) {
+			ctx->landing_ex[ctx->landing_idx++] = ctx->exentry_idx;
+			target = ret_addr;
+		}
+		ret = add_unwind_exentry(ctx, ret_addr, target);
 		if (ret)
 			return ret;
 		break;
+	}
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
 		if (bpf_is_unwind_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
@@ -2320,7 +2442,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	u8 *ro_image_ptr;
 	int body_idx;
 	int exentry_idx;
+	int nr_landings = 0;
 	int out_cnt;
+	int i;
 
 	if (!prog->jit_requested)
 		return prog;
@@ -2365,6 +2489,16 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	if (ctx.offset == NULL)
 		goto out_off;
 
+	for (i = 1; i < prog->len; i++)
+		if (bpf_is_unwind_goto(&prog->insnsi[i]) &&
+		    unwind_goto_after_helper(&prog->insnsi[i]))
+			nr_landings++;
+	if (nr_landings) {
+		ctx.landing_ex = kvzalloc_objs(int, nr_landings);
+		if (ctx.landing_ex == NULL)
+			goto out_off;
+	}
+
 	if (bpf_prog_uses_arena_insns(prog)) {
 		ctx.user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 		ctx.arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
@@ -2394,6 +2528,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 
 	ctx.epilogue_offset = ctx.idx;
 	build_epilogue(&ctx, was_classic, false);
+	if (build_landings(&ctx))
+		goto out_off;
 	build_plt(&ctx);
 
 	extable_align = __alignof__(struct exception_table_entry);
@@ -2427,6 +2563,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 skip_init_ctx:
 	ctx.idx = 0;
 	ctx.exentry_idx = 0;
+	ctx.landing_idx = 0;
 	ctx.write = true;
 
 	build_prologue(&ctx, was_classic);
@@ -2442,6 +2579,7 @@ skip_init_ctx:
 
 	ctx.epilogue_offset = ctx.idx;
 	ctx.exentry_idx = exentry_idx;
+	ctx.landing_idx = 0;
 	ctx.idx = body_idx;
 	ctx.write = true;
 
@@ -2451,6 +2589,8 @@ skip_init_ctx:
 		goto out_free_hdr;
 
 	build_epilogue(&ctx, was_classic, false);
+	if (build_landings(&ctx))
+		goto out_free_hdr;
 	build_plt(&ctx);
 
 	/* Extra pass to validate JITed code. */
@@ -2492,8 +2632,6 @@ skip_init_ctx:
 	prog->jited_len = prog_size - cfi_get_offset();
 
 	if (!prog->is_func || extra_pass) {
-		int i;
-
 		/* offset[prog->len] is the size of program */
 		for (i = 0; i <= prog->len; i++)
 			ctx.offset[i] *= AARCH64_INSN_SIZE;
@@ -2505,12 +2643,14 @@ skip_init_ctx:
 		 * reasons, expects to point to the next instruction)
 		 */
 		bpf_prog_update_insn_ptrs(prog, ctx.offset, ctx.ro_image);
+		bpf_prog_fill_frame_desc_table(prog, ctx.offset, ctx.ro_image);
 out_off:
 		if (!ro_header && priv_stack_ptr) {
 			free_percpu(priv_stack_ptr);
 			prog->aux->priv_stack_ptr = NULL;
 		}
 		kvfree(ctx.offset);
+		kvfree(ctx.landing_ex);
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;
@@ -3542,6 +3682,46 @@ bool bpf_jit_supports_timed_may_goto(void)
 	return true;
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+void *bpf_arch_throw_entry(void)
+{
+	return (void *)bpf_throw_entry;
+}
+
+void *bpf_arch_throw_fault_entry(void)
+{
+	return (void *)bpf_throw_fault_entry;
+}
+
+void *bpf_arch_cancel_entry(void)
+{
+	return (void *)bpf_cancel_entry;
+}
+
+/* The return address of a kernel frame the walker passed is in its frame record. */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return (u64 *)(long)(bp + 8);
+}
+
+/*
+ * JITed code signs the return address in its frame record with the stack
+ * pointer at entry, which is the address above the record, see
+ * build_prologue().
+ */
+void bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
+	register u64 x17 asm("x17") = to;
+	register u64 x16 asm("x16") = bp + 16;
+
+	asm("pacia1716" : "+r"(x17) : "r"(x16));
+	to = x17;
+#endif
+	*(u64 *)(long)(bp + 8) = to;
+}
+#endif
+
 bool bpf_jit_inlines_helper_call(s32 imm)
 {
 	switch (imm) {
@@ -3569,6 +3749,8 @@ void bpf_jit_free(struct bpf_prog *prog)
 		 */
 		if (jit_data) {
 			bpf_jit_binary_pack_finalize(jit_data->ro_header, jit_data->header);
+			kvfree(jit_data->ctx.offset);
+			kvfree(jit_data->ctx.landing_ex);
 			kfree(jit_data);
 		}
 		prog->bpf_func = (void *)prog->bpf_func - cfi_get_offset();
