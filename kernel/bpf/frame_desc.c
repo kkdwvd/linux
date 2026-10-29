@@ -810,21 +810,30 @@ static int fixed_add(struct bpf_verifier_env *env, struct scratch *s, int f,
 	return 0;
 }
 
-/* The entry an earlier path listed for the lock or IRQ flag of rank @order, and its frame. */
+/*
+ * The entry an earlier path listed for the lock or IRQ flags of rank @order on
+ * this path, and its frame. A descriptor ranks the locks and IRQ flags of its
+ * frame from 0, see place_fixed(), so the rank in a frame is the rank on the
+ * stack less what the frames below hold; the entries placed so far are all
+ * locks and IRQ flags, as sections are placed after them.
+ */
 static const struct bpf_frame_desc_entry *fixed_find(struct scratch *s, int curframe, s16 order,
 						     int *frame)
 {
-	int f, i;
+	int f, i, base = 0;
 
+	for (f = 0; f < s->first; f++)
+		base += s->nr_fixed[f];
 	for (f = s->first; f <= curframe; f++) {
 		struct bpf_frame_desc_build *b = s->builds[f];
 
 		for (i = 0; i < b->nr_fixed; i++) {
-			if (b->fixed[i].order == order) {
+			if (b->fixed[i].order == order - base) {
 				*frame = f;
 				return &b->fixed[i];
 			}
 		}
+		base += s->nr_fixed[f];
 	}
 	return NULL;
 }
@@ -1005,14 +1014,17 @@ static int place_section(struct bpf_verifier_env *env, struct scratch *s, int f,
  * these are released in order: the verifier keeps locks and IRQ flags in
  * acquisition order, and the unwinder releases inner frames first, so the
  * ranks placed in a frame must all follow those of its callers. Every path
- * must place exactly the same entries in every frame. The frames below the
- * first one the unwinder reaches keep what they hold; it still limits what
- * the frames above may release, which held_above records.
+ * must place exactly the same entries in every frame, and the unwinder
+ * releases one frame at a time, so a frame ranks its locks and IRQ flags
+ * from 0: what its callers hold may differ between the paths to a subprog.
+ * The frames below the first one the unwinder reaches keep what they hold;
+ * it still limits what the frames above may release, which held_above
+ * records.
  */
 static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 {
 	struct bpf_verifier_state *st = env->cur_state;
-	int i, f, k, order = 0, last = -1, held = 0, ret;
+	int i, f, k, n, order = 0, last = -1, held = 0, base = 0, ret;
 	bool section = false;
 
 	memset(s->nr_fixed, 0, sizeof(s->nr_fixed));
@@ -1059,6 +1071,14 @@ static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 			last = s->fixed[f][0].order;
 			break;
 		}
+		/* The frame's ranks follow those of the frames below: rebase them to 0. */
+		for (k = 0, n = 0; k < s->nr_fixed[f]; k++) {
+			if (s->fixed[f][k].order < 0)
+				continue;
+			s->fixed[f][k].order -= base;
+			n++;
+		}
+		base += n;
 		if (f < s->first)
 			continue;
 		if (!b->visits) {

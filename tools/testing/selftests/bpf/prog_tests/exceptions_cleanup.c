@@ -153,6 +153,7 @@ static void run_suite(const char *prefix)
 	CANCEL(cancel_may_goto_res_lock, 1, 0);
 	CANCEL(cancel_may_goto_res_lock_irq, 2, 0);
 	CANCEL(cancel_may_goto_irq, 1, 0);
+	CANCEL(cancel_may_goto_irq_shared, 2, 0);
 	CANCEL(cancel_may_goto_nested, 4, 1);
 	CANCEL(cancel_may_goto_global, 1, 0);
 	CANCEL(cancel_may_goto_global_chain, 1, 0);
