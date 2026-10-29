@@ -35,7 +35,6 @@ void __asan_load8(void *p);
 void __asan_store8(void *p);
 #endif
 
-static bool all_callee_regs_used[4] = {true, true, true, true};
 
 static void *trampoline_size_image;
 
@@ -428,6 +427,30 @@ static void pop_callee_regs(u8 **pprog, bool *callee_regs_used)
 	*pprog = prog;
 }
 
+/*
+ * Record where the prologue saved the caller's callee-saved registers relative to rbp,
+ * for the exception unwinder: r12 when @r12 was pushed, then rbx, r13, r14 and r15
+ * as push_callee_regs() pushed them. @off is the offset of rsp from rbp right before
+ * the first push.
+ */
+static void record_callee_reg_off(struct bpf_prog *prog, s32 off, bool *callee_regs_used,
+				  bool r12)
+{
+	int i;
+
+	prog->aux->callee_reg_off[4] = r12 ? off - 8 : 0;
+	if (r12)
+		off -= 8;
+	for (i = 0; i < 4; i++) {
+		if (!callee_regs_used[i]) {
+			prog->aux->callee_reg_off[i] = 0;
+			continue;
+		}
+		off -= 8;
+		prog->aux->callee_reg_off[i] = off;
+	}
+}
+
 /* add rsp, depth */
 static void emit_add_rsp(u8 **pprog, u32 depth)
 {
@@ -597,18 +620,21 @@ static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cb
 			/* Keep the same instruction layout. */
 			emit_nops(&prog, 3);     /* nop3 */
 	}
-	/* Exception callback receives FP as third parameter */
+	/*
+	 * The exception callback receives the main program's frame pointer as
+	 * its third parameter and, as its fourth, the callee-saved registers
+	 * the unwinder recovered from the frames it discarded, rbx, r13, r14,
+	 * r15 and r12 in that order: the values the main program's caller
+	 * expects back. Load them, then reuse the main program's frame.
+	 */
 	if (is_exception_cb) {
-		EMIT3(0x48, 0x89, 0xF4); /* mov rsp, rsi */
-		EMIT3(0x48, 0x89, 0xD5); /* mov rbp, rdx */
-		/* The main frame must have exception_boundary as true, so we
-		 * first restore those callee-saved regs from stack, before
-		 * reusing the stack frame.
-		 */
-		pop_callee_regs(&prog, all_callee_regs_used);
-		pop_r12(&prog);
-		/* Reset the stack frame. */
-		EMIT3(0x48, 0x89, 0xEC); /* mov rsp, rbp */
+		EMIT3(0x48, 0x8B, 0x19);       /* mov rbx, [rcx] */
+		EMIT4(0x4C, 0x8B, 0x69, 0x08); /* mov r13, [rcx + 8] */
+		EMIT4(0x4C, 0x8B, 0x71, 0x10); /* mov r14, [rcx + 16] */
+		EMIT4(0x4C, 0x8B, 0x79, 0x18); /* mov r15, [rcx + 24] */
+		EMIT4(0x4C, 0x8B, 0x61, 0x20); /* mov r12, [rcx + 32] */
+		EMIT3(0x48, 0x89, 0xD5);       /* mov rbp, rdx */
+		EMIT3(0x48, 0x89, 0xEC);       /* mov rsp, rbp */
 	} else {
 		EMIT1(0x55);             /* push rbp */
 		EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
@@ -884,14 +910,9 @@ static void emit_bpf_tail_call_indirect(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);            /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                              /* pop rax */
@@ -950,14 +971,9 @@ static void emit_bpf_tail_call_direct(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);                /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                                  /* pop rax */
@@ -1886,11 +1902,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+--------+-----------+---------+----------+
- * | 31        | 30          | 29-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+--------+-----------+---------+----------+
+ * +-----------+-------------+-------------+-----------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29          | 28        | 27-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |             |           |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | R0_ON_STACK | R0_IN_AX  | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+-------------+-----------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far past the faulting insn to resume. That is its own length
  *                      for a single-insn access, but the distance to the end of the whole
@@ -1906,6 +1922,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                        It is independent of DST_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
  * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
+ * - R0_IN_AX, R0_ON_STACK (1 bit each): Where R0 is while the faulting insn runs, when it is not
+ *                                       in RAX: the CMPXCHG loop of a fetching AND/OR/XOR keeps
+ *                                       it in BPF_REG_AX, or pushed on the stack when that holds
+ *                                       the address. The handler puts it back before it cancels
+ *                                       the program, which captures the register file.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1923,6 +1944,8 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_IN_AX	BIT(28)
+#define FIXUP_ARENA_R0_ON_STACK	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
 #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
@@ -1941,7 +1964,26 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		arena_reg = FIELD_GET(FIXUP_ARENA_REG_MASK, x->fixup);
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
+		if (bpf_prog_report_arena_violation(is_write, addr, regs->ip)) {
+			/*
+			 * The access is a cancellation point: resume the program
+			 * in bpf_throw_fault_entry() instead of after the access.
+			 * The stub captures the BPF register file, so R0 goes
+			 * back into RAX when the lowering of the access kept it
+			 * elsewhere. The faulting ip travels in r11, a temporary
+			 * of the JIT. The fault returns by iret, so the stub runs
+			 * on the stack the program had at the access, which no
+			 * return address was pushed to: the stub pushes r11 to
+			 * make its frame look like that of a call from the access.
+			 */
+			if (x->fixup & FIXUP_ARENA_R0_IN_AX)
+				regs->ax = regs->r10;
+			else if (x->fixup & FIXUP_ARENA_R0_ON_STACK)
+				regs->ax = *(unsigned long *)regs->sp;
+			regs->r11 = regs->ip;
+			regs->ip = (unsigned long)bpf_throw_fault_entry;
+			return true;
+		}
 	}
 
 	/* jump over the faulting access, or the sequence it is part of, and clear dest register */
@@ -1956,11 +1998,11 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
  * Record an arena access that may fault. @fault_ip is the address of the
  * faulting insn in the RO image, @resume_off how far past it execution has to
  * resume: for a multi-insn lowering that is the end of the whole sequence, not
- * the end of the one insn.
+ * the end of the one insn. @flags are the FIXUP_ARENA_* bits of the entry.
  */
 static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image,
 			      int *excnt, u8 *fault_ip, u32 resume_off,
-			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off)
+			      u32 fixup_reg, u32 arena_reg, u32 flags, s16 off)
 {
 	struct exception_table_entry *ex;
 	s64 delta;
@@ -1983,9 +2025,7 @@ static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image
 	ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, resume_off) |
 		    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
 		    FIELD_PREP(FIXUP_REG_MASK, fixup_reg) |
-		    FIXUP_ARENA_ACCESS;
-	if (is_write)
-		ex->fixup |= FIXUP_ARENA_WRITE;
+		    FIXUP_ARENA_ACCESS | flags;
 
 	return 0;
 }
@@ -2546,15 +2586,30 @@ static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, in
 	return 0;
 }
 
-static u64 bpf_unwind_target(u64 ret_addr)
+/*
+ * The verifier made sure that unwind_goto follows a call in a prog. When the
+ * kernel called an async callback, it's exit. A helper that calls a callback
+ * has a pad when it wants one, see bpf_call_cb().
+ */
+u64 bpf_unwind_target(u64 ret_addr)
 {
-	const struct exception_table_entry *e = search_bpf_extables(ret_addr - 1);
+	const struct exception_table_entry *e;
 
+	e = search_bpf_extables(ret_addr - 1);
+	if (e)
+		return ret_addr + e->fixup;
 	/*
-	 * The verifier made sure that unwind_goto follows a call in a prog. When
-	 * the kernel called an async callback, it's exit.
+	 * The pad of a helper that called a callback with bpf_call_cb(): its
+	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
+	 * Anything else at a return address is some caller's own fixup, and
+	 * what a JIT keyed there is a fixup of the insn after the call.
 	 */
-	return e ? ret_addr + e->fixup : ret_addr;
+	e = search_kernel_exception_table(ret_addr);
+	if (!e)
+		e = search_module_extables(ret_addr);
+	if (e && (e->data & EX_DATA_TYPE_MASK) == EX_TYPE_BPF)
+		return (unsigned long)&e->fixup + e->fixup;
+	return ret_addr;
 }
 
 /* unwind_exit: fix the return address of this frame. r0 and r2 are returned. */
@@ -2593,6 +2648,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	u32 stack_depth;
 	int callee_saved_size;
 	s32 outgoing_arg_base;
+	s32 callee_regs_off;
 	int err;
 
 	stack_depth = bpf_prog->aux->stack_depth;
@@ -2600,6 +2656,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	priv_stack_ptr = bpf_prog->aux->priv_stack_ptr;
 	if (priv_stack_ptr) {
 		priv_frame_ptr = priv_stack_ptr + PRIV_STACK_GUARD_SZ + round_up(stack_depth, 8);
+		bpf_prog->aux->priv_frame_off = PRIV_STACK_GUARD_SZ + round_up(stack_depth, 8);
 		stack_depth = 0;
 	}
 
@@ -2638,35 +2695,31 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 
 	bpf_prog->aux->ksym.fp_start = prog - temp;
 
-	/* Exception callback will clobber callee regs for its own use, and
-	 * restore the original callee regs from main prog's stack frame.
+	/*
+	 * Save the callee-saved registers this function uses. An exception
+	 * boundary saves nothing more: the unwinder recovers the registers of
+	 * the frames it discards and hands them to the exception callback.
 	 */
-	if (bpf_prog->aux->exception_boundary) {
-		/* We also need to save r12, which is not mapped to any BPF
-		 * register, as we throw after entry into the kernel, which may
-		 * overwrite r12.
-		 */
+	if (arena_vm_start)
 		push_r12(&prog);
-		push_callee_regs(&prog, all_callee_regs_used);
-	} else {
-		if (arena_vm_start)
-			push_r12(&prog);
-		push_callee_regs(&prog, callee_regs_used);
-	}
+	push_callee_regs(&prog, callee_regs_used);
+
+	/*
+	 * Record where the pushes above saved the caller's registers, relative to
+	 * the rbp that arch_bpf_stack_walk() reports for this frame. Below rbp lie,
+	 * from high to low addresses: round_up(stack_depth, 8) bytes of program
+	 * stack (none with a private stack), the tail call count and its pointer
+	 * (16 bytes) when tail_call_reachable, r12 when arena_vm_start, and then
+	 * rbx, r13, r14 and r15 in push order, each only when pushed.
+	 */
+	callee_regs_off = -(s32)round_up(stack_depth, 8) - (tail_call_reachable ? 16 : 0);
+	record_callee_reg_off(bpf_prog, callee_regs_off, callee_regs_used, arena_vm_start);
 
 	/* Compute callee-saved register area size. */
-	callee_saved_size = 0;
-	if (bpf_prog->aux->exception_boundary || arena_vm_start)
-		callee_saved_size += 8; /* r12 */
-	if (bpf_prog->aux->exception_boundary) {
-		callee_saved_size += 4 * 8; /* rbx, r13, r14, r15 */
-	} else {
-		int j;
-
-		for (j = 0; j < 4; j++)
-			if (callee_regs_used[j])
-				callee_saved_size += 8;
-	}
+	callee_saved_size = arena_vm_start ? 8 : 0; /* r12 */
+	for (int j = 0; j < 4; j++)
+		if (callee_regs_used[j])
+			callee_saved_size += 8;
 	/*
 	 * Base offset from rbp for translating BPF outgoing args 7+
 	 * to native offsets. BPF uses negative offsets from r11
@@ -2687,8 +2740,6 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	 * Arg 6 goes into r9 register, not on stack.
 	 */
 	outgoing_rsp = out_stack_arg_cnt > 1 ? (out_stack_arg_cnt - 1) * 8 : 0;
-	if (bpf_prog->aux->exception_boundary)
-		bpf_prog->aux->stack_arg_sp_adjust = outgoing_rsp;
 	emit_sub_rsp(&prog, outgoing_rsp);
 
 	if (arena_vm_start)
@@ -3218,8 +3269,8 @@ populate_extable:
 
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
-							 prog - start_of_ldx, fixup_reg,
-							 arena_reg, is_write, insn->off);
+							 prog - start_of_ldx, fixup_reg, arena_reg,
+							 is_write ? FIXUP_ARENA_WRITE : 0, insn->off);
 				if (err)
 					return err;
 			}
@@ -3452,7 +3503,8 @@ populate_extable:
 				/*
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
-				 * since the BPF insn is a read-modify-write.
+				 * since the BPF insn is a read-modify-write, and both
+				 * say where R0 is kept while RAX serves the CMPXCHG.
 				 */
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
@@ -3462,7 +3514,10 @@ populate_extable:
 								 resume - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 true, insn->off);
+								 FIXUP_ARENA_WRITE |
+								 (r0_on_stack ? FIXUP_ARENA_R0_ON_STACK :
+										FIXUP_ARENA_R0_IN_AX),
+								 insn->off);
 					if (err)
 						return err;
 				}
@@ -3882,14 +3937,9 @@ emit_jmp:
 			}
 			/* Deallocate outgoing args 7+ area. */
 			emit_add_rsp(&prog, outgoing_rsp);
-			if (bpf_prog->aux->exception_boundary) {
-				pop_callee_regs(&prog, all_callee_regs_used);
+			pop_callee_regs(&prog, callee_regs_used);
+			if (arena_vm_start)
 				pop_r12(&prog);
-			} else {
-				pop_callee_regs(&prog, callee_regs_used);
-				if (arena_vm_start)
-					pop_r12(&prog);
-			}
 			EMIT1(0xC9);         /* leave */
 			bpf_prog->aux->ksym.fp_end = prog - temp;
 
@@ -5085,8 +5135,10 @@ out_image:
 	}
 
 	if (!image || !prog->is_func || extra_pass) {
-		if (image)
+		if (image) {
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
+			bpf_prog_fill_frame_desc_table(prog, addrs, image);
+		}
 out_addrs:
 		kvfree(addrs);
 		if (!image && priv_stack_ptr) {
@@ -5235,6 +5287,39 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 	return;
 #endif
 }
+
+#ifdef CONFIG_BPF_SYSCALL
+/* arch/x86/net/bpf_throw.S, which calls bpf_throw_unwind(); both need the syscall. */
+void *bpf_arch_throw_entry(void)
+{
+	return (void *)bpf_throw_entry;
+}
+
+void *bpf_arch_throw_fault_entry(void)
+{
+	return (void *)bpf_throw_fault_entry;
+}
+
+void *bpf_arch_cancel_entry(void)
+{
+	return (void *)bpf_cancel_entry;
+}
+
+/*
+ * The return address of a kernel frame the walker passed sits below the stack
+ * pointer ORC reports for the frame above, which is its canonical frame address.
+ */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return (u64 *)(long)(next_sp - 8);
+}
+
+/* JITed code keeps a frame pointer, with the return address above it. */
+void bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
+	*(u64 *)(long)(bp + 8) = to;
+}
+#endif
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 			       struct bpf_prog *new, struct bpf_prog *old)
