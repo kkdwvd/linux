@@ -532,6 +532,37 @@ int cancel_may_goto_irq(struct __sk_buff *ctx)
 	return 0;
 }
 
+static __noinline int spin_with_irqs_off(void)
+{
+	unsigned long flags;
+
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
+/*
+ * The frame the timeout hits in saves IRQ flags of its own, and is reached
+ * both under flags its caller saved and under none: each frame restores the
+ * flags it saved, so the callee's descriptor is the same on both paths. At
+ * run time the caller's flags are saved too, and restored after the callee's.
+ */
+SEC("tc")
+int cancel_may_goto_irq_shared(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (ctx->len == 0)
+		spin_with_irqs_off();
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin_with_irqs_off();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
 /* Everything nested: released in the reverse order of acquisition. */
 SEC("tc")
 int cancel_may_goto_nested(struct __sk_buff *ctx)
