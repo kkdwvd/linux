@@ -11,6 +11,11 @@
 #define MAX_RES 8
 #define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
 
+extern void *bpf_coro_frame_alloc(__u64 size, void *ctx) __ksym;
+extern void bpf_coro_frame_free(void *frame) __ksym;
+/* bpf_testmod: suspends the frame and resumes it before returning. */
+extern void bpf_kfunc_coro_suspend_now(void *frame) __ksym;
+
 struct foo {
 	int data;
 	struct bpf_list_node node;
@@ -1311,6 +1316,83 @@ int cancel_may_goto_exception_cb(struct __sk_buff *ctx)
 {
 	bpf_throw(0);
 	return 0;
+}
+
+/*
+ * The continuation of a suspended coroutine, in the shape clang's lowering
+ * gives it: the resume and destroy functions take the frame as their only
+ * argument, and the frame's first two slots hold their addresses. The object
+ * the coroutine holds across the suspension lives in the third slot only.
+ */
+__u32 coro_cancel;
+
+static __noinline void coro_throw_resume(void *frame)
+{
+	__u64 *slots = frame;
+
+	if (coro_cancel)
+		bpf_throw(0xeB9F);
+	bpf_obj_drop((struct foo *)slots[2]);
+	bpf_coro_frame_free(frame);
+}
+
+static __noinline void coro_spin_resume(void *frame)
+{
+	__u64 *slots = frame;
+
+	spin();
+	bpf_obj_drop((struct foo *)slots[2]);
+	bpf_coro_frame_free(frame);
+}
+
+static __noinline void coro_destroy(void *frame)
+{
+	__u64 *slots = frame;
+
+	bpf_obj_drop((struct foo *)slots[2]);
+	bpf_coro_frame_free(frame);
+}
+
+static __always_inline int coro_suspend(void (*resume)(void *frame))
+{
+	__u64 *slots;
+	struct foo *f;
+
+	slots = bpf_coro_frame_alloc(32, NULL);
+	if (!slots)
+		return 1;
+	mark_acquired(slots);
+	f = bpf_obj_new(typeof(*f));
+	if (!f) {
+		bpf_coro_frame_free(slots);
+		return 1;
+	}
+	mark_acquired(f);
+	slots[0] = (__u64)resume;
+	slots[1] = (__u64)coro_destroy;
+	slots[2] = (__u64)f;
+	slots[3] = 0;
+	bpf_kfunc_coro_suspend_now(slots);
+	return 0;
+}
+
+/*
+ * The continuation throws: the object is released through the frame, then the
+ * frame. The kernel ran the continuation, so the program goes on from the
+ * suspend call and completes normally.
+ */
+SEC("tc")
+int throw_coro_cont(struct __sk_buff *ctx)
+{
+	coro_cancel = 1;
+	return coro_suspend(coro_throw_resume);
+}
+
+/* The timeout hits in the continuation. */
+SEC("tc")
+int cancel_may_goto_coro_cont(struct __sk_buff *ctx)
+{
+	return coro_suspend(coro_spin_resume);
 }
 
 char _license[] SEC("license") = "GPL";

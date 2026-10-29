@@ -145,6 +145,8 @@ static void run_suite(const char *prefix)
 	THROW(throw_obj_subprog, 1);
 	THROW(throw_obj_global_caller, 1);
 	THROW(throw_slot, 1);
+	/* The kernel resumed the continuation: the program completes after the throw in it. */
+	RUN(throw_coro_cont, 2, 2, 0, true, 0);
 	RUN(throw_spin_lock, 2, 2, 0, true, 0xeB9F);
 	RUN(throw_rcu, 1, 1, 1, true, 0xeB9F);
 	RUN(throw_irq, 1, 1, 1, true, 0xeB9F);
@@ -180,6 +182,7 @@ static void run_suite(const char *prefix)
 	/* The kfunc drops the node it was adding before the unwinder releases the lock. */
 	RUN_HOOK(cancel_may_goto_rbtree_less, skel->progs.drop_hook, 2, 2, 0, false, 2);
 	CANCEL(cancel_may_goto_exception_cb, 1, 0);
+	RUN(cancel_may_goto_coro_cont, 2, 2, 0, true, 0);
 	/* A cancelled syscall or tracing program returns 0. */
 	RUN(cancel_may_goto_find_vma, 1, 1, 0, true, 0);
 	RUN(cancel_may_goto_priv_stack, 1, 1, 0, true, 0);

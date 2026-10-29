@@ -220,6 +220,7 @@ static bool is_tracing_prog_type(enum bpf_prog_type type);
 static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static bool in_rcu_callback(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
@@ -381,6 +382,7 @@ static bool reg_not_null(struct bpf_verifier_env *env, const struct bpf_reg_stat
 		type == PTR_TO_SOCK_COMMON ||
 		(type == PTR_TO_BTF_ID && is_trusted_reg(env, reg)) ||
 		(type == PTR_TO_MEM && !(reg->type & PTR_UNTRUSTED)) ||
+		type == PTR_TO_CORO_FRAME ||
 		type == CONST_PTR_TO_MAP;
 }
 
@@ -1423,12 +1425,49 @@ out:
 	return arr ? arr : ZERO_SIZE_PTR;
 }
 
+static void free_reference_slots(struct bpf_verifier_state *state)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++) {
+		kfree(state->refs[i].slots);
+		state->refs[i].slots = NULL;
+		state->refs[i].nr_slots = 0;
+	}
+}
+
 static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf_verifier_state *src)
 {
+	int i;
+
+	/*
+	 * dst may be a reused state that still owns slot arrays; they must
+	 * not leak when the reference array is overwritten below.
+	 */
+	free_reference_slots(dst);
 	dst->refs = copy_array(dst->refs, src->refs, src->acquired_refs,
 			       sizeof(struct bpf_reference_state), GFP_KERNEL_ACCOUNT);
 	if (!dst->refs)
 		return -ENOMEM;
+
+	/*
+	 * The shallow copy above aliased src's slot arrays. Detach them all
+	 * before allocating so that a failure below leaves dst owning only
+	 * its own arrays and bpf_free_verifier_state() can clean up.
+	 */
+	for (i = 0; i < src->acquired_refs; i++)
+		dst->refs[i].slots = NULL;
+	for (i = 0; i < src->acquired_refs; i++) {
+		if (!src->refs[i].slots)
+			continue;
+		dst->refs[i].slots = kmemdup(src->refs[i].slots,
+					     src->refs[i].nr_slots * sizeof(*src->refs[i].slots),
+					     GFP_KERNEL_ACCOUNT);
+		if (!dst->refs[i].slots) {
+			dst->acquired_refs = src->acquired_refs;
+			return -ENOMEM;
+		}
+	}
 
 	dst->acquired_refs = src->acquired_refs;
 	dst->active_locks = src->active_locks;
@@ -1616,6 +1655,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	 * it can detect out-of-order IRQ restore. Hence use memmove to shift
 	 * the array instead of swapping the final element into the deleted idx.
 	 */
+	kfree(state->refs[idx].slots);
 	last_idx = state->acquired_refs - 1;
 	rem = state->acquired_refs - idx - 1;
 	if (last_idx && idx != last_idx)
@@ -1739,6 +1779,7 @@ void bpf_free_verifier_state(struct bpf_verifier_state *state,
 		free_func_state(state->frame[i]);
 		state->frame[i] = NULL;
 	}
+	free_reference_slots(state);
 	kfree(state->refs);
 	bpf_clear_jmp_history(state);
 	if (free_self)
@@ -3935,12 +3976,77 @@ static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
 		src_reg->id = ++env->id_gen;
 }
 
-static void save_register_state(struct bpf_verifier_env *env,
-				struct bpf_func_state *state,
-				int spi, struct bpf_reg_state *reg,
-				int size)
+/*
+ * Slot-level spill and scrub rules shared by every slot-tracked memory.
+ *
+ * A slot covers BPF_REG_SIZE bytes. slot_type[] describes them in reverse
+ * memory order: slot_type[BPF_REG_SIZE - 1] is the lowest address of the
+ * slot, which is where a full register spill starts and what
+ * bpf_is_spilled_reg() tests. Helpers take 'm', the byte offset within the
+ * slot in memory order, and translate with slot_byte_idx(). Accesses never
+ * straddle a slot because callers require size-aligned offsets.
+ */
+static int slot_byte_idx(int m)
 {
-	struct bpf_stack_state *slot = bpf_stack_slot(state, spi);
+	return BPF_REG_SIZE - 1 - m;
+}
+
+/* Byte offset within its slot of the stack byte at 'off' (off < 0). */
+static int stack_byte_off(int off)
+{
+	return slot_byte_idx((-off - 1) % BPF_REG_SIZE);
+}
+
+/*
+ * Unprivileged programs may not partially overwrite a spilled pointer: the
+ * remaining bytes would keep pointer bits that a later read can leak.
+ */
+static int check_slot_ptr_spill_corruption(struct bpf_verifier_env *env,
+					   struct bpf_stack_state *slot, int size,
+					   const char *mem, int off, int insn_idx)
+{
+	const char *reason;
+
+	if (env->allow_ptr_leaks || size == BPF_REG_SIZE ||
+	    !bpf_is_spilled_reg(slot) || bpf_is_spilled_scalar_reg(slot))
+		return 0;
+
+	verbose(env, "attempt to corrupt spilled pointer on %s\n", mem);
+	reason = bpf_diag_fmt(env,
+			      "This store writes %d bytes at %s offset %d into a %s slot that currently holds a spilled pointer. "
+			      "Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
+			      size, mem, off, mem);
+	bpf_diag_memory(env, insn_idx, bpf_diag_fmt(env, "%s spill corruption", mem), reason,
+			bpf_diag_fmt(env, "Write the full 8-byte spilled pointer slot, or use a separate %s slot for scalar data before overwriting only part of it.",
+				     mem));
+	return -EACCES;
+}
+
+/*
+ * A store needs Spectre v4 sanitization when it writes a pointer or lands on
+ * bytes that are not plain data, since a speculatively bypassed store could
+ * then expose a spilled pointer.
+ */
+static bool slot_write_needs_nospec(struct bpf_stack_state *slot, int m, int size,
+				    bool ptr_value)
+{
+	int i;
+
+	if (ptr_value)
+		return true;
+	for (i = 0; i < size; i++) {
+		u8 type = slot->slot_type[slot_byte_idx(m + i)];
+
+		if (type != STACK_MISC && type != STACK_ZERO)
+			return true;
+	}
+	return false;
+}
+
+/* Spill a register into a slot; bytes beyond a narrow spill become MISC. */
+static void spill_reg_to_slot(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			      struct bpf_reg_state *reg, int size)
+{
 	int i;
 
 	bpf_diag_mod_begin(env, &slot->spilled_ptr, reg, BPF_DIAG_MOD_SPILL);
@@ -3954,6 +4060,183 @@ static void save_register_state(struct bpf_verifier_env *env,
 		mark_stack_slot_misc(env, &slot->slot_type[i - 1]);
 
 	bpf_diag_mod_end(env);
+}
+
+static void scrub_special_slot(struct bpf_stack_state *slot)
+{
+	int i;
+
+	/* regular write of data into the slot destroys any spilled ptr */
+	slot->spilled_ptr.type = NOT_INIT;
+	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
+	if (is_stack_slot_special(slot))
+		for (i = 0; i < BPF_REG_SIZE; i++)
+			scrub_spilled_slot(&slot->slot_type[i]);
+}
+
+/*
+ * Record a plain data write of 'size' bytes at slot offset 'm'. The bytes
+ * become STACK_ZERO when a known zero is written, otherwise STACK_MISC.
+ */
+static int write_slot_data(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			   int m, int size, bool zero, int value_regno)
+{
+	u8 type = STACK_MISC;
+	int i, err;
+
+	if (bpf_is_spilled_reg(slot))
+		bpf_diag_record_scrub(env, &slot->spilled_ptr, BPF_DIAG_MOD_WRITE);
+	scrub_special_slot(slot);
+
+	if (zero) {
+		/*
+		 * STACK_ZERO case happened because register spill wasn't
+		 * properly aligned at the stack slot boundary, so it's not a
+		 * register spill anymore; force originating register to be
+		 * precise to make STACK_ZERO correct for subsequent states.
+		 */
+		err = mark_chain_precision(env, value_regno);
+		if (err)
+			return err;
+		type = STACK_ZERO;
+	}
+
+	for (i = 0; i < size; i++)
+		slot->slot_type[slot_byte_idx(m + i)] = type;
+	return 0;
+}
+
+/*
+ * Prepare byte 'm' of a slot that lies in the range of a variable-offset
+ * write. Spilled pointers in range are destroyed since any of them may be
+ * overwritten. A written zero lets STACK_ZERO bytes and zero spills keep
+ * their state, in which case '*zero_used' tells the caller to make the
+ * written register precise.
+ */
+static int prepare_slot_byte_var_write(struct bpf_verifier_env *env,
+				       struct bpf_stack_state *slot, int m,
+				       bool writing_zero, bool *zero_used,
+				       const char *mem, int insn_idx, int off)
+{
+	u8 new_type, *stype = &slot->slot_type[slot_byte_idx(m)];
+
+	if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
+		/*
+		 * Reject the write if range we may write to has not been
+		 * initialized beforehand. If we didn't reject here, the ptr
+		 * status would be erased below (even though not all slots are
+		 * actually overwritten), possibly opening the door to leaks.
+		 *
+		 * We do however catch STACK_INVALID case below, and only allow
+		 * reading possibly uninitialized memory later for CAP_PERFMON,
+		 * as the write may not happen to that slot.
+		 */
+		verbose(env, "spilled ptr in range of var-offset %s write; insn %d, ptr off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+
+	/*
+	 * If writing_zero and the slot contains a spill of value 0, maintain
+	 * the spill type.
+	 */
+	if (writing_zero && *stype == STACK_SPILL && bpf_is_spilled_scalar_reg(slot)) {
+		struct bpf_reg_state *spill_reg = &slot->spilled_ptr;
+
+		if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0) {
+			*zero_used = true;
+			return 0;
+		}
+	}
+
+	/*
+	 * Scrub slots if variable-offset write goes over spilled pointers.
+	 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type ==
+	 * NOT_INIT and valid program is rejected by check_stack_read_fixed_off()
+	 * with obscure "invalid size of register fill" message.
+	 */
+	scrub_special_slot(slot);
+
+	/* Update the slot type. */
+	new_type = STACK_MISC;
+	if (writing_zero && *stype == STACK_ZERO) {
+		new_type = STACK_ZERO;
+		*zero_used = true;
+	}
+	/*
+	 * If the slot is STACK_INVALID, we check whether it's OK to pretend
+	 * that it will be initialized by this write. The slot might not
+	 * actually be written to, and so if we mark it as initialized future
+	 * reads might leak uninitialized memory. For privileged programs, we
+	 * will accept such reads to slots that may or may not be written
+	 * because, if we're reject them, the error would be too confusing.
+	 * Conservatively, treat STACK_POISON in a similar way.
+	 */
+	if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
+	    !env->allow_uninit_stack) {
+		verbose(env, "uninit %s in range of var-offset write prohibited for !root; insn %d, off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+	*stype = new_type;
+	return 0;
+}
+
+enum slot_range_status {
+	SLOT_RANGE_OK,
+	SLOT_RANGE_UNINIT,
+	SLOT_RANGE_POISON,
+};
+
+/*
+ * Validate byte 'm' of a slot that a helper or kfunc will access through a
+ * memory argument. A write ('clobber') may store anything, so zero bytes,
+ * uninitialized bytes that privileged programs may read, and spilled
+ * registers turn into MISC data. Unprivileged output buffers can accept
+ * uninitialized bytes without marking them initialized. Spilled pointers
+ * may be passed only by privileged programs; spilled scalars always.
+ */
+static enum slot_range_status check_slot_byte_range(struct bpf_verifier_env *env,
+						    struct bpf_stack_state *slot, int m,
+						    bool clobber, bool allow_poison, bool uninit)
+{
+	u8 *stype = &slot->slot_type[slot_byte_idx(m)];
+	int j;
+
+	if (*stype == STACK_MISC)
+		return SLOT_RANGE_OK;
+	if ((*stype == STACK_ZERO) ||
+	    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
+		if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
+			/* helper can write anything into the slot */
+			*stype = STACK_MISC;
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	/*
+	 * Only the bytes marked STACK_SPILL hold the spilled register. The rest
+	 * of a narrowly spilled slot keeps its previous type and must be
+	 * initialized on its own.
+	 */
+	if (*stype == STACK_SPILL &&
+	    (slot->spilled_ptr.type == SCALAR_VALUE || env->allow_ptr_leaks)) {
+		if (clobber) {
+			__mark_reg_unknown(env, &slot->spilled_ptr);
+			for (j = 0; j < BPF_REG_SIZE; j++)
+				scrub_spilled_slot(&slot->slot_type[j]);
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	if (*stype == STACK_POISON) {
+		if (!allow_poison)
+			return SLOT_RANGE_POISON;
+		if (uninit && env->allow_uninit_stack)
+			*stype = STACK_MISC;
+		return SLOT_RANGE_OK;
+	}
+	return SLOT_RANGE_UNINIT;
 }
 
 static bool is_bpf_st_mem(struct bpf_insn *insn)
@@ -3991,19 +4274,6 @@ static void check_fastcall_stack_contract(struct bpf_verifier_env *env,
 	}
 }
 
-static void scrub_special_slot(struct bpf_func_state *state, int spi)
-{
-	struct bpf_stack_state *slot = bpf_stack_slot(state, spi);
-	int i;
-
-	/* regular write of data into stack destroys any spilled ptr */
-	slot->spilled_ptr.type = NOT_INIT;
-	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
-	if (is_stack_slot_special(slot))
-		for (i = 0; i < BPF_REG_SIZE; i++)
-			scrub_spilled_slot(&slot->slot_type[i]);
-}
-
 /* check_stack_{read,write}_fixed_off functions track spill/fill of registers,
  * stack boundary and alignment are checked in check_mem_access()
  */
@@ -4014,53 +4284,28 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 				       int insn_idx)
 {
 	struct bpf_func_state *cur; /* state of the current function */
-	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	int slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	struct bpf_stack_state *stack = bpf_stack_slot(state, spi);
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
 	int insn_flags = INSN_F_STACK_ACCESS;
 	int hist_spi = spi, hist_frame = state->frameno;
-	struct bpf_stack_state *ss = bpf_stack_slot(state, spi);
+	int m = stack_byte_off(off);
 
 	/*
 	 * caller checked that off % size == 0 and -env->stack_limit <= off < 0,
 	 * so it's aligned access and [off, off + size) are within stack limits
 	 */
-	if (!env->allow_ptr_leaks &&
-	    bpf_is_spilled_reg(ss) &&
-	    !bpf_is_spilled_scalar_reg(ss) &&
-	    size != BPF_REG_SIZE) {
-		const char *reason;
-
-		verbose(env, "attempt to corrupt spilled pointer on stack\n");
-		reason = bpf_diag_fmt(env,
-				      "This store writes %d bytes at stack offset %d into a stack slot that currently holds a spilled pointer. "
-			"Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
-			size, off);
-		bpf_diag_memory(
-			env, insn_idx, "stack spill corruption", reason,
-			"Write the full 8-byte spilled pointer slot, or use a separate stack slot for scalar data before overwriting only part of it.");
-		return -EACCES;
-	}
+	err = check_slot_ptr_spill_corruption(env, stack, size, "stack", off, insn_idx);
+	if (err)
+		return err;
 
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (!env->bypass_spec_v4) {
-		bool sanitize = reg && is_pointer_regtype(reg->type);
-
-		for (i = 0; i < size; i++) {
-			u8 type = ss->slot_type[(slot - i) %
-							      BPF_REG_SIZE];
-
-			if (type != STACK_MISC && type != STACK_ZERO) {
-				sanitize = true;
-				break;
-			}
-		}
-
-		if (sanitize)
-			env->insn_aux_data[insn_idx].nospec_result = true;
-	}
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(stack, m, size, reg && is_pointer_regtype(reg->type)))
+		env->insn_aux_data[insn_idx].nospec_result = true;
 
 	err = destroy_if_dynptr_stack_slot(env, state, spi);
 	if (err)
@@ -4074,10 +4319,10 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		/* Make sure that reg had an ID to build a relation on spill. */
 		if (reg_value_fits)
 			assign_scalar_id_before_mov(env, reg);
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 		/* Break the relation on a narrowing spill. */
 		if (!reg_value_fits)
-			clear_scalar_id(&ss->spilled_ptr);
+			clear_scalar_id(&stack->spilled_ptr);
 	} else if (!reg && !(off % BPF_REG_SIZE) && is_bpf_st_mem(insn) &&
 		   env->bpf_capable) {
 		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
@@ -4085,7 +4330,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		memset(tmp_reg, 0, sizeof(*tmp_reg));
 		__mark_reg_known(tmp_reg, insn->imm);
 		tmp_reg->type = SCALAR_VALUE;
-		save_register_state(env, state, spi, tmp_reg, size);
+		spill_reg_to_slot(env, stack, tmp_reg, size);
 	} else if (reg && is_pointer_regtype(reg->type)) {
 		/* register containing pointer is being spilled into stack */
 		if (size != BPF_REG_SIZE) {
@@ -4097,33 +4342,15 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			verbose(env, "cannot spill pointers to stack into stack frame of the caller\n");
 			return -EINVAL;
 		}
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 	} else {
-		u8 type = STACK_MISC;
-
-		if (bpf_is_spilled_reg(ss))
-			bpf_diag_record_scrub(env, &ss->spilled_ptr,
-					      BPF_DIAG_MOD_WRITE);
-		scrub_special_slot(state, spi);
-
 		/* when we zero initialize stack slots mark them as such */
-		if ((reg && bpf_register_is_null(reg)) ||
-		    (!reg && is_bpf_st_mem(insn) && insn->imm == 0)) {
-			/* STACK_ZERO case happened because register spill
-			 * wasn't properly aligned at the stack slot boundary,
-			 * so it's not a register spill anymore; force
-			 * originating register to be precise to make
-			 * STACK_ZERO correct for subsequent states
-			 */
-			err = mark_chain_precision(env, value_regno);
-			if (err)
-				return err;
-			type = STACK_ZERO;
-		}
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
 
-		/* Mark slots affected by this stack write. */
-		for (i = 0; i < size; i++)
-			ss->slot_type[(slot - i) % BPF_REG_SIZE] = type;
+		err = write_slot_data(env, stack, m, size, zero, value_regno);
+		if (err)
+			return err;
 		insn_flags = 0; /* not a register spill */
 	}
 
@@ -4184,75 +4411,13 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 
 	/* Variable offset writes destroy any spilled pointers in range. */
 	for (i = min_off; i < max_off; i++) {
-		struct bpf_stack_state *ss;
-		u8 new_type, *stype;
-		int slot, spi;
+		int spi = bpf_get_spi(i);
 
-		slot = -i - 1;
-		spi = slot / BPF_REG_SIZE;
-		ss = bpf_stack_slot(state, spi);
-		stype = &ss->slot_type[slot % BPF_REG_SIZE];
 		mark_stack_slot_scratched(env, spi);
-
-		if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
-			/* Reject the write if range we may write to has not
-			 * been initialized beforehand. If we didn't reject
-			 * here, the ptr status would be erased below (even
-			 * though not all slots are actually overwritten),
-			 * possibly opening the door to leaks.
-			 *
-			 * We do however catch STACK_INVALID case below, and
-			 * only allow reading possibly uninitialized memory
-			 * later for CAP_PERFMON, as the write may not happen to
-			 * that slot.
-			 */
-			verbose(env, "spilled ptr in range of var-offset stack write; insn %d, ptr off: %d",
-				insn_idx, i);
-			return -EINVAL;
-		}
-
-		/* If writing_zero and the spi slot contains a spill of value 0,
-		 * maintain the spill type.
-		 */
-		if (writing_zero && *stype == STACK_SPILL && bpf_is_spilled_scalar_reg(ss)) {
-			struct bpf_reg_state *spill_reg = &ss->spilled_ptr;
-
-			if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0) {
-				zero_used = true;
-				continue;
-			}
-		}
-
-		/*
-		 * Scrub slots if variable-offset stack write goes over spilled pointers.
-		 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type == NOT_INIT
-		 * and valid program is rejected by check_stack_read_fixed_off()
-		 * with obscure "invalid size of register fill" message.
-		 */
-		scrub_special_slot(state, spi);
-
-		/* Update the slot type. */
-		new_type = STACK_MISC;
-		if (writing_zero && *stype == STACK_ZERO) {
-			new_type = STACK_ZERO;
-			zero_used = true;
-		}
-		/* If the slot is STACK_INVALID, we check whether it's OK to
-		 * pretend that it will be initialized by this write. The slot
-		 * might not actually be written to, and so if we mark it as
-		 * initialized future reads might leak uninitialized memory.
-		 * For privileged programs, we will accept such reads to slots
-		 * that may or may not be written because, if we're reject
-		 * them, the error would be too confusing.
-		 * Conservatively, treat STACK_POISON in a similar way.
-		 */
-		if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
-		    !env->allow_uninit_stack) {
-			verbose(env, "uninit stack in range of var-offset write prohibited for !root; insn %d, off: %d",
-					insn_idx, i);
-			return -EINVAL;
-		}
-		*stype = new_type;
+		err = prepare_slot_byte_var_write(env, bpf_stack_slot(state, spi), stack_byte_off(i),
+						  writing_zero, &zero_used, "stack", insn_idx, i);
+		if (err)
+			return err;
 	}
 	if (zero_used) {
 		/* backtracking doesn't work for STACK_ZERO yet. */
@@ -4330,20 +4495,20 @@ static int mark_reg_stack_read(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, int i, int size,
-					enum bpf_stack_slot_type type)
+static void bpf_diag_slot_read_invalid(struct bpf_verifier_env *env, const char *mem, int off,
+				       int i, int size, enum bpf_stack_slot_type type)
 {
 	const char *problem, *reason, *suggestion, *kind;
 
 	if (type == STACK_INVALID) {
 		reason = bpf_diag_fmt(
-			env, "This rejected read uses %d bytes at stack offset %d, but byte %d in that range is uninitialized on this path. "
-			"Programs loaded with CAP_PERFMON can be allowed to read uninitialized stack bytes, but this program is being rejected without that allowance.",
-			size, off, i);
+			env, "This rejected read uses %d bytes at %s offset %d, but byte %d in that range is uninitialized on this path. "
+			"Programs loaded with CAP_PERFMON can be allowed to read uninitialized %s bytes, but this program is being rejected without that allowance.",
+			size, mem, off, i, mem);
 		bpf_diag_memory(
-			env, env->insn_idx, "uninitialized stack read", reason,
-			"Initialize every byte in the stack range before reading it, adjust the offset and size so the read covers only initialized bytes, "
-			"or load with CAP_PERFMON if uninitialized stack reads are intended.");
+			env, env->insn_idx, bpf_diag_fmt(env, "uninitialized %s read", mem), reason,
+			bpf_diag_fmt(env, "Initialize every byte in the %s range before reading it, adjust the offset and size so the read covers only initialized bytes, "
+				     "or load with CAP_PERFMON if uninitialized %s reads are intended.", mem, mem));
 		return;
 	}
 
@@ -4364,53 +4529,80 @@ static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, i
 		return;
 	}
 
-	problem = bpf_diag_fmt(env, "direct read of %s stack state", kind);
+	problem = bpf_diag_fmt(env, "direct read of %s %s state", kind, mem);
 	reason = bpf_diag_fmt(
-		env, "This rejected read uses %d bytes at stack offset %d, but byte %d in that range belongs to verifier-managed %s state. "
+		env, "This rejected read uses %d bytes at %s offset %d, but byte %d in that range belongs to verifier-managed %s state. "
 		"This state has an opaque representation that BPF programs cannot read directly.",
-		size, off, i, kind);
+		size, mem, off, i, kind);
 	bpf_diag_memory(env, env->insn_idx, problem, reason, suggestion);
 }
 
-/* Read the stack at 'off' and put the results into the register indicated by
- * 'dst_regno'. It handles reg filling if the addressed stack slot is a
- * spilled reg.
- *
- * 'dst_regno' can be -1, meaning that the read value is not going to a
- * register.
- *
- * The access is assumed to be within the current stack bounds.
+enum slot_read_result {
+	SLOT_READ_DATA,		/* dst derived from slot bytes */
+	SLOT_READ_FILL,		/* dst restored from the spilled register */
+	SLOT_READ_ZERO_SPILL,	/* dst is zero because zero-valued spill bytes contributed */
+};
+
+/*
+ * Check that byte 'm' of a slot may be read and account for zeroes. Returns
+ * -EACCES after logging when the byte is uninitialized or poisoned.
  */
-static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
-				      /* func where src register points to */
-				      struct bpf_func_state *reg_state,
-				      int off, int size, int dst_regno)
+static int check_slot_byte_readable(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+				    int m, const char *mem, int off, int i, int size)
+{
+	u8 type = slot->slot_type[slot_byte_idx(m)];
+
+	if (type == STACK_MISC || type == STACK_ZERO || type == STACK_SPILL)
+		return 0;
+	if (type == STACK_INVALID && env->allow_uninit_stack)
+		return 0;
+	if (type == STACK_POISON) {
+		verbose(env, "reading from %s off %d+%d size %d, slot poisoned by dead code elimination\n",
+			mem, off, i, size);
+	} else {
+		verbose(env, "invalid read from %s off %d+%d size %d\n", mem, off, i, size);
+		bpf_diag_slot_read_invalid(env, mem, off, i, size, type);
+	}
+	return -EACCES;
+}
+
+/*
+ * Read 'size' bytes at offset 'm' within a slot into register 'dst_regno'
+ * of the current frame, or only validate the read when dst_regno < 0.
+ *
+ * A full-width read of a spilled register restores it and narrow reads of
+ * spilled scalars restore a narrowed copy; both report SLOT_READ_FILL so the
+ * caller can record the fill for precision tracking. Reads of plain data
+ * produce an unknown scalar or a known zero (SLOT_READ_DATA). When
+ * zero-valued spill bytes contributed to a known zero, SLOT_READ_ZERO_SPILL
+ * asks the caller to make the slot precise so pruning cannot reuse this
+ * state for a later non-zero spill. 'off' is used in messages only.
+ */
+static int read_slot_reg(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			 int m, int size, int dst_regno, const char *mem, int off,
+			 enum slot_read_result *res)
 {
 	struct bpf_verifier_state *vstate = env->cur_state;
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
-	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE;
-	struct bpf_reg_state *reg;
-	u8 *stype, type;
-	int err;
-	int insn_flags = INSN_F_STACK_ACCESS;
-	int hist_spi = spi, hist_frame = reg_state->frameno;
-	struct bpf_stack_state *ss = bpf_stack_slot(reg_state, spi);
+	struct bpf_reg_state *reg = &slot->spilled_ptr;
+	u8 *stype = slot->slot_type, type;
+	int i, err;
 
-	stype = ss->slot_type;
-	reg = &ss->spilled_ptr;
-
-	mark_stack_slot_scratched(env, spi);
+	*res = SLOT_READ_DATA;
 
 	/*
-	 * Refine the in-progress load record's origin to the source stack slot.
+	 * Refine the in-progress load record's origin to the source slot.
 	 */
 	if (dst_regno >= 0)
 		bpf_diag_mod_begin(env, &state->regs[dst_regno], reg, BPF_DIAG_MOD_WRITE);
 
-	if (bpf_is_spilled_reg(ss)) {
-		u8 spill_size = bpf_spill_size(ss);
+	if (bpf_is_spilled_reg(slot)) {
+		u8 spill_size = bpf_spill_size(slot);
+
 
 		if (size != BPF_REG_SIZE || spill_size != BPF_REG_SIZE) {
+			int spill_cnt = 0, zero_cnt = 0;
+
 			if (reg->type != SCALAR_VALUE) {
 				verbose_linfo(env, env->insn_idx, "; ");
 				verbose(env, "invalid size of register fill\n");
@@ -4418,7 +4610,7 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 			}
 
 			if (size <= spill_size &&
-			    bpf_stack_narrow_access_ok(off, size, spill_size)) {
+			    bpf_stack_narrow_access_ok(m, size, spill_size)) {
 				if (dst_regno < 0)
 					return 0;
 
@@ -4435,65 +4627,47 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				 */
 				if (get_reg_width(reg) > size * BITS_PER_BYTE)
 					clear_scalar_id(&state->regs[dst_regno]);
-			} else {
-				int spill_cnt = 0, zero_cnt = 0;
-
-				for (i = 0; i < size; i++) {
-					type = stype[(slot - i) % BPF_REG_SIZE];
-					if (type == STACK_SPILL) {
-						spill_cnt++;
-						continue;
-					}
-					if (type == STACK_MISC)
-						continue;
-					if (type == STACK_ZERO) {
-						zero_cnt++;
-						continue;
-					}
-					if (type == STACK_INVALID && env->allow_uninit_stack)
-						continue;
-					if (type == STACK_POISON) {
-						verbose(env, "reading from stack off %d+%d size %d, slot poisoned by dead code elimination\n",
-							off, i, size);
-					} else {
-						verbose(env, "invalid read from stack off %d+%d size %d\n",
-							off, i, size);
-						bpf_diag_stack_read_invalid(env, off, i, size, type);
-					}
-					return -EACCES;
-				}
-
-				if (dst_regno < 0)
-					return 0;
-
-				if (spill_cnt == size &&
-				    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
-					__mark_reg_const_zero(env, &state->regs[dst_regno]);
-					/* this IS register fill, so keep insn_flags */
-				} else if (zero_cnt == size) {
-					/* similarly to mark_reg_stack_read(), preserve zeroes */
-					__mark_reg_const_zero(env, &state->regs[dst_regno]);
-					insn_flags = 0; /* not restoring original register state */
-				} else {
-					err = mark_reg_stack_read(env, reg_state, off, off + size,
-								  dst_regno);
-					if (err)
-						return err;
-					insn_flags = 0; /* not restoring original register state */
-				}
+				*res = SLOT_READ_FILL;
+				return 0;
 			}
-		} else if (dst_regno >= 0) {
-			/* restore register state from stack */
+
+			for (i = 0; i < size; i++) {
+				err = check_slot_byte_readable(env, slot, m + i, mem, off, i, size);
+				if (err)
+					return err;
+				type = stype[slot_byte_idx(m + i)];
+				if (type == STACK_SPILL)
+					spill_cnt++;
+				else if (type == STACK_ZERO)
+					zero_cnt++;
+			}
+
+			if (dst_regno < 0)
+				return 0;
+
+			if (spill_cnt == size &&
+			    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
+				__mark_reg_const_zero(env, &state->regs[dst_regno]);
+				/* this IS register fill */
+				*res = SLOT_READ_FILL;
+				return 0;
+			}
+			if (zero_cnt == size) {
+				/* similarly to the plain data case below, preserve zeroes */
+				__mark_reg_const_zero(env, &state->regs[dst_regno]);
+				return 0;
+			}
+			goto data;
+		}
+
+		if (dst_regno >= 0) {
+			/* restore register state from the slot */
 			if (env->bpf_capable)
 				/* Ensure stack slot has an ID to build a relation
 				 * with the destination register on fill.
 				 */
 				assign_scalar_id_before_mov(env, reg);
 			state->regs[dst_regno] = *reg;
-			/* mark reg as written since spilled pointer state likely
-			 * has its liveness marks cleared by is_state_visited()
-			 * which resets stack/reg liveness for state transitions
-			 */
 		} else if (__is_pointer_value(env->allow_ptr_leaks, reg)) {
 			/* If dst_regno==-1, the caller is asking us whether
 			 * it is acceptable to use this value as a SCALAR_VALUE
@@ -4501,39 +4675,86 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 			 * We must not allow unprivileged callers to do that
 			 * with spilled pointers.
 			 */
-			verbose(env, "leaking pointer from stack off %d\n",
-				off);
+			verbose(env, "leaking pointer from %s off %d\n", mem, off);
 			return -EACCES;
 		}
-	} else {
-		for (i = 0; i < size; i++) {
-			type = stype[(slot - i) % BPF_REG_SIZE];
-			if (type == STACK_MISC)
-				continue;
-			if (type == STACK_ZERO)
-				continue;
-			if (type == STACK_INVALID && env->allow_uninit_stack)
-				continue;
-			if (type == STACK_POISON) {
-				verbose(env, "reading from stack off %d+%d size %d, slot poisoned by dead code elimination\n",
-					off, i, size);
-			} else {
-				verbose(env, "invalid read from stack off %d+%d size %d\n",
-					off, i, size);
-				bpf_diag_stack_read_invalid(env, off, i, size, type);
-			}
-			return -EACCES;
-		}
-		if (dst_regno >= 0) {
-			err = mark_reg_stack_read(env, reg_state, off, off + size, dst_regno);
-			if (err)
-				return err;
-		}
-		insn_flags = 0; /* we are not restoring spilled register */
+		*res = SLOT_READ_FILL;
+		return 0;
 	}
-	if (insn_flags)
-		return bpf_push_jmp_history(env, env->cur_state, insn_flags,
-					    hist_spi, hist_frame, NULL, 0);
+
+	for (i = 0; i < size; i++) {
+		err = check_slot_byte_readable(env, slot, m + i, mem, off, i, size);
+		if (err)
+			return err;
+	}
+	if (dst_regno < 0)
+		return 0;
+data:
+	/*
+	 * Any access_size read into register is zero extended, so the whole
+	 * register == const_zero when every byte is a known zero. STACK_SPILL
+	 * bytes backed by a spilled scalar zero count as zero bytes too.
+	 */
+	{
+		bool zero_spill = false;
+		int zeros = 0;
+
+		for (i = 0; i < size; i++) {
+			type = stype[slot_byte_idx(m + i)];
+			if (type == STACK_ZERO) {
+				zeros++;
+				continue;
+			}
+			if (type == STACK_SPILL && bpf_register_is_null(reg)) {
+				zero_spill = true;
+				zeros++;
+				continue;
+			}
+			break;
+		}
+		if (zeros == size) {
+			__mark_reg_const_zero(env, &state->regs[dst_regno]);
+			if (zero_spill)
+				*res = SLOT_READ_ZERO_SPILL;
+		} else {
+			/* have read misc data from the slot */
+			mark_reg_unknown(env, state->regs, dst_regno);
+		}
+	}
+	return 0;
+}
+
+/* read from a slot of 'reg_state' at 'off' into 'dst_regno' (or check the read when < 0) */
+static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
+				      /* func where src register points to */
+				      struct bpf_func_state *reg_state,
+				      int off, int size, int dst_regno)
+{
+	int slot = -off - 1, spi = slot / BPF_REG_SIZE;
+	struct bpf_stack_state *stack = bpf_stack_slot(reg_state, spi);
+	enum slot_read_result res;
+	int err;
+
+	mark_stack_slot_scratched(env, spi);
+
+	err = read_slot_reg(env, stack, stack_byte_off(off), size, dst_regno, "stack", off, &res);
+	if (err)
+		return err;
+
+	switch (res) {
+	case SLOT_READ_FILL:
+		/*
+		 * Register fill: record it so precision backtracking can reach
+		 * the spilled register through this slot.
+		 */
+		return bpf_push_jmp_history(env, env->cur_state, INSN_F_STACK_ACCESS,
+					    spi, reg_state->frameno, NULL, 0);
+	case SLOT_READ_ZERO_SPILL:
+		bpf_bt_set_frame_slot(&env->bt, reg_state->frameno, spi);
+		return mark_chain_precision_batch(env, env->cur_state);
+	case SLOT_READ_DATA:
+		break;
+	}
 	return 0;
 }
 
@@ -5776,6 +5997,11 @@ static int check_ptr_alignment(struct bpf_verifier_env *env,
 		 * and check_stack_read_fixed_off() relies on stack accesses being
 		 * aligned.
 		 */
+		strict = true;
+		break;
+	case PTR_TO_CORO_FRAME:
+		pointer_desc = "coro_frame ";
+		/* Slot tracking relies on accesses not straddling slots. */
 		strict = true;
 		break;
 	case PTR_TO_SOCKET:
@@ -7331,6 +7557,375 @@ reg_unknown:
 	return 0;
 }
 
+/*
+ * Coroutine frames.
+ *
+ * bpf_coro_frame_alloc() returns PTR_TO_CORO_FRAME memory whose contents the
+ * program manages like its own stack, so the allocation's reference owns a
+ * slot array and accesses go through the shared slot helpers. Accesses are
+ * size aligned like stack accesses (see check_ptr_alignment()) and therefore
+ * never straddle a slot. The register's id is the reference id, which
+ * pointer arithmetic preserves, so any pointer into the frame finds it.
+ */
+static struct bpf_reference_state *coro_frame_ref(struct bpf_verifier_env *env,
+						  struct bpf_reg_state *reg)
+{
+	return bpf_find_ref_slots(env->cur_state, reg->id);
+}
+
+/* Attach the slot array to the reference just acquired for a frame of 'size' bytes. */
+static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_reference_state *ref = &vstate->refs[vstate->acquired_refs - 1];
+	u32 nr_slots = DIV_ROUND_UP(size, BPF_REG_SIZE);
+
+	if (verifier_bug_if(ref->id != id || nr_slots > BPF_MAX_REF_SLOTS, env,
+			    "coro_frame ref %d size %u", id, size))
+		return -EFAULT;
+	ref->slots = kcalloc(nr_slots, sizeof(*ref->slots), GFP_KERNEL_ACCOUNT);
+	if (!ref->slots)
+		return -ENOMEM;
+	ref->nr_slots = nr_slots;
+	ref->mem_size = size;
+	/* Precision requests for the frame's slots end at this allocation. */
+	return bpf_push_ref_jmp_history(env, vstate, INSN_F_REF_ALLOC, 0, id);
+}
+
+/* Record a spill into or fill from a frame slot for precision backtracking. */
+static int push_coro_frame_history(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				   int spi)
+{
+	return bpf_push_ref_jmp_history(env, env->cur_state, INSN_F_REF_SLOT_ACCESS, spi, ref->id);
+}
+
+static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				  int foff, int size, int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	int spi = foff / BPF_REG_SIZE, m = foff % BPF_REG_SIZE;
+	struct bpf_stack_state *slot = &ref->slots[spi];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	struct bpf_reg_state *reg = NULL;
+	bool spill = true;
+	int err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+
+	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
+	if (err)
+		return err;
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(slot, m, size, reg && is_pointer_regtype(reg->type)))
+		env->insn_aux_data[insn_idx].nospec_result = true;
+
+	if (reg && !m && reg->type == SCALAR_VALUE && env->bpf_capable) {
+		bool reg_value_fits = get_reg_width(reg) <= BITS_PER_BYTE * size;
+
+		/* Make sure that reg had an ID to build a relation on spill. */
+		if (reg_value_fits)
+			assign_scalar_id_before_mov(env, reg);
+		spill_reg_to_slot(env, slot, reg, size);
+		/* Break the relation on a narrowing spill. */
+		if (!reg_value_fits)
+			clear_scalar_id(&slot->spilled_ptr);
+	} else if (!reg && !m && is_bpf_st_mem(insn) && env->bpf_capable) {
+		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
+
+		memset(tmp_reg, 0, sizeof(*tmp_reg));
+		__mark_reg_known(tmp_reg, insn->imm);
+		tmp_reg->type = SCALAR_VALUE;
+		spill_reg_to_slot(env, slot, tmp_reg, size);
+	} else if (reg && is_pointer_regtype(reg->type)) {
+		if (size != BPF_REG_SIZE) {
+			verbose_linfo(env, insn_idx, "; ");
+			verbose(env, "invalid size of register spill\n");
+			return -EACCES;
+		}
+		/*
+		 * A frame can outlive the function that fills it, so a stack
+		 * pointer stored in it could dangle after that function
+		 * returns.
+		 */
+		if (reg->type == PTR_TO_STACK) {
+			verbose(env, "cannot spill stack pointers into coro_frame\n");
+			return -EINVAL;
+		}
+		spill_reg_to_slot(env, slot, reg, size);
+	} else {
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+		err = write_slot_data(env, slot, m, size, zero, value_regno);
+		if (err)
+			return err;
+		spill = false;
+	}
+
+	if (spill)
+		return push_coro_frame_history(env, ref, spi);
+	return 0;
+}
+
+static int check_coro_frame_read(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				 int foff, int size, int dst_regno)
+{
+	int spi = foff / BPF_REG_SIZE;
+	struct bpf_stack_state *slot = &ref->slots[spi];
+	enum slot_read_result res;
+	int err;
+
+	err = read_slot_reg(env, slot, foff % BPF_REG_SIZE, size, dst_regno, "coro_frame", foff,
+			    &res);
+	if (err)
+		return err;
+
+	switch (res) {
+	case SLOT_READ_FILL:
+		return push_coro_frame_history(env, ref, spi);
+	case SLOT_READ_ZERO_SPILL:
+		/*
+		 * The zero came from a spilled zero; make the slot precise so
+		 * pruning cannot reuse this state for a non-zero spill.
+		 */
+		err = bpf_bt_set_ref_slot(&env->bt, ref->id, spi);
+		if (err)
+			return err;
+		return mark_chain_precision_batch(env, env->cur_state);
+	case SLOT_READ_DATA:
+		break;
+	}
+	return 0;
+}
+
+static int check_coro_frame_write_var_off(struct bpf_verifier_env *env,
+					  struct bpf_reference_state *ref,
+					  struct bpf_reg_state *ptr_reg, int off, int size,
+					  int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	struct bpf_reg_state *reg = NULL;
+	bool writing_zero, zero_used = false;
+	int i, err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+	if (reg && is_pointer_regtype(reg->type)) {
+		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
+		return -EACCES;
+	}
+	writing_zero = (reg && bpf_register_is_null(reg)) ||
+		       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+	for (i = min_off; i < max_off; i++) {
+		err = prepare_slot_byte_var_write(env, &ref->slots[i / BPF_REG_SIZE],
+						  i % BPF_REG_SIZE, writing_zero, &zero_used,
+						  "coro_frame", insn_idx, i);
+		if (err)
+			return err;
+	}
+	if (zero_used) {
+		/* backtracking doesn't work for STACK_ZERO yet. */
+		err = mark_chain_precision(env, value_regno);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
+					 struct bpf_reference_state *ref,
+					 struct bpf_reg_state *ptr_reg, int off, int size,
+					 int dst_regno)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	bool zero_spill = false;
+	int i, err, zeros = 0;
+
+	for (i = min_off; i < max_off; i++) {
+		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
+		int m = i % BPF_REG_SIZE;
+		u8 type;
+
+		if (check_slot_byte_range(env, slot, m, false, false, false) != SLOT_RANGE_OK) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), ptr_reg->var_off);
+			verbose(env, "invalid read from coro_frame var_off %s+%d size %d\n",
+				tn_buf, i - min_off, size);
+			return -EACCES;
+		}
+		type = slot->slot_type[slot_byte_idx(m)];
+		if (type == STACK_ZERO) {
+			zeros++;
+		} else if (type == STACK_SPILL && bpf_register_is_null(&slot->spilled_ptr)) {
+			zeros++;
+			zero_spill = true;
+		}
+	}
+	/* Any read into a register is zero extended, so all-zero bytes give zero. */
+	if (zeros != max_off - min_off) {
+		mark_reg_unknown(env, cur->regs, dst_regno);
+		return 0;
+	}
+	__mark_reg_const_zero(env, &cur->regs[dst_regno]);
+	if (!zero_spill)
+		return 0;
+	/* Zero spills contributed: make their slots precise, as for the stack. */
+	for (i = min_off; i < max_off; i += BPF_REG_SIZE - i % BPF_REG_SIZE) {
+		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
+
+		if (!bpf_is_spilled_scalar_reg(slot))
+			continue;
+		err = bpf_bt_set_ref_slot(&env->bt, ref->id, i / BPF_REG_SIZE);
+		if (err)
+			return err;
+	}
+	return mark_chain_precision_batch(env, env->cur_state);
+}
+
+/*
+ * Validate a helper or kfunc memory argument that points into a coroutine
+ * frame, mirroring check_stack_range_initialized(): reads need initialized
+ * bytes, writes may clobber anything and scrub spilled registers, and
+ * output arguments may accept uninitialized bytes. As with stack outputs,
+ * only privileged constant ranges are marked initialized after the call.
+ */
+static int check_coro_frame_range_initialized(struct bpf_verifier_env *env,
+					      struct bpf_reg_state *reg, argno_t argno,
+					      int access_size, bool zero_size_allowed,
+					      enum bpf_access_type type,
+					      struct bpf_call_arg_meta *meta)
+{
+	bool clobber = type == BPF_WRITE;
+	bool allow_poison = access_size < 0 || clobber;
+	u32 arg_slot = arg_slot_from_argno(argno);
+	bool uninit = clobber && meta && arg_slot < MAX_BPF_FUNC_ARGS &&
+		      (meta->arg_raw_mem.mask & BIT(arg_slot));
+	bool raw_mode = uninit && env->allow_uninit_stack &&
+			!(meta->arg_raw_mem.var_size_mask & BIT(arg_slot));
+	struct bpf_reference_state *ref;
+	int i, err, min_off, max_off;
+
+	access_size = abs(access_size);
+
+	if (access_size == 0 && !zero_size_allowed) {
+		verbose(env, "invalid zero-sized read\n");
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, 0, access_size, reg->mem_size,
+				      zero_size_allowed);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+
+	if (tnum_is_const(reg->var_off)) {
+		min_off = max_off = reg->var_off.value;
+	} else {
+		if (!env->bypass_spec_v1) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "%s variable offset coro_frame access prohibited for !root, var_off=%s\n",
+				reg_arg_name(env, argno), tn_buf);
+			return -EACCES;
+		}
+		/* Variable offsets cannot be marked definitely initialized. */
+		raw_mode = false;
+		min_off = reg_smin(reg);
+		max_off = reg_smax(reg);
+	}
+
+	if (raw_mode) {
+		meta->arg_raw_mem.size[arg_slot] = access_size;
+		return 0;
+	}
+
+	for (i = min_off; i < max_off + access_size; i++) {
+		enum slot_range_status status;
+
+		status = check_slot_byte_range(env, &ref->slots[i / BPF_REG_SIZE],
+					       i % BPF_REG_SIZE, clobber, allow_poison, uninit);
+		if (status == SLOT_RANGE_OK)
+			continue;
+		if (tnum_is_const(reg->var_off)) {
+			verbose(env, "invalid read from coro_frame %s off %d+%d size %d\n",
+				reg_arg_name(env, argno), min_off, i - min_off, access_size);
+		} else {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "invalid read from coro_frame %s var_off %s+%d size %d\n",
+				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
+		}
+		return -EACCES;
+	}
+	return 0;
+}
+
+static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
+				   struct bpf_reg_state *reg, argno_t argno, int off, int size,
+				   enum bpf_access_type t, int value_regno)
+{
+	struct bpf_reference_state *ref;
+	int err;
+
+	if (type_may_be_null(reg->type)) {
+		verbose(env, "%s invalid mem access '%s'\n", reg_arg_name(env, argno),
+			reg_type_str(env, reg->type));
+		bpf_diag_invalid_deref(env, insn_idx, reg_from_argno(argno),
+				       reg_arg_name(env, argno), reg,
+				       BPF_DIAG_DEREF_NULLABLE_PTR, 0);
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, off, size, reg->mem_size, false);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+
+	if (tnum_is_const(reg->var_off)) {
+		int foff = reg->var_off.value + off;
+
+		if (t == BPF_WRITE)
+			return check_coro_frame_write(env, ref, foff, size, value_regno, insn_idx);
+		return check_coro_frame_read(env, ref, foff, size, value_regno);
+	}
+
+	/*
+	 * Variable offsets follow the stack rules: privileged only, since no
+	 * Spectre v1 masking exists for this memory, and only when a read has
+	 * a destination register, so pointer bytes cannot escape unnoticed.
+	 */
+	if (!env->bypass_spec_v1) {
+		verbose(env, "%s variable offset coro_frame access prohibited for !root\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	if (t == BPF_WRITE)
+		return check_coro_frame_write_var_off(env, ref, reg, off, size, value_regno,
+						      insn_idx);
+	if (value_regno < 0) {
+		verbose(env, "%s variable offset coro_frame access without destination register\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	return check_coro_frame_read_var_off(env, ref, reg, off, size, value_regno);
+}
+
 /* check whether memory at (regno + off) is accessible for t = (read | write)
  * if t==write, value_regno is a register which value is stored into memory
  * if t==read, value_regno is a register which will receive the value from memory
@@ -7489,6 +8084,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 		else
 			err = check_stack_write(env, reg, off, size,
 						value_regno, insn_idx);
+	} else if (base_type(reg->type) == PTR_TO_CORO_FRAME) {
+		err = check_coro_frame_access(env, insn_idx, reg, argno, off, size, t,
+					      value_regno);
 	} else if (reg_is_pkt_pointer(reg)) {
 		if (t == BPF_WRITE && !may_access_direct_pkt_data(env, NULL, t)) {
 			verbose(env, "cannot write into packet\n");
@@ -7927,7 +8525,7 @@ static int check_stack_range_initialized(
 		enum bpf_access_type type, struct bpf_call_arg_meta *meta)
 {
 	struct bpf_func_state *state = bpf_func(env, reg);
-	int err, min_off, max_off, i, j, slot, spi;
+	int err, min_off, max_off, i, slot, spi;
 	/* Some accesses can write anything into the stack, others are
 	 * read-only.
 	 */
@@ -7989,8 +8587,7 @@ static int check_stack_range_initialized(
 	}
 
 	for (i = min_off; i < max_off + access_size; i++) {
-		struct bpf_stack_state *ss;
-		u8 *stype;
+		enum slot_range_status status;
 
 		slot = -i - 1;
 		spi = slot / BPF_REG_SIZE;
@@ -7999,41 +8596,12 @@ static int check_stack_range_initialized(
 			return -EFAULT;
 		}
 
-		ss = bpf_stack_slot(state, spi);
-		stype = &ss->slot_type[slot % BPF_REG_SIZE];
-		if (*stype == STACK_MISC)
-			goto mark;
-		if ((*stype == STACK_ZERO) ||
-		    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
-			if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
-				/* helper can write anything into the stack */
-				*stype = STACK_MISC;
-			}
-			goto mark;
-		}
+		status = check_slot_byte_range(env, bpf_stack_slot(state, spi), stack_byte_off(i),
+					       clobber, allow_poison, uninit);
+		if (status == SLOT_RANGE_OK)
+			continue;
 
-		/*
-		 * Only the bytes marked STACK_SPILL hold the spilled register.
-		 * The rest of a narrowly spilled slot keeps its previous type
-		 * and must be initialized on its own.
-		 */
-		if (*stype == STACK_SPILL &&
-		    (ss->spilled_ptr.type == SCALAR_VALUE ||
-		     env->allow_ptr_leaks)) {
-			if (clobber) {
-				__mark_reg_unknown(env, &ss->spilled_ptr);
-				for (j = 0; j < BPF_REG_SIZE; j++)
-					scrub_spilled_slot(&ss->slot_type[j]);
-			}
-			goto mark;
-		}
-
-		if (*stype == STACK_POISON) {
-			if (allow_poison) {
-				if (uninit && env->allow_uninit_stack)
-					*stype = STACK_MISC;
-				goto mark;
-			}
+		if (status == SLOT_RANGE_POISON) {
 			verbose(env, "reading from stack %s off %d+%d size %d, slot poisoned by dead code elimination\n",
 				reg_arg_name(env, argno), min_off, i - min_off, access_size);
 		} else if (tnum_is_const(reg->var_off)) {
@@ -8047,8 +8615,6 @@ static int check_stack_range_initialized(
 				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
 		}
 		return -EACCES;
-mark:
-		;
 	}
 	return 0;
 }
@@ -8117,6 +8683,9 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, struct bpf_reg_
 				env, reg,
 				argno, 0, access_size,
 				zero_size_allowed, access_type, meta);
+	case PTR_TO_CORO_FRAME:
+		return check_coro_frame_range_initialized(env, reg, argno, access_size,
+							  zero_size_allowed, access_type, meta);
 	case PTR_TO_BTF_ID:
 		return check_ptr_to_btf_access(env, regs, reg, argno, 0,
 					       access_size, access_type, -1);
@@ -9257,7 +9826,7 @@ static int process_kf_arg_ptr_to_rbtree_node(struct bpf_verifier_env *env,
 static bool check_css_task_iter_allowlist(struct bpf_verifier_env *env);
 
 struct bpf_reg_types {
-	const enum bpf_reg_type types[10];
+	const enum bpf_reg_type types[11];
 	u32 *btf_id;
 };
 
@@ -9294,6 +9863,7 @@ static const struct bpf_reg_types mem_types = {
 		PTR_TO_MEM,
 		PTR_TO_MEM | MEM_RINGBUF,
 		PTR_TO_BUF,
+		PTR_TO_CORO_FRAME,
 		PTR_TO_BTF_ID | PTR_TRUSTED,
 		PTR_TO_CTX,
 	},
@@ -9337,6 +9907,9 @@ static const struct bpf_reg_types arena_types = {
 };
 static const struct bpf_reg_types ctx_out_types = {
 	.types = { PTR_TO_MEM | MEM_RDONLY | PTR_TRUSTED },
+};
+static const struct bpf_reg_types coro_frame_types = {
+	.types = { PTR_TO_CORO_FRAME }
 };
 
 static const struct bpf_reg_types alloc_obj_drop_types = {
@@ -9411,6 +9984,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_IRQ_FLAG]		= &stack_ptr_types,
 	[ARG_PTR_TO_ARENA]		= &arena_types,
 	[ARG_PTR_TO_CTX_OUT]		= &ctx_out_types,
+	[ARG_PTR_TO_CORO_FRAME]	= &coro_frame_types,
 };
 
 static void bpf_diag_call_arg(struct bpf_verifier_env *env, u32 insn_idx, argno_t argno,
@@ -9670,6 +10244,7 @@ static int check_func_arg_reg_off(struct bpf_verifier_env *env,
 	case PTR_TO_BUF:
 	case PTR_TO_BUF | MEM_RDONLY:
 	case PTR_TO_ARENA:
+	case PTR_TO_CORO_FRAME:
 	case SCALAR_VALUE:
 		return 0;
 	/* All the rest must be rejected, except PTR_TO_BTF_ID which allows
@@ -9888,6 +10463,34 @@ static enum bpf_access_type func_arg_access_type(enum bpf_arg_type arg_type)
 	if (arg_type & MEM_UNINIT)
 		return BPF_WRITE;
 	return BPF_READ | BPF_WRITE;
+}
+
+static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+				     u32 arg, argno_t argno, struct bpf_call_arg_meta *meta)
+{
+	u32 i;
+
+	/* An explicit KF_RELEASE on this argument must not release it twice. */
+	if (meta->release_regno == reg_from_argno(argno))
+		meta->release_regno = 0;
+	else if (meta->release_regno && cur_regs(env)[meta->release_regno].id == reg->id)
+		goto duplicate;
+
+	for (i = 0; i < meta->coro_frames.cnt; i++) {
+		if (meta->coro_frames.ids[i] == reg->id)
+			goto duplicate;
+	}
+
+	if (meta->func_proto && arg < btf_type_vlen(meta->func_proto) &&
+	    is_kfunc_arg_coro_suspend(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
+	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
+	return 0;
+
+duplicate:
+	verbose(env, "%s passes the same coroutine frame to multiple consuming arguments\n",
+		reg_arg_name(env, argno));
+	return -EINVAL;
 }
 
 static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 prev_slot,
@@ -10154,6 +10757,9 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 		}
 		break;
 	case ARG_PTR_TO_ARENA:
+		break;
+	case ARG_PTR_TO_CORO_FRAME:
+		err = record_coro_frame_release(env, reg, arg, argno, meta);
 		break;
 	case ARG_PTR_TO_ALLOC_BTF_ID:
 		if (reg->type == (PTR_TO_BTF_ID | MEM_ALLOC)) {
@@ -11276,8 +11882,23 @@ static int release_reference(struct bpf_verifier_env *env, int id)
 				continue;
 			}
 			bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_REF_RELEASE);
-			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL)
+			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL) {
+				bool coro_handle = base_type(reg->type) == PTR_TO_CORO_FRAME &&
+						   !(reg->type & PTR_MAYBE_NULL);
+
 				mark_reg_invalid(env, reg);
+				/*
+				 * A consumed coroutine frame leaves its handle
+				 * behind as a scalar; the compiler-generated
+				 * caller tests it against NULL to tell a
+				 * started coroutine from a failed allocation,
+				 * so keep what is known: it is not NULL.
+				 */
+				if (coro_handle && reg->type == SCALAR_VALUE) {
+					reg->r64 = cnum64_from_urange(1, U64_MAX);
+					reg_bounds_sync(reg);
+				}
+			}
 		}));
 	}
 
@@ -13728,6 +14349,21 @@ static bool is_kfunc_arg_arena(const struct btf *btf, const struct btf_param *ar
 	       btf_param_match_suffix(btf, arg, "__arena");
 }
 
+static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_frame");
+}
+
+/*
+ * A __coro_suspend parameter is a consumed frame that the kernel resumes
+ * later: the verifier snapshots the frame at the call and verifies its
+ * resume and destroy functions from that snapshot, see push_coro_suspend().
+ */
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_suspend");
+}
+
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
 					  const struct btf_param *arg,
 					  const char *name)
@@ -14124,6 +14760,7 @@ enum special_kfunc_type {
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
+	KF_bpf_coro_frame_alloc,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -14225,6 +14862,7 @@ BTF_ID(func, bpf_session_is_return)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, bpf_coro_frame_alloc)
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -14547,7 +15185,10 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		}
 		proto->arg_size[arg] = type_size;
 		arg_type = ARG_PTR_TO_CTX_OUT | MEM_FIXED_SIZE;
-	} else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
+	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]) ||
+		   is_kfunc_arg_coro_suspend(meta->btf, &args[arg]))
+		arg_type = ARG_PTR_TO_CORO_FRAME | OBJ_RELEASE;
+	else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_FUNC;
 	else if (is_kfunc_arg_arena(meta->btf, &args[arg])) {
 		if (!bpf_jit_supports_arena_args()) {
@@ -14616,8 +15257,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		arg_type |= PTR_MAYBE_NULL;
 
 	/*
-	 * Only the first argument of a KF_RELEASE kfunc releases anything, and
-	 * bpf_fetch_kfunc_arg_meta() only ever records BPF_REG_1 for it.
+	 * KF_RELEASE consumes the first argument. Coroutine frame parameters
+	 * carry OBJ_RELEASE independently of their position and this flag.
 	 */
 	if (is_kfunc_release(meta) && arg == 0)
 		arg_type |= OBJ_RELEASE;
@@ -15834,6 +16475,24 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 			return -EFAULT;
 		}
 		regs[BPF_REG_0].parent_id = meta->dynptr.id;
+	} else if (meta->func_id == special_kfunc_list[KF_bpf_coro_frame_alloc]) {
+		u64 size = meta->arg_constant.value;
+
+		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
+			return -EFAULT;
+		/*
+		 * The cap keeps every slot index within the history entry's
+		 * 'spi' field and bounds the per-state tracking cost like the
+		 * stack does.
+		 */
+		if (size == 0 || size > BPF_MAX_REF_SLOTS * BPF_REG_SIZE) {
+			verbose(env, "coro_frame size %llu out of range [1, %u]\n",
+				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
+			return -EINVAL;
+		}
+		mark_reg_known_zero(env, regs, BPF_REG_0);
+		regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
+		regs[BPF_REG_0].mem_size = size;
 	} else {
 		return 0;
 	}
@@ -15842,6 +16501,218 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 }
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
+
+/*
+ * Suspension of a coroutine into the kernel.
+ *
+ * A kfunc that takes a __coro_suspend frame keeps the frame and resumes the
+ * coroutine later by calling the resume function whose address the compiler
+ * stored in the frame's first slot, with the frame as the only argument; the
+ * destroy function in the second slot cancels it instead. The frame's
+ * contents are all the state those functions see, so each is verified as an
+ * async callback that starts from a snapshot of the frame taken at the call:
+ * the slots keep their types and values, the suspend index among them, so
+ * only the continuation of this suspend point is explored, and the acquired
+ * references stored in the frame move to the callback, which has to release
+ * them (or the frame holding them, along with the frame itself). Pointers
+ * that do not survive a suspension are rejected: the context, packet data,
+ * RCU-protected or untrusted pointers, and values of maps other than arrays,
+ * which are only valid under RCU.
+ */
+static struct bpf_reference_state *coro_ref_by_id(struct bpf_verifier_state *st, int id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id)
+			return &st->refs[i];
+	return NULL;
+}
+
+static struct bpf_reference_state *coro_add_ref(struct bpf_verifier_state *st, int insn_idx)
+{
+	int n = st->acquired_refs;
+
+	if (resize_reference_state(st, n + 1))
+		return NULL;
+	memset(&st->refs[n], 0, sizeof(st->refs[n]));
+	st->refs[n].insn_idx = insn_idx;
+	st->refs[n].type = REF_TYPE_PTR;
+	return &st->refs[n];
+}
+
+/* Is the pointer in a frame slot an acquired kernel reference? */
+static bool coro_slot_reg_is_ref(const struct bpf_reg_state *reg)
+{
+	switch (base_type(reg->type)) {
+	case PTR_TO_BTF_ID:
+	case PTR_TO_SOCKET:
+	case PTR_TO_SOCK_COMMON:
+	case PTR_TO_TCP_SOCK:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	switch (base_type(reg->type)) {
+	case SCALAR_VALUE:
+	case PTR_TO_FUNC:
+	case PTR_TO_ARENA:
+	case CONST_PTR_TO_MAP:
+		return true;
+	case PTR_TO_MAP_VALUE:
+		return reg->map_ptr && reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY;
+	default:
+		return coro_slot_reg_is_ref(reg) && reg_is_referenced(env, reg) &&
+		       !(reg->type & (MEM_RCU | NON_OWN_REF | PTR_UNTRUSTED | PTR_MAYBE_NULL));
+	}
+}
+
+/* Verify subprog 'subprog' as the continuation of the suspended 'frame'. */
+static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
+			       struct bpf_reference_state *frame, u32 *moved, int nr_moved)
+{
+	struct bpf_verifier_state *cur = env->cur_state, *async_cb;
+	struct bpf_reference_state *ref, *src;
+	struct bpf_func_state *callee;
+	struct bpf_reg_state *reg;
+	int i;
+
+	env->subprog_info[subprog].is_async_cb = true;
+	/*
+	 * No previous instruction: the continuation starts afresh, and
+	 * precision backtracking must not walk from its entry into the
+	 * code around this call. It stops at the entry instead.
+	 */
+	async_cb = push_async_cb(env, env->subprog_info[subprog].start, -1, subprog, false);
+	if (IS_ERR(async_cb))
+		return PTR_ERR(async_cb);
+	async_cb->first_insn_idx = env->subprog_info[subprog].start;
+	callee = async_cb->frame[0];
+	callee->async_entry_cnt = cur->frame[0]->async_entry_cnt + 1;
+	callee->in_async_callback_fn = true;
+	callee->coro_resume = true;
+	callee->callback_ret_range = retval_range(0, 0);
+
+	/* The frame, with a copy of its slots. Ids are unique across states. */
+	ref = coro_add_ref(async_cb, insn_idx);
+	if (!ref)
+		return -ENOMEM;
+	ref->id = frame->id;
+	ref->slots = kmemdup(frame->slots, frame->nr_slots * sizeof(*frame->slots),
+			     GFP_KERNEL_ACCOUNT);
+	if (!ref->slots)
+		return -ENOMEM;
+	ref->nr_slots = frame->nr_slots;
+	ref->mem_size = frame->mem_size;
+	/*
+	 * The callback starts here: nothing before it can be backtracked, so
+	 * the snapshot's scalars are precise from the start.
+	 */
+	for (i = 0; i < ref->nr_slots; i++) {
+		if (!bpf_is_spilled_reg(&ref->slots[i]))
+			continue;
+		reg = &ref->slots[i].spilled_ptr;
+		if (reg->type == SCALAR_VALUE)
+			reg->precise = true;
+	}
+
+	/* The references the frame holds. */
+	for (i = 0; i < nr_moved; i++) {
+		src = coro_ref_by_id(cur, moved[i]);
+		if (verifier_bug_if(!src || src->type != REF_TYPE_PTR, env,
+				    "coro_frame holds unknown reference %u", moved[i]))
+			return -EFAULT;
+		ref = coro_add_ref(async_cb, insn_idx);
+		if (!ref)
+			return -ENOMEM;
+		ref->id = src->id;
+		ref->parent_id = src->parent_id;
+	}
+
+	/* r1 is the frame; the continuation gets nothing else. */
+	reg = &callee->regs[BPF_REG_1];
+	mark_reg_known_zero(env, callee->regs, BPF_REG_1);
+	reg->type = PTR_TO_CORO_FRAME;
+	reg->mem_size = frame->mem_size;
+	reg->id = frame->id;
+	for (i = BPF_REG_2; i <= BPF_REG_5; i++)
+		bpf_mark_reg_not_init(env, &callee->regs[i]);
+	return 0;
+}
+
+static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_reference_state *frame = bpf_find_ref_slots(cur, id);
+	u32 moved[BPF_MAX_REF_SLOTS];
+	int i, j, err, nr_moved = 0, resume, destroy = -1;
+
+	if (verifier_bug_if(!frame, env, "suspended coro_frame %d has no slots", id))
+		return -EFAULT;
+	if (frame->nr_slots < 1 || !bpf_is_spilled_reg(&frame->slots[0]) ||
+	    frame->slots[0].spilled_ptr.type != PTR_TO_FUNC) {
+		verbose(env, "suspended coro_frame has no resume function in its first slot\n");
+		return -EINVAL;
+	}
+	resume = frame->slots[0].spilled_ptr.subprogno;
+	if (frame->nr_slots >= 2 && bpf_is_spilled_reg(&frame->slots[1]) &&
+	    frame->slots[1].spilled_ptr.type == PTR_TO_FUNC)
+		destroy = frame->slots[1].spilled_ptr.subprogno;
+
+	for (i = 0; i < frame->nr_slots; i++) {
+		struct bpf_stack_state *slot = &frame->slots[i];
+		struct bpf_reg_state *reg = &slot->spilled_ptr;
+
+		if (!bpf_is_spilled_reg(slot)) {
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				if (slot->slot_type[j] == STACK_DYNPTR ||
+				    slot->slot_type[j] == STACK_ITER ||
+				    slot->slot_type[j] == STACK_IRQ_FLAG) {
+					verbose(env, "coro_frame slot %d holds a verifier object that cannot be suspended\n",
+						i);
+					return -EINVAL;
+				}
+			}
+			continue;
+		}
+		if (!coro_slot_reg_survives(env, reg)) {
+			verbose(env, "coro_frame slot %d holds %s which cannot survive a suspension\n",
+				i, reg_type_str(env, reg->type));
+			return -EINVAL;
+		}
+		if (!coro_slot_reg_is_ref(reg))
+			continue;
+		for (j = 0; j < nr_moved; j++)
+			if (moved[j] == reg->id)
+				break;
+		if (j == nr_moved)
+			moved[nr_moved++] = reg->id;
+	}
+
+	err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved);
+	if (err)
+		return err;
+	if (destroy >= 0 && destroy != resume) {
+		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * The continuation owns the references now; every copy outside the
+	 * frame goes invalid. The frame itself is released by the caller.
+	 */
+	for (i = 0; i < nr_moved; i++) {
+		err = release_reference(env, moved[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
 
 /* Leave an RCU or preemption section: the innermost frame that entered one. */
 static void leave_section(struct bpf_verifier_state *st, bool rcu)
@@ -16165,6 +17036,30 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return err;
 	}
 
+	/*
+	 * Frames the kernel resumes later: verify their continuations from a
+	 * snapshot of the frame before the frame reference goes away.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		if (!(meta.coro_frames.suspend_mask & BIT(i)))
+			continue;
+		err = push_coro_suspend(env, insn_idx, meta.coro_frames.ids[i]);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * All arguments have been checked against the state before the call.
+	 * Use the saved identities: releasing a frame invalidates its aliases,
+	 * including those in other frames and outgoing stack arguments.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		err = release_reference(env, meta.coro_frames.ids[i]);
+		if (err)
+			return err;
+	}
+
+
 	if (is_bpf_list_push_kfunc(meta.func_id) || is_bpf_rbtree_add_kfunc(meta.func_id)) {
 		id = regs[BPF_REG_2].id;
 		insn_aux->insert_off = regs[BPF_REG_2].var_off.value;
@@ -16230,7 +17125,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (meta.btf != btf_vmlinux ||
 		    (!is_bpf_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_percpu_obj_new_kfunc(meta.func_id) &&
-		     !is_bpf_refcount_acquire_kfunc(meta.func_id))) {
+		     !is_bpf_refcount_acquire_kfunc(meta.func_id) &&
+		     meta.func_id != special_kfunc_list[KF_bpf_coro_frame_alloc])) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}
@@ -16390,6 +17286,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				return id;
 			regs[BPF_REG_0].id = id;
 			record_acquired_type(env, insn_idx, &regs[BPF_REG_0]);
+			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
+				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
+				if (err)
+					return err;
+			}
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -16918,6 +17819,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	case PTR_TO_BUF:
 	case PTR_TO_FUNC:
 	case CONST_PTR_TO_DYNPTR:
+	case PTR_TO_CORO_FRAME:
 		break;
 	case PTR_TO_FLOW_KEYS:
 		if (known)
@@ -20025,6 +20927,10 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 
 	/* LSM and struct_ops func-ptr's return type could be "void" */
 	if (!frame->in_async_callback_fn && program_returns_void(env))
+		return 0;
+	/* So can a coroutine's resume function, resumed by the kernel. */
+	if (frame->in_async_callback_fn && frame->coro_resume &&
+	    subprog_returns_void(env, frame->subprogno))
 		return 0;
 
 	if (prog_type == BPF_PROG_TYPE_STRUCT_OPS) {

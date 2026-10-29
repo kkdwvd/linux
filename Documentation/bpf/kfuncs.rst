@@ -351,6 +351,69 @@ In this case, a program attached to the ``inode_init_security`` LSM hook
 can pass the hook's own ``xattr_count`` argument through to the kfunc,
 which claims xattr slots by writing through it.
 
+2.3.10 __coro_frame Annotation
+------------------------------
+
+This annotation identifies an owned coroutine frame returned by
+``bpf_coro_frame_alloc()``. Each annotated parameter must receive the
+non-NULL base pointer of a live frame::
+
+        __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
+        {
+                kfree_nolock(p__coro_frame);
+        }
+
+A ``__coro_frame`` parameter always consumes the frame reference, without
+requiring ``KF_RELEASE``. A kfunc may take several frame parameters in any
+argument position, including stack arguments on architectures that support
+them. Each consuming argument must receive a distinct owned frame; passing
+aliases of the same frame to two consuming arguments is rejected.
+
+The verifier checks all arguments before consuming any frame references.
+After the call, all aliases of each consumed frame are invalid for further
+access, resumption, or release. The kfunc must free each frame or take
+responsibility for its subsequent lifetime. Explicit ``KF_RELEASE`` retains
+its first-argument semantics and does not consume a ``__coro_frame`` first
+argument twice.
+
+This annotation does not transfer references stored inside the frame or
+preserve verifier state for a later continuation. Passing frame storage to
+an ordinary memory parameter retains the usual memory-argument semantics.
+
+2.3.11 __coro_suspend Annotation
+--------------------------------
+
+A ``__coro_suspend`` parameter is a consumed frame that the kernel resumes
+later, once the event the kfunc waits for has happened::
+
+        __bpf_kfunc int bpf_blk_read_coro(struct bpf_blk_io *io__arena,
+                                          void *buf__arena,
+                                          void *frame__coro_suspend,
+                                          struct bpf_prog_aux *aux)
+
+The compiler stores the address of the coroutine's resume function in the
+frame's first slot and of its destroy function in the second, and both take
+the frame as their only argument. At the call the verifier snapshots the
+frame's slots and verifies each of the two functions as an async callback
+starting from that snapshot: the slots keep their types and values, so the
+suspend index selects only the continuation of this suspend point, and the
+acquired references stored in the frame move to the callback, which must
+release them (or the frame holding them, together with the frame itself).
+Pointers that do not survive a suspension are rejected: the context, packet
+pointers, RCU-protected or untrusted pointers, and values of maps other
+than arrays. The caller keeps the frame address as a non-NULL scalar, which
+lets the compiler-generated check for a failed frame allocation hold.
+
+The kfunc owns the frame from then on and calls its resume function once,
+with the frame as the first argument, from a context in which the program
+type's kfuncs are valid; see ``bpf_coro_cont_resume()``. A kfunc that fails
+after consuming the frame resumes it at once with the error reported in
+memory the coroutine can see.
+
+A continuation may be unwound like any callback the kernel runs, by
+``bpf_throw()`` or a cancellation; the references it holds in the frame's
+memory are then released through the frame, and the frame after them.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

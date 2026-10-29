@@ -914,6 +914,7 @@ enum bpf_arg_type {
 	 */
 	ARG_PTR_TO_MEM,		/* pointer to valid memory (stack, packet, map value) */
 	ARG_PTR_TO_ARENA,
+	ARG_PTR_TO_CORO_FRAME,	/* pointer to a BPF coroutine frame */
 
 	ARG_MEM_SIZE,		/* number of bytes accessed from memory */
 	ARG_MEM_SIZE_OR_ZERO,	/* number of bytes accessed from memory or 0 */
@@ -1131,6 +1132,7 @@ enum bpf_reg_type {
 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
 	PTR_TO_INSN,		 /* reg points to a bpf program instruction */
 	CONST_PTR_TO_DYNPTR,	 /* reg points to a const struct bpf_dynptr */
+	PTR_TO_CORO_FRAME,	 /* reg points to a frame from bpf_coro_frame_alloc() */
 	__BPF_REG_TYPE_MAX,
 
 	/* Extended reg_types. */
@@ -1806,6 +1808,7 @@ enum bpf_resource_kind {
 	BPF_RESOURCE_IRQ_FLAG_LOCK, /* flags of an irqsave lock, restored with the lock */
 	BPF_RESOURCE_RCU,		/* bpf_rcu_read_lock() sections: bpf_rcu_read_unlock() each */
 	BPF_RESOURCE_PREEMPT,	/* bpf_preempt_disable() sections: bpf_preempt_enable() each */
+	BPF_RESOURCE_CORO_FRAME,	/* bpf_coro_frame_alloc() frame: bpf_coro_frame_free() */
 };
 
 /* A resource class of a program; descriptor entries refer to it by index. */
@@ -1828,21 +1831,27 @@ enum {
 	BPF_FRAME_LOC_REG,	/* off is a register number */
 	BPF_FRAME_LOC_STACK,	/* off is a frame pointer relative stack offset */
 	BPF_FRAME_LOC_NONE,	/* no location: a lock at res->addr, or off sections to leave */
+	BPF_FRAME_LOC_CORO,	/* off is a byte offset in the coroutine frame read from the base */
 };
 
 #define BPF_FRAME_ENT_NULLABLE	BIT(0)	/* the location may hold NULL instead */
 
 /*
  * One resource of a frame: the value at a location, or a stack object at it.
- * Entries are laid out in release order: locks and IRQ flags first, latest
- * acquired first, then RCU-protected objects, sections, and other objects.
+ * A BPF_FRAME_LOC_CORO entry is the value in a slot of a coroutine frame whose
+ * pointer is read from the base, a register or stack location that may hold
+ * NULL. Entries are laid out in release order: locks and IRQ flags first,
+ * latest acquired first, then RCU-protected objects, sections, other objects,
+ * and the coroutine frames last, after the slots read through them.
  */
 struct bpf_frame_desc_entry {
 	u8 loc;
-	u8 flags;
+	u8 base_loc;	/* BPF_FRAME_LOC_CORO: where the frame pointer is read from */
 	u16 res;	/* index into the program's resource classes */
 	s16 off;
 	s16 order;	/* rank in the frame, or one of the negative ranks in frame_desc.c */
+	s16 base_off;
+	u16 flags;
 };
 
 struct bpf_frame_desc {
@@ -3047,6 +3056,7 @@ void bpf_obj_free_task_work(const struct btf_record *rec, void *obj);
 void bpf_obj_cancel_fields(struct bpf_map *map, void *obj);
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj);
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu);
+void bpf_coro_frame_free(void *p__coro_frame);
 void bpf_obj_drop_impl(void *p__alloc, void *meta__ign);
 void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign);
 void bpf_rcu_read_unlock(void);
