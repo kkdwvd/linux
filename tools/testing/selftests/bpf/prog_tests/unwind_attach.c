@@ -63,6 +63,27 @@ out:
 	unwind_attach__destroy(skel);
 }
 
+/* A helper with a pad is notrace: nothing may put a return address of its own in its frame */
+static void helper_with_pad(void)
+{
+	struct unwind_attach *skel;
+	struct bpf_link *link;
+	int err;
+
+	skel = unwind_attach__open();
+	if (!ASSERT_OK_PTR(skel, "unwind_attach__open"))
+		return;
+	bpf_program__set_autoload(skel->progs.fexit_bpf_loop, true);
+	err = unwind_attach__load(skel);
+	if (!err) {
+		link = bpf_program__attach(skel->progs.fexit_bpf_loop);
+		err = libbpf_get_error(link);
+		bpf_link__destroy(link);
+	}
+	ASSERT_ERR(err, "fexit on bpf_loop");
+	unwind_attach__destroy(skel);
+}
+
 void test_unwind_attach(void)
 {
 	struct verifier_unwind *tgt;
@@ -125,6 +146,8 @@ void test_unwind_attach(void)
 				   &throws_fd, sizeof(throws_fd), 0);
 	if (ASSERT_OK(err, "prog_array"))
 		ASSERT_EQ(run(tail_fd), 7, "retval");
+
+	helper_with_pad();
 out:
 	verifier_unwind__destroy(tgt);
 }

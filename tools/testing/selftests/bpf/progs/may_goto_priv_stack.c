@@ -10,8 +10,10 @@ __u64 regs_64[7];
 __u64 regs_128[7];
 
 /*
- * fentry prog with 64 or more bytes of stack uses private stack.
- * Loop until may_goto expires. r0-r5 should stay zero.
+ * fentry prog with 64 or more bytes of stack uses private stack. Loop past
+ * the count of the timed may_goto, so that its slow path runs once and
+ * refreshes the count, then leave the loop before its time runs out, which
+ * would cancel the program. r0-r5 should stay zero across the slow path.
  */
 #define TIMED_MAY_GOTO_PRIV_STACK(size, func)				\
 SEC("fentry/" #func)							\
@@ -30,7 +32,7 @@ __naked void priv_stack_##size(void)					\
 "1:"									\
 	".8byte %[may_goto];"						\
 	"r6 += 1;"							\
-	"goto 1b;"							\
+	"if r6 < %[iterations] goto 1b;"				\
 	"*(u64 *)(r7 + 0) = r0;"					\
 	"*(u64 *)(r7 + 8) = r1;"					\
 	"*(u64 *)(r7 + 16) = r2;"					\
@@ -42,6 +44,7 @@ __naked void priv_stack_##size(void)					\
 	"exit;"								\
 	:								\
 	: [regs]"i"(&regs_##size),					\
+	  [iterations]"i"(0x10001), /* BPF_MAX_TIMED_LOOPS + 2 */	\
 	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2, 0)) \
 	: __clobber_all);						\
 }

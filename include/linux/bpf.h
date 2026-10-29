@@ -7,6 +7,7 @@
 #include <uapi/linux/bpf.h>
 #include <uapi/linux/filter.h>
 #include <linux/bpf_defs.h>
+#include <linux/bpf_throw.h>
 
 #include <crypto/sha2.h>
 #include <linux/workqueue.h>
@@ -1782,6 +1783,97 @@ struct bpf_jit_poke_descriptor {
 	u32 insn_idx;
 };
 
+/*
+ * Frame descriptor: the resources a BPF frame holds at one instruction. The
+ * entry layout is defined together with the generator; this header only fixes
+ * the container so that tables can be built, keyed and freed.
+ */
+/* Kinds of resources a frame descriptor can release. */
+enum bpf_resource_kind {
+	BPF_RESOURCE_OBJ,		/* bpf_obj_new() object: bpf_obj_drop_impl(p, meta) */
+	BPF_RESOURCE_PERCPU_OBJ,	/* bpf_percpu_obj_new() object: bpf_percpu_obj_drop_impl(p, meta) */
+	BPF_RESOURCE_KPTR,		/* referenced kernel object: dtor(p) from the BTF dtor registry */
+	BPF_RESOURCE_SOCK,		/* socket acquired by a helper: bpf_sk_release() */
+	BPF_RESOURCE_RINGBUF,	/* bpf_ringbuf_reserve() record: bpf_ringbuf_discard() */
+	BPF_RESOURCE_DYNPTR_RINGBUF, /* ringbuf dynptr on the stack: bpf_ringbuf_discard_dynptr() */
+	BPF_RESOURCE_ITER,		/* open-coded iterator on the stack: its destroy kfunc */
+	BPF_RESOURCE_SPIN_LOCK,	/* bpf_spin_lock() held: bpf_spin_unlock() */
+	BPF_RESOURCE_RES_LOCK,	/* bpf_res_spin_lock() held: bpf_res_spin_unlock() */
+	BPF_RESOURCE_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave() held: its unlock_irqrestore */
+	BPF_RESOURCE_IRQ_FLAG,	/* bpf_local_irq_save() flags on the stack: its restore */
+	BPF_RESOURCE_IRQ_FLAG_LOCK, /* flags of an irqsave lock, restored with the lock */
+	BPF_RESOURCE_RCU,		/* bpf_rcu_read_lock() sections: bpf_rcu_read_unlock() each */
+	BPF_RESOURCE_PREEMPT,	/* bpf_preempt_disable() sections: bpf_preempt_enable() each */
+};
+
+/* A resource class of a program; descriptor entries refer to it by index. */
+struct bpf_resource {
+	u8 kind;	/* enum bpf_resource_kind */
+	bool sleeps;	/* the destructor may sleep */
+	bool rcu;	/* the destructor needs RCU protection */
+	s16 delta;	/* locks: offset of the lock from the pointer value at the location */
+	u32 type;	/* bpf_reg_type of a pointer resource */
+	u32 btf_id;
+	struct btf *btf;
+	union {
+		void (*dtor)(void *);
+		struct btf_struct_meta *meta;
+		void *addr;	/* locks: address of a lock in a global, needing no location */
+	};
+};
+
+enum {
+	BPF_FRAME_LOC_REG,	/* off is a register number */
+	BPF_FRAME_LOC_STACK,	/* off is a frame pointer relative stack offset */
+	BPF_FRAME_LOC_NONE,	/* no location: a lock at res->addr, or off sections to leave */
+};
+
+#define BPF_FRAME_ENT_NULLABLE	BIT(0)	/* the location may hold NULL instead */
+
+/*
+ * One resource of a frame: the value at a location, or a stack object at it.
+ * Entries are laid out in release order: locks and IRQ flags first, latest
+ * acquired first, then RCU-protected objects, sections, and other objects.
+ */
+struct bpf_frame_desc_entry {
+	u8 loc;
+	u8 flags;
+	u16 res;	/* index into the program's resource classes */
+	s16 off;
+	s16 order;	/* rank in the frame, or one of the negative ranks in frame_desc.c */
+};
+
+struct bpf_frame_desc {
+	u32 size;	/* total size in bytes, including this header */
+	u32 nent;	/* number of entries that follow */
+	struct bpf_frame_desc_entry ent[];
+};
+
+/* One throw site of a JITed function. */
+struct bpf_frame_desc_site {
+	u32 off;	/* native offset of the instruction's first byte from prog->bpf_func */
+	u32 end;	/* native offset one past the instruction's last byte */
+	u32 desc;	/* index into the main program's descriptor pool */
+};
+
+/*
+ * The throw sites of one JITed function, sorted by off. Until the JIT fills it,
+ * off holds the function-relative instruction index and end is unused.
+ */
+struct bpf_frame_desc_table {
+	u32 cnt;
+	bool filled;
+	struct bpf_frame_desc_site site[];
+};
+
+/* Owned by the main program and shared by its subprograms. */
+struct bpf_frame_desc_pool {
+	u32 cnt;
+	u32 resource_cnt;
+	struct bpf_resource *resources;
+	struct bpf_frame_desc *desc[];
+};
+
 /* reg_type info for ctx arguments */
 struct bpf_ctx_arg_aux {
 	u32 offset;
@@ -1891,7 +1983,6 @@ struct bpf_prog_aux {
 	bool tail_call_reachable;
 	bool xdp_has_frags;
 	bool exception_cb;
-	bool exception_boundary;
 	bool jits_use_priv_stack;
 	bool priv_stack_requested;
 	bool changes_pkt_data;
@@ -1937,9 +2028,33 @@ struct bpf_prog_aux {
 	int cgroup_atype; /* enum cgroup_bpf_attach_type */
 	struct bpf_map *cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE];
 	char name[BPF_OBJ_NAME_LEN];
-	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
-	u16 stack_arg_sp_adjust;
+	/*
+	 * The exception callback of the main program: @cookie is the value of
+	 * the throw, @sp and @bp the native stack and frame pointers of the main
+	 * program's frame, @saved the callee-saved registers the unwinder
+	 * restored, R6..R9 then the architecture's own, see struct bpf_throw_regs.
+	 */
+	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
+	/* Returns @cookie from the frame the unwinder stopped at: a callback, or the main program. */
+	u64 (*bpf_cancel_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
 	u16 freplace_link_cnt; /* counts freplace links extending this prog */
+	/*
+	 * Offsets from the native frame pointer of this JITed program at which
+	 * its prologue saved the caller's callee-saved registers, R6..R9 then
+	 * the architecture's own, or 0 when that register is not saved. Filled
+	 * by the JIT; consumed by the exception unwinder.
+	 */
+	s16 callee_reg_off[BPF_THROW_NR_CALLEE_SAVED];
+	/* BPF frame pointer relative to the native frame pointer the stack walker reports */
+	s16 frame_fp_off;
+	/* With a private stack, the frame's R10 is this far into this CPU's priv_stack_ptr. */
+	u32 priv_frame_off;
+	/* Return value of the main program when the kernel cancels an invocation. */
+	s32 cancel_retval;
+	/* The kernel cancels this program at its cancellation points, which it described. */
+	bool cancellable;
+	/* This JITed function is a timer, workqueue or similar callback: its own invocation. */
+	bool async_cb;
 #ifdef CONFIG_SECURITY
 	void *security;
 #endif
@@ -1973,6 +2088,14 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	/*
+	 * frame_desc_table keys the throw sites of this JITed function by native offset,
+	 * frame_desc_pool holds the descriptors they index. The main and sub progs share
+	 * the pool, which is freed with the main prog only. The main prog's
+	 * frame_desc_table is that of func[0] and is freed with func[0].
+	 */
+	struct bpf_frame_desc_table *frame_desc_table;
+	struct bpf_frame_desc_pool *frame_desc_pool;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;
@@ -2257,6 +2380,13 @@ struct bpf_struct_ops {
 	void (*unreg)(void *kdata, struct bpf_link *link);
 	int (*update)(void *kdata, void *old_kdata, struct bpf_link *link);
 	int (*validate)(void *kdata);
+	/*
+	 * The kernel cancelled an invocation of @prog, an operator of this
+	 * struct_ops, and is about to return 0 from it. A struct_ops whose
+	 * operators' return values mean more than that disables the attached
+	 * object here.
+	 */
+	void (*cancel)(const struct bpf_prog *prog);
 	void *cfi_stubs;
 	struct module *owner;
 	const char *name;
@@ -2913,6 +3043,13 @@ void bpf_obj_free_task_work(const struct btf_record *rec, void *obj);
 void bpf_obj_cancel_fields(struct bpf_map *map, void *obj);
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj);
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu);
+void bpf_obj_drop_impl(void *p__alloc, void *meta__ign);
+void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign);
+void bpf_rcu_read_unlock(void);
+void bpf_preempt_enable(void);
+void bpf_local_irq_restore(unsigned long *flags__irq_flag);
+void bpf_res_spin_unlock(struct bpf_res_spin_lock *lock);
+void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock, unsigned long *flags__irq_flag);
 
 struct bpf_map *bpf_map_get(u32 ufd);
 struct bpf_map *bpf_map_get_with_uref(u32 ufd);
@@ -3217,6 +3354,19 @@ int bpf_iter_map_fill_link_info(const struct bpf_iter_aux_info *aux,
 int bpf_iter_map_check_value_write(const struct bpf_prog *prog,
 				   const struct bpf_map *map);
 
+/*
+ * void (*)(void *) wrappers of the open-coded iterator destroy kfuncs, which the BTF
+ * destructor registry refers to.
+ */
+void bpf_iter_num_destroy_dtor(void *it);
+void bpf_iter_task_destroy_dtor(void *it);
+void bpf_iter_task_vma_destroy_dtor(void *it);
+void bpf_iter_css_destroy_dtor(void *it);
+void bpf_iter_css_task_destroy_dtor(void *it);
+void bpf_iter_bits_destroy_dtor(void *it);
+void bpf_iter_kmem_cache_destroy_dtor(void *it);
+void bpf_iter_dmabuf_destroy_dtor(void *it);
+
 int map_set_for_each_callback_args(struct bpf_verifier_env *env,
 				   struct bpf_func_state *caller,
 				   struct bpf_func_state *callee);
@@ -3412,7 +3562,7 @@ void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
 		     enum bpf_dynptr_type type, u32 offset, u32 size);
 void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
 void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
-void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip);
+bool bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip);
 
 static __always_inline u32
 bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
@@ -3752,9 +3902,10 @@ static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
 {
 }
 
-static inline void bpf_prog_report_arena_violation(bool write, unsigned long addr,
+static inline bool bpf_prog_report_arena_violation(bool write, unsigned long addr,
 						   unsigned long fault_ip)
 {
+	return false;
 }
 #endif /* CONFIG_BPF_SYSCALL */
 
@@ -4021,6 +4172,7 @@ struct bpf_key *bpf_lookup_system_key(u64 id);
 struct bpf_key *bpf_lookup_keyring(void);
 bool bpf_keyring_enforced(void);
 void bpf_key_put(struct bpf_key *bkey);
+void bpf_key_put_dtor(void *bkey);
 int bpf_verify_pkcs7_signature(const struct bpf_dynptr *data_p,
 			       const struct bpf_dynptr *sig_p,
 			       struct bpf_key *trusted_keyring);
@@ -4116,6 +4268,7 @@ extern const struct bpf_func_proto bpf_ringbuf_output_proto;
 extern const struct bpf_func_proto bpf_ringbuf_reserve_proto;
 extern const struct bpf_func_proto bpf_ringbuf_submit_proto;
 extern const struct bpf_func_proto bpf_ringbuf_discard_proto;
+extern const struct bpf_func_proto bpf_sk_release_proto;
 extern const struct bpf_func_proto bpf_ringbuf_query_proto;
 extern const struct bpf_func_proto bpf_ringbuf_reserve_dynptr_proto;
 extern const struct bpf_func_proto bpf_ringbuf_submit_dynptr_proto;
@@ -4381,9 +4534,31 @@ void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
 
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
+void bpf_prog_fill_frame_desc_table(struct bpf_prog *prog, const u32 *offsets, void *image);
+struct bpf_throw_regs;
+void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
+			    const struct bpf_throw_regs *regs, const u64 *callee_regs);
+void bpf_unwind_release(const struct bpf_resource *res, void *loc, void *flags);
+const struct bpf_frame_desc *bpf_prog_frame_desc_lookup(const struct bpf_prog *prog, unsigned long ip);
+void bpf_frame_desc_table_free(struct bpf_frame_desc_table *tab);
+void bpf_frame_desc_pool_free(struct bpf_frame_desc_pool *pool);
 #else
 static inline void
 bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image)
+{
+}
+static inline void bpf_prog_fill_frame_desc_table(struct bpf_prog *prog, const u32 *offsets, void *image)
+{
+}
+static inline const struct bpf_frame_desc *
+bpf_prog_frame_desc_lookup(const struct bpf_prog *prog, unsigned long ip)
+{
+	return NULL;
+}
+static inline void bpf_frame_desc_table_free(struct bpf_frame_desc_table *tab)
+{
+}
+static inline void bpf_frame_desc_pool_free(struct bpf_frame_desc_pool *pool)
 {
 }
 #endif

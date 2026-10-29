@@ -63,4 +63,11 @@ unsigned long freplace_throws(void)
 	return 0;
 }
 
+/* bpf_loop() has a pad, and its return address is its own: no tracer gets in */
+SEC("?fexit/bpf_loop")
+int BPF_PROG(fexit_bpf_loop)
+{
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";
