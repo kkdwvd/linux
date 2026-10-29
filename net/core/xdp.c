@@ -1281,14 +1281,18 @@ static const struct btf_kfunc_id_set xdp_frame_kfunc_set = {
 };
 
 BTF_ID_LIST_SINGLE(xdp_frame_btf_ids, struct, xdp_frame)
-BTF_ID_LIST_SINGLE(xdp_frame_dtor_ids, func, bpf_xdp_frame_dtor)
+BTF_ID_LIST(xdp_frame_dtor_ids)
+BTF_ID(func, bpf_xdp_frame_dtor)
+BTF_ID(func, bpf_xdp_frame_release)
 
 static int __init xdp_frame_kfunc_init(void)
 {
 	const struct btf_id_dtor_kfunc dtors[] = {
 		{
-			.btf_id	      = xdp_frame_btf_ids[0],
-			.kfunc_btf_id = xdp_frame_dtor_ids[0],
+			.btf_id	        = xdp_frame_btf_ids[0],
+			.kfunc_btf_id   = xdp_frame_dtor_ids[0],
+			.release_btf_id = xdp_frame_dtor_ids[1],
+			.flags          = BPF_DTOR_KPTR | BPF_DTOR_CLEANUP,
 		},
 	};
 	int ret;

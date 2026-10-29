@@ -1560,7 +1560,9 @@ static const struct btf_kfunc_id_set bpf_xdp_tcp_kfunc_set = {
 };
 
 BTF_ID_LIST_SINGLE(xdp_tcp_sock_btf_ids, struct, sock)
-BTF_ID_LIST_SINGLE(xdp_tcp_sock_dtor_ids, func, bpf_xdp_tcp_sock_dtor)
+BTF_ID_LIST(xdp_tcp_sock_dtor_ids)
+BTF_ID(func, bpf_xdp_tcp_sock_dtor)
+BTF_ID(func, bpf_xdp_tcp_release)
 
 static int __init bpf_xdp_tcp_kfunc_init(void)
 {
@@ -1568,6 +1570,8 @@ static int __init bpf_xdp_tcp_kfunc_init(void)
 		{
 			.btf_id = xdp_tcp_sock_btf_ids[0],
 			.kfunc_btf_id = xdp_tcp_sock_dtor_ids[0],
+			.release_btf_id = xdp_tcp_sock_dtor_ids[1],
+			.flags = BPF_DTOR_KPTR | BPF_DTOR_CLEANUP,
 		},
 	};
 	int err;
