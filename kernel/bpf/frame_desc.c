@@ -304,6 +304,24 @@ unsupported:
 	return -EOPNOTSUPP;
 }
 
+/*
+ * The class of the reference acquired at insn @acq, from the type the call
+ * returned it as, for a site where no live location shows it; -ENOENT when
+ * the acquisition was not a call returning it.
+ */
+static int resource_of_acquisition(struct bpf_verifier_env *env, u32 acq)
+{
+	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[acq];
+	struct bpf_reg_state reg = {};
+
+	if (aux->acq_type == NOT_INIT)
+		return -ENOENT;
+	reg.type = aux->acq_type;
+	reg.btf = aux->acq_btf;
+	reg.btf_id = aux->acq_btf_id;
+	return resource_of_reg(env, &reg);
+}
+
 static int resource_of_dynptr(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
 {
 	struct bpf_resource res;
@@ -1115,13 +1133,38 @@ static const char *release_blocker(struct bpf_verifier_env *env, struct scratch 
 }
 
 /*
+ * No live location in the owner holds @ref and its slot cannot release it,
+ * @why. An alias in another frame cannot stand in for the owner's location.
+ * Without any live alias the program never reads it again, so this path leaks it. A path
+ * that goes on is rejected for the leak by the verifier when it ends, as
+ * nothing can hold the reference again, and a throw it reaches first comes
+ * back here; a throw ends the path without that check, so it is rejected now.
+ */
+static int unheld(struct bpf_verifier_env *env, const struct bpf_reference_state *ref,
+		  const char *why, bool borrowed)
+{
+	if (borrowed) {
+		verbose(env, "frame_desc: reference id=%d (acquired at insn %d) has no live location in its owning frame%d and %s\n",
+			ref->id, ref->insn_idx, ref->frameno, why);
+		return -EINVAL;
+	}
+	if (!bpf_is_throw_kfunc(&env->prog->insnsi[env->insn_idx]))
+		return 0;
+	verbose(env, "frame_desc: reference id=%d (acquired at insn %d) is held at no live location and %s\n",
+		ref->id, ref->insn_idx, why);
+	return -EINVAL;
+}
+
+/*
  * List reference @ref, of class @res with @nr candidate locations on this
  * path. A reference acquired by a call is listed from the unique slot of the
  * owning frame, while it is still the acquiring frame, and at a location the paths
- * agree on as a fallback; when the location cannot be found, the slot is
- * required. A reference no live location holds
- * can never be released by the program, which the verifier rejects for the
- * leak when the path ends, so it is left out here.
+ * agree on as a fallback; when the location cannot be found or a frame may
+ * not release it, the slot is required. A reference no live location holds
+ * is one the program never reads again, which a path that ends in a throw
+ * never has to release, so it is not left out: the slot is required, with
+ * the class from the type its acquisition returned, and a throw it cannot
+ * be released at is rejected, see unheld().
  */
 static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		     const struct bpf_reference_state *ref, int nr, bool borrowed)
@@ -1130,15 +1173,19 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 	const char *why;
 	int k, res, chosen, af = ref->frameno;
 
-	if (!nr) {
-		if (borrowed) {
-			verbose(env, "frame_desc: reference id=%d has no live location in its owning frame%d\n",
-				ref->id, ref->frameno);
-			return -EINVAL;
-		}
-		return 0;
+	if (nr) {
+		res = s->cands[0].res;
+	} else if (aux->ref_slot == BPF_REF_SLOT_WANTED) {
+		res = aux->ref_slot_resource;
+	} else if (aux->ref_slot == BPF_REF_SLOT_NONE) {
+		res = resource_of_acquisition(env, ref->insn_idx);
+		if (res == -ENOENT)
+			return unheld(env, ref, "cannot be released from a slot", borrowed);
+		if (res < 0)
+			return res;
+	} else {
+		return unheld(env, ref, "cannot be released from a slot", borrowed);
 	}
-	res = s->cands[0].res;
 
 	if (aux->ref_slot == BPF_REF_SLOT_NONE) {
 		if (resource_slottable(&env->resources[res]) &&
@@ -1153,6 +1200,10 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		why = env->cur_state->frame[af]->subprogno != insn_subprog(env, ref->insn_idx) ?
 		      "was acquired in a subprog that returned" : release_blocker(env, s, af, res);
 		if (why) {
+			if (!nr) {
+				aux->ref_slot = BPF_REF_SLOT_BAD;
+				return unheld(env, ref, why, borrowed);
+			}
 			if (aux->ref_slot_needed) {
 				verbose(env, "frame_desc: the reference acquired at insn %d %s, and no location describes it on every path\n",
 					ref->insn_idx, why);
@@ -1165,6 +1216,12 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 			if (ret)
 				return ret;
 		}
+	}
+	if (!nr) {
+		if (aux->ref_slot != BPF_REF_SLOT_WANTED)
+			return unheld(env, ref, "cannot be released from a slot", borrowed);
+		aux->ref_slot_needed = true;
+		return 0;
 	}
 
 	chosen = choose(s, nr, ref->insn_idx);
