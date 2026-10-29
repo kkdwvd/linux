@@ -392,6 +392,12 @@ struct bpf_func_state {
 	/* Async callback that is a coroutine's resume or destroy function. */
 	bool coro_resume;
 	bool in_exception_callback_fn;
+	/*
+	 * The body of a BPF kthread: an async callback whose kernel caller,
+	 * bpf_kthread_fn(), keeps nothing across it that the sleep in
+	 * bpf_task_park() could invalidate, so the park is allowed in it.
+	 */
+	bool in_kthread_fn;
 	bool no_stack_arg_load;
 	/*
 	 * The helper invokes this callback under rcu_read_lock(), so the
@@ -1097,6 +1103,8 @@ struct bpf_subprog_info {
 	bool addr_in_data: 1;
 	/* [WIP] has callx of a number */
 	bool scalar_callx: 1;
+	/* some call reachable from this subprog may be bpf_task_park() */
+	bool might_park: 1;
 	u8 arg_slot_cnt:4;
 
 	enum priv_stack_mode priv_stack_mode;
@@ -2108,6 +2116,7 @@ static inline bool bpf_is_kfunc_sleepable(struct bpf_call_arg_meta *meta)
 	return meta->kfunc_flags & KF_SLEEPABLE;
 }
 bool bpf_is_kfunc_pkt_changing(struct bpf_call_arg_meta *meta);
+bool bpf_is_task_park_kfunc(struct bpf_call_arg_meta *meta);
 struct bpf_iarray *bpf_iarray_realloc(struct bpf_iarray *old, size_t n_elem);
 int bpf_copy_insn_array_uniq(struct bpf_map *map, u32 start, u32 end, u32 *off);
 bool bpf_insn_is_cond_jump(u8 code);

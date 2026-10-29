@@ -823,6 +823,13 @@ static __always_inline u32 bpf_prog_run(const struct bpf_prog *prog, const void 
  * This uses migrate_disable/enable() explicitly to document that the
  * invocation of a BPF program does not require reentrancy protection
  * against a BPF program which is invoked from a preempting task.
+ *
+ * A syscall program may call bpf_task_park(), or a BPF kthread kfunc that
+ * waits for another task, which lift the pin for the duration of the sleep
+ * or wait and restore it before returning to the program, so such a program
+ * may resume on another CPU. Nothing on this path keeps per-CPU state
+ * across the program: __bpf_prog_run() samples its stats only after the
+ * program returns.
  */
 static inline u32 bpf_prog_run_pin_on_cpu(const struct bpf_prog *prog,
 					  const void *ctx)

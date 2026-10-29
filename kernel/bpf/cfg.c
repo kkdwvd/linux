@@ -67,6 +67,14 @@ static void mark_subprog_might_sleep(struct bpf_verifier_env *env, int off)
 	subprog->might_sleep = true;
 }
 
+static void mark_subprog_might_park(struct bpf_verifier_env *env, int off)
+{
+	struct bpf_subprog_info *subprog;
+
+	subprog = bpf_find_containing_subprog(env, off);
+	subprog->might_park = true;
+}
+
 static void mark_subprog_might_throw(struct bpf_verifier_env *env, int off)
 {
 	struct bpf_subprog_info *subprog;
@@ -89,6 +97,16 @@ static void merge_callee_effects(struct bpf_verifier_env *env, int t, int w)
 	callee = bpf_find_containing_subprog(env, w);
 	caller->changes_pkt_data |= callee->changes_pkt_data;
 	caller->might_sleep |= callee->might_sleep;
+	/*
+	 * A park in a callback does not mark the function that only loads
+	 * the callback's address: a synchronous callback is refused at the
+	 * park with the caller's frames in view, and an asynchronous one is a
+	 * root of its own. The address may also be called through callx,
+	 * which is a call like any other, so the mark follows it when the
+	 * program has callx at all.
+	 */
+	if (bpf_pseudo_call(&env->prog->insnsi[t]) || env->has_callx)
+		caller->might_park |= callee->might_park;
 	caller->might_throw |= callee->might_throw;
 }
 
@@ -667,6 +685,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			 */
 			if (ret == 0 && bpf_is_kfunc_sleepable(&meta))
 				mark_subprog_might_sleep(env, t);
+			if (ret == 0 && bpf_is_task_park_kfunc(&meta))
+				mark_subprog_might_park(env, t);
 			if (ret == 0 && bpf_is_kfunc_pkt_changing(&meta))
 				mark_subprog_changes_pkt_data(env, t);
 			if (ret == 0 && bpf_is_throw_kfunc(insn))
