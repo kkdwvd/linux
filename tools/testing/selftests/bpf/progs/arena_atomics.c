@@ -266,157 +266,34 @@ int fetch_r0(const void *ctx)
 }
 
 __u64 __arena_global uaf_sink;
-volatile __u64 __arena_global uaf_recovery_fails;
-/* Register state after the r0 forms below fault, checked by the test */
-__u64 __arena_global uaf_r1_after_dst_r0;
-__u64 __arena_global uaf_r0_before_dst_r0;
-__u64 __arena_global uaf_r0_after_dst_r0;
-__u64 __arena_global uaf_r0_after_src_r0;
-/* What reading the faulted address again gives, see the end of uaf() */
-__u64 __arena_global uaf_reread;
+/* Set after the faulting access, which the program is cancelled at and never gets past. */
+__u64 __arena_global uaf_after;
 
+/*
+ * A fault at an arena access cancels the program: the fetch below is the last
+ * thing it does, and the page stays unmapped rather than being mapped to the
+ * scratch page.
+ */
 SEC("syscall")
 int uaf(const void *ctx)
 {
 	if (pid != (bpf_get_current_pid_tgid() >> 32))
 		return 0;
 /*
- * __BPF_FEATURE_ADDR_SPACE_CAST is required by the asm below, which spells
- * addr_space_cast textually. That and the mnemonic both arrived in LLVM 19.
+ * __BPF_FEATURE_ADDR_SPACE_CAST is required by the cast below, which arrived
+ * in LLVM 19.
  */
 #if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
 	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
 	__u32 __arena *page32;
-	__u64 __arena *page64;
 	void __arena *page;
 
 	page = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
 	bpf_arena_free_pages(&arena, page, 1);
-	uaf_recovery_fails = 26;
-	uaf_r1_after_dst_r0 = 1;
-	uaf_r0_after_dst_r0 = 1;
-	uaf_r0_after_src_r0 = 1;
-	uaf_reread = 1;
-
+	uaf_after = 0;
 	page32 = (__u32 __arena *)page;
 	uaf_sink += __sync_fetch_and_add(page32, 1);
-	uaf_recovery_fails -= 1;
-	__sync_add_and_fetch(page32, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_sub(page32, 1);
-	uaf_recovery_fails -= 1;
-	__sync_sub_and_fetch(page32, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_and(page32, 1);
-	uaf_recovery_fails -= 1;
-	__sync_and_and_fetch(page32, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_or(page32, 1);
-	uaf_recovery_fails -= 1;
-	__sync_or_and_fetch(page32, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_xor(page32, 1);
-	uaf_recovery_fails -= 1;
-	__sync_xor_and_fetch(page32, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_val_compare_and_swap(page32, 0, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_lock_test_and_set(page32, 1);
-	uaf_recovery_fails -= 1;
-
-	page64 = (__u64 __arena *)page;
-	uaf_sink += __sync_fetch_and_add(page64, 1);
-	uaf_recovery_fails -= 1;
-	__sync_add_and_fetch(page64, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_sub(page64, 1);
-	uaf_recovery_fails -= 1;
-	__sync_sub_and_fetch(page64, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_and(page64, 1);
-	uaf_recovery_fails -= 1;
-	__sync_and_and_fetch(page64, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_or(page64, 1);
-	uaf_recovery_fails -= 1;
-	__sync_or_and_fetch(page64, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_fetch_and_xor(page64, 1);
-	uaf_recovery_fails -= 1;
-	__sync_xor_and_fetch(page64, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_val_compare_and_swap(page64, 0, 1);
-	uaf_recovery_fails -= 1;
-	uaf_sink += __sync_lock_test_and_set(page64, 1);
-	uaf_recovery_fails -= 1;
-
-	/*
-	 * The x86 JIT needs RAX for the CMPXCHG loop it lowers a fetching
-	 * AND/OR/XOR into, and substitutes BPF_REG_AX for r0 when r0 is either
-	 * operand. Only then does the fault fixup have to name that register,
-	 * so spell both forms out: clang picks its own and never produces them.
-	 *
-	 * The freed page is the first of the arena, whose 32-bit address is 0,
-	 * which would make "the address register was left alone" an empty
-	 * check. Use the page after it, which is unmapped as well.
-	 */
-	asm volatile (
-	"r0 = %[page];"
-	"r0 += 4096;"
-	"r0 = addr_space_cast(r0, 0x0, 0x1);"
-	"r1 = 1;"
-	"r2 = %[uaf_r0_before_dst_r0] ll;"
-	"r2 = addr_space_cast(r2, 0x0, 0x1);"
-	"*(u64 *)(r2 + 0) = r0;"
-	".8byte %[fetch_dst_r0];"
-	"r2 = %[uaf_r0_after_dst_r0] ll;"
-	"r2 = addr_space_cast(r2, 0x0, 0x1);"
-	"*(u64 *)(r2 + 0) = r0;"
-	"r2 = %[uaf_r1_after_dst_r0] ll;"
-	"r2 = addr_space_cast(r2, 0x0, 0x1);"
-	"*(u64 *)(r2 + 0) = r1;"
-	: : [page]"r"(page64),
-	    __imm_insn(fetch_dst_r0,
-		       BPF_ATOMIC_OP(BPF_DW, BPF_OR | BPF_FETCH, BPF_REG_0, BPF_REG_1, 0)),
-	    __imm_addr(uaf_r0_before_dst_r0),
-	    __imm_addr(uaf_r0_after_dst_r0),
-	    __imm_addr(uaf_r1_after_dst_r0)
-	: "r0", "r1", "r2", "memory");
-	uaf_recovery_fails -= 1;
-
-	asm volatile (
-	"r1 = %[page];"
-	"r1 += 4096;"
-	"r1 = addr_space_cast(r1, 0x0, 0x1);"
-	"r0 = 1;"
-	".8byte %[fetch_src_r0];"
-	"r2 = %[uaf_r0_after_src_r0] ll;"
-	"r2 = addr_space_cast(r2, 0x0, 0x1);"
-	"*(u64 *)(r2 + 0) = r0;"
-	: : [page]"r"(page64),
-	    __imm_insn(fetch_src_r0,
-		       BPF_ATOMIC_OP(BPF_DW, BPF_OR | BPF_FETCH, BPF_REG_1, BPF_REG_0, 0)),
-	    __imm_addr(uaf_r0_after_src_r0)
-	: "r0", "r1", "r2", "memory");
-	uaf_recovery_fails -= 1;
-
-	/*
-	 * If a fault were recovered by the arena mapping its zeroed scratch
-	 * page rather than by the JIT's exception table entry, the access above
-	 * would have succeeded and written there. The page has to still be
-	 * unmapped, so that the read faults and gives 0.
-	 */
-	asm volatile (
-	"r1 = %[page];"
-	"r1 += 4096;"
-	"r1 = addr_space_cast(r1, 0x0, 0x1);"
-	"r3 = *(u64 *)(r1 + 0);"
-	"r2 = %[uaf_reread] ll;"
-	"r2 = addr_space_cast(r2, 0x0, 0x1);"
-	"*(u64 *)(r2 + 0) = r3;"
-	: : [page]"r"(page64),
-	    __imm_addr(uaf_reread)
-	: "r1", "r2", "r3", "memory");
+	uaf_after = 1;
 #endif
 
 	return 0;
