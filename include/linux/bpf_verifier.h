@@ -384,6 +384,13 @@ struct bpf_func_state {
 	 * callback and its callees run in an RCU read-side critical section.
 	 */
 	bool in_rcu_callback_fn;
+	/*
+	 * RCU read and preemption disabled sections this frame entered and has
+	 * not left: the unwinder leaves them with the frame. A frame leaving a
+	 * section it did not enter leaves one of a caller's.
+	 */
+	u32 rcu_locks;
+	u32 preempt_locks;
 	/* For callback calling functions that limit number of possible
 	 * callback executions (e.g. bpf_loop) keeps track of current
 	 * simulated iteration number.
@@ -434,6 +441,8 @@ enum {
 	INSN_F_SRC_REG_STACK = BIT(2), /* src_reg is PTR_TO_STACK */
 
 	INSN_F_STACK_ARG_ACCESS = BIT(3),
+
+	INSN_F_UNWOUND = BIT(4), /* the callback of this call unwound: r0 is the callback's */
 };
 
 /* Registers linked to one jump condition that a history entry can record */
@@ -444,8 +453,8 @@ struct bpf_jmp_history_entry {
 	u32 idx : 20;
 	u32 frame : 4;	/* stack access frame number */
 	/* special INSN_F_xxx flags */
-	u32 flags : 4;
-	u32 : 4;
+	u32 flags : 5;
+	u32 : 3;
 	u32 prev_idx : 20;
 	u32 spi : 12;	/* stack slot index */
 	/*
@@ -764,6 +773,19 @@ struct bpf_insn_aux_data {
 		u64 insert_off;
 	};
 	struct btf_struct_meta *kptr_struct_meta;
+	/* frame descriptor of the frame this insn is executed or waited in, see frame_desc.c */
+	struct bpf_frame_desc_build *frame_desc;
+	/* unique slot of the reference this insn acquires, and the slot it clears as a release */
+	u8 ref_slot;		/* BPF_REF_SLOT_* */
+	bool ref_slot_needed;	/* a site lists the reference from its slot only */
+	bool ref_slot_clear;	/* the insn releases a reference kept in the slot at ref_slot_clear_off */
+	u16 ref_slot_resource;
+	s16 ref_slot_off;
+	s16 ref_slot_clear_off;
+	/* the type the call at this insn returned the reference it acquired as, NOT_INIT if none */
+	u32 acq_type;
+	u32 acq_btf_id;
+	struct btf *acq_btf;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	/*
 	 * Per-instruction summary of stack slots in the current frame
@@ -949,7 +971,10 @@ struct bpf_subprog_info {
 	 */
 	u32 exit_idx;
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
+	/* throw sites of this subprogram, moved to the JITed function's aux by jit_subprogs() */
+	struct bpf_frame_desc_table *frame_desc_table;
 	u16 stack_depth; /* max. stack depth used by this function */
+	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
 	u32 insns_total;
 	u32 insns_self;
@@ -1063,6 +1088,51 @@ struct bpf_fd_array {
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
+/* What a register or stack slot holds across the paths merged into a descriptor. */
+struct bpf_frame_desc_loc {
+	u8 state;
+	u8 nullable;
+	u16 res;
+	u32 acq;	/* insn that acquired the reference listed here */
+};
+
+/* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
+struct bpf_frame_desc_build {
+	u32 pc;		/* the instruction the frame is at */
+	u32 visits;
+	u16 nr_slots;
+	bool regs_saved;	/* the entry saves R0-R9 of this frame; otherwise it waits in a call */
+	u16 nr_fixed;
+	struct bpf_frame_desc_entry *fixed;	/* locks, IRQ flags and sections, equal on every path */
+	u16 nr_slot_acqs;
+	u32 *slot_acqs;	/* acquisitions whose unique slot this frame releases */
+	u16 nr_spills;
+	struct bpf_frame_desc_entry *spills;	/* the unique slots, laid out once reserved */
+	struct bpf_frame_desc_loc regs[BPF_REG_10];
+	struct bpf_frame_desc_loc slots[];
+};
+
+/* A release of a reference, recorded for the unique slot of its acquisition. */
+struct bpf_ref_release {
+	u32 rel;	/* releasing insn */
+	u32 acq;	/* acquiring insn */
+};
+
+/* The unique slot of the reference an insn acquires, see frame_desc.c. */
+enum {
+	BPF_REF_SLOT_NONE,
+	BPF_REF_SLOT_WANTED,		/* a site needs the reference in its slot */
+	BPF_REF_SLOT_RESERVED,
+	BPF_REF_SLOT_BAD,		/* the slot cannot be kept up to date */
+};
+
+/* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
+struct bpf_stack_init {
+	u32 subprog;
+	s16 off;
+	s32 imm;
+};
+
 struct bpf_verifier_env {
 	u32 insn_idx;
 	u32 prev_insn_idx;
@@ -1089,7 +1159,21 @@ struct bpf_verifier_env {
 	u32 insn_array_map_cnt;		/* number of used maps of type BPF_MAP_TYPE_INSN_ARRAY */
 	u32 id_gen;			/* used to generate unique reg IDs */
 	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
+	struct bpf_stack_init *stack_inits; /* hidden slot initializations, see bpf_stack_slot_init() */
+	u32 stack_init_cnt;
+	struct bpf_resource *resources;	/* resource classes of frame descriptors */
+	u32 resource_cnt;
+	u32 frame_desc_visits;			/* paths merged into frame descriptors */
+	u32 frame_desc_sites;			/* table entries */
+	u32 frame_desc_bytes;			/* tables, descriptors and resource classes */
+	u32 ref_slots;				/* unique slots reserved */
+	u32 ref_spills;				/* instructions keeping them up to date */
+	void *frame_desc_scratch;
+	struct bpf_ref_release *ref_releases;	/* releases, for the unique slots */
+	u32 ref_release_cnt;
+	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
+	int cancel_callback_subprog;	/* returns the cookie from the frame of a cancelled callback */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -1120,6 +1204,8 @@ struct bpf_verifier_env {
 	 */
 	struct bpf_func_ptr *func_ptrs;
 	u32 func_ptr_cnt;
+	/* frame descriptors of the throw sites, handed to prog->aux once verification succeeds */
+	struct bpf_frame_desc_pool *frame_desc_pool;
 	bool has_callx;
 	/*
 	 * Call graph edges created by callx instructions. A bitmap of
@@ -2003,6 +2089,22 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 
 /* Functions in fixups.c, called from bpf_check() */
 void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
+int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off);
+int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm);
+
+/* Functions in frame_desc.c */
+int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite);
+int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int id);
+int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
+int bpf_frame_desc_emit_slots(struct bpf_verifier_env *env);
+void bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 from, u32 to);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 from, u32 to, s16 r6_off);
+int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
+void bpf_frame_desc_adjust_tables(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 off,
+			     u32 len);
+void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux);
+void bpf_frame_desc_env_free(struct bpf_verifier_env *env);
 int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env);
 int bpf_optimize_bpf_loop(struct bpf_verifier_env *env);
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env);
