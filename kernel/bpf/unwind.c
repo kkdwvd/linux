@@ -141,6 +141,9 @@ noinline void bpf_unwind_release(const struct bpf_resource *res, void *loc, void
 	case BPF_RESOURCE_RINGBUF:
 		bpf_ringbuf_discard_proto.func((u64)(long)obj, 0, 0, 0, 0);
 		break;
+	case BPF_RESOURCE_CORO_FRAME:
+		bpf_coro_frame_free(obj);
+		break;
 	default:
 		WARN_ON_ONCE(1);
 	}

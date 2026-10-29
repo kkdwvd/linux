@@ -284,6 +284,11 @@ static int resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_st
 			goto unsupported;
 		res.kind = BPF_RESOURCE_RINGBUF;
 		break;
+	case PTR_TO_CORO_FRAME:
+		if (flags)
+			goto unsupported;
+		res.kind = BPF_RESOURCE_CORO_FRAME;
+		break;
 	default:
 		goto unsupported;
 	}
@@ -507,6 +512,7 @@ static bool resource_slottable(const struct bpf_resource *res)
 	case BPF_RESOURCE_KPTR:
 	case BPF_RESOURCE_SOCK:
 	case BPF_RESOURCE_RINGBUF:
+	case BPF_RESOURCE_CORO_FRAME:
 		return true;
 	default:
 		return false;

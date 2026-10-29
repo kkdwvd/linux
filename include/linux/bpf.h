@@ -1806,6 +1806,7 @@ enum bpf_resource_kind {
 	BPF_RESOURCE_IRQ_FLAG_LOCK, /* flags of an irqsave lock, restored with the lock */
 	BPF_RESOURCE_RCU,		/* bpf_rcu_read_lock() sections: bpf_rcu_read_unlock() each */
 	BPF_RESOURCE_PREEMPT,	/* bpf_preempt_disable() sections: bpf_preempt_enable() each */
+	BPF_RESOURCE_CORO_FRAME,	/* bpf_coro_frame_alloc() frame: bpf_coro_frame_free() */
 };
 
 /* A resource class of a program; descriptor entries refer to it by index. */
@@ -3045,6 +3046,7 @@ void bpf_obj_free_task_work(const struct btf_record *rec, void *obj);
 void bpf_obj_cancel_fields(struct bpf_map *map, void *obj);
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj);
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu);
+void bpf_coro_frame_free(void *p__coro_frame);
 void bpf_obj_drop_impl(void *p__alloc, void *meta__ign);
 void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign);
 void bpf_rcu_read_unlock(void);
