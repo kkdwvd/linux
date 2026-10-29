@@ -25,6 +25,7 @@
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/btf.h>
+#include <linux/btf_ids.h>
 #include <linux/kallsyms.h>
 #include <linux/sort.h>
 
@@ -219,6 +220,26 @@ static bool helper_ok(struct bpf_verifier_env *env, enum bpf_func_id func_id)
 	return env->ops->get_func_proto && env->ops->get_func_proto(func_id, env->prog);
 }
 
+/*
+ * Does @reg point to one of the socket structs of vmlinux BTF? A referenced
+ * one is the cast of an acquired socket by a helper such as
+ * bpf_skc_to_tcp_sock(), which carries the socket's reference under the
+ * struct's type.
+ */
+static bool reg_is_sock_btf(const struct bpf_reg_state *reg)
+{
+#ifdef CONFIG_NET
+	int i;
+
+	if (!btf_is_vmlinux(reg->btf))
+		return false;
+	for (i = 0; i < MAX_BTF_SOCK_TYPE; i++)
+		if (reg->btf_id == btf_sock_ids[i])
+			return true;
+#endif
+	return false;
+}
+
 /* Classify a register or spilled register that holds a reference. */
 static int resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
 {
@@ -241,6 +262,11 @@ static int resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_st
 		}
 		if (flags & ~PTR_TRUSTED)
 			goto unsupported;
+		/* A socket cast to one of its structs is still what bpf_sk_release() takes. */
+		if (reg_is_sock_btf(reg) && helper_ok(env, BPF_FUNC_sk_release)) {
+			res.kind = BPF_RESOURCE_SOCK;
+			break;
+		}
 		res.kind = BPF_RESOURCE_KPTR;
 		ret = resource_registry(env, reg->btf, reg->btf_id, &res, "object");
 		if (ret)

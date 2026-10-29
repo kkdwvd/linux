@@ -102,6 +102,7 @@ static void run_timer(struct exceptions_cleanup *skel)
 static void run_suite(const char *prefix)
 {
 	struct exceptions_cleanup *skel;
+	int server = -1;
 	char name[64];
 
 	skel = exceptions_cleanup__open();
@@ -115,6 +116,11 @@ static void run_suite(const char *prefix)
 		goto out;
 	if (!ASSERT_OK(exceptions_cleanup__attach(skel), "attach"))
 		goto out;
+	/* The listener throw_sock_cast looks up, on an ephemeral port. */
+	server = start_server(AF_INET, SOCK_STREAM, "127.0.0.1", 0, 0);
+	if (!ASSERT_OK_FD(server, "start_server"))
+		goto out;
+	skel->bss->server_port = get_socket_local_port(server);
 
 #define RUN_HOOK(pname, hook, n, released, sections, ordered, retval) do {	\
 	snprintf(name, sizeof(name), "%s%s", prefix, #pname);			\
@@ -129,6 +135,7 @@ static void run_suite(const char *prefix)
 	THROW(throw_obj_two, 2);
 	THROW(throw_ringbuf, 1);
 	THROW(throw_task, 1);
+	THROW(throw_sock_cast, 1);
 	THROW(throw_iter, 1);
 	THROW(throw_obj_maybe, 1);
 	THROW(throw_obj_caller, 1);
@@ -190,6 +197,8 @@ static void run_suite(const char *prefix)
 #undef RUN
 #undef RUN_HOOK
 out:
+	if (server >= 0)
+		close(server);
 	exceptions_cleanup__destroy(skel);
 }
 

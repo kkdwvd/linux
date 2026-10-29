@@ -43,4 +43,32 @@ int irq_flags_rank_differs_by_caller(struct __sk_buff *skb)
 	return r;
 }
 
+/*
+ * A socket cast to its struct by a helper carries the reference of the
+ * socket a lookup acquired: a site reached with the cast pointer live
+ * releases the socket from it.
+ */
+SEC("tc")
+__description("frame_desc: a throw with a socket cast to tcp_sock live")
+__success
+int sock_cast_at_throw(struct __sk_buff *skb)
+{
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *sk;
+	struct tcp_sock *tp;
+
+	sk = bpf_sk_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), -1, 0);
+	if (!sk)
+		return 0;
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (!tp) {
+		bpf_sk_release(sk);
+		return 0;
+	}
+	if (skb->len > 100)
+		bpf_throw(0);
+	bpf_sk_release((struct bpf_sock *)tp);
+	return 1;
+}
+
 char _license[] SEC("license") = "GPL";

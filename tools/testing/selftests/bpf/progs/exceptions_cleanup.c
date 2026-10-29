@@ -3,6 +3,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
 #include <bpf_arena_common.h>
@@ -170,6 +171,37 @@ int throw_task(struct __sk_buff *ctx)
 	if (ctx->len)
 		bpf_throw(0xeB9F);
 	bpf_task_release(t);
+	return 0;
+}
+
+/* Port, in network order, of the listener throw_sock_cast looks up. */
+__u16 server_port;
+
+/*
+ * A socket acquired by a lookup and cast to its struct by a helper, which
+ * carries the reference under the struct's type: released as the socket.
+ */
+SEC("tc")
+int throw_sock_cast(struct __sk_buff *ctx)
+{
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *skc;
+	struct tcp_sock *tp;
+
+	tuple.ipv4.daddr = bpf_htonl(0x7f000001);
+	tuple.ipv4.dport = server_port;
+	skc = bpf_skc_lookup_tcp(ctx, &tuple, sizeof(tuple.ipv4), -1, 0);
+	if (!skc)
+		return 1;
+	tp = bpf_skc_to_tcp_sock(skc);
+	if (!tp) {
+		bpf_sk_release(skc);
+		return 1;
+	}
+	mark_acquired(tp);
+	if (ctx->len)
+		bpf_throw(0xeB9F);
+	bpf_sk_release((struct bpf_sock *)tp);
 	return 0;
 }
 
