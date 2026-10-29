@@ -150,6 +150,26 @@ noinline void bpf_unwind_release(const struct bpf_resource *res, void *loc, void
 }
 
 /*
+ * The address of a register or stack location of a frame: @fp is the frame
+ * pointer, @callee_regs the frame's R6-R9, and @regs the register file of the
+ * site, which holds R0-R5 for the innermost frame only, or NULL. A register's
+ * value is copied to @reg. NULL when the register is not available.
+ */
+static void *frame_loc(u8 loc, s16 off, u64 fp, const struct bpf_throw_regs *regs,
+		       const u64 *callee_regs, u64 *reg)
+{
+	if (loc == BPF_FRAME_LOC_STACK)
+		return (void *)(long)(fp + off);
+	if (off >= BPF_REG_6)
+		*reg = callee_regs[off - BPF_REG_6];
+	else if (regs)
+		*reg = regs->r[off];
+	else
+		return NULL;
+	return reg;
+}
+
+/*
  * Release the resources of one frame of @prog during an unwind. @pc is an
  * address inside the instruction the frame is at, @fp the frame's BPF frame
  * pointer, @regs the register file saved at the throw site when this is the
@@ -171,6 +191,7 @@ void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
 	for (i = 0; i < d->nent; i++) {
 		const struct bpf_frame_desc_entry *ent = &d->ent[i];
 		const struct bpf_resource *res = &pool->resources[ent->res];
+		bool coro = ent->loc == BPF_FRAME_LOC_CORO;
 		void *loc;
 		u64 reg;
 		int n;
@@ -182,18 +203,20 @@ void bpf_unwind_frame(const struct bpf_prog *prog, unsigned long pc, u64 fp,
 				flags = NULL;
 			continue;
 		}
-		if (ent->loc == BPF_FRAME_LOC_STACK) {
-			loc = (void *)(long)(fp + ent->off);
-		} else if (ent->off >= BPF_REG_6) {
-			reg = callee_regs[ent->off - BPF_REG_6];
-			loc = &reg;
-		} else if (regs) {
-			reg = regs->r[ent->off];
-			loc = &reg;
-		} else {
-			WARN_ONCE(1, "bpf: no register file to release R%d of %s from\n", ent->off,
-				  prog->aux->name);
+		loc = frame_loc(coro ? ent->base_loc : ent->loc, coro ? ent->base_off : ent->off,
+				fp, regs, callee_regs, &reg);
+		if (!loc) {
+			WARN_ONCE(1, "bpf: no register file to release R%d of %s from\n",
+				  coro ? ent->base_off : ent->off, prog->aux->name);
 			continue;
+		}
+		/* A slot of a coroutine frame: the frame pointer at the base may be NULL. */
+		if (coro) {
+			void *frame = *(void **)loc;
+
+			if (!frame)
+				continue;
+			loc = frame + ent->off;
 		}
 		/* The flags of an irqsave lock precede the lock, which restores them. */
 		if (res->kind == BPF_RESOURCE_IRQ_FLAG_LOCK)

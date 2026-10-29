@@ -1191,6 +1191,16 @@ struct bpf_frame_desc_loc {
 	u32 acq;	/* insn that acquired the reference listed here */
 };
 
+/* What a slot of a coroutine frame holds across the paths merged into a descriptor. */
+struct bpf_frame_desc_coro_loc {
+	u32 base_acq;	/* insn that acquired the frame */
+	u16 slot;	/* index of the slot in the frame */
+	u8 cur_class;	/* what the path being merged found in the slot, see frame_desc.c */
+	u16 cur_res;
+	u32 cur_acq;
+	struct bpf_frame_desc_loc loc;
+};
+
 /* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
 struct bpf_frame_desc_build {
 	u32 pc;		/* the instruction the frame is at */
@@ -1203,6 +1213,8 @@ struct bpf_frame_desc_build {
 	u32 *slot_acqs;	/* acquisitions whose unique slot this frame releases */
 	u16 nr_spills;
 	struct bpf_frame_desc_entry *spills;	/* the unique slots, laid out once reserved */
+	u16 nr_coro;
+	struct bpf_frame_desc_coro_loc *coro;	/* slots of the coroutine frames listed here */
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
 	struct bpf_frame_desc_loc slots[];
 };

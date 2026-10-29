@@ -410,6 +410,10 @@ type's kfuncs are valid; see ``bpf_coro_cont_resume()``. A kfunc that fails
 after consuming the frame resumes it at once with the error reported in
 memory the coroutine can see.
 
+A continuation may be unwound like any callback the kernel runs, by
+``bpf_throw()`` or a cancellation; the references it holds in the frame's
+memory are then released through the frame, and the frame after them.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

@@ -21,6 +21,13 @@
  * location the paths agree on, which is what describes a reference whose
  * slot cannot be, and what describes iterators and dynptrs, which live in
  * stack slots of their own.
+ *
+ * A reference that only the memory of a coroutine frame holds, as the
+ * continuation of a suspended coroutine holds what the frame carried across
+ * the suspension, is listed from the frame's slot: the entry names the slot
+ * and the location the frame pointer is read from, which lists the frame
+ * itself, released last so that its slots are read first. Every slot of a
+ * listed frame is classified on every path, like a register or a stack slot.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -59,22 +66,32 @@ enum {
 #define ORDER_RCU_OBJ		-1
 #define ORDER_SECTION		-2
 #define ORDER_OBJ		-3
+#define ORDER_CORO_FRAME	-4	/* after the objects its slots held */
+#define MAX_CORO_CANDS		64	/* frame slots one reference may be found in at a site */
 
 /* What the frames above a frame hold, which limits what the frame may release. */
 #define HELD_SECTION		BIT(0)	/* an RCU or preemption section, or IRQ flags */
 #define HELD_LOCK		BIT(1)
 
+/* The kinds of location a reference may be listed from. */
+enum {
+	CAND_REG,
+	CAND_STACK,
+	CAND_CORO,	/* a slot of a coroutine frame listed at the site, see coro_loc() */
+};
+
 /* A candidate location of one reference on the current path. */
 struct cand {
-	u16 frameno;
-	u16 is_slot;
-	u16 idx;	/* register number or spi */
+	u16 frameno;	/* the frame whose descriptor lists the location */
+	u16 kind;
+	u16 idx;	/* register number, spi, or slot index in the coroutine frame */
 	u16 res;
+	u32 base_acq;	/* CAND_CORO: insn that acquired the coroutine frame */
 };
 
 /* Per-site working storage, allocated once per verification. */
 struct scratch {
-	struct cand cands[MAX_CALL_FRAMES * FRAME_LOCS];
+	struct cand cands[MAX_CALL_FRAMES * FRAME_LOCS + MAX_CORO_CANDS];
 	u8 class[MAX_CALL_FRAMES][FRAME_LOCS];
 	u16 res[MAX_CALL_FRAMES][FRAME_LOCS];
 	u32 acq[MAX_CALL_FRAMES][FRAME_LOCS];
@@ -85,6 +102,8 @@ struct scratch {
 	u16 nr_fixed[MAX_CALL_FRAMES];
 	u8 held_above[MAX_CALL_FRAMES];	/* HELD_* of the frames above each frame */
 	bool in_section[MAX_CALL_FRAMES];	/* a section is held by the frame or one above */
+	int *homes;	/* per reference: the frame listing the coroutine frame it is, or -1 */
+	u32 nr_homes;
 	int first;	/* the outermost frame the unwinder reaches from this site */
 };
 
@@ -120,6 +139,7 @@ static void build_destroy(struct bpf_frame_desc_build *b)
 	kvfree(b->fixed);
 	kvfree(b->slot_acqs);
 	kvfree(b->spills);
+	kvfree(b->coro);
 	kvfree(b);
 }
 
@@ -142,8 +162,12 @@ static int insn_subprog(struct bpf_verifier_env *env, u32 idx)
 
 void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 {
+	struct scratch *s = env->frame_desc_scratch;
+
 	kvfree(env->resources);
-	kvfree(env->frame_desc_scratch);
+	if (s)
+		kvfree(s->homes);
+	kvfree(s);
 	kvfree(env->ref_releases);
 	env->resources = NULL;
 	env->frame_desc_scratch = NULL;
@@ -537,18 +561,82 @@ static int build_add_slot(struct bpf_frame_desc_build *b, u32 acq)
 	return 0;
 }
 
+/* The record of slot @slot of the coroutine frame acquired at @acq in the descriptor of @b. */
+static struct bpf_frame_desc_coro_loc *coro_loc(struct bpf_frame_desc_build *b, u32 acq, u32 slot)
+{
+	int i;
+
+	for (i = 0; i < b->nr_coro; i++)
+		if (b->coro[i].base_acq == acq && b->coro[i].slot == slot)
+			return &b->coro[i];
+	return NULL;
+}
+
+/*
+ * Give the @nr slots of the coroutine frame acquired at @acq their records in
+ * the descriptor of @b. Every slot of a listed frame is classified on every
+ * path, so a slot without a record while the frame has others lay beyond the
+ * frame on an earlier path, and is never released.
+ */
+static int coro_frame_slots(struct bpf_frame_desc_build *b, u32 acq, u32 nr)
+{
+	bool seen = coro_loc(b, acq, 0);
+	struct bpf_frame_desc_coro_loc *c;
+	u32 k;
+
+	for (k = 0; k < nr; k++) {
+		if (coro_loc(b, acq, k))
+			continue;
+		if (b->nr_coro == U16_MAX)
+			return -E2BIG;
+		c = kvrealloc(b->coro, array_size(b->nr_coro + 1, sizeof(*c)), GFP_KERNEL_ACCOUNT);
+		if (!c)
+			return -ENOMEM;
+		b->coro = c;
+		c = &b->coro[b->nr_coro++];
+		memset(c, 0, sizeof(*c));
+		c->base_acq = acq;
+		c->slot = k;
+		if (seen)
+			c->loc.state = LOC_OTHER;
+	}
+	return 0;
+}
+
+/* What the paths merged so far put at candidate @c. */
+static struct bpf_frame_desc_loc *cand_loc(struct scratch *s, const struct cand *c)
+{
+	struct bpf_frame_desc_build *b = s->builds[c->frameno];
+
+	switch (c->kind) {
+	case CAND_REG:
+		return &b->regs[c->idx];
+	case CAND_STACK:
+		return &b->slots[c->idx];
+	default:
+		return &coro_loc(b, c->base_acq, c->idx)->loc;
+	}
+}
+
 /*
  * Rank a candidate location that no earlier path lists: a location another
- * path left NULL merges best, then a stack slot or a callee-saved register,
- * which outlive calls, before a caller-saved register. Lower is better.
+ * path left NULL merges best, then a slot of a coroutine frame, which keeps
+ * the reference while the function runs, then a stack slot or a callee-saved
+ * register, which outlive calls, before a caller-saved register. Lower is
+ * better.
  */
 static int cand_rank(const struct cand *c, const struct bpf_frame_desc_loc *loc)
 {
 	int rank = loc->state == LOC_NULL ? 0 : 4;
 
-	if (c->is_slot)
+	switch (c->kind) {
+	case CAND_CORO:
 		return rank;
-	return rank + (c->idx >= BPF_REG_6 ? 1 : 2);
+	case CAND_STACK:
+		return rank + 1;
+	default:
+		return rank + (c->idx >= BPF_REG_6 ? 2 : 3);
+	}
 }
 
 /*
@@ -559,7 +647,8 @@ static int cand_rank(const struct cand *c, const struct bpf_frame_desc_loc *loc)
  * prefer a location no earlier path has put a resource or a copy into, by rank
  * and then outermost frame first. Fails when earlier paths list it at two
  * candidates (-EEXIST), list something else at one (-EINVAL), or when no
- * candidate is free (-ENOENT).
+ * candidate is free (-ENOENT). The references a continuation inherits from a
+ * suspend call share its insn, so a listing is theirs by class as well.
  */
 static int choose(struct scratch *s, int nr, u32 acq)
 {
@@ -567,11 +656,10 @@ static int choose(struct scratch *s, int nr, u32 acq)
 
 	for (i = 0; i < nr; i++) {
 		const struct cand *c = &s->cands[i];
-		struct bpf_frame_desc_build *b = s->builds[c->frameno];
-		struct bpf_frame_desc_loc *loc = c->is_slot ? &b->slots[c->idx] : &b->regs[c->idx];
+		struct bpf_frame_desc_loc *loc = cand_loc(s, c);
 
 		if (loc->state == LOC_RES) {
-			if (loc->acq != acq)
+			if (loc->acq != acq || loc->res != c->res)
 				return -EINVAL;
 			if (chosen >= 0)
 				return -EEXIST;
@@ -670,17 +758,59 @@ static int entry_cmp(const void *a, const void *b)
 		return x->loc - y->loc;
 	if (x->off != y->off)
 		return x->off - y->off;
+	if (x->base_loc != y->base_loc)
+		return x->base_loc - y->base_loc;
+	if (x->base_off != y->base_off)
+		return x->base_off - y->base_off;
 	return x->res - y->res;
 }
 
+/* A coroutine frame goes last: the entries before it read its slots. */
 static s16 resource_order(const struct bpf_verifier_env *env, u16 res)
 {
+	if (env->resources[res].kind == BPF_RESOURCE_CORO_FRAME)
+		return ORDER_CORO_FRAME;
 	return env->resources[res].rcu ? ORDER_RCU_OBJ : ORDER_OBJ;
 }
 
 /*
+ * Where the descriptor of @b reads the pointer of the coroutine frame acquired
+ * at @acq from: the location listing the frame, or the frame's unique slot.
+ */
+static bool coro_base(const struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
+		      u32 acq, u8 *loc, s16 *off)
+{
+	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[acq];
+	int i;
+
+	for (i = 0; i < BPF_REG_10 + b->nr_slots; i++) {
+		const struct bpf_frame_desc_loc *l = i < BPF_REG_10 ? &b->regs[i] :
+								   &b->slots[i - BPF_REG_10];
+
+		if (l->state != LOC_RES || l->acq != acq ||
+		    env->resources[l->res].kind != BPF_RESOURCE_CORO_FRAME)
+			continue;
+		*loc = i < BPF_REG_10 ? BPF_FRAME_LOC_REG : BPF_FRAME_LOC_STACK;
+		*off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
+		return true;
+	}
+	if (aux->ref_slot != BPF_REF_SLOT_RESERVED ||
+	    env->resources[aux->ref_slot_resource].kind != BPF_RESOURCE_CORO_FRAME)
+		return false;
+	for (i = 0; i < b->nr_slot_acqs; i++) {
+		if (b->slot_acqs[i] != acq)
+			continue;
+		*loc = BPF_FRAME_LOC_STACK;
+		*off = aux->ref_slot_off;
+		return true;
+	}
+	return false;
+}
+
+/*
  * Lay out the entries of one descriptor: every listed location of the frame,
- * the locks, IRQ flags and sections it holds, and the unique slots it owns.
+ * the listed slots of the coroutine frames it holds, the locks, IRQ flags and
+ * sections it holds, and the unique slots it owns.
  */
 static u32 build_body(const struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
 		      struct bpf_frame_desc *d)
@@ -704,6 +834,26 @@ static u32 build_body(const struct bpf_verifier_env *env, const struct bpf_frame
 		ent->flags = loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0;
 		ent->res = loc->res;
 		ent->order = resource_order(env, loc->res);
+	}
+	for (i = 0; i < b->nr_coro; i++) {
+		const struct bpf_frame_desc_coro_loc *c = &b->coro[i];
+		u8 base_loc;
+		s16 base_off;
+
+		/* bpf_frame_desc_resolve() rejected a listed slot without a base. */
+		if (c->loc.state != LOC_RES ||
+		    !coro_base(env, b, c->base_acq, &base_loc, &base_off))
+			continue;
+		if (!d) {
+			n++;
+			continue;
+		}
+		d->ent[n++] = (struct bpf_frame_desc_entry) {
+			.loc = BPF_FRAME_LOC_CORO, .off = c->slot * BPF_REG_SIZE,
+			.flags = c->loc.nullable ? BPF_FRAME_ENT_NULLABLE : 0, .res = c->loc.res,
+			.order = resource_order(env, c->loc.res), .base_loc = base_loc,
+			.base_off = base_off,
+		};
 	}
 	if (d) {
 		for (i = 0; i < b->nr_fixed; i++)
@@ -939,7 +1089,7 @@ static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
 			ret = resource_of_lock(env, &frame->regs[k], kind);
 			if (ret < 0)
 				return ret;
-			s->cands[nr++] = (struct cand) { f, 0, k, ret };
+			s->cands[nr++] = (struct cand) { f, CAND_REG, k, ret };
 		}
 		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
 			const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
@@ -950,7 +1100,7 @@ static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
 			ret = resource_of_lock(env, &slot->spilled_ptr, kind);
 			if (ret < 0)
 				return ret;
-			s->cands[nr++] = (struct cand) { f, 1, k, ret };
+			s->cands[nr++] = (struct cand) { f, CAND_STACK, k, ret };
 		}
 	}
 	prev = fixed_find(s, st->curframe, order, &prev_frame);
@@ -960,15 +1110,15 @@ static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
 		c = &s->cands[k];
 		if (prev) {
 			if (c->frameno == prev_frame && c->res == prev->res &&
-			    prev->loc == (c->is_slot ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG) &&
-			    prev->off == (c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx)) {
+			    prev->loc == (c->kind == CAND_STACK ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG) &&
+			    prev->off == (c->kind == CAND_STACK ? -(c->idx + 1) * BPF_REG_SIZE : c->idx)) {
 				chosen = k;
 				break;
 			}
 			continue;
 		}
 		rank = (st->curframe - c->frameno) * 4;
-		rank += c->is_slot ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
+		rank += c->kind == CAND_STACK ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
 		if (rank < best) {
 			best = rank;
 			chosen = k;
@@ -981,8 +1131,8 @@ static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
 		return -EINVAL;
 	}
 	c = &s->cands[chosen];
-	ent.loc = c->is_slot ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG;
-	ent.off = c->is_slot ? -(c->idx + 1) * BPF_REG_SIZE : c->idx;
+	ent.loc = c->kind == CAND_STACK ? BPF_FRAME_LOC_STACK : BPF_FRAME_LOC_REG;
+	ent.off = c->kind == CAND_STACK ? -(c->idx + 1) * BPF_REG_SIZE : c->idx;
 	ent.res = c->res;
 	return fixed_add(env, s, c->frameno, ent);
 }
@@ -1207,15 +1357,37 @@ static int unheld(struct bpf_verifier_env *env, const struct bpf_reference_state
  * is one the program never reads again, which a path that ends in a throw
  * never has to release, so it is not left out: the slot is required, with
  * the class from the type its acquisition returned, and a throw it cannot
- * be released at is rejected, see unheld().
+ * be released at is rejected, see unheld(). A reference a continuation
+ * inherits can also be filled from the memory of a coroutine frame, which
+ * is a location when the frame is listed here. @home receives the frame
+ * whose descriptor lists the reference, for the slots of a coroutine frame.
  */
 static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
-		     const struct bpf_reference_state *ref, int nr)
+		     const struct bpf_reference_state *ref, int nr, int *home)
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[ref->insn_idx];
 	const char *why;
 	int k, res, chosen, af;
 
+	*home = -1;
+	af = frame_of_subprog(env, insn_subprog(env, ref->insn_idx));
+	/*
+	 * The unique slot is in the acquiring frame: a reference acquired in a
+	 * subprog that returned, or at the suspend call a continuation inherits
+	 * its references from, has none and is listed from a location only.
+	 */
+	if (af < 0 && aux->ref_slot != BPF_REF_SLOT_BAD) {
+		if (!nr) {
+			aux->ref_slot = BPF_REF_SLOT_BAD;
+			return unheld(env, ref, "was acquired in a subprog that returned");
+		}
+		if (aux->ref_slot_needed) {
+			verbose(env, "frame_desc: the reference acquired at insn %d was acquired in a subprog that returned, and no location describes it on every path\n",
+				ref->insn_idx);
+			return -EINVAL;
+		}
+		aux->ref_slot = BPF_REF_SLOT_BAD;
+	}
 	if (nr) {
 		res = s->cands[0].res;
 	} else if (aux->ref_slot == BPF_REF_SLOT_WANTED) {
@@ -1227,10 +1399,10 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		if (res < 0)
 			return res;
 	} else {
-		return unheld(env, ref, "cannot be released from a slot");
+		return unheld(env, ref, af < 0 ? "was acquired in a subprog that returned" :
+				     "cannot be released from a slot");
 	}
 
-	af = frame_of_subprog(env, insn_subprog(env, ref->insn_idx));
 	if (aux->ref_slot == BPF_REF_SLOT_NONE) {
 		if (resource_slottable(&env->resources[res]) &&
 		    env->prog->insnsi[ref->insn_idx].code == (BPF_JMP | BPF_CALL)) {
@@ -1241,8 +1413,7 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		}
 	}
 	if (aux->ref_slot == BPF_REF_SLOT_WANTED) {
-		why = af < 0 ? "was acquired in a subprog that returned" :
-		      af >= s->first ? release_blocker(env, s, af, res) : NULL;
+		why = af >= s->first ? release_blocker(env, s, af, res) : NULL;
 		if (why) {
 			if (!nr) {
 				aux->ref_slot = BPF_REF_SLOT_BAD;
@@ -1265,6 +1436,7 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		if (aux->ref_slot != BPF_REF_SLOT_WANTED)
 			return unheld(env, ref, "cannot be released from a slot");
 		aux->ref_slot_needed = true;
+		*home = af;
 		return 0;
 	}
 
@@ -1275,16 +1447,31 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 	      release_blocker(env, s, s->cands[chosen].frameno, res);
 	for (k = 0; k < nr; k++) {
 		const struct cand *c = &s->cands[k];
-		int idx = c->is_slot ? BPF_REG_10 + c->idx : c->idx;
+		int class = !why && k == chosen ? CLASS_RES : CLASS_COPY;
+		int idx;
 
-		s->class[c->frameno][idx] = !why && k == chosen ? CLASS_RES : CLASS_COPY;
+		if (c->kind == CAND_CORO) {
+			struct bpf_frame_desc_coro_loc *cl;
+
+			cl = coro_loc(s->builds[c->frameno], c->base_acq, c->idx);
+			cl->cur_class = class;
+			cl->cur_res = c->res;
+			cl->cur_acq = ref->insn_idx;
+			continue;
+		}
+		idx = c->kind == CAND_STACK ? BPF_REG_10 + c->idx : c->idx;
+		s->class[c->frameno][idx] = class;
 		s->res[c->frameno][idx] = c->res;
 		s->acq[c->frameno][idx] = ref->insn_idx;
 	}
-	if (!why)
+	if (!why) {
+		/* The slots of a coroutine frame are listed where the frame is. */
+		*home = af >= 0 ? af : s->cands[chosen].frameno;
 		return 0;
+	}
 	if (aux->ref_slot == BPF_REF_SLOT_WANTED) {
 		aux->ref_slot_needed = true;
+		*home = af;
 		return 0;
 	}
 	verbose(env, "frame_desc: reference id=%d (acquired at insn %d) %s\n", ref->id,
@@ -1311,6 +1498,70 @@ static int first_frame(struct bpf_verifier_state *st)
 }
 
 /*
+ * The live locations holding reference @ref on this path: registers and stack
+ * slots of the frames the unwinder reaches, and with @frames the slots of the
+ * coroutine frames listed at this site. Returns their number; @outermost is
+ * the outermost frame holding the reference, below the first one or not.
+ */
+static int collect(struct bpf_verifier_env *env, struct scratch *s,
+		   const struct bpf_reference_state *ref, bool frames, int *outermost)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int f, i, k, nr = 0, ret;
+
+	*outermost = INT_MAX;
+	for (f = 0; f <= st->curframe; f++) {
+		struct bpf_func_state *frame = st->frame[f];
+		const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+
+		for (k = 0; k < BPF_REG_10; k++) {
+			if (!(s->live_regs[f] & BIT(k)) || !reg_is_ref(&frame->regs[k], ref->id))
+				continue;
+			ret = resource_of_reg(env, &frame->regs[k]);
+			if (ret < 0)
+				return ret;
+			*outermost = min(*outermost, f);
+			if (f >= s->first)
+				s->cands[nr++] = (struct cand) { f, CAND_REG, k, ret };
+		}
+		/* Only the slots this state allocated hold anything. */
+		for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
+			if (!test_bit(k, live_stack))
+				continue;
+			ret = stack_slot_ref(env, bpf_stack_slot(frame, k), ref->id);
+			if (ret == -ENOENT)
+				continue;
+			if (ret < 0)
+				return ret;
+			*outermost = min(*outermost, f);
+			if (f >= s->first)
+				s->cands[nr++] = (struct cand) { f, CAND_STACK, k, ret };
+		}
+	}
+	if (!frames)
+		return nr;
+	for (i = 0; i < st->acquired_refs; i++) {
+		const struct bpf_reference_state *fr = &st->refs[i];
+		int home = s->homes[i];
+
+		if (home < 0)
+			continue;
+		for (k = 0; k < fr->nr_slots && nr < ARRAY_SIZE(s->cands); k++) {
+			const struct bpf_stack_state *slot = &fr->slots[k];
+
+			if (!bpf_is_spilled_reg(slot) || !reg_is_ref(&slot->spilled_ptr, ref->id))
+				continue;
+			ret = resource_of_reg(env, &slot->spilled_ptr);
+			if (ret < 0)
+				return ret;
+			*outermost = min(*outermost, home);
+			s->cands[nr++] = (struct cand) { home, CAND_CORO, k, ret, fr->insn_idx };
+		}
+	}
+	return nr;
+}
+
+/*
  * Record the state at a site where the program may be unwound. @regs_saved
  * says that the entry the unwinder is reached through saves R0-R9 of the
  * innermost frame; otherwise it is waiting in a call and only keeps R6-R9 and
@@ -1324,7 +1575,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct scratch *s = env->frame_desc_scratch;
-	int f, i, k, nr, ret;
+	int f, i, k, nr, pass, ret;
 
 	if (!s) {
 		s = kvzalloc_obj(*s, GFP_KERNEL_ACCOUNT);
@@ -1356,47 +1607,76 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved)
 	if (ret)
 		return ret;
 
-	/* List every reference the frames reached from here hold. */
-	for (i = 0; i < st->acquired_refs; i++) {
-		const struct bpf_reference_state *ref = &st->refs[i];
-		int outermost = INT_MAX;
+	if (st->acquired_refs > s->nr_homes) {
+		int *homes = kvrealloc(s->homes, array_size(st->acquired_refs, sizeof(*homes)),
+				       GFP_KERNEL_ACCOUNT);
 
-		if (ref->type != REF_TYPE_PTR)
-			continue;
-		nr = 0;
-		for (f = 0; f <= st->curframe; f++) {
-			struct bpf_func_state *frame = st->frame[f];
-			const unsigned long *live_stack = env->insn_aux_data[s->pcs[f]].live_stack_before;
+		if (!homes)
+			return -ENOMEM;
+		s->homes = homes;
+		s->nr_homes = st->acquired_refs;
+	}
+	for (f = s->first; f <= st->curframe; f++)
+		for (k = 0; k < s->builds[f]->nr_coro; k++)
+			s->builds[f]->coro[k].cur_class = CLASS_OTHER;
 
-			for (k = 0; k < BPF_REG_10; k++) {
-				if (!(s->live_regs[f] & BIT(k)) || !reg_is_ref(&frame->regs[k], ref->id))
-					continue;
-				ret = resource_of_reg(env, &frame->regs[k]);
-				if (ret < 0)
-					return ret;
-				s->cands[nr++] = (struct cand) { f, 0, k, ret };
-				outermost = min(outermost, f);
-			}
-			/* Only the slots this state allocated hold anything. */
-			for (k = 0; k < frame->allocated_stack / BPF_REG_SIZE; k++) {
-				if (!test_bit(k, live_stack))
-					continue;
-				ret = stack_slot_ref(env, bpf_stack_slot(frame, k), ref->id);
-				if (ret == -ENOENT)
-					continue;
-				if (ret < 0)
-					return ret;
-				s->cands[nr++] = (struct cand) { f, 1, k, ret };
-				outermost = min(outermost, f);
-			}
+	/*
+	 * List every reference the frames reached from here hold: the coroutine
+	 * frames first, since their slots are locations of what they hold.
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < st->acquired_refs; i++) {
+			const struct bpf_reference_state *ref = &st->refs[i];
+			int outermost, home;
+
+			if (!pass)
+				s->homes[i] = -1;
+			if (ref->type != REF_TYPE_PTR || !!ref->slots == !!pass)
+				continue;
+			nr = collect(env, s, ref, pass, &outermost);
+			if (nr < 0)
+				return nr;
+			/* Held by a frame below the first one: released with that frame. */
+			f = frame_of_subprog(env, insn_subprog(env, ref->insn_idx));
+			if ((f >= 0 ? f : outermost) < s->first)
+				continue;
+			ret = place_ref(env, s, ref, nr, &home);
+			if (ret)
+				return ret;
+			if (pass || home < 0)
+				continue;
+			/* Every slot of a listed frame gets its record before it is classified. */
+			s->homes[i] = home;
+			ret = coro_frame_slots(s->builds[home], ref->insn_idx, ref->nr_slots);
+			if (ret)
+				return ret;
 		}
-		/* A reference a frame below the first one holds is released with that frame. */
-		f = frame_of_subprog(env, insn_subprog(env, ref->insn_idx));
-		if ((f >= 0 ? f : outermost) < s->first)
+	}
+
+	/* What every slot of the coroutine frames listed here holds on this path. */
+	for (i = 0; i < st->acquired_refs; i++) {
+		const struct bpf_reference_state *fr = &st->refs[i];
+		struct bpf_frame_desc_build *b;
+
+		if (s->homes[i] < 0)
 			continue;
-		ret = place_ref(env, s, ref, nr);
-		if (ret)
-			return ret;
+		b = s->builds[s->homes[i]];
+		for (k = 0; k < b->nr_coro; k++) {
+			struct bpf_frame_desc_coro_loc *c = &b->coro[k];
+			int class = CLASS_OTHER;
+
+			if (c->base_acq != fr->insn_idx)
+				continue;
+			if (c->slot < fr->nr_slots) {
+				if (c->cur_class != CLASS_OTHER)
+					class = c->cur_class;
+				else if (stack_slot_is_null(&fr->slots[c->slot]))
+					class = CLASS_NULL;
+			}
+			ret = merge(env, &c->loc, class, c->cur_res, c->cur_acq);
+			if (ret)
+				return ret;
+		}
 	}
 
 	/* Classify the remaining live locations and merge every frame. */
@@ -1543,6 +1823,24 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 
 			if (loc->state == LOC_RES && aux[loc->acq].ref_slot == BPF_REF_SLOT_RESERVED)
 				loc->state = LOC_OTHER;
+		}
+		/* A slot of a coroutine frame is read through the frame's own listing. */
+		for (k = 0; k < b->nr_coro; k++) {
+			struct bpf_frame_desc_coro_loc *c = &b->coro[k];
+			u8 base_loc;
+			s16 base_off;
+
+			if (c->loc.state != LOC_RES)
+				continue;
+			if (aux[c->loc.acq].ref_slot == BPF_REF_SLOT_RESERVED) {
+				c->loc.state = LOC_OTHER;
+				continue;
+			}
+			if (!coro_base(env, b, c->base_acq, &base_loc, &base_off)) {
+				verbose(env, "frame_desc: insn %d: the reference acquired at insn %d is held in the coroutine frame acquired at insn %d, which is not listed with it\n",
+					b->pc, c->loc.acq, c->base_acq);
+				return -EINVAL;
+			}
 		}
 		if (!b->nr_slot_acqs)
 			continue;

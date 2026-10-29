@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/delay.h>
@@ -314,6 +315,29 @@ __bpf_kfunc int bpf_kfunc_coro_frames_stack(void *a__coro_frame, u64 b, u64 c,
 	kfree_nolock(a__coro_frame);
 	kfree_nolock(f__coro_frame);
 	return b + c + d + e;
+}
+
+static void bpf_testmod_coro_fini(struct bpf_coro_cont *cont)
+{
+	kfree(cont);
+}
+
+/*
+ * Suspend @frame and resume it before returning, so that the continuation
+ * runs inside the call, where a test observes what it does and what an
+ * unwind inside it releases.
+ */
+__bpf_kfunc void bpf_kfunc_coro_suspend_now(void *frame__coro_suspend, struct bpf_prog_aux *aux)
+{
+	struct bpf_coro_cont *cont = kmalloc(sizeof(*cont), GFP_ATOMIC);
+
+	if (!cont) {
+		/* The program is running: resume without holding it. */
+		bpf_coro_run(frame__coro_suspend);
+		return;
+	}
+	bpf_coro_cont_init(cont, frame__coro_suspend, aux, bpf_testmod_coro_fini);
+	bpf_coro_cont_resume_now(cont);
 }
 
 __bpf_kfunc u64 bpf_kfunc_arena_arg_test(u64 *val__arena)
@@ -1051,6 +1075,7 @@ BTF_ID_FLAGS(func, bpf_kfunc_common_test)
 BTF_ID_FLAGS(func, bpf_kfunc_coro_frames)
 BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_stack)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_suspend_now, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_arg_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_nullable_test)

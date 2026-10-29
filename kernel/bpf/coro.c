@@ -25,6 +25,7 @@ void bpf_coro_run(void *frame)
 	migrate_enable();
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL_GPL(bpf_coro_run);
 
 static void bpf_coro_cont_work(struct work_struct *work)
 {
@@ -50,15 +51,18 @@ void bpf_coro_cont_init(struct bpf_coro_cont *cont, void *frame, struct bpf_prog
 	cont->fini = fini;
 	INIT_WORK(&cont->work, bpf_coro_cont_work);
 }
+EXPORT_SYMBOL_GPL(bpf_coro_cont_init);
 
 /* Resume from BH context on this CPU; callable from any context. */
 void bpf_coro_cont_resume(struct bpf_coro_cont *cont)
 {
 	WARN_ON_ONCE(!queue_work(system_bh_highpri_wq, &cont->work));
 }
+EXPORT_SYMBOL_GPL(bpf_coro_cont_resume);
 
 /* Resume right here, from a context that already allows running programs. */
 void bpf_coro_cont_resume_now(struct bpf_coro_cont *cont)
 {
 	bpf_coro_cont_work(&cont->work);
 }
+EXPORT_SYMBOL_GPL(bpf_coro_cont_resume_now);

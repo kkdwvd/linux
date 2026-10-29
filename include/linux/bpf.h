@@ -1829,21 +1829,27 @@ enum {
 	BPF_FRAME_LOC_REG,	/* off is a register number */
 	BPF_FRAME_LOC_STACK,	/* off is a frame pointer relative stack offset */
 	BPF_FRAME_LOC_NONE,	/* no location: a lock at res->addr, or off sections to leave */
+	BPF_FRAME_LOC_CORO,	/* off is a byte offset in the coroutine frame read from the base */
 };
 
 #define BPF_FRAME_ENT_NULLABLE	BIT(0)	/* the location may hold NULL instead */
 
 /*
  * One resource of a frame: the value at a location, or a stack object at it.
- * Entries are laid out in release order: locks and IRQ flags first, latest
- * acquired first, then RCU-protected objects, sections, and other objects.
+ * A BPF_FRAME_LOC_CORO entry is the value in a slot of a coroutine frame whose
+ * pointer is read from the base, a register or stack location that may hold
+ * NULL. Entries are laid out in release order: locks and IRQ flags first,
+ * latest acquired first, then RCU-protected objects, sections, other objects,
+ * and the coroutine frames last, after the slots read through them.
  */
 struct bpf_frame_desc_entry {
 	u8 loc;
-	u8 flags;
+	u8 base_loc;	/* BPF_FRAME_LOC_CORO: where the frame pointer is read from */
 	u16 res;	/* index into the program's resource classes */
 	s16 off;
 	s16 order;	/* rank in the frame, or one of the negative ranks in frame_desc.c */
+	s16 base_off;
+	u16 flags;
 };
 
 struct bpf_frame_desc {

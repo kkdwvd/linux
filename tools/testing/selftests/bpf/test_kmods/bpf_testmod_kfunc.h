@@ -331,6 +331,10 @@ int bpf_kfunc_coro_frames(__u64 cookie, void *a, void *b, __u64 *rdonly_buf) __k
 void bpf_kfunc_coro_frames_release(void *a, void *b) __ksym;
 int bpf_kfunc_coro_frames_stack(void *a, __u64 b, __u64 c, __u64 d, __u64 e,
 				void *f) __ksym;
+#ifndef __KERNEL__
+/* The verifier supplies the program's aux as the second argument. */
+extern void bpf_kfunc_coro_suspend_now(void *frame) __ksym;
+#endif
 
 int bpf_kfunc_init_sock(struct init_sock_args *args) __ksym;
 void bpf_kfunc_close_sock(void) __ksym;
