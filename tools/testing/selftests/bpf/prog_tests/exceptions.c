@@ -86,6 +86,7 @@ static void test_exceptions_success(void)
 	RUN_SUCCESS(exception_bad_assert_range, 0);
 	RUN_SUCCESS(exception_bad_assert_range_with, 10);
 	RUN_SUCCESS(exception_throw_from_void_global, 11);
+	RUN_SUCCESS(exception_noreturn_call, 16);
 
 	if (skel->rodata->has_stack_arg) {
 		RUN_SUCCESS(exception_throw_stack_arg, 56);
@@ -199,6 +200,26 @@ static void test_exceptions_success(void)
 				goto done;
 		}), "", ({ RUN_SUCCESS(exception_ext, 128); }));
 
+	if (test__start_subtest("extension -> global func that does not return"))
+		RUN_EXT(-EINVAL, true, ({
+			prog = eskel->progs.extension;
+			bpf_program__set_autoload(prog, true);
+			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
+				       bpf_program__fd(skel->progs.exception_noreturn_call),
+				       "exception_noreturn_global"), "set_attach_target"))
+				goto done;
+		}), "Extension cannot replace a function whose callers expect it not to return", 0);
+
+	if (test__start_subtest("throwing extension -> global func that does not return"))
+		RUN_EXT(-EINVAL, true, ({
+			prog = eskel->progs.throwing_extension;
+			bpf_program__set_autoload(prog, true);
+			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
+				       bpf_program__fd(skel->progs.exception_noreturn_call),
+				       "exception_noreturn_global"), "set_attach_target"))
+				goto done;
+		}), "Extension cannot replace a function whose callers expect it not to return", 0);
+
 	if (test__start_subtest("non-throwing fentry -> non-throwing subprog"))
 		/* non-throwing fentry -> non-throwing subprog : OK */
 		RUN_EXT(0, false, ({
@@ -265,27 +286,26 @@ static void test_exceptions_success(void)
 				goto done;
 		}), "", 0);
 
+	/* bpf_throw would unwind over the trampoline of the fexit, which never returns then */
 	if (test__start_subtest("non-throwing fexit -> throwing subprog"))
-		/* non-throwing fexit -> throwing subprog : OK */
-		RUN_EXT(0, false, ({
+		RUN_EXT(-EINVAL, true, ({
 			prog = eskel->progs.pfexit;
 			bpf_program__set_autoload(prog, true);
 			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
 				       bpf_program__fd(skel->progs.exception_throw_subprog),
 				       "throwing_subprog"), "set_attach_target"))
 				goto done;
-		}), "", 0);
+		}), "Only fentry can attach to throwing_subprog, which might throw", 0);
 
 	if (test__start_subtest("throwing fexit -> throwing subprog"))
-		/* throwing fexit -> throwing subprog : OK */
-		RUN_EXT(0, false, ({
+		RUN_EXT(-EINVAL, true, ({
 			prog = eskel->progs.throwing_fexit;
 			bpf_program__set_autoload(prog, true);
 			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
 				       bpf_program__fd(skel->progs.exception_throw_subprog),
 				       "throwing_subprog"), "set_attach_target"))
 				goto done;
-		}), "", 0);
+		}), "Only fentry can attach to throwing_subprog, which might throw", 0);
 
 	/* fmod_ret not allowed for subprog - Check so we remember to handle its
 	 * throwing specification compatibility with target when supported.

@@ -27,6 +27,26 @@
 #define KFUNC_DECL_TAG		"bpf_kfunc"
 #define FASTCALL_DECL_TAG	"bpf_fastcall"
 
+/*
+ * The kfuncs of is_sync_callback_calling_kfunc() in the verifier. They call
+ * their callback and leave the way it leaves, so a C++ callback may throw
+ * through them: not noexcept.
+ */
+static const char * const sync_callback_calling_kfuncs[] = {
+	"bpf_rbtree_add",
+	"bpf_rbtree_add_impl",
+};
+
+static bool kfunc_calls_sync_callback(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(sync_callback_calling_kfuncs); i++)
+		if (strcmp(name, sync_callback_calling_kfuncs[i]) == 0)
+			return true;
+	return false;
+}
+
 #define MAX_ROOT_IDS		16
 #define MAX_BTF_FILES		64
 #define MAX_LOC_PARAM_WORDS	8
@@ -893,7 +913,8 @@ static int dump_btf_kfuncs(struct btf_dump *d, const struct btf *btf)
 		if (err)
 			goto out;
 
-		printf(" __weak __ksym;\n");
+		printf("%s __weak __ksym;\n",
+		       kfunc_calls_sync_callback(opts.field_name) ? "" : " __bpf_noexcept");
 	}
 
 	printf("#endif\n\n");
@@ -1109,6 +1130,9 @@ static int dump_btf_c(const struct btf *btf,
 	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
 	printf("#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)\n");
 	printf("#endif\n\n");
+	printf("#ifdef __cplusplus\n");
+	printf("extern \"C\" {\n");
+	printf("#endif\n\n");
 	printf("#ifndef __ksym\n");
 	printf("#define __ksym __attribute__((section(\".ksyms\")))\n");
 	printf("#endif\n\n");
@@ -1120,6 +1144,19 @@ static int dump_btf_c(const struct btf *btf,
 	printf("#define __bpf_fastcall __attribute__((bpf_fastcall))\n");
 	printf("#else\n");
 	printf("#define __bpf_fastcall\n");
+	printf("#endif\n");
+	printf("#endif\n\n");
+	/*
+	 * C++ compiled with exceptions follows a call that may throw with
+	 * unwind_goto, which the verifier accepts only after a call of
+	 * something that can unwind. Kfuncs don't throw, except that the ones
+	 * that call a sync callback leave the way the callback leaves.
+	 */
+	printf("#ifndef __bpf_noexcept\n");
+	printf("#ifdef __cplusplus\n");
+	printf("#define __bpf_noexcept noexcept\n");
+	printf("#else\n");
+	printf("#define __bpf_noexcept\n");
 	printf("#endif\n");
 	printf("#endif\n\n");
 
@@ -1151,6 +1188,9 @@ static int dump_btf_c(const struct btf *btf,
 			goto done;
 	}
 
+	printf("#ifdef __cplusplus\n");
+	printf("} /* extern \"C\" */\n");
+	printf("#endif\n\n");
 	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
 	printf("#pragma clang attribute pop\n");
 	printf("#endif\n");

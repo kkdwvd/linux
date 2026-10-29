@@ -46,9 +46,13 @@ static __noinline int add1(int v)
 }
 
 /*
- * Pointers to functions and to data in read-only data of a program with callx.
- * Volatile, so that the compiler doesn't replace the pointers with what
- * they point to.
+ * Pointers to functions and to data in read-only data, which is in arena like
+ * the rest of the data. [WIP] The pointer to a function holds the JITed
+ * address of a copy of the function in the first program loaded that has one:
+ * a program that calls through numbers, or one that takes the address of the
+ * function, whether or not it calls through the pointer, see func_addrs.
+ * Volatile, so that the compiler doesn't replace the pointers with what they
+ * point to.
  */
 static const volatile struct {
 	op_fn fn;
@@ -56,17 +60,90 @@ static const volatile struct {
 	const char *name;
 } ops SEC(".data.rel.ro") = { add1, &x, hello };
 
+/* what the program loaded from ops.fn */
+unsigned long ops_fn;
+
 SEC("syscall")
 int use_ops(void *ctx)
 {
 	/* a program has the arena when its code refers to it */
 	counter++;
-#ifdef __clang__
-	return ops.fn(*ops.data) + ops.name[1];
-#else
-	/* gcc doesn't support indirect calls */
-	return add1(*ops.data) + ops.name[1];
-#endif
+	ops_fn = (unsigned long)ops.fn;
+	return *ops.data + 1 + ops.name[1];
+}
+
+/*
+ * [WIP] Pointers to functions in data, in a program that doesn't call through
+ * them: a slot that holds the address of a static function, like the
+ * terminate handler of the C++ runtime, and the addresses that ld_imm64 takes.
+ * The slot is filled with the JITed address of the copy of the function that
+ * the program got for arena data, and ld_imm64 takes the address of the same
+ * copy. An address compares equal however it is obtained: loaded from the
+ * slot, taken in code, or stored to the slot and loaded back.
+ */
+typedef void (*handler_fn)(void);
+
+static __noinline void default_handler(void)
+{
+	counter += 1;
+}
+
+static __noinline void other_handler(void)
+{
+	counter += 10;
+}
+
+/*
+ * Its address is taken in code that the verifier doesn't reach, and it's in
+ * a slot: the kernel verifies and keeps it all the same, and the slot is
+ * filled
+ */
+static __noinline void dead_handler(void)
+{
+	counter += 100;
+}
+
+/*
+ * In a section of its own, as the C++ runtime's handler is. Volatile: the
+ * program loads what it stored, the compiler doesn't know it. Not of the
+ * typedef, which the skeleton wouldn't have.
+ */
+void (*volatile handler)(void) SEC(".data.handler") = default_handler;
+void (*volatile dead_slot)(void) SEC(".data.handler") = dead_handler;
+/* the initial slot, the addresses that ld_imm64 took, the slot after the store */
+unsigned long handler_initial, handler_default, handler_other, handler_stored;
+
+SEC("syscall")
+int func_addrs(void *ctx)
+{
+	unsigned long zero = 0;
+	handler_fn prev;
+
+	/* the compiler doesn't know zero, the verifier does: dead code to it */
+	asm volatile("" : "+r"(zero));
+	if (zero)
+		dead_slot = dead_handler;
+
+	handler_initial = (unsigned long)handler;
+	handler_default = (unsigned long)default_handler;
+	handler_other = (unsigned long)other_handler;
+	if (!handler_initial)
+		return 1;
+	if (handler != default_handler)
+		return 2;
+	prev = handler;
+	handler = other_handler;
+	if (prev != default_handler)
+		return 3;
+	handler_stored = (unsigned long)handler;
+	if (handler != other_handler)
+		return 4;
+	handler = default_handler;
+	/* the pointer in read-only data, too */
+	ops_fn = (unsigned long)ops.fn;
+	if (ops.fn != add1)
+		return 5;
+	return 0;
 }
 
 SEC("syscall")
@@ -87,8 +164,8 @@ int use_ptrs(void *ctx)
 		return 3;
 	if (str[0] != 'h' || str[4] != 'o' || str[5])
 		return 4;
-	/* the literal is in a map */
-	if (bpf_strncmp(local, sizeof(local), "abc"))
+	/* a plain literal is in arena, which a helper can't read */
+	if (bpf_strncmp(local, sizeof(local), BPF_CONST_STR("abc")))
 		return 5;
 	return 0;
 }

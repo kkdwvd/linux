@@ -1759,6 +1759,8 @@ struct bpf_func_info_aux {
 	bool called[BPF_FUNC_CTX_CNT];
 	bool verified[BPF_FUNC_CTX_CNT];
 	bool called_with_pkt_ptrs;
+	/* a caller has nothing to continue with after the call */
+	bool called_as_noreturn;
 };
 
 enum bpf_jit_poke_reason {
@@ -1989,6 +1991,8 @@ struct bpf_prog_aux {
 	bool has_prologue;
 	bool might_sleep;
 	bool can_unwind;
+	/* bpf_throw may run with the frame of this subprog on the stack */
+	bool might_throw;
 	bool kprobe_write_ctx;
 	/* has insns that work with the arena base, see bpf_prog_has_arena_insns() */
 	bool uses_arena_insns;

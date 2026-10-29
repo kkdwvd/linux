@@ -384,7 +384,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (opcode_info->can_fallthrough)
+	if (opcode_info->can_fallthrough && !bpf_call_ends_subprog(env, idx))
 		succ->items[succ->cnt++] = idx + insn_sz;
 
 	if (opcode_info->can_jump)
@@ -395,9 +395,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	 * from the subprogram, which is a hidden edge to its exit. A subprogram
 	 * without an exit insn has no exit to model.
 	 */
-	if (unlikely((bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
-		     (BPF_CLASS(insn->code) == BPF_LD &&
-		      (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND)))) {
+	if (unlikely(bpf_insn_has_hidden_exit(insn))) {
 		u32 exit_idx = bpf_find_containing_subprog(env, idx)->exit_idx;
 
 		if (exit_idx != U32_MAX)
@@ -562,9 +560,12 @@ bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 half_sp
 		/* Get callsite from verifier state, not from instance callchain */
 		callsite = q->callsites[i];
 
-		alive = callee_stack_access_at_callsite(env, callsite)
-			? is_live_before(instance, callsite, rel, half_spi)
-			: is_live_before(instance, callsite + 1, rel, half_spi);
+		if (callee_stack_access_at_callsite(env, callsite))
+			alive = is_live_before(instance, callsite, rel, half_spi);
+		else if (callsite + 1 < instance->subprog_start + instance->insn_cnt)
+			alive = is_live_before(instance, callsite + 1, rel, half_spi);
+		else
+			alive = false; /* the call ends the subprog, nothing follows it */
 		if (alive)
 			return true;
 	}

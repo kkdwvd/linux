@@ -1605,6 +1605,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->changes_pkt_data = env->subprog_info[i].changes_pkt_data;
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
+		func[i]->aux->might_throw = env->subprog_info[i].might_throw;
 		func[i]->aux->async_cb = env->subprog_info[i].is_async_cb;
 		func[i]->aux->token = prog->aux->token;
 		func[i] = bpf_int_jit_compile(env, func[i]);

@@ -162,7 +162,11 @@ typedef union union_fwd union_fwd_t;
 
 typedef union union_fwd *union_fwd_ptr_t;
 
-struct struct_empty {};
+struct struct_empty {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
 struct struct_simple {
 	int a;
@@ -178,7 +182,11 @@ struct struct_simple {
 	enum e2 arr2[5];
 };
 
-union union_empty {};
+union union_empty {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
 union union_simple {
 	void *ptr;
@@ -207,9 +215,17 @@ struct struct_in_struct {
 	};
 };
 
-struct struct_in_array {};
+struct struct_in_array {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
-struct struct_in_array_typed {};
+struct struct_in_array_typed {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
 typedef struct struct_in_array_typed struct_in_array_t[2];
 

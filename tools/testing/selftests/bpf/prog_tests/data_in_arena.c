@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <sys/mman.h>
 #include <test_progs.h>
+#include <bpf/btf.h>
 #include "data_in_arena.skel.h"
 #include "data_in_arena_decl.skel.h"
 #include "data_in_arena_fail.skel.h"
@@ -12,6 +14,39 @@ static int run_prog(struct bpf_program *prog)
 	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &topts), "test_run"))
 		return -1;
 	return topts.retval;
+}
+
+/* The BTF type of the function of the loaded program at the JITed address, 0 if none */
+static __u32 jited_func_type(struct bpf_program *prog, unsigned long addr)
+{
+	struct bpf_func_info finfo[16];
+	struct bpf_prog_info info = {};
+	__u32 len = sizeof(info), i;
+	__u64 ksyms[16];
+
+	info.nr_jited_ksyms = ARRAY_SIZE(ksyms);
+	info.jited_ksyms = ptr_to_u64(ksyms);
+	info.nr_func_info = ARRAY_SIZE(finfo);
+	info.func_info_rec_size = sizeof(finfo[0]);
+	info.func_info = ptr_to_u64(finfo);
+	if (bpf_prog_get_info_by_fd(bpf_program__fd(prog), &info, &len) ||
+	    info.nr_jited_ksyms > ARRAY_SIZE(ksyms) || info.nr_jited_ksyms != info.nr_func_info)
+		return 0;
+	for (i = 0; i < info.nr_jited_ksyms; i++)
+		if (ksyms[i] == addr)
+			return finfo[i].type_id;
+	return 0;
+}
+
+/* Whether the address is that of a JITed function of a loaded program of the object */
+static bool jited_func(struct bpf_object *obj, unsigned long addr)
+{
+	struct bpf_program *prog;
+
+	bpf_object__for_each_program(prog, obj)
+		if (bpf_program__fd(prog) >= 0 && jited_func_type(prog, addr))
+			return true;
+	return false;
 }
 
 static void run(struct data_in_arena *skel, int counter)
@@ -47,6 +82,7 @@ static void test_in_arena(void)
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.data), "data autocreate");
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.bss), "bss autocreate");
 	ASSERT_FALSE(bpf_map__autocreate(skel->maps.rodata), "rodata autocreate");
+	ASSERT_FALSE(bpf_map__autocreate(skel->maps.data_rel_ro), "data_rel_ro autocreate");
 	ASSERT_EQ(bpf_map__set_autocreate(skel->maps.data, true), -EOPNOTSUPP, "set_autocreate");
 	ASSERT_EQ(bpf_map__set_value_size(skel->maps.bss, 4096), -EOPNOTSUPP, "set_value_size");
 	ASSERT_EQ(bpf_map__initial_value(skel->maps.data, &sz), skel->data, "initial_value");
@@ -62,11 +98,15 @@ static void test_in_arena(void)
 	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.bss), &info, &len), "bss map");
 	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.rodata), &info, &len),
 		   "rodata map");
+	ASSERT_ERR(bpf_map_get_info_by_fd(bpf_map__fd(skel->maps.data_rel_ro), &info, &len),
+		   "data_rel_ro map");
 	run(skel, 100);
 
-	/* pointers to data next to pointers to functions */
+	/* read-only data with pointers to data and to functions */
 	ASSERT_EQ(run_prog(skel->progs.use_ops), 42 + 1 + 'e', "use_ops");
 	ASSERT_EQ(skel->data->counter, 102, "counter");
+	/* [WIP] the pointer to a function is a JITed function of a program of the object */
+	ASSERT_TRUE(jited_func(skel->obj, skel->bss->ops_fn), "ops.fn");
 
 	/* alignment of sections and pointers to data in data */
 	ASSERT_EQ((unsigned long)&skel->bss->aligned64 % 64, 0, "alignment");
@@ -78,6 +118,66 @@ static void test_in_arena(void)
 	/* format strings of bpf_printk() and BPF_SNPRINTF() */
 	ASSERT_EQ(run_prog(skel->progs.use_printk), sizeof("43-7"), "use_printk");
 	ASSERT_STREQ(skel->bss->out, "43-7", "out");
+out:
+	data_in_arena__destroy(skel);
+}
+
+/*
+ * [WIP] A program that stores and compares the addresses of functions, and
+ * reads the slots in data that hold them, without calling through them. The
+ * slots are filled with the JITed addresses of copies of the functions in the
+ * program, which have a BTF FUNC of their own, and ld_imm64 in the program
+ * takes the addresses of the same copies, so the addresses compare equal
+ * however they are obtained. The program is the only one loaded, so that the
+ * copies are its own.
+ */
+static void test_func_addrs(void)
+{
+	struct data_in_arena *skel;
+	struct bpf_program *prog;
+	__u32 slot_id;
+	int func_id;
+
+	skel = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel, "open"))
+		return;
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, prog == skel->progs.func_addrs);
+	if (!ASSERT_OK(data_in_arena__load(skel), "load"))
+		goto out;
+
+	ASSERT_EQ(run_prog(skel->progs.func_addrs), 0, "func_addrs");
+	ASSERT_NEQ(skel->bss->handler_initial, 0, "handler initial");
+	ASSERT_EQ(skel->bss->handler_initial, skel->bss->handler_default, "initial is default");
+	ASSERT_EQ(skel->bss->handler_stored, skel->bss->handler_other, "stored is other");
+	ASSERT_NEQ(skel->bss->handler_default, skel->bss->handler_other, "two functions");
+	ASSERT_EQ((unsigned long)skel->data_handler->handler, skel->bss->handler_default,
+		  "slot after run");
+	/* nothing was called */
+	ASSERT_EQ(skel->data->counter, 5, "counter");
+
+	/* the slot held a copy of default_handler, with a FUNC of its own */
+	func_id = btf__find_by_name_kind(bpf_object__btf(skel->obj), "default_handler",
+					 BTF_KIND_FUNC);
+	slot_id = jited_func_type(skel->progs.func_addrs, skel->bss->handler_initial);
+	if (!ASSERT_GT(func_id, 0, "default_handler") || !ASSERT_NEQ(slot_id, 0, "slot func"))
+		goto out;
+	ASSERT_NEQ(slot_id, func_id, "a copy for arena data");
+	ASSERT_STREQ(btf__name_by_offset(bpf_object__btf(skel->obj),
+					 btf__type_by_id(bpf_object__btf(skel->obj), slot_id)->name_off),
+		     "default_handler", "copy name");
+	ASSERT_NEQ(jited_func_type(skel->progs.func_addrs, skel->bss->handler_other), 0,
+		   "other_handler");
+	ASSERT_NEQ(jited_func_type(skel->progs.func_addrs, skel->bss->ops_fn), 0, "ops.fn");
+
+	/* the address of dead_handler is taken in dead code only, and its slot is filled */
+	slot_id = jited_func_type(skel->progs.func_addrs,
+				  (unsigned long)skel->data_handler->dead_slot);
+	if (ASSERT_NEQ(slot_id, 0, "dead_slot"))
+		ASSERT_STREQ(btf__name_by_offset(bpf_object__btf(skel->obj),
+						 btf__type_by_id(bpf_object__btf(skel->obj),
+								 slot_id)->name_off),
+			     "dead_handler", "dead_slot name");
 out:
 	data_in_arena__destroy(skel);
 }
@@ -106,7 +206,10 @@ out:
 	data_in_arena_decl__destroy(skel);
 }
 
-/* A pointer in data that can't be made an address of arena fails the load */
+/*
+ * A pointer in data that can't be made an address of arena fails the load:
+ * one to per-CPU data, which is a map of its own
+ */
 static void test_ptr_to_map(void)
 {
 	struct data_in_arena_fail *skel;
@@ -114,7 +217,7 @@ static void test_ptr_to_map(void)
 	skel = data_in_arena_fail__open();
 	if (!ASSERT_OK_PTR(skel, "open"))
 		return;
-	ASSERT_ERR(data_in_arena_fail__load(skel), "load");
+	ASSERT_EQ(data_in_arena_fail__load(skel), -LIBBPF_ERRNO__RELOC, "load");
 	data_in_arena_fail__destroy(skel);
 }
 
@@ -167,6 +270,119 @@ out:
 	data_in_arena__destroy(skel);
 }
 
+#if defined(__aarch64__)
+#define ARENA_ADDR (1ull << 32)
+#else
+#define ARENA_ADDR (1ull << 44)
+#endif
+#define ARENA_PAGES 4
+
+/*
+ * With map_extra the address of an arena that libbpf doesn't create is known. libbpf doesn't
+ * write to such arena, so the data goes there from bpf_map__initial_value().
+ */
+static void test_reused_arena_at(void)
+{
+	LIBBPF_OPTS(bpf_map_create_opts, opts, .map_flags = BPF_F_MMAPABLE,
+		    .map_extra = ARENA_ADDR);
+	size_t page_sz = getpagesize(), arena_sz = ARENA_PAGES * page_sz, sz, off;
+	struct data_in_arena__data *data;
+	void *image, *base = MAP_FAILED;
+	struct data_in_arena *skel;
+	struct bpf_map *arena;
+	int fd = -1;
+
+	skel = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel, "open"))
+		return;
+	arena = bpf_object__find_map_by_name(skel->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	fd = bpf_map_create(BPF_MAP_TYPE_ARENA, "arena", 0, 0, ARENA_PAGES, &opts);
+	if (!ASSERT_GE(fd, 0, "map_create"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(arena, fd), "reuse_fd"))
+		goto out;
+	if (!ASSERT_OK(data_in_arena__load(skel), "load"))
+		goto out;
+
+	image = bpf_map__initial_value(arena, &sz);
+	if (!ASSERT_OK_PTR(image, "initial_value"))
+		goto out;
+	/*
+	 * skel->data points into the image, px is the address of x in arena,
+	 * and the image goes where that puts x.
+	 */
+	off = (unsigned long)skel->data->px - ARENA_ADDR - ((void *)&skel->data->x - image);
+	if (!ASSERT_LT(off, arena_sz, "data offset") ||
+	    !ASSERT_LE(sz, arena_sz - off, "data size") ||
+	    !ASSERT_EQ(off % page_sz, 0, "data alignment"))
+		goto out;
+
+	base = mmap((void *)ARENA_ADDR, arena_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (!ASSERT_EQ(base, (void *)ARENA_ADDR, "mmap"))
+		goto out;
+	memcpy(base + off, image, sz);
+
+	ASSERT_EQ(run_prog(skel->progs.use_ptrs), 0, "use_ptrs");
+	data = base + off + ((void *)skel->data - image);
+	ASSERT_EQ(data->x, 43, "x");
+	ASSERT_EQ(data->px, &data->x, "px");
+	ASSERT_EQ(*data->px, 43, "*px");
+	ASSERT_STREQ(data->str, "hello", "str");
+out:
+	if (base != MAP_FAILED)
+		munmap(base, arena_sz);
+	if (fd >= 0)
+		close(fd);
+	data_in_arena__destroy(skel);
+}
+
+/*
+ * A pinned arena with map_extra is at that address, whether libbpf creates it or reuses it
+ * from the pin.
+ */
+static void test_pinned_arena_at(void)
+{
+	const char *pin_path = "/sys/fs/bpf/data_in_arena_at";
+	struct data_in_arena *skel1, *skel2 = NULL;
+	struct bpf_map *arena;
+
+	unlink(pin_path);
+	skel1 = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel1, "open"))
+		return;
+	arena = bpf_object__find_map_by_name(skel1->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	ASSERT_OK(bpf_map__set_map_extra(arena, ARENA_ADDR), "map_extra");
+	ASSERT_OK(bpf_map__set_pin_path(arena, pin_path), "pin_path");
+	if (!ASSERT_OK(data_in_arena__load(skel1), "load"))
+		goto out;
+	ASSERT_EQ(run_prog(skel1->progs.use_ptrs), 0, "use_ptrs");
+	ASSERT_EQ((unsigned long)skel1->data->px >> 32, ARENA_ADDR >> 32, "px");
+	ASSERT_EQ(*skel1->data->px, 43, "*px");
+
+	skel2 = data_in_arena__open();
+	if (!ASSERT_OK_PTR(skel2, "open"))
+		goto out;
+	arena = bpf_object__find_map_by_name(skel2->obj, "arena");
+	if (!ASSERT_OK_PTR(arena, "arena"))
+		goto out;
+	ASSERT_OK(bpf_map__set_map_extra(arena, ARENA_ADDR), "map_extra");
+	ASSERT_OK(bpf_map__set_pin_path(arena, pin_path), "pin_path");
+	if (!ASSERT_OK(data_in_arena__load(skel2), "load"))
+		goto out;
+	ASSERT_TRUE(bpf_map__is_pinned(arena), "pinned");
+	/* the image of the second object points to the data of the first one, x is 43 there */
+	ASSERT_EQ(skel2->data->px, skel1->data->px, "px");
+	ASSERT_EQ(run_prog(skel2->progs.use_ptrs), 2, "use_ptrs");
+out:
+	data_in_arena__destroy(skel2);
+	data_in_arena__destroy(skel1);
+	unlink(pin_path);
+}
+
 /* The object is there if rustc and clang can build it, see Makefile.buildvars */
 static void test_rust(void)
 {
@@ -199,6 +415,8 @@ void test_data_in_arena(void)
 #endif
 	if (test__start_subtest("arena"))
 		test_in_arena();
+	if (test__start_subtest("func_addrs"))
+		test_func_addrs();
 	if (test__start_subtest("declared_arena"))
 		test_declared_arena();
 	if (test__start_subtest("ptr_to_map"))
@@ -211,6 +429,10 @@ void test_data_in_arena(void)
 		test_not_my_arena(true);
 	if (test__start_subtest("reused_arena"))
 		test_not_my_arena(false);
+	if (test__start_subtest("reused_arena_at"))
+		test_reused_arena_at();
+	if (test__start_subtest("pinned_arena_at"))
+		test_pinned_arena_at();
 	if (test__start_subtest("rust"))
 		test_rust();
 }
