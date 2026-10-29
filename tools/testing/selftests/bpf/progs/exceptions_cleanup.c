@@ -267,6 +267,25 @@ int throw_obj_caller(struct __sk_buff *ctx)
 	return ret;
 }
 
+/* The object is held by the caller across a call of the throwing subprog by its address. */
+SEC("tc")
+int throw_obj_callx_caller(struct __sk_buff *ctx)
+{
+	int (*callee)(struct __sk_buff *, int) = throw_in_subprog;
+	struct foo *f;
+	int ret;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	/* Hide the callee from the compiler, so that the call goes through the pointer: a callx. */
+	asm volatile ("" : "+r"(callee));
+	ret = callee(ctx, ctx->len);
+	bpf_obj_drop(f);
+	return ret;
+}
+
 /* The throw is unconditional, so nothing after it keeps the object alive. */
 SEC("tc")
 int throw_obj_unconditional(struct __sk_buff *ctx)

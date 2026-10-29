@@ -725,13 +725,13 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 
 /*
  * Is @insn, after all rewrites, what the unwinder sees a site through: a call,
- * or the probed access of an arena site.
+ * direct or through a function pointer, or the probed access of an arena site.
  */
 static bool site_insn_ok(const struct bpf_insn *insn)
 {
 	u8 class = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
 
-	if (insn->code == (BPF_JMP | BPF_CALL))
+	if (insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn))
 		return true;
 	if (class == BPF_LDX)
 		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
