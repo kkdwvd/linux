@@ -1161,8 +1161,8 @@ struct bpf_subprog_info {
 	u32 linfo_idx; /* The idx to the main_prog->aux->linfo */
 	u32 postorder_start; /* The idx to the env->cfg.insn_postorder */
 	/*
-	 * Index of one of the BPF_EXIT instructions in this subprogram, or
-	 * U32_MAX when it has none.
+	 * Index of one of the BPF_EXIT instructions in this subprogram, of a
+	 * call of bpf_throw() when it has none, or U32_MAX.
 	 */
 	u32 exit_idx;
 	u32 callx_edge; /* 1 + the first of its env->callx_edges, 0 if none */

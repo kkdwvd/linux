@@ -3288,8 +3288,12 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 		if (BPF_CLASS(code) != BPF_JMP && BPF_CLASS(code) != BPF_JMP32)
 			goto next;
-		if (BPF_OP(code) == BPF_CALL)
+		if (BPF_OP(code) == BPF_CALL) {
+			/* it leaves the subprog like an exit */
+			if (bpf_is_throw_kfunc(&insn[i]) && subprog[cur_subprog].exit_idx == U32_MAX)
+				subprog[cur_subprog].exit_idx = i;
 			goto next;
+		}
 		if (BPF_OP(code) == BPF_EXIT) {
 			subprog[cur_subprog].exit_idx = i;
 			goto next;
@@ -21579,7 +21583,9 @@ static int skip_unproven_insn(struct bpf_verifier_env *env, const struct bpf_ins
 	if (class == BPF_LD || ((class == BPF_JMP || class == BPF_JMP32) &&
 				!bpf_helper_call(insn) && !bpf_pseudo_kfunc_call(insn)))
 		return PROCESS_BPF_EXIT;
-	if (class == BPF_JMP && call_writes_held(env, insn))
+	/* nothing follows bpf_throw(), see bpf_insn_successors() */
+	if (class == BPF_JMP && (call_writes_held(env, insn) ||
+				 bpf_is_throw_kfunc((struct bpf_insn *)insn)))
 		return PROCESS_BPF_EXIT;
 	/* what it stores can be read */
 	for_each_set_bit(spi, cur_aux(env)->may_write_mask, bpf_stack_nr_slots(frame)) {

@@ -384,6 +384,10 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 		return jt;
 	}
 
+	/* bpf_throw() doesn't come back: what follows the call is not where the program goes */
+	if (unlikely(insn->code == (BPF_JMP | BPF_CALL) && bpf_is_throw_kfunc(insn)))
+		return succ;
+
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
 	if (opcode_info->can_fallthrough)
@@ -395,7 +399,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	/*
 	 * tail_call upon success and ld_{abs,ind} upon load failure return
 	 * from the subprogram, which is a hidden edge to its exit. A subprogram
-	 * without an exit insn has no exit to model.
+	 * with neither an exit insn nor bpf_throw() has no exit to model.
 	 */
 	if (unlikely((bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
 		     (BPF_CLASS(insn->code) == BPF_LD &&
