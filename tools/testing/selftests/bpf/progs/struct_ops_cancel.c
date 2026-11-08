@@ -17,17 +17,12 @@ __u64 acquired;
 __u64 released;
 __u32 cancelled;
 
-/* The object the unwinder released. */
+/* The object the unwinder released: the handle of an object is its pointer. */
 SEC("fentry/bpf_unwind_release")
-int BPF_PROG(release_hook, struct bpf_resource *res, void *loc, void *flags)
+int BPF_PROG(release_hook, struct bpf_resource *res, void *handle, void *flags)
 {
-	void *obj;
-
-	if (res->kind != BPF_RESOURCE_OBJ)
-		return 0;
-	bpf_probe_read_kernel(&obj, sizeof(obj), loc);
-	if ((__u64)obj == acquired)
-		released = (__u64)obj;
+	if (res->kind == BPF_RESOURCE_OBJ && (__u64)handle == acquired)
+		released = (__u64)handle;
 	return 0;
 }
 
