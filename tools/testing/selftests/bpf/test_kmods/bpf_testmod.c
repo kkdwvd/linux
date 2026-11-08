@@ -2093,8 +2093,22 @@ static int bpf_dummy_reg(void *kdata, struct bpf_link *link)
 		ops->test_2(4, ops->data);
 	if (ops->test_trampoline_stack_args)
 		ops->test_trampoline_stack_args(1, 2, 3, 4, 5, 6, 7, 8, 9999);
+	/*
+	 * An operator with a __ref argument gets a reference it has to release,
+	 * or hand on: the one bpf_task_acquire() takes, which bpf_task_release()
+	 * puts, see put_task_struct_rcu_user().
+	 */
+	if (ops->test_refcounted) {
+		refcount_inc(&current->rcu_users);
+		ops->test_refcounted(0, current);
+	}
 
 	return 0;
+}
+
+/* An operator was cancelled by the kernel; tests attach to this to see it. */
+static noinline void bpf_testmod_ops_cancel(const struct bpf_prog *prog)
+{
 }
 
 static void bpf_dummy_unreg(void *kdata, struct bpf_link *link)
@@ -2163,6 +2177,7 @@ struct bpf_struct_ops bpf_bpf_testmod_ops = {
 	.init_member = bpf_testmod_ops_init_member,
 	.reg = bpf_dummy_reg,
 	.unreg = bpf_dummy_unreg,
+	.cancel = bpf_testmod_ops_cancel,
 	.cfi_stubs = &__bpf_testmod_ops,
 	.name = "bpf_testmod_ops",
 	.owner = THIS_MODULE,
