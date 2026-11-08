@@ -13,6 +13,7 @@
 #include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
+#include <linux/pkt_cls.h>
 #include <linux/filter.h>
 #include <net/netlink.h>
 #include <linux/file.h>
@@ -23702,6 +23703,70 @@ again:
 	return 0;
 }
 
+/*
+ * The value the main program returns when the kernel cancels an invocation:
+ * for each program type the outcome that denies, drops or changes nothing.
+ * A program with an exception callback of its own receives it as the cookie
+ * and decides for itself. An extension takes the value of the program it
+ * replaces, whose type and attach type it carries while it is verified. A
+ * struct_ops program cannot be cancelled, since the meaning of its return
+ * value is the operator's.
+ */
+static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_retval_range range;
+
+	*retval = 0;
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_STRUCT_OPS:
+		return false;
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		*retval = TC_ACT_SHOT;
+		return true;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		*retval = BPF_DROP;
+		return true;
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		switch (prog->expected_attach_type) {
+		case BPF_CGROUP_UDP4_RECVMSG:
+		case BPF_CGROUP_UDP6_RECVMSG:
+		case BPF_CGROUP_UNIX_RECVMSG:
+		case BPF_CGROUP_INET4_GETPEERNAME:
+		case BPF_CGROUP_INET6_GETPEERNAME:
+		case BPF_CGROUP_UNIX_GETPEERNAME:
+		case BPF_CGROUP_INET4_GETSOCKNAME:
+		case BPF_CGROUP_INET6_GETSOCKNAME:
+		case BPF_CGROUP_UNIX_GETSOCKNAME:
+			/* The only value these hooks accept. */
+			*retval = 1;
+			return true;
+		default:
+			return true;
+		}
+	case BPF_PROG_TYPE_LSM:
+		/*
+		 * A cgroup LSM program denies with 0, and may not change the
+		 * outcome of a void hook, where 1 is the only accepted value;
+		 * the others deny with an errno where the hook returns one, and
+		 * with 0 where it returns a bool.
+		 */
+		if (prog->expected_attach_type == BPF_LSM_CGROUP)
+			*retval = prog->aux->attach_func_proto->type ? 0 : 1;
+		else if (prog->expected_attach_type == BPF_LSM_MAC &&
+			 !bpf_lsm_get_retval_range(prog, &range))
+			*retval = range.minval < 0 ? -EPERM : range.minval;
+		return true;
+	default:
+		return true;
+	}
+}
+
 static int do_check_main(struct bpf_verifier_env *env)
 {
 	int ret;
@@ -25854,6 +25919,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	/* The entries the unwinder is reached through are only called from JITed code. */
+	env->cancellable = bpf_jit_supports_cancellation() && env->prog->jit_requested &&
+			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
+	env->describe_frames |= env->cancellable;
 	ret = do_check_all(env);
 	/* while the calls are what they are in the program */
 	if (env->log.level & BPF_LOG_STATS)
@@ -25991,6 +26060,7 @@ skip_full_check:
 	/* The program owns the frame descriptors from here on. */
 	env->prog->aux->frame_desc_pool = env->frame_desc_pool;
 	env->frame_desc_pool = NULL;
+	env->prog->aux->cancellable = env->cancellable;
 
 	env->prog = __bpf_prog_select_runtime(env, env->prog, &ret);
 
