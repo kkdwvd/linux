@@ -8,18 +8,26 @@
 
 /* The cookie the programs throw. */
 #define THROWN		0xeB9F
+/* What a cancelled tc program returns: TC_ACT_SHOT. */
+#define CANCELLED	2
+
+/* bpf_find_vma() in the test program looks this up in the test process. */
+static int vma_target;
 
 /*
  * What a run of a program has to show: its return value, the number of
  * resources the program recorded acquiring, and the releases observed, in
  * order, as a string: a digit names the acquired resource released at that
  * point, 's' an RCU or preemption section, '?' any acquired resource not
- * named elsewhere. @param is a choice the program reads.
+ * named elsewhere. @hook is a tracing program recording releases the unwinder
+ * does not perform, attached for the run, and @param a choice the program
+ * reads.
  */
 struct expect {
 	int retval;
 	int acquired;
 	const char *released;
+	struct bpf_program *hook;
 	__u32 param;
 };
 
@@ -120,11 +128,15 @@ static void reset(struct exceptions_cleanup *skel, __u32 param)
 {
 	skel->bss->acquired_cnt = 0;
 	skel->bss->released_cnt = 0;
+	skel->bss->alloc_cnt = 0;
+	skel->bss->drop_cnt = 0;
+	skel->bss->released_objs = 0;
 	memset(skel->bss->acquired, 0, sizeof(skel->bss->acquired));
 	memset(skel->bss->released, 0, sizeof(skel->bss->released));
 	memset(skel->bss->released_section, 0, sizeof(skel->bss->released_section));
 	skel->bss->param = param;
 	skel->bss->test_pid = getpid();
+	skel->bss->vma_addr = (__u64)(long)&vma_target;
 }
 
 /* Run @prog once and check what it returned and what was released against @e. */
@@ -136,20 +148,86 @@ static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog,
 		.data_size_in = sizeof(pkt_v4),
 		.repeat = 1,
 	);
+	struct bpf_link *link = NULL, *hook_link = NULL;
 	int ret;
 
 	reset(skel, e->param);
-	/* A syscall program runs on nothing: no input, and once, without a repeat count. */
-	if (bpf_program__type(prog) == BPF_PROG_TYPE_SYSCALL) {
+	/*
+	 * A tracing program runs on its hook and a syscall program on nothing:
+	 * no input. The hook of a tracing program fires for every test run of a
+	 * tracing program in the system, so it is attached for this run only.
+	 */
+	if (bpf_program__type(prog) == BPF_PROG_TYPE_TRACING ||
+	    bpf_program__type(prog) == BPF_PROG_TYPE_SYSCALL) {
 		ropts.data_in = NULL;
 		ropts.data_size_in = 0;
-		ropts.repeat = 0;
 	}
+	if (bpf_program__type(prog) == BPF_PROG_TYPE_TRACING) {
+		link = bpf_program__attach(prog);
+		if (!ASSERT_OK_PTR(link, "attach"))
+			return;
+	}
+	if (e->hook) {
+		hook_link = bpf_program__attach(e->hook);
+		if (!ASSERT_OK_PTR(hook_link, "attach hook")) {
+			bpf_link__destroy(link);
+			return;
+		}
+	}
+	/* A syscall program is run once, without a repeat count. */
+	if (bpf_program__type(prog) == BPF_PROG_TYPE_SYSCALL)
+		ropts.repeat = 0;
 	ret = bpf_prog_test_run_opts(bpf_program__fd(prog), &ropts);
+	bpf_link__destroy(hook_link);
+	bpf_link__destroy(link);
 	if (!ASSERT_OK(ret, "test_run"))
 		return;
 	ASSERT_EQ(ropts.retval, e->retval, "retval");
 	check_releases(skel, e);
+}
+
+/* The timer callback runs once the program returned: wait for its cancellation. */
+static void run_timer(struct exceptions_cleanup *skel)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, ropts,
+		.data_in = &pkt_v4,
+		.data_size_in = sizeof(pkt_v4),
+		.repeat = 1,
+	);
+	int i;
+
+	reset(skel, 0);
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.cancel_may_goto_timer),
+					      &ropts), "test_run"))
+		return;
+	ASSERT_EQ(ropts.retval, 0, "retval");
+	for (i = 0; i < 300 && skel->bss->released_cnt < 1; i++)
+		usleep(10000);
+	ASSERT_EQ(skel->bss->acquired_cnt, 1, "timer acquired");
+	ASSERT_EQ(skel->bss->released_cnt, 1, "timer released");
+	ASSERT_EQ(skel->bss->released[0], skel->bss->acquired[0], "timer released ptr");
+}
+
+/*
+ * The recursion is cancelled at its entry check at a depth the test does not
+ * know: every object a live frame held is released, the others were dropped.
+ */
+static void run_recursion_check(struct exceptions_cleanup *skel)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, ropts,
+		.data_in = &pkt_v4,
+		.data_size_in = sizeof(pkt_v4),
+		.repeat = 1,
+	);
+
+	reset(skel, 0);
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.cancel_recursion_check_holding),
+					      &ropts), "test_run"))
+		return;
+	ASSERT_EQ(ropts.retval, CANCELLED, "retval");
+	ASSERT_GT(skel->bss->released_objs, 0, "released objects");
+	ASSERT_EQ(skel->bss->alloc_cnt, skel->bss->drop_cnt + skel->bss->released_objs,
+		  "every object dropped or released");
 }
 
 /* Run every program; @prefix names the pass in the subtest names. */
@@ -159,9 +237,15 @@ static void run_suite(const char *prefix)
 	int server = -1;
 	char name[64];
 
-	skel = exceptions_cleanup__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "exceptions_cleanup__open_and_load"))
+	skel = exceptions_cleanup__open();
+	if (!ASSERT_OK_PTR(skel, "exceptions_cleanup__open"))
 		return;
+	/* Attached by their runs only, see run_prog(). */
+	bpf_program__set_autoattach(skel->progs.cancel_may_goto_priv_stack, false);
+	bpf_program__set_autoload(skel->progs.drop_hook, true);
+	bpf_program__set_autoattach(skel->progs.drop_hook, false);
+	if (!ASSERT_OK(exceptions_cleanup__load(skel), "exceptions_cleanup__load"))
+		goto out;
 	if (!ASSERT_OK(exceptions_cleanup__attach(skel), "attach"))
 		goto out;
 	/* The listener throw_sock_cast looks up, on an ephemeral port. */
@@ -180,6 +264,8 @@ static void run_suite(const char *prefix)
 } while (0)
 #define RUN(pname, ret, n, rel, ...) RUN_AS(pname, #pname, ret, n, rel, ##__VA_ARGS__)
 #define THROW(pname, n, rel, ...) RUN(pname, THROWN, n, rel, ##__VA_ARGS__)
+/* A cancelled tc program returns TC_ACT_SHOT. */
+#define CANCEL(pname, n, rel, ...) RUN(pname, CANCELLED, n, rel, ##__VA_ARGS__)
 	THROW(throw_obj_reg, 1, "0");
 	THROW(throw_obj_two, 2, "??");
 	THROW(throw_ringbuf, 1, "0");
@@ -256,6 +342,77 @@ static void run_suite(const char *prefix)
 	       "", .param = 3);
 	/* A recursive subprog holding an object per frame: each frame owns its own. */
 	THROW(throw_recursion_holding, 4, "3210");
+	CANCEL(cancel_may_goto_obj, 1, "0");
+	CANCEL(cancel_may_goto_caller, 1, "0");
+	CANCEL(cancel_may_goto_mirror_conflict, 1, "0");
+	CANCEL(cancel_may_goto_rcu, 1, "s0");
+	CANCEL(cancel_may_goto_rcu_shared, 1, "s0");
+	CANCEL(cancel_may_goto_preempt, 0, "sss");
+	CANCEL(cancel_may_goto_spin_lock, 2, "10");
+	CANCEL(cancel_may_goto_obj_lock, 2, "10");
+	CANCEL(cancel_may_goto_lock_caller, 2, "10");
+	CANCEL(cancel_may_goto_res_lock, 1, "0");
+	CANCEL(cancel_may_goto_res_lock_irq, 2, "10");
+	CANCEL(cancel_may_goto_irq, 1, "0");
+	CANCEL(cancel_may_goto_irq_shared, 2, "10");
+	CANCEL(cancel_may_goto_nested, 4, "321s0");
+	CANCEL(cancel_may_goto_global, 1, "0");
+	CANCEL(cancel_may_goto_global_chain, 1, "0");
+	CANCEL(cancel_may_goto_obj_after_caller_lock, 2, "01");
+	CANCEL(cancel_may_goto_callee_leaves_rcu, 1, "0");
+	CANCEL(cancel_may_goto_callee_unlocks, 2, "0");
+	/* The may_goto the verifier adds to a loop or a recursive subprog cancels too. */
+	CANCEL(cancel_guard_obj, 1, "0");
+	CANCEL(cancel_recursion_caller, 1, "0");
+	CANCEL(cancel_recursion_holding, 4, "3210");
+	snprintf(name, sizeof(name), "%scancel_recursion_check_holding", prefix);
+	if (test__start_subtest(name))
+		run_recursion_check(skel);
+	/* Released locks can be taken again: a leaked resilient lock fails instead of hanging. */
+	CANCEL(cancel_may_goto_res_lock, 1, "0");
+	CANCEL(cancel_may_goto_res_lock_irq, 2, "10");
+	/* Sites in callbacks: the callback is unwound and the cancellation goes on from the call. */
+	CANCEL(cancel_may_goto_loop, 1, "0");
+	CANCEL(cancel_may_goto_loop_helper, 1, "0");
+	CANCEL(cancel_may_goto_global_callback, 1, "0");
+	CANCEL(cancel_may_goto_shared_subprog, 1, "0");
+	CANCEL(cancel_may_goto_for_each_array, 1, "0");
+	CANCEL(cancel_may_goto_for_each_hash, 1, "0");
+	CANCEL(cancel_may_goto_for_each_helper, 1, "0");
+	CANCEL(cancel_callback_clobbers_slot, 1, "0");
+	/* The kfunc drops the node it was adding before the unwinder releases the lock. */
+	CANCEL(cancel_may_goto_rbtree_less, 2, "01", .hook = skel->progs.drop_hook);
+	CANCEL(cancel_may_goto_exception_cb, 1, "0");
+	/* The stack in arena of a cancelled program goes back, and the one of a cancelled callback. */
+	ARENA_STACK(cancel_arena_stack, CANCELLED, NO_CB);
+	ARENA_STACK(cancel_arena_stack_callback, CANCELLED, CB_OWN_STACK);
+	/* A cancelled syscall or tracing program returns 0. */
+	RUN(cancel_may_goto_find_vma, 0, 1, "0");
+	RUN(cancel_may_goto_priv_stack, 0, 1, "0");
+	snprintf(name, sizeof(name), "%scancel_may_goto_timer", prefix);
+	if (test__start_subtest(name))
+		run_timer(skel);
+	/* Chains: a callee holding the caller's object or lock at the loop under one chain only. */
+	RUN_AS(cancel_release_if_split, "cancel_release_if_split_before", CANCELLED, 1, "",
+	       .param = 0);
+	RUN_AS(cancel_release_if_split, "cancel_release_if_split_after", CANCELLED, 1, "0",
+	       .param = 1);
+	RUN_AS(cancel_unlock_if_split, "cancel_unlock_if_split_before", CANCELLED, 2, "0",
+	       .param = 0);
+	RUN_AS(cancel_unlock_if_split, "cancel_unlock_if_split_after", CANCELLED, 2, "10",
+	       .param = 1);
+	RUN_AS(cancel_irq_order, "cancel_irq_order_enabled_first", CANCELLED, 2, "10s", .param = 1);
+	RUN_AS(cancel_irq_order, "cancel_irq_order_enabled_last", CANCELLED, 2, "01", .param = 0);
+	/* A counted section a callee left, or entered and returned with: the count follows. */
+	RUN_AS(cancel_section_left_by_callee, "cancel_section_left_by_callee_held", CANCELLED, 1,
+	       "0", .param = 1);
+	RUN_AS(cancel_section_left_by_callee, "cancel_section_left_by_callee_free", CANCELLED, 1,
+	       "0", .param = 0);
+	RUN_AS(cancel_section_entered_by_callee, "cancel_section_entered_by_callee_held",
+	       CANCELLED, 1, "s0", .param = 1);
+	RUN_AS(cancel_section_entered_by_callee, "cancel_section_entered_by_callee_free",
+	       CANCELLED, 1, "0", .param = 0);
+#undef CANCEL
 #undef THROW
 #undef RUN
 #undef RUN_AS

@@ -37,6 +37,7 @@ struct {
 } arena SEC(".maps");
 
 private(A) struct bpf_spin_lock glock;
+private(B) struct bpf_res_spin_lock grlock;
 
 /* Resources the program under test acquired, in order. */
 __u64 acquired[MAX_RES];
@@ -45,6 +46,10 @@ __u32 acquired_cnt;
 __u64 released[MAX_RES];
 __u8 released_section[MAX_RES];
 __u32 released_cnt;
+/* Objects allocated, dropped by the program and released by the unwinder, where the handles are not kept. */
+__u32 alloc_cnt;
+__u32 drop_cnt;
+__u32 released_objs;
 /* The test process: the sections it leaves are the ones under test. */
 __u32 test_pid;
 /* A choice of the test, read by the program under test. */
@@ -100,6 +105,8 @@ int BPF_PROG(release_hook, struct bpf_resource *res, void *handle, void *flags)
 	if (flags)
 		mark_released(flags, false);
 	mark_released(handle, res->kind == BPF_RESOURCE_RCU || res->kind == BPF_RESOURCE_PREEMPT);
+	if (res->kind == BPF_RESOURCE_OBJ && bpf_get_current_pid_tgid() >> 32 == test_pid)
+		released_objs++;
 	return 0;
 }
 
@@ -330,6 +337,8 @@ static __noinline int alloc_and_throw(void)
 
 /* A count the verifier does not know. */
 volatile __u32 loops = 1;
+/* Zero, which the verifier does not know: a bpf_loop() with these flags is not inlined. */
+volatile __u32 loop_flags;
 
 /*
  * The loop gets a may_goto of the verifier's, in front of the subprog that
@@ -425,6 +434,309 @@ int throw_obj_global_caller(struct __sk_buff *ctx)
 	return ret;
 }
 
+/* Spin until the timed may_goto gives up: cancels the program, or exits the loop. */
+static __always_inline void spin(void)
+{
+	for (;;)
+		cond_break;
+}
+
+/* A may_goto timeout cancels the program and releases what it holds. */
+SEC("tc")
+int cancel_may_goto_obj(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+static __noinline int spin_in_subprog(struct __sk_buff *ctx)
+{
+	__u64 a = ctx->len * 3, b = ctx->len * 5, c = ctx->len * 7;
+
+	spin();
+	return a + b + c;
+}
+
+/* The timeout hits in a static subprog while the caller holds the object. */
+SEC("tc")
+int cancel_may_goto_caller(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	spin_in_subprog(ctx);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+static int spin_cb(u32 i, void *ctx)
+{
+	spin();
+	return 0;
+}
+
+/*
+ * The timeout hits in a bpf_loop() callback. With flags known to be zero
+ * the loop is inlined and the callback is an ordinary callee: the frame is
+ * unwound through at the inlined call.
+ */
+SEC("tc")
+int cancel_may_goto_loop(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(1, spin_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * The callback runs from the helper, which the flags the verifier cannot
+ * see keep from being inlined: it is unwound and leaves into the pad of the
+ * helper, which returns to the entry of the cancellation, and the
+ * cancellation goes on from the call.
+ */
+SEC("tc")
+int cancel_may_goto_loop_helper(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(loops, spin_cb, NULL, loop_flags);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* An RCU read section is left before the object is released. */
+SEC("tc")
+int cancel_may_goto_rcu(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	spin();
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * The frame the timeout hits in is reached both inside and outside an RCU
+ * section: the section belongs to the caller that entered it, so the callee's
+ * descriptor is the same on both paths. At run time the loop runs under RCU.
+ */
+SEC("tc")
+int cancel_may_goto_rcu_shared(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (ctx->len == 0)
+		spin_in_subprog(ctx);
+	bpf_rcu_read_lock();
+	spin_in_subprog(ctx);
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* Nested RCU sections and a preemption disabled section are all left. */
+SEC("tc")
+int cancel_may_goto_preempt(struct __sk_buff *ctx)
+{
+	bpf_rcu_read_lock();
+	bpf_rcu_read_lock();
+	bpf_preempt_disable();
+	spin();
+	bpf_preempt_enable();
+	bpf_rcu_read_unlock();
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* A global spin lock is released from its fixed address, before the object. */
+SEC("tc")
+int cancel_may_goto_spin_lock(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&glock);
+	bpf_spin_lock(&glock);
+	spin();
+	bpf_spin_unlock(&glock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The lock of an allocated object is found from the pointer to the object. */
+SEC("tc")
+int cancel_may_goto_obj_lock(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	spin();
+	bpf_spin_unlock(&f->lock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The lock is held by the caller of the frame the timeout hits in. */
+SEC("tc")
+int cancel_may_goto_lock_caller(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	spin_in_subprog(ctx);
+	bpf_spin_unlock(&f->lock);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* A resilient spin lock. */
+SEC("tc")
+int cancel_may_goto_res_lock(struct __sk_buff *ctx)
+{
+	mark_acquired(&grlock);
+	if (bpf_res_spin_lock(&grlock))
+		return 1;
+	spin();
+	bpf_res_spin_unlock(&grlock);
+	return 0;
+}
+
+/* A resilient spin lock with IRQs disabled: the flags on the stack are restored with it. */
+SEC("tc")
+int cancel_may_goto_res_lock_irq(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	/* The verifier tracks the lock first, then the flags it saved. */
+	mark_acquired(&grlock);
+	mark_acquired(&flags);
+	if (bpf_res_spin_lock_irqsave(&grlock, &flags))
+		return 1;
+	spin();
+	bpf_res_spin_unlock_irqrestore(&grlock, &flags);
+	return 0;
+}
+
+/* Saved IRQ flags. */
+SEC("tc")
+int cancel_may_goto_irq(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
+static __noinline int spin_with_irqs_off(void)
+{
+	unsigned long flags;
+
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
+/*
+ * The frame the timeout hits in saves IRQ flags of its own, and is reached
+ * both under flags its caller saved and under none: each frame restores the
+ * flags it saved, so the callee's descriptor is the same on both paths. At
+ * run time the caller's flags are saved too, and restored after the callee's.
+ */
+SEC("tc")
+int cancel_may_goto_irq_shared(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (ctx->len == 0)
+		spin_with_irqs_off();
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	spin_with_irqs_off();
+	bpf_local_irq_restore(&flags);
+	return 0;
+}
+
+/* Everything nested: released in the reverse order of acquisition. */
+SEC("tc")
+int cancel_may_goto_nested(struct __sk_buff *ctx)
+{
+	unsigned long flags, lflags;
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	mark_acquired(&flags);
+	bpf_local_irq_save(&flags);
+	mark_acquired(&grlock);
+	mark_acquired(&lflags);
+	if (bpf_res_spin_lock_irqsave(&grlock, &lflags)) {
+		bpf_local_irq_restore(&flags);
+		bpf_rcu_read_unlock();
+		bpf_obj_drop(f);
+		return 1;
+	}
+	spin();
+	bpf_res_spin_unlock_irqrestore(&grlock, &lflags);
+	bpf_local_irq_restore(&flags);
+	bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* may_goto +2: BPF_JMP | BPF_JCOND, off 2 */
+static const struct bpf_insn may_goto_insn = { .code = 0xe5, .off = 2 };
+
 /*
  * R6 holds the ringbuf record on one path and a number on the other at the
  * site: no location describes both, so the record is released from its
@@ -466,10 +778,13 @@ __naked int name(void)							\
 	  __imm(bpf_ringbuf_reserve),					\
 	  __imm(bpf_ringbuf_discard),					\
 	  __imm(bpf_throw),						\
-	  [len]"i"(offsetof(struct __sk_buff, len))			\
+	  [len]"i"(offsetof(struct __sk_buff, len)),			\
+	  __imm_insn(may_goto, may_goto_insn)				\
 	: __clobber_all);						\
 }
 
+/* A may_goto timeout: the loop spins until it is cancelled. */
+MIRROR_PROG(cancel_may_goto_mirror_conflict, ".8byte %[may_goto]; r0 = 0; goto 2b;")
 /* An explicit throw. */
 MIRROR_PROG(throw_mirror_conflict, "r1 = 0xeB9F; call %[bpf_throw];")
 
@@ -1149,6 +1464,618 @@ int throw_sleeping_dtor_after_section(void *ctx)
 	return 0;
 }
 
+__noinline int global_spin(void)
+{
+	spin();
+	return 0;
+}
+
+/*
+ * The timeout hits in a global subprog, which is verified on its own: the
+ * call is a site of the caller, which holds the object.
+ */
+SEC("tc")
+int cancel_may_goto_global(struct __sk_buff *ctx)
+{
+	struct foo *f;
+	int ret;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	ret = global_spin();
+	bpf_obj_drop(f);
+	return ret;
+}
+
+__noinline int global_spin_in_subprog(struct __sk_buff *ctx)
+{
+	return spin_in_subprog(ctx);
+}
+
+/* The timeout hits in a static subprog of a global subprog. */
+SEC("tc")
+int cancel_may_goto_global_chain(struct __sk_buff *ctx)
+{
+	struct foo *f;
+	int ret;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	ret = global_spin_in_subprog(ctx);
+	bpf_obj_drop(f);
+	return ret;
+}
+
+static int global_spin_cb(u32 i, void *ctx)
+{
+	return global_spin();
+}
+
+/* A global subprog called below a callback is cancelled like one called directly. */
+SEC("tc")
+int cancel_may_goto_global_callback(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(1, global_spin_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+static __noinline int spin_shared(void)
+{
+	spin();
+	return 0;
+}
+
+static int spin_shared_cb(u32 i, void *ctx)
+{
+	return spin_shared();
+}
+
+/*
+ * A static subprog reached below a callback as well as directly is cancelled
+ * at either: the loop in the callback cancels the program.
+ */
+SEC("tc")
+int cancel_may_goto_shared_subprog(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_loop(1, spin_shared_cb, NULL, 0);
+	spin_shared();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * A tracing program with 64 bytes of stack runs on a private stack: the
+ * record is released from its spill slot in that frame.
+ */
+SEC("fentry/bpf_fentry_test1")
+__naked int cancel_may_goto_priv_stack(void)
+{
+	asm volatile (
+	"r1 = %[ringbuf] ll;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_ringbuf_reserve];"
+	"if r0 == 0 goto 1f;"
+	"*(u64 *)(r10 - 8) = r0;"
+	"*(u64 *)(r10 - 64) = r0;"
+	"r1 = %[acquired] ll;"
+	"*(u64 *)(r1 + 0) = r0;"
+	"r2 = 1;"
+	"r1 = %[acquired_cnt] ll;"
+	"*(u32 *)(r1 + 0) = r2;"
+	"2: .8byte %[may_goto];"
+	"r0 = 0;"
+	"goto 2b;"
+	"r1 = *(u64 *)(r10 - 8);"
+	"r2 = 0;"
+	"call %[bpf_ringbuf_discard];"
+	"1: r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(ringbuf),
+	  __imm_addr(acquired),
+	  __imm_addr(acquired_cnt),
+	  __imm(bpf_ringbuf_reserve),
+	  __imm(bpf_ringbuf_discard),
+	  __imm_insn(may_goto, may_goto_insn)
+	: __clobber_all);
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, int);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} array_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, int);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} hash_map SEC(".maps");
+
+static int spin_elem_cb(void *map, int *key, __u64 *val, void *ctx)
+{
+	spin();
+	return 0;
+}
+
+/*
+ * The timeout hits in the callback of bpf_for_each_map_elem(): the iterator of
+ * the map leaves to its pad.
+ */
+SEC("tc")
+int cancel_may_goto_for_each_array(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_for_each_map_elem(&array_map, spin_elem_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The hash map walk holds the RCU read lock around the callback, which the helper leaves on its way out. */
+SEC("tc")
+int cancel_may_goto_for_each_hash(struct __sk_buff *ctx)
+{
+	struct foo *f;
+	__u64 val = 1;
+	int key = 0;
+
+	if (bpf_map_update_elem(&hash_map, &key, &val, BPF_ANY))
+		return 1;
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_for_each_map_elem(&hash_map, spin_elem_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * Two maps at one call keep the verifier from calling the iterator of the map
+ * directly: the helper calls it, with a pad of its own, and the cancellation
+ * goes through both pads.
+ */
+SEC("tc")
+int cancel_may_goto_for_each_helper(struct __sk_buff *ctx)
+{
+	void *map = ctx->len > 1000 ? (void *)&hash_map : (void *)&array_map;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_for_each_map_elem(map, spin_elem_cb, NULL, 0);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+struct rb_foo {
+	int data;
+	struct bpf_rb_node node;
+};
+
+private(C) struct bpf_spin_lock rblock;
+private(C) struct bpf_rb_root rbtree __contains(rb_foo, node);
+
+static bool rbless(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	return true;
+}
+
+static bool rbless_spin(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	spin();
+	return true;
+}
+
+/*
+ * Observe the drop of the node bpf_rbtree_add() was adding when its comparator
+ * is cancelled: the kfunc drops it on its way to the pad after the call, not
+ * the unwinder, and frees the fields of the node first. Attached by that test
+ * alone, see run_prog().
+ */
+SEC("?fentry/bpf_obj_free_fields")
+int BPF_PROG(drop_hook, const struct btf_record *rec, void *obj)
+{
+	mark_released(obj, false);
+	return 0;
+}
+
+/*
+ * The comparator of bpf_rbtree_add() is cancelled: the kfunc drops the node it
+ * was adding and leaves, and the unwinder releases the lock of the tree, which
+ * the caller holds, as the cancellation goes on from the call. The comparator
+ * runs against the node added first.
+ */
+SEC("tc")
+int cancel_may_goto_rbtree_less(struct __sk_buff *ctx)
+{
+	struct rb_foo *f, *g;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	g = bpf_obj_new(typeof(*g));
+	if (!g) {
+		bpf_obj_drop(f);
+		return 1;
+	}
+	mark_acquired(g);
+	mark_acquired(&rblock);
+	bpf_spin_lock(&rblock);
+	bpf_rbtree_add(&rbtree, &f->node, rbless);
+	bpf_rbtree_add(&rbtree, &g->node, rbless_spin);
+	bpf_spin_unlock(&rblock);
+	return 0;
+}
+
+/* An address mapped in the test process, set by the test. */
+__u64 vma_addr;
+
+static int spin_vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
+{
+	spin();
+	return 0;
+}
+
+/*
+ * bpf_find_vma() holds the mmap lock around its callback and releases it on
+ * its way out. It is a tracing helper, which a syscall program may call
+ * without the test run triggering the other tracing programs, and a tracing
+ * program may not drop an object with a list node, so the resource is a
+ * ringbuf record here.
+ */
+SEC("syscall")
+int cancel_may_goto_find_vma(void *ctx)
+{
+	void *p;
+
+	p = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!p)
+		return 0;
+	mark_acquired(p);
+	bpf_find_vma(bpf_get_current_task_btf(), vma_addr, spin_vma_cb, NULL, 0);
+	bpf_ringbuf_discard(p, 0);
+	return 0;
+}
+
+struct timer_elem {
+	struct bpf_timer t;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, int);
+	__type(value, struct timer_elem);
+	__uint(max_entries, 1);
+} timer_map SEC(".maps");
+
+static int spin_timer_cb(void *map, int *key, struct timer_elem *e)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	mark_acquired(f);
+	spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * The timeout hits in a timer callback, an invocation of its own: the
+ * callback is unwound and the timer code ignores what it returns.
+ */
+SEC("tc")
+int cancel_may_goto_timer(struct __sk_buff *ctx)
+{
+	struct timer_elem *e;
+	int key = 0;
+
+	e = bpf_map_lookup_elem(&timer_map, &key);
+	if (!e)
+		return 1;
+	if (bpf_timer_init(&e->t, &timer_map, 1 /* CLOCK_MONOTONIC */))
+		return 1;
+	if (bpf_timer_set_callback(&e->t, spin_timer_cb))
+		return 1;
+	if (bpf_timer_start(&e->t, 0, 0))
+		return 1;
+	return 0;
+}
+
+/*
+ * The timeout hits in the exception callback of the program, which took the
+ * main frame over: the program completes with the default of its type, as
+ * the callback cannot run a second time.
+ */
+__noinline int exception_cb_spin(u64 cookie)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	spin();
+	bpf_obj_drop(f);
+	return 1;
+}
+
+SEC("tc")
+__exception_cb(exception_cb_spin)
+int cancel_may_goto_exception_cb(struct __sk_buff *ctx)
+{
+	bpf_throw(0);
+	return 0;
+}
+
+/*
+ * The stack in arena of a cancelled program goes back like that of a program
+ * that throws, see throw_arena_stack(): a timed may_goto over the jump back
+ * spins until the program is cancelled, as spin() does.
+ */
+#define arena_sp_spin				\
+	"1:"					\
+	".8byte 0x100e5;"			\
+	"goto 1b;"
+
+SEC("tc")
+__naked int cancel_arena_stack(void)
+{
+	asm volatile (
+	arena_sp_adj(32)
+	record_arena_sp(stack_addr)
+	arena_sp_spin
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(stack_addr),
+	  __imm_addr(param)
+	: __clobber_all);
+}
+
+/*
+ * A callback the helper runs takes a stack of its own, one of the slots since
+ * the main program holds the stack of the cpu, and is cancelled in it: the
+ * unwinder returns the slot before the callback leaves into the pad of
+ * bpf_loop(), and the stack of the main program when the cancellation goes
+ * on from its call.
+ */
+static __naked __noinline __used long arena_stack_spin_cb(void)
+{
+	asm volatile (
+	arena_sp_adj(32)
+	record_arena_sp(cb_stack_addr)
+	arena_sp_spin
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(cb_stack_addr),
+	  __imm_addr(param)
+	: __clobber_all);
+}
+
+SEC("tc")
+__naked int cancel_arena_stack_callback(void)
+{
+	asm volatile (
+	arena_sp_adj(32)
+	record_arena_sp(stack_addr)
+	"r1 = %[loops] ll;"
+	"r1 = *(u32 *)(r1 + 0);"
+	"r2 = arena_stack_spin_cb ll;"
+	"r3 = 0;"
+	"r4 = %[loop_flags] ll;"
+	"r4 = *(u32 *)(r4 + 0);"
+	"call %[bpf_loop];"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm(bpf_loop),
+	  __imm_addr(loops),
+	  __imm_addr(loop_flags),
+	  __imm_addr(stack_addr),
+	  __imm_addr(param)
+	: __clobber_all);
+}
+
+/* Pops a node under its caller's lock, and spins holding it. */
+static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
+
+	if (n)
+		mark_acquired(n);
+	spin();
+	return n;
+}
+
+/* The callee's node, popped under the caller's lock, is dropped after the lock is released. */
+SEC("tc")
+int cancel_may_goto_obj_after_caller_lock(struct __sk_buff *ctx)
+{
+	struct bpf_list_node *n;
+	struct locked_list *l;
+	struct lfoo *f;
+	int key = 0;
+
+	l = bpf_map_lookup_elem(&locked_list_map, &key);
+	if (!l)
+		return 1;
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(&l->lock);
+	bpf_spin_lock(&l->lock);
+	bpf_list_push_back(&l->head, &f->node);
+	n = pop_and_spin(l);
+	if (n)
+		bpf_list_push_back(&l->head, n);
+	bpf_spin_unlock(&l->lock);
+	return 0;
+}
+
+/* Leaves the RCU read section its caller entered, then spins. */
+static __noinline int rcu_unlock_and_spin(void)
+{
+	bpf_rcu_read_unlock();
+	spin();
+	return 0;
+}
+
+/*
+ * The caller lists its RCU read section at the call, and the callee, which has
+ * left it before the timeout, lists one section less: the unwinder leaves no
+ * section.
+ */
+SEC("tc")
+int cancel_may_goto_callee_leaves_rcu(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	rcu_unlock_and_spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* Unlocks the lock its caller holds, then spins. */
+static __noinline int unlock_and_spin(struct locked_foo *f)
+{
+	bpf_spin_unlock(&f->lock);
+	spin();
+	return 0;
+}
+
+/*
+ * The same for the lock of the caller's object, at a may_goto: the callee
+ * lists the lock, which it has released, and the caller's descriptor at the
+ * call omits it.
+ */
+SEC("tc")
+int cancel_may_goto_callee_unlocks(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	unlock_and_spin(f);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * A loop the verifier cannot count gets a may_goto of its own, which cancels
+ * the program when its time is up like a may_goto of the program does: the
+ * object is released.
+ */
+SEC("tc")
+int cancel_guard_obj(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	while (loops)
+		;
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* R1 says how deep to go. It calls itself twice: 2^R1 calls, more than the time allows for 60. */
+__naked __noinline __used
+static unsigned long calls_itself_twice(void)
+{
+	asm volatile (
+	"if r1 != 0 goto 1f;"
+	"r0 = 1;"
+	"exit;"
+	"1: r6 = r1;"
+	"r1 += -1;"
+	"call calls_itself_twice;"
+	"r7 = r0;"
+	"r1 = r6;"
+	"r1 += -1;"
+	"call calls_itself_twice;"
+	"r0 += r7;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/*
+ * A recursive subprog gets a check of its time and of the stack at its entry,
+ * which cancels the program when its time is up like a may_goto does: the
+ * record the caller holds is released.
+ */
+SEC("tc")
+__naked int cancel_recursion_caller(void)
+{
+	asm volatile (
+	"r1 = %[ringbuf] ll;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_ringbuf_reserve];"
+	"if r0 == 0 goto 1f;"
+	"r6 = r0;"
+	"r1 = %[acquired] ll;"
+	"*(u64 *)(r1 + 0) = r0;"
+	"r2 = 1;"
+	"r1 = %[acquired_cnt] ll;"
+	"*(u32 *)(r1 + 0) = r2;"
+	"r1 = 60;"
+	"call calls_itself_twice;"
+	"r1 = r6;"
+	"r2 = 0;"
+	"call %[bpf_ringbuf_discard];"
+	"1: r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(ringbuf),
+	  __imm_addr(acquired),
+	  __imm_addr(acquired_cnt),
+	  __imm(bpf_ringbuf_reserve),
+	  __imm(bpf_ringbuf_discard)
+	: __clobber_all);
+}
+
 /*
  * Drops the object when told to, then throws. Called with a constant from two
  * call sites, it runs under two chains of calls: under one it has released
@@ -1379,6 +2306,170 @@ __naked int throw_mirror_arrives_two_ways(void)
 }
 
 /*
+ * Drops the object before the loop when told to, after it otherwise. Called
+ * with a constant from two call sites, it runs under two chains of calls, and
+ * holds the object at the may_goto under one of them only: the site gets a
+ * descriptor per chain.
+ */
+static __noinline int drop_if_spin_drop(struct foo *f, int drop)
+{
+	if (drop)
+		bpf_obj_drop(f);
+	spin();
+	if (!drop)
+		bpf_obj_drop(f);
+	return 0;
+}
+
+/* The callee releases the object under either chain: the caller lists it at neither call. */
+SEC("tc")
+int cancel_release_if_split(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (param)
+		drop_if_spin_drop(f, 0);
+	else
+		drop_if_spin_drop(f, 1);
+	return 0;
+}
+
+/* The same with the lock of the caller's object, which the callee unlocks before or after the loop. */
+static __noinline int unlock_if_spin_unlock(struct locked_foo *f, int unlock)
+{
+	if (unlock)
+		bpf_spin_unlock(&f->lock);
+	spin();
+	if (!unlock)
+		bpf_spin_unlock(&f->lock);
+	return 0;
+}
+
+SEC("tc")
+int cancel_unlock_if_split(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	if (param)
+		unlock_if_spin_unlock(f, 0);
+	else
+		unlock_if_spin_unlock(f, 1);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * Two paths save the same two sets of IRQ flags in opposite orders and meet at
+ * the loop, kept apart by the RCU read section one of them holds.
+ */
+SEC("tc")
+int cancel_irq_order(struct __sk_buff *ctx)
+{
+	int order = param;
+	unsigned long a, b;
+
+	mark_acquired(&a);
+	mark_acquired(&b);
+	if (order) {
+		bpf_local_irq_save(&a);
+		bpf_local_irq_save(&b);
+		bpf_rcu_read_lock();
+	} else {
+		bpf_local_irq_save(&b);
+		bpf_local_irq_save(&a);
+	}
+	spin();
+	if (order) {
+		bpf_rcu_read_unlock();
+		bpf_local_irq_restore(&b);
+		bpf_local_irq_restore(&a);
+	} else {
+		bpf_local_irq_restore(&a);
+		bpf_local_irq_restore(&b);
+	}
+	return 0;
+}
+
+/* Leaves the RCU read section its caller entered, and returns. */
+static __noinline int rcu_unlock_and_return(void)
+{
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* Enters an RCU read section, and returns holding it. */
+static __noinline int rcu_lock_and_return(void)
+{
+	bpf_rcu_read_lock();
+	return 0;
+}
+
+/* A loop that ends by itself: a site the program passes. */
+static __always_inline void pass_a_site(void)
+{
+	int i;
+
+	for (i = 0; i < 2 && can_loop; i++)
+		;
+}
+
+/*
+ * The section is entered at run time or not, so the frame counts its
+ * sections in a hidden slot, and a callee leaves it: the count follows what
+ * the callee did, and the unwinder leaves no section at the timeout.
+ */
+SEC("tc")
+int cancel_section_left_by_callee(struct __sk_buff *ctx)
+{
+	int held = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (held)
+		bpf_rcu_read_lock();
+	pass_a_site();
+	if (held)
+		rcu_unlock_and_return();
+	spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* The same with a callee that enters the section and returns with it: the unwinder leaves it. */
+SEC("tc")
+int cancel_section_entered_by_callee(struct __sk_buff *ctx)
+{
+	int held = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (held)
+		rcu_lock_and_return();
+	pass_a_site();
+	spin();
+	if (held)
+		bpf_rcu_read_unlock();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
  * Allocates, recurses while holding, and throws in the innermost frame: every
  * frame of the subprog owns an object obtained at the same instruction, and
  * its state holds the objects of the frames below, obtained there too.
@@ -1441,6 +2532,85 @@ int throw_callee_clobbers_slot(struct __sk_buff *ctx)
 	mark_acquired(f);
 	c.node = f;
 	clobber_slot_and_throw(&c);
+	bpf_obj_drop(c.node);
+	return 0;
+}
+
+/* The same, with the innermost frame spinning until its time is up. */
+static __noinline int alloc_recurse_spin(int n)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	mark_acquired(f);
+	if (n)
+		alloc_recurse_spin(n - 1);
+	else
+		spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+SEC("tc")
+int cancel_recursion_holding(struct __sk_buff *ctx)
+{
+	return alloc_recurse_spin(3);
+}
+
+/*
+ * Calls itself twice per level, holding an object per frame: 2^60 calls, more
+ * than the time allows, so the check at the entry of the subprog cancels the
+ * program at a depth the test does not know. Every object the frames hold is
+ * released, see released_objs.
+ */
+static __noinline int alloc_and_call_twice(int n)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	alloc_cnt++;
+	if (n) {
+		alloc_and_call_twice(n - 1);
+		alloc_and_call_twice(n - 1);
+	}
+	drop_cnt++;
+	bpf_obj_drop(f);
+	return 0;
+}
+
+SEC("tc")
+int cancel_recursion_check_holding(struct __sk_buff *ctx)
+{
+	return alloc_and_call_twice(60);
+}
+
+/* The same across the may_goto of a callback: the slot is a number while the callback spins. */
+static int clobber_slot_cb(u32 i, struct slot_ctx *c)
+{
+	struct foo *f = c->node;
+
+	c->node = (void *)(long)param;
+	spin();
+	c->node = f;
+	return 0;
+}
+
+SEC("tc")
+int cancel_callback_clobbers_slot(struct __sk_buff *ctx)
+{
+	struct slot_ctx c;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	bpf_loop(loops, clobber_slot_cb, &c, loop_flags);
 	bpf_obj_drop(c.node);
 	return 0;
 }
