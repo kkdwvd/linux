@@ -747,7 +747,7 @@ __bpf_unwind_entry
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
 	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
-	bool kernel = kind != BPF_THROW_CALL;
+	bool kernel = kind != BPF_THROW_CALL, tell = kernel;
 	struct bpf_prog_aux *aux, *main_aux;
 	u64 (*cb)(u64, u64, u64, u64, u64);
 	const struct bpf_prog_aux *fn;
@@ -797,7 +797,8 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	 * into the pad of the helper, and the cancellation goes on from the
 	 * call to it, where the program's main frame is reached in turn; a
 	 * callback the kernel ran returns the cancel value, which the kernel
-	 * code ignores.
+	 * code ignores. A struct_ops gets to know that the kernel cancelled an
+	 * invocation of one of its programs, once the invocation is over.
 	 */
 	if (ctx.pad) {
 		/*
@@ -811,6 +812,7 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 		bpf_arch_set_ret_addr(ctx.bp, ctx.pad);
 		cookie = ctx.site;
 		cb = main_aux->bpf_cancel_cb;
+		tell = false;
 	} else if (aux->exception_cb || bpf_is_subprog(ctx.prog)) {
 		/*
 		 * A callback the kernel ran, asynchronous or the exception
@@ -834,6 +836,9 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 			cookie = main_aux->cancel_retval;
 		cb = main_aux->bpf_exception_cb;
 	}
+	if (tell && main_aux->prog->type == BPF_PROG_TYPE_STRUCT_OPS && main_aux->st_ops &&
+	    main_aux->st_ops->cancel)
+		main_aux->st_ops->cancel(main_aux->prog);
 	/*
 	 * Every program with a site has both callbacks, see bpf_do_misc_fixups();
 	 * without one nothing completes the frame, and there is no return from

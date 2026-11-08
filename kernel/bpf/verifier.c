@@ -23866,8 +23866,11 @@ again:
  * program, which takes any scalar of a global function. It takes the value
  * of that program, found from that program's own attachment: the extension
  * attaches to a function of the program's BTF, by an id that names nothing
- * in the kernel's. A struct_ops program cannot be cancelled, since the
- * meaning of its return value is the operator's.
+ * in the kernel's. The meaning of a struct_ops program's return value is the
+ * operator's: it returns 0, and the struct_ops is told through its cancel
+ * hook, so only a struct_ops with the hook has cancellable programs, and an
+ * extension of an operator is not cancellable, since the hook is told of the
+ * operator's own program.
  */
 static bool bpf_prog_cancel_retval(const struct bpf_prog *prog, s32 *retval)
 {
@@ -23875,7 +23878,8 @@ static bool bpf_prog_cancel_retval(const struct bpf_prog *prog, s32 *retval)
 
 	*retval = 0;
 	if (resolve_prog_type(prog) == BPF_PROG_TYPE_STRUCT_OPS)
-		return false;
+		return prog->type == BPF_PROG_TYPE_STRUCT_OPS && prog->aux->st_ops &&
+		       prog->aux->st_ops->cancel;
 	while (prog->type == BPF_PROG_TYPE_EXT)
 		prog = prog->aux->dst_prog;
 	switch (prog->type) {
