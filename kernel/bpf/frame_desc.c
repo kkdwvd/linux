@@ -2886,43 +2886,52 @@ void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_pat
 }
 
 /*
- * The bpf_loop() call at insn @off is being inlined: its callback is an
- * ordinary callee now, called from insn @call of the patch, and the frame is
- * unwound through there instead of stopping at the callback. The loop keeps
- * R6, R7 and R8 in the stack slots from @r6_off up while it runs, so what the
- * descriptor listed in those registers is listed in the slots.
+ * A rewrite of insn @off keeps register @reg in the stack slot at @slot_off
+ * of the frame while the unwinder may see the site: what the descriptor
+ * listed in the register is listed in the slot.
  */
-int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off)
+int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s16 slot_off)
 {
 	struct bpf_frame_desc_build *b = env->insn_aux_data[off].frame_desc;
-	int r, k, ret;
+	u32 spi = -slot_off / BPF_REG_SIZE - 1;
+	int k;
 
 	if (!b)
 		return 0;
-	ret = bpf_frame_desc_move_site(env, off, call);
-	if (ret)
-		return ret;
-	for (r = BPF_REG_6; r <= BPF_REG_8; r++) {
-		s16 slot_off = r6_off + (r - BPF_REG_6) * BPF_REG_SIZE;
-		u32 spi = -slot_off / BPF_REG_SIZE - 1;
+	for (k = 0; k < b->nr_fixed; k++) {
+		struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
 
-		for (k = 0; k < b->nr_fixed; k++) {
-			struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
-
-			if (ent->loc != BPF_FRAME_LOC_REG || ent->off != r)
-				continue;
-			ent->loc = BPF_FRAME_LOC_STACK;
-			ent->off = slot_off;
-		}
-		if (b->regs[r].state != LOC_RES)
+		if (ent->loc != BPF_FRAME_LOC_REG || ent->off != reg)
 			continue;
-		b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
-		if (!b)
-			return -ENOMEM;
-		b->slots[spi] = b->regs[r];
-		b->regs[r].state = LOC_OTHER;
+		ent->loc = BPF_FRAME_LOC_STACK;
+		ent->off = slot_off;
 	}
+	if (b->regs[reg].state != LOC_RES)
+		return 0;
+	b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
+	if (!b)
+		return -ENOMEM;
+	b->slots[spi] = b->regs[reg];
+	b->regs[reg].state = LOC_OTHER;
 	return 0;
+}
+
+/*
+ * The bpf_loop() call at insn @off is being inlined: its callback is an
+ * ordinary callee now, called from insn @call of the patch, and the frame is
+ * unwound through there instead of stopping at the callback. The loop keeps
+ * R6, R7 and R8 in the stack slots from @r6_off up while it runs.
+ */
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off)
+{
+	int r, ret;
+
+	if (!env->insn_aux_data[off].frame_desc)
+		return 0;
+	ret = bpf_frame_desc_move_site(env, off, call);
+	for (r = BPF_REG_6; r <= BPF_REG_8 && !ret; r++)
+		ret = bpf_frame_desc_spilled_reg(env, off, r, r6_off + (r - BPF_REG_6) * BPF_REG_SIZE);
+	return ret;
 }
 
 /* What is emitted at an insn of the current image, in this order; see emit_before(). */

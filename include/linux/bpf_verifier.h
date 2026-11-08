@@ -2399,6 +2399,7 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit(struct bpf_verifier_env *env);
 int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k);
+int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s16 slot_off);
 int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off);
 void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
