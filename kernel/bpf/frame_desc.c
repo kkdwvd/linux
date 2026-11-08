@@ -92,6 +92,8 @@ enum bpf_cell_state {
 #define ORDER_SECTION		-2
 #define ORDER_OBJ		-3
 
+static void note_held(struct bpf_verifier_env *env, const struct bpf_verifier_state *st, u32 origin);
+
 /* A candidate location of one reference on the current path. */
 struct cand {
 	u8 is_slot;
@@ -335,7 +337,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	}
 	for (i = 0; i < env->prog->len; i++) {
 		memset(&aux[i].ret_cell, 0, sizeof(aux[i].ret_cell));
-		aux[i].ref_held_twice = false;
+		aux[i].ref_held_max = 0;
 	}
 }
 
@@ -2263,14 +2265,12 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 	s->build = b;
 
 	/*
-	 * Two references of one origin, which a loop the verifier unrolled
-	 * acquired twice at one insn, would share a mirror: note it for the
-	 * origin, should a site need the mirror, see mirror_resource().
+	 * Several references of one origin, which a loop the verifier unrolled
+	 * acquired at one insn, need a slot each in the mirror of the origin:
+	 * note how many, should a site need the mirror, see mirror_resource().
 	 */
 	for (i = 0; i < st->acquired_refs; i++)
-		for (k = 0; k < i; k++)
-			if (st->refs[k].origin == st->refs[i].origin)
-				env->insn_aux_data[st->refs[i].origin].ref_held_twice = true;
+		note_held(env, st, st->refs[i].origin);
 
 	ret = place_fixed(env, s);
 	if (ret)
@@ -2419,6 +2419,7 @@ int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int reg
 	m = mirror_get(env, frame->subprogno, MIRROR_OWNED, ref->origin, 0);
 	if (!m)
 		return -ENOMEM;
+	note_held(env, st, ref->origin);
 	if (after && !reg_ref_off(&frame->regs[regno], ref->id, &adj))
 		adj = 0;
 	if (m->reg.type == NOT_INIT) {
@@ -2453,9 +2454,11 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 {
 	struct bpf_stack_state slot = { .spilled_ptr = m->reg };
 	const struct bpf_insn_aux_data *aux;
+	struct bpf_reg_state reg;
 	const struct bpf_insn *insn;
 	int ret;
 
+	m->nr_slots = 1;
 	if (m->ambiguous) {
 		verbose(env, "frame_desc: the pointer to the stack object obtained at insn %d is in different registers at the call on different paths\n",
 			m->at);
@@ -2473,7 +2476,7 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 	}
 	aux = &env->insn_aux_data[env->frame_desc_new_of[m->at]];
 	insn = &env->prog->insnsi[env->frame_desc_new_of[m->at]];
-	if (aux->ref_held_twice) {
+	if (aux->ref_held_max > 1 && m->kind != MIRROR_KIND_PTR) {
 		verbose(env, "frame_desc: two references obtained at insn %d are held at once, and no one slot can mirror both\n",
 			m->at);
 		return -EINVAL;
@@ -2482,7 +2485,23 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 	case MIRROR_KIND_PTR:
 		if (m->reg.type == NOT_INIT)
 			break;
-		ret = resource_of_reg(env, &m->reg);
+		reg = m->reg;
+		/*
+		 * References of one acquisition held several at once, by a loop
+		 * the verifier unrolled, get a slot each: the acquisition fills
+		 * the first free one, see emit_after(), and a release clears the
+		 * one holding what it releases, see emit_before(). The slots hold
+		 * the pointer as the acquisition returned it, which may point
+		 * into the object: the class carries by how much. The mirror
+		 * takes as many slots as the frame has room for below its stack.
+		 */
+		if (aux->ref_held_max > 1) {
+			const struct bpf_mirror_store *st = mirror_store_find(m, m->at, MIRROR_AFTER);
+
+			m->nr_slots = aux->ref_held_max;
+			reg.var_off = tnum_const(st ? st->adj : 0);
+		}
+		ret = resource_of_reg(env, &reg);
 		/* returned by a subprog: R0 is stored whatever the call returns with */
 		if (ret >= 0 && (bpf_pseudo_call(insn) || bpf_is_callx(insn)) &&
 		    !cell_has(&aux->ret_cell, ret)) {
@@ -2659,6 +2678,21 @@ static int section_insn_add(struct bpf_verifier_env *env, u32 insn, u16 subprog,
 	env->section_insns = si;
 	env->section_insn_cnt = cnt + 1;
 	return 0;
+}
+
+/*
+ * Note how many references of origin @origin the current frame of @st owns
+ * at once: a mirror of the origin needs a slot each. What the frames below
+ * own at the same origin, in a recursive subprog, sits in their slots.
+ */
+static void note_held(struct bpf_verifier_env *env, const struct bpf_verifier_state *st, u32 origin)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[origin];
+	u32 i, n = 0;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		n += st->refs[i].origin == origin && st->refs[i].frameno == st->curframe;
+	aux->ref_held_max = max_t(u32, aux->ref_held_max, min_t(u32, n, U16_MAX));
 }
 
 /* The current insn enters (@delta 1) or leaves (-1) a section of @kind, for the counters. */
@@ -2872,20 +2906,23 @@ static u64 frame_slots(struct bpf_verifier_env *env, const struct bpf_func_state
 	return mask;
 }
 
+static int state_held(const struct bpf_verifier_state *st, u32 origin, bool owned);
+
 /*
  * The current frame is about to call a subprog: note what it holds, so that
- * the return can tell what the callee released, and which stack slots R1-R5
- * point at, where the callee may create a stack object the frame returns
- * with, see bpf_frame_desc_record_return(). The notes go by the chain the
- * frame is under, which tells the mirror of a reference the frame does not
- * own.
+ * the return can tell what the callee released, how many references of an
+ * origin it holds several of, since the callee releasing one of them leaves
+ * the frame holding the origin, and which stack slots R1-R5 point at, where
+ * the callee may create a stack object the frame returns with, see
+ * bpf_frame_desc_record_return(). The notes go by the chain the frame is
+ * under, which tells the mirror of a reference the frame does not own.
  */
 int bpf_frame_desc_record_call(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_call_ref *r;
-	u32 i;
+	u32 i, k;
 	int node;
 
 	if (!env->describe_frames || st->speculative)
@@ -2906,26 +2943,44 @@ int bpf_frame_desc_record_call(struct bpf_verifier_env *env)
 		frame->call_obj_frame[i] = reg->frameno;
 		frame->call_obj_spi[i] = -off / BPF_REG_SIZE - 1;
 	}
+	frame->call_held_cnt = 0;
 	for (i = 0; i < st->acquired_refs; i++) {
-		r = call_ref_get(env, env->insn_idx, st->refs[i].origin, frame->subprogno,
-				 st->refs[i].frameno == st->curframe, node);
+		bool owned = st->refs[i].frameno == st->curframe;
+		u32 origin = st->refs[i].origin;
+		int n;
+
+		r = call_ref_get(env, env->insn_idx, origin, frame->subprogno, owned, node);
 		if (!r)
 			return -ENOMEM;
 		r->held_before = true;
+		n = state_held(st, origin, owned);
+		if (n < 2)
+			continue;
+		for (k = 0; k < frame->call_held_cnt; k++)
+			if (frame->call_held[k].origin == origin && frame->call_held[k].owned == owned)
+				break;
+		if (k < frame->call_held_cnt)
+			continue;
+		if (k == BPF_CALL_HELD) {
+			verbose(env, "frame_desc: the call at insn %d holds references of more than %d origins several at once\n",
+				env->insn_idx, BPF_CALL_HELD);
+			return -E2BIG;
+		}
+		frame->call_held[k] = (struct bpf_call_held) { .origin = origin, .owned = owned,
+							       .cnt = min_t(int, n, U16_MAX) };
+		frame->call_held_cnt++;
 	}
 	return 0;
 }
 
-/* Does @st hold a reference of origin @origin, @owned by the current frame or not? */
-static bool state_holds(const struct bpf_verifier_state *st, u32 origin, bool owned)
+/* How many references of origin @origin, @owned by the current frame or not, does @st hold? */
+static int state_held(const struct bpf_verifier_state *st, u32 origin, bool owned)
 {
-	u32 i;
+	int i, n = 0;
 
 	for (i = 0; i < st->acquired_refs; i++)
-		if (st->refs[i].origin == origin &&
-		    (st->refs[i].frameno == st->curframe) == owned)
-			return true;
-	return false;
+		n += st->refs[i].origin == origin && (st->refs[i].frameno == st->curframe) == owned;
+	return n;
 }
 
 /*
@@ -2940,8 +2995,10 @@ static bool state_holds(const struct bpf_verifier_state *st, u32 origin, bool ow
  * mirror has to be cleared after the call, and when the callee releases it
  * only on some paths, refreshed from where the paths tell apart, R0 or a
  * stack slot of the frame that holds the reference on the one kind of path
- * and 0 on the other. What the call does is recorded per path; what to emit
- * is settled once every path has returned, see mirror_resolve_calls().
+ * and 0 on the other. A callee that releases one of several references of
+ * an origin the frame holds leaves the frame holding the origin, which the
+ * count at the call tells. What the call does is recorded per path; what to
+ * emit is settled once every path has returned, see mirror_resolve_calls().
  */
 int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 				 int call_idx)
@@ -2996,6 +3053,7 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 		r->slots_ok &= ref->type == REF_TYPE_PTR ? frame_slots(env, frame, ref->id) : 0;
 		if (ref->origin != (u32)call_idx)
 			continue;
+		note_held(env, st, ref->origin);
 		if (in_r0) {
 			/* the callee returned it: an acquisition at the call */
 			m = mirror_get(env, frame->subprogno, MIRROR_OWNED, ref->origin, 0);
@@ -3041,14 +3099,26 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 	for (i = 0; i < env->call_ref_cnt; i++) {
 		r = &env->call_refs[i];
 		if (r->call != (u32)call_idx || r->node != (u32)node || !r->held_before ||
-		    state_holds(st, r->origin, r->owned))
+		    state_held(st, r->origin, r->owned))
 			continue;
 		r->absent = true;
 		r->r0_ok &= bpf_register_is_null((struct bpf_reg_state *)&regs[BPF_REG_0]);
 		r->slots_ok &= frame_slots(env, frame, 0);
 	}
+	/* what was held several at once at the call and is held fewer now: the callee released one */
+	for (i = 0; i < frame->call_held_cnt; i++) {
+		const struct bpf_call_held *h = &frame->call_held[i];
+		int n = state_held(st, h->origin, h->owned);
+
+		if (!n || n >= h->cnt)
+			continue;
+		r = call_ref_get(env, call_idx, h->origin, frame->subprogno, h->owned, node);
+		if (!r)
+			return -ENOMEM;
+		r->partial = true;
+	}
 	/* what the call returns with on some path and not on this one, see mirror_check_obtained() */
-	if (!state_holds(st, call_idx, true)) {
+	if (!state_held(st, call_idx, true)) {
 		r = call_ref_get(env, call_idx, call_idx, frame->subprogno, true, node);
 		if (!r)
 			return -ENOMEM;
@@ -3141,14 +3211,19 @@ static int mirror_resolve_calls(struct bpf_verifier_env *env, struct bpf_mirror 
 			c.held_before |= o->held_before;
 			c.held |= o->held;
 			c.absent |= o->absent;
+			c.partial |= o->partial;
 			c.r0_ok &= o->r0_ok;
 			c.slots_ok &= o->slots_ok;
 			releases |= call_releases(env, o->call, o->origin);
 		}
-		if (!c.held_before || !c.absent || !releases)
+		if (!c.held_before || !(c.absent || c.partial) || !releases)
 			continue;
 		if (!c.held) {
 			ret = mirror_store_add(m, c.call, MIRROR_CLEAR_AFTER, 0, 0, 0);
+		} else if (m->nr_slots > 1) {
+			verbose(env, "frame_desc: the call at insn %d may release one of the references obtained at insn %d, which are held several at once\n",
+				c.call, c.origin);
+			return -EINVAL;
 		} else if (c.r0_ok) {
 			ret = mirror_store_add(m, c.call, MIRROR_AFTER, BPF_REG_0, 0, c.r0_off);
 		} else if (c.slots_ok) {
@@ -4168,8 +4243,14 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 				m->at);
 			return -EINVAL;
 		}
-		ret = bpf_reserve_stack_slots(env, m->subprog, 1, &m->off);
-		ret = ret ?: bpf_stack_slot_init(env, m->subprog, m->off, 0);
+		ret = bpf_reserve_stack_slots(env, m->subprog, m->nr_slots, &m->off);
+		if (ret) {
+			verbose(env, "frame_desc: no room in the stack of subprog %d for the mirror of %d references obtained at insn %d\n",
+				m->subprog, m->nr_slots, m->at);
+			return ret;
+		}
+		for (k = 0; !ret && k < m->nr_slots; k++)
+			ret = bpf_stack_slot_init(env, m->subprog, m->off - k * BPF_REG_SIZE, 0);
 		if (ret)
 			return ret;
 	}
@@ -4188,9 +4269,12 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 				.flags = BPF_FRAME_ENT_INDIRECT | BPF_FRAME_ENT_NULLABLE,
 				.res = m->res, .off = m->off, .order = resource_order(env, m->res),
 			};
-			ret = build_mirror(b, b->listed[k].origin, ent);
-			if (ret)
-				return ret;
+			for (i = 0; i < m->nr_slots; i++) {
+				ent.off = m->off - i * BPF_REG_SIZE;
+				ret = build_mirror(b, b->listed[k].origin, ent);
+				if (ret)
+					return ret;
+			}
 		}
 	}
 	return 0;
@@ -4304,6 +4388,7 @@ enum {
 	EMIT_CLEAR_AFTER,	/* the mirror, after a call that released it */
 	EMIT_CLEAR_FAIL,	/* the mirror, after a call that failed to acquire it: R0 is not 0 */
 	EMIT_SECTION_AFTER,	/* the section count, after a call whose callee changed it */
+	EMIT_STORE_AFTER_FREE,	/* the first free of the slots of a mirror, from R0 */
 };
 
 struct emit_point {
@@ -4311,6 +4396,7 @@ struct emit_point {
 	u8 kind;
 	u8 reg;
 	s8 delta;	/* EMIT_SECTION */
+	u16 nr;		/* EMIT_STORE_AFTER_FREE: the slots */
 	s16 off;	/* the mirror, or the counter */
 	s16 src;	/* EMIT_STORE_AFTER_SLOT: the slot read */
 	s16 adj;	/* the register points that many bytes into the object */
@@ -4365,6 +4451,8 @@ static int point_cost(const struct emit_point *p, int clears)
 	case EMIT_STORE_BEFORE:
 	case EMIT_STORE_AFTER:
 		return p->adj ? 3 : 1;
+	case EMIT_STORE_AFTER_FREE:
+		return 4 * p->nr - 1;
 	default:
 		return 1;
 	}
@@ -4418,7 +4506,7 @@ static int emit_before(struct bpf_insn *buf, const struct emit_point *p, int n)
 /* The insns that refresh the mirrors after an insn, @n points from @p. */
 static int emit_after(struct bpf_insn *buf, const struct emit_point *p, int n)
 {
-	int i, cnt = 0;
+	int i, k, cnt = 0;
 
 	for (i = 0; i < n; i++) {
 		switch (p[i].kind) {
@@ -4440,6 +4528,19 @@ static int emit_after(struct bpf_insn *buf, const struct emit_point *p, int n)
 			buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, p[i].off);
 			buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, p[i].delta);
 			buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX, p[i].off);
+			break;
+		case EMIT_STORE_AFTER_FREE:
+			/* the first slot that is 0 takes it; the rest are left alone */
+			for (k = 0; k < p[i].nr; k++) {
+				s16 off = p[i].off - k * BPF_REG_SIZE;
+				bool last = k == p[i].nr - 1;
+
+				buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, off);
+				buf[cnt++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, last ? 1 : 2);
+				buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, p[i].reg, off);
+				if (!last)
+					buf[cnt++] = BPF_JMP_A((p[i].nr - 1 - k) * 4 - 1);
+			}
 			break;
 		}
 	}
@@ -4476,20 +4577,19 @@ static int points_cost(const struct emit_point *p, int n)
  */
 int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 {
-	struct bpf_insn *buf = env->insn_buf, *scratch, *insn;
+	struct bpf_insn *buf = NULL, *scratch = NULL, *insn;
 	struct emit_point *points;
-	u32 i, k, n = 0, len = env->prog->len, orig_len = env->frame_desc_orig_len;
+	u32 i, k, j, n = 0, len = env->prog->len, orig_len = env->frame_desc_orig_len, room = 0;
 	const u32 *new_of = env->frame_desc_new_of;
 	int ret = 0, cnt, off;
 
 	if (!env->mirrors_needed && !env->section_counters)
 		return 0;
 	for (i = 0; i < env->mirror_cnt; i++)
-		n += env->mirrors[i].needed ? env->mirrors[i].nr_stores : 0;
+		n += env->mirrors[i].needed ? env->mirrors[i].nr_stores * env->mirrors[i].nr_slots : 0;
 	n += env->section_insn_cnt;
 	points = kvcalloc(n, sizeof(*points), GFP_KERNEL_ACCOUNT);
-	scratch = kvcalloc(INSN_BUF_SIZE, sizeof(*scratch), GFP_KERNEL_ACCOUNT);
-	if (!points || !scratch) {
+	if (!points) {
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -4500,7 +4600,8 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 			continue;
 		for (k = 0; k < m->nr_stores; k++) {
 			const struct bpf_mirror_store *s = &m->stores[k];
-			u32 at = s->insn < orig_len ? new_of[s->insn] : len;
+			u32 at = s->insn < orig_len ? new_of[s->insn] : len, nr = 1;
+			u8 kind = mirror_emit_kind[s->point];
 
 			/* after the insn that takes the frame in the stack in arena, if any */
 			if (s->point == MIRROR_ENTRY_STORE) {
@@ -4512,13 +4613,25 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 				ret = -EFAULT;
 				goto out;
 			}
-			points[n++] = (struct emit_point) {
-				.insn = at, .kind = mirror_emit_kind[s->point], .reg = s->reg,
-				.off = m->off, .src = s->off, .adj = s->adj,
-			};
-			/* the mirror holds what arrived, which may point into the object: compare from there */
-			if (s->point == MIRROR_CLEAR)
-				points[n - 1].adj -= env->resources[m->res].delta;
+			/*
+			 * A mirror of several slots: the acquisition fills the first free
+			 * one, the other stores go slot by slot.
+			 */
+			if (m->nr_slots > 1) {
+				if (s->point == MIRROR_AFTER)
+					kind = EMIT_STORE_AFTER_FREE;
+				else
+					nr = m->nr_slots;
+			}
+			for (j = 0; j < nr; j++) {
+				points[n++] = (struct emit_point) {
+					.insn = at, .kind = kind, .reg = s->reg, .nr = m->nr_slots,
+					.off = m->off - j * BPF_REG_SIZE, .src = s->off, .adj = s->adj,
+				};
+				/* what arrived may point into the object: compare from there */
+				if (s->point == MIRROR_CLEAR)
+					points[n - 1].adj -= env->resources[m->res].delta;
+			}
 		}
 	}
 	for (i = 0; i < env->section_insn_cnt; i++) {
@@ -4537,6 +4650,18 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 		};
 	}
 	sort(points, n, sizeof(*points), point_cmp, NULL);
+	/* room for what goes before or after any one insn, twice for the ways out of an unwind_goto */
+	for (i = 0; i < n; i = k) {
+		for (k = i; k < n && points[k].insn == points[i].insn; k++)
+			;
+		room = max_t(u32, room, 2 * points_cost(&points[i], k - i) + 4);
+	}
+	buf = kvcalloc(room, sizeof(*buf), GFP_KERNEL_ACCOUNT);
+	scratch = kvcalloc(room, sizeof(*scratch), GFP_KERNEL_ACCOUNT);
+	if (!buf || !scratch) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	for (i = 0; i < n; i = k) {
 		u32 idx = points[i].insn, ne = 0, nb = 0, na;
@@ -4564,8 +4689,6 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 			env->mirror_insns += ne;
 		}
 		if (nb) {
-			if (points_cost(&points[i + ne], nb) >= INSN_BUF_SIZE)
-				goto too_many;
 			cnt = emit_before(scratch, &points[i + ne], nb);
 			memcpy(buf, scratch, cnt * sizeof(*buf));
 			buf[cnt++] = env->prog->insnsi[idx];
@@ -4578,14 +4701,10 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 		}
 		if (!na)
 			continue;
-		if (points_cost(&points[i + ne + nb], na) > INSN_BUF_SIZE)
-			goto too_many;
 		cnt = emit_after(scratch, &points[i + ne + nb], na);
 		if (idx + 1 < len && bpf_is_unwind_goto(&env->prog->insnsi[idx + 1])) {
 			struct bpf_insn ug = env->prog->insnsi[idx + 1];
 
-			if (2 * cnt + 3 > INSN_BUF_SIZE)
-				goto too_many;
 			/*
 			 * The jump where unwind_goto went sits 2 * cnt + 2 insns
 			 * below it: a target in front of the unwind_goto did not
@@ -4617,11 +4736,8 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 	}
 	ret = bpf_patch_list_commit(env);
 out:
+	kvfree(buf);
 	kvfree(scratch);
 	kvfree(points);
 	return ret;
-too_many:
-	verbose(env, "frame_desc: too many mirrors written at insn %d\n", points[i].insn);
-	ret = -E2BIG;
-	goto out;
 }
