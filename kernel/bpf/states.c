@@ -707,7 +707,8 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	    old->entry_rcu_locks != cur->entry_rcu_locks ||
 	    old->entry_preempt_locks != cur->entry_preempt_locks ||
 	    old->rcu_released_below != cur->rcu_released_below ||
-	    old->preempt_released_below != cur->preempt_released_below)
+	    old->preempt_released_below != cur->preempt_released_below ||
+	    old->refs_released_below != cur->refs_released_below)
 		return false;
 	/* what the callee released of what the frame holds is told at the return */
 	if (old->nr_released != cur->nr_released ||

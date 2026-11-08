@@ -1617,9 +1617,12 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	size_t rem;
 
 	/* the frames that were entered with it don't hold it ever since */
-	for (fr = 0; fr <= state->curframe; fr++)
-		if (idx < state->frame[fr]->entry_refs)
+	for (fr = 0; fr <= state->curframe; fr++) {
+		if (idx < state->frame[fr]->entry_refs) {
 			state->frame[fr]->entry_refs--;
+			state->frame[fr]->refs_released_below++;
+		}
+	}
 
 	/* IRQ state requires the relative ordering of elements remaining the
 	 * same, since it relies on the refs array to behave as a stack, so that
@@ -11350,6 +11353,32 @@ static int set_callee_state(struct bpf_verifier_env *env,
 			    struct bpf_func_state *caller,
 			    struct bpf_func_state *callee, int insn_idx);
 
+/*
+ * What R1-R5 name at the entry of @callee: the frame descriptors find out
+ * from it which register the caller passed a resource in that the callee
+ * releases, see bpf_frame_desc_record_release().
+ */
+static void record_arg_refs(struct bpf_func_state *callee)
+{
+	int i;
+
+	for (i = 0; i < MAX_BPF_FUNC_REG_ARGS; i++) {
+		const struct bpf_reg_state *reg = &callee->regs[BPF_REG_1 + i];
+		struct bpf_arg_ref *arg = &callee->arg_refs[i];
+
+		memset(arg, 0, sizeof(*arg));
+		if (reg->type == SCALAR_VALUE || reg->type == NOT_INIT || !tnum_is_const(reg->var_off))
+			continue;
+		if (reg->type == PTR_TO_STACK) {
+			arg->stack = true;
+			arg->frameno = reg->frameno;
+			arg->off = reg->var_off.value;
+		} else if (!reg->var_off.value) {
+			arg->id = reg->id;
+		}
+	}
+}
+
 static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int callsite,
 			    set_callee_state_fn set_callee_state_cb,
 			    struct bpf_verifier_state *state)
@@ -11389,6 +11418,7 @@ static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int calls
 	err = set_callee_state_cb(env, caller, callee, callsite);
 	if (err)
 		goto err_out;
+	record_arg_refs(callee);
 
 	/* only increment it after check_reg_arg() finished */
 	state->curframe++;
@@ -11868,6 +11898,7 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		callee->stack_arg_regs[i].map_uid =
 			inherited_id(state, callee->stack_arg_regs[i].map_uid);
 	}
+	record_arg_refs(callee);
 
 	account_current_path(env);
 	env->subprog_info[subprog].on_its_own = true;
@@ -12859,9 +12890,17 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * bpf_throw, this will be done by do_check_block() for extra frames. */
 	state->frame[state->curframe--] = NULL;
 	invalidate_outgoing_stack_args(env, caller);
-	/* what the callee did to what the caller holds, for the caller's mirrors */
-	err = callee->in_callback_fn ? 0 :
-	      bpf_frame_desc_record_return(env, state, callee->callsite, callee);
+	/*
+	 * What the callee did to what the caller holds, for the caller's
+	 * mirrors. A callback leaves the record to the kernel code that ran it,
+	 * see bpf_frame_desc_record_release().
+	 */
+	if (callee->in_callback_fn) {
+		caller->nr_released = 0;
+		err = 0;
+	} else {
+		err = bpf_frame_desc_record_return(env, state, callee->callsite, callee);
+	}
 	free_func_state(callee);
 	return err;
 }

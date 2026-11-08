@@ -462,7 +462,8 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 		    fa->entry_rcu_locks != fb->entry_rcu_locks ||
 		    fa->entry_preempt_locks != fb->entry_preempt_locks ||
 		    fa->rcu_released_below != fb->rcu_released_below ||
-		    fa->preempt_released_below != fb->preempt_released_below)
+		    fa->preempt_released_below != fb->preempt_released_below ||
+		    fa->refs_released_below != fb->refs_released_below)
 			return false;
 		/* what the callee released of what the frame holds is told at the return */
 		if (fa->nr_released != fb->nr_released ||

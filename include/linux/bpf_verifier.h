@@ -349,6 +349,14 @@ struct bpf_retval_range {
 	bool return_32bit;
 };
 
+/* A register at a frame's entry, as far as it names a resource, see frame_desc.c. */
+struct bpf_arg_ref {
+	u32 id;
+	s32 off;	/* a pointer to the stack: the slot, with the frame */
+	u8 frameno;
+	bool stack;
+};
+
 /* SCEV/widening register space: r0..r10 plus every stack slot of a frame. */
 #define BPF_SCEV_REGS_NUM (MAX_BPF_REG + MAX_BPF_STACK_SLOTS)
 
@@ -516,6 +524,14 @@ struct bpf_func_state {
 	 */
 	u32 rcu_released_below;
 	u32 preempt_released_below;
+	/*
+	 * How many of the references held when the frame was entered it or a
+	 * callee released: what the frame has to retract of what the frames
+	 * below list, for the unwinder.
+	 */
+	u32 refs_released_below;
+	/* What R1-R5 held at the entry: which the frame below passed a resource in. */
+	struct bpf_arg_ref arg_refs[MAX_BPF_FUNC_REG_ARGS];
 
 	/* The following fields should be last. See copy_func_state() */
 	/*
@@ -1050,6 +1066,11 @@ struct bpf_subprog_info {
 	struct bpf_frame_desc_table *frame_desc_table;
 	/* frame descriptor of a may_goto at the entry of a recursive subprog, see frame_desc.c */
 	struct bpf_frame_desc_build *entry_guard;
+	/* retractions of the subprog, see frame_desc.c: the most a frame releases of its callers' */
+	u8 max_retract;
+	u8 retract_scratch_cnt;	/* hidden slots a call keeps the handles it passes in */
+	s16 retract_scratch;	/* the topmost */
+	s16 retract_tmp;	/* where R0 is kept while a retraction is committed */
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1272,6 +1293,8 @@ struct bpf_frame_desc_build {
 /* A reference a frame or its callee released that a frame below held at the call. */
 struct bpf_released_ref {
 	u32 acq;	/* orig insn of the acquisition */
+	u16 res;	/* the class of what was released */
+	u8 reg;		/* the register the frame passed it in at the call, 0 for none */
 	bool owner;	/* the frame that gets told owns it */
 };
 
@@ -1318,12 +1341,32 @@ struct bpf_call_ref {
 	u32 call;	/* orig insn */
 	u32 acq;
 	u16 subprog;	/* the caller's */
+	u16 res;	/* the class of the reference, when a callee released it */
+	u8 reg;		/* the register the caller passed it in, 0 for none, ~0 when paths differ */
 	bool owner;	/* the caller owns the reference */
 	bool held;	/* held after the call on some path */
 	bool released;	/* released by the callee on some path */
 	bool transferred;	/* the callee returned it on some path */
 	bool r0_ok;	/* R0 holds it after the call on the paths that hold it, is 0 on the others */
 	u64 slots_ok;	/* the same for the stack slots of the caller's frame */
+};
+
+/* A release insn of a subprog that releases what a frame below owns, see frame_desc.c. */
+struct bpf_retraction {
+	u32 rel;	/* orig insn */
+	u16 subprog;
+	u16 res;	/* the class of what is released */
+	u8 reg;		/* the register the insn takes the handle from */
+};
+
+/* The retraction slots of a subprog for one class of handles, see frame_desc.c. */
+struct bpf_retract_array {
+	u16 subprog;
+	u16 res;	/* a class of the handles: the unwinder matches by handle */
+	u8 hclass;
+	u8 n;		/* slots */
+	s16 base;	/* fp offset of slot 0; slot i is at base + 8 * i */
+	s16 cnt_off;	/* the count of handles written, in bytes */
 };
 
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
@@ -1373,6 +1416,11 @@ struct bpf_verifier_env {
 	u32 mirror_insns;			/* instructions keeping the mirrors up to date */
 	struct bpf_call_ref *call_refs;
 	u32 call_ref_cnt;
+	struct bpf_retraction *retractions;
+	u32 retraction_cnt;
+	struct bpf_retract_array *retract_arrays;
+	u32 retract_array_cnt;
+	u32 retraction_slots;			/* hidden slots of the retraction arrays */
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
