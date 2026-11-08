@@ -562,8 +562,8 @@ static bool stack_arg_safe(struct bpf_verifier_env *env, struct bpf_func_state *
 	return true;
 }
 
-static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *cur,
-		    struct bpf_idmap *idmap)
+static bool refsafe(struct bpf_verifier_env *env, struct bpf_verifier_state *old,
+		    struct bpf_verifier_state *cur, struct bpf_idmap *idmap)
 {
 	int i;
 
@@ -590,6 +590,16 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
 		    old->refs[i].type != cur->refs[i].type ||
 		    old->refs[i].frameno != cur->refs[i].frameno)
+			return false;
+		/*
+		 * The frame descriptors key the mirror of a reference or a lock
+		 * by its origin, see frame_desc.c: a state doesn't stand for one
+		 * that obtained its references elsewhere. Not for what the
+		 * callers of a function verified on its own hold: it is theirs to
+		 * release.
+		 */
+		if (env->describe_frames && old->refs[i].type != REF_TYPE_IRQ &&
+		    i >= old->frame[0]->entry_refs && old->refs[i].origin != cur->refs[i].origin)
 			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
@@ -751,7 +761,7 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (old->unwound != cur->unwound || old->changed_pkt_data != cur->changed_pkt_data)
 		return false;
 
-	if (!refsafe(old, cur, &env->idmap_scratch))
+	if (!refsafe(env, old, cur, &env->idmap_scratch))
 		return false;
 
 	/* for states to be equal callsites have to be the same

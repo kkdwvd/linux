@@ -525,7 +525,7 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 }
 
 /* Things that can't be different in two states that are joined */
-static bool join_check_state(const struct bpf_verifier_state *a,
+static bool join_check_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
 			     const struct bpf_verifier_state *b)
 {
 	int i;
@@ -547,6 +547,15 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 		return false;
 	for (i = 0; i < a->acquired_refs; i++) {
 		if (a->refs[i].type != b->refs[i].type || a->refs[i].frameno != b->refs[i].frameno)
+			return false;
+		/*
+		 * The frame descriptors key the mirror of a reference or a lock
+		 * by its origin, see frame_desc.c, and the result keeps the
+		 * origins of 'a'. Not for what the callers of a function verified
+		 * on its own hold: it is theirs to release.
+		 */
+		if (env->describe_frames && a->refs[i].type != REF_TYPE_IRQ &&
+		    i >= a->frame[0]->entry_refs && a->refs[i].origin != b->refs[i].origin)
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
@@ -634,7 +643,7 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 	js->npairs = 0;
 	js->pairs_overflow = false;
 
-	if (!join_check_state(a, b))
+	if (!join_check_state(env, a, b))
 		return 1;
 	err = bpf_copy_verifier_state(dst, a);
 	if (err)
