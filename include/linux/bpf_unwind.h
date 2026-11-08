@@ -45,6 +45,7 @@
 #include <linux/compiler.h>
 #include <linux/kprobes.h>
 #include <linux/types.h>
+#include <linux/bpf_throw.h>
 #include <linux/filter.h>
 #include <linux/stringify.h>
 
@@ -126,14 +127,17 @@ do {										\
  * a pad to go to: a miss is a bug, and the exception would be lost in a return.
  * The store is the last thing before the return, into the frame of the function
  * itself, which a compiler may take for a dead store: hence WRITE_ONCE(), as
- * lkdtm writes its return address through a volatile pointer.
+ * lkdtm writes its return address through a volatile pointer. A cancelled
+ * callback leaves into the pad the same way, but the unwinder has made the
+ * return address of the outermost helper bpf_cancel_entry() already, which has
+ * no pad: the cancellation goes on there, see bpf_throw_unwind().
  */
 static __always_inline void bpf_unwind_leave(void)
 {
 	unsigned long *slot = (unsigned long *)__builtin_dwarf_cfa() - 1;
 	unsigned long to = bpf_unwind_target(*slot);
 
-	WARN_ON_ONCE(to == *slot);
+	WARN_ON_ONCE(to == *slot && to != (unsigned long)bpf_arch_cancel_entry());
 	WRITE_ONCE(*slot, to);
 }
 
@@ -243,7 +247,8 @@ static __always_inline void bpf_unwind_leave(void)
 	unsigned long from = ptrauth_strip_kernel_insn_pac(*slot);
 	unsigned long to = bpf_unwind_target(from);
 
-	WARN_ON_ONCE(to == from);
+	/* A cancellation goes on at bpf_cancel_entry(), see x86-64 above */
+	WARN_ON_ONCE(to == from && to != (unsigned long)bpf_arch_cancel_entry());
 #ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
 	{
 		register unsigned long x17 asm("x17") = to;
