@@ -1843,34 +1843,57 @@ enum bpf_resource_kind {
 	BPF_RESOURCE_RINGBUF,	/* bpf_ringbuf_reserve() record: bpf_ringbuf_discard() */
 	BPF_RESOURCE_DYNPTR_RINGBUF, /* ringbuf dynptr on the stack: bpf_ringbuf_discard_dynptr() */
 	BPF_RESOURCE_ITER,		/* open-coded iterator on the stack: its destroy kfunc */
+	BPF_RESOURCE_SPIN_LOCK,	/* bpf_spin_lock() held: bpf_spin_unlock() */
+	BPF_RESOURCE_RES_LOCK,	/* bpf_res_spin_lock() held: bpf_res_spin_unlock() */
+	BPF_RESOURCE_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave() held: its unlock_irqrestore */
+	BPF_RESOURCE_IRQ_FLAG,	/* bpf_local_irq_save() flags on the stack: its restore */
+	BPF_RESOURCE_IRQ_FLAG_LOCK, /* flags of an irqsave lock, restored with the lock */
+	BPF_RESOURCE_RCU,		/* bpf_rcu_read_lock() sections: bpf_rcu_read_unlock() each */
+	BPF_RESOURCE_PREEMPT,	/* bpf_preempt_disable() sections: bpf_preempt_enable() each */
 };
 
 /* A resource class of a program; descriptor entries refer to it by index. */
 struct bpf_resource {
 	u8 kind;	/* enum bpf_resource_kind */
 	bool sleeps;	/* the destructor may sleep */
+	bool rcu;	/* the destructor needs RCU protection */
+	s16 delta;	/* locks: offset of the lock from the pointer value at the location */
 	u32 type;	/* bpf_reg_type of a pointer resource */
 	u32 btf_id;
 	struct btf *btf;
 	union {
 		void (*dtor)(void *);
 		struct btf_struct_meta *meta;
+		void *addr;	/* locks: address of a lock in a global, needing no location */
 	};
 };
 
 enum {
 	BPF_FRAME_LOC_REG,	/* off is a register number */
 	BPF_FRAME_LOC_STACK,	/* off is a frame pointer relative stack offset */
+	BPF_FRAME_LOC_NONE,	/* no location: a lock at res->addr, or off sections to leave */
 };
 
-#define BPF_FRAME_ENT_NULLABLE	BIT(0)	/* the location may hold NULL instead */
+#define BPF_FRAME_ENT_NULLABLE	BIT(0)	/* the location may hold NULL instead: skip then */
+#define BPF_FRAME_ENT_INDIRECT	BIT(1)	/* the location holds a pointer to the resource */
+/* the location holds a handle this frame released of a frame below it; NONE: off handles */
+#define BPF_FRAME_ENT_RETRACT	BIT(2)
 
-/* One resource of a frame: the value at a location, or a stack object at it. */
+/* Retractions a frame may list: a frame cannot release more of its callers' resources. */
+#define BPF_UNWIND_MAX_RETRACT	32
+
+/*
+ * One resource of a frame: the value at a location, or a stack object at it.
+ * Entries are laid out in release order: locks and IRQ flags first, latest
+ * acquired first, then RCU-protected objects, sections, other objects, and
+ * the retractions, which the unwinder reads before it releases anything.
+ */
 struct bpf_frame_desc_entry {
 	u8 loc;
 	u8 flags;
 	u16 res;	/* index into the program's resource classes */
 	s16 off;
+	s16 order;	/* acquisition rank or one of the negative ranks in frame_desc.c */
 };
 
 struct bpf_frame_desc {
