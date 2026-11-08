@@ -9,8 +9,10 @@
  * where the caller is described from its state at the call: that way the
  * unwinder releases each frame from its instruction pointer alone, and
  * nothing a callee does to its own frame is the caller's concern. One
- * descriptor is built per (subprog, insn), and the paths that reach the
- * instruction are merged into it.
+ * descriptor is built per (subprog, insn, chain of calls), the calls the
+ * frames below wait in, and the paths that reach the instruction under the
+ * chain are merged into it; the builds of the chains are merged back into
+ * one after the pass where the chains agree, see remerge_builds().
  *
  * A frame lists the references it owns, see bpf_reference_state::frameno,
  * and those it holds for a frame below that it, or a callee of its, may
@@ -109,6 +111,7 @@ struct scratch {
 	struct bpf_frame_desc_build *build;
 	u32 pc;
 	u32 subprog;
+	u32 node;	/* the chain of the frame */
 	u32 live_regs;
 	const unsigned long *live_stack;
 	struct bpf_frame_desc_fixed fixed[MAX_FIXED];
@@ -137,22 +140,50 @@ static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32
 	return b;
 }
 
-/* The descriptor of insn @pc, which @slot holds, or the aux data of the insn when NULL. */
+/*
+ * The build of insn @pc for the chain @node, in the list @slot holds, or the
+ * list in the aux data of the insn when @slot is NULL: the build of the node,
+ * or a new one appended to the list.
+ */
 static struct bpf_frame_desc_build *build_get(struct bpf_verifier_env *env, u32 pc, u32 nr_slots,
-					      struct bpf_frame_desc_build **slot)
+					      struct bpf_frame_desc_build **slot, u32 node)
 {
-	return build_grow(env, pc, slot ?: &env->insn_aux_data[pc].frame_desc, nr_slots);
+	struct bpf_frame_desc_build **pp = slot ?: &env->insn_aux_data[pc].frame_desc, *b;
+
+	for (; *pp; pp = &(*pp)->next)
+		if ((*pp)->node == node)
+			break;
+	b = build_grow(env, pc, pp, nr_slots);
+	if (b)
+		b->node = node;
+	return b;
 }
 
-void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b)
+static void build_destroy(struct bpf_frame_desc_build *b)
 {
-	if (!b)
-		return;
 	kvfree(b->fixed);
 	kvfree(b->listed);
 	kvfree(b->targets);
 	kvfree(b->extra);
 	kvfree(b);
+}
+
+/* Destroy the list of builds at @b. */
+void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b)
+{
+	struct bpf_frame_desc_build *next;
+
+	for (; b; b = next) {
+		next = b->next;
+		build_destroy(b);
+	}
+}
+
+static void cells_free(struct bpf_cells *cells)
+{
+	kvfree(cells->sets);
+	cells->sets = NULL;
+	cells->cnt = 0;
 }
 
 void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux)
@@ -161,17 +192,92 @@ void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux)
 	bpf_frame_desc_build_destroy(aux->guard_desc);
 	aux->frame_desc = NULL;
 	aux->guard_desc = NULL;
+	cells_free(&aux->ref_load_cells);
 }
 
 /* The subprog insn @idx belongs to. */
 static int insn_subprog(struct bpf_verifier_env *env, u32 idx)
 {
-	int s;
+	int l = 0, r = env->subprog_cnt, m;
 
-	for (s = 0; s < env->subprog_cnt; s++)
-		if (idx < env->subprog_info[s + 1].start)
-			return s;
-	return -1;
+	if (idx >= env->subprog_info[r].start)
+		return -1;
+	while (r - l > 1) {
+		m = l + (r - l) / 2;
+		if (env->subprog_info[m].start <= idx)
+			l = m;
+		else
+			r = m;
+	}
+	return l;
+}
+
+/*
+ * The trie of the chains of calls the main pass sees. The chain of a frame
+ * is the sequence of the calls the frames below it wait in, nearest first:
+ * a path from the root, node 0, which is the chain of the main program, of
+ * a subprog verified on its own, of an asynchronous callback and of the
+ * exception callback; the chain of a callback a helper runs begins with the
+ * call of the helper. The verifier keeps its states apart by chain, so a
+ * frame may hold different things at an insn under different chains, and
+ * the descriptors follow: one build per (insn, chain), see build_get(),
+ * which bpf_frame_desc_resolve() merges back where the chains agree. Here
+ * the chains are paths of orig insns; the trie the unwinder walks names the
+ * sites instead, see bpf_frame_desc_build_tables().
+ */
+static int chain_child(struct bpf_verifier_env *env, u32 parent, u32 pc, bool create)
+{
+	struct bpf_chain *c;
+	u32 i, cnt = env->chain_cnt;
+
+	for (i = 1; i < cnt; i++)
+		if (env->chains[i].parent == parent && env->chains[i].pc == pc)
+			return i;
+	if (!create)
+		return -ENOENT;
+	c = kvrealloc(env->chains, array_size(cnt + 2, sizeof(*c)), GFP_KERNEL_ACCOUNT);
+	if (!c)
+		return -ENOMEM;
+	env->chains = c;
+	if (!cnt)
+		c[cnt++] = (struct bpf_chain) { .pc = ~0 };
+	c[cnt] = (struct bpf_chain) { .parent = parent, .pc = pc, .pool = ~0 };
+	env->chain_cnt = cnt + 1;
+	return cnt;
+}
+
+/* Is chain @v a proper prefix of chain @w: does the path to w go through v? */
+static bool chain_is_prefix(const struct bpf_verifier_env *env, u32 v, u32 w)
+{
+	if (v == w)
+		return false;
+	while (w) {
+		w = env->chains[w].parent;
+		if (w == v)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The node of the chain of the current frame of @st, interned. Each frame
+ * keeps its node once it is known, which the copies of the state carry on:
+ * the path is walked from the deepest frame that knows it.
+ */
+static int chain_of(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	int f, node;
+
+	for (f = st->curframe; f > 0 && !st->frame[f]->chain; f--)
+		;
+	node = f ? st->frame[f]->chain - 1 : 0;
+	for (f++; f <= st->curframe; f++) {
+		node = chain_child(env, node, st->frame[f]->callsite, true);
+		if (node < 0)
+			return node;
+		st->frame[f]->chain = node + 1;
+	}
+	return node;
 }
 
 /*
@@ -198,6 +304,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	kvfree(env->coclaims);
 	kvfree(env->section_insns);
 	kvfree(env->resources);
+	kvfree(env->chains);
 	env->mirrors = NULL;
 	env->call_refs = NULL;
 	env->arrivals = NULL;
@@ -205,6 +312,8 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	env->coclaims = NULL;
 	env->section_insns = NULL;
 	env->resources = NULL;
+	env->chains = NULL;
+	env->chain_cnt = 0;
 	env->mirror_cnt = 0;
 	env->call_ref_cnt = 0;
 	env->arrival_cnt = 0;
@@ -218,11 +327,10 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	for (i = 0; i < env->subprog_cnt; i++) {
 		struct bpf_subprog_info *sub = &env->subprog_info[i];
 
-		memset(sub->entry_cell, 0, sizeof(sub->entry_cell));
+		cells_free(&sub->entry_cells);
 		sub->section_counter = 0;
 	}
 	for (i = 0; i < env->prog->len; i++) {
-		memset(&aux[i].ref_load_cell, 0, sizeof(aux[i].ref_load_cell));
 		memset(&aux[i].ret_cell, 0, sizeof(aux[i].ret_cell));
 		aux[i].ref_held_twice = false;
 	}
@@ -232,8 +340,10 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 {
 	int i;
 
-	for (i = 0; i < env->subprog_cnt; i++)
+	for (i = 0; i < env->subprog_cnt; i++) {
 		bpf_frame_desc_build_destroy(env->subprog_info[i].entry_guard);
+		cells_free(&env->subprog_info[i].entry_cells);
+	}
 	for (i = 0; i < env->mirror_cnt; i++)
 		kvfree(env->mirrors[i].stores);
 	kvfree(env->mirrors);
@@ -246,9 +356,10 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->frame_desc_scratch);
 	kvfree(env->frame_desc_new_of);
 	kvfree(env->frame_desc_targets);
-	kvfree(env->frame_desc_reach);
 	kvfree(env->frame_desc_moves);
+	kvfree(env->chains);
 	env->frame_desc_moves = NULL;
+	env->chains = NULL;
 	env->mirrors = NULL;
 	env->call_refs = NULL;
 	env->arrivals = NULL;
@@ -259,7 +370,6 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	env->frame_desc_scratch = NULL;
 	env->frame_desc_new_of = NULL;
 	env->frame_desc_targets = NULL;
-	env->frame_desc_reach = NULL;
 }
 
 /* Intern a resource class; descriptors refer to it by index. */
@@ -719,29 +829,51 @@ static int cand_idx(const struct cand *c)
 	return c->is_slot ? BPF_REG_10 + c->idx : c->idx;
 }
 
-/* How frames of @subprog got the reference of origin @origin that they do not own, if known. */
-static struct bpf_arrival *arrival_find(struct bpf_verifier_env *env, u32 subprog, u32 origin)
+/* Any chain, where a key is looked up for a frame whatever it is under, see mirror_key(). */
+/*
+ * How frames of @subprog under chain @node got the reference of origin
+ * @origin that they do not own, if known: as noted under the node, or under
+ * a prefix of its chain, whose visits run under the node as well, see
+ * merge_prefix_builds(). Noted differently under two of them, it has no one
+ * place.
+ */
+static const struct bpf_arrival *arrival_lookup(struct bpf_verifier_env *env, u32 subprog,
+						u32 origin, u32 node)
 {
+	static const struct bpf_arrival none = { .how = ARRIVE_NONE };
+	const struct bpf_arrival *found = NULL;
 	u32 i;
 
-	for (i = 0; i < env->arrival_cnt; i++)
-		if (env->arrivals[i].origin == origin && env->arrivals[i].subprog == subprog)
-			return &env->arrivals[i];
-	return NULL;
+	for (i = 0; i < env->arrival_cnt; i++) {
+		const struct bpf_arrival *a = &env->arrivals[i];
+
+		if (a->origin != origin || a->subprog != subprog ||
+		    (a->node != node && !chain_is_prefix(env, a->node, node)))
+			continue;
+		if (a->how == ARRIVE_NONE)
+			return a;
+		if (found && (found->how != a->how || found->at != a->at || found->res != a->res))
+			return &none;
+		found = a;
+	}
+	return found;
 }
 
 /*
- * Frames of @subprog get the reference of origin @origin @how, @at a register
- * of the entry or a load insn, as a reference of class @res; got it in two
- * ways, it has no one place.
+ * Frames of @subprog under chain @node get the reference of origin @origin
+ * @how, @at a register of the entry or a load insn, as a reference of class
+ * @res; got it in two ways under the chain, it has no one place.
  */
-static int arrival_add(struct bpf_verifier_env *env, u32 subprog, u32 origin, u8 how, u32 at,
-		       u16 res)
+static int arrival_add(struct bpf_verifier_env *env, u32 subprog, u32 origin, u32 node, u8 how,
+		       u32 at, u16 res)
 {
-	struct bpf_arrival *a = arrival_find(env, subprog, origin);
-	u32 cnt = env->arrival_cnt;
+	struct bpf_arrival *a;
+	u32 i, cnt = env->arrival_cnt;
 
-	if (a) {
+	for (i = 0; i < cnt; i++) {
+		a = &env->arrivals[i];
+		if (a->origin != origin || a->subprog != subprog || a->node != node)
+			continue;
 		if (a->how != how || a->at != at || a->res != res)
 			a->how = ARRIVE_NONE;
 		return 0;
@@ -749,23 +881,24 @@ static int arrival_add(struct bpf_verifier_env *env, u32 subprog, u32 origin, u8
 	a = kvrealloc(env->arrivals, array_size(cnt + 1, sizeof(*a)), GFP_KERNEL_ACCOUNT);
 	if (!a)
 		return -ENOMEM;
-	a[cnt] = (struct bpf_arrival) { .origin = origin, .subprog = subprog, .how = how, .at = at,
-					.res = res };
+	a[cnt] = (struct bpf_arrival) { .origin = origin, .node = node, .subprog = subprog,
+					.how = how, .at = at, .res = res };
 	env->arrivals = a;
 	env->arrival_cnt = cnt + 1;
 	return 0;
 }
 
 /*
- * Where frames of @subprog obtain the reference of origin
+ * Where frames of @subprog under chain @node obtain the reference of origin
  * @origin, which keys its mirror: the origin itself when the frame owns the
- * reference, see bpf_reference_state::origin, else how it arrived and as what, since a register may carry an object and its lock at
+ * reference, see bpf_reference_state::origin, else how it arrived under the
+ * chain and as what, since a register may carry an object and its lock at
  * once, which are released differently. Whether the frame owns it is noted
  * where the frame is described, not told from the origin: a frame of a
  * recursive subprog holds what another frame of the subprog owns by its
  * arrival, in a slot the owner's acquisition never writes.
  */
-static void mirror_key(struct bpf_verifier_env *env, u32 subprog, u32 origin, bool owned,
+static void mirror_key(struct bpf_verifier_env *env, u32 subprog, u32 origin, u32 node, bool owned,
 		       u8 *how, u32 *at, u16 *res)
 {
 	const struct bpf_arrival *a;
@@ -776,7 +909,7 @@ static void mirror_key(struct bpf_verifier_env *env, u32 subprog, u32 origin, bo
 		*at = origin;
 		return;
 	}
-	a = arrival_find(env, subprog, origin);
+	a = arrival_lookup(env, subprog, origin, node);
 	if (!a || a->how == ARRIVE_NONE) {
 		*how = MIRROR_NOWHERE;
 		*at = origin;
@@ -803,14 +936,15 @@ static struct bpf_mirror *mirror_find(struct bpf_verifier_env *env, u32 subprog,
 	return NULL;
 }
 
-/* The mirror of the reference of origin @origin in frames of @subprog, if recorded. */
-static struct bpf_mirror *mirror_of(struct bpf_verifier_env *env, u32 subprog, u32 origin, bool owned)
+/* The mirror of the reference of origin @origin in frames of @subprog under chain @node, if recorded. */
+static struct bpf_mirror *mirror_of(struct bpf_verifier_env *env, u32 subprog, u32 origin, u32 node,
+				    bool owned)
 {
 	u8 how;
 	u32 at;
 	u16 res;
 
-	mirror_key(env, subprog, origin, owned, &how, &at, &res);
+	mirror_key(env, subprog, origin, node, owned, &how, &at, &res);
 	return mirror_find(env, subprog, how, at, res);
 }
 
@@ -836,15 +970,18 @@ static struct bpf_mirror *mirror_get(struct bpf_verifier_env *env, u32 subprog, 
 	return m;
 }
 
-/* The resource of origin @origin has to be released from its mirror at some site of @subprog. */
-static int mirror_need(struct bpf_verifier_env *env, u32 subprog, u32 origin, bool owned)
+/*
+ * The resource of origin @origin has to be released from its mirror at some
+ * site of @subprog under chain @node.
+ */
+static int mirror_need(struct bpf_verifier_env *env, u32 subprog, u32 origin, u32 node, bool owned)
 {
 	struct bpf_mirror *m;
 	u8 how;
 	u32 at;
 	u16 res;
 
-	mirror_key(env, subprog, origin, owned, &how, &at, &res);
+	mirror_key(env, subprog, origin, node, owned, &how, &at, &res);
 	m = mirror_get(env, subprog, how, at, res);
 	if (!m)
 		return -ENOMEM;
@@ -951,6 +1088,26 @@ static bool cell_has(const struct bpf_cell *c, u16 res)
 	return false;
 }
 
+/* The cells of a place for chain @node, added when @create. */
+static struct bpf_cell_set *cells_get(struct bpf_cells *cells, u32 node, bool create)
+{
+	struct bpf_cell_set *sets;
+	u32 i;
+
+	for (i = 0; i < cells->cnt; i++)
+		if (cells->sets[i].node == node)
+			return &cells->sets[i];
+	if (!create)
+		return NULL;
+	sets = kvrealloc(cells->sets, array_size(cells->cnt + 1, sizeof(*sets)), GFP_KERNEL_ACCOUNT);
+	if (!sets)
+		return NULL;
+	memset(&sets[cells->cnt], 0, sizeof(*sets));
+	sets[cells->cnt].node = node;
+	cells->sets = sets;
+	return &sets[cells->cnt++];
+}
+
 /* The store of mirror @m at @point of insn @insn, if recorded. */
 static struct bpf_mirror_store *mirror_store_find(const struct bpf_mirror *m, u32 insn, u8 point)
 {
@@ -980,22 +1137,24 @@ static int mirror_store_add(struct bpf_mirror *m, u32 insn, u8 point, u8 reg, s1
 
 /*
  * Note that the frame of build @b lists the resource of origin @origin at the
- * site, at location @loc of the lattice, or at none when it is mirrored.
+ * site, at location @loc of the lattice, or at none when it is mirrored,
+ * under chain @node.
  */
-static int build_add_listing(struct bpf_frame_desc_build *b, u32 origin, s16 loc, bool owned)
+static int build_add_listing(struct bpf_frame_desc_build *b, u32 origin, s16 loc, u32 node,
+			     bool owned)
 {
 	struct bpf_frame_desc_listing *l;
 	int i;
 
 	for (i = 0; i < b->nr_listed; i++)
 		if (b->listed[i].origin == origin && b->listed[i].loc == loc &&
-		    b->listed[i].owned == owned)
+		    b->listed[i].node == node && b->listed[i].owned == owned)
 			return 0;
 	l = kvrealloc(b->listed, array_size(b->nr_listed + 1, sizeof(*l)), GFP_KERNEL_ACCOUNT);
 	if (!l)
 		return -ENOMEM;
 	l[b->nr_listed++] = (struct bpf_frame_desc_listing) { .origin = origin, .loc = loc,
-							      .owned = owned };
+							      .node = node, .owned = owned };
 	b->listed = l;
 	return 0;
 }
@@ -1050,7 +1209,7 @@ static int conflict(struct bpf_verifier_env *env, struct scratch *s, u32 origin,
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "frame_desc: insn %d: the reference obtained at insn %d %s: mirrored\n",
 			s->pc, origin, why);
-	return mirror_need(env, s->subprog, origin, owned);
+	return mirror_need(env, s->subprog, origin, s->node, owned);
 }
 
 /* Replace the section entry of kind @kind of @b by the counter entry, or add it. */
@@ -1257,50 +1416,155 @@ static bool site_insn_ok(const struct bpf_insn *insn)
 }
 
 /*
+ * The node of the program's trie for chain @node of the pass, interning it
+ * and its ancestors: a node names the site of its call, by the subprog and
+ * the first entry of the site in the subprog's table, which @site_of gives
+ * for the orig insn of the call.
+ */
+static int pool_intern_chain(struct bpf_verifier_env *env, const u32 *site_of, u32 node)
+{
+	struct bpf_frame_desc_pool *pool = env->frame_desc_pool;
+	struct bpf_chain *c = &env->chains[node];
+	struct bpf_chain_node *nodes;
+	int parent;
+
+	if (!node)
+		return 0;
+	if (c->pool != ~0U)
+		return c->pool;
+	parent = pool_intern_chain(env, site_of, c->parent);
+	if (parent < 0)
+		return parent;
+	if (verifier_bug_if(c->pc >= env->frame_desc_orig_len || !site_of[2 * c->pc + 1], env,
+			    "chain through insn %d, which is not a site", c->pc))
+		return -EFAULT;
+	nodes = kvrealloc(pool->nodes, array_size(pool->node_cnt + 1, sizeof(*nodes)),
+			  GFP_KERNEL_ACCOUNT);
+	if (!nodes)
+		return -ENOMEM;
+	pool->nodes = nodes;
+	nodes[pool->node_cnt] = (struct bpf_chain_node) {
+		.parent = parent, .subprog = site_of[2 * c->pc], .site = site_of[2 * c->pc + 1] - 1,
+	};
+	c->pool = pool->node_cnt++;
+	env->frame_desc_bytes += sizeof(*nodes);
+	return c->pool;
+}
+
+static int site_cmp(const void *a, const void *b)
+{
+	const struct bpf_frame_desc_site *x = a, *y = b;
+
+	if (x->off != y->off)
+		return x->off < y->off ? -1 : 1;
+	return x->node < y->node ? -1 : x->node > y->node;
+}
+
+/*
+ * Build the trie of the chains the tables tell the descriptors of a site
+ * apart by, with the root, and key the entries by its nodes, sorted by site
+ * and node.
+ */
+static int pool_build_chains(struct bpf_verifier_env *env, const u32 *site_of)
+{
+	struct bpf_frame_desc_pool *pool = env->frame_desc_pool;
+	int s, ret;
+	u32 i;
+
+	pool->nodes = kvzalloc(sizeof(*pool->nodes), GFP_KERNEL_ACCOUNT);
+	if (!pool->nodes)
+		return -ENOMEM;
+	pool->node_cnt = 1;
+	env->frame_desc_bytes += sizeof(*pool->nodes);
+	for (s = 0; s < env->subprog_cnt; s++) {
+		struct bpf_frame_desc_table *tab = env->subprog_info[s].frame_desc_table;
+
+		if (!tab)
+			continue;
+		for (i = 0; i < tab->cnt; i++) {
+			ret = pool_intern_chain(env, site_of, tab->site[i].node);
+			if (ret < 0)
+				return ret;
+			tab->site[i].node = ret;
+		}
+		sort(tab->site, tab->cnt, sizeof(tab->site[0]), site_cmp, NULL);
+	}
+	env->chain_nodes = pool->node_cnt - 1;
+	return 0;
+}
+
+/*
  * After all instruction rewrites, turn the descriptors attached to instructions
  * into the per subprogram tables the unwinder uses, keyed by instruction index
- * until the JIT fills in native offsets. Identical descriptors share a body.
+ * until the JIT fills in native offsets, and by the chain where an insn has a
+ * descriptor per chain. Identical descriptors share a body.
  */
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_frame_desc_pool *pool;
+	u32 *site_of;	/* of an orig insn: subprog and first entry, see pool_intern_chain() */
 	int i, s, ret;
 
 	if (!env->frame_desc_visits)
 		return 0;
 	pool = kvzalloc(struct_size(pool, desc, 0), GFP_KERNEL_ACCOUNT);
-	if (!pool)
+	site_of = kvcalloc(2 * env->frame_desc_orig_len, sizeof(*site_of), GFP_KERNEL_ACCOUNT);
+	if (!pool || !site_of) {
+		kvfree(pool);
+		kvfree(site_of);
 		return -ENOMEM;
+	}
 	env->frame_desc_pool = pool;
 	for (s = 0; s < env->subprog_cnt; s++) {
 		u32 start = env->subprog_info[s].start, end = env->subprog_info[s + 1].start;
 		struct bpf_frame_desc_table *tab;
+		struct bpf_frame_desc_build *b;
 		u32 cnt = 0;
 
 		for (i = start; i < end; i++)
-			cnt += !!aux[i].frame_desc;
+			for (b = aux[i].frame_desc; b; b = b->next)
+				cnt++;
 		if (!cnt)
 			continue;
 		tab = kvzalloc(struct_size(tab, site, cnt), GFP_KERNEL_ACCOUNT);
-		if (!tab)
-			return -ENOMEM;
+		if (!tab) {
+			ret = -ENOMEM;
+			goto out;
+		}
 		env->subprog_info[s].frame_desc_table = tab;
 		env->frame_desc_bytes += struct_size(tab, site, cnt);
 		for (i = start; i < end; i++) {
-			if (!aux[i].frame_desc)
+			b = aux[i].frame_desc;
+			if (!b)
 				continue;
 			if (verifier_bug_if(!site_insn_ok(&env->prog->insnsi[i]), env,
-					    "frame descriptor at insn %d is not at a site", i))
-				return -EFAULT;
-			ret = pool_add(env, aux[i].frame_desc);
-			if (ret < 0)
-				return ret;
-			tab->site[tab->cnt++] = (struct bpf_frame_desc_site) { .off = i - start,
-									      .desc = ret };
-			env->frame_desc_sites++;
+					    "frame descriptor at insn %d is not at a site", i)) {
+				ret = -EFAULT;
+				goto out;
+			}
+			/* where the calls the pass named by insn ended up: the chains name them */
+			if (b->callsite) {
+				site_of[2 * b->pc] = s;
+				site_of[2 * b->pc + 1] = tab->cnt + 1;
+			}
+			env->chain_split_sites += !!b->next;
+			for (; b; b = b->next) {
+				ret = pool_add(env, b);
+				if (ret < 0)
+					goto out;
+				/* one build is for any chain: nothing to tell it from */
+				tab->site[tab->cnt++] = (struct bpf_frame_desc_site) {
+					.off = i - start, .desc = ret,
+					.node = aux[i].frame_desc->next ? b->node : 0,
+				};
+				env->frame_desc_sites++;
+			}
 		}
 	}
+	ret = pool_build_chains(env, site_of);
+	if (ret)
+		goto out;
 	/* a guard whose may_goto was not added after all, see check_recursion() */
 	for (s = 0; s < env->subprog_cnt; s++) {
 		bpf_frame_desc_build_destroy(env->subprog_info[s].entry_guard);
@@ -1315,7 +1579,10 @@ int bpf_frame_desc_build_tables(struct bpf_verifier_env *env)
 		env->prog->aux->frame_desc_table = env->subprog_info[0].frame_desc_table;
 		env->subprog_info[0].frame_desc_table = NULL;
 	}
-	return 0;
+	ret = 0;
+out:
+	kvfree(site_of);
+	return ret;
 }
 
 /*
@@ -1425,7 +1692,7 @@ static int fixed_add(struct bpf_verifier_env *env, struct scratch *s,
 		return -E2BIG;
 	}
 	s->fixed[s->nr_fixed++] = (struct bpf_frame_desc_fixed) { .ent = ent, .origin = origin,
-								   .owned = owned };
+								   .node = s->node, .owned = owned };
 	return 0;
 }
 
@@ -1460,7 +1727,7 @@ static int fixed_mirror(struct bpf_verifier_env *env, struct scratch *s, u32 ori
 					    .flags = BPF_FRAME_ENT_INDIRECT | BPF_FRAME_ENT_NULLABLE };
 	int ret;
 
-	ret = mirror_need(env, s->subprog, origin, owned);
+	ret = mirror_need(env, s->subprog, origin, s->node, owned);
 	return ret ?: fixed_add(env, s, ent, origin, owned);
 }
 
@@ -1727,12 +1994,12 @@ static int fixed_merge(struct bpf_verifier_env *env, struct scratch *s)
 		if (k == b->nr_fixed) {
 			/* not held on an earlier path: insert it after what precedes it here */
 			ret = fixed_insert(b, last + 1, e);
-			ret = ret ?: mirror_need(env, s->subprog, e->origin, e->owned);
+			ret = ret ?: mirror_need(env, s->subprog, e->origin, s->node, e->owned);
 			if (ret)
 				return ret;
 			k = last + 1;
 		} else if (!fixed_same(&b->fixed[k], e)) {
-			ret = mirror_need(env, s->subprog, e->origin, e->owned);
+			ret = mirror_need(env, s->subprog, e->origin, s->node, e->owned);
 			if (ret)
 				return ret;
 		}
@@ -1746,7 +2013,8 @@ static int fixed_merge(struct bpf_verifier_env *env, struct scratch *s)
 			section_disagree(env, s, b->fixed[k].ent.res);
 			continue;
 		}
-		ret = mirror_need(env, s->subprog, b->fixed[k].origin, b->fixed[k].owned);
+		ret = mirror_need(env, s->subprog, b->fixed[k].origin, b->fixed[k].node,
+				  b->fixed[k].owned);
 		if (ret)
 			return ret;
 	}
@@ -1788,7 +2056,8 @@ static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 		if (ret == 0)
 			order++;
 		/* not this frame's to place, unless it turns out to list it, see resolve_transfer() */
-		ret = build_add_listing(b, ref->origin, ret ? LISTED_SKIPPED : LISTED_FIXED, ref->frameno == st->curframe);
+		ret = build_add_listing(b, ref->origin, ret ? LISTED_SKIPPED : LISTED_FIXED, s->node,
+					ref->frameno == st->curframe);
 		if (ret)
 			return ret;
 	}
@@ -1937,12 +2206,13 @@ static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state 
 
 /*
  * Record the state of the current frame at a site where the program may be
- * unwound. @regs_saved says that the entry the unwinder is reached through
- * saves R0-R9 of the frame; otherwise it waits in a call and only keeps R6-R9
- * and its stack. A call of BPF code may enter @callee, which may release what
- * it is passed. Only live locations are considered, which keeps the
- * descriptors consistent with the joins of the verifier: two states it joins
- * agree on every live location, and so do a state and one it is within.
+ * unwound, in the build of the insn for the chain the frame is under. @regs_saved
+ * says that the entry the unwinder is reached through saves R0-R9 of the
+ * frame; otherwise it waits in a call and only keeps R6-R9 and its stack. A
+ * call of BPF code may enter @callee, which may release what it is passed.
+ * Only live locations are considered, which keeps the descriptors consistent
+ * with the joins of the verifier: two states it joins agree on every live
+ * location, and so do a state and one it is within.
  */
 static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		   struct bpf_frame_desc_build **slot, int callee)
@@ -1968,7 +2238,11 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		s->live_regs &= CALLEE_SAVED_REGS;
 	s->live_stack = env->insn_aux_data[s->pc].live_stack_before;
 	memset(s->class, 0, sizeof(s->class));
-	b = build_get(env, s->pc, bpf_stack_nr_slots(frame), slot);
+	ret = chain_of(env, st);
+	if (ret < 0)
+		return ret;
+	s->node = ret;
+	b = build_get(env, s->pc, bpf_stack_nr_slots(frame), slot, ret);
 	if (!b)
 		return -ENOMEM;
 	b->regs_saved = regs_saved;
@@ -2013,7 +2287,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		if (nr < 0)
 			return nr;
 		if (!nr && !owned) {
-			ret = build_add_listing(b, ref->origin, LISTED_SKIPPED, false);
+			ret = build_add_listing(b, ref->origin, LISTED_SKIPPED, s->node, false);
 			if (ret)
 				return ret;
 			continue;
@@ -2021,7 +2295,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		ret = place_ref(env, s, ref, nr);
 		if (ret < -1)
 			return ret;
-		ret = build_add_listing(b, ref->origin, ret, owned);
+		ret = build_add_listing(b, ref->origin, ret, s->node, owned);
 		if (ret)
 			return ret;
 	}
@@ -2059,6 +2333,8 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		b->is_call = true;
 		site_passed(env, st, b);
 	}
+	/* the chains name the calls, of BPF code and of helpers running callbacks, by their sites */
+	b->callsite |= callee != -1;
 	b->visits++;
 	return 0;
 }
@@ -2162,7 +2438,6 @@ int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int reg
 static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 {
 	struct bpf_stack_state slot = { .spilled_ptr = m->reg };
-	const struct bpf_subprog_info *sub = &env->subprog_info[m->subprog];
 	const struct bpf_insn_aux_data *aux;
 	const struct bpf_insn *insn;
 	int ret;
@@ -2174,17 +2449,9 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 	}
 	switch (m->how) {
 	case MIRROR_ENTRY:
-		if (cell_has(&sub->entry_cell[m->at - BPF_REG_1], m->res))
-			return m->res;
-		verbose(env, "frame_desc: subprog %d gets a reference in R%d at its entry on some paths and something else on others\n",
-			m->subprog, m->at);
-		return -EINVAL;
 	case MIRROR_LOAD:
-		if (cell_has(&env->insn_aux_data[env->frame_desc_new_of[m->at]].ref_load_cell, m->res))
-			return m->res;
-		verbose(env, "frame_desc: the load at insn %d yields a reference on some paths and something else on others\n",
-			m->at);
-		return -EINVAL;
+		/* what arrived, under the chains of the sites listing it, see mirror_sound_at() */
+		return m->res;
 	case MIRROR_NOWHERE:
 		verbose(env, "frame_desc: the reference obtained at insn %d is held by no register the frame obtained it in\n",
 			m->at);
@@ -2222,24 +2489,29 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 }
 
 /*
- * A frame of @st just entered its subprog: note what R1-R5 hold over every
- * entry, and in which register each reference of a frame below arrives, which
- * is where the subprog's mirror of it is written, see mirror_key().
+ * A frame of @st just entered its subprog under chain @node: note what R1-R5
+ * hold over every entry under the chain, and in which register each
+ * reference of a frame below arrives, which is where the subprog's mirror of
+ * it is written, see mirror_key().
  */
 static int record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
-			const struct bpf_reg_state *regs, int subprog, int owner)
+			const struct bpf_reg_state *regs, int subprog, int owner, u32 node)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	struct bpf_cell_set *cells;
 	u16 res[BPF_CELL_CLASSES];
 	int k, i, n, ret;
 
 	if (!env->describe_frames || st->speculative)
 		return 0;
+	cells = cells_get(&sub->entry_cells, node, true);
+	if (!cells)
+		return -ENOMEM;
 	for (k = 0; k < MAX_BPF_FUNC_REG_ARGS; k++) {
 		const struct bpf_reg_state *reg = &regs[BPF_REG_1 + k];
 
 		n = reg_classes(env, st, reg, res);
-		cell_merge(&sub->entry_cell[k], n, res);
+		cell_merge(&cells->cell[k], n, res);
 		if (n <= 0)
 			continue;
 		for (i = 0; i < st->acquired_refs; i++) {
@@ -2250,7 +2522,8 @@ static int record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			ret = ref_class_in_reg(env, st, reg, ref);
 			if (ret < 0)
 				continue;
-			ret = arrival_add(env, subprog, ref->origin, ARRIVE_REG, BPF_REG_1 + k, ret);
+			ret = arrival_add(env, subprog, ref->origin, node, ARRIVE_REG, BPF_REG_1 + k,
+					  ret);
 			if (ret)
 				return ret;
 		}
@@ -2261,33 +2534,43 @@ static int record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state 
 int bpf_frame_desc_record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int node;
 
-	return record_entry(env, st, frame->regs, frame->subprogno, st->curframe);
+	if (!env->describe_frames || st->speculative)
+		return 0;
+	node = chain_of(env, st);
+	if (node < 0)
+		return node;
+	return record_entry(env, st, frame->regs, frame->subprogno, st->curframe, node);
 }
 
 /*
  * The current frame of @st, the caller, calls @subprog, which is verified on
- * its own: what the subprog gets in R1-R5 is what the caller has there, dead
- * or not, under the caller's ids, which the entry state renames.
+ * its own, at the root of the chains: what the subprog gets in R1-R5 is what
+ * the caller has there, dead or not, under the caller's ids, which the entry
+ * state renames.
  */
 int bpf_frame_desc_record_entry_of(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 				   int subprog)
 {
-	return record_entry(env, st, st->frame[st->curframe]->regs, subprog, -2);
+	return record_entry(env, st, st->frame[st->curframe]->regs, subprog, -2, 0);
 }
 
 /*
  * Frames of @subprog run as invocations of their own, with what the kernel
- * hands them in R1-R5: the subprog may be called by the program as well, and
- * no register of its entry can mirror what arrives there then.
+ * hands them in R1-R5: the subprog may be called by the program as well, on
+ * its own, and no register of its entry can mirror what arrives there then.
  */
 void bpf_frame_desc_record_async_entry(struct bpf_verifier_env *env, int subprog)
 {
-	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	struct bpf_cell_set *cells = cells_get(&env->subprog_info[subprog].entry_cells, 0, true);
 	int k;
 
+	/* without the memory to note it, the entry is as good as never visited */
+	if (!cells)
+		return;
 	for (k = 0; k < MAX_BPF_FUNC_REG_ARGS; k++)
-		cell_merge(&sub->entry_cell[k], -2, NULL);
+		cell_merge(&cells->cell[k], -2, NULL);
 }
 
 /*
@@ -2301,13 +2584,20 @@ int bpf_frame_desc_record_load(struct bpf_verifier_env *env, int regno)
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
 	const struct bpf_reg_state *reg = &frame->regs[regno];
+	struct bpf_cell_set *cells;
 	u16 res[BPF_CELL_CLASSES];
-	int n, i, ret;
+	int n, i, ret, node;
 
 	if (!env->describe_frames || st->speculative)
 		return 0;
+	node = chain_of(env, st);
+	if (node < 0)
+		return node;
+	cells = cells_get(&aux->ref_load_cells, node, true);
+	if (!cells)
+		return -ENOMEM;
 	n = reg_classes(env, st, reg, res);
-	cell_merge(&aux->ref_load_cell, n, res);
+	cell_merge(&cells->cell[0], n, res);
 	if (n <= 0)
 		return 0;
 	for (i = 0; i < st->acquired_refs; i++) {
@@ -2318,7 +2608,8 @@ int bpf_frame_desc_record_load(struct bpf_verifier_env *env, int regno)
 		ret = ref_class_in_reg(env, st, reg, ref);
 		if (ret < 0)
 			continue;
-		ret = arrival_add(env, frame->subprogno, ref->origin, ARRIVE_LOAD, env->insn_idx, ret);
+		ret = arrival_add(env, frame->subprogno, ref->origin, node, ARRIVE_LOAD, env->insn_idx,
+				  ret);
 		if (ret)
 			return ret;
 	}
@@ -2389,18 +2680,34 @@ static int handle_regno(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	return -1;
 }
 
-static int release_rec_add(struct bpf_verifier_env *env, u32 rel, u16 subprog, u32 origin)
+/*
+ * Does a frame of @subprog under chain @node, or one below it, release the
+ * reference of origin @origin?
+ */
+static bool marked(const struct bpf_verifier_env *env, u32 origin, u32 node, u32 subprog)
+{
+	u32 i;
+
+	for (i = 0; i < env->release_rec_cnt; i++) {
+		const struct bpf_release_rec *r = &env->release_recs[i];
+
+		if (r->origin == origin && r->node == node && r->subprog == subprog)
+			return true;
+	}
+	return false;
+}
+
+static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u16 subprog)
 {
 	struct bpf_release_rec *r;
-	u32 i, cnt = env->release_rec_cnt;
+	u32 cnt = env->release_rec_cnt;
 
-	for (i = 0; i < cnt; i++)
-		if (env->release_recs[i].rel == rel && env->release_recs[i].origin == origin)
-			return 0;
+	if (marked(env, origin, node, subprog))
+		return 0;
 	r = kvrealloc(env->release_recs, array_size(cnt + 1, sizeof(*r)), GFP_KERNEL_ACCOUNT);
 	if (!r)
 		return -ENOMEM;
-	r[cnt] = (struct bpf_release_rec) { .rel = rel, .subprog = subprog, .origin = origin };
+	r[cnt] = (struct bpf_release_rec) { .origin = origin, .node = node, .subprog = subprog };
 	env->release_recs = r;
 	env->release_rec_cnt = cnt + 1;
 	return 0;
@@ -2411,10 +2718,12 @@ static int release_rec_add(struct bpf_verifier_env *env, u32 rel, u16 subprog, u
  * is released: the frame's mirror of it is cleared, with the handle in the
  * register the insn takes it from, so that the mirror says exactly whether
  * the resource is held. A release of what a frame below owns is noted for
- * the subprog: it is the one to list the resource then, see
- * bpf_frame_desc_resolve(). A callback leaves into the kernel code that ran
- * it, which no descriptor sees through, so a callback, or a frame above one
- * up to the helper call, may not release what the frames below hold.
+ * the frame and for every frame between, by the chain each is under: they
+ * are the ones to list the resource then, and the owner lists it no more at
+ * the call it passed it through, see resolve_transfer(). A callback leaves
+ * into the kernel code that ran it, which no descriptor sees through, so a
+ * callback, or a frame above one up to the helper call, may not release what
+ * the frames below hold.
  */
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 {
@@ -2422,7 +2731,7 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 	const struct bpf_reference_state *ref = &st->refs[idx];
 	u32 subprog = st->frame[st->curframe]->subprogno;
 	struct bpf_mirror *m;
-	int c, regno, ret;
+	int c, regno, ret, node;
 	u8 how;
 	u32 at;
 	u16 res;
@@ -2434,6 +2743,9 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 	if (verifier_bug_if(!site_insn_ok(&env->prog->insnsi[env->insn_idx]), env,
 			    "release at insn %d is not a call", env->insn_idx))
 		return -EFAULT;
+	node = chain_of(env, st);
+	if (node < 0)
+		return node;
 	if (ref->frameno != st->curframe) {
 		for (c = ref->frameno + 1; c <= st->curframe; c++) {
 			if (!st->frame[c]->in_callback_fn)
@@ -2442,14 +2754,18 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 				env->insn_idx);
 			return -EINVAL;
 		}
-		ret = release_rec_add(env, env->insn_idx, subprog, ref->origin);
-		if (ret)
-			return ret;
+		/* the frames know their chains: chain_of() walked them */
+		for (c = ref->frameno + 1; c <= st->curframe; c++) {
+			ret = mark_add(env, ref->origin, c ? st->frame[c]->chain - 1 : 0,
+				       st->frame[c]->subprogno);
+			if (ret)
+				return ret;
+		}
 	}
 	regno = handle_regno(env, st, ref, &adj);
 	if (regno < 0)
 		return 0;
-	mirror_key(env, subprog, ref->origin, ref->frameno == st->curframe, &how, &at, &res);
+	mirror_key(env, subprog, ref->origin, node, ref->frameno == st->curframe, &how, &at, &res);
 	m = mirror_get(env, subprog, how, at, res);
 	if (!m)
 		return -ENOMEM;
@@ -2457,14 +2773,14 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 }
 
 static struct bpf_call_ref *call_ref_get(struct bpf_verifier_env *env, u32 call, u32 origin,
-					 u32 subprog, bool owned)
+					 u32 subprog, bool owned, u32 node)
 {
 	struct bpf_call_ref *r;
 	u32 i, cnt = env->call_ref_cnt;
 
 	for (i = 0; i < cnt; i++)
 		if (env->call_refs[i].call == call && env->call_refs[i].origin == origin &&
-		    env->call_refs[i].owned == owned)
+		    env->call_refs[i].owned == owned && env->call_refs[i].node == node)
 			return &env->call_refs[i];
 	r = kvrealloc(env->call_refs, array_size(cnt + 1, sizeof(*r)), GFP_KERNEL_ACCOUNT);
 	if (!r)
@@ -2475,6 +2791,7 @@ static struct bpf_call_ref *call_ref_get(struct bpf_verifier_env *env, u32 call,
 	memset(r, 0, sizeof(*r));
 	r->call = call;
 	r->origin = origin;
+	r->node = node;
 	r->subprog = subprog;
 	r->owned = owned;
 	r->r0_ok = true;
@@ -2506,7 +2823,9 @@ static u64 frame_slots(struct bpf_verifier_env *env, const struct bpf_func_state
  * The current frame is about to call a subprog: note what it holds, so that
  * the return can tell what the callee released, and which stack slots R1-R5
  * point at, where the callee may create a stack object the frame returns
- * with, see bpf_frame_desc_record_return().
+ * with, see bpf_frame_desc_record_return(). The notes go by the chain the
+ * frame is under, which tells the mirror of a reference the frame does not
+ * own.
  */
 int bpf_frame_desc_record_call(struct bpf_verifier_env *env)
 {
@@ -2514,9 +2833,13 @@ int bpf_frame_desc_record_call(struct bpf_verifier_env *env)
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_call_ref *r;
 	u32 i;
+	int node;
 
 	if (!env->describe_frames || st->speculative)
 		return 0;
+	node = chain_of(env, st);
+	if (node < 0)
+		return node;
 	for (i = 0; i < SECTION_KINDS; i++)
 		frame->call_sections[i] = frame_sections(st, !i);
 	for (i = 0; i < MAX_BPF_FUNC_REG_ARGS; i++) {
@@ -2532,7 +2855,7 @@ int bpf_frame_desc_record_call(struct bpf_verifier_env *env)
 	}
 	for (i = 0; i < st->acquired_refs; i++) {
 		r = call_ref_get(env, env->insn_idx, st->refs[i].origin, frame->subprogno,
-				 st->refs[i].frameno == st->curframe);
+				 st->refs[i].frameno == st->curframe, node);
 		if (!r)
 			return -ENOMEM;
 		r->held_before = true;
@@ -2577,11 +2900,14 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 	struct bpf_mirror *m;
 	u16 res[BPF_CELL_CLASSES];
 	u32 i;
-	int objframe, spi, k, ret;
+	int objframe, spi, k, ret, node;
 	s16 r0_off = 0;
 
 	if (!env->describe_frames || st->speculative)
 		return 0;
+	node = chain_of(env, st);
+	if (node < 0)
+		return node;
 	/* what the callee did to the sections the frame holds, for its counter */
 	for (k = 0; k < SECTION_KINDS; k++) {
 		s32 n = frame_sections(st, !k) - frame->call_sections[k];
@@ -2604,7 +2930,7 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 			     reg_ref_off(&regs[BPF_REG_0], ref->id, &r0_off);
 
 		r = call_ref_get(env, call_idx, ref->origin, frame->subprogno,
-				 ref->frameno == st->curframe);
+				 ref->frameno == st->curframe, node);
 		if (!r)
 			return -ENOMEM;
 		/* R0 has to point the same way into the object on every path that holds it */
@@ -2661,7 +2987,7 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 	/* what was held at the call on some path and is not held now */
 	for (i = 0; i < env->call_ref_cnt; i++) {
 		r = &env->call_refs[i];
-		if (r->call != (u32)call_idx || !r->held_before ||
+		if (r->call != (u32)call_idx || r->node != (u32)node || !r->held_before ||
 		    state_holds(st, r->origin, r->owned))
 			continue;
 		r->absent = true;
@@ -2670,7 +2996,7 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 	}
 	/* what the call returns with on some path and not on this one, see mirror_check_obtained() */
 	if (!state_holds(st, call_idx, true)) {
-		r = call_ref_get(env, call_idx, call_idx, frame->subprogno, true);
+		r = call_ref_get(env, call_idx, call_idx, frame->subprogno, true, node);
 		if (!r)
 			return -ENOMEM;
 		r->absent = true;
@@ -2688,53 +3014,96 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
  */
 static int mirror_check_obtained(struct bpf_verifier_env *env, const struct bpf_mirror *m)
 {
+	bool held = false, absent = false;
 	u32 i;
 
 	if (m->how != MIRROR_OWNED || !mirror_store_find(m, m->at, MIRROR_BEFORE))
 		return 0;
+	/* under any chain of the calling frame: the store in front of the call is one for all */
 	for (i = 0; i < env->call_ref_cnt; i++) {
 		const struct bpf_call_ref *r = &env->call_refs[i];
 
-		if (r->call != m->at || r->origin != m->at || !r->owned || !r->held || !r->absent)
+		if (r->call != m->at || r->origin != m->at || !r->owned)
 			continue;
-		verbose(env, "frame_desc: the call at insn %d returns with the stack object obtained there on some paths and not on others\n",
-			m->at);
-		return -EINVAL;
+		held |= r->held;
+		absent |= r->absent;
 	}
-	return 0;
+	if (!held || !absent)
+		return 0;
+	verbose(env, "frame_desc: the call at insn %d returns with the stack object obtained there on some paths and not on others\n",
+		m->at);
+	return -EINVAL;
 }
 
 static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin);
 
+/* Is @r a record of a call of the subprog of @m whose reference the frame mirrors in @m? */
+static bool call_ref_mirrors(struct bpf_verifier_env *env, const struct bpf_call_ref *r,
+			     const struct bpf_mirror *m)
+{
+	return r->subprog == m->subprog &&
+	       mirror_of(env, r->subprog, r->origin, r->node, r->owned) == m;
+}
+
 /*
  * Settle what the calls of the subprog do to mirror @m: a call whose callee
- * releases the reference, after which it is gone on every path, clears the
- * mirror; one after which it is gone on some paths and held on others
- * refreshes the mirror from R0 or from a stack slot that tells the paths
- * apart.
+ * releases what the mirror holds, after which it is gone on every path,
+ * clears the mirror; one after which it is gone on some paths and held on
+ * others refreshes the mirror from R0 or from a stack slot that tells the
+ * paths apart. A call is recorded per reference and per chain of the
+ * calling frame, and the mirror of a reference the frame does not own goes
+ * by the chain, see mirror_key(): the records of one call that resolve to
+ * the mirror, of any origin under any chain, are taken together, since what
+ * is emitted after the call is emitted once for all of them.
  */
 static int mirror_resolve_calls(struct bpf_verifier_env *env, struct bpf_mirror *m)
 {
-	u32 i;
+	u32 i, j;
 	int ret;
 
 	for (i = 0; i < env->call_ref_cnt; i++) {
-		const struct bpf_call_ref *r = &env->call_refs[i];
+		struct bpf_call_ref c = env->call_refs[i];
+		bool releases;
 
-		if (r->subprog != m->subprog || !r->held_before || !r->absent ||
-		    mirror_of(env, r->subprog, r->origin, r->owned) != m ||
-		    !call_releases(env, r->call, r->origin))
+		if (!call_ref_mirrors(env, &c, m))
 			continue;
-		if (!r->held) {
-			ret = mirror_store_add(m, r->call, MIRROR_CLEAR_AFTER, 0, 0, 0);
-		} else if (r->r0_ok) {
-			ret = mirror_store_add(m, r->call, MIRROR_AFTER, BPF_REG_0, 0, r->r0_off);
-		} else if (r->slots_ok) {
-			ret = mirror_store_add(m, r->call, MIRROR_AFTER_SLOT, 0,
-					       -(__ffs64(r->slots_ok) + 1) * BPF_REG_SIZE, 0);
+		/* at the first of the records of the call */
+		for (j = 0; j < i; j++)
+			if (env->call_refs[j].call == c.call &&
+			    call_ref_mirrors(env, &env->call_refs[j], m))
+				break;
+		if (j < i)
+			continue;
+		releases = call_releases(env, c.call, c.origin);
+		for (j = i + 1; j < env->call_ref_cnt; j++) {
+			const struct bpf_call_ref *o = &env->call_refs[j];
+
+			if (o->call != c.call || !call_ref_mirrors(env, o, m))
+				continue;
+			/* R0 has to point the same way into the object on every path that holds it */
+			if (o->held && c.held && o->r0_off != c.r0_off)
+				c.r0_ok = false;
+			if (o->held && !c.held)
+				c.r0_off = o->r0_off;
+			c.held_before |= o->held_before;
+			c.held |= o->held;
+			c.absent |= o->absent;
+			c.r0_ok &= o->r0_ok;
+			c.slots_ok &= o->slots_ok;
+			releases |= call_releases(env, o->call, o->origin);
+		}
+		if (!c.held_before || !c.absent || !releases)
+			continue;
+		if (!c.held) {
+			ret = mirror_store_add(m, c.call, MIRROR_CLEAR_AFTER, 0, 0, 0);
+		} else if (c.r0_ok) {
+			ret = mirror_store_add(m, c.call, MIRROR_AFTER, BPF_REG_0, 0, c.r0_off);
+		} else if (c.slots_ok) {
+			ret = mirror_store_add(m, c.call, MIRROR_AFTER_SLOT, 0,
+					       -(__ffs64(c.slots_ok) + 1) * BPF_REG_SIZE, 0);
 		} else {
 			verbose(env, "frame_desc: the call at insn %d may release the reference obtained at insn %d, and neither R0 nor a stack slot tells on every path\n",
-				r->call, r->origin);
+				c.call, c.origin);
 			return -EINVAL;
 		}
 		if (ret)
@@ -2755,20 +3124,51 @@ static bool mirror_is_written(const struct bpf_mirror *m)
 	return false;
 }
 
-/* The subprog whose frame build @i describes: an insn, or the entry guard of a subprog. */
-static struct bpf_frame_desc_build *build_nth(struct bpf_verifier_env *env, u32 i, int *subprog)
+/*
+ * The lists of builds, by index: of the insns, of the guards in front of the
+ * insns, then of the entry guards of the subprogs; and the subprog whose
+ * frame the builds of a list describe.
+ */
+#define NR_LISTS(env)	(2 * (env)->prog->len + (env)->subprog_cnt)
+
+static struct bpf_frame_desc_build **build_list(struct bpf_verifier_env *env, u32 idx, int *subprog)
 {
 	u32 len = env->prog->len;
 
-	if (i < 2 * len) {
-		*subprog = insn_subprog(env, i / 2);
-		return i & 1 ? env->insn_aux_data[i / 2].guard_desc : env->insn_aux_data[i / 2].frame_desc;
+	if (idx < 2 * len) {
+		*subprog = insn_subprog(env, idx % len);
+		return idx < len ? &env->insn_aux_data[idx].frame_desc :
+				   &env->insn_aux_data[idx - len].guard_desc;
 	}
-	*subprog = i - 2 * len;
-	return env->subprog_info[i - 2 * len].entry_guard;
+	*subprog = idx - 2 * len;
+	return &env->subprog_info[idx - 2 * len].entry_guard;
 }
 
-#define NR_BUILDS(env)	(2 * (env)->prog->len + (env)->subprog_cnt)
+/* Walk every build of every list, see for_each_build(). */
+struct build_cursor {
+	u32 idx;
+	int subprog;
+	struct bpf_frame_desc_build *b;
+};
+
+static struct bpf_frame_desc_build *build_next(struct bpf_verifier_env *env, struct build_cursor *c)
+{
+	if (c->b) {
+		c->b = c->b->next;
+		if (c->b)
+			return c->b;
+		c->idx++;
+	}
+	for (; c->idx < NR_LISTS(env); c->idx++) {
+		c->b = *build_list(env, c->idx, &c->subprog);
+		if (c->b)
+			return c->b;
+	}
+	return NULL;
+}
+
+#define for_each_build(env, c, b)							\
+	for ((c)->idx = 0, (c)->b = NULL, (b) = build_next(env, c); (b); (b) = build_next(env, c))
 
 static struct bpf_frame_desc_loc *build_loc_nth(struct bpf_frame_desc_build *b, int l)
 {
@@ -2785,19 +3185,17 @@ static struct bpf_frame_desc_loc *build_loc_nth(struct bpf_frame_desc_build *b, 
  */
 static int mirror_settle(struct bpf_verifier_env *env)
 {
-	u32 i, k, j;
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
+	u32 k, j;
 	bool again = true;
 	int ret;
 
 	while (again) {
 		again = false;
-		for (i = 0; i < NR_BUILDS(env); i++) {
-			struct bpf_frame_desc_build *b;
-			int subprog;
+		for_each_build(env, &c, b) {
+			int subprog = c.subprog;
 
-			b = build_nth(env, i, &subprog);
-			if (!b)
-				continue;
 			for (k = 0; k < b->nr_listed; k++) {
 				const struct bpf_frame_desc_listing *l = &b->listed[k];
 				struct bpf_frame_desc_loc *loc;
@@ -2806,7 +3204,7 @@ static int mirror_settle(struct bpf_verifier_env *env)
 				if (l->loc < 0 || l->dropped)
 					continue;
 				loc = build_loc_nth(b, l->loc);
-				m = mirror_of(env, subprog, l->origin, l->owned);
+				m = mirror_of(env, subprog, l->origin, l->node, l->owned);
 				if (loc->state == LOC_RES && !(m && m->needed))
 					continue;
 				/* withdrawn, or mirrored: nothing listed there stays */
@@ -2816,17 +3214,368 @@ static int mirror_settle(struct bpf_verifier_env *env)
 					if (b->listed[j].loc != l->loc || b->listed[j].dropped)
 						continue;
 					m = mirror_of(env, subprog, b->listed[j].origin,
-						      b->listed[j].owned);
+						      b->listed[j].node, b->listed[j].owned);
 					if (m && m->needed)
 						continue;
 					ret = mirror_need(env, subprog, b->listed[j].origin,
-							  b->listed[j].owned);
+							  b->listed[j].node, b->listed[j].owned);
 					if (ret)
 						return ret;
 					again = true;
 				}
 			}
 		}
+	}
+	return 0;
+}
+
+/*
+ * Merge what a location holds in build @src into what it holds in @dst, a
+ * build of the same insn, as merge() does for the paths of one build: NULL
+ * on one side makes the resource of the other nullable, and different
+ * resources, or a resource against a copy or anything else, conflict, after
+ * which the location is withdrawn. Returns 1 on a conflict.
+ */
+static int loc_merge(struct bpf_frame_desc_loc *dst, const struct bpf_frame_desc_loc *src)
+{
+	if (src->state == LOC_UNSEEN)
+		return 0;
+	if (dst->state == LOC_UNSEEN) {
+		*dst = *src;
+		return 0;
+	}
+	if (dst->state == LOC_NULL && src->state == LOC_NULL)
+		return 0;
+	if (dst->state == LOC_NULL && src->state == LOC_RES) {
+		*dst = *src;
+		dst->nullable = 1;
+		return 0;
+	}
+	if (dst->state == LOC_RES && src->state == LOC_NULL) {
+		dst->nullable = 1;
+		return 0;
+	}
+	if (dst->state == LOC_RES && src->state == LOC_RES) {
+		if (dst->res == src->res && dst->indirect == src->indirect) {
+			dst->nullable |= src->nullable;
+			return 0;
+		}
+		dst->state = LOC_OTHER;
+		return 1;
+	}
+	if (dst->state == LOC_RES || src->state == LOC_RES) {
+		dst->state = LOC_OTHER;
+		return 1;
+	}
+	dst->state = LOC_OTHER;
+	return 0;
+}
+
+/* The fixed entry of @b for @e: the lock or flags of its origin, or the section of its kind. */
+static struct bpf_frame_desc_fixed *fixed_find(struct bpf_frame_desc_build *b,
+					       const struct bpf_frame_desc_fixed *e)
+{
+	int k;
+
+	for (k = 0; k < b->nr_fixed; k++)
+		if (b->fixed[k].origin == e->origin &&
+		    (e->origin != ACQ_NONE || b->fixed[k].ent.res == e->ent.res))
+			return &b->fixed[k];
+	return NULL;
+}
+
+static void section_disagree_in(struct bpf_verifier_env *env, int subprog, u16 res)
+{
+	u8 kind = env->resources[res].kind == BPF_RESOURCE_RCU ? 0 : 1;
+
+	env->subprog_info[subprog].section_counter |= BIT(kind);
+}
+
+/*
+ * Merge build @src into the build at @dstp, of the same insn of @subprog:
+ * the lattice, see loc_merge(), the listings, the locks, flags and sections,
+ * and the targets of a call. When @strict a conflict fails the merge, and so
+ * do locks, flags or sections placed differently, or placed in one build
+ * only: the builds stay apart then, and 1 is returned. Otherwise a location
+ * in conflict is withdrawn and what is listed there goes to its mirror, see
+ * mirror_settle(), and a lock or flags placed differently, or in one build
+ * only, goes to its mirror too, and sections that differ to the counter of
+ * the subprog, as between the paths of one build, see fixed_merge().
+ */
+static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_frame_desc_build **dstp,
+		       const struct bpf_frame_desc_build *src, bool strict)
+{
+	struct bpf_frame_desc_build *dst;
+	int l, i, k, order = 0, ret;
+
+	dst = build_grow(env, src->pc, dstp, src->nr_slots);
+	if (!dst)
+		return -ENOMEM;
+	if (verifier_bug_if(dst->regs_saved != src->regs_saved || dst->nr_extra || src->nr_extra,
+			    env, "merging the builds of insn %d", src->pc))
+		return -EFAULT;
+	for (l = 0; l < BPF_REG_10 + src->nr_slots; l++) {
+		struct bpf_frame_desc_loc *d = l < BPF_REG_10 ? &dst->regs[l] :
+								&dst->slots[l - BPF_REG_10];
+		const struct bpf_frame_desc_loc *o = l < BPF_REG_10 ? &src->regs[l] :
+								      &src->slots[l - BPF_REG_10];
+
+		if (loc_merge(d, o) && strict)
+			return 1;
+	}
+	for (i = 0; i < src->nr_listed; i++) {
+		const struct bpf_frame_desc_listing *sl = &src->listed[i];
+		struct bpf_frame_desc_listing *dl = NULL;
+
+		for (k = 0; k < dst->nr_listed; k++) {
+			if (dst->listed[k].origin != sl->origin)
+				continue;
+			/* listed by one chain and released below it by another: not one site */
+			if (strict && dst->listed[k].dropped != sl->dropped)
+				return 1;
+			if (dst->listed[k].loc == sl->loc && dst->listed[k].node == sl->node &&
+			    dst->listed[k].owned == sl->owned)
+				dl = &dst->listed[k];
+		}
+		if (!dl) {
+			ret = build_add_listing(dst, sl->origin, sl->loc, sl->node, sl->owned);
+			if (ret)
+				return ret;
+			dl = &dst->listed[dst->nr_listed - 1];
+			dl->dropped = sl->dropped;
+		}
+		dl->passed |= sl->passed;
+	}
+	for (i = 0; i < src->nr_fixed; i++) {
+		const struct bpf_frame_desc_fixed *e = &src->fixed[i];
+		struct bpf_frame_desc_fixed *f = fixed_find(dst, e);
+		bool same = f && fixed_same(f, e) && (e->origin != ACQ_NONE || f->ent.off == e->ent.off);
+
+		if (same)
+			continue;
+		if (strict)
+			return 1;
+		if (e->origin == ACQ_NONE) {
+			section_disagree_in(env, subprog, e->ent.res);
+			continue;
+		}
+		if (!f) {
+			ret = fixed_insert(dst, dst->nr_fixed, e);
+			if (ret)
+				return ret;
+		}
+		ret = mirror_need(env, subprog, e->origin, e->node, e->owned);
+		if (ret)
+			return ret;
+	}
+	for (k = 0; k < dst->nr_fixed; k++) {
+		const struct bpf_frame_desc_fixed *f = &dst->fixed[k];
+
+		if (fixed_find((struct bpf_frame_desc_build *)src, f))
+			continue;
+		if (strict)
+			return 1;
+		if (f->origin == ACQ_NONE) {
+			section_disagree_in(env, subprog, f->ent.res);
+			continue;
+		}
+		ret = mirror_need(env, subprog, f->origin, f->node, f->owned);
+		if (ret)
+			return ret;
+	}
+	for (k = 0; k < dst->nr_fixed; k++)
+		if (dst->fixed[k].origin != ACQ_NONE)
+			dst->fixed[k].ent.order = order++;
+	for (i = 0; i < src->nr_targets; i++) {
+		ret = build_add_target(dst, src->targets[i]);
+		if (ret)
+			return ret;
+	}
+	dst->is_call |= src->is_call;
+	dst->callsite |= src->callsite;
+	dst->visits += src->visits;
+	return 0;
+}
+
+/*
+ * A frame the pass visited under a chain runs, at run time, under every
+ * chain that extends it: the main program and a subprog verified on its own
+ * have callers the pass did not see, and a subprog visited under a short
+ * chain for one of them is visited under the longer chains as well where a
+ * caller is verified in context. The unwinder looks a frame up by the
+ * deepest node of its chain it finds, see bpf_unwind_chain(): so the build
+ * of a chain is merged into every build of the same insn whose chain extends
+ * it, and stays for the chains that have no build of their own.
+ */
+static int merge_prefix_builds(struct bpf_verifier_env *env)
+{
+	struct bpf_frame_desc_build **head, **w, *v;
+	u32 idx;
+	int subprog, ret;
+
+	for (idx = 0; idx < NR_LISTS(env); idx++) {
+		head = build_list(env, idx, &subprog);
+		if (!*head || !(*head)->next)
+			continue;
+		for (w = head; *w; w = &(*w)->next) {
+			for (v = *head; v; v = v->next) {
+				if (!chain_is_prefix(env, v->node, (*w)->node))
+					continue;
+				ret = build_merge(env, subprog, w, v, false);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Is mirror @m sound for a frame under chain @node: does the register of the
+ * entry, or the load, it is stored from hold a reference of its class, or
+ * NULL, on every visit under the node, and under the prefixes of its chain,
+ * whose visits run under the node as well? Otherwise what the store puts in
+ * the mirror is no handle, and no site under the node may list the mirror.
+ * The mirror of a resource the subprog obtains itself holds its handle or
+ * NULL under every chain.
+ */
+static bool mirror_sound_at(struct bpf_verifier_env *env, const struct bpf_mirror *m, u32 node)
+{
+	const struct bpf_cells *cells;
+	int k = 0;
+	u32 i;
+
+	if (m->how == MIRROR_ENTRY) {
+		cells = &env->subprog_info[m->subprog].entry_cells;
+		k = m->at - BPF_REG_1;
+	} else if (m->how == MIRROR_LOAD) {
+		cells = &env->insn_aux_data[env->frame_desc_new_of[m->at]].ref_load_cells;
+	} else {
+		return true;
+	}
+	for (i = 0; i < cells->cnt; i++) {
+		const struct bpf_cell *c = &cells->sets[i].cell[k];
+
+		if (cells->sets[i].node != node && !chain_is_prefix(env, cells->sets[i].node, node))
+			continue;
+		if (c->state != CELL_UNSEEN && c->state != CELL_NULL && !cell_has(c, m->res))
+			return false;
+	}
+	return true;
+}
+
+static int mirror_unsound(struct bpf_verifier_env *env, const struct bpf_mirror *m)
+{
+	if (m->how == MIRROR_ENTRY)
+		verbose(env, "frame_desc: subprog %d gets a reference in R%d at its entry on some paths and something else on others\n",
+			m->subprog, m->at);
+	else
+		verbose(env, "frame_desc: the load at insn %d yields a reference on some paths and something else on others\n",
+			m->at);
+	return -EINVAL;
+}
+
+/* The mirrors each build lists have to be sound under the build's chain. */
+static int check_mirrors_sound(struct bpf_verifier_env *env)
+{
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
+	u32 k;
+
+	for_each_build(env, &c, b) {
+		for (k = 0; k < b->nr_listed; k++) {
+			const struct bpf_frame_desc_listing *l = &b->listed[k];
+			const struct bpf_mirror *m;
+
+			if (l->dropped)
+				continue;
+			m = mirror_of(env, c.subprog, l->origin, l->node, l->owned);
+			if (m && m->needed && !mirror_sound_at(env, m, b->node))
+				return mirror_unsound(env, m);
+		}
+	}
+	return 0;
+}
+
+/* Does build @b drop a listing of a reference that mirror @m holds under the build's chain? */
+static bool build_drops_into(struct bpf_verifier_env *env, int subprog,
+			     const struct bpf_frame_desc_build *b, const struct bpf_mirror *m)
+{
+	u32 k;
+
+	for (k = 0; k < b->nr_listed; k++) {
+		const struct bpf_frame_desc_listing *l = &b->listed[k];
+
+		if (l->dropped && mirror_of(env, subprog, l->origin, l->node, l->owned) == m)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The builds of an insn for the chains the pass kept apart are merged back
+ * into one where the chains agree, see build_merge(), and where the mirrors
+ * one lists are sound under the chains of the others: the site has one
+ * descriptor then, for any chain, and the chains need no node of the trie
+ * for it. A mirror filled from a register of the entry or by a load holds
+ * whatever arrives there under any chain: a chain that drops what arrives
+ * there, for the frame below to list it at its call, cannot share the
+ * descriptor that lists the mirror, which would release it as well.
+ * Otherwise the site keeps a descriptor per chain, and the unwinder tells
+ * them apart by the chain of the frame. One build alone is for any chain as
+ * well: no other chain reaches the insn.
+ */
+static int remerge_builds(struct bpf_verifier_env *env)
+{
+	struct bpf_frame_desc_build **head, *a, *b, *r;
+	u32 idx, nr_slots, k;
+	int subprog, ret;
+
+	for (idx = 0; idx < NR_LISTS(env); idx++) {
+		head = build_list(env, idx, &subprog);
+		if (!*head || !(*head)->next)
+			continue;
+		nr_slots = 0;
+		for (b = *head; b; b = b->next)
+			nr_slots = max_t(u32, nr_slots, b->nr_slots);
+		r = NULL;
+		if (!build_grow(env, (*head)->pc, &r, nr_slots))
+			return -ENOMEM;
+		r->regs_saved = (*head)->regs_saved;
+		for (b = *head; b; b = b->next) {
+			ret = build_merge(env, subprog, &r, b, true);
+			if (ret)
+				break;
+		}
+		for (a = *head; !ret && a; a = a->next) {
+			for (k = 0; !ret && k < a->nr_listed; k++) {
+				const struct bpf_frame_desc_listing *l = &a->listed[k];
+				const struct bpf_mirror *m;
+
+				if (l->dropped)
+					continue;
+				m = mirror_of(env, subprog, l->origin, l->node, l->owned);
+				if (!m || !m->needed)
+					continue;
+				for (b = *head; b; b = b->next) {
+					if (!mirror_sound_at(env, m, b->node))
+						ret = 1;
+					if ((m->how == MIRROR_ENTRY || m->how == MIRROR_LOAD) &&
+					    build_drops_into(env, subprog, b, m))
+						ret = 1;
+				}
+			}
+		}
+		if (ret < 0) {
+			build_destroy(r);
+			return ret;
+		}
+		if (ret) {
+			build_destroy(r);
+			continue;
+		}
+		bpf_frame_desc_build_destroy(*head);
+		*head = r;
 	}
 	return 0;
 }
@@ -2856,81 +3605,39 @@ static int build_mirror(struct bpf_frame_desc_build *b, u32 origin, struct bpf_f
 }
 
 /*
- * The subprogs each subprog reaches through calls of BPF code, itself
- * included: static and global calls, and calls through function pointers.
- * Never a callback: the kernel code that runs it is in between. A bitmap
- * of subprog_cnt rows of subprog_cnt bits, like the callx edges.
+ * Does a frame of @subprog under chain @node, or under a prefix of its chain,
+ * release @origin at or below it?
  */
-static unsigned long *compute_reach(struct bpf_verifier_env *env)
+static bool marked_up(const struct bpf_verifier_env *env, u32 origin, u32 node, u32 subprog)
 {
-	u32 cnt = env->subprog_cnt, s, t, u, i;
-	unsigned long *reach;
-	bool again = true;
-
-	reach = kvcalloc(BITS_TO_LONGS(cnt * cnt), sizeof(long), GFP_KERNEL_ACCOUNT);
-	if (!reach)
-		return NULL;
-	for (s = 0; s < cnt; s++) {
-		__set_bit(s * cnt + s, reach);
-		for (i = env->subprog_info[s].start; i < env->subprog_info[s + 1].start; i++) {
-			const struct bpf_insn *insn = &env->prog->insnsi[i];
-			int callee;
-
-			if (!bpf_pseudo_call(insn))
-				continue;
-			callee = bpf_find_subprog(env, i + insn->imm + 1);
-			if (callee >= 0)
-				__set_bit(s * cnt + callee, reach);
-		}
-	}
-	if (env->callx_edges)
-		for (i = 0; i < cnt * cnt; i++)
-			if (test_bit(i, env->callx_edges))
-				__set_bit(i, reach);
-	while (again) {
-		again = false;
-		for (s = 0; s < cnt; s++) {
-			for (t = 0; t < cnt; t++) {
-				if (s == t || !test_bit(s * cnt + t, reach))
-					continue;
-				for (u = 0; u < cnt; u++) {
-					if (!test_bit(t * cnt + u, reach) || test_bit(s * cnt + u, reach))
-						continue;
-					__set_bit(s * cnt + u, reach);
-					again = true;
-				}
-			}
-		}
-	}
-	return reach;
-}
-
-/* Does a frame of @s, or of a subprog it reaches, release the reference of origin @origin? */
-static bool transferred(struct bpf_verifier_env *env, const unsigned long *reach, u32 s, u32 origin)
-{
-	u32 i, cnt = env->subprog_cnt;
-
-	for (i = 0; i < env->release_rec_cnt; i++) {
-		const struct bpf_release_rec *r = &env->release_recs[i];
-
-		if (r->origin == origin && test_bit(s * cnt + r->subprog, reach))
+	for (;;) {
+		if (marked(env, origin, node, subprog))
 			return true;
+		if (!node)
+			return false;
+		node = env->chains[node].parent;
 	}
-	return false;
 }
 
-/* Does a frame of @s list the reference of origin @origin for another target of a callx? */
-static bool coclaimed(struct bpf_verifier_env *env, u32 s, u32 origin)
+/*
+ * Does a frame of @s under chain @node list the reference of origin @origin
+ * for another target of a callx?
+ */
+static bool coclaimed(struct bpf_verifier_env *env, u32 s, u32 origin, u32 node)
 {
 	u32 i;
 
-	for (i = 0; i < env->coclaim_cnt; i++)
-		if (env->coclaims[i].origin == origin && env->coclaims[i].subprog == s)
+	for (i = 0; i < env->coclaim_cnt; i++) {
+		const struct bpf_coclaim *c = &env->coclaims[i];
+
+		if (c->origin == origin && c->subprog == s &&
+		    (c->node == node || chain_is_prefix(env, c->node, node)))
 			return true;
+	}
 	return false;
 }
 
-static int coclaim_add(struct bpf_verifier_env *env, u32 s, u32 origin)
+static int coclaim_add(struct bpf_verifier_env *env, u32 s, u32 origin, u32 node)
 {
 	struct bpf_coclaim *c;
 	u32 cnt = env->coclaim_cnt;
@@ -2938,36 +3645,86 @@ static int coclaim_add(struct bpf_verifier_env *env, u32 s, u32 origin)
 	c = kvrealloc(env->coclaims, array_size(cnt + 1, sizeof(*c)), GFP_KERNEL_ACCOUNT);
 	if (!c)
 		return -ENOMEM;
-	c[cnt] = (struct bpf_coclaim) { .origin = origin, .subprog = s };
+	c[cnt] = (struct bpf_coclaim) { .origin = origin, .subprog = s, .node = node };
 	env->coclaims = c;
 	env->coclaim_cnt = cnt + 1;
 	return 0;
 }
 
 /*
- * Does a frame of @s list the reference of origin @origin, which it does not
- * own: does it or a callee release it, or one that arrives the way it does,
- * in the same register of the entry or by the same load, as a reference of
- * the same class, since the mirror of that register or load lists whatever
- * arrived there; or is it a target of a callx another target of which lists
- * it, see coclaim_targets()?
+ * Does a frame of @s under chain @node list the reference of origin @origin,
+ * which it does not own: does it or a callee release it, under the chain or
+ * a prefix of it, or one that arrives the way it does, in the same register
+ * of the entry or by the same load, as a reference of the same class, since
+ * the mirror of that register or load lists whatever arrived there; or is
+ * it a target of a callx another target of which lists it, see
+ * coclaim_targets()?
  */
-static bool claimed(struct bpf_verifier_env *env, const unsigned long *reach, u32 s, u32 origin)
+static bool claimed(struct bpf_verifier_env *env, u32 s, u32 origin, u32 node)
 {
-	const struct bpf_arrival *a = arrival_find(env, s, origin);
+	const struct bpf_arrival *a;
 	u32 i;
 
-	if (coclaimed(env, s, origin))
+	if (coclaimed(env, s, origin, node) || marked_up(env, origin, node, s))
 		return true;
+	a = arrival_lookup(env, s, origin, node);
 	if (!a || a->how == ARRIVE_NONE)
-		return transferred(env, reach, s, origin);
+		return false;
 	for (i = 0; i < env->arrival_cnt; i++) {
 		const struct bpf_arrival *o = &env->arrivals[i];
 
-		if (o->subprog == s && o->how == a->how && o->at == a->at && o->res == a->res &&
-		    (transferred(env, reach, s, o->origin) || coclaimed(env, s, o->origin)))
+		if (o->subprog != s || o->how != a->how || o->at != a->at || o->res != a->res ||
+		    (o->node != node && !chain_is_prefix(env, o->node, node)))
+			continue;
+		if (marked_up(env, o->origin, node, s) || coclaimed(env, s, o->origin, node))
 			return true;
 	}
+	return false;
+}
+
+/*
+ * The chain of a frame the call of build @b enters: the call, then the chain
+ * of the frame of the build. Walk its nodes from the root as far as the trie
+ * has them, into @nodes: a frame of the callee visited under a shorter
+ * chain, from a caller verified on its own, is at one of the shorter ones
+ * and runs under the longer ones, see merge_prefix_builds(). Returns how
+ * many, and the deepest last.
+ */
+static int callee_chain(struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
+			u32 *nodes)
+{
+	u32 pcs[MAX_CALL_FRAMES + 1], node;
+	int n = 0, k, depth = 0;
+
+	pcs[depth++] = b->pc;
+	for (node = b->node; node && depth < ARRAY_SIZE(pcs); node = env->chains[node].parent)
+		pcs[depth++] = env->chains[node].pc;
+	node = 0;
+	nodes[n++] = node;
+	for (k = 0; k < depth; k++) {
+		int child = chain_child(env, node, pcs[k], false);
+
+		if (child < 0)
+			break;
+		node = child;
+		nodes[n++] = node;
+	}
+	return n;
+}
+
+/*
+ * Does target @t of the call of build @b list the reference of origin
+ * @origin, under some chain the call enters it under?
+ */
+static bool callee_claims(struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b, u32 t,
+			  u32 origin)
+{
+	u32 nodes[MAX_CALL_FRAMES + 2];
+	int n = callee_chain(env, b, nodes), k;
+
+	for (k = 0; k < n; k++)
+		if (claimed(env, t, origin, nodes[k]))
+			return true;
 	return false;
 }
 
@@ -2975,23 +3732,23 @@ static bool claimed(struct bpf_verifier_env *env, const unsigned long *reach, u3
  * A callx passes what it passes to every target alike, and the caller lists
  * nothing a target releases: the targets that do not release it list it,
  * as a reference that arrived the way it did, from their lattice or their
- * mirror. A target may be one of another callx in turn: to a fixed point.
+ * mirror, under the deepest chain the call enters them under. A target may
+ * be one of another callx in turn: to a fixed point.
  */
 static int coclaim_targets(struct bpf_verifier_env *env)
 {
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
 	bool again = true;
-	u32 i, k;
-	int t, ret;
+	u32 k, nodes[MAX_CALL_FRAMES + 2];
+	int t, n, ret;
 
 	while (again) {
 		again = false;
-		for (i = 0; i < NR_BUILDS(env); i++) {
-			struct bpf_frame_desc_build *b;
-			int subprog;
-
-			b = build_nth(env, i, &subprog);
-			if (!b || !b->is_call || b->nr_targets < 2)
+		for_each_build(env, &c, b) {
+			if (!b->is_call || b->nr_targets < 2)
 				continue;
+			n = callee_chain(env, b, nodes);
 			for (k = 0; k < b->nr_listed; k++) {
 				const struct bpf_frame_desc_listing *l = &b->listed[k];
 				bool any = false;
@@ -2999,13 +3756,13 @@ static int coclaim_targets(struct bpf_verifier_env *env)
 				if (!l->passed)
 					continue;
 				for (t = 0; t < b->nr_targets; t++)
-					any |= claimed(env, env->frame_desc_reach, b->targets[t], l->origin);
+					any |= callee_claims(env, b, b->targets[t], l->origin);
 				if (!any)
 					continue;
 				for (t = 0; t < b->nr_targets; t++) {
-					if (claimed(env, env->frame_desc_reach, b->targets[t], l->origin))
+					if (callee_claims(env, b, b->targets[t], l->origin))
 						continue;
-					ret = coclaim_add(env, b->targets[t], l->origin);
+					ret = coclaim_add(env, b->targets[t], l->origin, nodes[n - 1]);
 					if (ret)
 						return ret;
 					again = true;
@@ -3040,44 +3797,59 @@ static int call_targets(struct bpf_verifier_env *env, u32 call, u16 *targets)
 	return n;
 }
 
-/* Does the callee of the call at @call (an orig insn) release the reference of origin @origin? */
+/*
+ * Does a callee of the call at @call (an orig insn) release the reference of
+ * origin @origin, under some chain: a frame entered from the call, or one
+ * verified on its own, of a target of the call?
+ */
 static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 {
 	u16 *targets = env->frame_desc_targets;
 	int i, n;
+	u32 k;
 
 	if (verifier_bug_if(call >= env->frame_desc_orig_len, env, "call at insn %d", call))
 		return false;
 	n = call_targets(env, env->frame_desc_new_of[call], targets);
-	for (i = 0; i < n; i++)
-		if (transferred(env, env->frame_desc_reach, targets[i], origin))
-			return true;
+	for (k = 0; k < env->release_rec_cnt; k++) {
+		const struct bpf_release_rec *r = &env->release_recs[k];
+
+		if (r->origin != origin)
+			continue;
+		if (r->node) {
+			if (env->chains[r->node].pc == call)
+				return true;
+			continue;
+		}
+		for (i = 0; i < n; i++)
+			if (targets[i] == r->subprog)
+				return true;
+	}
 	return false;
 }
 
 /*
  * The transfer: a frame lists what it owns and what it, or a callee, releases
- * of what the frames below own, which the frames below do not list at the
- * call through which the resource reached the releasing frame. Drop every
- * other provisional listing, and withdraw a location of the lattice whose
- * listings are dropped, which a reference listed there that stays is then
- * mirrored for, see mirror_settle().
+ * of what the frames below own, under the chain it is under or a prefix of
+ * it, which the frames below do not list at the call through which the
+ * resource reached the releasing frame, under the chains the call enters
+ * it under. Drop every other provisional listing, and withdraw a location of
+ * the lattice whose listings are dropped, which a reference listed there
+ * that stays is then mirrored for, see mirror_settle().
  */
 static int resolve_transfer(struct bpf_verifier_env *env)
 {
-	u32 i, k, j;
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
+	u32 k, j;
 	int ret;
 
 	ret = coclaim_targets(env);
 	if (ret)
 		return ret;
-	for (i = 0; i < NR_BUILDS(env); i++) {
-		struct bpf_frame_desc_build *b;
-		int subprog;
+	for_each_build(env, &c, b) {
+		int subprog = c.subprog;
 
-		b = build_nth(env, i, &subprog);
-		if (!b)
-			continue;
 		for (k = 0; k < b->nr_listed; k++) {
 			struct bpf_frame_desc_listing *l = &b->listed[k];
 			int t;
@@ -3085,7 +3857,7 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			u32 at;
 			u16 res;
 
-			if (!l->owned && !claimed(env, env->frame_desc_reach, subprog, l->origin)) {
+			if (!l->owned && !claimed(env, subprog, l->origin, b->node)) {
 				l->dropped = true;
 				continue;
 			}
@@ -3095,20 +3867,20 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			 * too late for a site in front of the load.
 			 */
 			if (l->loc == LISTED_SKIPPED) {
-				mirror_key(env, subprog, l->origin, false, &how, &at, &res);
+				mirror_key(env, subprog, l->origin, l->node, false, &how, &at, &res);
 				if (how == MIRROR_LOAD) {
 					verbose(env, "frame_desc: subprog %d releases the reference obtained at insn %d, which it holds nowhere at insn %d, before loading it at insn %d\n",
 						subprog, l->origin, b->pc, at);
 					return -EINVAL;
 				}
-				ret = mirror_need(env, subprog, l->origin, false);
+				ret = mirror_need(env, subprog, l->origin, l->node, false);
 				if (ret)
 					return ret;
 				l->loc = -1;
 			}
 			/* passed to a callee chain that lists it: the chain releases it */
 			for (t = 0; l->passed && t < b->nr_targets; t++) {
-				if (!claimed(env, env->frame_desc_reach, b->targets[t], l->origin))
+				if (!callee_claims(env, b, b->targets[t], l->origin))
 					continue;
 				l->dropped = true;
 				break;
@@ -3150,7 +3922,9 @@ static int resolve_transfer(struct bpf_verifier_env *env)
  */
 static int resolve_section_counters(struct bpf_verifier_env *env)
 {
-	u32 i, s;
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
+	u32 s, i;
 	int kind, ret;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
@@ -3176,15 +3950,9 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
 			si->insn, si->kind ? "preemption disabled" : "RCU read");
 		return -EINVAL;
 	}
-	for (i = 0; i < NR_BUILDS(env); i++) {
-		struct bpf_frame_desc_build *b;
-		struct bpf_subprog_info *sub;
-		int subprog;
+	for_each_build(env, &c, b) {
+		struct bpf_subprog_info *sub = &env->subprog_info[c.subprog];
 
-		b = build_nth(env, i, &subprog);
-		if (!b)
-			continue;
-		sub = &env->subprog_info[subprog];
 		for (kind = 0; kind < SECTION_KINDS; kind++) {
 			struct bpf_resource res = { .kind = kind ? BPF_RESOURCE_PREEMPT :
 							       BPF_RESOURCE_RCU };
@@ -3210,23 +3978,20 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
  */
 static void mirror_drop_unlisted(struct bpf_verifier_env *env)
 {
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
 	u32 i, k;
 
 	for (i = 0; i < env->mirror_cnt; i++)
 		env->mirrors[i].listed = false;
-	for (i = 0; i < NR_BUILDS(env); i++) {
-		struct bpf_frame_desc_build *b;
-		int subprog;
-
-		b = build_nth(env, i, &subprog);
-		if (!b)
-			continue;
+	for_each_build(env, &c, b) {
 		for (k = 0; k < b->nr_listed; k++) {
 			struct bpf_mirror *m;
 
 			if (b->listed[k].dropped)
 				continue;
-			m = mirror_of(env, subprog, b->listed[k].origin, b->listed[k].owned);
+			m = mirror_of(env, c.subprog, b->listed[k].origin, b->listed[k].node,
+				      b->listed[k].owned);
 			if (m)
 				m->listed = true;
 		}
@@ -3240,13 +4005,16 @@ static void mirror_drop_unlisted(struct bpf_verifier_env *env)
 
 /*
  * After the main pass, once every release and every return has been seen and
- * the stack is final: settle which frame lists what, reserve the mirrors the
- * sites need, settle what the calls do to them, and list each in every
- * descriptor of its subprog that lists its resource, which lists it nowhere
- * else.
+ * the stack is final: merge the builds of the chains that run one under the
+ * other, settle which frame lists what, reserve the mirrors the sites need,
+ * settle what the calls do to them, merge the builds of the chains that agree
+ * back into one, and list each mirror in every descriptor of its subprog that
+ * lists its resource, which lists it nowhere else.
  */
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 {
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
 	u32 i, k, len = env->prog->len;
 	int ret;
 
@@ -3258,14 +4026,16 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 					       env->insn_aux_data[i].orig_idx + 1);
 	env->frame_desc_new_of = kvcalloc(env->frame_desc_orig_len, sizeof(u32), GFP_KERNEL_ACCOUNT);
 	env->frame_desc_targets = kvcalloc(env->subprog_cnt, sizeof(u16), GFP_KERNEL_ACCOUNT);
-	env->frame_desc_reach = compute_reach(env);
-	if (!env->frame_desc_new_of || !env->frame_desc_targets || !env->frame_desc_reach)
+	if (!env->frame_desc_new_of || !env->frame_desc_targets)
 		return -ENOMEM;
 	for (i = 0; i < len; i++)
 		env->frame_desc_new_of[env->insn_aux_data[i].orig_idx] = i;
 
-	ret = resolve_transfer(env);
+	ret = merge_prefix_builds(env);
+	ret = ret ?: resolve_transfer(env);
 	ret = ret ?: mirror_settle(env);
+	ret = ret ?: check_mirrors_sound(env);
+	ret = ret ?: remerge_builds(env);
 	ret = ret ?: resolve_section_counters(env);
 	if (ret)
 		return ret;
@@ -3302,16 +4072,10 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	}
 
 	/* Every descriptor, the guards the verifier adds may_goto for included. */
-	for (i = 0; i < NR_BUILDS(env); i++) {
-		struct bpf_frame_desc_build *b;
-		int subprog;
-
-		b = build_nth(env, i, &subprog);
-		if (!b)
-			continue;
+	for_each_build(env, &c, b) {
 		for (k = 0; k < b->nr_listed; k++) {
-			struct bpf_mirror *m = mirror_of(env, subprog, b->listed[k].origin,
-							 b->listed[k].owned);
+			struct bpf_mirror *m = mirror_of(env, c.subprog, b->listed[k].origin,
+							 b->listed[k].node, b->listed[k].owned);
 			struct bpf_frame_desc_entry ent;
 
 			if (b->listed[k].dropped || !m || !m->needed)
@@ -3383,25 +4147,28 @@ void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_pat
  */
 int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s16 slot_off)
 {
-	struct bpf_frame_desc_build *b = env->insn_aux_data[off].frame_desc;
+	struct bpf_frame_desc_build **pp, *b;
 	u32 spi = -slot_off / BPF_REG_SIZE - 1;
 	int k;
 
-	for (k = 0; k < b->nr_fixed; k++) {
-		struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
+	/* every build of the site: the chains share the slot */
+	for (pp = &env->insn_aux_data[off].frame_desc; (b = *pp); pp = &(*pp)->next) {
+		for (k = 0; k < b->nr_fixed; k++) {
+			struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
 
-		if (ent->loc != BPF_FRAME_LOC_REG || ent->off != reg)
+			if (ent->loc != BPF_FRAME_LOC_REG || ent->off != reg)
+				continue;
+			ent->loc = BPF_FRAME_LOC_STACK;
+			ent->off = slot_off;
+		}
+		if (b->regs[reg].state != LOC_RES)
 			continue;
-		ent->loc = BPF_FRAME_LOC_STACK;
-		ent->off = slot_off;
+		b = build_grow(env, off, pp, spi + 1);
+		if (!b)
+			return -ENOMEM;
+		b->slots[spi] = b->regs[reg];
+		b->regs[reg].state = LOC_OTHER;
 	}
-	if (b->regs[reg].state != LOC_RES)
-		return 0;
-	b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
-	if (!b)
-		return -ENOMEM;
-	b->slots[spi] = b->regs[reg];
-	b->regs[reg].state = LOC_OTHER;
 	return 0;
 }
 
