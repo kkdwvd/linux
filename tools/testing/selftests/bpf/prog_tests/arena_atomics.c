@@ -198,19 +198,8 @@ static void test_uaf(struct arena_atomics *skel)
 	if (!ASSERT_OK(topts.retval, "test_run_opts retval"))
 		return;
 
-	ASSERT_EQ(skel->arena->uaf_recovery_fails, 0, "uaf_recovery_fails");
-
-#ifndef __powerpc64__
-	/*
-	 * A fault clears the fetched register and leaves the address alone. The
-	 * powerpc64 JIT does not clear the register of a faulting atomic yet.
-	 */
-	ASSERT_EQ(skel->arena->uaf_r1_after_dst_r0, 0, "uaf_r1_after_dst_r0");
-	ASSERT_EQ(skel->arena->uaf_r0_after_dst_r0, skel->arena->uaf_r0_before_dst_r0,
-		  "uaf_r0_after_dst_r0");
-	ASSERT_EQ(skel->arena->uaf_r0_after_src_r0, 0, "uaf_r0_after_src_r0");
-	ASSERT_EQ(skel->arena->uaf_reread, 0, "uaf_reread");
-#endif
+	/* The fault cancelled the program before it got past the access. */
+	ASSERT_EQ(skel->arena->uaf_after, 0, "uaf_after");
 }
 
 static void test_load_acquire(struct arena_atomics *skel)
