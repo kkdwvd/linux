@@ -1641,7 +1641,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
  * A frame that was entered with more sections than are held now has left one of its
  * callers', and counts that for the unwinder.
  */
-static void release_context_state(struct bpf_verifier_state *state)
+static void release_context_state(struct bpf_verifier_env *env, struct bpf_verifier_state *state)
 {
 	struct bpf_func_state *frame;
 	int fr;
@@ -2534,6 +2534,8 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 			0 /* frameno within this callchain */,
 			subprog /* subprog number within this prog */);
 	elem->st.frame[0] = frame;
+	/* the kernel calls it with whatever it passes, for the descriptors */
+	bpf_frame_desc_record_async_entry(env, subprog);
 	return &elem->st;
 }
 
@@ -4187,6 +4189,13 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				 */
 				assign_scalar_id_before_mov(env, reg);
 			state->regs[dst_regno] = *reg;
+			/* a reference of a frame below may come in this way, for the descriptors */
+			if (reg_state != state) {
+				int err = bpf_frame_desc_record_load(env, dst_regno);
+
+				if (err)
+					return err;
+			}
 		} else if (__is_pointer_value(env->allow_ptr_leaks, reg)) {
 			/* If dst_regno==-1, the caller is asking us whether
 			 * it is acceptable to use this value as a SCALAR_VALUE
@@ -4494,7 +4503,8 @@ static int check_stack_arg_read(struct bpf_verifier_env *env, struct bpf_func_st
 	bpf_diag_mod_begin(env, &cur->regs[dst_regno], arg, BPF_DIAG_MOD_WRITE);
 	cur->regs[dst_regno] = *arg;
 	bpf_diag_mod_end(env);
-	return 0;
+	/* a reference of the caller may come in this way, for the descriptors */
+	return bpf_frame_desc_record_load(env, dst_regno);
 }
 
 static int check_outgoing_stack_args(struct bpf_verifier_env *env, struct bpf_func_state *caller,
@@ -7591,6 +7601,13 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 					regs[value_regno].btf = info.btf;
 					regs[value_regno].btf_id = info.btf_id;
 					regs[value_regno].id = info.ref_id;
+					/* a reference the kernel holds arrives this way, for the descriptors */
+					if (info.ref_id) {
+						regs[value_regno].type = info.reg_type;
+						err = bpf_frame_desc_record_load(env, value_regno);
+						if (err)
+							return err;
+					}
 				} else if (base_type(info.reg_type) == PTR_TO_MEM) {
 					regs[value_regno].mem_size = info.mem_size;
 				}
@@ -11392,7 +11409,8 @@ static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int calls
 	/* only increment it after check_reg_arg() finished */
 	state->curframe++;
 
-	return 0;
+	/* what the frame gets in R1-R5 of what the frames below hold, for the descriptors */
+	return bpf_frame_desc_record_entry(env, state);
 
 err_out:
 	free_func_state(callee);
@@ -11850,6 +11868,12 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	callee->entry_refs = entry.acquired_refs;
 	callee->entry_rcu_locks = entry.active_rcu_locks;
 	callee->entry_preempt_locks = entry.active_preempt_locks;
+	/* what the frame gets in R1-R5 of what its callers hold, for the descriptors */
+	err = bpf_frame_desc_record_entry_of(env, state, subprog);
+	if (err) {
+		bpf_free_verifier_state(&entry, false);
+		return err;
+	}
 	for (i = BPF_REG_1; i <= BPF_REG_5; i++) {
 		/* what a scalar is linked to stays with the caller, so does the delta to it */
 		if (callee->regs[i].type == SCALAR_VALUE)
@@ -12872,7 +12896,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	 * bpf_throw, this will be done by do_check_block() for extra frames. */
 	state->frame[state->curframe--] = NULL;
 	invalidate_outgoing_stack_args(env, caller);
-	/* what the callee did to what the caller holds, for the caller's mirrors */
+	/* what the callee did to what the caller holds, for the caller's mirrors and counters */
 	err = callee->in_callback_fn ? 0 : bpf_frame_desc_record_return(env, state, callee->callsite);
 	free_func_state(callee);
 	return err;
@@ -16368,6 +16392,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_disable = is_kfunc_bpf_preempt_disable(&meta);
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
+	/* the descriptors may count the sections of the frame in a hidden slot */
+	if (rcu_lock || rcu_unlock || preempt_disable || preempt_enable) {
+		err = bpf_frame_desc_record_section(env, rcu_lock || rcu_unlock ? 0 : 1,
+						    rcu_lock || preempt_disable ? 1 : -1);
+		if (err)
+			return err;
+	}
 	if (rcu_lock) {
 		env->cur_state->active_rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
@@ -16381,7 +16412,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_rcu_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env, env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
 					env->cur_state->active_rcu_locks);
 		if (!in_rcu_cs(env))
@@ -16399,7 +16430,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_preempt_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env, env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
 					env->cur_state->active_preempt_locks);
 		if (!in_rcu_cs(env))
