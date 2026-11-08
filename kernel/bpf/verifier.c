@@ -11778,14 +11778,6 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		return false;
 	if (state->speculative)
 		return false;
-	/*
-	 * A site inside the subprog would have to say which of its frames
-	 * releases what the callers hold, which a subprog on its own cannot
-	 * tell, see frame_desc.c: a call that holds a reference, a lock or
-	 * IRQ flags is verified in the context of its caller.
-	 */
-	if (env->describe_frames && state->acquired_refs)
-		return false;
 	if (sub->releases_inherited &&
 	    (state->acquired_refs || state->active_rcu_locks || state->active_preempt_locks))
 		return false;
@@ -12086,8 +12078,8 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
-	/* what the frame holds at the call, for what the return finds released */
-	err = bpf_frame_desc_record_call(env);
+	/* The frame waits in the call: what it holds is listed from here. */
+	err = bpf_frame_desc_call_site(env, subprog);
 	if (err)
 		return err;
 
@@ -12171,8 +12163,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return err;
 		}
 
-		/* what the frame holds at the call, for what the return finds released */
-		err = bpf_frame_desc_record_call(env);
+		/* The frame waits in the call: what it holds is listed from here. */
+		err = bpf_frame_desc_call_site(env, subprog);
 		if (err)
 			return err;
 
@@ -21425,9 +21417,21 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 					if (err)
 						return err;
 				}
-				return check_kfunc_call(env, insn, &env->insn_idx);
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			} else {
+				err = check_helper_call(env, insn, &env->insn_idx);
 			}
-			return check_helper_call(env, insn, &env->insn_idx);
+			if (err)
+				return err;
+			/*
+			 * A callback the helper or the kfunc ran may be unwound: the
+			 * unwinding goes on from the call, with the effects of the
+			 * call on this frame applied. The revisit of the call after
+			 * the callback unwound is on its way to the pad instead.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && !env->cur_state->unwound)
+				return bpf_frame_desc_call_site(env, -1);
+			return 0;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);

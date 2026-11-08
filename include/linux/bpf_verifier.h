@@ -1266,6 +1266,7 @@ struct bpf_frame_desc_listing {
 	u32 origin;
 	s16 loc;	/* the location of the lattice, a fixed entry, or none when mirrored */
 	bool dropped;	/* the frame neither owns nor releases it: another frame lists it */
+	u8 passed;	/* at a call: the registers it is passed in, or through the stack */
 };
 
 /* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
@@ -1278,6 +1279,9 @@ struct bpf_frame_desc_build {
 	struct bpf_frame_desc_fixed *fixed;	/* locks, IRQ flags and sections, equal on every path */
 	u16 nr_listed;
 	struct bpf_frame_desc_listing *listed;	/* the references the frame lists at the site */
+	bool is_call;	/* the site is a call of BPF code: of the targets */
+	u16 nr_targets;
+	u16 *targets;
 	u16 nr_extra;
 	struct bpf_frame_desc_entry *extra;	/* the mirror entries, laid out once reserved */
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
@@ -1372,6 +1376,12 @@ struct bpf_section_insn {
 	s8 delta;
 };
 
+/* The site at insn 'off' follows insn 'k' of the patch that replaces it, see bpf_frame_desc_move_site(). */
+struct bpf_frame_desc_move {
+	u32 off;
+	u32 k;
+};
+
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
 struct bpf_stack_init {
 	u32 subprog;
@@ -1430,6 +1440,8 @@ struct bpf_verifier_env {
 	u32 *frame_desc_new_of;			/* their indices after the loop guards */
 	u16 *frame_desc_targets;		/* room for the targets of a call */
 	unsigned long *frame_desc_reach;	/* subprog_cnt rows: the subprogs each reaches */
+	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
+	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2370,6 +2382,7 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
 int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot);
+int bpf_frame_desc_call_site(struct bpf_verifier_env *env, int callee);
 int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int regno, bool after);
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx);
 int bpf_frame_desc_record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
@@ -2380,6 +2393,9 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 				 int call_idx);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit(struct bpf_verifier_env *env);
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off);
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);
