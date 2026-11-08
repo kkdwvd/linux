@@ -16214,11 +16214,59 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+static bool nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
+/*
+ * A site inside a callback that a helper or a kfunc runs, called at insn
+ * @callsite. The unwinder stops at the callback, which leaves into the pad of
+ * its caller the way unwind_exit does, so the caller needs one, see
+ * bpf_call_cb(). The pad of bpf_rbtree_add() drops the node, which is a
+ * bpf_obj_drop() under the rule above.
+ */
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[callsite];
+	struct btf_struct_meta *meta;
+
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn)) {
+		if (bpf_helper_call(insn))
+			verbose(env,
+				"the callback of %s() cannot be cancelled: the helper has no pad\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env,
+				"the callback of the kfunc at insn %d cannot be cancelled: it has no pad\n",
+				callsite);
+		return -EINVAL;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) || !is_bpf_rbtree_add_kfunc(insn->imm) ||
+	    !nmi_unsafe_prog(env))
+		return 0;
+	meta = env->insn_aux_data[callsite].kptr_struct_meta;
+	if (meta && btf_record_has_nmi_unsafe_fields(meta->record)) {
+		verbose(env,
+			"bpf_rbtree_add with a comparator that can be cancelled cannot be used in tracing programs on types with NMI unsafe fields\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16335,10 +16383,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
@@ -24304,6 +24349,59 @@ static int find_tgt_subprog(const struct bpf_prog *tgt_prog, u32 btf_id)
 }
 
 /*
+ * Can an unwind pass through a frame of @subprog of @prog? It can when a
+ * frame of the subprog, or of a subprog it calls, can be the innermost frame
+ * of an unwind. Every call of BPF code in a program whose frames are
+ * described is a site the caller waits in, so the callees are found through
+ * the calls in the instructions, which name their callee after
+ * jit_subprogs(), and a subprog's table says whether some site of its own is
+ * not such a call, see bpf_prog_fill_frame_desc_table(); a callx is such a
+ * site, whatever it calls. Returns a negative errno on failure.
+ */
+static int subprog_may_unwind(const struct bpf_prog *prog, int subprog)
+{
+	const struct bpf_prog_aux *aux = prog->aux;
+	u32 n = aux->real_func_cnt, *start, *todo, cnt = 1, i, s;
+	unsigned long *seen;
+	int ret = 0;
+
+	/* JITed as one function: nothing calls BPF code, and no subprog can be attached to */
+	if (!aux->func)
+		return 0;
+	start = kcalloc(2 * n, sizeof(*start), GFP_KERNEL);
+	seen = bitmap_zalloc(n, GFP_KERNEL);
+	if (!start || !seen) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	todo = start + n;
+	for (s = 1; s < n; s++)
+		start[s] = start[s - 1] + aux->func[s - 1]->len;
+	todo[0] = subprog;
+	__set_bit(subprog, seen);
+	while (cnt) {
+		const struct bpf_frame_desc_table *tab;
+
+		s = todo[--cnt];
+		tab = aux->func[s]->aux->frame_desc_table;
+		if (tab && tab->innermost) {
+			ret = 1;
+			break;
+		}
+		for (i = start[s]; i < start[s] + aux->func[s]->len; i++) {
+			const struct bpf_insn *insn = &prog->insnsi[i];
+
+			if (bpf_pseudo_call(insn) && !test_and_set_bit(insn->off, seen))
+				todo[cnt++] = insn->off;
+		}
+	}
+out:
+	kfree(start);
+	bitmap_free(seen);
+	return ret;
+}
+
+/*
  * The prologue of an extension gives a cloned skb a new head, unless the
  * prologue of the target program has done that. The callers of the function
  * that it replaces must not hold on to the old head.
@@ -24453,11 +24551,24 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		tgt_can_unwind = (subprog || tgt_prog->type == BPF_PROG_TYPE_EXT) &&
 				 (aux->func ? aux->func[subprog]->aux->can_unwind
 					    : aux->can_unwind);
-		/* unwind_exit would return to the trampoline that called the target */
-		if (tgt_can_unwind && !prog_extension &&
-		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
-			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
-			return -EINVAL;
+		/*
+		 * unwind_exit would return to the trampoline that called the
+		 * target, and the unwinder would stop at a frame of the target
+		 * under it, since the trampoline's frame is not BPF code and has
+		 * no pad, see bpf_stack_walker(). Only fentry leaves no frame of
+		 * its own behind while the target runs.
+		 */
+		if (!prog_extension && prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			ret = tgt_can_unwind;
+			if (!ret && subprog)
+				ret = subprog_may_unwind(tgt_prog, subprog);
+			if (ret < 0)
+				return ret;
+			if (ret) {
+				bpf_log(log, "Only fentry can attach to %s, which can unwind\n",
+					tname);
+				return -EINVAL;
+			}
 		}
 		/* What it takes of the stack is not counted, see bpf_insert_recursion_checks() */
 		if (aux->func && aux->func[subprog]->aux->in_recursion) {

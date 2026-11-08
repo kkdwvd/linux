@@ -1954,6 +1954,12 @@ struct bpf_frame_desc_site {
 struct bpf_frame_desc_table {
 	u32 cnt;
 	bool filled;
+	/*
+	 * Some site is not a call of BPF code, which a frame waits in: a frame of
+	 * the function can be the innermost one of an unwind. Set as the table is
+	 * filled.
+	 */
+	bool innermost;
 	struct bpf_frame_desc_site site[];
 };
 
@@ -2140,6 +2146,8 @@ struct bpf_prog_aux {
 	 * restored, R6..R9 then the architecture's own, see struct bpf_throw_regs.
 	 */
 	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
+	/* Returns @cookie from the frame the unwinder stopped at: a callback, or the main program. */
+	u64 (*bpf_cancel_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
 	u16 freplace_link_cnt; /* counts freplace links extending this prog */
 	/*
 	 * Offsets from the native frame pointer of this JITed program at which
@@ -2156,6 +2164,8 @@ struct bpf_prog_aux {
 	s32 cancel_retval;
 	/* The kernel cancels this program at its cancellation points, which it described. */
 	bool cancellable;
+	/* This JITed function is a timer, workqueue or similar callback: its own invocation. */
+	bool async_cb;
 #ifdef CONFIG_SECURITY
 	void *security;
 #endif
