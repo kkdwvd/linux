@@ -129,7 +129,7 @@ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
 }
 
 SEC("?tc")
-__failure __msg("cannot unwind from the callback of bpf_rbtree_add()")
+__failure __msg("cannot be called from callback subprog")
 int reject_with_rbtree_add_throw(void *ctx)
 {
 	struct foo *f;

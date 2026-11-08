@@ -1025,7 +1025,8 @@ static __naked __noinline __used long spin_cb(void)
 
 SEC("syscall")
 __description("arena stack: bpf_loop() ends when the time of may_goto is up")
-__success __retval(121)
+/* the spin in the callback cancels the prog, which returns 0 */
+__success __retval(0)
 /* the second call of the callback returns 1 before it takes a stack */
 __xlated("if r0 != 0x0 goto pc+2")
 __xlated("r0 = 1")

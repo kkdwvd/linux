@@ -3,8 +3,10 @@
  * There is one time slice of may_goto for an invocation of a prog: one call from the kernel into
  * the main prog, with the subprogs and sync callbacks that it reaches.
  *
- * Most tests call a function that spins until may_goto stops it, four times, each in a different
- * way. Only the first call can spin. With a time slice for each call all four do.
+ * A prog whose time is up is cancelled: the kernel unwinds it and it returns the default of its
+ * type, TC_ACT_SHOT for tc and 0 for a socket filter or raw_tp. Most tests call a function that
+ * spins until the time is up, four times, each in a different way: the first call cancels the
+ * prog. With a time slice for each call the prog would make all four, and the test fails.
  */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
@@ -17,6 +19,8 @@ char _license[] SEC("license") = "GPL";
 #if (defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64)) && __clang_major__ >= 18
 
 #define TRIES 4
+/* What a cancelled tc prog returns: TC_ACT_SHOT */
+#define CANCELLED 2
 
 int zero;
 
@@ -46,7 +50,7 @@ static __noinline int counts_to_1000(void)
 
 SEC("tc")
 __description("timed may_goto: call")
-__success __retval(1)
+__success __retval(CANCELLED)
 int call_subprog(void *ctx)
 {
 	int i, n = 0;
@@ -58,7 +62,7 @@ int call_subprog(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: a call after the time is up makes no iteration")
-__success __retval(0)
+__success __retval(CANCELLED)
 int short_loop_after_timeout(void *ctx)
 {
 	spins();
@@ -67,7 +71,7 @@ int short_loop_after_timeout(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: the loop of the main prog stops when the time is up in a subprog")
-__success __retval(1)
+__success __retval(CANCELLED)
 int main_loop_after_timeout(void *ctx)
 {
 	int n = 0;
@@ -84,7 +88,7 @@ static __noinline int passes(int i)
 
 SEC("tc")
 __description("timed may_goto: call through a function without a loop")
-__success __retval(1)
+__success __retval(CANCELLED)
 int call_through(void *ctx)
 {
 	int i, n = 0;
@@ -101,7 +105,7 @@ __noinline int global_spins(void)
 
 SEC("tc")
 __description("timed may_goto: call of a global function")
-__success __retval(1)
+__success __retval(CANCELLED)
 int call_global(void *ctx)
 {
 	int i, n = 0;
@@ -113,7 +117,7 @@ int call_global(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: callx")
-__success __retval(1)
+__success __retval(CANCELLED)
 __naked void callx_subprog(void)
 {
 	asm volatile (
@@ -141,7 +145,7 @@ static int loop_cb(__u64 i, int *spun)
 
 SEC("tc")
 __description("timed may_goto: bpf_loop() inlined")
-__success __retval(1)
+__success __retval(CANCELLED)
 int loop_inlined(void *ctx)
 {
 	int spun = 0;
@@ -152,7 +156,7 @@ int loop_inlined(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: bpf_loop() not inlined")
-__success __retval(1)
+__success __retval(CANCELLED)
 int loop_not_inlined(void *ctx)
 {
 	int spun = 0;
@@ -171,7 +175,7 @@ static int count_cb(__u64 i, int *calls)
 #define LOOP_ENDS(name, flags)							\
 SEC("tc")									\
 __description("timed may_goto: bpf_loop() " #name " ends when the time is up")	\
-__success __retval(10)								\
+__success __retval(CANCELLED)							\
 int loop_ends_##name(void *ctx)							\
 {										\
 	int calls = 0;								\
@@ -204,7 +208,7 @@ static int outer_cb(__u64 i, struct nested *n)
 
 SEC("tc")
 __description("timed may_goto: bpf_loop() in bpf_loop() ends when the time is up")
-__success __retval(1)
+__success __retval(CANCELLED)
 int loop_in_loop(void *ctx)
 {
 	struct nested n = { .t0 = bpf_ktime_get_ns() };
@@ -222,7 +226,7 @@ static __noinline int called_cb(__u64 i, int *calls)
 /* BPF code calls the callback too, so its return value has to be its own. bpf_loop() goes on. */
 SEC("tc")
 __description("timed may_goto: bpf_loop() with a callback that is called as well")
-__success __retval(45)
+__success __retval(CANCELLED)
 int loop_and_call(void *ctx)
 {
 	int calls = 0;
@@ -248,7 +252,7 @@ static int short_cb(__u64 i, __u64 *t0)
  */
 SEC("tc")
 __description("timed may_goto: bpf_loop() the callback makes 60000 iterations")
-__success __retval(1)
+__success __retval(CANCELLED)
 int loop_short_cb(void *ctx)
 {
 	__u64 t0 = bpf_ktime_get_ns();
@@ -272,7 +276,7 @@ static __noinline int loops_around_spins(void)
 
 SEC("tc")
 __description("timed may_goto: a loop that is on the stack ends when the time is up")
-__success __retval(1)
+__success __retval(CANCELLED)
 int rest_of_batch(void *ctx)
 {
 	return loops_around_spins();
@@ -312,7 +316,7 @@ static int call_many(__u64 i, __u64 *t0)
  */
 SEC("tc")
 __description("timed may_goto: 65535 calls that make one iteration read the clock")
-__success __retval(1)
+__success __retval(CANCELLED)
 int clock_after_65535_calls(void *ctx)
 {
 	__u64 t0 = bpf_ktime_get_ns();
@@ -344,7 +348,7 @@ static int elem_cb(void *map, int *key, int *val, int *spun)
 #define FOR_EACH(name)								\
 SEC("tc")									\
 __description("timed may_goto: bpf_for_each_map_elem() " #name)			\
-__success __retval(21)								\
+__success __retval(CANCELLED)							\
 int for_each_##name(void *ctx)							\
 {										\
 	int i, key, spun = 0;							\
@@ -367,7 +371,7 @@ static long vma_cb(struct task_struct *task, struct vm_area_struct *vma, int *sp
 
 SEC("raw_tp")
 __description("timed may_goto: bpf_find_vma()")
-__success __retval(1)
+__success __retval(0)
 int find_vma(void *ctx)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -406,7 +410,7 @@ static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 
 SEC("tc")
 __description("timed may_goto: bpf_rbtree_add()")
-__success __retval(1)
+__success __retval(CANCELLED)
 int rbtree_add(void *ctx)
 {
 	struct bpf_rb_node *rb;
@@ -652,7 +656,7 @@ __naked void dead_reg(void)
 /* No iteration: 165, then 6, 6 (the may_goto jumps) and 4 (R2 isn't stored). */
 SEC("tc")
 __description("timed may_goto: may_goto takes a register that is dead, the time is up")
-__success __retval(181)
+__success __retval(CANCELLED)
 __naked void dead_reg_time_is_up(void)
 {
 	asm volatile (
@@ -681,7 +685,7 @@ static unsigned long spins_on_may_goto(void)
 /* The first may_goto of the function finds that the time is up */
 SEC("tc")
 __description("timed may_goto: registers across may_goto when the time is up")
-__success __retval(46)
+__success __retval(CANCELLED)
 __naked void regs_when_time_is_up(void)
 {
 	asm volatile (
@@ -699,7 +703,7 @@ __naked void regs_when_time_is_up(void)
 /* The first insn of the main prog is the target of a jump. It must not set the count again. */
 SEC("socket")
 __description("timed may_goto: 9 insns")
-__success __retval(1)
+__success __retval(0)
 __naked void loop_calls_subprog_with_may_goto(void)
 {
 	asm volatile (
@@ -751,7 +755,7 @@ static unsigned long calls_60000_times(void)
 
 SEC("socket")
 __description("timed may_goto: three levels of loops that end before they read the clock")
-__success __retval(1)
+__success __retval(0)
 __naked void three_levels_of_short_loops(void)
 {
 	asm volatile (
@@ -783,7 +787,7 @@ static unsigned long loops_65534(void)
 
 SEC("socket")
 __description("timed may_goto: the subprog makes 65534 iterations")
-__success __retval(1)
+__success __retval(0)
 __naked void loop_calls_subprog_with_65534_iterations(void)
 {
 	asm volatile (
@@ -823,7 +827,7 @@ static unsigned __int128 returns_pair_after_may_goto(void)
 
 SEC("socket")
 __description("timed may_goto: the subprog returns 16 bytes")
-__success __retval(3)
+__success __retval(0)
 __naked void subprog_with_may_goto_returns_pair(void)
 {
 	asm volatile (
@@ -879,7 +883,7 @@ __noinline int exception_cb_loops(u64 cookie)
 SEC("tc")
 __description("timed may_goto: bpf_throw() the exception callback has a loop")
 __exception_cb(exception_cb_loops)
-__success __retval(0)
+__success __retval(CANCELLED)
 int throw_after_timeout(void *ctx)
 {
 	return throws_after_spin();
