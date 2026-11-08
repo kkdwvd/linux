@@ -23805,6 +23805,12 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->insn_processed,
 		env->max_states_per_insn, env->total_states,
 		env->peak_states);
+	if (env->log.level & BPF_LOG_STATS)
+		verbose(env, "frame descriptors: sites %u visits %u classes %u bytes %u conflicts %u mirrors %u mirror_insns %u retractions %u\n",
+			env->frame_desc_sites, env->frame_desc_visits,
+			env->frame_desc_pool ? env->frame_desc_pool->resource_cnt : env->resource_cnt,
+			env->frame_desc_bytes, env->frame_desc_conflicts, env->mirrors_needed,
+			env->mirror_insns, env->retraction_slots);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
