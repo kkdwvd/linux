@@ -307,6 +307,32 @@ struct bpf_stack_state {
 	u8 slot_type[BPF_REG_SIZE];
 };
 
+/*
+ * The origin of the reference the kernel holds for __ref argument @argno of a
+ * struct_ops program: no insn has it, so it collides with no reference the
+ * program obtains, see bpf_frame_desc_record_release(), and the frame
+ * descriptors tell such a reference by it, see bpf_origin_is_ctx_arg(): the
+ * main program holds it for the kernel and lists it, from the context.
+ */
+#define BPF_ORIGIN_CTX_ARGS		32
+#define BPF_ORIGIN_CTX_ARG(argno)	(U32_MAX - 1 - (argno))
+#define BPF_ORIGIN_CTX_ARGNO(origin)	(U32_MAX - 1 - (origin))
+
+static inline bool bpf_origin_is_ctx_arg(u32 origin)
+{
+	return origin >= BPF_ORIGIN_CTX_ARG(BPF_ORIGIN_CTX_ARGS - 1) && origin != U32_MAX;
+}
+
+/* Name the origin of a reference in a message, in @buf: the insn, or the argument the kernel holds. */
+static inline const char *bpf_origin_name(u32 origin, char *buf, size_t len)
+{
+	if (bpf_origin_is_ctx_arg(origin))
+		snprintf(buf, len, "the kernel holds in ctx argument %u", BPF_ORIGIN_CTX_ARGNO(origin));
+	else
+		snprintf(buf, len, "obtained at insn %u", origin);
+	return buf;
+}
+
 struct bpf_reference_state {
 	/* Each reference object has a type. Ensure REF_TYPE_PTR is zero to
 	 * default to pointer reference on zero initialization of a state.
@@ -327,6 +353,18 @@ struct bpf_reference_state {
 	 * is used purely to inform the user of a reference leak.
 	 */
 	int insn_idx;
+	/*
+	 * The frame that owns the reference: the one that acquired it, or the
+	 * caller a returning frame handed it to. -1 for what the callers of a
+	 * function verified on its own hold, which are not in the state.
+	 */
+	s8 frameno;
+	/*
+	 * The insn of the owner's subprog that gave it the reference: the
+	 * acquiring call, or the call of the subprog that returned it; for a
+	 * reference the kernel holds, see BPF_ORIGIN_CTX_ARG().
+	 */
+	u32 origin;
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -503,6 +541,13 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * How many of the RCU read and preemption disabled sections held when the
+	 * frame was entered it left, or a callee of it did: what is left of the
+	 * callers' sections below this frame, for the unwinder.
+	 */
+	u32 rcu_released_below;
+	u32 preempt_released_below;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
