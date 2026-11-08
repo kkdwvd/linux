@@ -443,12 +443,14 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 		if (fn->priv_stack_ptr)
 			fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
 		/*
-		 * Release what the frame holds of this walk's phase. Every
-		 * frame is at a call, whose return address is the first byte of
-		 * the next instruction. Then recover the caller's callee-saved
-		 * registers from the frame.
+		 * Release what the frame holds of this walk's phase. The
+		 * innermost frame of a fault is at the faulting instruction;
+		 * every other frame is at a call, whose return address is the
+		 * first byte of the next instruction. Then recover the caller's
+		 * callee-saved registers from the frame.
 		 */
-		bpf_unwind_frame(ctx, prog, ip - 1, fp);
+		bpf_unwind_frame(ctx, prog, ctx->cnt || ctx->kind != BPF_THROW_FAULT ? ip - 1 : ip,
+				 fp);
 		bpf_unwind_recover(fn, bp, ctx->saved, BPF_THROW_NR_CALLEE_SAVED);
 	}
 	ctx->cnt++;
