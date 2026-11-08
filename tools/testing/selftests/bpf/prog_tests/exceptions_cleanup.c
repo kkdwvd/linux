@@ -412,6 +412,14 @@ static void run_suite(const char *prefix)
 	       CANCELLED, 1, "s0", .param = 1);
 	RUN_AS(cancel_section_entered_by_callee, "cancel_section_entered_by_callee_free",
 	       CANCELLED, 1, "0", .param = 0);
+	/* An arena page fault cancels the program as a may_goto timeout does. */
+	CANCEL(cancel_arena_read, 1, "0");
+	CANCEL(cancel_arena_write, 1, "0");
+	CANCEL(cancel_arena_caller, 1, "0");
+	CANCEL(cancel_arena_global, 1, "0");
+	CANCEL(cancel_arena_fetch_r0, 1, "0");
+	CANCEL(cancel_arena_loop, 1, "0");
+	CANCEL(cancel_arena_loop_helper, 1, "0");
 	/* what the frames hold at call depth two */
 	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_throw", THROWN, 1, "0", .param = 1);
 	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_discard", 0, 1, "", .param = 0);
