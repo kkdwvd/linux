@@ -52,6 +52,16 @@ enum stat_id {
 	PROG_TYPE,
 	ATTACH_TYPE,
 	MEMORY_PEAK,
+	FRAME_DESC_SITES,
+	FRAME_DESC_VISITS,
+	FRAME_DESC_CLASSES,
+	FRAME_DESC_BYTES,
+	FRAME_DESC_CONFLICTS,
+	FRAME_DESC_MIRRORS,
+	FRAME_DESC_MIRROR_INSNS,
+	FRAME_DESC_SECTION_COUNTERS,
+	FRAME_DESC_CHAINS,
+	FRAME_DESC_SPLIT_SITES,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -812,13 +822,16 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 16,
+	.spec_cnt = 26,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
 		MAX_STATES_PER_INSN, MARK_READ_MAX_LEN,
 		SIZE, JITED_SIZE, PROG_TYPE, ATTACH_TYPE,
 		STACK, MAX_STACK, MEMORY_PEAK,
+		FRAME_DESC_SITES, FRAME_DESC_VISITS, FRAME_DESC_CLASSES, FRAME_DESC_BYTES,
+		FRAME_DESC_CONFLICTS, FRAME_DESC_MIRRORS, FRAME_DESC_MIRROR_INSNS,
+		FRAME_DESC_SECTION_COUNTERS, FRAME_DESC_CHAINS, FRAME_DESC_SPLIT_SITES,
 	},
 };
 
@@ -861,6 +874,16 @@ static struct stat_def {
 	[PROG_TYPE] = { "Program type", {"prog_type"}, },
 	[ATTACH_TYPE] = { "Attach type", {"attach_type", }, },
 	[MEMORY_PEAK] = { "Peak memory (MiB)", {"mem_peak", }, },
+	[FRAME_DESC_SITES] = { "Frame desc sites", {"frame_desc_sites", }, },
+	[FRAME_DESC_VISITS] = { "Frame desc visits", {"frame_desc_visits", }, },
+	[FRAME_DESC_CLASSES] = { "Frame desc classes", {"frame_desc_classes", }, },
+	[FRAME_DESC_BYTES] = { "Frame desc bytes", {"frame_desc_bytes", }, },
+	[FRAME_DESC_CONFLICTS] = { "Frame desc conflicts", {"frame_desc_conflicts", }, },
+	[FRAME_DESC_MIRRORS] = { "Frame desc mirrors", {"mirrors", }, },
+	[FRAME_DESC_MIRROR_INSNS] = { "Frame desc mirror insns", {"mirror_insns", }, },
+	[FRAME_DESC_SECTION_COUNTERS] = { "Frame desc section counters", {"section_counters", }, },
+	[FRAME_DESC_CHAINS] = { "Frame desc chains", {"chains", }, },
+	[FRAME_DESC_SPLIT_SITES] = { "Frame desc split sites", {"split_sites", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1048,6 +1071,19 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				&s->stats[TOTAL_STATES],
 				&s->stats[PEAK_STATES],
 				&s->stats[MARK_READ_MAX_LEN]))
+			continue;
+		/* Only kernels with frame descriptors print this line. */
+		if (10 == sscanf(cur, "frame descriptors: sites %ld visits %ld classes %ld bytes %ld conflicts %ld mirrors %ld mirror_insns %ld section_counters %ld chains %ld split_sites %ld",
+				 &s->stats[FRAME_DESC_SITES],
+				 &s->stats[FRAME_DESC_VISITS],
+				 &s->stats[FRAME_DESC_CLASSES],
+				 &s->stats[FRAME_DESC_BYTES],
+				 &s->stats[FRAME_DESC_CONFLICTS],
+				 &s->stats[FRAME_DESC_MIRRORS],
+				 &s->stats[FRAME_DESC_MIRROR_INSNS],
+				 &s->stats[FRAME_DESC_SECTION_COUNTERS],
+				 &s->stats[FRAME_DESC_CHAINS],
+				 &s->stats[FRAME_DESC_SPLIT_SITES]))
 			continue;
 
 		/*
@@ -2345,6 +2381,16 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case PEAK_STATES:
 	case MAX_STATES_PER_INSN:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_CONFLICTS:
+	case FRAME_DESC_MIRRORS:
+	case FRAME_DESC_MIRROR_INSNS:
+	case FRAME_DESC_SECTION_COUNTERS:
+	case FRAME_DESC_CHAINS:
+	case FRAME_DESC_SPLIT_SITES:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2576,6 +2622,16 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case SIZE:
 	case JITED_SIZE:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_CONFLICTS:
+	case FRAME_DESC_MIRRORS:
+	case FRAME_DESC_MIRROR_INSNS:
+	case FRAME_DESC_SECTION_COUNTERS:
+	case FRAME_DESC_CHAINS:
+	case FRAME_DESC_SPLIT_SITES:
 		*val = s ? s->stats[id] : 0;
 		break;
 	default:
@@ -2663,6 +2719,16 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case SIZE:
 	case JITED_SIZE:
 	case MEMORY_PEAK:
+	case FRAME_DESC_SITES:
+	case FRAME_DESC_VISITS:
+	case FRAME_DESC_CLASSES:
+	case FRAME_DESC_BYTES:
+	case FRAME_DESC_CONFLICTS:
+	case FRAME_DESC_MIRRORS:
+	case FRAME_DESC_MIRROR_INSNS:
+	case FRAME_DESC_SECTION_COUNTERS:
+	case FRAME_DESC_CHAINS:
+	case FRAME_DESC_SPLIT_SITES:
 	case STACK:
 	case MAX_STACK: {
 		long val;
