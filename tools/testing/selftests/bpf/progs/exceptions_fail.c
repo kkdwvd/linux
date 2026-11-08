@@ -34,22 +34,6 @@ struct {
 private(A) struct bpf_spin_lock lock;
 private(A) struct bpf_rb_root rbtree __contains(foo, node);
 
-struct lfoo {
-	struct bpf_list_node node;
-};
-
-struct locked_list {
-	struct bpf_spin_lock lock;
-	struct bpf_list_head head __contains(lfoo, node);
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__type(key, int);
-	__type(value, struct locked_list);
-	__uint(max_entries, 1);
-} locked_list_map SEC(".maps");
-
 __noinline void *exception_cb_bad_ret_type1(u64 cookie)
 {
 	return NULL;
@@ -311,40 +295,6 @@ int reject_out_of_range_global_throw(struct __sk_buff *skb)
 {
 	foo();
 
-	return 0;
-}
-
-/* A may_goto in a callee holding a node popped under its caller's lock. */
-static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
-{
-	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
-
-	for (;;)
-		cond_break;
-	return n;
-}
-
-SEC("?tc")
-__failure __msg("cannot be released under a lock a caller holds")
-int reject_may_goto_under_caller_lock(struct __sk_buff *ctx)
-{
-	struct bpf_list_node *n;
-	struct locked_list *l;
-	struct lfoo *f;
-	int key = 0;
-
-	l = bpf_map_lookup_elem(&locked_list_map, &key);
-	if (!l)
-		return 1;
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 1;
-	bpf_spin_lock(&l->lock);
-	bpf_list_push_back(&l->head, &f->node);
-	n = pop_and_spin(l);
-	if (n)
-		bpf_list_push_back(&l->head, n);
-	bpf_spin_unlock(&l->lock);
 	return 0;
 }
 

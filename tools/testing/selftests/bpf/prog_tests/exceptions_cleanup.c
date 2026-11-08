@@ -219,7 +219,7 @@ static void run_suite(const char *prefix)
 	THROW(throw_iter_by_callee, 1, "0");
 	CANCEL(cancel_may_goto_obj, 1, "0");
 	CANCEL(cancel_may_goto_caller, 1, "0");
-	CANCEL(cancel_may_goto_slot, 1, "0");
+	CANCEL(cancel_may_goto_mirror_conflict, 1, "0");
 	CANCEL(cancel_may_goto_rcu, 1, "s0");
 	CANCEL(cancel_may_goto_rcu_shared, 1, "s0");
 	CANCEL(cancel_may_goto_preempt, 0, "sss");
@@ -233,6 +233,12 @@ static void run_suite(const char *prefix)
 	CANCEL(cancel_may_goto_nested, 4, "321s0");
 	CANCEL(cancel_may_goto_global, 1, "0");
 	CANCEL(cancel_may_goto_global_chain, 1, "0");
+	CANCEL(cancel_may_goto_obj_after_caller_lock, 2, "01");
+	CANCEL(cancel_may_goto_retract_rcu, 1, "0");
+	CANCEL(cancel_may_goto_retract_lock, 2, "0");
+	/* The may_goto the verifier adds to a loop or a recursive subprog cancels too. */
+	CANCEL(cancel_guard_obj, 1, "0");
+	CANCEL(cancel_recursion_caller, 1, "0");
 	/* Released locks can be taken again: a leaked resilient lock fails instead of hanging. */
 	CANCEL(cancel_may_goto_res_lock, 1, "0");
 	CANCEL(cancel_may_goto_res_lock_irq, 2, "10");

@@ -100,8 +100,9 @@ static int rcu_trace_cb(struct bpf_map *map, void *key, void *val)
 }
 
 /*
- * The time of this prog is up when it starts the callbacks. User space keeps the task on the cpu,
- * so the callbacks find what it has left. Each call of a callback is an invocation of its own.
+ * The prog starts the callbacks, then spins until it is cancelled. User space keeps the task on
+ * the cpu, so the callbacks find what it has left. Each call of a callback is an invocation of
+ * its own.
  */
 SEC("syscall")
 int async_after_timeout(void *ctx)
@@ -119,11 +120,6 @@ int async_after_timeout(void *ctx)
 		return 101;
 	if (bpf_wq_init(&e->wq, &async, 0) || bpf_wq_set_callback(&e->wq, wq_cb, 0))
 		return 102;
-	if (!spins())
-		return 103;
-	/* control: the time is up */
-	if (counts_to_1000())
-		return 109;
 	if (bpf_timer_start(&e->timer, 0, BPF_F_TIMER_CPU_PIN))
 		return 104;
 	if (bpf_wq_start(&e->wq, 0))
@@ -134,7 +130,9 @@ int async_after_timeout(void *ctx)
 		return 107;
 	if (bpf_call_rcu_tasks_trace(&e1->rcu, &async, rcu_trace_cb))
 		return 108;
-	return 0;
+	spins();
+	/* not reached: the spin cancels the prog, which returns 0 */
+	return 103;
 }
 
 int ticks;
@@ -150,7 +148,8 @@ static int tick_cb(void *map, int *key, struct elem *e)
 
 /*
  * A callback of the prog interrupts it, on the same cpu, each 20 ms. It has its own time. That
- * doesn't give more time to the prog. Return how long the loop went on, in ms.
+ * doesn't give more time to the prog, which is cancelled when its time is up: user space measures
+ * how long the loop went on.
  */
 SEC("syscall")
 int spin_under_timer(void *ctx)
@@ -277,7 +276,8 @@ int drain(void *ctx)
 }
 
 /*
- * A tracing prog with large frames: they are in a private stack.
+ * A tracing prog with large frames: they are in a private stack. The first spin cancels the prog,
+ * which stores nothing after it.
  */
 int priv_stack_spun, priv_stack_cb_spun;
 
@@ -302,6 +302,7 @@ int BPF_PROG(priv_stack)
 	volatile char buf[128] = {};
 	int i, n = buf[zero & 127], spun = 0;
 
+	priv_stack_spun = priv_stack_cb_spun = -1;
 	for (i = 0; i < TRIES; i++)
 		n += spins_with_stack();
 	bpf_loop(TRIES, priv_stack_cb, &spun, zero);

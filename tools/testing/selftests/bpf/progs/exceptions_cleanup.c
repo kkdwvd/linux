@@ -713,7 +713,7 @@ __naked int name(void)							\
 }
 
 /* A may_goto timeout: the loop spins until it is cancelled. */
-MIRROR_PROG(cancel_may_goto_slot, ".8byte %[may_goto]; r0 = 0; goto 2b;")
+MIRROR_PROG(cancel_may_goto_mirror_conflict, ".8byte %[may_goto]; r0 = 0; goto 2b;")
 /* An explicit throw. */
 MIRROR_PROG(throw_mirror_conflict, "r1 = 0xeB9F; call %[bpf_throw];")
 
@@ -1489,7 +1489,7 @@ int cancel_may_goto_shared_subprog(struct __sk_buff *ctx)
 
 /*
  * A tracing program with 64 bytes of stack runs on a private stack: the
- * record is released from a slot of that frame.
+ * record is released from its spill slot in that frame.
  */
 SEC("fentry/bpf_fentry_test1")
 __naked int cancel_may_goto_priv_stack(void)
@@ -1786,6 +1786,170 @@ int cancel_may_goto_exception_cb(struct __sk_buff *ctx)
 {
 	bpf_throw(0);
 	return 0;
+}
+
+/* Pops a node under its caller's lock, and spins holding it. */
+static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
+
+	if (n)
+		mark_acquired(n);
+	spin();
+	return n;
+}
+
+/* The callee's node, popped under the caller's lock, is dropped after the lock is released. */
+SEC("tc")
+int cancel_may_goto_obj_after_caller_lock(struct __sk_buff *ctx)
+{
+	struct bpf_list_node *n;
+	struct locked_list *l;
+	struct lfoo *f;
+	int key = 0;
+
+	l = bpf_map_lookup_elem(&locked_list_map, &key);
+	if (!l)
+		return 1;
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(&l->lock);
+	bpf_spin_lock(&l->lock);
+	bpf_list_push_back(&l->head, &f->node);
+	n = pop_and_spin(l);
+	if (n)
+		bpf_list_push_back(&l->head, n);
+	bpf_spin_unlock(&l->lock);
+	return 0;
+}
+
+/* Leaves the RCU read section its caller entered, then spins. */
+static __noinline int rcu_unlock_and_spin(void)
+{
+	bpf_rcu_read_unlock();
+	spin();
+	return 0;
+}
+
+/*
+ * The caller lists its RCU read section at the call, and the callee has left
+ * it before the timeout and records that: the unwinder leaves no section.
+ */
+SEC("tc")
+int cancel_may_goto_retract_rcu(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	bpf_rcu_read_lock();
+	rcu_unlock_and_spin();
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* Unlocks the lock its caller holds, then spins. */
+static __noinline int unlock_and_spin(struct locked_foo *f)
+{
+	bpf_spin_unlock(&f->lock);
+	spin();
+	return 0;
+}
+
+/* The same for the lock of the caller's object, at a may_goto. */
+SEC("tc")
+int cancel_may_goto_retract_lock(struct __sk_buff *ctx)
+{
+	struct locked_foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	mark_acquired(&f->lock);
+	bpf_spin_lock(&f->lock);
+	unlock_and_spin(f);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * A loop the verifier cannot count gets a may_goto of its own, which cancels
+ * the program when its time is up like a may_goto of the program does: the
+ * object is released.
+ */
+SEC("tc")
+int cancel_guard_obj(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	while (loops)
+		;
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* R1 says how deep to go. It calls itself twice: 2^R1 calls, more than the time allows for 60. */
+__naked __noinline __used
+static unsigned long calls_itself_twice(void)
+{
+	asm volatile (
+	"if r1 != 0 goto 1f;"
+	"r0 = 1;"
+	"exit;"
+	"1: r6 = r1;"
+	"r1 += -1;"
+	"call calls_itself_twice;"
+	"r7 = r0;"
+	"r1 = r6;"
+	"r1 += -1;"
+	"call calls_itself_twice;"
+	"r0 += r7;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/*
+ * A recursive subprog gets a check of its time and of the stack at its entry,
+ * which cancels the program when its time is up like a may_goto does: the
+ * record the caller holds is released.
+ */
+SEC("tc")
+__naked int cancel_recursion_caller(void)
+{
+	asm volatile (
+	"r1 = %[ringbuf] ll;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_ringbuf_reserve];"
+	"if r0 == 0 goto 1f;"
+	"r6 = r0;"
+	"r1 = %[acquired] ll;"
+	"*(u64 *)(r1 + 0) = r0;"
+	"r2 = 1;"
+	"r1 = %[acquired_cnt] ll;"
+	"*(u32 *)(r1 + 0) = r2;"
+	"r1 = 60;"
+	"call calls_itself_twice;"
+	"r1 = r6;"
+	"r2 = 0;"
+	"call %[bpf_ringbuf_discard];"
+	"1: r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(ringbuf),
+	  __imm_addr(acquired),
+	  __imm_addr(acquired_cnt),
+	  __imm(bpf_ringbuf_reserve),
+	  __imm(bpf_ringbuf_discard)
+	: __clobber_all);
 }
 
 char _license[] SEC("license") = "GPL";
