@@ -7,7 +7,8 @@
  * the site is reached in, and describes the current frame alone, at the
  * instruction. A caller frame waits in a call, which is a site of its own,
  * where the caller is described from its state at the call: that way the
- * unwinder releases each frame from its instruction pointer alone. One
+ * unwinder releases each frame from its instruction pointer alone, and
+ * nothing a callee does to its own frame is the caller's concern. One
  * descriptor is built per (subprog, insn), and the paths that reach the
  * instruction are merged into it.
  *
@@ -69,6 +70,7 @@ enum {
 #define MAX_FIXED		32	/* locks, IRQ flags and sections a frame may hold */
 #define ACQ_NONE		(~0U)	/* sections have no origin */
 #define LISTED_FIXED		-2	/* listed as a fixed entry, see build_add_listing() */
+#define PASSED_STACK		BIT(5)	/* reaches the callee through the stack, see site_passed() */
 #define MIRROR_KIND_PTR		0	/* the pointer the acquisition returned */
 #define MIRROR_KIND_LOCK	0xff	/* the pointer to the lock; else a stack object's slot type */
 #define DISC_SLOTS		64	/* stack slots that may tell a call's outcome */
@@ -148,6 +150,7 @@ void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b)
 		return;
 	kvfree(b->fixed);
 	kvfree(b->listed);
+	kvfree(b->targets);
 	kvfree(b->extra);
 	kvfree(b);
 }
@@ -192,18 +195,21 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	kvfree(env->call_refs);
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
+	kvfree(env->coclaims);
 	kvfree(env->section_insns);
 	kvfree(env->resources);
 	env->mirrors = NULL;
 	env->call_refs = NULL;
 	env->arrivals = NULL;
 	env->release_recs = NULL;
+	env->coclaims = NULL;
 	env->section_insns = NULL;
 	env->resources = NULL;
 	env->mirror_cnt = 0;
 	env->call_ref_cnt = 0;
 	env->arrival_cnt = 0;
 	env->release_rec_cnt = 0;
+	env->coclaim_cnt = 0;
 	env->section_insn_cnt = 0;
 	env->resource_cnt = 0;
 	env->frame_desc_visits = 0;
@@ -234,16 +240,20 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->call_refs);
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
+	kvfree(env->coclaims);
 	kvfree(env->section_insns);
 	kvfree(env->resources);
 	kvfree(env->frame_desc_scratch);
 	kvfree(env->frame_desc_new_of);
 	kvfree(env->frame_desc_targets);
 	kvfree(env->frame_desc_reach);
+	kvfree(env->frame_desc_moves);
+	env->frame_desc_moves = NULL;
 	env->mirrors = NULL;
 	env->call_refs = NULL;
 	env->arrivals = NULL;
 	env->release_recs = NULL;
+	env->coclaims = NULL;
 	env->section_insns = NULL;
 	env->resources = NULL;
 	env->frame_desc_scratch = NULL;
@@ -1237,10 +1247,13 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 	return pool->cnt++;
 }
 
-/* Is @insn, after all rewrites, what the unwinder sees a site through: a call. */
+/*
+ * Is @insn, after all rewrites, what the unwinder sees a site through: a call,
+ * direct or through a function pointer.
+ */
 static bool site_insn_ok(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_CALL);
+	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn);
 }
 
 /*
@@ -1832,16 +1845,107 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 	return cand_idx(&s->cands[chosen]);
 }
 
+/* Note that the call of build @b may enter subprog @callee. */
+static int build_add_target(struct bpf_frame_desc_build *b, u16 callee)
+{
+	u16 *targets;
+	int i;
+
+	for (i = 0; i < b->nr_targets; i++)
+		if (b->targets[i] == callee)
+			return 0;
+	targets = kvrealloc(b->targets, array_size(b->nr_targets + 1, sizeof(*targets)),
+			    GFP_KERNEL_ACCOUNT);
+	if (!targets)
+		return -ENOMEM;
+	targets[b->nr_targets++] = callee;
+	b->targets = targets;
+	return 0;
+}
+
+/* Does @reg hold the handle of @ref, or point at its stack object, in @st? */
+static bool reg_has_ref(const struct bpf_verifier_state *st, const struct bpf_reg_state *reg,
+			const struct bpf_reference_state *ref)
+{
+	int objframe, spi;
+
+	if (ref->type & REF_TYPE_LOCK_MASK)
+		return reg_is_lock(reg, ref);
+	if (stack_object_find(st, ref, &objframe, &spi))
+		return reg_points_at(reg, objframe, spi);
+	return reg_is_ref(reg, ref->id);
+}
+
+/* Is @ref spilled in, or a stack object in, the stack of frame @frameno of @st? */
+static bool frame_stack_has_ref(const struct bpf_verifier_state *st, int frameno,
+				const struct bpf_reference_state *ref)
+{
+	const struct bpf_func_state *frame = st->frame[frameno];
+	int objframe, spi, k;
+
+	if (stack_object_find(st, ref, &objframe, &spi))
+		return objframe == frameno;
+	for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
+		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+		if (bpf_is_spilled_reg(slot) && reg_has_ref(st, &slot->spilled_ptr, ref))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The site is a call of BPF code: note, for every reference listed, which
+ * of R1-R5 pass it to the callee, and whether the callee can reach it through
+ * the stack: as a stack argument, or spilled in, or a stack object in, a
+ * frame that a stack pointer argument points into. The callee chain may
+ * release what it is passed, and then lists it, see bpf_frame_desc_resolve().
+ */
+static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			struct bpf_frame_desc_build *b)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	u32 stack_frames = 0;
+	int k, i, l;
+
+	for (k = BPF_REG_1; k <= BPF_REG_5; k++)
+		if (frame->regs[k].type == PTR_TO_STACK)
+			stack_frames |= BIT(frame->regs[k].frameno);
+	for (i = 0; i < frame->out_stack_arg_cnt; i++)
+		if (frame->stack_arg_regs[i].type == PTR_TO_STACK)
+			stack_frames |= BIT(frame->stack_arg_regs[i].frameno);
+	for (l = 0; l < b->nr_listed; l++) {
+		struct bpf_frame_desc_listing *lst = &b->listed[l];
+
+		for (i = 0; i < st->acquired_refs; i++) {
+			const struct bpf_reference_state *ref = &st->refs[i];
+
+			if (ref->origin != lst->origin)
+				continue;
+			for (k = BPF_REG_1; k <= BPF_REG_5; k++)
+				if (reg_has_ref(st, &frame->regs[k], ref))
+					lst->passed |= BIT(k - 1);
+			for (k = 0; k < frame->out_stack_arg_cnt; k++)
+				if (reg_has_ref(st, &frame->stack_arg_regs[k], ref))
+					lst->passed |= PASSED_STACK;
+			for (k = 0; k <= st->curframe; k++)
+				if ((stack_frames & BIT(k)) && frame_stack_has_ref(st, k, ref))
+					lst->passed |= PASSED_STACK;
+		}
+	}
+}
+
 /*
  * Record the state of the current frame at a site where the program may be
  * unwound. @regs_saved says that the entry the unwinder is reached through
  * saves R0-R9 of the frame; otherwise it waits in a call and only keeps R6-R9
- * and its stack. Only live locations are considered, which keeps the
+ * and its stack. A call of BPF code may enter @callee, which may release what
+ * it is passed. Only live locations are considered, which keeps the
  * descriptors consistent with the joins of the verifier: two states it joins
  * agree on every live location, and so do a state and one it is within.
  */
 static int site_do(struct bpf_verifier_env *env, bool regs_saved,
-		   struct bpf_frame_desc_build **slot)
+		   struct bpf_frame_desc_build **slot, int callee)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = st->frame[st->curframe];
@@ -1948,6 +2052,13 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		if (ret)
 			return ret;
 	}
+	if (callee >= 0) {
+		ret = build_add_target(b, callee);
+		if (ret)
+			return ret;
+		b->is_call = true;
+		site_passed(env, st, b);
+	}
 	b->visits++;
 	return 0;
 }
@@ -1958,22 +2069,39 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
  * @slot: the site of a may_goto the verifier adds is the insn it goes in
  * front of, and the descriptor is moved onto the may_goto once it is there.
  */
-static int site(struct bpf_verifier_env *env, bool regs_saved, struct bpf_frame_desc_build **slot)
+static int site(struct bpf_verifier_env *env, bool regs_saved, struct bpf_frame_desc_build **slot,
+		int callee)
 {
 	if (env->cur_state->speculative)
 		return 0;
-	return site_do(env, regs_saved, slot);
+	return site_do(env, regs_saved, slot, callee);
 }
 
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved)
 {
-	return site(env, regs_saved, NULL);
+	return site(env, regs_saved, NULL, -1);
 }
 
 /* The timed may_goto slow path saves R0-R9, like the entry of bpf_throw(). */
 int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot)
 {
-	return site(env, true, slot);
+	return site(env, true, slot, -1);
+}
+
+/*
+ * The current insn calls BPF code: subprog @callee, or the callback of a
+ * helper or kfunc when @callee is -1. The frame waits in the call with R6-R9
+ * and its stack, and is described from there; what it holds at the call is
+ * noted for what the return finds released.
+ */
+int bpf_frame_desc_call_site(struct bpf_verifier_env *env, int callee)
+{
+	int ret;
+
+	if (!env->describe_frames)
+		return 0;
+	ret = callee >= 0 ? bpf_frame_desc_record_call(env) : 0;
+	return ret ?: site(env, false, NULL, callee >= 0 ? callee : -2);
 }
 
 /*
@@ -2239,7 +2367,10 @@ int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delt
 				false);
 }
 
-/* The register among R1-R5 that holds the handle of @ref at the current insn, or -1. */
+/*
+ * The register among R1-R5 that holds the handle of @ref at the current
+ * insn, or -1; a release may take the node of the object, @adj bytes in.
+ */
 static int handle_regno(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 			const struct bpf_reference_state *ref, s16 *adj)
 {
@@ -2788,30 +2919,102 @@ static bool transferred(struct bpf_verifier_env *env, const unsigned long *reach
 	return false;
 }
 
+/* Does a frame of @s list the reference of origin @origin for another target of a callx? */
+static bool coclaimed(struct bpf_verifier_env *env, u32 s, u32 origin)
+{
+	u32 i;
+
+	for (i = 0; i < env->coclaim_cnt; i++)
+		if (env->coclaims[i].origin == origin && env->coclaims[i].subprog == s)
+			return true;
+	return false;
+}
+
+static int coclaim_add(struct bpf_verifier_env *env, u32 s, u32 origin)
+{
+	struct bpf_coclaim *c;
+	u32 cnt = env->coclaim_cnt;
+
+	c = kvrealloc(env->coclaims, array_size(cnt + 1, sizeof(*c)), GFP_KERNEL_ACCOUNT);
+	if (!c)
+		return -ENOMEM;
+	c[cnt] = (struct bpf_coclaim) { .origin = origin, .subprog = s };
+	env->coclaims = c;
+	env->coclaim_cnt = cnt + 1;
+	return 0;
+}
+
 /*
  * Does a frame of @s list the reference of origin @origin, which it does not
  * own: does it or a callee release it, or one that arrives the way it does,
  * in the same register of the entry or by the same load, as a reference of
  * the same class, since the mirror of that register or load lists whatever
- * arrived there?
+ * arrived there; or is it a target of a callx another target of which lists
+ * it, see coclaim_targets()?
  */
 static bool claimed(struct bpf_verifier_env *env, const unsigned long *reach, u32 s, u32 origin)
 {
 	const struct bpf_arrival *a = arrival_find(env, s, origin);
 	u32 i;
 
+	if (coclaimed(env, s, origin))
+		return true;
 	if (!a || a->how == ARRIVE_NONE)
 		return transferred(env, reach, s, origin);
 	for (i = 0; i < env->arrival_cnt; i++) {
 		const struct bpf_arrival *o = &env->arrivals[i];
 
 		if (o->subprog == s && o->how == a->how && o->at == a->at && o->res == a->res &&
-		    transferred(env, reach, s, o->origin))
+		    (transferred(env, reach, s, o->origin) || coclaimed(env, s, o->origin)))
 			return true;
 	}
 	return false;
 }
 
+/*
+ * A callx passes what it passes to every target alike, and the caller lists
+ * nothing a target releases: the targets that do not release it list it,
+ * as a reference that arrived the way it did, from their lattice or their
+ * mirror. A target may be one of another callx in turn: to a fixed point.
+ */
+static int coclaim_targets(struct bpf_verifier_env *env)
+{
+	bool again = true;
+	u32 i, k;
+	int t, ret;
+
+	while (again) {
+		again = false;
+		for (i = 0; i < NR_BUILDS(env); i++) {
+			struct bpf_frame_desc_build *b;
+			int subprog;
+
+			b = build_nth(env, i, &subprog);
+			if (!b || !b->is_call || b->nr_targets < 2)
+				continue;
+			for (k = 0; k < b->nr_listed; k++) {
+				const struct bpf_frame_desc_listing *l = &b->listed[k];
+				bool any = false;
+
+				if (!l->passed)
+					continue;
+				for (t = 0; t < b->nr_targets; t++)
+					any |= claimed(env, env->frame_desc_reach, b->targets[t], l->origin);
+				if (!any)
+					continue;
+				for (t = 0; t < b->nr_targets; t++) {
+					if (claimed(env, env->frame_desc_reach, b->targets[t], l->origin))
+						continue;
+					ret = coclaim_add(env, b->targets[t], l->origin);
+					if (ret)
+						return ret;
+					again = true;
+				}
+			}
+		}
+	}
+	return 0;
+}
 
 /*
  * The subprogs the call at @call of the current image may enter: a static or
@@ -2865,6 +3068,9 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 	u32 i, k, j;
 	int ret;
 
+	ret = coclaim_targets(env);
+	if (ret)
+		return ret;
 	for (i = 0; i < NR_BUILDS(env); i++) {
 		struct bpf_frame_desc_build *b;
 		int subprog;
@@ -2874,6 +3080,7 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			continue;
 		for (k = 0; k < b->nr_listed; k++) {
 			struct bpf_frame_desc_listing *l = &b->listed[k];
+			int t;
 			u8 how;
 			u32 at;
 			u16 res;
@@ -2898,6 +3105,13 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 				if (ret)
 					return ret;
 				l->loc = -1;
+			}
+			/* passed to a callee chain that lists it: the chain releases it */
+			for (t = 0; l->passed && t < b->nr_targets; t++) {
+				if (!claimed(env, env->frame_desc_reach, b->targets[t], l->origin))
+					continue;
+				l->dropped = true;
+				break;
 			}
 		}
 		for (k = 0; k < b->nr_listed; k++) {
@@ -3113,6 +3327,100 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 		}
 	}
 	return 0;
+}
+
+/*
+ * Insn @off is being replaced by a patch of the list, and the insn the unwinder
+ * sees the site through is insn @k of the patch, not its last insn, where the
+ * aux data of @off goes: the commit moves the descriptor there, see
+ * bpf_frame_desc_remap_aux().
+ */
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k)
+{
+	struct bpf_frame_desc_move *moves;
+	u32 cnt = env->frame_desc_move_cnt;
+
+	if (!env->insn_aux_data[off].frame_desc)
+		return 0;
+	moves = kvrealloc(env->frame_desc_moves, array_size(cnt + 1, sizeof(*moves)),
+			  GFP_KERNEL_ACCOUNT);
+	if (!moves)
+		return -ENOMEM;
+	moves[cnt] = (struct bpf_frame_desc_move) { .off = off, .k = k };
+	env->frame_desc_moves = moves;
+	env->frame_desc_move_cnt = cnt + 1;
+	return 0;
+}
+
+/*
+ * Apply the moves of bpf_frame_desc_move_site() to the aux data of the new
+ * image, which the commit has put in place: the descriptor of a replaced insn
+ * went to the last insn of its patch with the rest of its aux data.
+ */
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u32 i;
+
+	for (i = 0; i < env->frame_desc_move_cnt; i++) {
+		const struct bpf_frame_desc_move *m = &env->frame_desc_moves[i];
+		u32 first = bpf_patch_image_remap(img, img->new_off, m->off);
+		u32 last = bpf_patch_image_remap(img, img->new_off, m->off + 1) - 1;
+
+		/* not replaced after all, or the site is at the last insn anyway */
+		if (first + m->k >= last)
+			continue;
+		aux[first + m->k].frame_desc = aux[last].frame_desc;
+		aux[last].frame_desc = NULL;
+	}
+	env->frame_desc_move_cnt = 0;
+}
+
+/*
+ * A rewrite of insn @off keeps register @reg in the stack slot at @slot_off
+ * of the frame while the unwinder may see the site: what the descriptor
+ * listed in the register is listed in the slot.
+ */
+int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s16 slot_off)
+{
+	struct bpf_frame_desc_build *b = env->insn_aux_data[off].frame_desc;
+	u32 spi = -slot_off / BPF_REG_SIZE - 1;
+	int k;
+
+	for (k = 0; k < b->nr_fixed; k++) {
+		struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
+
+		if (ent->loc != BPF_FRAME_LOC_REG || ent->off != reg)
+			continue;
+		ent->loc = BPF_FRAME_LOC_STACK;
+		ent->off = slot_off;
+	}
+	if (b->regs[reg].state != LOC_RES)
+		return 0;
+	b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
+	if (!b)
+		return -ENOMEM;
+	b->slots[spi] = b->regs[reg];
+	b->regs[reg].state = LOC_OTHER;
+	return 0;
+}
+
+/*
+ * The bpf_loop() call at insn @off is being inlined: its callback is an
+ * ordinary callee now, called from insn @call of the patch, and the frame is
+ * unwound through there instead of stopping at the callback. The loop keeps
+ * R6, R7 and R8 in the stack slots from @r6_off up while it runs.
+ */
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off)
+{
+	int r, ret;
+
+	if (!env->insn_aux_data[off].frame_desc)
+		return 0;
+	ret = bpf_frame_desc_move_site(env, off, call);
+	for (r = BPF_REG_6; r <= BPF_REG_8 && !ret; r++)
+		ret = bpf_frame_desc_spilled_reg(env, off, r, r6_off + (r - BPF_REG_6) * BPF_REG_SIZE);
+	return ret;
 }
 
 /* What is emitted at an insn of the current image, in this order; see emit_before(). */
