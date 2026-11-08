@@ -21,6 +21,8 @@ SYM_FUNC_START(arch_bpf_timed_may_goto)
 	 * pass it as the first argument in x0.
 	 */
 	mov	x0, x9
+	/* The return address into the program identifies the may_goto. */
+	mov	x1, x30
 	bl	bpf_check_timed_may_goto
 	/* BPF_REG_AX(x9) will be stored into count, so move return value to it. */
 	mov	x9, x0
