@@ -1244,12 +1244,21 @@ struct bpf_frame_desc_loc {
 	u32 acq;	/* insn that acquired the reference listed here */
 };
 
+/* A lock, IRQ flags or section entry of a frame, which every path reaching the site places. */
+struct bpf_frame_desc_fixed {
+	struct bpf_frame_desc_entry ent;
+	u32 acq;	/* insn that took the lock or saved the flags; ~0 for sections */
+	bool seen;	/* placed by the current path, see place_fixed() */
+};
+
 /* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
 struct bpf_frame_desc_build {
 	u32 pc;		/* the instruction the frame is at */
 	u32 visits;
 	u16 nr_slots;
 	bool regs_saved;	/* the entry saves R0-R9 of this frame; otherwise it waits in a call */
+	u16 nr_fixed;
+	struct bpf_frame_desc_fixed *fixed;	/* locks, IRQ flags and sections, equal on every path */
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
 	struct bpf_frame_desc_loc slots[];
 };
