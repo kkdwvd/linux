@@ -651,12 +651,14 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	if (ctx->regs) {
 		/*
 		 * Note the frame, to release what it holds of this walk's
-		 * phase once its callers are known. Every frame is at a call,
-		 * whose return address is the first byte of the next
+		 * phase once its callers are known. The innermost frame of a
+		 * fault is at the faulting instruction; every other frame is at
+		 * a call, whose return address is the first byte of the next
 		 * instruction. Then recover the caller's callee-saved registers
 		 * from the frame.
 		 */
-		bpf_unwind_note(ctx, prog, ip - 1, bp, fp, true);
+		bpf_unwind_note(ctx, prog, ctx->cnt || ctx->kind != BPF_THROW_FAULT ? ip - 1 : ip, bp,
+				fp, true);
 		bpf_unwind_recover(fn, bp, ctx->saved, BPF_THROW_NR_CALLEE_SAVED);
 	}
 	ctx->cnt++;
