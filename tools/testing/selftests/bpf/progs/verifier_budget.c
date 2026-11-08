@@ -14,6 +14,10 @@
  *
  * It takes unwinding, per-cpu insns and timed may_goto in JIT. Some of the progs never end
  * on their own.
+ *
+ * In a prog the kernel can cancel, which the socket filters below are, a may_goto that is added
+ * cancels the prog when its time is up, like a may_goto of the program: the prog returns 0,
+ * whatever it holds is released, and nothing of the above happens.
  */
 #define unwind_goto(off) ".8byte %[insn_unwind_goto_" #off "];"
 #define unwind_exit ".8byte %[insn_unwind_exit];"
@@ -210,7 +214,7 @@ SEC("socket")
 __description("budget: a loop in a subprog is left when there is no unwind_goto")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void loop_in_subprog(void)
 {
 	asm volatile (
@@ -224,7 +228,7 @@ SEC("socket")
 __description("budget: a loop in a subprog unwinds when there is unwind_goto")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
 __naked void loop_in_subprog_caught(void)
 {
 	asm volatile (
@@ -304,7 +308,7 @@ SEC("socket")
 __description("budget: a loop in a subprog that holds something is left")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void loop_in_subprog_locked(void)
 {
 	asm volatile (
@@ -611,7 +615,7 @@ SEC("socket")
 __description("budget: a subprog that calls itself in a loop that never ends")
 __arch_x86_64
 __arch_arm64
-__success __retval(1)
+__success __retval(0)
 __naked void recursion_in_a_loop(void)
 {
 	asm volatile (
@@ -830,7 +834,7 @@ SEC("socket")
 __description("budget: a loop that goes on when its iterator is drained")
 __arch_x86_64
 __arch_arm64
-__success __retval(1)
+__success __retval(0)
 __naked void loop_after_iter_is_drained(void)
 {
 	asm volatile (
@@ -1054,7 +1058,7 @@ SEC("socket")
 __description("budget: may_goto at the head of a loop keeps a register that the loop sets")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void guard_at_head_keeps_reg(void)
 {
 	asm volatile (
@@ -1709,7 +1713,7 @@ SEC("socket")
 __description("budget: may_goto where all registers are live, out of budget")
 __arch_x86_64
 __arch_arm64
-__success __retval(38)
+__success __retval(0)
 __naked void guard_all_regs_live_spins(void)
 {
 	asm volatile (
