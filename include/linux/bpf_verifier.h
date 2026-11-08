@@ -327,6 +327,17 @@ struct bpf_reference_state {
 	 * is used purely to inform the user of a reference leak.
 	 */
 	int insn_idx;
+	/*
+	 * The frame that owns the reference: the one that acquired it, or the
+	 * caller a returning frame handed it to. -1 for what the callers of a
+	 * function verified on its own hold, which are not in the state.
+	 */
+	s8 frameno;
+	/*
+	 * The insn of the owner's subprog that gave it the reference: the
+	 * acquiring call, or the call of the subprog that returned it.
+	 */
+	u32 origin;
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -503,6 +514,13 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * How many of the RCU read and preemption disabled sections held when the
+	 * frame was entered it left, or a callee of it did: what is left of the
+	 * callers' sections below this frame, for the unwinder.
+	 */
+	u32 rcu_released_below;
+	u32 preempt_released_below;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
