@@ -96,13 +96,13 @@ static __noinline int throw_unconditionally(void)
 /*
  * The callee's throw is unconditional, so the caller never reads the socket
  * again and no live location of its frame holds it at the call: the socket
- * is listed from the unique slot of its acquisition, which the statistics
- * count.
+ * is listed from its mirror, a hidden slot the acquisition fills, which the
+ * statistics count.
  */
 SEC("tc")
 __description("frame_desc: a socket held in no live location of the caller of a throw")
 __success __log_level(5)
-__msg("frame descriptors:{{.*}} slots 1 spills")
+__msg("frame descriptors:{{.*}} mirrors 1 mirror_insns")
 int sock_dead_in_caller(struct __sk_buff *skb)
 {
 	struct bpf_sock_tuple tuple = {};
@@ -122,12 +122,14 @@ static __noinline struct bpf_sock *lookup_in_subprog(struct __sk_buff *skb)
 }
 
 /*
- * The socket was acquired by a subprog that has returned, so no slot can
- * hold it either: the throw leaks it, and the program is rejected.
+ * The socket was acquired by a subprog that has returned: the caller owns it
+ * since the return, so its mirror is a slot of the caller's frame, filled
+ * from R0 after the call that returned it.
  */
 SEC("tc")
 __description("frame_desc: a socket of a returned subprog held in no live location at a throw")
-__failure __msg("is held at no live location and was acquired in a subprog that returned")
+__success __log_level(5)
+__msg("frame descriptors:{{.*}} mirrors 1 mirror_insns")
 int sock_dead_from_subprog(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk;
