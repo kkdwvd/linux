@@ -16214,11 +16214,59 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+static bool nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
+/*
+ * A site inside a callback that a helper or a kfunc runs, called at insn
+ * @callsite. The unwinder stops at the callback, which leaves into the pad of
+ * its caller the way unwind_exit does, so the caller needs one, see
+ * bpf_call_cb(). The pad of bpf_rbtree_add() drops the node, which is a
+ * bpf_obj_drop() under the rule above.
+ */
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[callsite];
+	struct btf_struct_meta *meta;
+
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn)) {
+		if (bpf_helper_call(insn))
+			verbose(env,
+				"the callback of %s() cannot be cancelled: the helper has no pad\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env,
+				"the callback of the kfunc at insn %d cannot be cancelled: it has no pad\n",
+				callsite);
+		return -EINVAL;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) || !is_bpf_rbtree_add_kfunc(insn->imm) ||
+	    !nmi_unsafe_prog(env))
+		return 0;
+	meta = env->insn_aux_data[callsite].kptr_struct_meta;
+	if (meta && btf_record_has_nmi_unsafe_fields(meta->record)) {
+		verbose(env,
+			"bpf_rbtree_add with a comparator that can be cancelled cannot be used in tracing programs on types with NMI unsafe fields\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16335,10 +16383,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
