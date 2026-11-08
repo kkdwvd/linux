@@ -535,19 +535,42 @@ static int visit_func_ptrs_insn(int t, struct bpf_verifier_env *env,
 static void close_callee_effects(struct bpf_verifier_env *env)
 {
 	struct bpf_insn *insn = env->prog->insnsi;
+	struct bpf_subprog_info *sub;
 	struct bpf_func_ptr *ptrs;
-	bool changed;
+	bool changed, thrower;
 	u32 cnt, j;
 	int t;
 
 	do {
 		changed = false;
+		thrower = false;
 		for (t = 0; t < env->prog->len; t++) {
 			if (bpf_pseudo_call(&insn[t]) || bpf_pseudo_func(&insn[t]))
 				changed |= merge_callee_effects(env, t, t + insn[t].imm + 1);
+			if (bpf_pseudo_func(&insn[t]))
+				thrower |= bpf_find_containing_subprog(env, t + insn[t].imm + 1)->might_throw;
 			ptrs = insn_func_ptrs(env, t, &cnt);
-			for (j = 0; j < cnt; j++)
+			for (j = 0; j < cnt; j++) {
 				changed |= merge_callee_effects(env, t, ptrs[j].xlated_off);
+				thrower |= bpf_find_containing_subprog(env, ptrs[j].xlated_off)->might_throw;
+			}
+			if (bpf_is_ldimm64(&insn[t]))
+				t++;
+		}
+		/*
+		 * The marks of a function whose address is taken go to the subprog
+		 * that takes the address, which may pass it on: a callx, and a helper
+		 * or a kfunc that runs a callback, enter such a function from
+		 * wherever the address got to. A throw unwinds through the frames
+		 * of the subprogs that call, so when one of the functions may throw,
+		 * every subprog with such a call may.
+		 */
+		for (t = 0; thrower && t < env->prog->len; t++) {
+			if (bpf_is_callx(&insn[t]) || bpf_is_sync_callback_calling_insn(&insn[t])) {
+				sub = bpf_find_containing_subprog(env, t);
+				changed |= !sub->might_throw;
+				sub->might_throw = true;
+			}
 			if (bpf_is_ldimm64(&insn[t]))
 				t++;
 		}
