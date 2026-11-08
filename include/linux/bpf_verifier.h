@@ -467,6 +467,8 @@ struct bpf_func_state {
 	 * reused after returns, while this ID is preserved across state clones.
 	 */
 	u32 diag_frame_id;
+	/* the node of the chain of calls the frame is under, plus one; 0 until asked, see chain_of() */
+	u32 chain;
 	/* subprog number == index within subprog_info
 	 * zero == main subprog
 	 */
@@ -841,6 +843,17 @@ struct bpf_cell {
 	u16 res[BPF_CELL_CLASSES];
 };
 
+/* The cells of a place, per chain of calls it is visited under, see cells_get() in frame_desc.c. */
+struct bpf_cell_set {
+	u32 node;
+	struct bpf_cell cell[MAX_BPF_FUNC_REG_ARGS];
+};
+
+struct bpf_cells {
+	u32 cnt;
+	struct bpf_cell_set *sets;
+};
+
 struct bpf_insn_aux_data {
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
@@ -879,8 +892,8 @@ struct bpf_insn_aux_data {
 	struct bpf_frame_desc_build *guard_desc;
 	/* two references obtained here were held at once, see frame_desc.c */
 	bool ref_held_twice;
-	/* what a load of another frame's stack yields, over its visits, see frame_desc.c */
-	struct bpf_cell ref_load_cell;
+	/* what a load of another frame's stack yields, over its visits, per chain, see frame_desc.c */
+	struct bpf_cells ref_load_cells;
 	/* what a call of a subprog returns in R0, over its visits */
 	struct bpf_cell ret_cell;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
@@ -1076,8 +1089,8 @@ struct bpf_subprog_info {
 	struct bpf_frame_desc_table *frame_desc_table;
 	/* frame descriptor of a may_goto at the entry of a recursive subprog, see frame_desc.c */
 	struct bpf_frame_desc_build *entry_guard;
-	/* what R1-R5 hold at the entry, over every entry visit, see frame_desc.c */
-	struct bpf_cell entry_cell[MAX_BPF_FUNC_REG_ARGS];
+	/* what R1-R5 hold at the entry, over every entry visit, per chain, see frame_desc.c */
+	struct bpf_cells entry_cells;
 	/* the sections the frames disagree on: counted in a hidden slot, see frame_desc.c */
 	u8 section_counter;	/* BIT(kind) */
 	u16 entry_stores;	/* insns storing mirrors at the entry, see bpf_frame_desc_emit() */
@@ -1283,6 +1296,7 @@ struct bpf_frame_desc_loc {
 struct bpf_frame_desc_fixed {
 	struct bpf_frame_desc_entry ent;
 	u32 origin;	/* of the lock or the flags; ~0 for sections */
+	u32 node;	/* the chain it was placed under, see chain_of() */
 	bool owned;	/* the frame owns it, see bpf_frame_desc_listing */
 	bool seen;	/* placed by the current path, see place_fixed() */
 };
@@ -1290,6 +1304,7 @@ struct bpf_frame_desc_fixed {
 /* A reference a frame lists at a site, see build_add_listing() in frame_desc.c. */
 struct bpf_frame_desc_listing {
 	u32 origin;
+	u32 node;	/* the chain it was listed under, which says how the frame got it */
 	s16 loc;	/* the location of the lattice, a fixed entry, or none when mirrored */
 	/*
 	 * The frame owns the reference, see bpf_reference_state::frameno, which
@@ -1301,10 +1316,25 @@ struct bpf_frame_desc_listing {
 	u8 passed;	/* at a call: the registers it is passed in, or through the stack */
 };
 
-/* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
+/*
+ * A node of the trie of the chains of calls the main pass sees, see
+ * chain_child() in frame_desc.c: the chain of a frame is the sequence of
+ * the calls the frames below it wait in, nearest first, a path from the
+ * root, node 0.
+ */
+struct bpf_chain {
+	u32 parent;
+	u32 pc;		/* orig insn of the call, see bpf_func_state::callsite */
+	u32 pool;	/* the node of the program's trie, see bpf_frame_desc_build_tables() */
+};
+
+/* Frame descriptor under construction for one (subprog, insn, chain), see frame_desc.c. */
 struct bpf_frame_desc_build {
 	u32 pc;		/* the instruction the frame is at */
 	u32 visits;
+	u32 node;	/* the chain the frame was visited under, see chain_of() */
+	struct bpf_frame_desc_build *next;	/* the build of the insn for another chain */
+	bool callsite;	/* the insn calls BPF code, or a helper or kfunc that runs a callback */
 	u16 nr_slots;
 	bool regs_saved;	/* the entry saves R0-R9; otherwise the frame waits in a call */
 	u16 nr_fixed;
@@ -1348,15 +1378,20 @@ enum bpf_arrive {
 
 struct bpf_arrival {
 	u32 origin;
+	u32 node;	/* the chain the frame is under */
 	u16 subprog;
 	u8 how;		/* enum bpf_arrive */
 	u32 at;		/* the register, or the load insn */
 	u16 res;	/* the class the reference arrives as: an object, or its lock */
 };
 
-/* A target of a callx lists what another target releases, see claimed() in frame_desc.c. */
+/*
+ * A target of a callx under chain @node lists what another target releases,
+ * see claimed() in frame_desc.c.
+ */
 struct bpf_coclaim {
 	u32 origin;
+	u32 node;
 	u16 subprog;
 };
 
@@ -1391,12 +1426,13 @@ struct bpf_mirror {
 };
 
 /*
- * What a call did to a reference its caller held, per (call insn, origin),
- * see bpf_frame_desc_record_return().
+ * What a call did to a reference its caller held, per (call insn, origin,
+ * chain of the caller's frame), see bpf_frame_desc_record_return().
  */
 struct bpf_call_ref {
 	u32 call;	/* orig insn */
 	u32 origin;
+	u32 node;	/* the chain the caller's frame is under, see chain_of() in frame_desc.c */
 	u16 subprog;	/* the caller's */
 	bool owned;	/* by the caller's frame, see bpf_frame_desc_listing */
 	bool held_before;	/* held at the call on some path */
@@ -1407,11 +1443,14 @@ struct bpf_call_ref {
 	u64 slots_ok;	/* the same for the stack slots of the caller's frame */
 };
 
-/* A release in @subprog of a reference its frame does not own, see frame_desc.c. */
+/*
+ * A frame of @subprog under chain @node, or a frame below it, releases a
+ * reference of origin @origin that the frame does not own, see frame_desc.c.
+ */
 struct bpf_release_rec {
-	u32 rel;	/* orig insn */
-	u16 subprog;
 	u32 origin;
+	u32 node;
+	u16 subprog;
 };
 
 /*
@@ -1477,6 +1516,10 @@ struct bpf_verifier_env {
 	u32 frame_desc_sites;			/* table entries */
 	u32 frame_desc_bytes;			/* tables, descriptors and resource classes */
 	u32 frame_desc_conflicts;		/* merges in which the paths disagreed on a location */
+	struct bpf_chain *chains;		/* the trie of the chains of calls, see frame_desc.c */
+	u32 chain_cnt;
+	u32 chain_nodes;			/* nodes of the program's trie: the chains kept apart */
+	u32 chain_split_sites;			/* sites with a descriptor per chain */
 	void *frame_desc_scratch;
 	struct bpf_mirror *mirrors;		/* see frame_desc.c */
 	u32 mirror_cnt;
@@ -1496,7 +1539,6 @@ struct bpf_verifier_env {
 	u32 frame_desc_orig_len;		/* the insns the main pass named, see frame_desc.c */
 	u32 *frame_desc_new_of;			/* their indices after the loop guards */
 	u16 *frame_desc_targets;		/* room for the targets of a call */
-	unsigned long *frame_desc_reach;	/* subprog_cnt rows: the subprogs each reaches */
 	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
 	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
