@@ -467,9 +467,16 @@ l3_%=:	r1 = r7;					\
  * 11: exit(0)
  */
 
+/*
+ * Where the frames are described for the unwinder, in a cancellable program,
+ * see kernel/bpf/frame_desc.c, the second state at 29 is not within the
+ * first: a lock is told by the insn that acquired it, which keys the hidden
+ * slot it may have to be released from, and the two were acquired at 23 and
+ * 28. The states come together after the unlock then.
+ */
 SEC("cgroup/skb")
 __description("spin_lock: regsafe() check_ids() similar id mappings")
-__success __msg("to 29: within")
+__success __msg("{{to 29: within|from 31 to 32: within}}")
 __failure_unpriv __msg_unpriv("")
 __log_level(2) __retval(0)
 __naked void check_ids_similar_id_mappings(void)

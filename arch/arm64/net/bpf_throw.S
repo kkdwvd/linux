@@ -25,9 +25,10 @@ SYM_FUNC_START(bpf_throw_entry)
 	stp	x25, x26, [sp, #112]
 	stp	x27, x28, [sp, #128]
 
-	/* bpf_throw_unwind(regs, cookie); the cookie is R1 of the caller. */
+	/* bpf_throw_unwind(regs, cookie, BPF_THROW_CALL); the cookie is R1 of the caller. */
 	mov	x1, x0
 	add	x0, sp, #16
+	mov	x2, #BPF_THROW_CALL
 	bl	bpf_throw_unwind
 	brk	#0x1
 SYM_FUNC_END(bpf_throw_entry)
