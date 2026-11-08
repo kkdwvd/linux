@@ -14,7 +14,9 @@
  * A frame lists exactly the references it owns, see
  * bpf_reference_state::frameno. What it holds for a caller is the caller's to
  * list, at the call the caller waits in, and what a callee returns with
- * becomes the caller's at the return.
+ * becomes the caller's at the return. A stack object, an iterator or a
+ * dynptr, is listed where it is when it is in the frame's own stack, and
+ * through a pointer to it otherwise.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -55,7 +57,8 @@ enum {
 
 /* A candidate location of one reference on the current path. */
 struct cand {
-	u16 is_slot;
+	u8 is_slot;
+	u8 indirect;	/* the location holds a pointer to the resource */
 	u16 idx;	/* register number or spi */
 	u16 res;
 };
@@ -64,6 +67,7 @@ struct cand {
 struct scratch {
 	struct cand cands[FRAME_LOCS];
 	u8 class[FRAME_LOCS];
+	u8 indirect[FRAME_LOCS];
 	u16 res[FRAME_LOCS];
 	u32 acq[FRAME_LOCS];
 	struct bpf_frame_desc_build *build;
@@ -291,6 +295,46 @@ unsupported:
 	return -EOPNOTSUPP;
 }
 
+static int resource_of_dynptr(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	struct bpf_resource res;
+
+	if (!helper_ok(env, BPF_FUNC_ringbuf_discard_dynptr)) {
+		verbose(env, "frame_desc: cannot release a ringbuf dynptr in this program\n");
+		return -EOPNOTSUPP;
+	}
+	memset(&res, 0, sizeof(res));
+	res.kind = BPF_RESOURCE_DYNPTR_RINGBUF;
+	return resource_intern(env, &res);
+}
+
+/*
+ * The class of the iterator in @reg, the first slot of an iterator. An
+ * RCU-protected iterator is destroyed before the sections of its frame end,
+ * unless its destructor sleeps: that runs after every section, which is
+ * the only place the program could have called it.
+ */
+static int resource_of_iter(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	struct bpf_resource res;
+	int ret;
+
+	if (reg->type & PTR_UNTRUSTED) {
+		verbose(env,
+			"frame_desc: cannot release an iterator after its RCU protection ended\n");
+		return -EOPNOTSUPP;
+	}
+	memset(&res, 0, sizeof(res));
+	res.kind = BPF_RESOURCE_ITER;
+	res.btf = reg->iter.btf;
+	res.btf_id = reg->iter.btf_id;
+	ret = resource_registry(env, reg->iter.btf, reg->iter.btf_id, &res, "iterator");
+	if (ret)
+		return ret;
+	res.rcu = (reg->type & MEM_RCU) && !res.sleeps;
+	return resource_intern(env, &res);
+}
+
 /*
  * Does @reg hold the object of reference @id itself? A pointer with the same
  * id but an offset points into the object and cannot be released.
@@ -314,22 +358,76 @@ static bool stack_slot_is_null(const struct bpf_stack_state *slot)
 }
 
 /*
- * Does @slot hold reference @id, and what resource class is it then, when
- * @classify? -ENOENT when it does not.
+ * Is @slot the stack object of reference @id: the first slot of an iterator,
+ * or of a ringbuf dynptr, which tracks the record's reference as its parent?
+ */
+static bool stack_slot_is_object(const struct bpf_stack_state *slot, int id)
+{
+	const struct bpf_reg_state *reg = &slot->spilled_ptr;
+
+	switch (slot->slot_type[BPF_REG_SIZE - 1]) {
+	case STACK_DYNPTR:
+		return reg->dynptr.first_slot && reg->dynptr.type == BPF_DYNPTR_TYPE_RINGBUF &&
+		       reg->parent_id == id;
+	case STACK_ITER:
+		return reg->id == id;
+	default:
+		return false;
+	}
+}
+
+/* The class of the stack object at @slot, see stack_slot_is_object(). */
+static int resource_of_object(struct bpf_verifier_env *env, const struct bpf_stack_state *slot)
+{
+	if (slot->slot_type[BPF_REG_SIZE - 1] == STACK_DYNPTR)
+		return resource_of_dynptr(env, &slot->spilled_ptr);
+	return resource_of_iter(env, &slot->spilled_ptr);
+}
+
+/*
+ * Does @slot hold the pointer of reference @id, and what resource class is
+ * it then, when @classify? -ENOENT when it does not.
  */
 static int stack_slot_ref(struct bpf_verifier_env *env, const struct bpf_stack_state *slot, int id,
 			  bool classify)
 {
 	const struct bpf_reg_state *reg = &slot->spilled_ptr;
 
-	switch (slot->slot_type[BPF_REG_SIZE - 1]) {
-	case STACK_SPILL:
-		if (!bpf_is_spilled_reg(slot) || !reg_is_ref(reg, id))
-			return -ENOENT;
-		return classify ? resource_of_reg(env, reg) : 0;
-	default:
+	if (slot->slot_type[BPF_REG_SIZE - 1] != STACK_SPILL || !bpf_is_spilled_reg(slot) ||
+	    !reg_is_ref(reg, id))
 		return -ENOENT;
+	return classify ? resource_of_reg(env, reg) : 0;
+}
+
+/*
+ * The frame and slot of the stack object of reference @ref, if it is one:
+ * the object may be in the stack of another frame, created through a
+ * pointer to it.
+ */
+static bool stack_object_find(const struct bpf_verifier_state *st,
+			      const struct bpf_reference_state *ref, int *frameno, int *spi)
+{
+	int f, k;
+
+	for (f = st->curframe; f >= 0; f--) {
+		const struct bpf_func_state *frame = st->frame[f];
+
+		for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
+			if (!stack_slot_is_object(bpf_stack_slot(frame, k), ref->id))
+				continue;
+			*frameno = f;
+			*spi = k;
+			return true;
+		}
 	}
+	return false;
+}
+
+/* Does @reg point at the stack object at slot @spi of frame @frameno? */
+static bool reg_points_at(const struct bpf_reg_state *reg, int frameno, int spi)
+{
+	return reg->type == PTR_TO_STACK && reg->frameno == frameno &&
+	       tnum_is_const(reg->var_off) && (s64)reg->var_off.value == -(spi + 1) * BPF_REG_SIZE;
 }
 
 /*
@@ -349,6 +447,11 @@ static int cand_rank(const struct cand *c, const struct bpf_frame_desc_loc *loc)
 static struct bpf_frame_desc_loc *build_loc(struct bpf_frame_desc_build *b, const struct cand *c)
 {
 	return c->is_slot ? &b->slots[c->idx] : &b->regs[c->idx];
+}
+
+static int cand_idx(const struct cand *c)
+{
+	return c->is_slot ? BPF_REG_10 + c->idx : c->idx;
 }
 
 /*
@@ -403,7 +506,7 @@ static int conflict(struct bpf_verifier_env *env, u32 acq, const char *why)
 
 /* Merge one path's classification of a location into the descriptor. */
 static int merge(struct bpf_verifier_env *env, struct bpf_frame_desc_loc *loc, int class, u16 res,
-		 u32 acq)
+		 u32 acq, bool indirect)
 {
 	int ret;
 
@@ -416,6 +519,7 @@ static int merge(struct bpf_verifier_env *env, struct bpf_frame_desc_loc *loc, i
 			loc->state = LOC_RES;
 			loc->res = res;
 			loc->acq = acq;
+			loc->indirect = indirect;
 			break;
 		case CLASS_NULL:
 			loc->state = LOC_NULL;
@@ -431,8 +535,13 @@ static int merge(struct bpf_verifier_env *env, struct bpf_frame_desc_loc *loc, i
 		switch (class) {
 		case CLASS_RES:
 			/* choose() reuses a listed location only for the same acquisition. */
-			return 0;
+			if (loc->indirect == indirect)
+				return 0;
+			return conflict(env, acq, "is a stack object on one path and a pointer on another");
 		case CLASS_NULL:
+			/* A stack object in place is never NULL. */
+			if (!loc->indirect)
+				return conflict(env, loc->acq, "is a stack object that is not there on every path");
 			loc->nullable = 1;
 			return 0;
 		default:
@@ -492,7 +601,8 @@ static u32 build_body(const struct bpf_verifier_env *env, const struct bpf_frame
 		ent = &d->ent[n++];
 		ent->loc = i < BPF_REG_10 ? BPF_FRAME_LOC_REG : BPF_FRAME_LOC_STACK;
 		ent->off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
-		ent->flags = BPF_FRAME_ENT_INDIRECT | (loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0);
+		ent->flags = (loc->indirect ? BPF_FRAME_ENT_INDIRECT : 0) |
+			     (loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0);
 		ent->res = loc->res;
 		ent->order = resource_order(env, loc->res);
 	}
@@ -629,8 +739,8 @@ void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_
 }
 
 /*
- * The live locations of the frame that hold reference @ref: the registers in
- * @live_regs and the live stack slots the state allocated. Those of a
+ * The locations of the frame that hold the pointer of reference @ref: the
+ * live registers and the live stack slots the state allocated. Those of a
  * reference the frame does not own are copies, which need no class.
  */
 static int find_cands(struct bpf_verifier_env *env, struct scratch *s,
@@ -645,7 +755,7 @@ static int find_cands(struct bpf_verifier_env *env, struct scratch *s,
 		ret = classify ? resource_of_reg(env, &frame->regs[k]) : 0;
 		if (ret < 0)
 			return ret;
-		s->cands[nr++] = (struct cand) { 0, k, ret };
+		s->cands[nr++] = (struct cand) { 0, 1, k, ret };
 	}
 	for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
 		if (!test_bit(k, s->live_stack))
@@ -655,7 +765,44 @@ static int find_cands(struct bpf_verifier_env *env, struct scratch *s,
 			continue;
 		if (ret < 0)
 			return ret;
-		s->cands[nr++] = (struct cand) { 1, k, ret };
+		s->cands[nr++] = (struct cand) { 1, 1, k, ret };
+	}
+	return nr;
+}
+
+/*
+ * The locations of the frame that give the stack object of reference @ref,
+ * at slot @spi of frame @objframe: the slot itself when it is in this frame,
+ * whether it is live or not, since the joins of the verifier keep stack
+ * objects whatever their liveness, and the live registers and stack slots
+ * that point at it, which release it through the pointer.
+ */
+static int find_object_cands(struct bpf_verifier_env *env, struct scratch *s,
+			     const struct bpf_verifier_state *st, int objframe, int spi,
+			     bool classify)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int k, nr = 0, res = 0;
+
+	if (classify) {
+		res = resource_of_object(env, bpf_stack_slot(st->frame[objframe], spi));
+		if (res < 0)
+			return res;
+	}
+	if (objframe == st->curframe)
+		s->cands[nr++] = (struct cand) { 1, 0, spi, res };
+	for (k = 0; k < BPF_REG_10; k++) {
+		if (!(s->live_regs & BIT(k)) || !reg_points_at(&frame->regs[k], objframe, spi))
+			continue;
+		s->cands[nr++] = (struct cand) { 0, 1, k, res };
+	}
+	for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
+		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+		if (!test_bit(k, s->live_stack) || !bpf_is_spilled_reg(slot) ||
+		    !reg_points_at(&slot->spilled_ptr, objframe, spi))
+			continue;
+		s->cands[nr++] = (struct cand) { 1, 1, k, res };
 	}
 	return nr;
 }
@@ -665,12 +812,8 @@ static void place_copy(struct scratch *s, int nr)
 {
 	int k;
 
-	for (k = 0; k < nr; k++) {
-		const struct cand *c = &s->cands[k];
-		int idx = c->is_slot ? BPF_REG_10 + c->idx : c->idx;
-
-		s->class[idx] = CLASS_COPY;
-	}
+	for (k = 0; k < nr; k++)
+		s->class[cand_idx(&s->cands[k])] = CLASS_COPY;
 }
 
 /*
@@ -698,11 +841,12 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		return conflict(env, ref->insn_idx, why);
 	for (k = 0; k < nr; k++) {
 		const struct cand *c = &s->cands[k];
-		int idx = c->is_slot ? BPF_REG_10 + c->idx : c->idx;
+		int idx = cand_idx(c);
 
 		s->class[idx] = k == chosen ? CLASS_RES : CLASS_COPY;
 		s->res[idx] = c->res;
 		s->acq[idx] = ref->insn_idx;
+		s->indirect[idx] = c->indirect;
 	}
 	return 0;
 }
@@ -748,10 +892,14 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 	for (i = 0; i < st->acquired_refs; i++) {
 		const struct bpf_reference_state *ref = &st->refs[i];
 		bool owned = ref->frameno == st->curframe;
+		int objframe, spi;
 
 		if (ref->type != REF_TYPE_PTR)
 			continue;
-		nr = find_cands(env, s, frame, ref, owned);
+		if (stack_object_find(st, ref, &objframe, &spi))
+			nr = find_object_cands(env, s, st, objframe, spi, owned);
+		else
+			nr = find_cands(env, s, frame, ref, owned);
 		if (nr < 0)
 			return nr;
 		if (!owned) {
@@ -784,7 +932,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 				s->class[k] = CLASS_NULL;
 			dst = &b->slots[spi];
 		}
-		ret = merge(env, dst, s->class[k], s->res[k], s->acq[k]);
+		ret = merge(env, dst, s->class[k], s->res[k], s->acq[k], s->indirect[k]);
 		if (ret)
 			return ret;
 	}
