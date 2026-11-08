@@ -1266,6 +1266,7 @@ void bpf_patch_image_install(struct bpf_prog *prog, const struct bpf_patch_image
 struct bpf_frame_desc_loc {
 	u8 state;
 	u8 nullable;
+	u8 indirect;	/* the location holds a pointer to the resource, not the resource */
 	u16 res;
 	u32 acq;	/* insn that acquired the reference listed here */
 };
