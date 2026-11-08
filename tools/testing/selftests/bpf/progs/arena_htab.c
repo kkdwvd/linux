@@ -19,7 +19,7 @@ void __arena *htab_for_user;
 bool skip = false;
 
 int zero = 0;
-char __arena arr1[100000];
+char __arena_global arr1[100000];
 char arr2[1000];
 
 SEC("syscall")
@@ -28,6 +28,8 @@ int arena_htab_llvm(void *ctx)
 #if defined(__BPF_FEATURE_ADDR_SPACE_CAST) || defined(BPF_ARENA_FORCE_ASM)
 	struct htab __arena *htab;
 	char __arena *arr = arr1;
+
+	cast_kern(arr);
 	__u64 i;
 
 	htab = bpf_alloc(sizeof(*htab));
