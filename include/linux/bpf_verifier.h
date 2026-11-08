@@ -1443,6 +1443,7 @@ struct bpf_verifier_env {
 	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
 	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
