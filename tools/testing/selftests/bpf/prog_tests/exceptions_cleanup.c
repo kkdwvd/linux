@@ -4,19 +4,78 @@
 
 #include "exceptions_cleanup.skel.h"
 
+/* The cookie the programs throw. */
+#define THROWN		0xeB9F
+/* What a cancelled tc program returns: TC_ACT_SHOT. */
+#define CANCELLED	2
+
 /* bpf_find_vma() in the test program looks this up in the test process. */
 static int vma_target;
 
 /*
- * Run @prog and check what the unwinder released against what the program
- * recorded acquiring: @released of the @acquired resources, the last acquired
- * first when @ordered, and @sections RCU or preemption sections. @hook is a
- * tracing program that records releases the unwinder does not perform, attached
- * for this run, or NULL.
+ * What a run of a program has to show: its return value, the number of
+ * resources the program recorded acquiring, and the releases observed, in
+ * order, as a string: a digit names the acquired resource released at that
+ * point, 's' an RCU or preemption section, '?' any acquired resource not
+ * named elsewhere. @hook is a tracing program recording releases the unwinder
+ * does not perform, attached for the run, and @param a choice the program
+ * reads.
  */
+struct expect {
+	int retval;
+	int acquired;
+	const char *released;
+	struct bpf_program *hook;
+	__u32 param;
+};
+
+static void check_releases(struct exceptions_cleanup *skel, const struct expect *e)
+{
+	bool matched[ARRAY_SIZE(skel->bss->acquired)] = {};
+	int n = strlen(e->released), i, j;
+
+	ASSERT_EQ(skel->bss->acquired_cnt, e->acquired, "acquired");
+	if (!ASSERT_EQ(skel->bss->released_cnt, n, "released"))
+		return;
+	for (i = 0; i < n; i++) {
+		__u64 handle = skel->bss->released[i];
+		char c = e->released[i];
+
+		if (c == 's') {
+			ASSERT_TRUE(skel->bss->released_section[i], "section");
+			continue;
+		}
+		if (!ASSERT_FALSE(skel->bss->released_section[i], "not a section"))
+			continue;
+		if (c == '?') {
+			for (j = 0; j < e->acquired; j++)
+				if (!matched[j] && handle == skel->bss->acquired[j])
+					break;
+			if (ASSERT_LT(j, e->acquired, "released an acquired resource"))
+				matched[j] = true;
+			continue;
+		}
+		j = c - '0';
+		if (ASSERT_EQ(handle, skel->bss->acquired[j], "release order"))
+			matched[j] = true;
+	}
+}
+
+static void reset(struct exceptions_cleanup *skel, __u32 param)
+{
+	skel->bss->acquired_cnt = 0;
+	skel->bss->released_cnt = 0;
+	memset(skel->bss->acquired, 0, sizeof(skel->bss->acquired));
+	memset(skel->bss->released, 0, sizeof(skel->bss->released));
+	memset(skel->bss->released_section, 0, sizeof(skel->bss->released_section));
+	skel->bss->param = param;
+	skel->bss->test_pid = getpid();
+	skel->bss->vma_addr = (__u64)(long)&vma_target;
+}
+
+/* Run @prog once and check what it returned and what was released against @e. */
 static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog,
-		     struct bpf_program *hook, int acquired, int released, int sections,
-		     bool ordered, int retval)
+		     const struct expect *e)
 {
 	LIBBPF_OPTS(bpf_test_run_opts, ropts,
 		.data_in = &pkt_v4,
@@ -24,15 +83,9 @@ static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog,
 		.repeat = 1,
 	);
 	struct bpf_link *link = NULL, *hook_link = NULL;
-	int ret, i;
+	int ret;
 
-	skel->bss->acquired_cnt = 0;
-	skel->bss->released_cnt = 0;
-	skel->bss->sections_cnt = 0;
-	memset(skel->bss->acquired, 0, sizeof(skel->bss->acquired));
-	memset(skel->bss->released, 0, sizeof(skel->bss->released));
-	skel->bss->vma_addr = (__u64)(long)&vma_target;
-
+	reset(skel, e->param);
 	/*
 	 * A tracing program runs on its hook and a syscall program on nothing:
 	 * no input. The hook of a tracing program fires for every test run of a
@@ -48,8 +101,8 @@ static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog,
 		if (!ASSERT_OK_PTR(link, "attach"))
 			return;
 	}
-	if (hook) {
-		hook_link = bpf_program__attach(hook);
+	if (e->hook) {
+		hook_link = bpf_program__attach(e->hook);
 		if (!ASSERT_OK_PTR(hook_link, "attach hook")) {
 			bpf_link__destroy(link);
 			return;
@@ -63,16 +116,8 @@ static void run_prog(struct exceptions_cleanup *skel, struct bpf_program *prog,
 	bpf_link__destroy(link);
 	if (!ASSERT_OK(ret, "test_run"))
 		return;
-	ASSERT_EQ(ropts.retval, retval, "retval");
-	ASSERT_EQ(skel->bss->acquired_cnt, acquired, "acquired");
-	ASSERT_EQ(skel->bss->released_cnt, released, "released");
-	ASSERT_EQ(skel->bss->sections_cnt, sections, "sections");
-	for (i = 0; i < released; i++) {
-		ASSERT_NEQ(skel->bss->released[i], 0, "released ptr");
-		if (ordered)
-			ASSERT_EQ(skel->bss->released[i], skel->bss->acquired[acquired - 1 - i],
-				  "release order");
-	}
+	ASSERT_EQ(ropts.retval, e->retval, "retval");
+	check_releases(skel, e);
 }
 
 /* The timer callback runs once the program returned: wait for its cancellation. */
@@ -85,8 +130,7 @@ static void run_timer(struct exceptions_cleanup *skel)
 	);
 	int i;
 
-	skel->bss->acquired_cnt = 0;
-	skel->bss->released_cnt = 0;
+	reset(skel, 0);
 	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.cancel_may_goto_timer),
 					      &ropts), "test_run"))
 		return;
@@ -122,82 +166,105 @@ static void run_suite(const char *prefix)
 		goto out;
 	skel->bss->server_port = get_socket_local_port(server);
 
-#define RUN_HOOK(pname, hook, n, released, sections, ordered, retval) do {	\
-	snprintf(name, sizeof(name), "%s%s", prefix, #pname);			\
+/* Run program @pname as subtest @sname, expecting @ret, @n acquisitions and the releases @rel. */
+#define RUN_AS(pname, sname, ret, n, rel, ...) do {				\
+	struct expect e = { .retval = ret, .acquired = n, .released = rel, ##__VA_ARGS__ }; \
+										\
+	snprintf(name, sizeof(name), "%s%s", prefix, sname);			\
 	if (test__start_subtest(name))						\
-		run_prog(skel, skel->progs.pname, hook, n, released, sections, ordered, \
-			 retval);						\
+		run_prog(skel, skel->progs.pname, &e);				\
 } while (0)
-#define RUN(pname, n, released, sections, ordered, retval) \
-	RUN_HOOK(pname, NULL, n, released, sections, ordered, retval)
-#define THROW(name, n) RUN(name, n, n, 0, false, 0xeB9F)
-	THROW(throw_obj_reg, 1);
-	THROW(throw_obj_two, 2);
-	THROW(throw_ringbuf, 1);
-	THROW(throw_task, 1);
-	THROW(throw_sock_cast, 1);
-	THROW(throw_iter, 1);
-	THROW(throw_obj_maybe, 1);
-	THROW(throw_obj_caller, 1);
-	THROW(throw_obj_callx_caller, 1);
-	THROW(throw_obj_unconditional, 1);
-	THROW(throw_obj_dead_caller, 1);
-	THROW(throw_obj_subprog, 1);
-	THROW(throw_obj_global_caller, 1);
-	THROW(throw_slot, 1);
-	RUN(throw_spin_lock, 2, 2, 0, true, 0xeB9F);
-	RUN(throw_rcu, 1, 1, 1, true, 0xeB9F);
-	RUN(throw_irq, 1, 1, 1, true, 0xeB9F);
-	/* A cancelled tc program returns TC_ACT_SHOT. */
-#define CANCEL(name, n, sections) RUN(name, n, n, sections, true, 2)
-	CANCEL(cancel_may_goto_obj, 1, 0);
-	CANCEL(cancel_may_goto_caller, 1, 0);
-	CANCEL(cancel_may_goto_slot, 1, 0);
-	CANCEL(cancel_may_goto_rcu, 1, 1);
-	CANCEL(cancel_may_goto_rcu_shared, 1, 1);
-	CANCEL(cancel_may_goto_preempt, 0, 3);
-	CANCEL(cancel_may_goto_spin_lock, 2, 0);
-	CANCEL(cancel_may_goto_obj_lock, 2, 0);
-	CANCEL(cancel_may_goto_lock_caller, 2, 0);
-	CANCEL(cancel_may_goto_res_lock, 1, 0);
-	CANCEL(cancel_may_goto_res_lock_irq, 2, 0);
-	CANCEL(cancel_may_goto_irq, 1, 0);
-	CANCEL(cancel_may_goto_irq_shared, 2, 0);
-	CANCEL(cancel_may_goto_nested, 4, 1);
-	CANCEL(cancel_may_goto_global, 1, 0);
-	CANCEL(cancel_may_goto_global_chain, 1, 0);
+#define RUN(pname, ret, n, rel, ...) RUN_AS(pname, #pname, ret, n, rel, ##__VA_ARGS__)
+#define THROW(pname, n, rel, ...) RUN(pname, THROWN, n, rel, ##__VA_ARGS__)
+/* A cancelled tc program returns TC_ACT_SHOT. */
+#define CANCEL(pname, n, rel, ...) RUN(pname, CANCELLED, n, rel, ##__VA_ARGS__)
+	THROW(throw_obj_reg, 1, "0");
+	THROW(throw_obj_two, 2, "??");
+	THROW(throw_ringbuf, 1, "0");
+	THROW(throw_task, 1, "0");
+	THROW(throw_sock_cast, 1, "0");
+	THROW(throw_iter, 1, "0");
+	THROW(throw_obj_maybe, 1, "0");
+	THROW(throw_obj_caller, 1, "0");
+	THROW(throw_obj_callx_caller, 1, "0");
+	THROW(throw_obj_unconditional, 1, "0");
+	THROW(throw_obj_dead_caller, 1, "0");
+	THROW(throw_obj_subprog, 1, "0");
+	THROW(throw_obj_global_caller, 1, "0");
+	/* Locks and IRQ flags go first, sections next, objects last. */
+	THROW(throw_spin_lock, 2, "10");
+	THROW(throw_rcu, 1, "s0");
+	THROW(throw_irq, 1, "0s");
+	THROW(throw_obj_after_caller_lock, 2, "01");
+	THROW(throw_sleeping_dtor_after_section, 1, "s0");
+	/* Mirrors: references no location of the frame holds on every path. */
+	THROW(throw_mirror_conflict, 1, "0");
+	THROW(throw_mirror_dead, 1, "0");
+	THROW(throw_mirror_lock_two_locations, 2, "01");
+	RUN_AS(throw_mirror_shared_release, "throw_mirror_shared_release_first", THROWN, 2, "1",
+	       .param = 0);
+	RUN_AS(throw_mirror_shared_release, "throw_mirror_shared_release_second", THROWN, 2, "0",
+	       .param = 1);
+	RUN_AS(throw_refcount_shared_release, "throw_refcount_shared_release_first", THROWN, 1, "0",
+	       .param = 0);
+	RUN_AS(throw_refcount_shared_release, "throw_refcount_shared_release_second", THROWN, 1, "0",
+	       .param = 1);
+	RUN_AS(throw_mirror_refresh, "throw_mirror_refresh_kept", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_mirror_refresh, "throw_mirror_refresh_discarded", THROWN, 1, "", .param = 1);
+	/* Retractions: what a callee releases of its callers' resources. */
+	THROW(throw_retract_obj, 2, "1");
+	THROW(throw_retract_lock, 2, "0");
+	THROW(throw_retract_iter, 2, "1");
+	THROW(throw_retract_irq, 2, "1");
+	THROW(throw_iter_by_callee, 1, "0");
+	CANCEL(cancel_may_goto_obj, 1, "0");
+	CANCEL(cancel_may_goto_caller, 1, "0");
+	CANCEL(cancel_may_goto_slot, 1, "0");
+	CANCEL(cancel_may_goto_rcu, 1, "s0");
+	CANCEL(cancel_may_goto_rcu_shared, 1, "s0");
+	CANCEL(cancel_may_goto_preempt, 0, "sss");
+	CANCEL(cancel_may_goto_spin_lock, 2, "10");
+	CANCEL(cancel_may_goto_obj_lock, 2, "10");
+	CANCEL(cancel_may_goto_lock_caller, 2, "10");
+	CANCEL(cancel_may_goto_res_lock, 1, "0");
+	CANCEL(cancel_may_goto_res_lock_irq, 2, "10");
+	CANCEL(cancel_may_goto_irq, 1, "0");
+	CANCEL(cancel_may_goto_irq_shared, 2, "10");
+	CANCEL(cancel_may_goto_nested, 4, "321s0");
+	CANCEL(cancel_may_goto_global, 1, "0");
+	CANCEL(cancel_may_goto_global_chain, 1, "0");
 	/* Released locks can be taken again: a leaked resilient lock fails instead of hanging. */
-	CANCEL(cancel_may_goto_res_lock, 1, 0);
-	CANCEL(cancel_may_goto_res_lock_irq, 2, 0);
+	CANCEL(cancel_may_goto_res_lock, 1, "0");
+	CANCEL(cancel_may_goto_res_lock_irq, 2, "10");
 	/* Sites in callbacks: the callback is unwound and the cancellation goes on from the call. */
-	CANCEL(cancel_may_goto_loop, 1, 0);
-	CANCEL(cancel_may_goto_loop_helper, 1, 0);
-	CANCEL(cancel_may_goto_global_callback, 1, 0);
-	CANCEL(cancel_may_goto_shared_subprog, 1, 0);
-	CANCEL(cancel_may_goto_for_each_array, 1, 0);
-	CANCEL(cancel_may_goto_for_each_hash, 1, 0);
-	CANCEL(cancel_may_goto_for_each_helper, 1, 0);
+	CANCEL(cancel_may_goto_loop, 1, "0");
+	CANCEL(cancel_may_goto_loop_helper, 1, "0");
+	CANCEL(cancel_may_goto_global_callback, 1, "0");
+	CANCEL(cancel_may_goto_shared_subprog, 1, "0");
+	CANCEL(cancel_may_goto_for_each_array, 1, "0");
+	CANCEL(cancel_may_goto_for_each_hash, 1, "0");
+	CANCEL(cancel_may_goto_for_each_helper, 1, "0");
 	/* The kfunc drops the node it was adding before the unwinder releases the lock. */
-	RUN_HOOK(cancel_may_goto_rbtree_less, skel->progs.drop_hook, 2, 2, 0, false, 2);
-	CANCEL(cancel_may_goto_exception_cb, 1, 0);
+	CANCEL(cancel_may_goto_rbtree_less, 2, "01", .hook = skel->progs.drop_hook);
+	CANCEL(cancel_may_goto_exception_cb, 1, "0");
 	/* A cancelled syscall or tracing program returns 0. */
-	RUN(cancel_may_goto_find_vma, 1, 1, 0, true, 0);
-	RUN(cancel_may_goto_priv_stack, 1, 1, 0, true, 0);
+	RUN(cancel_may_goto_find_vma, 0, 1, "0");
+	RUN(cancel_may_goto_priv_stack, 0, 1, "0");
 	snprintf(name, sizeof(name), "%scancel_may_goto_timer", prefix);
 	if (test__start_subtest(name))
 		run_timer(skel);
 	/* An arena page fault cancels the program as a may_goto timeout does. */
-	CANCEL(cancel_arena_read, 1, 0);
-	CANCEL(cancel_arena_write, 1, 0);
-	CANCEL(cancel_arena_caller, 1, 0);
-	CANCEL(cancel_arena_global, 1, 0);
-	CANCEL(cancel_arena_fetch_r0, 1, 0);
-	CANCEL(cancel_arena_loop, 1, 0);
-	CANCEL(cancel_arena_loop_helper, 1, 0);
+	CANCEL(cancel_arena_read, 1, "0");
+	CANCEL(cancel_arena_write, 1, "0");
+	CANCEL(cancel_arena_caller, 1, "0");
+	CANCEL(cancel_arena_global, 1, "0");
+	CANCEL(cancel_arena_fetch_r0, 1, "0");
+	CANCEL(cancel_arena_loop, 1, "0");
+	CANCEL(cancel_arena_loop_helper, 1, "0");
 #undef CANCEL
 #undef THROW
 #undef RUN
-#undef RUN_HOOK
+#undef RUN_AS
 out:
 	if (server >= 0)
 		close(server);

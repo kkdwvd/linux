@@ -314,42 +314,7 @@ int reject_out_of_range_global_throw(struct __sk_buff *skb)
 	return 0;
 }
 
-/* The popped node is this frame's only resource; the lock stays with the caller. */
-static __noinline struct bpf_list_node *pop_and_throw(struct locked_list *l)
-{
-	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
-
-	bpf_throw(0);
-	return n;
-}
-
-/* The unwinder would drop the callee's object under the caller's lock. */
-SEC("?tc")
-__failure __msg("cannot be released under a lock a caller holds")
-int reject_obj_under_caller_lock(struct __sk_buff *ctx)
-{
-	struct bpf_list_node *n;
-	struct locked_list *l;
-	struct lfoo *f;
-	int key = 0;
-
-	l = bpf_map_lookup_elem(&locked_list_map, &key);
-	if (!l)
-		return 1;
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 1;
-	bpf_spin_lock(&l->lock);
-	bpf_list_push_back(&l->head, &f->node);
-	n = pop_and_throw(l);
-	if (n)
-		bpf_list_push_back(&l->head, n);
-	bpf_spin_unlock(&l->lock);
-	return 0;
-}
-
-
-/* The same at a may_goto: the kernel would cancel the program there. */
+/* A may_goto in a callee holding a node popped under its caller's lock. */
 static __noinline struct bpf_list_node *pop_and_spin(struct locked_list *l)
 {
 	struct bpf_list_node *n = bpf_list_pop_front(&l->head);
