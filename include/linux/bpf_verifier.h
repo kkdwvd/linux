@@ -450,6 +450,14 @@ static inline bool bpf_loop_walk_may_give_up(const struct loop_stack_entry *entr
 
 #define LOOP_STACK_SIZE 16
 
+/* References of one origin a frame holds several of at a call, see frame_desc.c. */
+struct bpf_call_held {
+	u32 origin;
+	bool owned;	/* by the frame, see bpf_reference_state::frameno */
+	u16 cnt;
+};
+#define BPF_CALL_HELD 4
+
 /* state of the program:
  * type of all registers and stack info
  */
@@ -532,6 +540,13 @@ struct bpf_func_state {
 	u16 call_obj_spi[MAX_BPF_FUNC_REG_ARGS];
 	/* the net RCU and preemption sections of the frame at that call, see frame_desc.c */
 	s32 call_sections[2];
+	/*
+	 * The origins of which the frame held several references at that call,
+	 * and how many of each: a callee that releases one of them leaves the
+	 * frame holding the origin still, see bpf_frame_desc_record_return().
+	 */
+	struct bpf_call_held call_held[BPF_CALL_HELD];
+	u8 call_held_cnt;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
@@ -890,8 +905,8 @@ struct bpf_insn_aux_data {
 	struct bpf_frame_desc_build *frame_desc;
 	/* the same for a may_goto the verifier adds in front of the insn, see check_loop_guard() */
 	struct bpf_frame_desc_build *guard_desc;
-	/* two references obtained here were held at once, see frame_desc.c */
-	bool ref_held_twice;
+	/* the most references obtained here that a state held at once, see frame_desc.c */
+	u16 ref_held_max;
 	/* what a load of another frame's stack yields, over its visits, per chain, see frame_desc.c */
 	struct bpf_cells ref_load_cells;
 	/* what a call of a subprog returns in R0, over its visits */
@@ -1419,7 +1434,8 @@ struct bpf_mirror {
 	bool ambiguous;	/* the register to store it from differs between paths */
 	u8 kind;	/* what the handle is: a pointer, a stack object or a lock */
 	u8 lock_kind;	/* the resource kind of a lock */
-	s16 off;	/* the slot, once reserved */
+	u16 nr_slots;	/* slots in a row, one per reference held at once, see mirror_resource() */
+	s16 off;	/* the first slot, once reserved; the others follow below it */
 	struct bpf_reg_state reg;	/* what classifies the resource, see mirror_resource() */
 	u32 nr_stores;
 	struct bpf_mirror_store *stores;
@@ -1438,6 +1454,7 @@ struct bpf_call_ref {
 	bool held_before;	/* held at the call on some path */
 	bool held;	/* held after the call on some path */
 	bool absent;	/* not held after the call on some path that held it before */
+	bool partial;	/* one of several held at the call is not held after it, on some path */
 	bool r0_ok;	/* R0 holds it after the call on the paths that hold it, is 0 on the others */
 	s16 r0_off;	/* how far into the object R0 points then */
 	u64 slots_ok;	/* the same for the stack slots of the caller's frame */
