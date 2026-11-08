@@ -460,7 +460,9 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 			return false;
 		if (fa->entry_refs != fb->entry_refs ||
 		    fa->entry_rcu_locks != fb->entry_rcu_locks ||
-		    fa->entry_preempt_locks != fb->entry_preempt_locks)
+		    fa->entry_preempt_locks != fb->entry_preempt_locks ||
+		    fa->rcu_released_below != fb->rcu_released_below ||
+		    fa->preempt_released_below != fb->preempt_released_below)
 			return false;
 		if (!join_loop_stack(fa, fb))
 			return false;
@@ -544,7 +546,7 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	if (a->acquired_refs != b->acquired_refs)
 		return false;
 	for (i = 0; i < a->acquired_refs; i++) {
-		if (a->refs[i].type != b->refs[i].type)
+		if (a->refs[i].type != b->refs[i].type || a->refs[i].frameno != b->refs[i].frameno)
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
