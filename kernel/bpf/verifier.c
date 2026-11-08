@@ -1641,18 +1641,25 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
  * A frame that was entered with more sections than are held now has left one of its
  * callers', and counts that for the unwinder.
  */
-static void release_context_state(struct bpf_verifier_state *state)
+static void release_context_state(struct bpf_verifier_env *env, struct bpf_verifier_state *state)
 {
 	struct bpf_func_state *frame;
 	int fr;
 
 	for (fr = 0; fr <= state->curframe; fr++) {
 		frame = state->frame[fr];
-		if (frame->entry_rcu_locks > state->active_rcu_locks)
+		if (frame->entry_rcu_locks > state->active_rcu_locks) {
 			frame->rcu_released_below += frame->entry_rcu_locks - state->active_rcu_locks;
-		if (frame->entry_preempt_locks > state->active_preempt_locks)
+			/* a callee left it: a counter of the frame could not tell, see frame_desc.c */
+			if (fr < state->curframe)
+				env->subprog_info[frame->subprogno].callee_left_section |= BIT(0);
+		}
+		if (frame->entry_preempt_locks > state->active_preempt_locks) {
 			frame->preempt_released_below += frame->entry_preempt_locks -
 							 state->active_preempt_locks;
+			if (fr < state->curframe)
+				env->subprog_info[frame->subprogno].callee_left_section |= BIT(1);
+		}
 		frame->entry_rcu_locks = min(frame->entry_rcu_locks, state->active_rcu_locks);
 		frame->entry_preempt_locks = min(frame->entry_preempt_locks,
 						 state->active_preempt_locks);
@@ -4137,6 +4144,13 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				 */
 				if (get_reg_width(reg) > size * BITS_PER_BYTE)
 					clear_scalar_id(&state->regs[dst_regno]);
+				/* a reference of a frame below may come in this way, for the descriptors */
+				if (reg_state != state && size == BPF_REG_SIZE) {
+					int err = bpf_frame_desc_record_load(env, dst_regno);
+
+					if (err)
+						return err;
+				}
 			} else {
 				int spill_cnt = 0, zero_cnt = 0;
 
@@ -11388,7 +11402,8 @@ static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int calls
 	/* only increment it after check_reg_arg() finished */
 	state->curframe++;
 
-	return 0;
+	/* what the frame gets in R1-R5 of what the frames below hold, for the descriptors */
+	return bpf_frame_desc_record_entry(env, state);
 
 err_out:
 	free_func_state(callee);
@@ -11846,6 +11861,12 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	callee->entry_refs = entry.acquired_refs;
 	callee->entry_rcu_locks = entry.active_rcu_locks;
 	callee->entry_preempt_locks = entry.active_preempt_locks;
+	/* what the frame gets in R1-R5 of what its callers hold, for the descriptors */
+	err = bpf_frame_desc_record_entry(env, &entry);
+	if (err) {
+		bpf_free_verifier_state(&entry, false);
+		return err;
+	}
 	for (i = BPF_REG_1; i <= BPF_REG_5; i++) {
 		/* what a scalar is linked to stays with the caller, so does the delta to it */
 		if (callee->regs[i].type == SCALAR_VALUE)
@@ -16363,6 +16384,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_disable = is_kfunc_bpf_preempt_disable(&meta);
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
+	/* the descriptors may count the sections of the frame in a hidden slot */
+	if (rcu_lock || rcu_unlock || preempt_disable || preempt_enable) {
+		err = bpf_frame_desc_record_section(env, rcu_lock || rcu_unlock ? 0 : 1,
+						    rcu_lock || preempt_disable ? 1 : -1);
+		if (err)
+			return err;
+	}
 	if (rcu_lock) {
 		env->cur_state->active_rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
@@ -16376,7 +16404,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_rcu_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env, env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
 					env->cur_state->active_rcu_locks);
 		if (!in_rcu_cs(env))
@@ -16394,7 +16422,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_preempt_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env, env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
 					env->cur_state->active_preempt_locks);
 		if (!in_rcu_cs(env))
