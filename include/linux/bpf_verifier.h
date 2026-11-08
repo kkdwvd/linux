@@ -1241,14 +1241,20 @@ struct bpf_frame_desc_loc {
 	u8 nullable;
 	u8 indirect;	/* the location holds a pointer to the resource, not the resource */
 	u16 res;
-	u32 acq;	/* insn that acquired the reference listed here */
+	u32 origin;	/* of the reference first listed here; later ones share the class */
 };
 
 /* A lock, IRQ flags or section entry of a frame, which every path reaching the site places. */
 struct bpf_frame_desc_fixed {
 	struct bpf_frame_desc_entry ent;
-	u32 acq;	/* insn that took the lock or saved the flags; ~0 for sections */
+	u32 origin;	/* of the lock or the flags; ~0 for sections */
 	bool seen;	/* placed by the current path, see place_fixed() */
+};
+
+/* A reference a frame lists at a site, see build_add_listing() in frame_desc.c. */
+struct bpf_frame_desc_listing {
+	u32 origin;
+	s16 loc;	/* the location of the lattice, a fixed entry, or none when mirrored */
 };
 
 /* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
@@ -1259,8 +1265,61 @@ struct bpf_frame_desc_build {
 	bool regs_saved;	/* the entry saves R0-R9 of this frame; otherwise it waits in a call */
 	u16 nr_fixed;
 	struct bpf_frame_desc_fixed *fixed;	/* locks, IRQ flags and sections, equal on every path */
+	u16 nr_listed;
+	struct bpf_frame_desc_listing *listed;	/* the references the frame lists at the site */
+	u16 nr_extra;
+	struct bpf_frame_desc_entry *extra;	/* the mirror entries, laid out once reserved */
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
 	struct bpf_frame_desc_loc slots[];
+};
+
+/* Where the owner subprog writes a mirror, see bpf_frame_desc_record_acquire(). */
+enum bpf_mirror_point {
+	MIRROR_BEFORE,		/* the register, in front of the insn */
+	MIRROR_CLEAR,		/* zero, in front of the insn: a release */
+	MIRROR_AFTER,		/* the register, after the insn */
+	MIRROR_AFTER_SLOT,	/* a stack slot of the frame, after the insn */
+	MIRROR_CLEAR_AFTER,	/* zero, after the insn: a callee released it */
+};
+
+struct bpf_mirror_store {
+	u32 insn;	/* orig insn */
+	u8 point;	/* enum bpf_mirror_point */
+	u8 reg;
+	s16 off;	/* MIRROR_AFTER_SLOT */
+};
+
+/*
+ * The hidden stack slot of a reference, a lock or saved IRQ flags where no
+ * location of its owner frame describes it on every path, keyed by the owner
+ * subprog and the origin of the reference. See frame_desc.c.
+ */
+struct bpf_mirror {
+	u32 origin;
+	u16 subprog;
+	u16 res;
+	bool needed;
+	u8 kind;	/* what the handle is: a pointer, a stack object or a lock */
+	u8 lock_kind;	/* the resource kind of a lock */
+	s16 off;	/* the slot, once reserved */
+	struct bpf_reg_state reg;	/* what classifies the resource, see mirror_resource() */
+	u32 nr_stores;
+	struct bpf_mirror_store *stores;
+};
+
+/*
+ * What a call did to a reference its caller held, per (call insn, origin),
+ * see bpf_frame_desc_record_return().
+ */
+struct bpf_call_ref {
+	u32 call;	/* orig insn */
+	u32 origin;
+	u16 subprog;	/* the caller's */
+	bool held_before;	/* held at the call on some path */
+	bool held;	/* held after the call on some path */
+	bool absent;	/* not held after the call on some path that held it before */
+	bool r0_ok;	/* R0 holds it after the call on the paths that hold it, is 0 on the others */
+	u64 slots_ok;	/* the same for the stack slots of the caller's frame */
 };
 
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
@@ -1304,6 +1363,12 @@ struct bpf_verifier_env {
 	u32 frame_desc_bytes;			/* tables, descriptors and resource classes */
 	u32 frame_desc_conflicts;		/* merges in which the paths disagreed on a location */
 	void *frame_desc_scratch;
+	struct bpf_mirror *mirrors;		/* see frame_desc.c */
+	u32 mirror_cnt;
+	u32 mirrors_needed;
+	u32 mirror_insns;			/* instructions keeping the mirrors up to date */
+	struct bpf_call_ref *call_refs;
+	u32 call_ref_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2244,6 +2309,13 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
 int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot);
+int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int regno, bool after);
+int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx);
+int bpf_frame_desc_record_call(struct bpf_verifier_env *env);
+int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				 int call_idx);
+int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
+int bpf_frame_desc_emit(struct bpf_verifier_env *env);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);
