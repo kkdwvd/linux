@@ -1022,6 +1022,8 @@ struct bpf_subprog_info {
 	 */
 	u32 exit_idx;
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
+	/* throw sites of this subprogram, moved to the JITed function's aux by jit_subprogs() */
+	struct bpf_frame_desc_table *frame_desc_table;
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1280,6 +1282,8 @@ struct bpf_verifier_env {
 	/* What a pointer that was read from a table of functions may point to. */
 	struct bpf_func_set **func_sets;
 	u32 func_set_cnt;
+	/* frame descriptors of the throw sites, handed to prog->aux once verification succeeds */
+	struct bpf_frame_desc_pool *frame_desc_pool;
 	bool has_callx;
 	/*
 	 * Call graph edges created by callx instructions. A bitmap of
