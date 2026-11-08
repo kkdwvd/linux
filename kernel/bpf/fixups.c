@@ -3033,6 +3033,16 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			cnt = may_goto_expand_timed(insn_buf, insn->off, may_goto_off(env, insn, i),
 						    tmg, reg, save_off);
 
+			/*
+			 * The unwinder sees a cancelled may_goto through its slow path
+			 * call, which the store of the count follows, and the reload of
+			 * the saved R0, which is in its slot while the call runs.
+			 */
+			ret = bpf_frame_desc_move_site(env, i, cnt - (save_off ? 3 : 2));
+			if (!ret && save_off)
+				ret = bpf_frame_desc_spilled_reg(env, i, BPF_REG_0, save_off);
+			if (ret)
+				return ret;
 			insn = bpf_patch_list_add(env, i, insn_buf, cnt);
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
