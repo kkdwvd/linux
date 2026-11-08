@@ -3954,6 +3954,16 @@ void * __weak bpf_arch_throw_entry(void)
 	return NULL;
 }
 
+/*
+ * The entry a fault at an arena access of JITed code is redirected to, which
+ * captures the BPF register file of the access, or NULL when the architecture
+ * resumes the program after such a fault.
+ */
+void * __weak bpf_arch_throw_fault_entry(void)
+{
+	return NULL;
+}
+
 bool __weak bpf_jit_supports_timed_may_goto(void)
 {
 	return false;
@@ -3995,7 +4005,7 @@ bool bpf_jit_supports_cancellation(void)
 {
 	return BPF_HAS_CB_PADS && bpf_jit_supports_exceptions() &&
 	       bpf_jit_supports_timed_may_goto() && bpf_arch_throw_entry() &&
-	       bpf_arch_cancel_entry();
+	       bpf_arch_throw_fault_entry() && bpf_arch_cancel_entry();
 }
 
 u64 __weak arch_bpf_timed_may_goto(void)
