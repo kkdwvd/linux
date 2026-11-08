@@ -813,6 +813,10 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 	mark_dynptr_stack_regs(env, &bpf_stack_slot(state, spi)->spilled_ptr,
 			       &bpf_stack_slot(state, spi - 1)->spilled_ptr, type, parent_id);
 
+	/* a referenced dynptr is a stack object the unwinder discards at its address */
+	if (dynptr->type == BPF_DYNPTR_TYPE_INVALID && dynptr_type_referenced(type))
+		return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+						     reg - cur_regs(env), false);
 	return 0;
 }
 
@@ -1077,7 +1081,9 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 		mark_stack_slot_scratched(env, spi - i);
 	}
 
-	return 0;
+	/* a stack object the unwinder destroys at its address, which the call takes */
+	return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+					     reg - cur_regs(env), false);
 }
 
 static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
@@ -1203,7 +1209,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 		slot->slot_type[i] = STACK_IRQ_FLAG;
 
 	mark_stack_slot_scratched(env, spi);
-	return 0;
+	/* a stack object the unwinder restores at its address, which the call takes */
+	return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+					     reg - cur_regs(env), false);
 }
 
 static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
@@ -1685,6 +1693,10 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
+			int err = bpf_frame_desc_record_release(env, i);
+
+			if (err)
+				return err;
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
@@ -1715,6 +1727,10 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_IRQ)
 			continue;
 		if (state->refs[i].id == id) {
+			int err = bpf_frame_desc_record_release(env, i);
+
+			if (err)
+				return err;
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
 			bpf_diag_record_context(env, env->insn_idx, BPF_DIAG_CONTEXT_IRQ,
@@ -1748,6 +1764,7 @@ static void free_func_state(struct bpf_func_state *state)
 {
 	if (!state)
 		return;
+	kfree(state->released);
 	kfree(state->loop_stack);
 	kfree(state->stack_arg_regs);
 	kfree(state->stack);
@@ -1781,6 +1798,11 @@ static int copy_func_state(struct bpf_func_state *dst,
 				     sizeof(*src->loop_stack), GFP_KERNEL_ACCOUNT);
 	if (!dst->loop_stack)
 		return -ENOMEM;
+	dst->released = copy_array(dst->released, src->released, src->nr_released,
+				   sizeof(*src->released), GFP_KERNEL_ACCOUNT);
+	if (!dst->released)
+		return -ENOMEM;
+	dst->nr_released = src->nr_released;
 	return copy_stack_state(dst, src);
 }
 
@@ -8477,6 +8499,11 @@ static int process_spin_lock(struct bpf_verifier_env *env, struct bpf_reg_state 
 			verbose(env, "Failed to acquire lock state\n");
 			return err;
 		}
+		/* the unwinder releases the lock at the address the call takes */
+		err = bpf_frame_desc_record_acquire(env, cur->acquired_refs - 1,
+						    reg - cur_regs(env), false);
+		if (err)
+			return err;
 	} else {
 		void *ptr;
 		int type;
@@ -11115,9 +11142,18 @@ static int __release_reference_nomark(struct bpf_verifier_state *state, int id)
 
 static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
-	int err;
+	struct bpf_verifier_state *state = env->cur_state;
+	int i, err;
 
-	err = __release_reference_nomark(env->cur_state, id);
+	for (i = 0; i < state->acquired_refs; i++) {
+		if (state->refs[i].type != REF_TYPE_PTR || state->refs[i].id != id)
+			continue;
+		err = bpf_frame_desc_record_release(env, i);
+		if (err)
+			return err;
+		break;
+	}
+	err = __release_reference_nomark(state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
 	return err;
@@ -12821,10 +12857,13 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	account_processed_insns(env, callee, caller);
 	/* clear everything in the callee. In case of exceptional exits using
 	 * bpf_throw, this will be done by do_check_block() for extra frames. */
-	free_func_state(callee);
 	state->frame[state->curframe--] = NULL;
 	invalidate_outgoing_stack_args(env, caller);
-	return 0;
+	/* what the callee did to what the caller holds, for the caller's mirrors */
+	err = callee->in_callback_fn ? 0 :
+	      bpf_frame_desc_record_return(env, state, callee->callsite, callee);
+	free_func_state(callee);
+	return err;
 }
 
 static int do_refine_retval_range(struct bpf_verifier_env *env,
@@ -13648,6 +13687,11 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		/* the unwinder releases the pointer the call returns */
+		err = bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+						    BPF_REG_0, true);
+		if (err)
+			return err;
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -16613,6 +16657,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			/* the unwinder releases the pointer the call returns */
+			err = bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+							    BPF_REG_0, true);
+			if (err)
+				return err;
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -25745,6 +25794,20 @@ skip_full_check:
 	if (ret == 0)
 		ret = bpf_remove_fastcall_spills_fills(env);
 
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
+	/*
+	 * Every frame is described and the stack is final: reserve the mirrors
+	 * the sites need and emit the stores that keep them up to date, with the
+	 * insns still those the main pass recorded.
+	 */
+	if (ret == 0)
+		ret = bpf_frame_desc_resolve(env);
+	if (ret == 0)
+		ret = bpf_frame_desc_emit(env);
+
+	/* Account for the mirrors reserved by frame descriptor resolution. */
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
