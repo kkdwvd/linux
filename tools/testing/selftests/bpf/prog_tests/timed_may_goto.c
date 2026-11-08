@@ -8,6 +8,8 @@
 #include "timed_may_goto_ext.skel.h"
 
 #define TRIES 4
+/* What a cancelled tc prog returns: TC_ACT_SHOT */
+#define CANCELLED 2
 
 static int run_tc(struct bpf_program *prog)
 {
@@ -52,8 +54,14 @@ static void test_async(struct timed_may_goto_user *skel)
 
 static void test_timer_on_top(struct timed_may_goto_user *skel)
 {
-	int ms = run_syscall(skel->progs.spin_under_timer);
-	int ticks = skel->bss->ticks;
+	struct timespec t0, t1;
+	int ms, ticks;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	ASSERT_EQ(run_syscall(skel->progs.spin_under_timer), 0, "cancelled");
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	ticks = skel->bss->ticks;
 
 	/* stop the timer */
 	skel->bss->ticks = 100;
@@ -68,7 +76,7 @@ static void test_freplace(struct timed_may_goto_user *skel)
 {
 	struct timed_may_goto_ext *ext;
 
-	ASSERT_EQ(run_tc(skel->progs.freplace_target), 1, "not replaced");
+	ASSERT_EQ(run_tc(skel->progs.freplace_target), CANCELLED, "not replaced");
 
 	ext = timed_may_goto_ext__open();
 	if (!ASSERT_OK_PTR(ext, "ext_open"))
@@ -79,10 +87,11 @@ static void test_freplace(struct timed_may_goto_user *skel)
 	if (!ASSERT_OK(timed_may_goto_ext__load(ext), "ext_load") ||
 	    !ASSERT_OK(timed_may_goto_ext__attach(ext), "ext_attach"))
 		goto out;
-	ASSERT_EQ(run_tc(skel->progs.freplace_target), TRIES, "replaced");
+	/* each call of the extension prog is cancelled, with the return value of the target's type */
+	ASSERT_EQ(run_tc(skel->progs.freplace_target), TRIES * CANCELLED, "replaced");
 out:
 	timed_may_goto_ext__destroy(ext);
-	ASSERT_EQ(run_tc(skel->progs.freplace_target), 1, "not replaced");
+	ASSERT_EQ(run_tc(skel->progs.freplace_target), CANCELLED, "not replaced");
 }
 
 /* What a prog leaves behind when its time is up doesn't matter for the next one on the cpu. */
@@ -94,17 +103,19 @@ static void test_tail_call_and_throw(struct timed_may_goto_user *skel)
 	if (!ASSERT_OK(bpf_map_update_elem(map_fd, &key, &fd, 0), "update"))
 		return;
 
-	ASSERT_EQ(run_tc(skel->progs.normal_prog), 1, "normal_prog");
-	ASSERT_EQ(run_tc(skel->progs.normal_prog), 1, "normal_prog");
+	ASSERT_EQ(run_tc(skel->progs.normal_prog), CANCELLED, "normal_prog");
+	ASSERT_EQ(run_tc(skel->progs.normal_prog), CANCELLED, "normal_prog");
 
-	ASSERT_EQ(run_tc(skel->progs.tail_call_in_subprog), 1, "tail_call_in_subprog");
-	ASSERT_EQ(skel->bss->tail_callee_spun, 1, "tail_callee_spun");
+	/* the tail callee is cancelled before it counts, and the prog after it */
+	ASSERT_EQ(run_tc(skel->progs.tail_call_in_subprog), CANCELLED, "tail_call_in_subprog");
+	ASSERT_EQ(skel->bss->tail_callee_spun, 0, "tail_callee_spun");
 
-	ASSERT_EQ(run_tc(skel->progs.tail_call_after_timeout), 0, "tail_call_after_timeout");
-	ASSERT_EQ(skel->bss->tail_callee_spun, 1, "tail_callee_spun");
+	/* cancelled before the tail call: the callee leaves its count alone */
+	ASSERT_EQ(run_tc(skel->progs.tail_call_after_timeout), CANCELLED, "tail_call_after_timeout");
+	ASSERT_EQ(skel->bss->tail_callee_spun, 0, "tail_callee_spun");
 
-	ASSERT_EQ(run_tc(skel->progs.throw_after_timeout), 7, "throw_after_timeout");
-	ASSERT_EQ(run_tc(skel->progs.throw_after_timeout), 7, "throw_after_timeout");
+	ASSERT_EQ(run_tc(skel->progs.throw_after_timeout), CANCELLED, "throw_after_timeout");
+	ASSERT_EQ(run_tc(skel->progs.throw_after_timeout), CANCELLED, "throw_after_timeout");
 }
 
 static void test_user_ringbuf(struct timed_may_goto_user *skel)
@@ -122,8 +133,8 @@ static void test_user_ringbuf(struct timed_may_goto_user *skel)
 			goto out;
 		user_ring_buffer__submit(rb, sample);
 	}
-	/* The helper takes a sample out of the buffer for each call: all calls have to run. */
-	ASSERT_EQ(run_syscall(skel->progs.drain), TRIES * 10 + 1, "drain");
+	/* The first call spins: the prog is cancelled from the callback of the helper. */
+	ASSERT_EQ(run_syscall(skel->progs.drain), 0, "drain");
 out:
 	user_ring_buffer__free(rb);
 }
@@ -138,8 +149,9 @@ static void test_priv_stack(struct timed_may_goto_user *skel)
 	if (!ASSERT_OK_PTR(link, "attach"))
 		return;
 	ASSERT_OK(bpf_prog_test_run_opts(fd, &opts), "test_run");
-	ASSERT_EQ(skel->bss->priv_stack_spun, 1, "priv_stack_spun");
-	ASSERT_EQ(skel->bss->priv_stack_cb_spun, 0, "priv_stack_cb_spun");
+	/* cancelled at the first spin: nothing is stored after it */
+	ASSERT_EQ(skel->bss->priv_stack_spun, -1, "priv_stack_spun");
+	ASSERT_EQ(skel->bss->priv_stack_cb_spun, -1, "priv_stack_cb_spun");
 	bpf_link__destroy(link);
 }
 
