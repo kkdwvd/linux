@@ -7,7 +7,8 @@
  * the site is reached in, and describes the current frame alone, at the
  * instruction. A caller frame waits in a call, which is a site of its own,
  * where the caller is described from its state at the call: that way the
- * unwinder releases each frame from its instruction pointer alone. One
+ * unwinder releases each frame from its instruction pointer alone, and
+ * nothing a callee does to its own frame is the caller's concern. One
  * descriptor is built per (subprog, insn), and the paths that reach the
  * instruction are merged into it.
  *
@@ -223,12 +224,14 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->retract_arrays);
 	kvfree(env->resources);
 	kvfree(env->frame_desc_scratch);
+	kvfree(env->frame_desc_moves);
 	env->mirrors = NULL;
 	env->call_refs = NULL;
 	env->retractions = NULL;
 	env->retract_arrays = NULL;
 	env->resources = NULL;
 	env->frame_desc_scratch = NULL;
+	env->frame_desc_moves = NULL;
 }
 
 /* Intern a resource class; descriptors refer to it by index. */
@@ -948,10 +951,13 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 	return pool->cnt++;
 }
 
-/* Is @insn, after all rewrites, what the unwinder sees a site through: a call. */
+/*
+ * Is @insn, after all rewrites, what the unwinder sees a site through: a call,
+ * direct or through a function pointer.
+ */
 static bool site_insn_ok(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_CALL);
+	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn);
 }
 
 /*
@@ -1636,9 +1642,11 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 
 /*
  * Describe the current frame at a site where the program may be unwound: a
- * bpf_throw() call. The descriptor goes to the aux data of the insn, or to
- * @slot: the site of a may_goto the verifier adds is the insn it goes in
- * front of, and the descriptor is moved onto the may_goto once it is there.
+ * bpf_throw() call, or a call of BPF code, a subprog or a callback, which
+ * the frame waits in while the callee may be unwound. The descriptor goes
+ * to the aux data of the insn, or to @slot: the site of a may_goto the
+ * verifier adds is the insn it goes in front of, and the descriptor is moved
+ * onto the may_goto once it is there.
  */
 static int site(struct bpf_verifier_env *env, bool regs_saved, struct bpf_frame_desc_build **slot)
 {
@@ -2342,6 +2350,93 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 		}
+	}
+	return 0;
+}
+
+/*
+ * Insn @off is being replaced by a patch of the list, and the insn the unwinder
+ * sees the site through is insn @k of the patch, not its last insn, where the
+ * aux data of @off goes: the commit moves the descriptor there, see
+ * bpf_frame_desc_remap_aux().
+ */
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k)
+{
+	struct bpf_frame_desc_move *moves;
+	u32 cnt = env->frame_desc_move_cnt;
+
+	if (!env->insn_aux_data[off].frame_desc)
+		return 0;
+	moves = kvrealloc(env->frame_desc_moves, array_size(cnt + 1, sizeof(*moves)),
+			  GFP_KERNEL_ACCOUNT);
+	if (!moves)
+		return -ENOMEM;
+	moves[cnt] = (struct bpf_frame_desc_move) { .off = off, .k = k };
+	env->frame_desc_moves = moves;
+	env->frame_desc_move_cnt = cnt + 1;
+	return 0;
+}
+
+/*
+ * Apply the moves of bpf_frame_desc_move_site() to the aux data of the new
+ * image, which the commit has put in place: the descriptor of a replaced insn
+ * went to the last insn of its patch with the rest of its aux data.
+ */
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u32 i;
+
+	for (i = 0; i < env->frame_desc_move_cnt; i++) {
+		const struct bpf_frame_desc_move *m = &env->frame_desc_moves[i];
+		u32 first = bpf_patch_image_remap(img, img->new_off, m->off);
+		u32 last = bpf_patch_image_remap(img, img->new_off, m->off + 1) - 1;
+
+		/* not replaced after all, or the site is at the last insn anyway */
+		if (first + m->k >= last)
+			continue;
+		aux[first + m->k].frame_desc = aux[last].frame_desc;
+		aux[last].frame_desc = NULL;
+	}
+	env->frame_desc_move_cnt = 0;
+}
+
+/*
+ * The bpf_loop() call at insn @off is being inlined: its callback is an
+ * ordinary callee now, called from insn @call of the patch, and the frame is
+ * unwound through there instead of stopping at the callback. The loop keeps
+ * R6, R7 and R8 in the stack slots from @r6_off up while it runs, so what the
+ * descriptor listed in those registers is listed in the slots.
+ */
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off)
+{
+	struct bpf_frame_desc_build *b = env->insn_aux_data[off].frame_desc;
+	int r, k, ret;
+
+	if (!b)
+		return 0;
+	ret = bpf_frame_desc_move_site(env, off, call);
+	if (ret)
+		return ret;
+	for (r = BPF_REG_6; r <= BPF_REG_8; r++) {
+		s16 slot_off = r6_off + (r - BPF_REG_6) * BPF_REG_SIZE;
+		u32 spi = -slot_off / BPF_REG_SIZE - 1;
+
+		for (k = 0; k < b->nr_fixed; k++) {
+			struct bpf_frame_desc_entry *ent = &b->fixed[k].ent;
+
+			if (ent->loc != BPF_FRAME_LOC_REG || ent->off != r)
+				continue;
+			ent->loc = BPF_FRAME_LOC_STACK;
+			ent->off = slot_off;
+		}
+		if (b->regs[r].state != LOC_RES)
+			continue;
+		b = build_grow(env, off, &env->insn_aux_data[off].frame_desc, spi + 1);
+		if (!b)
+			return -ENOMEM;
+		b->slots[spi] = b->regs[r];
+		b->regs[r].state = LOC_OTHER;
 	}
 	return 0;
 }

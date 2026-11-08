@@ -7733,6 +7733,18 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type type,
 			     bool allow_trust_mismatch);
 
+/*
+ * A call of BPF code is a site of the calling frame where frames are
+ * described: whatever unwinds inside the callee unwinds through this frame,
+ * which waits in the call with R6-R9 and its stack.
+ */
+static int check_call_site(struct bpf_verifier_env *env)
+{
+	if (!env->describe_frames)
+		return 0;
+	return bpf_frame_desc_site(env, false);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -11798,14 +11810,6 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		return false;
 	if (state->speculative)
 		return false;
-	/*
-	 * A site inside the subprog would have to say which of its frames
-	 * releases what the callers hold, which a subprog on its own cannot
-	 * tell, see frame_desc.c: a call that holds a reference, a lock or
-	 * IRQ flags is verified in the context of its caller.
-	 */
-	if (env->describe_frames && state->acquired_refs)
-		return false;
 	if (sub->releases_inherited &&
 	    (state->acquired_refs || state->active_rcu_locks || state->active_preempt_locks))
 		return false;
@@ -12100,6 +12104,11 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
+	/* The frame waits in the call: what it holds is listed from here. */
+	err = check_call_site(env);
+	if (err)
+		return err;
+
 	if (func_is_on_its_own(env, state, subprog))
 		return call_func_on_its_own(env, subprog, *insn_idx);
 
@@ -12179,6 +12188,11 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				subprog, sub_name);
 			return err;
 		}
+
+		/* The frame waits in the call: what it holds is listed from here. */
+		err = check_call_site(env);
+		if (err)
+			return err;
 
 		if (env->log.level & BPF_LOG_LEVEL)
 			verbose(env, "Func#%d ('%s') is global and assumed valid.\n",
@@ -21428,9 +21442,21 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 					if (err)
 						return err;
 				}
-				return check_kfunc_call(env, insn, &env->insn_idx);
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			} else {
+				err = check_helper_call(env, insn, &env->insn_idx);
 			}
-			return check_helper_call(env, insn, &env->insn_idx);
+			if (err)
+				return err;
+			/*
+			 * A callback the helper or the kfunc ran may be unwound: the
+			 * unwinding goes on from the call, with the effects of the
+			 * call on this frame applied. The revisit of the call after
+			 * the callback unwound is on its way to the pad instead.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && !env->cur_state->unwound)
+				return check_call_site(env);
+			return 0;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);

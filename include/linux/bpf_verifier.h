@@ -1369,6 +1369,12 @@ struct bpf_retract_array {
 	s16 cnt_off;	/* the count of handles written, in bytes */
 };
 
+/* The site at insn 'off' follows insn 'k' of the patch that replaces it, see bpf_frame_desc_move_site(). */
+struct bpf_frame_desc_move {
+	u32 off;
+	u32 k;
+};
+
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
 struct bpf_stack_init {
 	u32 subprog;
@@ -1421,6 +1427,8 @@ struct bpf_verifier_env {
 	struct bpf_retract_array *retract_arrays;
 	u32 retract_array_cnt;
 	u32 retraction_slots;			/* hidden slots of the retraction arrays */
+	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
+	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2367,6 +2375,9 @@ int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifi
 				 int call_idx, const struct bpf_func_state *callee);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit(struct bpf_verifier_env *env);
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off);
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);
