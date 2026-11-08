@@ -11733,6 +11733,14 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		return false;
 	if (state->speculative)
 		return false;
+	/*
+	 * A site inside the subprog would have to say which of its frames
+	 * releases what the callers hold, which a subprog on its own cannot
+	 * tell, see frame_desc.c: a call that holds a reference, a lock or
+	 * IRQ flags is verified in the context of its caller.
+	 */
+	if (env->describe_frames && state->acquired_refs)
+		return false;
 	if (sub->releases_inherited &&
 	    (state->acquired_refs || state->active_rcu_locks || state->active_preempt_locks))
 		return false;
@@ -12967,6 +12975,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	int i;
 
 	if (!exception_exit && cur_func(env)->frameno)
+		return 0;
+	/* The unwinder releases what the frame descriptors of the throw site list. */
+	if (exception_exit && bpf_arch_throw_entry())
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -21328,8 +21339,14 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				if (err)
 					return err;
 			}
-			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (bpf_is_throw_kfunc(insn)) {
+					err = bpf_frame_desc_site(env, true);
+					if (err)
+						return err;
+				}
 				return check_kfunc_call(env, insn, &env->insn_idx);
+			}
 			return check_helper_call(env, insn, &env->insn_idx);
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
@@ -23628,6 +23645,7 @@ static int do_check_all(struct bpf_verifier_env *env)
 		bpf_vlog_reset(&env->log, min(log_pos, env->log.end_pos));
 		for (i = 0; i < env->prog->len; i++)
 			env->insn_aux_data[i].seen = 0;
+		bpf_frame_desc_reset(env);
 		for (i = 1; env->prog->aux->func_info && i < env->subprog_cnt; i++) {
 			sub_aux = subprog_aux(env, i);
 			memset(sub_aux->called, 0, sizeof(sub_aux->called));
@@ -25636,6 +25654,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = bpf_check_cfg(env);
 	if (ret < 0)
 		goto skip_full_check;
+	/* A program that may throw gets frame descriptors, see frame_desc.c. */
+	for (i = 0; i < env->subprog_cnt; i++)
+		env->describe_frames |= env->subprog_info[i].might_throw;
 
 	ret = check_unwind_insns(env);
 	if (ret < 0)
@@ -25793,6 +25814,9 @@ skip_full_check:
 	}
 
 	if (ret == 0)
+		ret = bpf_frame_desc_build_tables(env);
+
+	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
 
 	env->verification_time = ktime_get_ns() - start_time;
@@ -25909,6 +25933,7 @@ err_free_env:
 		kfree(env->func_sets[i]);
 	kfree(env->func_sets);
 	kvfree(env->stack_inits);
+	bpf_frame_desc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

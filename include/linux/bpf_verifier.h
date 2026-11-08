@@ -851,6 +851,10 @@ struct bpf_insn_aux_data {
 		u64 insert_off;
 	};
 	struct btf_struct_meta *kptr_struct_meta;
+	/* frame descriptor of the frame this insn is executed or waited in, see frame_desc.c */
+	struct bpf_frame_desc_build *frame_desc;
+	/* the same for a may_goto the verifier adds in front of the insn, see check_loop_guard() */
+	struct bpf_frame_desc_build *guard_desc;
 	u64 map_key_state; /* constant (32 bit) key tracking for maps */
 	/*
 	 * Per-instruction summary of stack slots in the current frame
@@ -1042,6 +1046,8 @@ struct bpf_subprog_info {
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
 	/* throw sites of this subprogram, moved to the JITed function's aux by jit_subprogs() */
 	struct bpf_frame_desc_table *frame_desc_table;
+	/* frame descriptor of a may_goto at the entry of a recursive subprog, see frame_desc.c */
+	struct bpf_frame_desc_build *entry_guard;
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1229,6 +1235,24 @@ void bpf_patch_image_install(struct bpf_prog *prog, const struct bpf_patch_image
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
+/* What a register or stack slot holds across the paths merged into a descriptor. */
+struct bpf_frame_desc_loc {
+	u8 state;
+	u8 nullable;
+	u16 res;
+	u32 acq;	/* insn that acquired the reference listed here */
+};
+
+/* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
+struct bpf_frame_desc_build {
+	u32 pc;		/* the instruction the frame is at */
+	u32 visits;
+	u16 nr_slots;
+	bool regs_saved;	/* the entry saves R0-R9; otherwise the frame waits in a call */
+	struct bpf_frame_desc_loc regs[BPF_REG_10];
+	struct bpf_frame_desc_loc slots[];
+};
+
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
 struct bpf_stack_init {
 	u32 subprog;
@@ -1263,6 +1287,14 @@ struct bpf_verifier_env {
 	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	struct bpf_stack_init *stack_inits; /* hidden slot initializations, see bpf_stack_slot_init() */
 	u32 stack_init_cnt;
+	struct bpf_resource *resources;	/* resource classes of frame descriptors */
+	u32 resource_cnt;
+	u32 frame_desc_visits;			/* paths merged into frame descriptors */
+	u32 frame_desc_sites;			/* table entries */
+	u32 frame_desc_bytes;			/* tables, descriptors and resource classes */
+	u32 frame_desc_conflicts;		/* merges in which the paths disagreed on a location */
+	void *frame_desc_scratch;
+	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
@@ -2208,6 +2240,16 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
 int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off);
 int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm);
+
+/* Functions in frame_desc.c */
+int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
+int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot);
+int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
+void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
+void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);
+void bpf_frame_desc_build_free(struct bpf_insn_aux_data *aux);
+void bpf_frame_desc_reset(struct bpf_verifier_env *env);
+void bpf_frame_desc_env_free(struct bpf_verifier_env *env);
 int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env);
 int bpf_optimize_bpf_loop(struct bpf_verifier_env *env);
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env);
