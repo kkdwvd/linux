@@ -1445,6 +1445,7 @@ struct bpf_verifier_env {
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	bool cancellable;			/* the kernel cancels this program at its cancellation points */
 	int exception_callback_subprog;
+	int cancel_callback_subprog;	/* returns the cookie from the frame of a cancelled callback */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -2379,6 +2380,9 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
 int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off);
 int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm);
+
+/* A site inside the callback of the helper or kfunc called at @callsite, see frame_desc.c. */
+int bpf_check_callback_site(struct bpf_verifier_env *env, int callsite);
 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);

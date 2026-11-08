@@ -1902,15 +1902,30 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 
 /*
  * Describe the current frame at a site where the program may be unwound: a
- * bpf_throw() call. The descriptor goes to the aux data of the insn, or to
+ * bpf_throw() call, a call of BPF code, or a point at which the kernel may
+ * cancel the program. The descriptor goes to the aux data of the insn, or to
  * @slot: the site of a may_goto the verifier adds is the insn it goes in
  * front of, and the descriptor is moved onto the may_goto once it is there.
+ * A cancellation inside a callback a helper ran unwinds the callback, which
+ * leaves into the pad of the helper: the helper needs one, see
+ * bpf_check_callback_site(); bpf_throw() is refused in callbacks.
  */
 static int site(struct bpf_verifier_env *env, bool regs_saved, struct bpf_frame_desc_build **slot,
 		int callee)
 {
-	if (env->cur_state->speculative)
+	struct bpf_verifier_state *st = env->cur_state;
+	int f, ret;
+
+	if (st->speculative)
 		return 0;
+	for (f = env->cancellable ? st->curframe : 0; f > 0; f--) {
+		if (!st->frame[f]->in_callback_fn)
+			continue;
+		ret = bpf_check_callback_site(env, st->frame[f]->callsite);
+		if (ret)
+			return ret;
+		break;
+	}
 	return site_do(env, regs_saved, slot, callee);
 }
 
