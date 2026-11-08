@@ -24,8 +24,14 @@ static __noinline int cb1(void *map, void *key, void *value, void *ctx)
 	return 0;
 }
 
+/*
+ * Where the frames are described for the unwinder, in a cancellable program,
+ * see kernel/bpf/frame_desc.c, the release in the callback of what the
+ * frames below the helper call hold is refused before the verifier gets to
+ * the second run of the callback, which finds the pointer released.
+ */
 SEC("?tc")
-__failure __msg("R1 type=scalar expected=ptr_, trusted_ptr_, rcu_ptr_")
+__failure __msg("{{R1 type=scalar expected=ptr_, trusted_ptr_, rcu_ptr_|a callback may not release what the frames below the helper call hold}}")
 int underflow_prog(void *ctx)
 {
 	struct prog_test_ref_kfunc *p;

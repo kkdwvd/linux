@@ -1605,7 +1605,9 @@ struct bpf_verifier_env {
 	unsigned long *frame_desc_reach;	/* the subprogs each subprog reaches through calls, see frame_desc.c */
 	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
 	u32 frame_desc_move_cnt;
-	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	/* frame descriptors are generated: the program may throw or be cancelled */
+	bool describe_frames;
+	bool cancellable;			/* cancelled by the kernel at its cancellation points */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;

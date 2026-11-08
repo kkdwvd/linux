@@ -13,6 +13,7 @@
 #include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
+#include <linux/pkt_cls.h>
 #include <linux/filter.h>
 #include <net/netlink.h>
 #include <linux/file.h>
@@ -23733,6 +23734,74 @@ again:
 	return 0;
 }
 
+/*
+ * The value the main program returns when the kernel cancels an invocation:
+ * for each program type the outcome that denies, drops or changes nothing.
+ * A program with an exception callback of its own receives it as the cookie
+ * and decides for itself. An extension returns into what called the function
+ * it replaces: the hook that ran the program it extends, or a frame of that
+ * program, which takes any scalar of a global function. It takes the value
+ * of that program, found from that program's own attachment: the extension
+ * attaches to a function of the program's BTF, by an id that names nothing
+ * in the kernel's. A struct_ops program cannot be cancelled, since the
+ * meaning of its return value is the operator's.
+ */
+static bool bpf_prog_cancel_retval(const struct bpf_prog *prog, s32 *retval)
+{
+	struct bpf_retval_range range;
+
+	*retval = 0;
+	if (resolve_prog_type(prog) == BPF_PROG_TYPE_STRUCT_OPS)
+		return false;
+	while (prog->type == BPF_PROG_TYPE_EXT)
+		prog = prog->aux->dst_prog;
+	switch (prog->type) {
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		*retval = TC_ACT_SHOT;
+		return true;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		*retval = BPF_DROP;
+		return true;
+	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		switch (prog->expected_attach_type) {
+		case BPF_CGROUP_UDP4_RECVMSG:
+		case BPF_CGROUP_UDP6_RECVMSG:
+		case BPF_CGROUP_UNIX_RECVMSG:
+		case BPF_CGROUP_INET4_GETPEERNAME:
+		case BPF_CGROUP_INET6_GETPEERNAME:
+		case BPF_CGROUP_UNIX_GETPEERNAME:
+		case BPF_CGROUP_INET4_GETSOCKNAME:
+		case BPF_CGROUP_INET6_GETSOCKNAME:
+		case BPF_CGROUP_UNIX_GETSOCKNAME:
+			/* The only value these hooks accept. */
+			*retval = 1;
+			return true;
+		default:
+			return true;
+		}
+	case BPF_PROG_TYPE_LSM:
+		/*
+		 * A cgroup LSM program denies with 0, and may not change the
+		 * outcome of a void hook, where 1 is the only accepted value;
+		 * the others deny with an errno where the hook returns one, and
+		 * with 0 where it returns a bool.
+		 */
+		if (prog->expected_attach_type == BPF_LSM_CGROUP)
+			*retval = prog->aux->attach_func_proto->type ? 0 : 1;
+		else if (prog->expected_attach_type == BPF_LSM_MAC &&
+			 !bpf_lsm_get_retval_range(prog, &range))
+			*retval = range.minval < 0 ? -EPERM : range.minval;
+		return true;
+	default:
+		return true;
+	}
+}
+
 static int do_check_main(struct bpf_verifier_env *env)
 {
 	int ret;
@@ -25885,6 +25954,18 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	/*
+	 * The entries the unwinder is reached through are only called from JITed
+	 * code, and the slow paths of the timed may_goto and of an arena fault
+	 * find the program to cancel by a return address, among the programs in
+	 * the kernel's symbol table, which a program loaded without CAP_BPF is
+	 * kept out of, see bpf_prog_kallsyms_add(): they fall back to the branch
+	 * and to the fault handler, and the frames need no description.
+	 */
+	env->cancellable = bpf_jit_supports_cancellation() && env->prog->jit_requested &&
+			   bpf_token_capable(env->prog->aux->token, CAP_BPF) &&
+			   bpf_prog_cancel_retval(env->prog, &env->prog->aux->cancel_retval);
+	env->describe_frames |= env->cancellable;
 	ret = do_check_all(env);
 	/* while the calls are what they are in the program */
 	if (env->log.level & BPF_LOG_STATS)
@@ -26024,6 +26105,11 @@ skip_full_check:
 	env->frame_desc_pool = NULL;
 
 	env->prog = __bpf_prog_select_runtime(env, env->prog, &ret);
+	/*
+	 * A JIT that failed leaves the program to the interpreter, which gets to
+	 * no cancellation point and has no tables: the program is not cancellable.
+	 */
+	env->prog->aux->cancellable = env->cancellable && env->prog->jited;
 
 err_release_maps:
 	/*
