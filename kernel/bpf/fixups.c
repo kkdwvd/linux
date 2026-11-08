@@ -1493,6 +1493,9 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 		patch = zext_patch;
 		patch_len = 2;
 apply_patch_buffer:
+		/* The patched insn stays first; the descriptor of a site belongs to it. */
+		if (bpf_frame_desc_move_site(env, i, 0))
+			return -ENOMEM;
 		patch = bpf_patch_list_add(env, i, patch, patch_len);
 		if (IS_ERR(patch))
 			return PTR_ERR(patch);
