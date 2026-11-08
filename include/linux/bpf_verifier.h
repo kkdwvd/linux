@@ -1325,6 +1325,8 @@ struct bpf_frame_desc_listing {
 	 */
 	bool owned;
 	bool dropped;	/* the frame neither owns nor releases it: another frame lists it */
+	u8 passed;	/* at a call: the registers it is passed in, or through the stack */
+	bool unpassed;	/* at a call: held on some visit that passes it nowhere */
 };
 
 /* Frame descriptor under construction for one (subprog, insn), see frame_desc.c. */
@@ -1337,6 +1339,9 @@ struct bpf_frame_desc_build {
 	struct bpf_frame_desc_fixed *fixed;	/* locks, IRQ flags and sections, equal on every path */
 	u16 nr_listed;
 	struct bpf_frame_desc_listing *listed;	/* the references the frame lists at the site */
+	bool is_call;	/* the site is a call of BPF code: of the targets */
+	u16 nr_targets;
+	u16 *targets;
 	u16 nr_extra;
 	struct bpf_frame_desc_entry *extra;	/* the mirror entries, laid out once reserved */
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
@@ -1378,6 +1383,11 @@ struct bpf_arrival {
 	u16 res;	/* the class the reference arrives as: an object, or its lock */
 };
 
+/* A target of a callx lists what another target releases, see claimed() in frame_desc.c. */
+struct bpf_coclaim {
+	u32 origin;
+	u16 subprog;
+};
 
 /* What writes a mirror: the owner's acquisition, or where a holder got the reference. */
 enum bpf_mirror_how {
@@ -1436,6 +1446,18 @@ struct bpf_release_rec {
 };
 
 /*
+ * The current frame wrote stack slots [@spi_lo, @spi_hi] of a frame below,
+ * through a pointer into its stack, while that frame waits in the call at
+ * @call: the descriptor of the frame at the call cannot list what it keeps
+ * there, see slot_writes_resolve() in frame_desc.c.
+ */
+struct bpf_slot_write {
+	u32 call;	/* orig insn */
+	u16 spi_lo;
+	u16 spi_hi;
+};
+
+/*
  * A call that enters or leaves a section, or one of BPF code whose callee
  * changes the sections of the caller by @delta, for the counter of its
  * subprog, see frame_desc.c.
@@ -1447,6 +1469,15 @@ struct bpf_section_insn {
 	s8 delta;
 	bool after;	/* the callee's change, counted after the call */
 	bool conflict;	/* the callee's change differs between paths: the counter cannot follow */
+};
+
+/*
+ * The site at insn 'off' follows insn 'k' of the patch that replaces it, see
+ * bpf_frame_desc_move_site().
+ */
+struct bpf_frame_desc_move {
+	u32 off;
+	u32 k;
 };
 
 /* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
@@ -1500,6 +1531,10 @@ struct bpf_verifier_env {
 	u32 arrival_cnt;
 	struct bpf_release_rec *release_recs;
 	u32 release_rec_cnt;
+	struct bpf_slot_write *slot_writes;
+	u32 slot_write_cnt;
+	struct bpf_coclaim *coclaims;
+	u32 coclaim_cnt;
 	struct bpf_section_insn *section_insns;
 	u32 section_insn_cnt;
 	u32 section_counters;			/* hidden slots counting sections */
@@ -1507,6 +1542,8 @@ struct bpf_verifier_env {
 	u32 *frame_desc_new_of;			/* their indices after the loop guards */
 	u16 *frame_desc_targets;		/* room for the targets of a call */
 	unsigned long *frame_desc_reach;	/* subprog_cnt rows: the subprogs each reaches */
+	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
+	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -2457,6 +2494,7 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 /* Functions in frame_desc.c */
 int bpf_frame_desc_site(struct bpf_verifier_env *env, bool regs_saved);
 int bpf_frame_desc_guard_site(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot);
+int bpf_frame_desc_call_site(struct bpf_verifier_env *env, int callee);
 int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int regno, bool after,
 				  bool may_fail);
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx);
@@ -2466,11 +2504,17 @@ int bpf_frame_desc_record_entry_of(struct bpf_verifier_env *env, struct bpf_veri
 void bpf_frame_desc_record_async_entry(struct bpf_verifier_env *env, int subprog);
 int bpf_frame_desc_record_load(struct bpf_verifier_env *env, int regno);
 int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delta);
+int bpf_frame_desc_record_stack_write(struct bpf_verifier_env *env, const struct bpf_func_state *frame,
+				      int min_off, int max_off);
 int bpf_frame_desc_record_call(struct bpf_verifier_env *env);
 int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 				 int call_idx);
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
 int bpf_frame_desc_emit(struct bpf_verifier_env *env);
+int bpf_frame_desc_move_site(struct bpf_verifier_env *env, u32 off, u32 k);
+int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s16 slot_off);
+int bpf_frame_desc_inlined_loop(struct bpf_verifier_env *env, u32 off, u32 call, s16 r6_off);
+void bpf_frame_desc_remap_aux(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 int bpf_frame_desc_build_tables(struct bpf_verifier_env *env);
 void bpf_frame_desc_remap_tables(struct bpf_verifier_env *env, const struct bpf_patch_image *img);
 void bpf_frame_desc_build_destroy(struct bpf_frame_desc_build *b);

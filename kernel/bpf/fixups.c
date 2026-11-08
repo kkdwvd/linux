@@ -536,6 +536,8 @@ int bpf_patch_list_commit(struct bpf_verifier_env *env)
 
 	patch_list_remap_aux(env, &img, data);
 	data = NULL;
+	/* A site may follow another insn of its patch than the aux data did. */
+	bpf_frame_desc_remap_aux(env, &img);
 	/* the frame descriptor tables key sites by insn, relative to the old subprog starts */
 	bpf_frame_desc_remap_tables(env, &img);
 	patch_list_remap_subprogs(env, &img);
@@ -3779,6 +3781,14 @@ int bpf_optimize_bpf_loop(struct bpf_verifier_env *env)
 			}
 			err = inline_bpf_loop(env, i, loop_off - 2 * BPF_REG_SIZE,
 					      inline_state->callback_subprogno);
+			if (err)
+				return err;
+			/*
+			 * The callback is an ordinary callee now, so the frame is
+			 * unwound through at the inlined call, insn 12 of the patch,
+			 * with R6-R8 in the slots the loop spilled them to.
+			 */
+			err = bpf_frame_desc_inlined_loop(env, i, 12, loop_off - 2 * BPF_REG_SIZE);
 			if (err)
 				return err;
 		}

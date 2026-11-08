@@ -779,6 +779,13 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		bpf_stack_slot(state, spi)->slot_type[i] = STACK_DYNPTR;
 		bpf_stack_slot(state, spi - 1)->slot_type[i] = STACK_DYNPTR;
 	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (state->frameno != env->cur_state->curframe) {
+		err = bpf_frame_desc_record_stack_write(env, state, -(spi + 1) * BPF_REG_SIZE,
+							-(spi - 1) * BPF_REG_SIZE);
+		if (err)
+			return err;
+	}
 
 	type = arg_to_dynptr_type(arg_type);
 	if (type == BPF_DYNPTR_TYPE_INVALID)
@@ -1079,6 +1086,14 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 			slot->slot_type[j] = STACK_ITER;
 
 		mark_stack_slot_scratched(env, spi - i);
+	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (state->frameno != env->cur_state->curframe) {
+		int err = bpf_frame_desc_record_stack_write(env, state, -(spi + 1) * BPF_REG_SIZE,
+							    -(spi - nr_slots + 1) * BPF_REG_SIZE);
+
+		if (err)
+			return err;
 	}
 
 	/* a stack object the unwinder destroys at its address, which the call takes */
@@ -4398,6 +4413,9 @@ static int check_stack_write(struct bpf_verifier_env *env,
 						reg, off, size,
 						value_regno, insn_idx);
 	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (!err && state->frameno != env->cur_state->curframe)
+		err = bpf_frame_desc_record_stack_write(env, state, min_off, max_off);
 	/* After the write is modelled: the insn may store a slice to its own buffer. */
 	invalidate_stack_slices(env, state->frameno, min_off, max_off);
 	return err;
@@ -8065,6 +8083,13 @@ static int check_stack_range_initialized(
 
 		min_off = reg_smin(reg) + off;
 		max_off = reg_smax(reg) + off;
+	}
+
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (clobber && access_size > 0 && state->frameno != env->cur_state->curframe) {
+		err = bpf_frame_desc_record_stack_write(env, state, min_off, max_off + access_size);
+		if (err)
+			return err;
 	}
 
 	/* Unprivileged outputs retain each byte's initialization state. */
@@ -11785,14 +11810,6 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		return false;
 	if (state->speculative)
 		return false;
-	/*
-	 * A site inside the subprog would have to say which of its frames
-	 * releases what the callers hold, which a subprog on its own cannot
-	 * tell, see frame_desc.c: a call that holds a reference, a lock or
-	 * IRQ flags is verified in the context of its caller.
-	 */
-	if (env->describe_frames && state->acquired_refs)
-		return false;
 	if (sub->releases_inherited &&
 	    (state->acquired_refs || state->active_rcu_locks || state->active_preempt_locks))
 		return false;
@@ -12093,8 +12110,8 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
-	/* what the frame holds at the call, for what the return finds released */
-	err = bpf_frame_desc_record_call(env);
+	/* The frame waits in the call: what it holds is listed from here. */
+	err = bpf_frame_desc_call_site(env, subprog);
 	if (err)
 		return err;
 
@@ -12178,8 +12195,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return err;
 		}
 
-		/* what the frame holds at the call, for what the return finds released */
-		err = bpf_frame_desc_record_call(env);
+		/* The frame waits in the call: what it holds is listed from here. */
+		err = bpf_frame_desc_call_site(env, subprog);
 		if (err)
 			return err;
 
@@ -21438,9 +21455,21 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 					if (err)
 						return err;
 				}
-				return check_kfunc_call(env, insn, &env->insn_idx);
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			} else {
+				err = check_helper_call(env, insn, &env->insn_idx);
 			}
-			return check_helper_call(env, insn, &env->insn_idx);
+			if (err)
+				return err;
+			/*
+			 * A callback the helper or the kfunc ran may be unwound: the
+			 * unwinding goes on from the call, with the effects of the
+			 * call on this frame applied. The revisit of the call after
+			 * the callback unwound is on its way to the pad instead.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && !env->cur_state->unwound)
+				return bpf_frame_desc_call_site(env, -1);
+			return 0;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);
