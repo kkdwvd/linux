@@ -1827,6 +1827,7 @@ int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_st
 	dst_state->suspect_loops = src->suspect_loops;
 	dst_state->join_key = src->join_key;
 	dst_state->instance_id = src->instance_id;
+	dst_state->parked = src->parked;
 	dst_state->insn_idx = src->insn_idx;
 	dst_state->last_insn_idx = src->last_insn_idx;
 	for (i = 0; i <= src->curframe; i++) {
@@ -11367,6 +11368,9 @@ static void invalidate_regs_across_park(struct bpf_verifier_env *env)
 		bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_TASK_PARK);
 		mark_reg_invalid(env, reg);
 	}));
+	/* the frames of the callers are looked at when the function returns to them */
+	if (env->cur_state->instance_id)
+		env->cur_state->parked = true;
 }
 
 static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
@@ -11790,6 +11794,9 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 	if (sub->changes_pkt_data || sub->has_tail_call || sub->has_ld_abs ||
 	    sub->is_cb || sub->is_async_cb || sub->is_exception_cb)
 		return false;
+	/* a park looks at every frame, and takes from each what the sleep may free */
+	if (sub->might_park)
+		return false;
 	if (env->path_sensitive)
 		return false;
 	if (sub->releases_inherited &&
@@ -11969,6 +11976,17 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		if (exit->speculative)
 			return -EACCES;
 		env->subprog_info[callee->subprogno].changes_pkt_data = true;
+		return BPF_EXIT_NEEDS_CALLER;
+	}
+	/*
+	 * Likewise for a park behind such an address. It was checked against the frames
+	 * of the function only: which caller is a callback, and what the sleep takes
+	 * from each, is found out in the context of the caller.
+	 */
+	if (exit->parked) {
+		if (exit->speculative)
+			return -EACCES;
+		env->subprog_info[callee->subprogno].might_park = true;
 		return BPF_EXIT_NEEDS_CALLER;
 	}
 

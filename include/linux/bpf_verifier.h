@@ -622,6 +622,14 @@ struct bpf_verifier_state {
 	);
 	/* Not zero in a function that is verified on its own, see bpf_flow_call() */
 	u32 instance_id;
+	/*
+	 * A function that is verified on its own parked the task. Its callers,
+	 * what the sleep takes from them and whether one of them is a callback,
+	 * are not in the state, see bpf_flow_return(). Like instance_id, a part
+	 * of the join_key that is outside of it, see bpf_same_join_key(): the
+	 * join_key has no holes and no room left.
+	 */
+	bool parked;
 
 	/* The insn that the state comes from, -1 if no instructions have been executed yet. */
 	u32 last_insn_idx;
