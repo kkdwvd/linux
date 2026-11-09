@@ -3968,7 +3968,7 @@ static bool call_ref_mirrors(struct bpf_verifier_env *env, const struct bpf_call
 static int mirror_resolve_calls(struct bpf_verifier_env *env, struct bpf_mirror *m)
 {
 	u32 i, j;
-	int ret;
+	int ret, delta;
 
 	for (i = 0; i < env->call_ref_cnt; i++) {
 		struct bpf_call_ref c = env->call_refs[i];
@@ -4004,15 +4004,23 @@ static int mirror_resolve_calls(struct bpf_verifier_env *env, struct bpf_mirror 
 		}
 		if (!c.held_before || !(c.absent || c.partial) || !releases)
 			continue;
+		/*
+		 * The mirror holds the pointer as the frame obtained it, see
+		 * mirror_resource(): a reference that arrived pointing into the
+		 * object keeps that offset, which the class carries, so R0 is taken
+		 * to the same point, and a slot, which holds the pointer to the
+		 * object itself, see frame_slots(), refreshes a mirror without offset.
+		 */
+		delta = env->resources[m->res].delta;
 		if (!c.held) {
 			ret = mirror_store_add(m, c.call, MIRROR_CLEAR_AFTER, 0, 0, 0);
 		} else if (m->nr_slots > 1) {
 			verbose(env, "frame_desc: the call at insn %d may release one of the references obtained at insn %d, which are held several at once\n",
 				c.call, c.origin);
 			return -EINVAL;
-		} else if (c.r0_ok) {
-			ret = mirror_store_add(m, c.call, MIRROR_AFTER, BPF_REG_0, 0, c.r0_off);
-		} else if (c.slots_ok) {
+		} else if (c.r0_ok && c.r0_off - delta == (s16)(c.r0_off - delta)) {
+			ret = mirror_store_add(m, c.call, MIRROR_AFTER, BPF_REG_0, 0, c.r0_off - delta);
+		} else if (c.slots_ok && !delta) {
 			ret = mirror_store_add(m, c.call, MIRROR_AFTER_SLOT, 0,
 					       -(__ffs64(c.slots_ok) + 1) * BPF_REG_SIZE, 0);
 		} else {
