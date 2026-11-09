@@ -1298,6 +1298,14 @@ void bpf_patch_image_install(struct bpf_prog *prog, const struct bpf_patch_image
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
+/* The range of a scalar, unsigned, in 64 and in 32 bits, see guard_cand() in frame_desc.c. */
+struct bpf_guard_hull {
+	u64 min;
+	u64 max;
+	u32 min32;
+	u32 max32;
+};
+
 /* What a register or stack slot holds across the paths merged into a descriptor. */
 struct bpf_frame_desc_loc {
 	u8 state;
@@ -1306,6 +1314,16 @@ struct bpf_frame_desc_loc {
 	u8 owned;	/* the frame owns the reference listed here, see bpf_frame_desc_listing */
 	u16 res;
 	u32 origin;	/* of the reference first listed here; later ones share the class */
+	/*
+	 * A candidate for a guard: a live scalar on every path so far, whose
+	 * range over the paths is kept, see cells_update() in frame_desc.c. A
+	 * location that listed a resource once and was withdrawn lists nothing
+	 * again.
+	 */
+	u8 cand;	/* CAND_* in frame_desc.c */
+	u8 withdrawn;
+	struct bpf_guard_hull hull;
+	struct bpf_frame_desc_guard guard;	/* of a guarded location, once decided, see guards_resolve() */
 };
 
 /* A lock, IRQ flags or section entry of a frame, which every path reaching the site places. */
@@ -1362,6 +1380,9 @@ struct bpf_frame_desc_build {
 	u16 *targets;
 	u16 nr_extra;
 	struct bpf_frame_desc_entry *extra;	/* the mirror entries, laid out once reserved */
+	struct bpf_guard_digest *digests;	/* the guard candidates of the guarded locations */
+	/* a site in a callback found this build of the helper call not visited yet: no guards, see guard_feed() */
+	bool fed_blind;
 	struct bpf_frame_desc_loc regs[BPF_REG_10];
 	struct bpf_frame_desc_loc slots[];
 };
@@ -1472,6 +1493,20 @@ struct bpf_release_rec {
 };
 
 /*
+ * The callback of the helper or kfunc called at @call by a frame of @subprog
+ * under chain @node, or a frame above the callback, may release the reference
+ * of origin @origin that the frame holds, @owned or not: the frame lists it
+ * at the call, guarded, see bpf_frame_desc_record_release().
+ */
+struct bpf_cb_release {
+	u32 origin;
+	u32 call;	/* orig insn */
+	u32 node;
+	u16 subprog;
+	bool owned;
+};
+
+/*
  * A call that enters or leaves a section, or one of BPF code whose callee
  * changes the sections of the caller by @delta, for the counter of its
  * subprog, see frame_desc.c.
@@ -1549,6 +1584,9 @@ struct bpf_verifier_env {
 	u32 arrival_cnt;
 	struct bpf_release_rec *release_recs;
 	u32 release_rec_cnt;
+	struct bpf_cb_release *cb_releases;
+	u32 cb_release_cnt;
+	u32 frame_desc_guards;			/* entries released on a run-time condition, see frame_desc.c */
 	struct bpf_coclaim *coclaims;
 	u32 coclaim_cnt;
 	struct bpf_section_insn *section_insns;

@@ -746,6 +746,15 @@ static const struct bpf_insn may_goto_insn = { .code = 0xe5, .off = 2 };
  * mirror, a hidden slot of the frame, which the acquisition fills and the
  * release clears.
  */
+/*
+ * With guarded entries the record is not mirrored here after all: R7, which
+ * the program keeps to know whether it holds the record, tells the paths
+ * apart, and the entry for R6 is guarded by it. The same goes for
+ * throw_mirror_shared_release and throw_mirror_arrives_two_ways; the mirror
+ * tests that stay are the ones no scalar tells, the record read by nothing,
+ * the lock at two locations, the IRQ flags saved in two orders, the
+ * refcounted object, the refresh after a call and the pad before one.
+ */
 #define MIRROR_PROG(name, site)						\
 SEC("tc")								\
 __naked int name(void)							\
@@ -2718,6 +2727,219 @@ SEC("tc")
 int cancel_recursion_check_holding(struct __sk_buff *ctx)
 {
 	return alloc_and_call_twice(60);
+}
+
+/*
+ * Guards: a callee, or the callback of a helper, releases the object on a
+ * run-time condition, and the caller tests the condition afterwards to find
+ * out. The paths that hold the object and the ones that do not differ in a
+ * scalar of the frame, which the verifier found: the entry for the object is
+ * guarded by it, and the unwinder releases the object only when the scalar
+ * says it is there. Nothing is mirrored.
+ */
+
+/*
+ * Drops the object when told to. The caller knows by the flag it keeps in its
+ * stack, which the callee refines on each of its paths: the pointer makes
+ * the verifier check the callee in the context of its caller, where the
+ * refinement reaches the caller's slot.
+ */
+static __noinline void drop_if(struct foo *f, const __u64 *drop)
+{
+	if (*drop)
+		bpf_obj_drop(f);
+}
+
+/*
+ * The object is held at the throw when the flag is 0 and gone when it is 1,
+ * in the register the caller keeps it in for the drop of its own, and the
+ * flag is live at the throw: the entry for the object is guarded by the
+ * flag.
+ */
+SEC("tc")
+int throw_guard_drop_if(struct __sk_buff *ctx)
+{
+	__u64 flag = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	drop_if(f, &flag);
+	if (flag > 1)
+		return 2;
+	if (!flag && ctx->len > 1000) {
+		bpf_obj_drop(f);
+		return 3;
+	}
+	bpf_throw(0xeB9F);
+	return 0;
+}
+
+/* The same at the may_goto of a loop, after which the caller drops the object itself when it has it. */
+SEC("tc")
+int cancel_guard_drop_if(struct __sk_buff *ctx)
+{
+	__u64 flag = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	drop_if(f, &flag);
+	spin();
+	if (!flag)
+		bpf_obj_drop(f);
+	return 0;
+}
+
+/*
+ * Holds the caller's object across the loop, dropped by the callee when told
+ * to, with a copy of the flag in its own stack, linked to the caller's, and
+ * drops it after the loop when the callee did not.
+ */
+static __noinline __u64 drop_if_and_spin(struct foo *f, const __u64 *drop)
+{
+	__u64 d = *drop;
+
+	drop_if(f, &d);
+	spin();
+	if (!d)
+		bpf_obj_drop(f);
+	return d;
+}
+
+/*
+ * The frame between the owner and the one that drops the object lists it at
+ * the loop, guarded by its copy of the flag; the owner lists it at neither
+ * call, since the callee chain releases it on every path.
+ */
+SEC("tc")
+int cancel_guard_two_levels(struct __sk_buff *ctx)
+{
+	__u64 flag = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	drop_if_and_spin(f, &flag);
+	return 0;
+}
+
+/* What a callback gets from its caller: the object and the flag that says whether it has gone. */
+struct guard_ctx {
+	struct foo *node;
+	struct lfoo *lnode;
+	__u64 done;
+	__u64 drop;	/* the callback drops the object */
+	__u64 spin_in_cb;	/* the callback spins; otherwise the caller spins after the loop */
+};
+
+static int guard_loop_cb(u32 i, struct guard_ctx *c)
+{
+	if (c->drop && !c->done) {
+		bpf_obj_drop(c->node);
+		c->done = 1;
+	}
+	if (c->spin_in_cb)
+		spin();
+	return 0;
+}
+
+/*
+ * The callback drops the caller's object once and says so in a flag in the
+ * caller's stack, the way a callback can release what its caller holds, and
+ * the caller drops the object after the loop when the callback did not. The
+ * caller lists the object at the call of the helper and at the loop after
+ * it, guarded by the flag; the callback lists nothing of it. Cancelled in the
+ * callback or after the loop, before or after the drop, the object is
+ * released exactly once.
+ */
+SEC("tc")
+int cancel_guard_loop_cb(struct __sk_buff *ctx)
+{
+	struct guard_ctx c = { .drop = param & 1, .spin_in_cb = param & 2 };
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	bpf_loop(loops, guard_loop_cb, &c, loop_flags);
+	if (!c.spin_in_cb)
+		spin();
+	if (!c.done)
+		bpf_obj_drop(c.node);
+	return 0;
+}
+
+/* The same with the loop inlined: the callback is an ordinary callee then. */
+SEC("tc")
+int cancel_guard_loop_cb_inlined(struct __sk_buff *ctx)
+{
+	struct guard_ctx c = { .drop = param & 1, .spin_in_cb = param & 2 };
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	bpf_loop(1, guard_loop_cb, &c, 0);
+	if (!c.spin_in_cb)
+		spin();
+	if (!c.done)
+		bpf_obj_drop(c.node);
+	return 0;
+}
+
+/* Pushes the caller's node into the list on the element the test names, once, under the list's lock. */
+static int guard_push_cb(void *map, int *key, __u64 *val, struct guard_ctx *c)
+{
+	struct locked_list *l;
+	int k = 0;
+
+	if (c->drop && !c->done) {
+		l = bpf_map_lookup_elem(&locked_list_map, &k);
+		if (!l)
+			return 1;
+		bpf_spin_lock(&l->lock);
+		bpf_list_push_back(&l->head, &c->lnode->node);
+		bpf_spin_unlock(&l->lock);
+		c->done = 1;
+	}
+	if (c->spin_in_cb)
+		spin();
+	return 0;
+}
+
+/*
+ * The callback of bpf_for_each_map_elem() hands the caller's node to a list,
+ * which releases it, and says so in the flag; the caller drops the node
+ * after the walk when the callback did not.
+ */
+SEC("tc")
+int cancel_guard_for_each_push(struct __sk_buff *ctx)
+{
+	struct guard_ctx c = { .drop = param & 1, .spin_in_cb = param & 2 };
+	struct lfoo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.lnode = f;
+	bpf_for_each_map_elem(&array_map, guard_push_cb, &c, 0);
+	if (!c.spin_in_cb)
+		spin();
+	if (!c.done)
+		bpf_obj_drop(c.lnode);
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";

@@ -1898,6 +1898,13 @@ enum {
  * paths to the site disagree on it.
  */
 #define BPF_FRAME_ENT_COUNTER	BIT(2)
+/*
+ * The entry has a guard, see bpf_frame_desc_guard: the resource is held only
+ * when the test of the guard passes, and the entry is skipped otherwise. The
+ * guards follow the entries of the descriptor, one for each guarded entry in
+ * the order of the entries.
+ */
+#define BPF_FRAME_ENT_GUARDED	BIT(3)
 
 /*
  * One resource of a frame. Entries are laid out in release order: locks and
@@ -1915,11 +1922,44 @@ struct bpf_frame_desc_entry {
 	s16 order;	/* rank in the frame, or one of the generator's negative ranks */
 };
 
+/* The test of a guard, on the value at its location as an unsigned number. */
+enum {
+	BPF_FRAME_GUARD_LT,	/* the resource is held when the value is below val */
+	BPF_FRAME_GUARD_GE,	/* when the value is val or above */
+	BPF_FRAME_GUARD_EQ,	/* when the value is val */
+	BPF_FRAME_GUARD_NE,	/* when the value is not val */
+};
+#define BPF_FRAME_GUARD_32	BIT(7)	/* the test is on the low 32 bits of the value */
+
+/*
+ * A scalar of the frame that says whether the resource of a guarded entry is
+ * held. A program that releases a resource on a run-time condition in a
+ * callee, or in a callback a helper runs, tests a scalar afterwards to find
+ * out, and the verifier found that scalar to separate the paths that hold
+ * the resource at the site from the ones that do not. Its location is read
+ * like an entry's: a register recovered for the frame, or a stack slot of
+ * it.
+ */
+struct bpf_frame_desc_guard {
+	u8 loc;		/* BPF_FRAME_LOC_REG or BPF_FRAME_LOC_STACK */
+	u8 op;		/* BPF_FRAME_GUARD_*, with BPF_FRAME_GUARD_32 or not */
+	s16 off;
+	u32 reserved;
+	u64 val;
+};
+
 struct bpf_frame_desc {
-	u32 size;	/* total size in bytes, including this header */
+	u32 size;	/* total size in bytes, including this header and the guards */
 	u32 nent;	/* number of entries that follow */
+	u32 nguards;	/* guards after the entries, one per guarded entry, in their order */
 	struct bpf_frame_desc_entry ent[];
 };
+
+/* The guards of @d, which follow its entries. */
+static inline const struct bpf_frame_desc_guard *bpf_frame_desc_guards(const struct bpf_frame_desc *d)
+{
+	return (const void *)d + ALIGN(struct_size(d, ent, d->nent), __alignof__(struct bpf_frame_desc_guard));
+}
 
 /*
  * A node of the trie of the chains of calls the frames of a program are
