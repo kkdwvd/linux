@@ -4223,6 +4223,15 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	for (i = 0; i < len; i++)
 		env->frame_desc_new_of[env->insn_aux_data[i].orig_idx] = i;
 
+	/*
+	 * A loop guard the pass described, which bpf_insert_loop_guards() did
+	 * not add after all: not a site, and nothing is mirrored for it.
+	 */
+	for (i = 0; i < len; i++) {
+		bpf_frame_desc_build_destroy(env->insn_aux_data[i].guard_desc);
+		env->insn_aux_data[i].guard_desc = NULL;
+	}
+
 	ret = merge_prefix_builds(env);
 	ret = ret ?: resolve_transfer(env);
 	ret = ret ?: slot_writes_resolve(env);
