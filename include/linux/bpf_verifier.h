@@ -310,9 +310,28 @@ struct bpf_stack_state {
 /*
  * The origin of the reference the kernel holds for __ref argument @argno of a
  * struct_ops program: no insn has it, so it collides with no reference the
- * program obtains, see bpf_frame_desc_record_release().
+ * program obtains, see bpf_frame_desc_record_release(), and the frame
+ * descriptors tell such a reference by it, see bpf_origin_is_ctx_arg(): the
+ * main program holds it for the kernel and lists it, from the context.
  */
+#define BPF_ORIGIN_CTX_ARGS		32
 #define BPF_ORIGIN_CTX_ARG(argno)	(U32_MAX - 1 - (argno))
+#define BPF_ORIGIN_CTX_ARGNO(origin)	(U32_MAX - 1 - (origin))
+
+static inline bool bpf_origin_is_ctx_arg(u32 origin)
+{
+	return origin >= BPF_ORIGIN_CTX_ARG(BPF_ORIGIN_CTX_ARGS - 1) && origin != U32_MAX;
+}
+
+/* Name the origin of a reference in a message, in @buf: the insn, or the argument the kernel holds. */
+static inline const char *bpf_origin_name(u32 origin, char *buf, size_t len)
+{
+	if (bpf_origin_is_ctx_arg(origin))
+		snprintf(buf, len, "the kernel holds in ctx argument %u", BPF_ORIGIN_CTX_ARGNO(origin));
+	else
+		snprintf(buf, len, "obtained at insn %u", origin);
+	return buf;
+}
 
 struct bpf_reference_state {
 	/* Each reference object has a type. Ensure REF_TYPE_PTR is zero to

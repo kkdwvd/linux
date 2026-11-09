@@ -23743,6 +23743,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 	/* Acquire references for struct_ops program arguments tagged with "__ref" */
 	if (!subprog && env->prog->type == BPF_PROG_TYPE_STRUCT_OPS) {
 		for (i = 0; i < aux->ctx_arg_info_size; i++) {
+			if (verifier_bug_if(i >= BPF_ORIGIN_CTX_ARGS, env, "ctx argument %d has no origin", i)) {
+				ret = -EFAULT;
+				goto out;
+			}
 			ret = aux->ctx_arg_info[i].refcounted ? acquire_reference(env, 0, 0) : 0;
 			if (ret < 0)
 				goto out;
