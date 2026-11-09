@@ -875,7 +875,13 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	 * invocation of one of its programs, once the invocation is over.
 	 */
 	if (ctx.pad) {
-		if (!WARN_ON_ONCE(!ctx.slot || *ctx.slot != ctx.site))
+		/*
+		 * The slot may hold the address signed, see bpf_arch_ret_addr(),
+		 * which the walker strips from what it reports; the entry is
+		 * stored raw, since the pad of the helper signs what it leaves
+		 * with, see bpf_unwind_leave().
+		 */
+		if (!WARN_ON_ONCE(!ctx.slot || bpf_arch_ret_addr(ctx.slot) != ctx.site))
 			*ctx.slot = (u64)(long)bpf_arch_cancel_entry();
 		bpf_arch_set_ret_addr(ctx.bp, ctx.pad);
 		cookie = ctx.site;
