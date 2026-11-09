@@ -349,6 +349,13 @@ static void bpf_unwind_entry(struct bpf_throw_ctx *ctx, const struct bpf_prog *p
 	} else {
 		if (!bpf_unwind_handle(ctx, prog, fp, ent, regs, innermost, &handle))
 			goto out;
+		/*
+		 * The location holds the context the kernel called the program
+		 * with, and the handle is an argument in it: a __ref argument of a
+		 * struct_ops program, which the kernel holds a reference for.
+		 */
+		if (res->through)
+			handle = *(void **)(handle + res->load_off);
 		/* The pointer may point into the object, or at the object that holds the lock. */
 		handle -= res->delta;
 	}
