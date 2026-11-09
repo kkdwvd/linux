@@ -26221,9 +26221,13 @@ skip_full_check:
 	/* The program owns the frame descriptors from here on. */
 	env->prog->aux->frame_desc_pool = env->frame_desc_pool;
 	env->frame_desc_pool = NULL;
-	env->prog->aux->cancellable = env->cancellable;
 
 	env->prog = __bpf_prog_select_runtime(env, env->prog, &ret);
+	/*
+	 * A JIT that failed leaves the program to the interpreter, which gets to
+	 * no cancellation point and has no tables: the program is not cancellable.
+	 */
+	env->prog->aux->cancellable = env->cancellable && env->prog->jited;
 
 err_release_maps:
 	/*
