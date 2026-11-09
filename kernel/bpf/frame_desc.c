@@ -3243,6 +3243,11 @@ static int mirror_resource(struct bpf_verifier_env *env, struct bpf_mirror *m)
 			m->at);
 		return -EINVAL;
 	}
+	if (m->unclearable) {
+		verbose(env, "frame_desc: the resource obtained at insn %d is released through no register that holds it, and its mirror cannot be cleared\n",
+			m->at);
+		return -EINVAL;
+	}
 	switch (m->how) {
 	case MIRROR_ENTRY:
 	case MIRROR_LOAD:
@@ -3547,7 +3552,7 @@ static int handle_regno(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		stack_object_find(st, ref, &objframe, &spi);
 	for (k = BPF_REG_1; k <= BPF_REG_5; k++) {
 		if (ref->type & REF_TYPE_LOCK_MASK ? reg_is_lock(&regs[k], ref) :
-		    objframe >= 0 ? reg_points_at(&regs[k], objframe, spi) :
+		    objframe >= 0 ? reg_object_slot(st, &regs[k], ref->id) != NULL :
 		    reg_ref_off(&regs[k], ref->id, adj))
 			return k;
 	}
@@ -3677,12 +3682,21 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 		}
 	}
 	regno = handle_regno(env, st, ref, &adj);
-	if (regno < 0)
-		return 0;
 	mirror_key(env, subprog, ref->origin, node, ref->frameno == st->curframe, &how, &at, &res);
 	m = mirror_get(env, subprog, how, at, res);
 	if (!m)
 		return -ENOMEM;
+	/*
+	 * A release takes the handle in R1-R5, as a call of a release kfunc or
+	 * helper, except for a referenced dynptr the descriptors do not know as
+	 * a stack object, a file dynptr: its mirror cannot be cleared here, and
+	 * stays stale, which rejects the program should a site need it, see
+	 * mirror_resource().
+	 */
+	if (regno < 0) {
+		m->unclearable = true;
+		return 0;
+	}
 	return mirror_store_add(m, env->insn_idx, MIRROR_CLEAR, regno, 0, adj);
 }
 

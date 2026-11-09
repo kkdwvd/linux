@@ -1464,6 +1464,7 @@ struct bpf_mirror {
 	bool needed;
 	bool listed;	/* by a listing that stays after the transfer, see mirror_drop_unlisted() */
 	bool ambiguous;	/* the register to store it from differs between paths */
+	bool unclearable;	/* a release took the handle from no register: not cleared there */
 	u8 kind;	/* what the handle is: a pointer, a stack object or a lock */
 	u8 lock_kind;	/* the resource kind of a lock */
 	u16 nr_slots;	/* slots in a row, one per reference held at once, see mirror_resource() */
