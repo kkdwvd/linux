@@ -74,10 +74,12 @@ void *bpf_arch_cancel_entry(void);
 /*
  * Where a kernel frame the stack walker passed keeps its return address, given
  * the frame pointer the walker reported for it and the stack pointer it
- * reported for the frame above, and the way to make the JITed frame whose
- * frame pointer is @bp return to @to.
+ * reported for the frame above; the return address such a slot holds, as the
+ * walker reports it, less what the architecture adds to it in the slot; and
+ * the way to make the JITed frame whose frame pointer is @bp return to @to.
  */
 u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp);
+u64 bpf_arch_ret_addr(const u64 *slot);
 void bpf_arch_set_ret_addr(u64 bp, u64 to);
 #endif /* __ASSEMBLER__ */
 

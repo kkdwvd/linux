@@ -3985,6 +3985,12 @@ u64 * __weak bpf_arch_ret_slot(u64 bp, u64 next_sp)
 	return NULL;
 }
 
+/* The slot holds the return address as it is, unless the architecture signs it. */
+u64 __weak bpf_arch_ret_addr(const u64 *slot)
+{
+	return *slot;
+}
+
 void __weak bpf_arch_set_ret_addr(u64 bp, u64 to)
 {
 }
