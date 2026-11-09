@@ -7784,6 +7784,7 @@ static int check_cancel_guard(struct bpf_verifier_env *env, struct bpf_frame_des
 {
 	if (!env->cancellable)
 		return 0;
+	env->cancel_visits++;
 	return bpf_frame_desc_guard_site(env, slot);
 }
 
