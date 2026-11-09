@@ -3429,9 +3429,13 @@ static int section_insn_add(struct bpf_verifier_env *env, u32 insn, u16 subprog,
  */
 static void note_held(struct bpf_verifier_env *env, const struct bpf_verifier_state *st, u32 origin)
 {
-	struct bpf_insn_aux_data *aux = &env->insn_aux_data[origin];
+	struct bpf_insn_aux_data *aux;
 	u32 i, n = 0;
 
+	/* a reference the kernel holds was obtained at no insn, see BPF_ORIGIN_CTX_ARG() */
+	if (origin >= env->prog->len)
+		return;
+	aux = &env->insn_aux_data[origin];
 	for (i = 0; i < st->acquired_refs; i++)
 		n += st->refs[i].origin == origin && st->refs[i].frameno == st->curframe;
 	aux->ref_held_max = max_t(u32, aux->ref_held_max, min_t(u32, n, U16_MAX));
