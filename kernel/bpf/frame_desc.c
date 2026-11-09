@@ -1973,6 +1973,12 @@ static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_bu
 	return pool->cnt++;
 }
 
+/* A load the frame may obtain a reference by, see bpf_frame_desc_record_load(): plain or acquire. */
+static bool insn_is_load(const struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_LDX || bpf_atomic_is_load_acq(insn);
+}
+
 /*
  * Is @insn, after all rewrites, what the unwinder sees a site through: a call,
  * direct or through a function pointer, or the probed access of an arena site.
@@ -3325,24 +3331,29 @@ static int record_entry(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (!cells)
 		return -ENOMEM;
 	for (k = 0; k < MAX_BPF_FUNC_REG_ARGS; k++) {
-		const struct bpf_reg_state *reg = &regs[BPF_REG_1 + k];
-
-		n = reg_classes(env, st, reg, res);
+		n = reg_classes(env, st, &regs[BPF_REG_1 + k], res);
 		cell_merge(&cells->cell[k], n, res);
-		if (n <= 0)
-			continue;
-		for (i = 0; i < st->acquired_refs; i++) {
-			const struct bpf_reference_state *ref = &st->refs[i];
+	}
+	/*
+	 * Where each reference of a frame below arrives: the first register
+	 * that carries it, which every entry under the chain has to agree on.
+	 * A reference passed twice, as the object and as a pointer into it,
+	 * arrives in the first register as far as the mirror is concerned.
+	 */
+	for (i = 0; i < st->acquired_refs; i++) {
+		const struct bpf_reference_state *ref = &st->refs[i];
 
-			if (ref->frameno == owner)
-				continue;
-			ret = ref_class_in_reg(env, st, reg, ref);
+		if (ref->frameno == owner)
+			continue;
+		for (k = 0; k < MAX_BPF_FUNC_REG_ARGS; k++) {
+			ret = ref_class_in_reg(env, st, &regs[BPF_REG_1 + k], ref);
 			if (ret < 0)
 				continue;
 			ret = arrival_add(env, subprog, ref->origin, node, ARRIVE_REG, BPF_REG_1 + k,
 					  ret);
 			if (ret)
 				return ret;
+			break;
 		}
 	}
 	return 0;
@@ -5498,6 +5509,13 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	env->frame_desc_targets = kvcalloc(env->subprog_cnt, sizeof(u16), GFP_KERNEL_ACCOUNT);
 	if (!env->frame_desc_new_of || !env->frame_desc_targets)
 		return -ENOMEM;
+	/*
+	 * The insns of a patch all name the insn they replaced, and its aux
+	 * data, the descriptor included, went to the last of them, see
+	 * bpf_patch_insn_data(): the last wins. The budget exit appended to a
+	 * subprog names the subprog's last insn as well, and wins over it,
+	 * which nothing minds: no record keys on the insn of a budget exit.
+	 */
 	for (i = 0; i < len; i++)
 		env->frame_desc_new_of[env->insn_aux_data[i].orig_idx] = i;
 
@@ -5996,7 +6014,7 @@ int bpf_frame_desc_emit(struct bpf_verifier_env *env)
 		na = k - i - ne - nb;
 		/* a call, or the load a mirror is stored after; entry stores go in front of anything */
 		if (verifier_bug_if((nb || na) && !site_insn_ok(&env->prog->insnsi[idx]) &&
-				    (nb || BPF_CLASS(env->prog->insnsi[idx].code) != BPF_LDX), env,
+				    (nb || !insn_is_load(&env->prog->insnsi[idx])), env,
 				    "mirror written at insn %d, not a call", idx)) {
 			ret = -EFAULT;
 			goto out;
