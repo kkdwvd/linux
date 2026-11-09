@@ -1141,6 +1141,7 @@ struct bpf_subprog_info {
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
 	u16 arena_stack_depth; /* size of the frame in the stack in arena */
+	s16 arena_stack_slot; /* where r12 is kept as the stack was taken, see bpf_prog_aux */
 	u32 insns_total;
 	u32 insns_self;
 	/* offsets in range [stack_depth .. fastcall_stack_off)

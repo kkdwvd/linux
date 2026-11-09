@@ -1170,7 +1170,9 @@ void bpf_lower_cast_mov(struct bpf_verifier_env *env)
  *  - the main program takes a stack when it starts and returns it when it exits:
  *    the stack of the cpu when it's free, without a call.
  *    See struct bpf_arena_cpu_stack. So does a callback.
- *    bpf_throw() doesn't return it: the stack stays taken until the arena is freed.
+ *    An unwind never reaches that exit: the function keeps r12 as the stack was
+ *    taken in a slot of its frame, from which the unwinder returns the stack,
+ *    see bpf_throw_unwind().
  *  - a function that has a frame drops it before exit.
  *  - 'rX = r12' gives the address like user space sees it, as other addresses
  *    in arena are.
@@ -1215,6 +1217,10 @@ static struct bpf_insn *emit_arena_stack_percpu(struct bpf_verifier_env *env,
  *
  * r0 and r6-r9 are not initialized when a function starts. Neither are r2-r5 in
  * the main program. A callback has arguments there.
+ *
+ * Then r12 is stored in a slot of the frame, where bpf_throw_unwind() finds it
+ * when the function is unwound and its exit, which returns the stack, is never
+ * reached.
  */
 static int insert_arena_stack_get(struct bpf_verifier_env *env, int s)
 {
@@ -1224,17 +1230,20 @@ static int insert_arena_stack_get(struct bpf_verifier_env *env, int s)
 	int size = s ? BPF_REG_8 : BPF_REG_4;
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
 	struct bpf_insn *buf = env->insn_buf, *patch;
-	int jfree, jdone, jslow, slow, free, done, i, spill = 0;
+	int jfree, jdone, jslow, slow, free, done, i, spill, slot;
 
-	if (s) {
-		spill = round_up(sub->stack_depth, BPF_REG_SIZE);
-		sub->stack_depth = spill + MAX_BPF_FUNC_REG_ARGS * BPF_REG_SIZE;
-		if (sub->stack_depth > env->stack_limit) {
-			verbose(env, "no room in the stack of %s() for its arguments\n",
-				bpf_subprog_name(env, s));
-			return -EACCES;
-		}
+	/* the slots for the arguments of a callback, then the slot for r12 */
+	spill = round_up(sub->stack_depth, BPF_REG_SIZE);
+	sub->stack_depth = spill + (s ? MAX_BPF_FUNC_REG_ARGS + 1 : 1) * BPF_REG_SIZE;
+	if (sub->stack_depth > env->stack_limit) {
+		verbose(env, "no room in the stack of %s() to take a stack in arena\n",
+			bpf_subprog_name(env, s));
+		return -EACCES;
 	}
+	slot = -(int)sub->stack_depth;
+	sub->arena_stack_slot = slot;
+	if (!s)
+		env->prog->aux->arena_stack_slot = slot;
 
 	patch = emit_arena_stack_percpu(env, buf, ptr);
 	*patch++ = BPF_MOV32_IMM(cnt, 1);
@@ -1263,6 +1272,7 @@ static int insert_arena_stack_get(struct bpf_verifier_env *env, int s)
 	jslow = patch++ - buf;
 	*patch++ = BPF_LDX_MEM(BPF_W, BPF_REG_ARENA_SP, ptr, CPU_STACK_OFF(base));
 	done = patch - buf;
+	*patch++ = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_ARENA_SP, slot);
 
 	buf[jfree] = BPF_JMP_IMM(BPF_JEQ, cnt, 0, free - jfree - 1);
 	buf[jdone] = BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, done - jdone - 1);
@@ -1271,7 +1281,7 @@ static int insert_arena_stack_get(struct bpf_verifier_env *env, int s)
 				   slow - jslow - 1);
 
 	/* a jump to the first insn doesn't take the stack again, neither does gotox */
-	return bpf_patch_list_insert(env, sub->start, buf, done);
+	return bpf_patch_list_insert(env, sub->start, buf, patch - buf);
 }
 
 int bpf_insert_arena_stack(struct bpf_verifier_env *env)
@@ -2059,6 +2069,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->arena = prog->aux->arena;
 		func[i]->aux->arena_stack_size = prog->aux->arena_stack_size;
 		func[i]->aux->arena_stack_entry = env->subprog_info[i].arena_stack_entry;
+		func[i]->aux->arena_stack_slot = env->subprog_info[i].arena_stack_slot;
 		func[i]->aux->uses_arena_insns = bpf_prog_has_arena_insns(func[i]);
 		func[i]->aux->used_maps = env->used_maps;
 		func[i]->aux->used_map_cnt = env->used_map_cnt;
