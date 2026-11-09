@@ -2712,6 +2712,21 @@ static bool frame_stack_has_ref(const struct bpf_verifier_state *st, int frameno
 	return false;
 }
 
+/* Is a pointer to the context spilled in the stack of frame @frameno of @st? */
+static bool frame_stack_has_ctx(const struct bpf_verifier_state *st, int frameno)
+{
+	const struct bpf_func_state *frame = st->frame[frameno];
+	int k;
+
+	for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
+		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+		if (bpf_is_spilled_reg(slot) && slot->spilled_ptr.type == PTR_TO_CTX)
+			return true;
+	}
+	return false;
+}
+
 /*
  * What location @l of frame @h of @st holds now, for what the frame lists
  * there in @b, the build of the call the frame waits in: the resource of one
@@ -2860,14 +2875,21 @@ static int site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	u32 stack_frames = 0;
+	bool ctx = false;
 	int k, i, l, ret;
 
-	for (k = BPF_REG_1; k <= BPF_REG_5; k++)
+	for (k = BPF_REG_1; k <= BPF_REG_5; k++) {
 		if (frame->regs[k].type == PTR_TO_STACK)
 			stack_frames |= BIT(frame->regs[k].frameno);
-	for (i = 0; i < frame->out_stack_arg_cnt; i++)
+		ctx |= frame->regs[k].type == PTR_TO_CTX;
+	}
+	for (i = 0; i < frame->out_stack_arg_cnt; i++) {
 		if (frame->stack_arg_regs[i].type == PTR_TO_STACK)
 			stack_frames |= BIT(frame->stack_arg_regs[i].frameno);
+		ctx |= frame->stack_arg_regs[i].type == PTR_TO_CTX;
+	}
+	for (k = 0; k <= st->curframe && !ctx; k++)
+		ctx = (stack_frames & BIT(k)) && frame_stack_has_ctx(st, k);
 	for (l = 0; l < b->nr_listed; l++) {
 		struct bpf_frame_desc_listing *lst = &b->listed[l];
 		bool held = false;
@@ -2888,6 +2910,14 @@ static int site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *
 			for (k = 0; k <= st->curframe; k++)
 				if ((stack_frames & BIT(k)) && frame_stack_has_ref(st, k, ref))
 					passed |= PASSED_STACK;
+			/*
+			 * A reference the kernel holds for a __ref argument of a
+			 * struct_ops program is owned by no frame of the state, and
+			 * reaches a callee that gets the context, which it loads it
+			 * from, see bpf_frame_desc_record_load().
+			 */
+			if (ref->frameno < 0 && ctx && env->prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+				passed |= PASSED_STACK;
 		}
 		if (!held)
 			continue;
