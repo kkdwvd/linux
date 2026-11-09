@@ -4086,6 +4086,17 @@ u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp)
 }
 
 /*
+ * The kernel's C code is built with pac-ret, so the record holds the address
+ * signed with the stack pointer at entry on hardware with pointer
+ * authentication, which the stack walker strips from the addresses it reports,
+ * see kunwind_next().
+ */
+u64 bpf_arch_ret_addr(const u64 *slot)
+{
+	return ptrauth_strip_kernel_insn_pac(*slot);
+}
+
+/*
  * JITed code signs the return address in its frame record with the stack
  * pointer at entry, which is the address above the record, see
  * build_prologue().
