@@ -592,14 +592,14 @@ static bool refsafe(struct bpf_verifier_env *env, struct bpf_verifier_state *old
 		    old->refs[i].frameno != cur->refs[i].frameno)
 			return false;
 		/*
-		 * The frame descriptors key the mirror of a reference or a lock
-		 * by its origin, see frame_desc.c: a state doesn't stand for one
-		 * that obtained its references elsewhere. Not for what the
-		 * callers of a function verified on its own hold: it is theirs to
-		 * release.
+		 * The frame descriptors key the mirror of a reference, a lock or
+		 * saved IRQ flags by its origin, see frame_desc.c: a state doesn't
+		 * stand for one that obtained its references elsewhere. Not for
+		 * what the callers of a function verified on its own hold: it is
+		 * theirs to release.
 		 */
-		if (env->describe_frames && old->refs[i].type != REF_TYPE_IRQ &&
-		    i >= old->frame[0]->entry_refs && old->refs[i].origin != cur->refs[i].origin)
+		if (env->describe_frames && i >= old->frame[0]->entry_refs &&
+		    old->refs[i].origin != cur->refs[i].origin)
 			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
