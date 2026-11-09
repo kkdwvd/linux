@@ -873,10 +873,18 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  * Once the time slice of the invocation is over every call returns at once, and the frames
  * that are there come to an end.
  */
+/* Where the check of subprog @s goes: after the arena stack adjustment and the entry stores. */
+static int check_pos(struct bpf_verifier_env *env, int s)
+{
+	const struct bpf_subprog_info *si = &env->subprog_info[s];
+
+	return si->start + is_arena_sp_adj(&env->prog->insnsi[si->start]) + si->entry_stores;
+}
+
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_insn buf[24], nop = BPF_JMP_A(0), *insn;
+	struct bpf_insn buf[24];
 	bool found = false;
 	int s, n, jmp, err;
 
@@ -890,14 +898,6 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 		if (!si[s].recursive)
 			continue;
 		n = 0;
-		/* The exit drops the frame in the stack in arena. Take it before the check. */
-		if (is_arena_sp_adj(&env->prog->insnsi[si[s].start])) {
-			buf[n++] = env->prog->insnsi[si[s].start];
-			/* one insn for one: done at once, the list copies the nop */
-			insn = bpf_patch_list_add(env, si[s].start, &nop, 1);
-			if (IS_ERR(insn))
-				return PTR_ERR(insn);
-		}
 		jmp = n++;
 		n += emit_stack_check(buf + n, bpf_ret_reg_pair(env, s) ? 4 : 3);
 		/* The arguments are not needed any more */
@@ -907,20 +907,30 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 		if (bpf_ret_reg_pair(env, s))
 			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 		buf[n++] = budget_exit_insn(env, &si[s]);
-		/* calls get to the check, jumps to the first insn do not */
-		err = bpf_patch_list_insert(env, si[s].start, buf, n);
+		/*
+		 * Calls get to the check, jumps to the first insn do not. The exit
+		 * drops the frame in the stack in arena: the check goes after the insn
+		 * that takes it, and after the stores of the mirrors the entry fills,
+		 * which the site of the check lists, see bpf_frame_desc_emit().
+		 */
+		err = bpf_patch_list_insert(env, check_pos(env, s), buf, n);
 		if (err)
 			return err;
 	}
 	err = bpf_patch_list_commit(env);
 	if (err)
 		return err;
-	/* may_goto keeps the address of its count in a register that is dead: R0 */
+	/*
+	 * may_goto keeps the address of its count in a register that is dead: R0.
+	 * And it is a site, with the frame descriptor the main pass made at the entry.
+	 */
 	for (s = 1; s < env->subprog_cnt; s++) {
 		if (!si[s].recursive)
 			continue;
-		n = si[s].start + is_arena_sp_adj(&env->prog->insnsi[si[s].start]);
+		n = check_pos(env, s);
 		env->insn_aux_data[n].live_regs_before = (u16)~BIT(BPF_REG_0);
+		env->insn_aux_data[n].frame_desc = si[s].entry_guard;
+		si[s].entry_guard = NULL;
 	}
 	return 0;
 }
