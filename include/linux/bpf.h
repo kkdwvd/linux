@@ -1857,7 +1857,9 @@ struct bpf_resource {
 	u8 kind;	/* enum bpf_resource_kind */
 	bool sleeps;	/* the destructor may sleep */
 	bool rcu;	/* the destructor needs RCU protection */
+	bool through;	/* the location holds a pointer to memory that holds the handle, see load_off */
 	s16 delta;	/* the pointer at a location points this far past the handle, see below */
+	s16 load_off;	/* with through: the handle is this far into that memory, a __ref argument in the context */
 	u32 type;	/* bpf_reg_type of a pointer resource */
 	u32 btf_id;
 	struct btf *btf;
