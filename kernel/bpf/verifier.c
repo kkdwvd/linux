@@ -23855,24 +23855,28 @@ again:
  * The value the main program returns when the kernel cancels an invocation:
  * for each program type the outcome that denies, drops or changes nothing.
  * A program with an exception callback of its own receives it as the cookie
- * and decides for itself. An extension takes the value of the program it
- * replaces, whose type and attach type it carries while it is verified.
- * The meaning of a struct_ops program's return value is the operator's: it
- * returns 0, and the struct_ops is told through its cancel hook, so only a
- * struct_ops with the hook has cancellable programs, and an extension of an
- * operator is not cancellable, since the hook is told of the operator's own
- * program.
+ * and decides for itself. An extension returns into what called the function
+ * it replaces: the hook that ran the program it extends, or a frame of that
+ * program, which takes any scalar of a global function. It takes the value
+ * of that program, found from that program's own attachment: the extension
+ * attaches to a function of the program's BTF, by an id that names nothing
+ * in the kernel's. The meaning of a struct_ops program's return value is the
+ * operator's: it returns 0, and the struct_ops is told through its cancel
+ * hook, so only a struct_ops with the hook has cancellable programs, and an
+ * extension of an operator is not cancellable, since the hook is told of the
+ * operator's own program.
  */
-static bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *retval)
+static bool bpf_prog_cancel_retval(const struct bpf_prog *prog, s32 *retval)
 {
-	struct bpf_prog *prog = env->prog;
 	struct bpf_retval_range range;
 
 	*retval = 0;
 	if (resolve_prog_type(prog) == BPF_PROG_TYPE_STRUCT_OPS)
 		return prog->type == BPF_PROG_TYPE_STRUCT_OPS && prog->aux->st_ops &&
 		       prog->aux->st_ops->cancel;
-	switch (resolve_prog_type(prog)) {
+	while (prog->type == BPF_PROG_TYPE_EXT)
+		prog = prog->aux->dst_prog;
+	switch (prog->type) {
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 		*retval = TC_ACT_SHOT;
@@ -26148,7 +26152,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	 */
 	env->cancellable = bpf_jit_supports_cancellation() && env->prog->jit_requested &&
 			   bpf_token_capable(env->prog->aux->token, CAP_BPF) &&
-			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
+			   bpf_prog_cancel_retval(env->prog, &env->prog->aux->cancel_retval);
 	env->describe_frames |= env->cancellable;
 	ret = do_check_all(env);
 	/* while the calls are what they are in the program */
