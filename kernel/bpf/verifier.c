@@ -7764,12 +7764,15 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 /*
  * A point at which the kernel may cancel the program, if it can cancel it at
  * all: the frame is described for the unwinder. @regs_saved says whether the
- * entry the unwinder is reached through saves R0-R9 of the frame.
+ * entry the unwinder is reached through saves R0-R9 of the frame. The visits
+ * are counted apart from those of the calls the frames are described at: a
+ * program with no cancellation point is never unwound, see bpf_do_misc_fixups().
  */
 static int check_cancel_site(struct bpf_verifier_env *env, bool regs_saved)
 {
 	if (!env->cancellable)
 		return 0;
+	env->cancel_visits++;
 	return bpf_frame_desc_site(env, regs_saved);
 }
 
@@ -23956,6 +23959,7 @@ static int do_check_all(struct bpf_verifier_env *env)
 		for (i = 0; i < env->prog->len; i++)
 			env->insn_aux_data[i].seen = 0;
 		bpf_frame_desc_reset(env);
+		env->cancel_visits = 0;
 		for (i = 1; env->prog->aux->func_info && i < env->subprog_cnt; i++) {
 			sub_aux = subprog_aux(env, i);
 			memset(sub_aux->called, 0, sizeof(sub_aux->called));
