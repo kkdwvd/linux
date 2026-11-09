@@ -794,11 +794,9 @@ static void bpf_unwind_frames(struct bpf_throw_ctx *ctx)
  * bpf_cancel_entry(), which the unwinder made its return address, and the
  * cancellation goes on from the call. A callback the kernel ran returns the
  * program's cancel value to it. @regs is the register file of the throw
- * site, or NULL when the architecture has no native entry and the kfunc was
- * called directly; with it, the resources the frames unwound hold are
- * released and their callee-saved registers restored for the callback,
- * without it the main program's prologue has saved them all. @kind says how
- * the throw site was reached.
+ * site, which the entry of the architecture captured: the resources the
+ * frames unwound hold are released from it and their callee-saved registers
+ * restored for the callback. @kind says how the throw site was reached.
  */
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
@@ -808,6 +806,16 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	u64 (*cb)(u64, u64, u64, u64, u64);
 	const struct bpf_prog_aux *fn;
 
+	/*
+	 * The kfunc passes NULL, but the verifier retargets its call to
+	 * bpf_arch_throw_entry() wherever there is one, and both architectures
+	 * that support exceptions have one. Nothing saves the callee-saved
+	 * registers of the program's caller but the entries, since the
+	 * prologue of the main program saves only what it uses: without the
+	 * file the callback would hand the caller zeros, so there is no going
+	 * on without it.
+	 */
+	BUG_ON(!regs);
 	bpf_unwind_frames(&ctx);
 	WARN_ON_ONCE(!ctx.prog);
 	WARN_ON_ONCE(ctx.prog && !ctx.prog->aux->main_prog_aux->exception_boundary);
