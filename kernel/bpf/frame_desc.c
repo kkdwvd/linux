@@ -160,7 +160,7 @@ static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32
 					       struct bpf_frame_desc_build **slot, u32 nr_slots)
 {
 	struct bpf_frame_desc_build *b = *slot;
-	u32 old = b ? b->nr_slots : 0;
+	u32 old = b ? b->nr_slots : 0, first = old;
 	bool new = !b;
 
 	if (b && old >= nr_slots)
@@ -178,6 +178,14 @@ static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32
 	b->pc = pc;
 	b->nr_slots = nr_slots;
 	*slot = b;
+	/*
+	 * A slot the earlier visits did not have was not in their frames, and
+	 * holds anything on their paths: nothing is released from it unless a
+	 * scalar tells the paths apart, see guarded(), or it is mirrored.
+	 */
+	if (!new && b->visits)
+		for (; first < nr_slots; first++)
+			b->slots[first].state = LOC_OTHER;
 	return b;
 }
 
