@@ -1489,6 +1489,7 @@ struct bpf_call_ref {
 struct bpf_release_rec {
 	u32 origin;
 	u32 node;
+	u32 call;	/* the call the frame was entered from, see bpf_func_state::callsite; ~0 at the root */
 	u16 subprog;
 };
 
