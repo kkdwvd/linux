@@ -79,6 +79,7 @@ enum {
 #define MIRROR_KIND_PTR		0	/* the pointer the acquisition returned */
 #define MIRROR_KIND_LOCK	0xff	/* the pointer to the lock; else a stack object's slot type */
 #define DISC_SLOTS		64	/* stack slots that may tell a call's outcome */
+#define PASS_DIGEST(k)		(FRAME_LOCS + (k))	/* the digest of a listing passed on some visits, see passed_digest() */
 #define SECTION_KINDS		2	/* RCU read, preemption disabled */
 
 /* What a register holds where a frame obtains references, over every visit, see cell_merge(). */
@@ -102,6 +103,7 @@ enum {
 };
 
 static void note_held(struct bpf_verifier_env *env, const struct bpf_verifier_state *st, u32 origin);
+static void slots_written_at(const struct bpf_verifier_env *env, u32 pc, unsigned long *written);
 
 /* A candidate location of one reference on the current path. */
 struct cand {
@@ -2813,6 +2815,30 @@ static int guard_feed(struct bpf_verifier_env *env, struct bpf_verifier_state *s
 }
 
 /*
+ * Listing @lst of build @b is @passed on this visit, or kept. Where the
+ * visits come to disagree, the location of the listing is a candidate for a
+ * guard, should the callee chain turn out to release the reference, see
+ * passed_guard(): the frame has nothing to release there on the visits that
+ * pass it, and has to release it on the others. The digest goes under a key
+ * of its own, since as far as the lattice knows the location holds the
+ * reference on every visit; it is opened and fed like that of a guarded
+ * location, from the hulls of the earlier visits, before cells_update().
+ */
+static int passed_digest(struct bpf_frame_desc_build *b, const struct scratch *s,
+			 const struct bpf_frame_desc_listing *lst, bool passed)
+{
+	int k = PASS_DIGEST(lst->loc);
+
+	if (lst->passed && lst->unpassed) {
+		digest_visit(b, s, k, passed);
+		return 0;
+	}
+	if ((passed && lst->unpassed) || (!passed && lst->passed))
+		return digest_open(b, s, k, !passed);
+	return 0;
+}
+
+/*
  * The site is a call of BPF code: note, for every reference listed, which
  * of R1-R5 pass it to the callee, and whether the callee can reach it through
  * the stack: as a stack argument, or spilled in, or a stack object in, a
@@ -2822,12 +2848,12 @@ static int guard_feed(struct bpf_verifier_env *env, struct bpf_verifier_state *s
  * reference passes it, since on a visit that keeps it the frame is the one
  * to release it, so a visit that passes it nowhere is noted too.
  */
-static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
-			struct bpf_frame_desc_build *b)
+static int site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+		       struct bpf_frame_desc_build *b)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	u32 stack_frames = 0;
-	int k, i, l;
+	int k, i, l, ret;
 
 	for (k = BPF_REG_1; k <= BPF_REG_5; k++)
 		if (frame->regs[k].type == PTR_TO_STACK)
@@ -2858,11 +2884,17 @@ static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		}
 		if (!held)
 			continue;
+		if (lst->loc >= 0) {
+			ret = passed_digest(b, env->frame_desc_scratch, lst, passed);
+			if (ret)
+				return ret;
+		}
 		if (passed)
 			lst->passed |= passed;
 		else
 			lst->unpassed = true;
 	}
+	return 0;
 }
 
 /*
@@ -2982,14 +3014,17 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		if (ret)
 			return ret;
 	}
-	cells_update(b, s);
 	if (callee >= 0) {
 		ret = build_add_target(b, callee);
 		if (ret)
 			return ret;
 		b->is_call = true;
-		site_passed(env, st, b);
+		/* before cells_update(): a digest it opens takes the hulls of the earlier visits */
+		ret = site_passed(env, st, b);
+		if (ret)
+			return ret;
 	}
+	cells_update(b, s);
 	/* the chains name the calls, of BPF code and of helpers running callbacks, by their sites */
 	b->callsite |= callee != -1;
 	b->visits++;
@@ -4032,6 +4067,12 @@ static int mirror_settle(struct bpf_verifier_env *env)
 				m = mirror_of(env, subprog, l->origin, l->node, l->owned);
 				if ((loc->state == LOC_RES || loc->state == LOC_GUARD) && !(m && m->needed))
 					continue;
+				/* the mirror would release it where the callee lists it, see passed_guard() */
+				if (l->must_guard) {
+					verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths and holds it on others, and the reference is mirrored\n",
+						b->pc, l->origin);
+					return -EINVAL;
+				}
 				/* withdrawn, or mirrored: nothing listed there stays */
 				if (loc->state == LOC_RES || loc->state == LOC_GUARD)
 					withdraw(loc);
@@ -4240,6 +4281,20 @@ static void section_disagree_in(struct bpf_verifier_env *env, int subprog, u16 r
 }
 
 /*
+ * What the visits of a build that hold the reference of listing @l do with it
+ * at the call, as a state of the location for digest_merge(): keep it on all
+ * of them, pass it on all, or disagree.
+ */
+static u8 pass_state(const struct bpf_frame_desc_listing *l)
+{
+	if (l->passed && l->unpassed)
+		return LOC_GUARD;
+	if (l->unpassed)
+		return LOC_RES;
+	return l->passed ? LOC_OTHER : LOC_UNSEEN;
+}
+
+/*
  * Merge build @src into the build at @dstp, of the same insn of @subprog:
  * the lattice, see loc_merge(), the listings, the locks, flags and sections,
  * and the targets of a call. When @strict a conflict fails the merge, and so
@@ -4329,32 +4384,54 @@ static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_fra
 			d->cand = CAND_NONE;
 		}
 	}
-	kvfree(snap);
 	dst->fed_blind |= src->fed_blind;
 	for (i = 0; i < src->nr_listed; i++) {
 		const struct bpf_frame_desc_listing *sl = &src->listed[i];
 		struct bpf_frame_desc_listing *dl = NULL;
+		u8 ds, ss;
 
 		for (k = 0; k < dst->nr_listed; k++) {
 			if (dst->listed[k].origin != sl->origin)
 				continue;
 			/* listed by one chain and released below it by another: not one site */
-			if (strict && dst->listed[k].dropped != sl->dropped)
+			if (strict && dst->listed[k].dropped != sl->dropped) {
+				kvfree(snap);
 				return 1;
+			}
 			if (dst->listed[k].loc == sl->loc && dst->listed[k].node == sl->node &&
 			    dst->listed[k].owned == sl->owned)
 				dl = &dst->listed[k];
 		}
 		if (!dl) {
 			ret = build_add_listing(dst, sl->origin, sl->loc, sl->node, sl->owned);
-			if (ret)
+			if (ret) {
+				kvfree(snap);
 				return ret;
+			}
 			dl = &dst->listed[dst->nr_listed - 1];
 			dl->dropped = sl->dropped;
+		}
+		/*
+		 * The digests of a listing passed on some visits only, see
+		 * passed_digest(): a side passed on all of its visits holds
+		 * nothing to release at the location, one that kept the reference
+		 * on all of them holds it, like the sides of a guarded location.
+		 */
+		ds = pass_state(dl);
+		ss = pass_state(sl);
+		if (!strict && dl->loc >= 0 &&
+		    (ds == LOC_GUARD || ss == LOC_GUARD ||
+		     (ds != LOC_UNSEEN && ss != LOC_UNSEEN && ds != ss))) {
+			ret = digest_merge(dst, src, PASS_DIGEST(dl->loc), snap, ds, ss);
+			if (ret) {
+				kvfree(snap);
+				return ret;
+			}
 		}
 		dl->passed |= sl->passed;
 		dl->unpassed |= sl->unpassed;
 	}
+	kvfree(snap);
 	for (i = 0; i < src->nr_fixed; i++) {
 		const struct bpf_frame_desc_fixed *e = &src->fixed[i];
 		struct bpf_frame_desc_fixed *f = fixed_find(dst, e);
@@ -4905,6 +4982,44 @@ static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 }
 
 /*
+ * Listing @k of build @b is passed to a callee chain that releases the
+ * reference, on some visits, and kept on others: the frame releases it from
+ * the listing's location when a scalar of the frame says that the visit
+ * kept it, see passed_digest(), or the program is rejected. The location has
+ * to list the reference on every visit and nothing else, since the guard
+ * goes with the location. The digest moves under the location, where
+ * guards_resolve() decides the same guard from it, and the listing has to
+ * stay at the location, see mirror_settle().
+ */
+static int passed_guard(struct bpf_verifier_env *env, struct bpf_frame_desc_build *b, int k)
+{
+	DECLARE_BITMAP(written, MAX_BPF_STACK_SLOTS);
+	struct bpf_frame_desc_listing *l = &b->listed[k];
+	struct bpf_frame_desc_loc *loc = NULL;
+	struct bpf_guard_digest *d = NULL;
+	int j;
+
+	if (l->loc >= 0) {
+		loc = build_loc_nth(b, l->loc);
+		for (j = 0; j < b->nr_listed; j++)
+			if (j != k && b->listed[j].loc == l->loc)
+				loc = NULL;
+	}
+	if (loc && loc->state == LOC_RES && !b->fed_blind)
+		d = digest_find(b, PASS_DIGEST(l->loc));
+	slots_written_at(env, b->pc, written);
+	if (!d || !guard_decide(b, d, written, &loc->guard)) {
+		verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths and holds it on others, and no scalar of the frame tells\n",
+			b->pc, l->origin);
+		return -EINVAL;
+	}
+	d->loc = l->loc;
+	loc->state = LOC_GUARD;
+	l->must_guard = true;
+	return 0;
+}
+
+/*
  * The transfer: a frame lists what it owns and what it, or a callee, releases
  * of what the frames below own, under the chain it is under or a prefix of
  * it, which the frames below do not list at the call through which the
@@ -4961,12 +5076,14 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 				/*
 				 * Held on some visit that passes it nowhere: the frame has to
 				 * release it then, and must not where the callee lists it,
-				 * which its mirror, holding the handle either way, cannot tell.
+				 * which its mirror, holding the handle either way, cannot tell;
+				 * a scalar of the frame may, see passed_guard().
 				 */
 				if (l->unpassed) {
-					verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths, and holds it on others\n",
-						b->pc, l->origin);
-					return -EINVAL;
+					ret = passed_guard(env, b, k);
+					if (ret)
+						return ret;
+					break;
 				}
 				l->dropped = true;
 				break;
