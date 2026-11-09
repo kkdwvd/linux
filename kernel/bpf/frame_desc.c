@@ -910,6 +910,41 @@ static bool stack_object_find(const struct bpf_verifier_state *st,
 	return false;
 }
 
+/*
+ * The slot of @st that @reg points at, when it is the stack object of the
+ * reference @id: a referenced dynptr and its clones share the reference, and
+ * any of them is the object, see stack_slot_is_object(), so a pointer to any
+ * of them holds the handle.
+ */
+static const struct bpf_stack_state *reg_object_slot(const struct bpf_verifier_state *st,
+						     const struct bpf_reg_state *reg, int id)
+{
+	const struct bpf_stack_state *slot;
+	const struct bpf_func_state *frame;
+	s64 off;
+	int spi;
+
+	if (reg->type != PTR_TO_STACK || !tnum_is_const(reg->var_off) ||
+	    reg->frameno > st->curframe)
+		return NULL;
+	off = reg->var_off.value;
+	if (off >= 0 || off % BPF_REG_SIZE)
+		return NULL;
+	frame = st->frame[reg->frameno];
+	spi = -off / BPF_REG_SIZE - 1;
+	if (spi >= bpf_stack_nr_slots(frame))
+		return NULL;
+	slot = bpf_stack_slot(frame, spi);
+	return stack_slot_is_object(slot, id) ? slot : NULL;
+}
+
+/* The id of the reference the stack object in @slot is, see stack_slot_is_object(). */
+static int object_slot_id(const struct bpf_stack_state *slot)
+{
+	return slot->slot_type[BPF_REG_SIZE - 1] == STACK_DYNPTR ? slot->spilled_ptr.parent_id :
+								    slot->spilled_ptr.id;
+}
+
 /* Does @reg point at the stack object at slot @spi of frame @frameno? */
 static bool reg_points_at(const struct bpf_reg_state *reg, int frameno, int spi)
 {
@@ -2201,6 +2236,7 @@ static int find_object_cands(struct bpf_verifier_env *env, struct scratch *s,
 			     bool classify)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int id = object_slot_id(bpf_stack_slot(st->frame[objframe], spi));
 	int k, nr = 0, res = 0;
 
 	if (classify) {
@@ -2210,8 +2246,9 @@ static int find_object_cands(struct bpf_verifier_env *env, struct scratch *s,
 	}
 	if (objframe == st->curframe)
 		s->cands[nr++] = (struct cand) { 1, 0, spi, res };
+	/* a pointer to the object, or to any clone of a dynptr, which is the object as well */
 	for (k = 0; k < BPF_REG_10; k++) {
-		if (!(s->live_regs & BIT(k)) || !reg_points_at(&frame->regs[k], objframe, spi))
+		if (!(s->live_regs & BIT(k)) || !reg_object_slot(st, &frame->regs[k], id))
 			continue;
 		s->cands[nr++] = (struct cand) { 0, 1, k, res };
 	}
@@ -2219,7 +2256,7 @@ static int find_object_cands(struct bpf_verifier_env *env, struct scratch *s,
 		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
 
 		if (!test_bit(k, s->live_stack) || !bpf_is_spilled_reg(slot) ||
-		    !reg_points_at(&slot->spilled_ptr, objframe, spi))
+		    !reg_object_slot(st, &slot->spilled_ptr, id))
 			continue;
 		s->cands[nr++] = (struct cand) { 1, 1, k, res };
 	}
