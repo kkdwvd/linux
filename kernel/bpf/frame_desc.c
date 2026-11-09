@@ -4281,6 +4281,25 @@ static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_fra
 			}
 		}
 	}
+	/* the slots @src lacks were not in the frames of its visits, which held anything there */
+	for (; src->visits && l < BPF_REG_10 + dst->nr_slots; l++) {
+		static const struct bpf_frame_desc_loc other = { .state = LOC_OTHER };
+		struct bpf_frame_desc_loc *d = build_loc_nth(dst, l);
+		u8 dstate = d->state;
+
+		ret = loc_merge(d, &other, strict);
+		if (ret == 1 && strict) {
+			kvfree(snap);
+			return 1;
+		}
+		if (ret == 2) {
+			ret = digest_merge(dst, src, l, snap, dstate, LOC_OTHER);
+			if (ret) {
+				kvfree(snap);
+				return ret;
+			}
+		}
+	}
 	/* the candidates of the merged build: live scalars on the visits of both */
 	for (l = 0; l < BPF_REG_10 + dst->nr_slots; l++) {
 		struct bpf_frame_desc_loc *d = build_loc_nth(dst, l);
