@@ -5675,7 +5675,12 @@ static const u8 mirror_emit_kind[] = {
 	[MIRROR_ENTRY_STORE] = EMIT_ENTRY,
 };
 
-/* The store of the handle in @reg, which points @adj bytes into the object, into the mirror at @off. */
+/*
+ * The store of the handle in @reg, which points @adj bytes into the object,
+ * into the mirror at @off. The register may hold NULL: the pop the mirror
+ * is stored after found the list empty, or the callee it is refreshed after
+ * released the object; the mirror has to hold NULL then, not -@adj.
+ */
 static int emit_store(struct bpf_insn *buf, u8 reg, s16 adj, s16 off)
 {
 	int cnt = 0;
@@ -5685,6 +5690,7 @@ static int emit_store(struct bpf_insn *buf, u8 reg, s16 adj, s16 off)
 		return cnt;
 	}
 	buf[cnt++] = BPF_MOV64_REG(BPF_REG_AX, reg);
+	buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_AX, 0, 1);
 	buf[cnt++] = BPF_ALU64_IMM(BPF_SUB, BPF_REG_AX, adj);
 	buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX, off);
 	return cnt;
@@ -5704,7 +5710,7 @@ static int point_cost(const struct emit_point *p, int clears)
 		return 2;
 	case EMIT_STORE_BEFORE:
 	case EMIT_STORE_AFTER:
-		return p->adj ? 3 : 1;
+		return p->adj ? 4 : 1;
 	case EMIT_STORE_AFTER_FREE:
 		return 4 * p->nr - 1;
 	default:
