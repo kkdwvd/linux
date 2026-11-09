@@ -111,6 +111,7 @@ struct cand {
 	u8 indirect;	/* the location holds a pointer to the resource */
 	u16 idx;	/* register number or spi */
 	u16 res;
+	u8 nullable;	/* the pointer may be NULL on this path: not checked yet */
 };
 
 /* Per-site working storage, allocated once per verification. */
@@ -118,6 +119,7 @@ struct scratch {
 	struct cand cands[FRAME_LOCS];
 	u8 class[FRAME_LOCS];
 	u8 indirect[FRAME_LOCS];
+	u8 nullable[FRAME_LOCS];
 	u16 res[FRAME_LOCS];
 	u32 origin[FRAME_LOCS];
 	u8 owned[FRAME_LOCS];
@@ -2168,17 +2170,21 @@ static int find_cands(struct bpf_verifier_env *env, struct scratch *s,
 		ret = classify ? resource_of_reg(env, &frame->regs[k]) : 0;
 		if (ret < 0)
 			return ret;
-		s->cands[nr++] = (struct cand) { 0, 1, k, ret };
+		s->cands[nr++] = (struct cand) { .indirect = 1, .idx = k, .res = ret,
+						 .nullable = type_may_be_null(frame->regs[k].type) };
 	}
 	for (k = 0; k < bpf_stack_nr_slots(frame); k++) {
+		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
 		if (!test_bit(k, s->live_stack))
 			continue;
-		ret = stack_slot_ref(env, bpf_stack_slot(frame, k), ref->id, classify);
+		ret = stack_slot_ref(env, slot, ref->id, classify);
 		if (ret == -ENOENT)
 			continue;
 		if (ret < 0)
 			return ret;
-		s->cands[nr++] = (struct cand) { 1, 1, k, ret };
+		s->cands[nr++] = (struct cand) { .is_slot = 1, .indirect = 1, .idx = k, .res = ret,
+						 .nullable = type_may_be_null(slot->spilled_ptr.type) };
 	}
 	return nr;
 }
@@ -2652,6 +2658,7 @@ static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		s->origin[idx] = ref->origin;
 		s->owned[idx] = owned;
 		s->indirect[idx] = c->indirect;
+		s->nullable[idx] = c->nullable;
 	}
 	return cand_idx(&s->cands[chosen]);
 }
@@ -2931,6 +2938,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		s->live_regs &= CALLEE_SAVED_REGS;
 	s->live_stack = env->insn_aux_data[s->pc].live_stack_before;
 	memset(s->class, 0, sizeof(s->class));
+	memset(s->nullable, 0, sizeof(s->nullable));
 	ret = chain_of(env, st);
 	if (ret < 0)
 		return ret;
@@ -3013,6 +3021,17 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 			    s->indirect[k]);
 		if (ret)
 			return ret;
+		/*
+		 * A reference the program has not checked for NULL yet is held by
+		 * its id all the same: where the location lists it, the unwinder
+		 * has to skip NULL, which the acquisition may have returned.
+		 */
+		if (s->class[k] == CLASS_RES && s->nullable[k]) {
+			struct bpf_frame_desc_loc *loc = build_loc_nth(b, k);
+
+			if (loc->state == LOC_RES || loc->state == LOC_GUARD)
+				loc->nullable = 1;
+		}
 	}
 	if (callee >= 0) {
 		ret = build_add_target(b, callee);
