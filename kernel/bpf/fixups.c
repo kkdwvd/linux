@@ -2765,11 +2765,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	 * unless the program has one of its own, and a cancellable program
 	 * needs one that returns the cookie from the frame of a callback,
 	 * which is the default one unless the program has its own. A
-	 * cancellable program is unwound from the sites the main pass
-	 * described, which the guards it added after the pass are among:
-	 * whether it has any is settled here, not as the pass goes.
+	 * cancellable program is unwound from the cancellation points the
+	 * main pass visited, which the guards it added after the pass are
+	 * among, not from the calls it described the frames at: whether it
+	 * has any is settled here, not as the pass goes.
 	 */
-	if (env->cancellable && env->frame_desc_visits)
+	if (env->cancellable && env->cancel_visits)
 		env->seen_exception = true;
 	if (env->seen_exception && (!env->exception_callback_subprog || env->cancellable)) {
 		struct bpf_insn *patch = insn_buf;
