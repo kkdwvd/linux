@@ -22217,9 +22217,14 @@ static int flow_drain(struct bpf_verifier_env *env)
 static int check_recursion_guard(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[cur_func(env)->subprogno];
+	int err;
 
 	if (!sub->recursive || env->insn_idx != sub->start)
 		return 0;
+	/* A timed out may_goto cancels the program instead of returning. */
+	err = check_cancel_guard(env, &sub->entry_guard);
+	if (err)
+		return err;
 	return push_budget_exit(env);
 }
 
