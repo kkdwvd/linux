@@ -313,24 +313,58 @@ static bool chain_is_prefix(const struct bpf_verifier_env *env, u32 v, u32 w)
 }
 
 /*
- * The node of the chain of the current frame of @st, interned. Each frame
- * keeps its node once it is known, which the copies of the state carry on:
- * the path is walked from the deepest frame that knows it.
+ * The path of the chain of callsites @pcs, @n of them nearest first, from the
+ * root: into @nodes, the root first, as far as the trie has it, or whole when
+ * @create interns the rest. Returns how many nodes, or -ENOMEM. This is the
+ * one place that says which way round the trie keeps a chain: the nearest
+ * callsite is the child of the root, as the unwinder walks the callers of a
+ * frame from the nearest, see bpf_unwind_chain(), and so a shorter chain of
+ * the same frame, under a caller verified on its own, is a prefix of the
+ * longer one, see merge_prefix_builds().
+ */
+static int chain_walk(struct bpf_verifier_env *env, const u32 *pcs, int n, bool create, u32 *nodes)
+{
+	int k, node = 0, cnt = 1;
+
+	nodes[0] = 0;
+	for (k = 0; k < n; k++) {
+		int child = chain_child(env, node, pcs[k], create);
+
+		if (child == -ENOENT)
+			break;
+		if (child < 0)
+			return child;
+		node = child;
+		nodes[cnt++] = node;
+	}
+	return cnt;
+}
+
+/*
+ * The node of the chain of the current frame of @st, interned: the callsites
+ * of the frames below it, nearest first. Each frame keeps its node once it is
+ * known, which the copies of the state carry on; the node of a frame is not
+ * the child of its caller's, the caller's chain being the tail of its own,
+ * so every frame that does not know its node yet walks its own path, the
+ * frames below the current one included, whose nodes the records of a
+ * release go by, see bpf_frame_desc_record_release().
  */
 static int chain_of(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
 {
-	int f, node;
+	u32 pcs[MAX_CALL_FRAMES], nodes[MAX_CALL_FRAMES + 1];
+	int f, k, ret;
 
-	for (f = st->curframe; f > 0 && !st->frame[f]->chain; f--)
-		;
-	node = f ? st->frame[f]->chain - 1 : 0;
-	for (f++; f <= st->curframe; f++) {
-		node = chain_child(env, node, st->frame[f]->callsite, true);
-		if (node < 0)
-			return node;
-		st->frame[f]->chain = node + 1;
+	for (f = 1; f <= st->curframe; f++) {
+		if (st->frame[f]->chain)
+			continue;
+		for (k = 0; k < f; k++)
+			pcs[k] = st->frame[f - k]->callsite;
+		ret = chain_walk(env, pcs, f, true, nodes);
+		if (ret < 0)
+			return ret;
+		st->frame[f]->chain = nodes[f] + 1;
 	}
-	return node;
+	return st->curframe ? st->frame[st->curframe]->chain - 1 : 0;
 }
 
 /*
@@ -3390,7 +3424,8 @@ static bool marked(const struct bpf_verifier_env *env, u32 origin, u32 node, u32
 	return false;
 }
 
-static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u16 subprog)
+/* A frame of @subprog under chain @node, entered from the call at @call, releases @origin at or below it. */
+static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u32 call, u16 subprog)
 {
 	struct bpf_release_rec *r;
 	u32 cnt = env->release_rec_cnt;
@@ -3400,7 +3435,8 @@ static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u16 subp
 	r = kvrealloc(env->release_recs, array_size(cnt + 1, sizeof(*r)), GFP_KERNEL_ACCOUNT);
 	if (!r)
 		return -ENOMEM;
-	r[cnt] = (struct bpf_release_rec) { .origin = origin, .node = node, .subprog = subprog };
+	r[cnt] = (struct bpf_release_rec) { .origin = origin, .node = node, .call = call,
+					    .subprog = subprog };
 	env->release_recs = r;
 	env->release_rec_cnt = cnt + 1;
 	return 0;
@@ -3476,7 +3512,7 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 			if (st->frame[c]->in_callback_fn)
 				break;
 			ret = mark_add(env, ref->origin, c ? st->frame[c]->chain - 1 : 0,
-				       st->frame[c]->subprogno);
+				       c ? st->frame[c]->callsite : ~0U, st->frame[c]->subprogno);
 			if (ret)
 				return ret;
 		}
@@ -4614,33 +4650,32 @@ static bool claimed(struct bpf_verifier_env *env, u32 s, u32 origin, u32 node)
 }
 
 /*
- * The chain of a frame the call of build @b enters: the call, then the chain
- * of the frame of the build. Walk its nodes from the root as far as the trie
- * has them, into @nodes: a frame of the callee visited under a shorter
- * chain, from a caller verified on its own, is at one of the shorter ones
- * and runs under the longer ones, see merge_prefix_builds(). Returns how
- * many, and the deepest last.
+ * The chain of a frame the call of build @b enters: the call, nearest, then
+ * the chain of the frame of the build. Walk its nodes from the root as far
+ * as the trie has them, into @nodes: a frame of the callee visited under a
+ * shorter chain, from a caller verified on its own, is at one of the shorter
+ * ones and runs under the longer ones, see merge_prefix_builds(). Returns
+ * how many, and the deepest last. The path up from the node of the build
+ * yields its chain outermost first, see chain_walk(): it is put down from
+ * the end.
  */
 static int callee_chain(struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
 			u32 *nodes)
 {
 	u32 pcs[MAX_CALL_FRAMES + 1], node;
-	int n = 0, k, depth = 0;
+	int depth = 0, k;
 
-	pcs[depth++] = b->pc;
-	for (node = b->node; node && depth < ARRAY_SIZE(pcs); node = env->chains[node].parent)
-		pcs[depth++] = env->chains[node].pc;
-	node = 0;
-	nodes[n++] = node;
-	for (k = 0; k < depth; k++) {
-		int child = chain_child(env, node, pcs[k], false);
-
-		if (child < 0)
-			break;
-		node = child;
-		nodes[n++] = node;
+	for (node = b->node; node; node = env->chains[node].parent)
+		depth++;
+	if (verifier_bug_if(depth > MAX_CALL_FRAMES, env, "chain of %d calls at insn %d", depth,
+			    b->pc)) {
+		nodes[0] = 0;
+		return 1;
 	}
-	return n;
+	pcs[0] = b->pc;
+	for (node = b->node, k = depth; node; node = env->chains[node].parent)
+		pcs[k--] = env->chains[node].pc;
+	return chain_walk(env, pcs, depth + 1, false, nodes);
 }
 
 /*
@@ -4730,8 +4765,9 @@ static int call_targets(struct bpf_verifier_env *env, u32 call, u16 *targets)
 
 /*
  * Does a callee of the call at @call (an orig insn) release the reference of
- * origin @origin, under some chain: a frame entered from the call, or one
- * verified on its own, of a target of the call?
+ * origin @origin, under some chain: a frame entered from the call, which the
+ * record of the release names, or one verified on its own, of a target of
+ * the call?
  */
 static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 {
@@ -4748,7 +4784,7 @@ static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 		if (r->origin != origin)
 			continue;
 		if (r->node) {
-			if (env->chains[r->node].pc == call)
+			if (r->call == call)
 				return true;
 			continue;
 		}
