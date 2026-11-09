@@ -586,8 +586,8 @@ static bool reg_is_sock_btf(const struct bpf_reg_state *reg)
  * class: it is one the program could not release either, so a site holding
  * it is one the verifier would reject anyway, for the leak.
  */
-static int __resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg,
-			     bool report)
+static int resource_describe(struct bpf_verifier_env *env, const struct bpf_reg_state *reg,
+			     struct bpf_resource *resp, bool report)
 {
 	u32 flags = type_flag(reg->type) & ~PTR_MAYBE_NULL;
 	struct bpf_resource res;
@@ -634,7 +634,8 @@ static int __resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_
 	default:
 		goto unsupported;
 	}
-	return resource_intern(env, &res);
+	*resp = res;
+	return 0;
 unsupported:
 	if (report)
 		verbose(env, "frame_desc: cannot release a reference of type %s\n",
@@ -642,9 +643,59 @@ unsupported:
 	return -EOPNOTSUPP;
 }
 
+static int __resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg,
+			     bool report)
+{
+	struct bpf_resource res;
+	int ret;
+
+	ret = resource_describe(env, reg, &res, report);
+	return ret ?: resource_intern(env, &res);
+}
+
 static int resource_of_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
 {
 	return __resource_of_reg(env, reg, true);
+}
+
+/*
+ * The class of the reference the kernel holds for __ref argument @argno of a
+ * struct_ops program: the object as the program loads it from the context,
+ * or, @through a pointer to the context at a location, the word @load_off
+ * into the context, where the kernel put the argument.
+ */
+static int resource_of_ctx_arg(struct bpf_verifier_env *env, u32 argno, bool through, s16 load_off)
+{
+	const struct bpf_ctx_arg_aux *info = &env->prog->aux->ctx_arg_info[argno];
+	struct bpf_reg_state reg = { .type = info->reg_type, .btf = info->btf, .btf_id = info->btf_id };
+	struct bpf_resource res;
+	int ret;
+
+	ret = resource_describe(env, &reg, &res, true);
+	if (ret)
+		return ret;
+	res.through = through;
+	res.load_off = load_off;
+	return resource_intern(env, &res);
+}
+
+/*
+ * Does frame @frameno of @st own reference @ref: the frame that acquired it,
+ * or was handed it at a return, see bpf_reference_state::frameno. A reference
+ * the kernel holds for a __ref argument of a struct_ops program was acquired
+ * by no frame; the main program holds it for the kernel, and owns it for the
+ * descriptors, so that it is listed wherever main holds it, whether or not
+ * the program releases it, and released by the unwinder when main is unwound
+ * with it. A callee that releases it claims it like any reference of a frame
+ * below, and main drops it at the call that passed it the context.
+ */
+static bool ref_owned(const struct bpf_verifier_state *st, const struct bpf_reference_state *ref,
+		      int frameno)
+{
+	if (ref->frameno == frameno)
+		return true;
+	return ref->frameno < 0 && bpf_origin_is_ctx_arg(ref->origin) && frameno == 0 &&
+	       st->frame[0]->subprogno == 0;
 }
 
 static int resource_of_dynptr(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
@@ -2223,6 +2274,43 @@ static int find_cands(struct bpf_verifier_env *env, struct scratch *s,
 		s->cands[nr++] = (struct cand) { .is_slot = 1, .indirect = 1, .idx = k, .res = ret,
 						 .nullable = type_may_be_null(slot->spilled_ptr.type) };
 	}
+	/*
+	 * A reference the kernel holds for a __ref argument sits in the context
+	 * until the program loads it: a live pointer to the context holds it,
+	 * through the context, by a class that says how far in, see
+	 * resource_of_ctx_arg(). The pointer may point into the context.
+	 */
+	if (bpf_origin_is_ctx_arg(ref->origin)) {
+		u32 argno = BPF_ORIGIN_CTX_ARGNO(ref->origin);
+		s64 base = env->prog->aux->ctx_arg_info[argno].offset, off;
+
+		for (k = 0; k < BPF_REG_10 + bpf_stack_nr_slots(frame); k++) {
+			const struct bpf_reg_state *reg;
+			bool is_slot = k >= BPF_REG_10;
+
+			if (is_slot) {
+				const struct bpf_stack_state *slot = bpf_stack_slot(frame, k - BPF_REG_10);
+
+				if (!test_bit(k - BPF_REG_10, s->live_stack) || !bpf_is_spilled_reg(slot))
+					continue;
+				reg = &slot->spilled_ptr;
+			} else {
+				if (!(s->live_regs & BIT(k)))
+					continue;
+				reg = &frame->regs[k];
+			}
+			if (reg->type != PTR_TO_CTX || !tnum_is_const(reg->var_off))
+				continue;
+			off = base - (s64)reg->var_off.value;
+			if (off != (s16)off)
+				continue;
+			ret = classify ? resource_of_ctx_arg(env, argno, true, off) : 0;
+			if (ret < 0)
+				return ret;
+			s->cands[nr++] = (struct cand) { .is_slot = is_slot, .indirect = 1,
+							 .idx = is_slot ? k - BPF_REG_10 : k, .res = ret };
+		}
+	}
 	return nr;
 }
 
@@ -2674,7 +2762,7 @@ static int place_fixed(struct bpf_verifier_env *env, struct scratch *s)
 static int place_ref(struct bpf_verifier_env *env, struct scratch *s,
 		     const struct bpf_reference_state *ref, int nr)
 {
-	bool owned = ref->frameno == env->cur_state->curframe;
+	bool owned = ref_owned(env->cur_state, ref, env->cur_state->curframe);
 	const char *why;
 	int k, chosen, ret;
 
@@ -3045,7 +3133,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 	 */
 	for (i = 0; i < st->acquired_refs; i++) {
 		const struct bpf_reference_state *ref = &st->refs[i];
-		bool owned = ref->frameno == st->curframe;
+		bool owned = ref_owned(st, ref, st->curframe);
 		int objframe, spi;
 
 		if (ref->type != REF_TYPE_PTR)
