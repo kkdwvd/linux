@@ -2762,16 +2762,17 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	/*
 	 * A program that may be unwound needs the exception callback the
 	 * unwinder transfers to from the main frame, which returns the cookie
-	 * unless the program has one of its own, and a cancellable program
-	 * needs one that returns the cookie from the frame of a callback,
-	 * which is the default one unless the program has its own. A
-	 * cancellable program is unwound from the sites the main pass
-	 * described, which the guards it added after the pass are among:
-	 * whether it has any is settled here, not as the pass goes.
+	 * unless the program has one of its own, and the hidden callback that
+	 * returns its cookie from the frame of a callback the kernel ran, which
+	 * the unwinder completes such a frame of any program with, cancellable
+	 * or not, see bpf_throw_unwind(): so every program that may be unwound
+	 * gets the hidden one. A cancellable program is unwound from the sites
+	 * the main pass described, which the guards it added after the pass
+	 * are among: whether it has any is settled here, not as the pass goes.
 	 */
 	if (env->cancellable && env->frame_desc_visits)
 		env->seen_exception = true;
-	if (env->seen_exception && (!env->exception_callback_subprog || env->cancellable)) {
+	if (env->seen_exception) {
 		struct bpf_insn *patch = insn_buf;
 
 		*patch++ = env->prog->insnsi[insn_cnt - 1];
@@ -2785,8 +2786,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 
 		if (!env->exception_callback_subprog)
 			env->exception_callback_subprog = env->subprog_cnt - 1;
-		if (env->cancellable)
-			env->cancel_callback_subprog = env->subprog_cnt - 1;
+		env->cancel_callback_subprog = env->subprog_cnt - 1;
 		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
 		bpf_mark_subprog_exc_cb(env, env->subprog_cnt - 1);
 	}

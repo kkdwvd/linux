@@ -1993,6 +1993,12 @@ struct bpf_frame_desc_site {
 struct bpf_frame_desc_table {
 	u32 cnt;
 	bool filled;
+	/*
+	 * Some site is not a call of BPF code, which a frame waits in: a frame of
+	 * the function can be the innermost one of an unwind. Set as the table is
+	 * filled.
+	 */
+	bool innermost;
 	struct bpf_frame_desc_site site[];
 };
 
