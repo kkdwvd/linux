@@ -1425,6 +1425,7 @@ enum bpf_mirror_point {
 	MIRROR_CLEAR_AFTER,	/* zero, after the insn: a callee released it */
 	MIRROR_CLEAR_FAIL,	/* zero, after the insn, where R0 is not 0: the acquisition failed */
 	MIRROR_ENTRY_STORE,	/* the register, in front of the first insn of subprog 'insn' */
+	MIRROR_CTX_STORE,	/* the word at 'off' of the context in R1, in front of the first insn of the program */
 };
 
 struct bpf_mirror_store {
@@ -1467,6 +1468,7 @@ enum bpf_mirror_how {
 	MIRROR_ENTRY,	/* in R'at' at the subprog's entry */
 	MIRROR_LOAD,	/* loaded at insn 'at' from the stack of a frame below */
 	MIRROR_NOWHERE,	/* no one place: cannot be written */
+	MIRROR_CTX,	/* the kernel holds it for __ref argument 'at' of the context: main's, filled at its entry */
 };
 
 /*
