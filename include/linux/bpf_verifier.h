@@ -1348,6 +1348,7 @@ struct bpf_frame_desc_listing {
 	bool owned;
 	bool dropped;	/* the frame neither owns nor releases it: another frame lists it */
 	u8 passed;	/* at a call: the registers it is passed in, or through the stack */
+	bool unpassed;	/* at a call: held on some visit that passes it nowhere */
 };
 
 /*

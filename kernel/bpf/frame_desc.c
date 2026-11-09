@@ -2817,7 +2817,10 @@ static int guard_feed(struct bpf_verifier_env *env, struct bpf_verifier_state *s
  * of R1-R5 pass it to the callee, and whether the callee can reach it through
  * the stack: as a stack argument, or spilled in, or a stack object in, a
  * frame that a stack pointer argument points into. The callee chain may
- * release what it is passed, and then lists it, see bpf_frame_desc_resolve().
+ * release what it is passed, and then lists it, see bpf_frame_desc_resolve():
+ * the frame drops the listing only when every visit that holds the
+ * reference passes it, since on a visit that keeps it the frame is the one
+ * to release it, so a visit that passes it nowhere is noted too.
  */
 static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 			struct bpf_frame_desc_build *b)
@@ -2834,22 +2837,31 @@ static void site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			stack_frames |= BIT(frame->stack_arg_regs[i].frameno);
 	for (l = 0; l < b->nr_listed; l++) {
 		struct bpf_frame_desc_listing *lst = &b->listed[l];
+		bool held = false;
+		u8 passed = 0;
 
 		for (i = 0; i < st->acquired_refs; i++) {
 			const struct bpf_reference_state *ref = &st->refs[i];
 
 			if (ref->origin != lst->origin)
 				continue;
+			held = true;
 			for (k = BPF_REG_1; k <= BPF_REG_5; k++)
 				if (reg_has_ref(st, &frame->regs[k], ref))
-					lst->passed |= BIT(k - 1);
+					passed |= BIT(k - 1);
 			for (k = 0; k < frame->out_stack_arg_cnt; k++)
 				if (reg_has_ref(st, &frame->stack_arg_regs[k], ref))
-					lst->passed |= PASSED_STACK;
+					passed |= PASSED_STACK;
 			for (k = 0; k <= st->curframe; k++)
 				if ((stack_frames & BIT(k)) && frame_stack_has_ref(st, k, ref))
-					lst->passed |= PASSED_STACK;
+					passed |= PASSED_STACK;
 		}
+		if (!held)
+			continue;
+		if (passed)
+			lst->passed |= passed;
+		else
+			lst->unpassed = true;
 	}
 }
 
@@ -4945,6 +4957,16 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			for (t = 0; l->passed && t < b->nr_targets; t++) {
 				if (!callee_claims(env, b, b->targets[t], l->origin))
 					continue;
+				/*
+				 * Held on some visit that passes it nowhere: the frame has to
+				 * release it then, and must not where the callee lists it,
+				 * which its mirror, holding the handle either way, cannot tell.
+				 */
+				if (l->unpassed) {
+					verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths, and holds it on others\n",
+						b->pc, l->origin);
+					return -EINVAL;
+				}
 				l->dropped = true;
 				break;
 			}
