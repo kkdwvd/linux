@@ -452,6 +452,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->frame_desc_scratch);
 	kvfree(env->frame_desc_new_of);
 	kvfree(env->frame_desc_targets);
+	kvfree(env->frame_desc_reach);
 	kvfree(env->frame_desc_moves);
 	kvfree(env->chains);
 	env->frame_desc_moves = NULL;
@@ -468,6 +469,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	env->frame_desc_scratch = NULL;
 	env->frame_desc_new_of = NULL;
 	env->frame_desc_targets = NULL;
+	env->frame_desc_reach = NULL;
 }
 
 /* Intern a resource class; descriptors refer to it by index. */
@@ -4571,19 +4573,37 @@ static int build_mirror(struct bpf_frame_desc_build *b, u32 origin, struct bpf_f
 	return 0;
 }
 
+/* Does @s call @t through calls of BPF code, in any number of steps, or is it @t? See reach_build(). */
+static bool reaches(const struct bpf_verifier_env *env, u32 s, u32 t)
+{
+	return test_bit(t, env->frame_desc_reach + s * BITS_TO_LONGS(env->subprog_cnt));
+}
+
 /*
  * Does a frame of @subprog under chain @node, or under a prefix of its chain,
- * release @origin at or below it?
+ * release @origin at or below it? A release in a frame verified on its own
+ * is recorded at the root for that frame's subprog alone, the frames that
+ * call it not being in its state: it stands for every call of the subprog,
+ * from @subprog itself or from any subprog it reaches through calls.
  */
 static bool marked_up(const struct bpf_verifier_env *env, u32 origin, u32 node, u32 subprog)
 {
+	u32 i;
+
 	for (;;) {
 		if (marked(env, origin, node, subprog))
 			return true;
 		if (!node)
-			return false;
+			break;
 		node = env->chains[node].parent;
 	}
+	for (i = 0; i < env->release_rec_cnt; i++) {
+		const struct bpf_release_rec *r = &env->release_recs[i];
+
+		if (r->origin == origin && !r->node && reaches(env, subprog, r->subprog))
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -4764,10 +4784,59 @@ static int call_targets(struct bpf_verifier_env *env, u32 call, u16 *targets)
 }
 
 /*
+ * Which subprogs a frame of each subprog may enter through calls of BPF
+ * code, transitively, itself included: static and global calls and the
+ * targets of a callx, never a callback, which the kernel runs; a release
+ * recorded at the root for a subprog verified on its own reaches every call
+ * of it through them, see marked_up() and call_releases(). A row of
+ * BITS_TO_LONGS(subprog_cnt) longs per subprog, from the insns of the image
+ * as it is after the pass.
+ */
+static int reach_build(struct bpf_verifier_env *env)
+{
+	u32 cnt = env->subprog_cnt, stride = BITS_TO_LONGS(cnt), i, s, t;
+	u16 *targets = env->frame_desc_targets;
+	unsigned long *reach;
+	bool again = true;
+	int n, k;
+
+	reach = kvcalloc(cnt * stride, sizeof(*reach), GFP_KERNEL_ACCOUNT);
+	if (!reach)
+		return -ENOMEM;
+	env->frame_desc_reach = reach;
+	for (s = 0; s < cnt; s++)
+		__set_bit(s, reach + s * stride);
+	for (i = 0; i < env->prog->len; i++) {
+		const struct bpf_insn *insn = &env->prog->insnsi[i];
+
+		if (!bpf_pseudo_call(insn) && !bpf_is_callx(insn))
+			continue;
+		s = insn_subprog(env, i);
+		n = call_targets(env, i, targets);
+		for (k = 0; k < n; k++)
+			__set_bit(targets[k], reach + s * stride);
+	}
+	while (again) {
+		again = false;
+		for (s = 0; s < cnt; s++) {
+			unsigned long *row = reach + s * stride;
+
+			for_each_set_bit(t, row, cnt) {
+				if (t == s || bitmap_subset(reach + t * stride, row, cnt))
+					continue;
+				bitmap_or(row, row, reach + t * stride, cnt);
+				again = true;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
  * Does a callee of the call at @call (an orig insn) release the reference of
  * origin @origin, under some chain: a frame entered from the call, which the
  * record of the release names, or one verified on its own, of a target of
- * the call?
+ * the call or of a subprog a target reaches, see marked_up()?
  */
 static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 {
@@ -4789,7 +4858,7 @@ static bool call_releases(struct bpf_verifier_env *env, u32 call, u32 origin)
 			continue;
 		}
 		for (i = 0; i < n; i++)
-			if (targets[i] == r->subprog)
+			if (reaches(env, targets[i], r->subprog))
 				return true;
 	}
 	return false;
@@ -5162,7 +5231,8 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 		env->insn_aux_data[i].guard_desc = NULL;
 	}
 
-	ret = merge_prefix_builds(env);
+	ret = reach_build(env);
+	ret = ret ?: merge_prefix_builds(env);
 	ret = ret ?: resolve_transfer(env);
 	ret = ret ?: slot_writes_resolve(env);
 	ret = ret ?: guards_resolve(env);
