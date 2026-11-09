@@ -1614,6 +1614,7 @@ struct bpf_verifier_env {
 	/* frame descriptors are generated: the program may throw or be cancelled */
 	bool describe_frames;
 	bool cancellable;			/* cancelled by the kernel at its cancellation points */
+	u32 cancel_visits;			/* visits of the cancellation points, see check_cancel_site() */
 	int exception_callback_subprog;
 	int cancel_callback_subprog;	/* returns the cookie from the frame of a cancelled callback */
 	bool explore_alu_limits;

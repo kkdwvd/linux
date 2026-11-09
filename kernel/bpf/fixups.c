@@ -2766,11 +2766,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	 * returns its cookie from the frame of a callback the kernel ran, which
 	 * the unwinder completes such a frame of any program with, cancellable
 	 * or not, see bpf_throw_unwind(): so every program that may be unwound
-	 * gets the hidden one. A cancellable program is unwound from the sites
-	 * the main pass described, which the guards it added after the pass
-	 * are among: whether it has any is settled here, not as the pass goes.
+	 * gets the hidden one. A cancellable program is unwound from the
+	 * cancellation points the main pass visited, which the guards it added
+	 * after the pass are among, not from the calls it described the frames
+	 * at: whether it has any is settled here, not as the pass goes.
 	 */
-	if (env->cancellable && env->frame_desc_visits)
+	if (env->cancellable && env->cancel_visits)
 		env->seen_exception = true;
 	if (env->seen_exception) {
 		struct bpf_insn *patch = insn_buf;
