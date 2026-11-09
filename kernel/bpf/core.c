@@ -4112,6 +4112,10 @@ __weak void bpf_arena_stack_put(struct bpf_prog_aux *aux, u32 base)
 {
 }
 
+__weak void bpf_arena_stack_release(struct bpf_prog_aux *aux, u32 base)
+{
+}
+
 #ifdef CONFIG_BPF_SYSCALL
 __weak bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write,
 					unsigned long fault_ip)

@@ -867,6 +867,7 @@ __xlated("r3 = r2")
 __xlated("...")
 /* the end of the code that takes a stack, the first insn of far_from_r12_cb() */
 __xlated("r12 = *(u32 *)(r{{[0-9]}} +8)")
+__xlated("*(u64 *)(r10 -{{[0-9]+}}) = r12")
 __xlated("r6 = r2")
 __naked void callback_in_callback(void)
 {
@@ -1279,6 +1280,8 @@ __xlated("10: r2 = 0x")
 __xlated("12: r2 = &(void __percpu *)(r2)")
 __xlated("...")
 __xlated("r12 = *(u32 *)(r2 +8)")
+/* kept for the unwinder, which returns the stack */
+__xlated("*(u64 *)(r10 -8) = r12")
 /* main prog */
 __xlated("w12 += 48")
 __xlated("r2 = *(u64 *)(r1 +")
