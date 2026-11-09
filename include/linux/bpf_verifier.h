@@ -1610,6 +1610,7 @@ struct bpf_verifier_env {
 	u32 frame_desc_orig_len;		/* the insns the main pass named, see frame_desc.c */
 	u32 *frame_desc_new_of;			/* their indices after the loop guards */
 	u16 *frame_desc_targets;		/* room for the targets of a call */
+	unsigned long *frame_desc_reach;	/* the subprogs each subprog reaches through calls, see frame_desc.c */
 	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
 	u32 frame_desc_move_cnt;
 	/* frame descriptors are generated: the program may throw or be cancelled */
