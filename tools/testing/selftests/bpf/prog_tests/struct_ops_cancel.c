@@ -15,8 +15,9 @@ void test_struct_ops_cancel(void)
 	skel = struct_ops_cancel__open_and_load();
 	if (!ASSERT_OK_PTR(skel, "open_and_load"))
 		return;
-	/* The hooks have to be in place before the operator runs at attach. */
+	/* The hooks have to be in place before the operators run at attach. */
 	bpf_map__set_autoattach(skel->maps.testmod_cancel, false);
+	bpf_map__set_autoattach(skel->maps.testmod_ctx_ref, false);
 	if (!ASSERT_OK(struct_ops_cancel__attach(skel), "attach hooks"))
 		goto out;
 
@@ -27,6 +28,14 @@ void test_struct_ops_cancel(void)
 	ASSERT_NEQ(skel->bss->acquired, 0, "acquired");
 	ASSERT_EQ(skel->bss->released, skel->bss->acquired, "released");
 	ASSERT_EQ(skel->bss->cancelled, 1, "cancelled");
+	bpf_link__destroy(link);
+
+	/* The operator with a __ref argument throws holding it: released once, by the unwinder. */
+	link = bpf_map__attach_struct_ops(skel->maps.testmod_ctx_ref);
+	if (!ASSERT_OK_PTR(link, "attach struct_ops with a __ref argument"))
+		goto out;
+	ASSERT_NEQ(skel->bss->task_ptr, 0, "task passed");
+	ASSERT_EQ(skel->bss->task_released, 1, "task released once");
 	bpf_link__destroy(link);
 out:
 	struct_ops_cancel__destroy(skel);

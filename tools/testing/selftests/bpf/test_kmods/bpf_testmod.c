@@ -2093,6 +2093,15 @@ static int bpf_dummy_reg(void *kdata, struct bpf_link *link)
 		ops->test_2(4, ops->data);
 	if (ops->test_trampoline_stack_args)
 		ops->test_trampoline_stack_args(1, 2, 3, 4, 5, 6, 7, 8, 9999);
+	/*
+	 * An operator with a __ref argument gets a reference it has to release,
+	 * or hand on: the one bpf_task_acquire() takes, which bpf_task_release()
+	 * puts, see put_task_struct_rcu_user().
+	 */
+	if (ops->test_refcounted) {
+		refcount_inc(&current->rcu_users);
+		ops->test_refcounted(0, current);
+	}
 
 	return 0;
 }

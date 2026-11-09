@@ -16,6 +16,9 @@ struct foo {
 __u64 acquired;
 __u64 released;
 __u32 cancelled;
+/* The task the kernel handed test_refcounted a reference to, and how often the unwinder released it. */
+__u64 task_ptr;
+__u32 task_released;
 
 /* The object the unwinder released: the handle of an object is its pointer. */
 SEC("fentry/bpf_unwind_release")
@@ -23,6 +26,8 @@ int BPF_PROG(release_hook, struct bpf_resource *res, void *handle, void *flags)
 {
 	if (res->kind == BPF_RESOURCE_OBJ && (__u64)handle == acquired)
 		released = (__u64)handle;
+	if (task_ptr && (__u64)handle == task_ptr)
+		task_released++;
 	return 0;
 }
 
@@ -53,4 +58,37 @@ int BPF_PROG(test_1)
 SEC(".struct_ops.link")
 struct bpf_testmod_ops testmod_cancel = {
 	.test_1 = (void *)test_1,
+};
+
+/* Loads the task the kernel holds a reference to from ctx: throws holding it when dummy is 0, releases it otherwise. */
+static __noinline int release_or_throw(unsigned long long *ctx)
+{
+	struct task_struct *task = (void *)ctx[1];
+
+	barrier_var(task);
+	if (ctx[0] == 0)
+		bpf_throw(0);
+	bpf_task_release(task);
+	return 0;
+}
+
+/*
+ * The reference the kernel holds for a __ref argument is released once: by
+ * the subprog that loads it from ctx, or by the unwinder from the frame that
+ * throws holding it, not from the operator's frame as well, which keeps the
+ * task live across the call.
+ */
+SEC("struct_ops/test_refcounted")
+int BPF_PROG(test_refcounted, int dummy, struct task_struct *task)
+{
+	struct task_struct *t = task;
+
+	task_ptr = (__u64)t;
+	release_or_throw(ctx);
+	return t == NULL;
+}
+
+SEC(".struct_ops.link")
+struct bpf_testmod_ops testmod_ctx_ref = {
+	.test_refcounted = (void *)test_refcounted,
 };
