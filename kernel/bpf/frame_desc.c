@@ -48,13 +48,16 @@
 
 /*
  * What a location (register or stack slot) has held across the paths merged
- * into a descriptor so far. Only RES locations are released at run time; NULL
- * is the one disagreement allowed with RES, since the unwinder skips NULL.
+ * into a descriptor so far. Only RES and GUARD locations are released at run
+ * time; NULL is the one disagreement allowed with RES, since the unwinder
+ * skips NULL, and a GUARD location is released when a scalar of the frame
+ * says that the resource is there, see guarded().
  */
 enum {
 	LOC_UNSEEN,	/* no path classified this location yet */
 	LOC_NULL,	/* known NULL on every path so far */
 	LOC_RES,	/* holds the resource of class .res, maybe NULL on some path */
+	LOC_GUARD,	/* the resource of class .res on some paths, nothing to release on others */
 	LOC_COPY,	/* held a copy of a resource that is released elsewhere */
 	LOC_OTHER,	/* held something that must not be released */
 };
@@ -91,6 +94,12 @@ enum bpf_cell_state {
 #define ORDER_RCU_OBJ		-1
 #define ORDER_SECTION		-2
 #define ORDER_OBJ		-3
+/* A candidate for a guard: a live scalar on every visit of the build so far, see cells_update(). */
+enum {
+	CAND_UNSEEN,
+	CAND_SCALAR,
+	CAND_NONE,
+};
 
 static void note_held(struct bpf_verifier_env *env, const struct bpf_verifier_state *st, u32 origin);
 
@@ -118,6 +127,32 @@ struct scratch {
 	const unsigned long *live_stack;
 	struct bpf_frame_desc_fixed fixed[MAX_FIXED];
 	u16 nr_fixed;
+	/* the live scalars of the frame on this visit, the candidates for a guard, see scratch_ranges() */
+	struct bpf_guard_hull range[FRAME_LOCS];
+	u8 scalar[FRAME_LOCS];
+};
+
+/*
+ * A candidate for the guard of a location, see guarded(): the hull of its range
+ * on the visits that hold the resource there and on those that hold nothing
+ * to release there, and whether a constant on the one kind is outside every
+ * range of the other, see cand_add().
+ */
+struct bpf_guard_cand {
+	struct bpf_guard_hull held;
+	struct bpf_guard_hull free;
+	bool alive;	/* a live scalar on every visit */
+	bool excl;	/* every free range excludes the held constant: BPF_FRAME_GUARD_EQ */
+	bool excl32;
+	bool hexcl;	/* every held range excludes the free constant: BPF_FRAME_GUARD_NE */
+	bool hexcl32;
+};
+
+/* The candidates for the guard of location @loc of a build, see digest_open(). */
+struct bpf_guard_digest {
+	s16 loc;
+	struct bpf_guard_digest *next;
+	struct bpf_guard_cand cand[FRAME_LOCS];
 };
 
 /* Make room for @nr_slots stack slots in the descriptor at @slot, of insn @pc. */
@@ -136,6 +171,10 @@ static struct bpf_frame_desc_build *build_grow(struct bpf_verifier_env *env, u32
 	if (new)
 		memset(b, 0, offsetof(struct bpf_frame_desc_build, slots));
 	memset(&b->slots[old], 0, (nr_slots - old) * sizeof(b->slots[0]));
+	/* a slot the earlier visits did not have holds anything on them: no guard reads it */
+	if (!new && b->visits)
+		for (; old < nr_slots; old++)
+			b->slots[old].cand = CAND_NONE;
 	b->pc = pc;
 	b->nr_slots = nr_slots;
 	*slot = b;
@@ -161,8 +200,20 @@ static struct bpf_frame_desc_build *build_get(struct bpf_verifier_env *env, u32 
 	return b;
 }
 
+static void digests_free(struct bpf_frame_desc_build *b)
+{
+	struct bpf_guard_digest *d, *next;
+
+	for (d = b->digests; d; d = next) {
+		next = d->next;
+		kvfree(d);
+	}
+	b->digests = NULL;
+}
+
 static void build_destroy(struct bpf_frame_desc_build *b)
 {
+	digests_free(b);
 	kvfree(b->fixed);
 	kvfree(b->listed);
 	kvfree(b->targets);
@@ -303,6 +354,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	kvfree(env->call_refs);
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
+	kvfree(env->cb_releases);
 	kvfree(env->slot_writes);
 	kvfree(env->coclaims);
 	kvfree(env->section_insns);
@@ -312,6 +364,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	env->call_refs = NULL;
 	env->arrivals = NULL;
 	env->release_recs = NULL;
+	env->cb_releases = NULL;
 	env->slot_writes = NULL;
 	env->coclaims = NULL;
 	env->section_insns = NULL;
@@ -322,12 +375,14 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	env->call_ref_cnt = 0;
 	env->arrival_cnt = 0;
 	env->release_rec_cnt = 0;
+	env->cb_release_cnt = 0;
 	env->slot_write_cnt = 0;
 	env->coclaim_cnt = 0;
 	env->section_insn_cnt = 0;
 	env->resource_cnt = 0;
 	env->frame_desc_visits = 0;
 	env->frame_desc_conflicts = 0;
+	env->frame_desc_guards = 0;
 	env->mirrors_needed = 0;
 	for (i = 0; i < env->subprog_cnt; i++) {
 		struct bpf_subprog_info *sub = &env->subprog_info[i];
@@ -355,6 +410,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->call_refs);
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
+	kvfree(env->cb_releases);
 	kvfree(env->slot_writes);
 	kvfree(env->coclaims);
 	kvfree(env->section_insns);
@@ -370,6 +426,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	env->call_refs = NULL;
 	env->arrivals = NULL;
 	env->release_recs = NULL;
+	env->cb_releases = NULL;
 	env->slot_writes = NULL;
 	env->coclaims = NULL;
 	env->section_insns = NULL;
@@ -841,6 +898,330 @@ static int cand_idx(const struct cand *c)
 	return c->is_slot ? BPF_REG_10 + c->idx : c->idx;
 }
 
+static struct bpf_frame_desc_loc *build_loc_nth(struct bpf_frame_desc_build *b, int l)
+{
+	return l < BPF_REG_10 ? &b->regs[l] : &b->slots[l - BPF_REG_10];
+}
+
+/*
+ * A location that listed a resource is given up: what was listed there is
+ * mirrored, and it lists nothing again.
+ */
+static void withdraw(struct bpf_frame_desc_loc *loc)
+{
+	loc->state = LOC_OTHER;
+	loc->withdrawn = 1;
+}
+
+/*
+ * Guards. A frame may hold a resource at a site on some paths and not on
+ * others, since a callee, or the callback of a helper, released it on a
+ * run-time condition the frame tests afterwards: a scalar of the frame, whose
+ * range the verifier refined on each path and tests the frame's later
+ * branches against. Where the paths disagree that way on a location, the
+ * location is listed with a guard, the scalar, a constant and a test, when a
+ * live scalar of the frame separates the paths that hold the resource from
+ * the ones that do not: the unwinder tests it and skips the entry when it
+ * says that the resource is gone. Only live scalars qualify: two states the
+ * verifier joins or orders agree on the range of every live scalar, so that
+ * the range a visit sees covers every path folded into it, while a dead one
+ * says nothing about the paths. Each location of a build keeps the hull of
+ * its range over the visits, see cells_update(); a location that comes to
+ * disagree gets a digest, see digest_open(), which keeps for every candidate
+ * the hull of its range on the visits that hold the resource and on the
+ * others, and the guard is decided once the pass is over, see
+ * guards_resolve(). No instruction is emitted for a guard. Where no scalar
+ * tells, the location is withdrawn and the resource is mirrored, as before.
+ */
+/* The unsigned bounds of a scalar: the hull of its range, which may wrap around. */
+static void hull_set(struct bpf_guard_hull *h, const struct bpf_reg_state *reg)
+{
+	h->min = cnum64_umin(reg->r64);
+	h->max = cnum64_umax(reg->r64);
+	h->min32 = cnum32_umin(reg->r32);
+	h->max32 = cnum32_umax(reg->r32);
+}
+
+static void hull_union(struct bpf_guard_hull *h, const struct bpf_guard_hull *o)
+{
+	h->min = min(h->min, o->min);
+	h->max = max(h->max, o->max);
+	h->min32 = min(h->min32, o->min32);
+	h->max32 = max(h->max32, o->max32);
+}
+
+static bool hull_has(const struct bpf_guard_hull *h, u64 v)
+{
+	return h->min <= v && v <= h->max;
+}
+
+static bool hull_has32(const struct bpf_guard_hull *h, u32 v)
+{
+	return h->min32 <= v && v <= h->max32;
+}
+
+/*
+ * The candidates for a guard on this visit of @frame: the live scalars among
+ * the locations the unwinder reads, R6-R9 of every frame, R0-R5 of the frame
+ * at a site whose entry saves them, which the live set of the scratch says
+ * already, and the stack slots a spilled scalar fills.
+ */
+static void scratch_ranges(struct scratch *s, const struct bpf_func_state *frame)
+{
+	int k;
+
+	memset(s->scalar, 0, sizeof(s->scalar));
+	for (k = 0; k < BPF_REG_10; k++) {
+		const struct bpf_reg_state *reg = &frame->regs[k];
+
+		if (!(s->live_regs & BIT(k)) || reg->type != SCALAR_VALUE)
+			continue;
+		hull_set(&s->range[k], reg);
+		s->scalar[k] = 1;
+	}
+	for (k = 0; k < bpf_stack_nr_slots(frame) && k < MAX_BPF_STACK_SLOTS; k++) {
+		const struct bpf_stack_state *slot = bpf_stack_slot(frame, k);
+
+		if (!test_bit(k, s->live_stack) || !bpf_is_spilled_scalar_reg(slot) ||
+		    bpf_spill_size(slot) != BPF_REG_SIZE)
+			continue;
+		hull_set(&s->range[BPF_REG_10 + k], &slot->spilled_ptr);
+		s->scalar[BPF_REG_10 + k] = 1;
+	}
+}
+
+/*
+ * The ranges of this visit go into the hulls of the locations of @b: a
+ * location stays a candidate while every visit finds a live scalar there.
+ */
+static void cells_update(struct bpf_frame_desc_build *b, const struct scratch *s)
+{
+	int k;
+
+	for (k = 0; k < BPF_REG_10 + b->nr_slots; k++) {
+		struct bpf_frame_desc_loc *loc = build_loc_nth(b, k);
+
+		if (loc->cand == CAND_NONE)
+			continue;
+		if (!s->scalar[k]) {
+			loc->cand = CAND_NONE;
+			continue;
+		}
+		if (loc->cand == CAND_UNSEEN)
+			loc->hull = s->range[k];
+		else
+			hull_union(&loc->hull, &s->range[k]);
+		loc->cand = CAND_SCALAR;
+	}
+}
+
+static struct bpf_guard_digest *digest_find(const struct bpf_frame_desc_build *b, int loc)
+{
+	struct bpf_guard_digest *d;
+
+	for (d = b->digests; d; d = d->next)
+		if (d->loc == loc)
+			return d;
+	return NULL;
+}
+
+/* The digest of location @loc of @b, with no candidate alive when new. */
+static struct bpf_guard_digest *digest_get(struct bpf_frame_desc_build *b, int loc)
+{
+	struct bpf_guard_digest *d = digest_find(b, loc);
+
+	if (d)
+		return d;
+	d = kvzalloc(sizeof(*d), GFP_KERNEL_ACCOUNT);
+	if (!d)
+		return NULL;
+	d->loc = loc;
+	d->next = b->digests;
+	b->digests = d;
+	return d;
+}
+
+/* Candidate @c ranges over @held on the visits that hold the resource, over @free on the others. */
+static void cand_set(struct bpf_guard_cand *c, const struct bpf_guard_hull *held,
+		     const struct bpf_guard_hull *free)
+{
+	c->alive = true;
+	c->held = *held;
+	c->free = *free;
+	c->excl = !(held->min == held->max && hull_has(free, held->min));
+	c->excl32 = !(held->min32 == held->max32 && hull_has32(free, held->min32));
+	c->hexcl = !(free->min == free->max && hull_has(held, free->min));
+	c->hexcl32 = !(free->min32 == free->max32 && hull_has32(held, free->min32));
+}
+
+/*
+ * Candidate @c ranges over @r on another visit, one that holds the resource,
+ * or one that does not when @free. A constant the other kind of visit keeps
+ * has to stay outside every range of this kind for the tests on equality;
+ * once the hull of a kind grows past a constant those are off anyway.
+ */
+static void cand_add(struct bpf_guard_cand *c, const struct bpf_guard_hull *r, bool free)
+{
+	struct bpf_guard_hull *mine = free ? &c->free : &c->held;
+	const struct bpf_guard_hull *other = free ? &c->held : &c->free;
+	bool *ex = free ? &c->excl : &c->hexcl, *ex32 = free ? &c->excl32 : &c->hexcl32;
+
+	if (other->min == other->max && hull_has(r, other->min))
+		*ex = false;
+	if (other->min32 == other->max32 && hull_has32(r, other->min32))
+		*ex32 = false;
+	hull_union(mine, r);
+}
+
+/* Candidate @c takes what @o saw of the same location in another build of the insn. */
+static void cand_merge(struct bpf_guard_cand *c, const struct bpf_guard_cand *o)
+{
+	if (!c->alive || !o->alive) {
+		c->alive = false;
+		return;
+	}
+	cand_add(c, &o->held, false);
+	cand_add(c, &o->free, true);
+	c->excl &= o->excl;
+	c->excl32 &= o->excl32;
+	c->hexcl &= o->hexcl;
+	c->hexcl32 &= o->hexcl32;
+}
+
+/*
+ * Location @k of the build held a resource on every visit so far and holds
+ * nothing to release on this one, or the other way round when @holds: it is
+ * guarded if a scalar tells the two kinds of visit apart. Open its digest
+ * with every candidate of the build: the hull of a candidate over the visits
+ * so far is its range on the one kind of visit, its range on this visit on
+ * the other.
+ */
+static int digest_open(struct bpf_frame_desc_build *b, const struct scratch *s, int k, bool holds)
+{
+	struct bpf_guard_digest *d = digest_get(b, k);
+	int c;
+
+	if (!d)
+		return -ENOMEM;
+	for (c = 0; c < BPF_REG_10 + b->nr_slots; c++) {
+		const struct bpf_frame_desc_loc *loc = build_loc_nth(b, c);
+		struct bpf_guard_cand *cand = &d->cand[c];
+
+		if (loc->cand != CAND_SCALAR || !s->scalar[c]) {
+			cand->alive = false;
+			continue;
+		}
+		if (holds)
+			cand_set(cand, &s->range[c], &loc->hull);
+		else
+			cand_set(cand, &loc->hull, &s->range[c]);
+	}
+	return 0;
+}
+
+/*
+ * Guarded location @k of the build is visited again: this visit holds the
+ * resource there, or nothing to release when @free.
+ */
+static void digest_visit(struct bpf_frame_desc_build *b, const struct scratch *s, int k, bool free)
+{
+	struct bpf_guard_digest *d = digest_find(b, k);
+	int c;
+
+	if (!d)
+		return;
+	for (c = 0; c < BPF_REG_10 + b->nr_slots; c++) {
+		struct bpf_guard_cand *cand = &d->cand[c];
+
+		if (!cand->alive)
+			continue;
+		if (!s->scalar[c]) {
+			cand->alive = false;
+			continue;
+		}
+		cand_add(cand, &s->range[c], free);
+	}
+}
+
+/*
+ * The test of candidate @c, if it separates the visits: below some bound on
+ * every visit that holds the resource and at or above it on every visit
+ * that does not, or the other way round; else a constant on the one kind of
+ * visit that is never seen on the other. In 64 bits, or in the low 32 bits
+ * where the program compared the scalar in 32 bits.
+ */
+static bool cand_guard(const struct bpf_guard_cand *c, struct bpf_frame_desc_guard *g)
+{
+	const struct bpf_guard_hull *h = &c->held, *f = &c->free;
+
+	if (h->max < f->min) {
+		g->op = BPF_FRAME_GUARD_LT;
+		g->val = f->min;
+	} else if (f->max < h->min) {
+		g->op = BPF_FRAME_GUARD_GE;
+		g->val = h->min;
+	} else if (h->min == h->max && c->excl) {
+		g->op = BPF_FRAME_GUARD_EQ;
+		g->val = h->min;
+	} else if (f->min == f->max && c->hexcl) {
+		g->op = BPF_FRAME_GUARD_NE;
+		g->val = f->min;
+	} else if (h->max32 < f->min32) {
+		g->op = BPF_FRAME_GUARD_LT | BPF_FRAME_GUARD_32;
+		g->val = f->min32;
+	} else if (f->max32 < h->min32) {
+		g->op = BPF_FRAME_GUARD_GE | BPF_FRAME_GUARD_32;
+		g->val = h->min32;
+	} else if (h->min32 == h->max32 && c->excl32) {
+		g->op = BPF_FRAME_GUARD_EQ | BPF_FRAME_GUARD_32;
+		g->val = h->min32;
+	} else if (f->min32 == f->max32 && c->hexcl32) {
+		g->op = BPF_FRAME_GUARD_NE | BPF_FRAME_GUARD_32;
+		g->val = f->min32;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The guard of a location of @b from its digest @d, if a candidate survived:
+ * a callee-saved register first, which the unwinder has for every frame, then
+ * a stack slot, then R0-R5, which it has for the frame whose entry saved
+ * them.
+ */
+static bool guard_decide(const struct bpf_frame_desc_build *b, const struct bpf_guard_digest *d,
+			 const unsigned long *written, struct bpf_frame_desc_guard *g)
+{
+	int pass, c, from, to;
+
+	for (pass = 0; pass < 3; pass++) {
+		if (pass == 0) {
+			from = BPF_REG_6;
+			to = BPF_REG_10;
+		} else if (pass == 1) {
+			from = BPF_REG_10;
+			to = BPF_REG_10 + b->nr_slots;
+		} else if (b->regs_saved) {
+			from = BPF_REG_0;
+			to = BPF_REG_6;
+		} else {
+			break;
+		}
+		for (c = from; c < to; c++) {
+			/* a slot a callee writes says nothing at a site inside the callee */
+			if (c >= BPF_REG_10 && test_bit(c - BPF_REG_10, written))
+				continue;
+			if (!d->cand[c].alive || !cand_guard(&d->cand[c], g))
+				continue;
+			g->loc = c < BPF_REG_10 ? BPF_FRAME_LOC_REG : BPF_FRAME_LOC_STACK;
+			g->off = c < BPF_REG_10 ? c : -(c - BPF_REG_10 + 1) * BPF_REG_SIZE;
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Any chain, where a key is looked up for a frame whatever it is under, see mirror_key(). */
 /*
  * How frames of @subprog under chain @node got the reference of origin
@@ -1177,36 +1558,42 @@ static int build_add_listing(struct bpf_frame_desc_build *b, u32 origin, s16 loc
  * location an earlier path already lists for its class must be reused, so
  * that the reference is never listed twice on a path: whichever reference of
  * the class is there is released the same way; otherwise prefer a location no
- * earlier path has put a resource or a copy into, by rank. Fails when earlier
- * paths list the class at two candidates (-EEXIST), list another class or a
- * stack object at one (-EINVAL), or when no candidate is free (-ENOENT).
+ * earlier path has put a resource or a copy into, by rank; failing that, one
+ * that held nothing to release on the earlier paths, which lists the
+ * reference if a scalar guards it, see guarded(). Fails when earlier paths
+ * list the class at two candidates (-EEXIST), list another class or a stack
+ * object at one (-EINVAL), or when no candidate is free (-ENOENT).
  */
 static int choose(struct bpf_verifier_env *env, struct scratch *s, int nr)
 {
-	int i, chosen = -1, free = -1, free_rank = INT_MAX;
+	int i, chosen = -1, free = -1, free_rank = INT_MAX, other = -1, other_rank = INT_MAX;
 
 	for (i = 0; i < nr; i++) {
 		const struct cand *c = &s->cands[i];
 		struct bpf_frame_desc_loc *loc = build_loc(s->build, c);
+		int rank = cand_rank(c, loc, s->build->regs_saved);
 
-		if (loc->state == LOC_RES) {
+		if (loc->state == LOC_RES || loc->state == LOC_GUARD) {
 			if (loc->res != c->res || loc->indirect != c->indirect)
 				return -EINVAL;
 			if (chosen >= 0)
 				return -EEXIST;
 			chosen = i;
 		} else if (loc->state == LOC_UNSEEN || loc->state == LOC_NULL) {
-			int rank = cand_rank(c, loc, s->build->regs_saved);
-
 			if (rank < free_rank) {
 				free = i;
 				free_rank = rank;
 			}
+		} else if (loc->state == LOC_OTHER && !loc->withdrawn && rank < other_rank) {
+			other = i;
+			other_rank = rank;
 		}
 	}
 	if (chosen >= 0)
 		return chosen;
-	return free >= 0 ? free : -ENOENT;
+	if (free >= 0)
+		return free;
+	return other >= 0 ? other : -ENOENT;
 }
 
 /*
@@ -1248,13 +1635,51 @@ static int build_section_counter(struct bpf_frame_desc_build *b, u8 kind, u16 re
 }
 
 /*
- * Merge one path's classification of a location into the descriptor. A
- * listing that is withdrawn takes every reference listed there with it: they
- * are mirrored once the pass is over, see bpf_frame_desc_resolve().
+ * Location @k holds the resource on some paths and nothing to release on
+ * others: it @holds it on this path and did not on the earlier ones, or the
+ * other way round. The location is guarded by a scalar that tells the paths
+ * apart, if one is found once the pass is over, see guards_resolve(), and
+ * withdrawn otherwise, when what is listed there goes to its mirror. The
+ * reference listed is this path's when the location holds it now.
  */
-static int merge(struct bpf_verifier_env *env, struct scratch *s, struct bpf_frame_desc_loc *loc,
-		 int class, u16 res, u32 origin, bool owned, bool indirect)
+static int guarded(struct bpf_verifier_env *env, struct scratch *s, int k, bool holds, u16 res,
+		 u32 origin, bool owned, bool indirect)
 {
+	struct bpf_frame_desc_loc *loc = build_loc_nth(s->build, k);
+	int ret;
+
+	if (loc->state == LOC_GUARD) {
+		digest_visit(s->build, s, k, !holds);
+		return 0;
+	}
+	ret = digest_open(s->build, s, k, holds);
+	if (ret)
+		return ret;
+	env->frame_desc_conflicts++;
+	if (env->log.level & BPF_LOG_LEVEL2)
+		verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is held on some paths and not on others: guarded if a scalar tells\n",
+			s->pc, holds ? origin : loc->origin);
+	if (holds) {
+		loc->res = res;
+		loc->origin = origin;
+		loc->owned = owned;
+		loc->indirect = indirect;
+	}
+	loc->state = LOC_GUARD;
+	return 0;
+}
+
+/*
+ * Merge one path's classification of location @k into the descriptor. A
+ * listing that is withdrawn takes every reference listed there with it: they
+ * are mirrored once the pass is over, see bpf_frame_desc_resolve(). A
+ * location that holds the resource on this path and nothing to release on
+ * another, or the other way round, is guarded, see guarded().
+ */
+static int merge(struct bpf_verifier_env *env, struct scratch *s, int k, int class, u16 res,
+		 u32 origin, bool owned, bool indirect)
+{
+	struct bpf_frame_desc_loc *loc = build_loc_nth(s->build, k);
 	int ret;
 
 	switch (loc->state) {
@@ -1280,41 +1705,43 @@ static int merge(struct bpf_verifier_env *env, struct scratch *s, struct bpf_fra
 		}
 		return 0;
 	case LOC_RES:
+	case LOC_GUARD:
 		switch (class) {
 		case CLASS_RES:
 			/* choose() reuses a listed location only for the same class. */
-			if (loc->res == res && loc->indirect == indirect)
+			if (loc->res == res && loc->indirect == indirect) {
+				if (loc->state == LOC_GUARD)
+					digest_visit(s->build, s, k, false);
 				return 0;
-			loc->state = LOC_OTHER;
+			}
+			withdraw(loc);
 			return conflict(env, s, origin, owned,
 					"shares a location with another kind of resource");
 		case CLASS_NULL:
-			/* A stack object in place is never NULL. */
-			if (!loc->indirect) {
-				loc->state = LOC_OTHER;
-				return conflict(env, s, loc->origin, loc->owned,
-						"is a stack object that is not there on every path");
-			}
+			/* A stack object in place is never NULL: it is not there on this path. */
+			if (!loc->indirect)
+				return guarded(env, s, k, false, 0, 0, false, false);
 			loc->nullable = 1;
 			return 0;
-		default:
-			/* Not the resource on this path: the listing is withdrawn. */
+		case CLASS_COPY:
+			/* Another resource's copy on this path: the listing is withdrawn. */
 			ret = conflict(env, s, loc->origin, loc->owned,
 				       "is at different locations on different paths");
 			if (ret)
 				return ret;
-			loc->state = LOC_OTHER;
-			if (class == CLASS_COPY)
-				return conflict(env, s, origin, owned,
-						"shares a location with another resource");
-			return 0;
+			withdraw(loc);
+			return conflict(env, s, origin, owned, "shares a location with another resource");
+		default:
+			/* Nothing to release here on this path: guarded, if a scalar tells. */
+			return guarded(env, s, k, false, 0, 0, false, false);
 		}
 	default:
-		/* choose() never lists a location an earlier path used otherwise. */
-		if (class == CLASS_RES)
-			return conflict(env, s, origin, owned,
-					"shares a location with another resource");
-		return 0;
+		if (class != CLASS_RES)
+			return 0;
+		/* choose() lists a location an earlier path used otherwise as a guarded one only. */
+		if (loc->state == LOC_OTHER && !loc->withdrawn)
+			return guarded(env, s, k, true, res, origin, owned, indirect);
+		return conflict(env, s, origin, owned, "shares a location with another resource");
 	}
 }
 
@@ -1348,59 +1775,104 @@ static s16 resource_order(const struct bpf_verifier_env *env, u16 res)
 	return env->resources[res].rcu ? ORDER_RCU_OBJ : ORDER_OBJ;
 }
 
+/* An entry with its guard while the entries are sorted, see build_body(). */
+struct body_entry {
+	struct bpf_frame_desc_entry ent;
+	struct bpf_frame_desc_guard guard;
+};
+
+static int body_cmp(const void *a, const void *b)
+{
+	return entry_cmp(&((const struct body_entry *)a)->ent, &((const struct body_entry *)b)->ent);
+}
+
 /*
- * Lay out the entries of one descriptor: every listed location of the frame,
- * the locks, IRQ flags and sections it holds, and the mirrors it lists.
+ * Lay out the entries of one descriptor into @ents, or count them: every
+ * listed location of the frame, with its guard where it has one, the locks,
+ * IRQ flags and sections it holds, and the mirrors it lists. Returns how
+ * many, and in @nguards how many are guarded.
  */
 static u32 build_body(const struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b,
-		      struct bpf_frame_desc *d)
+		      struct body_entry *ents, u32 *nguards)
 {
-	u32 n = 0, i;
+	u32 n = 0, ng = 0, i;
 
 	for (i = 0; i < BPF_REG_10 + b->nr_slots; i++) {
 		const struct bpf_frame_desc_loc *loc = i < BPF_REG_10 ? &b->regs[i] :
 								     &b->slots[i - BPF_REG_10];
 		struct bpf_frame_desc_entry *ent;
 
-		if (loc->state != LOC_RES)
+		if (loc->state != LOC_RES && loc->state != LOC_GUARD)
 			continue;
-		if (!d) {
+		ng += loc->state == LOC_GUARD;
+		if (!ents) {
 			n++;
 			continue;
 		}
-		ent = &d->ent[n++];
+		ent = &ents[n].ent;
 		ent->loc = i < BPF_REG_10 ? BPF_FRAME_LOC_REG : BPF_FRAME_LOC_STACK;
 		ent->off = i < BPF_REG_10 ? i : -(i - BPF_REG_10 + 1) * BPF_REG_SIZE;
 		ent->flags = (loc->indirect ? BPF_FRAME_ENT_INDIRECT : 0) |
-			     (loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0);
+			     (loc->nullable ? BPF_FRAME_ENT_NULLABLE : 0) |
+			     (loc->state == LOC_GUARD ? BPF_FRAME_ENT_GUARDED : 0);
 		ent->res = loc->res;
 		ent->order = resource_order(env, loc->res);
+		if (loc->state == LOC_GUARD)
+			ents[n].guard = loc->guard;
+		n++;
 	}
-	if (d) {
+	if (ents) {
 		for (i = 0; i < b->nr_fixed; i++)
-			d->ent[n++] = b->fixed[i].ent;
+			ents[n++].ent = b->fixed[i].ent;
 		for (i = 0; i < b->nr_extra; i++)
-			d->ent[n++] = b->extra[i];
-		d->nent = n;
-		d->size = struct_size(d, ent, n);
-		sort(d->ent, n, sizeof(d->ent[0]), entry_cmp, NULL);
+			ents[n++].ent = b->extra[i];
+		sort(ents, n, sizeof(ents[0]), body_cmp, NULL);
 	} else {
 		n += b->nr_fixed + b->nr_extra;
 	}
+	*nguards = ng;
 	return n;
+}
+
+/* The size of a descriptor of @n entries, @ng of them guarded: the guards follow the entries. */
+static u32 desc_size(u32 n, u32 ng)
+{
+	u32 size = struct_size_t(struct bpf_frame_desc, ent, n);
+
+	if (ng)
+		size = ALIGN(size, __alignof__(struct bpf_frame_desc_guard)) +
+		       ng * sizeof(struct bpf_frame_desc_guard);
+	return size;
 }
 
 /* Add the descriptor of @b to the pool, sharing an identical earlier one. */
 static int pool_add(struct bpf_verifier_env *env, const struct bpf_frame_desc_build *b)
 {
 	struct bpf_frame_desc_pool *pool = env->frame_desc_pool;
+	struct bpf_frame_desc_guard *guards;
 	struct bpf_frame_desc *d;
-	u32 i, n = build_body(env, b, NULL);
+	struct body_entry *ents;
+	u32 i, k, ng, n = build_body(env, b, NULL, &ng);
 
-	d = kvzalloc(struct_size(d, ent, n), GFP_KERNEL_ACCOUNT);
-	if (!d)
+	ents = kvcalloc(n, sizeof(*ents), GFP_KERNEL_ACCOUNT);
+	d = kvzalloc(desc_size(n, ng), GFP_KERNEL_ACCOUNT);
+	if (!ents || !d) {
+		kvfree(ents);
+		kvfree(d);
 		return -ENOMEM;
-	build_body(env, b, d);
+	}
+	build_body(env, b, ents, &ng);
+	d->nent = n;
+	d->nguards = ng;
+	d->size = desc_size(n, ng);
+	guards = (struct bpf_frame_desc_guard *)bpf_frame_desc_guards(d);
+	for (i = 0, k = 0; i < n; i++) {
+		d->ent[i] = ents[i].ent;
+		if (ents[i].ent.flags & BPF_FRAME_ENT_GUARDED)
+			guards[k++] = ents[i].guard;
+	}
+	kvfree(ents);
+	env->frame_desc_guards += ng;
 	for (i = 0; i < pool->cnt; i++) {
 		if (pool->desc[i]->size == d->size && !memcmp(pool->desc[i], d, d->size)) {
 			kvfree(d);
@@ -2188,6 +2660,115 @@ static bool frame_stack_has_ref(const struct bpf_verifier_state *st, int frameno
 }
 
 /*
+ * What location @l of frame @h of @st holds now, for what the frame lists
+ * there in @b, the build of the call the frame waits in: the resource of one
+ * of its listings, NULL, or nothing to release, which a resource a callback
+ * released since is.
+ */
+static int feed_class(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+		      const struct bpf_frame_desc_build *b, const struct bpf_func_state *frame, int h,
+		      int l)
+{
+	const struct bpf_stack_state *slot = NULL;
+	const struct bpf_reg_state *reg = NULL;
+	int i, j, spi = l - BPF_REG_10;
+
+	if (l < BPF_REG_10)
+		reg = &frame->regs[l];
+	else if (spi < bpf_stack_nr_slots(frame))
+		slot = bpf_stack_slot(frame, spi);
+	else
+		return CLASS_OTHER;
+	for (i = 0; i < b->nr_listed; i++) {
+		const struct bpf_frame_desc_listing *lst = &b->listed[i];
+
+		if (lst->loc != l)
+			continue;
+		for (j = 0; j < st->acquired_refs; j++) {
+			const struct bpf_reference_state *ref = &st->refs[j];
+
+			if (ref->origin != lst->origin || (ref->frameno == h) != lst->owned)
+				continue;
+			if (reg ? reg_has_ref(st, reg, ref) :
+			    stack_slot_is_object(slot, ref->id) ||
+			    (bpf_is_spilled_reg(slot) && reg_has_ref(st, &slot->spilled_ptr, ref)))
+				return CLASS_RES;
+		}
+	}
+	if (reg ? bpf_register_is_null((struct bpf_reg_state *)reg) : stack_slot_is_null(slot))
+		return CLASS_NULL;
+	return CLASS_OTHER;
+}
+
+/*
+ * The callback a helper runs, and the frames above it up to the helper call,
+ * may release what the frame that called the helper holds: that frame lists
+ * the resource at the call, guarded by a scalar the callback stores to in
+ * the frame's stack, see bpf_frame_desc_record_release(). The guard has to
+ * be right at every site inside the callback, not only when the callback
+ * returns to the call: between the release and the store the two disagree.
+ * So a site in a frame above a callback is a visit of the descriptor of the
+ * helper call of the frame below the callback, for what that frame lists
+ * there: whether each listed location holds its resource now, and the
+ * scalars of the frame as they are now, which only its stack can change.
+ */
+static int guard_feed(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	struct scratch *s = env->frame_desc_scratch;
+	struct bpf_frame_desc_build *b;
+	int k, h, l, cls, ret;
+
+	for (k = 1; k <= st->curframe; k++) {
+		const struct bpf_func_state *frame;
+		u32 callsite, node;
+
+		if (!st->frame[k]->in_callback_fn)
+			continue;
+		h = k - 1;
+		frame = st->frame[h];
+		callsite = st->frame[k]->callsite;
+		/* the frames know their chains: chain_of() walked them at the site */
+		node = h ? frame->chain - 1 : 0;
+		b = build_get(env, callsite, bpf_stack_nr_slots(frame), NULL, node);
+		if (!b)
+			return -ENOMEM;
+		/* the call is visited before the callback runs; should it not be, nothing is guarded there */
+		if (!b->visits) {
+			b->fed_blind = true;
+			continue;
+		}
+		s->build = b;
+		s->pc = callsite;
+		s->subprog = frame->subprogno;
+		s->node = node;
+		s->live_regs = env->insn_aux_data[callsite].live_regs_before & CALLEE_SAVED_REGS;
+		s->live_stack = env->insn_aux_data[callsite].live_stack_before;
+		scratch_ranges(s, frame);
+		for (l = 0; l < BPF_REG_10 + b->nr_slots; l++) {
+			struct bpf_frame_desc_loc *loc = build_loc_nth(b, l);
+
+			if (loc->state != LOC_RES && loc->state != LOC_GUARD)
+				continue;
+			cls = feed_class(env, st, b, frame, h, l);
+			if (cls == CLASS_RES) {
+				if (loc->state == LOC_GUARD)
+					digest_visit(b, s, l, false);
+				continue;
+			}
+			if (cls == CLASS_NULL && loc->indirect) {
+				loc->nullable = 1;
+				continue;
+			}
+			ret = guarded(env, s, l, false, 0, 0, false, false);
+			if (ret)
+				return ret;
+		}
+		cells_update(b, s);
+	}
+	return 0;
+}
+
+/*
  * The site is a call of BPF code: note, for every reference listed, which
  * of R1-R5 pass it to the callee, and whether the callee can reach it through
  * the stack: as a stack argument, or spilled in, or a stack object in, a
@@ -2271,6 +2852,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 		return -ENOMEM;
 	b->regs_saved = regs_saved;
 	s->build = b;
+	scratch_ranges(s, frame);
 
 	/*
 	 * Several references of one origin, which a loop the verifier unrolled
@@ -2324,14 +2906,11 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 
 	/* Classify the remaining live locations and merge. */
 	for (k = 0; k < BPF_REG_10 + b->nr_slots; k++) {
-		struct bpf_frame_desc_loc *dst;
-
 		if (k < BPF_REG_10) {
 			if (!(s->live_regs & BIT(k)))
 				continue;
 			if (!s->class[k] && bpf_register_is_null(&frame->regs[k]))
 				s->class[k] = CLASS_NULL;
-			dst = &b->regs[k];
 		} else {
 			int spi = k - BPF_REG_10;
 
@@ -2341,13 +2920,13 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 			if (!s->class[k] && spi < bpf_stack_nr_slots(frame) &&
 			    stack_slot_is_null(bpf_stack_slot(frame, spi)))
 				s->class[k] = CLASS_NULL;
-			dst = &b->slots[spi];
 		}
-		ret = merge(env, s, dst, s->class[k], s->res[k], s->origin[k], s->owned[k],
+		ret = merge(env, s, k, s->class[k], s->res[k], s->origin[k], s->owned[k],
 			    s->indirect[k]);
 		if (ret)
 			return ret;
 	}
+	cells_update(b, s);
 	if (callee >= 0) {
 		ret = build_add_target(b, callee);
 		if (ret)
@@ -2358,7 +2937,7 @@ static int site_do(struct bpf_verifier_env *env, bool regs_saved,
 	/* the chains name the calls, of BPF code and of helpers running callbacks, by their sites */
 	b->callsite |= callee != -1;
 	b->visits++;
-	return 0;
+	return guard_feed(env, st);
 }
 
 /*
@@ -2736,7 +3315,9 @@ int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delt
  * The descriptor of @frame at the call it waits in was built from its state
  * at the call and lists what the slots held then; a site in the callee would
  * have the unwinder release what they hold now. Note the slots for the call,
- * see slot_writes_resolve().
+ * see slot_writes_resolve(). Where the frame above is a callback, every site
+ * inside it visits the descriptor with what the slots hold then, see
+ * guard_feed(): nothing is noted.
  */
 int bpf_frame_desc_record_stack_write(struct bpf_verifier_env *env, const struct bpf_func_state *frame,
 				      int min_off, int max_off)
@@ -2748,6 +3329,8 @@ int bpf_frame_desc_record_stack_write(struct bpf_verifier_env *env, const struct
 
 	if (!env->describe_frames || st->speculative || frame->frameno >= st->curframe ||
 	    min_off >= max_off || max_off > 0)
+		return 0;
+	if (st->frame[frame->frameno + 1]->in_callback_fn)
 		return 0;
 	call = st->frame[frame->frameno + 1]->callsite;
 	lo = max_t(int, -max_off / BPF_REG_SIZE, 0);
@@ -2824,6 +3407,33 @@ static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u16 subp
 }
 
 /*
+ * The callback of the call at @call, made by a frame of @subprog under chain
+ * @node, or a frame above the callback, may release the reference of origin
+ * @origin the frame holds, @owned or not: see cb_release_check().
+ */
+static int cb_release_add(struct bpf_verifier_env *env, u32 origin, u32 call, u32 node, u16 subprog,
+			  bool owned)
+{
+	struct bpf_cb_release *r;
+	u32 i, cnt = env->cb_release_cnt;
+
+	for (i = 0; i < cnt; i++) {
+		r = &env->cb_releases[i];
+		if (r->origin == origin && r->call == call && r->node == node &&
+		    r->subprog == subprog && r->owned == owned)
+			return 0;
+	}
+	r = kvrealloc(env->cb_releases, array_size(cnt + 1, sizeof(*r)), GFP_KERNEL_ACCOUNT);
+	if (!r)
+		return -ENOMEM;
+	r[cnt] = (struct bpf_cb_release) { .origin = origin, .call = call, .node = node,
+					   .subprog = subprog, .owned = owned };
+	env->cb_releases = r;
+	env->cb_release_cnt = cnt + 1;
+	return 0;
+}
+
+/*
  * Record that the current insn releases the resource refs[@idx], before it
  * is released: the frame's mirror of it is cleared, with the handle in the
  * register the insn takes it from, so that the mirror says exactly whether
@@ -2831,9 +3441,13 @@ static int mark_add(struct bpf_verifier_env *env, u32 origin, u32 node, u16 subp
  * the frame and for every frame between, by the chain each is under: they
  * are the ones to list the resource then, and the owner lists it no more at
  * the call it passed it through, see resolve_transfer(). A callback leaves
- * into the kernel code that ran it, which no descriptor sees through, so a
- * callback, or a frame above one up to the helper call, may not release what
- * the frames below hold.
+ * into the kernel code that ran it, which no descriptor sees through, and
+ * the frames below the helper call are unwound from the call once the
+ * helper has returned the cancellation: the frame that called the helper
+ * lists the resource at the call, released on the run-time condition the
+ * callback tested, which a scalar of the frame has to tell, see guarded(); the
+ * callback and the frames between do not list it. Locks and IRQ flags are
+ * not guarded: a callback may not release those of the frames below.
  */
 int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 {
@@ -2857,17 +3471,24 @@ int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx)
 	if (node < 0)
 		return node;
 	if (ref->frameno != st->curframe) {
-		for (c = ref->frameno + 1; c <= st->curframe; c++) {
-			if (!st->frame[c]->in_callback_fn)
-				continue;
-			verbose(env, "frame_desc: insn %d: a callback may not release what the frames below the helper call hold\n",
-				env->insn_idx);
-			return -EINVAL;
-		}
 		/* the frames know their chains: chain_of() walked them */
 		for (c = ref->frameno + 1; c <= st->curframe; c++) {
+			if (st->frame[c]->in_callback_fn)
+				break;
 			ret = mark_add(env, ref->origin, c ? st->frame[c]->chain - 1 : 0,
 				       st->frame[c]->subprogno);
+			if (ret)
+				return ret;
+		}
+		if (c <= st->curframe) {
+			if (ref->type != REF_TYPE_PTR) {
+				verbose(env, "frame_desc: insn %d: a callback may not release the lock or IRQ flags the frames below the helper call hold\n",
+					env->insn_idx);
+				return -EINVAL;
+			}
+			ret = cb_release_add(env, ref->origin, st->frame[c]->callsite,
+					     c > 1 ? st->frame[c - 1]->chain - 1 : 0,
+					     st->frame[c - 1]->subprogno, ref->frameno == c - 1);
 			if (ret)
 				return ret;
 		}
@@ -3321,11 +3942,6 @@ static struct bpf_frame_desc_build *build_next(struct bpf_verifier_env *env, str
 #define for_each_build(env, c, b)							\
 	for ((c)->idx = 0, (c)->b = NULL, (b) = build_next(env, c); (b); (b) = build_next(env, c))
 
-static struct bpf_frame_desc_loc *build_loc_nth(struct bpf_frame_desc_build *b, int l)
-{
-	return l < BPF_REG_10 ? &b->regs[l] : &b->slots[l - BPF_REG_10];
-}
-
 /*
  * A location of the lattice lists whichever reference of its class is there:
  * when any of the references listed there needs its mirror, the mirror
@@ -3356,11 +3972,11 @@ static int mirror_settle(struct bpf_verifier_env *env)
 					continue;
 				loc = build_loc_nth(b, l->loc);
 				m = mirror_of(env, subprog, l->origin, l->node, l->owned);
-				if (loc->state == LOC_RES && !(m && m->needed))
+				if ((loc->state == LOC_RES || loc->state == LOC_GUARD) && !(m && m->needed))
 					continue;
 				/* withdrawn, or mirrored: nothing listed there stays */
-				if (loc->state == LOC_RES)
-					loc->state = LOC_OTHER;
+				if (loc->state == LOC_RES || loc->state == LOC_GUARD)
+					withdraw(loc);
 				for (j = 0; j < b->nr_listed; j++) {
 					if (b->listed[j].loc != l->loc || b->listed[j].dropped)
 						continue;
@@ -3380,45 +3996,168 @@ static int mirror_settle(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/* What @dst lists, from @src: the lattice, not the candidate it is for a guard. */
+static void loc_copy_listing(struct bpf_frame_desc_loc *dst, const struct bpf_frame_desc_loc *src)
+{
+	dst->state = src->state;
+	dst->nullable = src->nullable;
+	dst->indirect = src->indirect;
+	dst->owned = src->owned;
+	dst->res = src->res;
+	dst->origin = src->origin;
+	dst->withdrawn = src->withdrawn;
+	dst->guard = src->guard;
+}
+
 /*
  * Merge what a location holds in build @src into what it holds in @dst, a
  * build of the same insn, as merge() does for the paths of one build: NULL
  * on one side makes the resource of the other nullable, and different
- * resources, or a resource against a copy or anything else, conflict, after
- * which the location is withdrawn. Returns 1 on a conflict.
+ * resources, or a resource against a copy, conflict, after which the
+ * location is withdrawn. A resource on one side and nothing to release on
+ * the other is guarded, like between the paths of one build, and so is a
+ * guarded location against anything but another resource; the caller merges
+ * the digests then. When @strict, the guards are decided already: guarded
+ * locations merge only when they agree, and nothing becomes guarded. Returns
+ * 1 on a conflict, 2 when the location is guarded.
  */
-static int loc_merge(struct bpf_frame_desc_loc *dst, const struct bpf_frame_desc_loc *src)
+static int loc_merge(struct bpf_frame_desc_loc *dst, const struct bpf_frame_desc_loc *src, bool strict)
 {
+	bool dres = dst->state == LOC_RES || dst->state == LOC_GUARD;
+	bool sres = src->state == LOC_RES || src->state == LOC_GUARD;
+
 	if (src->state == LOC_UNSEEN)
 		return 0;
 	if (dst->state == LOC_UNSEEN) {
-		*dst = *src;
-		return 0;
+		loc_copy_listing(dst, src);
+		return dst->state == LOC_GUARD ? 2 : 0;
 	}
 	if (dst->state == LOC_NULL && src->state == LOC_NULL)
 		return 0;
-	if (dst->state == LOC_NULL && src->state == LOC_RES) {
-		*dst = *src;
+	if (dst->state == LOC_NULL && sres) {
+		loc_copy_listing(dst, src);
 		dst->nullable = 1;
-		return 0;
+		return dst->state == LOC_GUARD ? 2 : 0;
 	}
-	if (dst->state == LOC_RES && src->state == LOC_NULL) {
+	if (dres && src->state == LOC_NULL) {
 		dst->nullable = 1;
-		return 0;
+		return dst->state == LOC_GUARD ? 2 : 0;
 	}
-	if (dst->state == LOC_RES && src->state == LOC_RES) {
-		if (dst->res == src->res && dst->indirect == src->indirect) {
+	if (dres && sres) {
+		if (dst->res != src->res || dst->indirect != src->indirect) {
+			withdraw(dst);
+			return 1;
+		}
+		if (dst->state == LOC_RES && src->state == LOC_RES) {
 			dst->nullable |= src->nullable;
 			return 0;
 		}
-		dst->state = LOC_OTHER;
-		return 1;
+		if (strict) {
+			if (dst->state != src->state || memcmp(&dst->guard, &src->guard, sizeof(dst->guard))) {
+				withdraw(dst);
+				return 1;
+			}
+			dst->nullable |= src->nullable;
+			return 0;
+		}
+		dst->nullable |= src->nullable;
+		dst->state = LOC_GUARD;
+		return 2;
 	}
-	if (dst->state == LOC_RES || src->state == LOC_RES) {
-		dst->state = LOC_OTHER;
-		return 1;
+	if (dres || sres) {
+		/* a withdrawn location lists nothing again: what it listed is mirrored */
+		if (strict || dst->withdrawn || src->withdrawn) {
+			withdraw(dst);
+			return 1;
+		}
+		if (sres)
+			loc_copy_listing(dst, src);
+		dst->state = LOC_GUARD;
+		return 2;
 	}
 	dst->state = LOC_OTHER;
+	dst->withdrawn |= src->withdrawn;
+	return 0;
+}
+
+/* The hull and the standing as a candidate of a location of @dst before a merge, see build_merge(). */
+struct cell_snap {
+	struct bpf_guard_hull hull;
+	u8 cand;
+};
+
+/*
+ * Location @l of @dst is guarded after the merge of @src into it: merge the
+ * digests. A side that was guarded brings its digest; a side that held the
+ * resource on every visit adds the hull of each candidate as a range that
+ * holds it, a side that held nothing to release adds it as one that does
+ * not; NULL adds nothing. The hulls of @dst are those from before the merge,
+ * in @snap.
+ */
+static int digest_merge(struct bpf_frame_desc_build *dst, const struct bpf_frame_desc_build *src,
+			int l, const struct cell_snap *snap, u8 dstate, u8 sstate)
+{
+	const struct bpf_guard_digest *sd = sstate == LOC_GUARD ? digest_find(src, l) : NULL;
+	struct bpf_guard_digest *dd = digest_find(dst, l);
+	bool dnew = !dd;
+	int c;
+
+	if (dnew) {
+		dd = digest_get(dst, l);
+		if (!dd)
+			return -ENOMEM;
+	}
+	for (c = 0; c < BPF_REG_10 + dst->nr_slots; c++) {
+		struct bpf_guard_cand *cand = &dd->cand[c];
+		const struct bpf_frame_desc_loc *o = c < BPF_REG_10 + src->nr_slots ? build_loc_nth((struct bpf_frame_desc_build *)src, c) : NULL;
+		const struct bpf_guard_hull *shull = o && o->cand == CAND_SCALAR ? &o->hull : NULL;
+		const struct bpf_guard_hull *dhull = snap[c].cand == CAND_SCALAR ? &snap[c].hull : NULL;
+
+		if (dstate == LOC_GUARD && sstate == LOC_GUARD) {
+			if (!sd || !cand->alive) {
+				cand->alive = false;
+				continue;
+			}
+			cand_merge(cand, &sd->cand[c]);
+			continue;
+		}
+		if (dstate == LOC_GUARD) {
+			if (!cand->alive)
+				continue;
+			if (!shull || sstate == LOC_UNSEEN)
+				cand->alive = sstate == LOC_NULL || sstate == LOC_UNSEEN ? cand->alive : false;
+			else if (sstate == LOC_RES)
+				cand_add(cand, shull, false);
+			else if (sstate != LOC_NULL)
+				cand_add(cand, shull, true);
+			continue;
+		}
+		if (sstate == LOC_GUARD) {
+			if (!sd) {
+				cand->alive = false;
+				continue;
+			}
+			*cand = sd->cand[c];
+			if (!cand->alive || dstate == LOC_NULL || dstate == LOC_UNSEEN)
+				continue;
+			if (!dhull)
+				cand->alive = false;
+			else if (dstate == LOC_RES)
+				cand_add(cand, dhull, false);
+			else
+				cand_add(cand, dhull, true);
+			continue;
+		}
+		/* a resource on one side, nothing to release on the other */
+		if (!dhull || !shull) {
+			cand->alive = false;
+			continue;
+		}
+		if (dstate == LOC_RES)
+			cand_set(cand, dhull, shull);
+		else
+			cand_set(cand, shull, dhull);
+	}
 	return 0;
 }
 
@@ -3457,6 +4196,8 @@ static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_fra
 		       const struct bpf_frame_desc_build *src, bool strict)
 {
 	struct bpf_frame_desc_build *dst;
+	struct cell_snap *snap;
+	bool fresh;
 	int l, i, k, order = 0, ret;
 
 	dst = build_grow(env, src->pc, dstp, src->nr_slots);
@@ -3465,15 +4206,54 @@ static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_fra
 	if (verifier_bug_if(dst->regs_saved != src->regs_saved || dst->nr_extra || src->nr_extra,
 			    env, "merging the builds of insn %d", src->pc))
 		return -EFAULT;
-	for (l = 0; l < BPF_REG_10 + src->nr_slots; l++) {
-		struct bpf_frame_desc_loc *d = l < BPF_REG_10 ? &dst->regs[l] :
-								&dst->slots[l - BPF_REG_10];
-		const struct bpf_frame_desc_loc *o = l < BPF_REG_10 ? &src->regs[l] :
-								      &src->slots[l - BPF_REG_10];
+	/* a build without visits is the fresh one of remerge_builds(): it takes what @src has */
+	fresh = !dst->visits;
+	snap = kvcalloc(FRAME_LOCS, sizeof(*snap), GFP_KERNEL_ACCOUNT);
+	if (!snap)
+		return -ENOMEM;
+	for (l = 0; l < BPF_REG_10 + dst->nr_slots; l++) {
+		const struct bpf_frame_desc_loc *d = build_loc_nth(dst, l);
 
-		if (loc_merge(d, o) && strict)
-			return 1;
+		snap[l].hull = d->hull;
+		snap[l].cand = d->cand;
 	}
+	for (l = 0; l < BPF_REG_10 + src->nr_slots; l++) {
+		struct bpf_frame_desc_loc *d = build_loc_nth(dst, l);
+		const struct bpf_frame_desc_loc *o = build_loc_nth((struct bpf_frame_desc_build *)src, l);
+		u8 dstate = d->state, sstate = o->state;
+
+		ret = loc_merge(d, o, strict);
+		if (ret == 1 && strict) {
+			kvfree(snap);
+			return 1;
+		}
+		if (ret == 2) {
+			ret = digest_merge(dst, src, l, snap, dstate, sstate);
+			if (ret) {
+				kvfree(snap);
+				return ret;
+			}
+		}
+	}
+	/* the candidates of the merged build: live scalars on the visits of both */
+	for (l = 0; l < BPF_REG_10 + dst->nr_slots; l++) {
+		struct bpf_frame_desc_loc *d = build_loc_nth(dst, l);
+		const struct bpf_frame_desc_loc *o = l < BPF_REG_10 + src->nr_slots ?
+			build_loc_nth((struct bpf_frame_desc_build *)src, l) : NULL;
+
+		if (fresh) {
+			d->cand = o ? o->cand : CAND_NONE;
+			d->hull = o ? o->hull : d->hull;
+		} else if (snap[l].cand == CAND_SCALAR && o && o->cand == CAND_SCALAR) {
+			d->hull = snap[l].hull;
+			hull_union(&d->hull, &o->hull);
+			d->cand = CAND_SCALAR;
+		} else {
+			d->cand = CAND_NONE;
+		}
+	}
+	kvfree(snap);
+	dst->fed_blind |= src->fed_blind;
 	for (i = 0; i < src->nr_listed; i++) {
 		const struct bpf_frame_desc_listing *sl = &src->listed[i];
 		struct bpf_frame_desc_listing *dl = NULL;
@@ -4043,7 +4823,7 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			if (!l->dropped)
 				continue;
 			if (l->loc >= 0) {
-				build_loc_nth(b, l->loc)->state = LOC_OTHER;
+				withdraw(build_loc_nth(b, l->loc));
 				continue;
 			}
 			if (l->loc != LISTED_FIXED)
@@ -4122,6 +4902,160 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
 }
 
 /*
+ * A frame waiting in a call lists what it keeps in its stack from its state
+ * at the call, and the callee may have written some of those slots since,
+ * through a pointer into the frame's stack, see
+ * bpf_frame_desc_record_stack_write(). Withdraw what the descriptors of the
+ * call list at the written slots, under every chain: the resource is
+ * mirrored then, as one at a location the paths disagree on is, and so are a
+ * lock or IRQ flags placed there.
+ */
+static int slot_writes_resolve(struct bpf_verifier_env *env)
+{
+	struct bpf_frame_desc_build *b;
+	u32 i, spi;
+	int k, ret;
+
+	for (i = 0; i < env->slot_write_cnt; i++) {
+		const struct bpf_slot_write *w = &env->slot_writes[i];
+		u32 call = env->frame_desc_new_of[w->call];
+		int subprog = insn_subprog(env, call);
+
+		for (b = env->insn_aux_data[call].frame_desc; b; b = b->next) {
+			for (spi = w->spi_lo; spi <= w->spi_hi && spi < b->nr_slots; spi++) {
+				struct bpf_frame_desc_loc *loc = &b->slots[spi];
+
+				if (loc->state != LOC_RES && loc->state != LOC_GUARD)
+					continue;
+				env->frame_desc_conflicts++;
+				if (env->log.level & BPF_LOG_LEVEL2)
+					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is in a slot a callee writes: mirrored\n",
+						w->call, loc->origin);
+				withdraw(loc);
+			}
+			for (k = 0; k < b->nr_fixed; k++) {
+				const struct bpf_frame_desc_fixed *f = &b->fixed[k];
+
+				if (f->ent.loc != BPF_FRAME_LOC_STACK || f->origin == ACQ_NONE ||
+				    -f->ent.off / BPF_REG_SIZE - 1 < w->spi_lo ||
+				    -f->ent.off / BPF_REG_SIZE - 1 > w->spi_hi)
+					continue;
+				env->frame_desc_conflicts++;
+				ret = mirror_need(env, subprog, f->origin, f->node, f->owned);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+	return 0;
+}
+
+/* The slots of the frame that a callee of the call at @pc writes, see slot_writes_resolve(). */
+static void slots_written_at(const struct bpf_verifier_env *env, u32 pc, unsigned long *written)
+{
+	u32 i, spi;
+
+	bitmap_zero(written, MAX_BPF_STACK_SLOTS);
+	for (i = 0; i < env->slot_write_cnt; i++) {
+		const struct bpf_slot_write *w = &env->slot_writes[i];
+
+		if (w->call != pc)
+			continue;
+		for (spi = w->spi_lo; spi <= w->spi_hi; spi++)
+			__set_bit(spi, written);
+	}
+}
+
+/*
+ * Decide the guards: a location that held a resource on some visits and
+ * nothing to release on others lists the resource with the scalar its digest
+ * found, or is withdrawn, after which what is listed there goes to its
+ * mirror, see mirror_settle(). After the transfer, which drops listings, and
+ * before the mirrors are settled.
+ */
+static int guards_resolve(struct bpf_verifier_env *env)
+{
+	DECLARE_BITMAP(written, MAX_BPF_STACK_SLOTS);
+	struct bpf_frame_desc_build *b;
+	struct build_cursor c;
+	u32 k;
+
+	for_each_build(env, &c, b) {
+		slots_written_at(env, b->pc, written);
+		for (k = 0; k < BPF_REG_10 + b->nr_slots; k++) {
+			struct bpf_frame_desc_loc *loc = build_loc_nth(b, k);
+			const struct bpf_guard_digest *d;
+
+			if (loc->state != LOC_GUARD)
+				continue;
+			d = digest_find(b, k);
+			memset(&loc->guard, 0, sizeof(loc->guard));
+			if (d && !b->fed_blind && guard_decide(b, d, written, &loc->guard)) {
+				static const char * const ops[] = { "<", ">=", "==", "!=" };
+
+				if (env->log.level & BPF_LOG_LEVEL2)
+					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is held when %s%d %s %llu%s\n",
+						b->pc, loc->origin,
+						loc->guard.loc == BPF_FRAME_LOC_REG ? "R" : "fp",
+						loc->guard.off, ops[loc->guard.op & ~BPF_FRAME_GUARD_32],
+						loc->guard.val,
+						loc->guard.op & BPF_FRAME_GUARD_32 ? " in 32 bits" : "");
+				continue;
+			}
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "frame_desc: insn %d: no scalar of the frame tells whether the reference obtained at insn %d is held: mirrored\n",
+					b->pc, loc->origin);
+			withdraw(loc);
+		}
+		digests_free(b);
+	}
+	return 0;
+}
+
+/*
+ * The frame that called a helper whose callback may release a reference the
+ * frame holds lists it at the call, guarded, see
+ * bpf_frame_desc_record_release(): it may not be released from a mirror of
+ * the frame, which the release in the callback does not clear and the return
+ * of the helper does not refresh, and the frame has to hold it at the call,
+ * where the guard is.
+ */
+static int cb_release_check(struct bpf_verifier_env *env)
+{
+	u32 i, k;
+
+	for (i = 0; i < env->cb_release_cnt; i++) {
+		const struct bpf_cb_release *r = &env->cb_releases[i];
+		const struct bpf_mirror *m = mirror_of(env, r->subprog, r->origin, r->node, r->owned);
+		struct bpf_frame_desc_build *b, *head;
+		bool listed = false;
+
+		head = env->insn_aux_data[env->frame_desc_new_of[r->call]].frame_desc;
+		for (b = head; b && !listed && !(m && m->needed); b = b->next) {
+			/* the build of the frame's chain, or the one build left for every chain */
+			if (b->node != r->node && head->next)
+				continue;
+			for (k = 0; k < b->nr_listed && !listed; k++) {
+				const struct bpf_frame_desc_listing *l = &b->listed[k];
+				const struct bpf_frame_desc_loc *loc;
+
+				if (l->origin != r->origin || l->owned != r->owned || l->dropped ||
+				    l->loc < 0)
+					continue;
+				loc = build_loc_nth(b, l->loc);
+				listed = loc->state == LOC_RES || loc->state == LOC_GUARD;
+			}
+		}
+		if (!listed) {
+			verbose(env, "frame_desc: insn %d: the callback may release the reference obtained at insn %d, and no scalar of the frame tells on every path\n",
+				r->call, r->origin);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
  * The sites asked for mirrors during the pass for whatever they could not
  * place, the references of the frames below included, whose listings the
  * transfer may have dropped since: a mirror that no listing that stays
@@ -4157,60 +5091,12 @@ static void mirror_drop_unlisted(struct bpf_verifier_env *env)
 /*
  * After the main pass, once every release and every return has been seen and
  * the stack is final: merge the builds of the chains that run one under the
- * other, settle which frame lists what, reserve the mirrors the sites need,
- * settle what the calls do to them, merge the builds of the chains that agree
- * back into one, and list each mirror in every descriptor of its subprog that
- * lists its resource, which lists it nowhere else.
+ * other, settle which frame lists what, decide the guards, reserve the
+ * mirrors the sites need, settle what the calls do to them, merge the builds
+ * of the chains that agree back into one, and list each mirror in every
+ * descriptor of its subprog that lists its resource, which lists it nowhere
+ * else.
  */
-/*
- * A frame waiting in a call lists what it keeps in its stack from its state
- * at the call, and the callee may have written some of those slots since,
- * through a pointer into the frame's stack, see
- * bpf_frame_desc_record_stack_write(). Withdraw what the descriptors of the
- * call list at the written slots, under every chain: the resource is
- * mirrored then, as one at a location the paths disagree on is, and so are a
- * lock or IRQ flags placed there.
- */
-static int slot_writes_resolve(struct bpf_verifier_env *env)
-{
-	struct bpf_frame_desc_build *b;
-	u32 i, spi;
-	int k, ret;
-
-	for (i = 0; i < env->slot_write_cnt; i++) {
-		const struct bpf_slot_write *w = &env->slot_writes[i];
-		u32 call = env->frame_desc_new_of[w->call];
-		int subprog = insn_subprog(env, call);
-
-		for (b = env->insn_aux_data[call].frame_desc; b; b = b->next) {
-			for (spi = w->spi_lo; spi <= w->spi_hi && spi < b->nr_slots; spi++) {
-				struct bpf_frame_desc_loc *loc = &b->slots[spi];
-
-				if (loc->state != LOC_RES)
-					continue;
-				env->frame_desc_conflicts++;
-				if (env->log.level & BPF_LOG_LEVEL2)
-					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is in a slot a callee writes: mirrored\n",
-						w->call, loc->origin);
-				loc->state = LOC_OTHER;
-			}
-			for (k = 0; k < b->nr_fixed; k++) {
-				const struct bpf_frame_desc_fixed *f = &b->fixed[k];
-
-				if (f->ent.loc != BPF_FRAME_LOC_STACK || f->origin == ACQ_NONE ||
-				    -f->ent.off / BPF_REG_SIZE - 1 < w->spi_lo ||
-				    -f->ent.off / BPF_REG_SIZE - 1 > w->spi_hi)
-					continue;
-				env->frame_desc_conflicts++;
-				ret = mirror_need(env, subprog, f->origin, f->node, f->owned);
-				if (ret)
-					return ret;
-			}
-		}
-	}
-	return 0;
-}
-
 int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 {
 	struct bpf_frame_desc_build *b;
@@ -4243,6 +5129,7 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	ret = merge_prefix_builds(env);
 	ret = ret ?: resolve_transfer(env);
 	ret = ret ?: slot_writes_resolve(env);
+	ret = ret ?: guards_resolve(env);
 	ret = ret ?: mirror_settle(env);
 	ret = ret ?: check_mirrors_sound(env);
 	ret = ret ?: remerge_builds(env);
@@ -4250,6 +5137,9 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	if (ret)
 		return ret;
 	mirror_drop_unlisted(env);
+	ret = cb_release_check(env);
+	if (ret)
+		return ret;
 	for (i = 0; i < env->mirror_cnt; i++) {
 		struct bpf_mirror *m = &env->mirrors[i];
 
@@ -4380,7 +5270,17 @@ int bpf_frame_desc_spilled_reg(struct bpf_verifier_env *env, u32 off, int reg, s
 			ent->loc = BPF_FRAME_LOC_STACK;
 			ent->off = slot_off;
 		}
-		if (b->regs[reg].state != LOC_RES)
+		/* a guard reading the register reads the slot */
+		for (k = 0; k < BPF_REG_10 + b->nr_slots; k++) {
+			struct bpf_frame_desc_loc *loc = build_loc_nth(b, k);
+
+			if (loc->state != LOC_GUARD || loc->guard.loc != BPF_FRAME_LOC_REG ||
+			    loc->guard.off != reg)
+				continue;
+			loc->guard.loc = BPF_FRAME_LOC_STACK;
+			loc->guard.off = slot_off;
+		}
+		if (b->regs[reg].state != LOC_RES && b->regs[reg].state != LOC_GUARD)
 			continue;
 		b = build_grow(env, off, pp, spi + 1);
 		if (!b)

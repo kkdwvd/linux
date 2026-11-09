@@ -368,6 +368,55 @@ out:
 }
 
 /*
+ * Does the guard of an entry say that its resource is held? The location of
+ * the guard is read like an entry's, see bpf_unwind_handle(): a register
+ * recovered for the frame, or a stack slot of it, and its value is tested as
+ * an unsigned number, on its low 32 bits where the guard says so. A guard
+ * that cannot be read says that the resource is not there: what is not
+ * released is leaked, what is released wrongly is worse.
+ */
+static bool bpf_unwind_guard_holds(const struct bpf_throw_ctx *ctx, const struct bpf_prog *prog, u64 fp,
+				   const struct bpf_frame_desc_guard *g, const u64 *regs, bool innermost)
+{
+	const char *name = prog->aux->name;
+	u64 val;
+
+	switch (g->loc) {
+	case BPF_FRAME_LOC_STACK:
+		val = *(u64 *)(long)(fp + g->off);
+		break;
+	case BPF_FRAME_LOC_REG:
+		if (g->off >= BPF_REG_6) {
+			val = regs[g->off - BPF_REG_6];
+		} else if (innermost && ctx->regs) {
+			val = ctx->regs->r[g->off];
+		} else {
+			WARN_ONCE(1, "bpf: no register file to read the guard R%d of %s from\n", g->off,
+				  name);
+			return false;
+		}
+		break;
+	default:
+		WARN_ONCE(1, "bpf: bad location %d in a guard of %s\n", g->loc, name);
+		return false;
+	}
+	if (g->op & BPF_FRAME_GUARD_32)
+		val = (u32)val;
+	switch (g->op & ~BPF_FRAME_GUARD_32) {
+	case BPF_FRAME_GUARD_LT:
+		return val < g->val;
+	case BPF_FRAME_GUARD_GE:
+		return val >= g->val;
+	case BPF_FRAME_GUARD_EQ:
+		return val == g->val;
+	case BPF_FRAME_GUARD_NE:
+		return val != g->val;
+	}
+	WARN_ONCE(1, "bpf: bad test %d in a guard of %s\n", g->op, name);
+	return false;
+}
+
+/*
  * Count the sections a frame's entry holds for their phase. The entry counts
  * the sections the frame entered less those of its callers it or a callee
  * left, which nets out a callee's leaving of a caller's section, and a frame
@@ -408,30 +457,38 @@ static bool bpf_unwind_irqs_enabled(const struct bpf_throw_ctx *ctx, const struc
  * enabled, of which it can have one at most, since every later save found
  * them disabled, are restored last, after the locks and the other flags in
  * whatever order the frame saved them; the flags of an irqsave lock go with
- * the lock.
+ * the lock. A guarded entry is released only when its guard says that the
+ * resource is held, see bpf_unwind_guard_holds(); the guards follow the
+ * entries, one per guarded entry in their order.
  */
 static void bpf_unwind_frame(struct bpf_throw_ctx *ctx, const struct bpf_prog *prog,
 			     const struct bpf_frame_desc *d, u64 fp, const u64 *regs, bool innermost)
 {
 	const struct bpf_frame_desc_pool *pool = prog->aux->frame_desc_pool;
+	const struct bpf_frame_desc_guard *guards = bpf_frame_desc_guards(d);
 	int passes = ctx->phase == BPF_UNWIND_PHASE_LOCKS ? 2 : 1, pass;
-	u32 i;
+	u32 i, g;
 
 	for (pass = 0; pass < passes; pass++) {
 		void *flags = NULL;
 		bool late = false;
 
-		for (i = 0; i < d->nent; i++) {
+		for (i = 0, g = 0; i < d->nent; i++) {
 			const struct bpf_frame_desc_entry *ent = &d->ent[i];
 			const struct bpf_resource *res = &pool->resources[ent->res];
+			const struct bpf_frame_desc_guard *guard = NULL;
 			int phase = release_phase(res);
 
+			if (ent->flags & BPF_FRAME_ENT_GUARDED)
+				guard = &guards[g++];
 			if (phase == BPF_UNWIND_PHASE_SECTIONS) {
 				if (ctx->phase == BPF_UNWIND_PHASE_LOCKS && !pass)
 					bpf_unwind_count(ctx, fp, ent, res);
 				continue;
 			}
 			if (phase != ctx->phase)
+				continue;
+			if (guard && !bpf_unwind_guard_holds(ctx, prog, fp, guard, regs, innermost))
 				continue;
 			if (passes == 2) {
 				/* an irqsave lock goes in the pass of its flags, which precede it */
