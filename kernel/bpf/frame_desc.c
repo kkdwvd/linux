@@ -3547,7 +3547,7 @@ int bpf_frame_desc_record_load(struct bpf_verifier_env *env, int regno)
 	for (i = 0; i < st->acquired_refs; i++) {
 		const struct bpf_reference_state *ref = &st->refs[i];
 
-		if (ref->frameno == st->curframe)
+		if (ref_owned(st, ref, st->curframe))
 			continue;
 		ret = ref_class_in_reg(env, st, reg, ref);
 		if (ret < 0)
@@ -5272,6 +5272,7 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 {
 	struct bpf_frame_desc_build *b;
 	struct build_cursor c;
+	char name[64];
 	u32 k, j;
 	int ret;
 
@@ -5300,8 +5301,9 @@ static int resolve_transfer(struct bpf_verifier_env *env)
 			if (l->loc == LISTED_SKIPPED) {
 				mirror_key(env, subprog, l->origin, l->node, false, &how, &at, &res);
 				if (how == MIRROR_LOAD) {
-					verbose(env, "frame_desc: subprog %d releases the reference obtained at insn %d, which it holds nowhere at insn %d, before loading it at insn %d\n",
-						subprog, l->origin, b->pc, at);
+					verbose(env, "frame_desc: subprog %d releases the reference %s, which it holds nowhere at insn %d, before loading it at insn %d\n",
+						subprog, bpf_origin_name(l->origin, name, sizeof(name)), b->pc,
+						at);
 					return -EINVAL;
 				}
 				ret = mirror_need(env, subprog, l->origin, l->node, false);
