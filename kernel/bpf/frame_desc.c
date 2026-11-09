@@ -3067,11 +3067,10 @@ static int site_passed(struct bpf_verifier_env *env, struct bpf_verifier_state *
 					passed |= PASSED_STACK;
 			/*
 			 * A reference the kernel holds for a __ref argument of a
-			 * struct_ops program is owned by no frame of the state, and
-			 * reaches a callee that gets the context, which it loads it
-			 * from, see bpf_frame_desc_record_load().
+			 * struct_ops program reaches a callee that gets the context,
+			 * which it loads it from, see bpf_frame_desc_record_load().
 			 */
-			if (ref->frameno < 0 && ctx && env->prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+			if (bpf_origin_is_ctx_arg(ref->origin) && ctx)
 				passed |= PASSED_STACK;
 		}
 		if (!held)
@@ -4287,6 +4286,7 @@ static int mirror_settle(struct bpf_verifier_env *env)
 {
 	struct bpf_frame_desc_build *b;
 	struct build_cursor c;
+	char name[64];
 	u32 k, j;
 	bool again = true;
 	int ret;
@@ -4309,8 +4309,8 @@ static int mirror_settle(struct bpf_verifier_env *env)
 					continue;
 				/* the mirror would release it where the callee lists it, see passed_guard() */
 				if (l->must_guard) {
-					verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths and holds it on others, and the reference is mirrored\n",
-						b->pc, l->origin);
+					verbose(env, "frame_desc: the call at insn %d passes the reference %s to a callee that releases it on some paths and holds it on others, and the reference is mirrored\n",
+						b->pc, bpf_origin_name(l->origin, name, sizeof(name)));
 					return -EINVAL;
 				}
 				/* withdrawn, or mirrored: nothing listed there stays */
@@ -5427,6 +5427,7 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
 static int slot_writes_resolve(struct bpf_verifier_env *env)
 {
 	struct bpf_frame_desc_build *b;
+	char name[64];
 	u32 i, spi;
 	int k, ret;
 
@@ -5443,8 +5444,8 @@ static int slot_writes_resolve(struct bpf_verifier_env *env)
 					continue;
 				env->frame_desc_conflicts++;
 				if (env->log.level & BPF_LOG_LEVEL2)
-					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is in a slot a callee writes: mirrored\n",
-						w->call, loc->origin);
+					verbose(env, "frame_desc: insn %d: the reference %s is in a slot a callee writes: mirrored\n",
+						w->call, bpf_origin_name(loc->origin, name, sizeof(name)));
 				withdraw(loc);
 			}
 			for (k = 0; k < b->nr_fixed; k++) {
