@@ -482,6 +482,12 @@ static void bpf_unwind_frame(struct bpf_throw_ctx *ctx, const struct bpf_prog *p
 			if (ent->flags & BPF_FRAME_ENT_GUARDED)
 				guard = &guards[g++];
 			if (phase == BPF_UNWIND_PHASE_SECTIONS) {
+				/*
+				 * A guard comes from a location of the lattice, see
+				 * build_body(); a section entry is fixed and has none, and
+				 * is counted whatever a guard would say.
+				 */
+				WARN_ON_ONCE(guard);
 				if (ctx->phase == BPF_UNWIND_PHASE_LOCKS && !pass)
 					bpf_unwind_count(ctx, fp, ent, res);
 				continue;
