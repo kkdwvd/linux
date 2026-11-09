@@ -16,8 +16,10 @@ struct foo {
 __u64 acquired;
 __u64 released;
 __u32 cancelled;
-/* The task the kernel handed test_refcounted a reference to, and how often the unwinder released it. */
-__u64 task_ptr;
+/*
+ * How often the unwinder released the task the kernel handed an operator a
+ * reference to: the current task, since the operators run at the attach.
+ */
 __u32 task_released;
 
 /* The object the unwinder released: the handle of an object is its pointer. */
@@ -26,7 +28,7 @@ int BPF_PROG(release_hook, struct bpf_resource *res, void *handle, void *flags)
 {
 	if (res->kind == BPF_RESOURCE_OBJ && (__u64)handle == acquired)
 		released = (__u64)handle;
-	if (task_ptr && (__u64)handle == task_ptr)
+	if ((__u64)handle == (__u64)bpf_get_current_task_btf())
 		task_released++;
 	return 0;
 }
@@ -83,7 +85,6 @@ int BPF_PROG(test_refcounted, int dummy, struct task_struct *task)
 {
 	struct task_struct *t = task;
 
-	task_ptr = (__u64)t;
 	release_or_throw(ctx);
 	return t == NULL;
 }
@@ -91,4 +92,60 @@ int BPF_PROG(test_refcounted, int dummy, struct task_struct *task)
 SEC(".struct_ops.link")
 struct bpf_testmod_ops testmod_ctx_ref = {
 	.test_refcounted = (void *)test_refcounted,
+};
+
+/*
+ * Throws before touching the argument: the operator holds the reference in
+ * the context alone, which nothing live points at by then, so the unwinder
+ * releases it from the mirror the entry fills from the context.
+ */
+SEC("struct_ops/test_refcounted")
+int BPF_PROG(test_refcounted_throw_unloaded, int dummy, struct task_struct *task)
+{
+	bpf_throw(0);
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct bpf_testmod_ops testmod_ctx_ref_unloaded = {
+	.test_refcounted = (void *)test_refcounted_throw_unloaded,
+};
+
+/* Throws with the argument loaded: released from the register that holds it. */
+SEC("struct_ops/test_refcounted")
+int BPF_PROG(test_refcounted_throw_loaded, int dummy, struct task_struct *task)
+{
+	acquired = (__u64)task;
+	bpf_throw(0);
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct bpf_testmod_ops testmod_ctx_ref_loaded = {
+	.test_refcounted = (void *)test_refcounted_throw_loaded,
+};
+
+static __noinline int throw_with_ctx(unsigned long long *ctx)
+{
+	if (ctx[0] == 0)
+		bpf_throw(0);
+	return 0;
+}
+
+/*
+ * Passes the context to a subprog that throws and releases nothing: the
+ * operator's frame lists the argument at the call, through the context or
+ * from its mirror, and the subprog, which holds it for the operator, does not.
+ */
+SEC("struct_ops/test_refcounted")
+int BPF_PROG(test_refcounted_callee_throws, int dummy, struct task_struct *task)
+{
+	throw_with_ctx(ctx);
+	bpf_task_release(task);
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct bpf_testmod_ops testmod_ctx_ref_callee = {
+	.test_refcounted = (void *)test_refcounted_callee_throws,
 };
