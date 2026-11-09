@@ -62,6 +62,7 @@ enum stat_id {
 	FRAME_DESC_SECTION_COUNTERS,
 	FRAME_DESC_CHAINS,
 	FRAME_DESC_SPLIT_SITES,
+	FRAME_DESC_GUARDS,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -832,6 +833,7 @@ static const struct stat_specs default_csv_output_spec = {
 		FRAME_DESC_SITES, FRAME_DESC_VISITS, FRAME_DESC_CLASSES, FRAME_DESC_BYTES,
 		FRAME_DESC_CONFLICTS, FRAME_DESC_MIRRORS, FRAME_DESC_MIRROR_INSNS,
 		FRAME_DESC_SECTION_COUNTERS, FRAME_DESC_CHAINS, FRAME_DESC_SPLIT_SITES,
+		FRAME_DESC_GUARDS,
 	},
 };
 
@@ -884,6 +886,7 @@ static struct stat_def {
 	[FRAME_DESC_SECTION_COUNTERS] = { "Frame desc section counters", {"section_counters", }, },
 	[FRAME_DESC_CHAINS] = { "Frame desc chains", {"chains", }, },
 	[FRAME_DESC_SPLIT_SITES] = { "Frame desc split sites", {"split_sites", }, },
+	[FRAME_DESC_GUARDS] = { "Frame desc guards", {"guards", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1073,7 +1076,7 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				&s->stats[MARK_READ_MAX_LEN]))
 			continue;
 		/* Only kernels with frame descriptors print this line. */
-		if (10 == sscanf(cur, "frame descriptors: sites %ld visits %ld classes %ld bytes %ld conflicts %ld mirrors %ld mirror_insns %ld section_counters %ld chains %ld split_sites %ld",
+		if (11 == sscanf(cur, "frame descriptors: sites %ld visits %ld classes %ld bytes %ld conflicts %ld mirrors %ld mirror_insns %ld section_counters %ld chains %ld split_sites %ld guards %ld",
 				 &s->stats[FRAME_DESC_SITES],
 				 &s->stats[FRAME_DESC_VISITS],
 				 &s->stats[FRAME_DESC_CLASSES],
@@ -1083,7 +1086,8 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 				 &s->stats[FRAME_DESC_MIRROR_INSNS],
 				 &s->stats[FRAME_DESC_SECTION_COUNTERS],
 				 &s->stats[FRAME_DESC_CHAINS],
-				 &s->stats[FRAME_DESC_SPLIT_SITES]))
+				 &s->stats[FRAME_DESC_SPLIT_SITES],
+				 &s->stats[FRAME_DESC_GUARDS]))
 			continue;
 
 		/*
@@ -2391,6 +2395,7 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case FRAME_DESC_SECTION_COUNTERS:
 	case FRAME_DESC_CHAINS:
 	case FRAME_DESC_SPLIT_SITES:
+	case FRAME_DESC_GUARDS:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2632,6 +2637,7 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case FRAME_DESC_SECTION_COUNTERS:
 	case FRAME_DESC_CHAINS:
 	case FRAME_DESC_SPLIT_SITES:
+	case FRAME_DESC_GUARDS:
 		*val = s ? s->stats[id] : 0;
 		break;
 	default:
@@ -2729,6 +2735,7 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case FRAME_DESC_SECTION_COUNTERS:
 	case FRAME_DESC_CHAINS:
 	case FRAME_DESC_SPLIT_SITES:
+	case FRAME_DESC_GUARDS:
 	case STACK:
 	case MAX_STACK: {
 		long val;

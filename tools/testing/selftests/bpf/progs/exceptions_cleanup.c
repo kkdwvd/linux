@@ -746,6 +746,15 @@ static const struct bpf_insn may_goto_insn = { .code = 0xe5, .off = 2 };
  * mirror, a hidden slot of the frame, which the acquisition fills and the
  * release clears.
  */
+/*
+ * With guarded entries the record is not mirrored here after all: R7, which
+ * the program keeps to know whether it holds the record, tells the paths
+ * apart, and the entry for R6 is guarded by it. The same goes for
+ * throw_mirror_shared_release and throw_mirror_arrives_two_ways; the mirror
+ * tests that stay are the ones no scalar tells, the record read by nothing,
+ * the lock at two locations, the IRQ flags saved in two orders, the
+ * refcounted object, the refresh after a call and the pad before one.
+ */
 #define MIRROR_PROG(name, site)						\
 SEC("tc")								\
 __naked int name(void)							\
@@ -2668,46 +2677,6 @@ int throw_recursion_holding(struct __sk_buff *ctx)
 	return alloc_recurse_throw(3);
 }
 
-/* The object, in the stack of the frame that passes the struct to a callee. */
-struct slot_ctx {
-	struct foo *node;
-};
-
-/*
- * Stashes the caller's object, overwrites the slot it came from with a
- * number across the throw, and puts it back. The caller's descriptor at the
- * call cannot list the slot: the unwinder would release the number.
- */
-static __noinline void clobber_slot_and_throw(struct slot_ctx *c)
-{
-	struct foo *f = c->node;
-
-	c->node = (void *)(long)param;
-	bpf_throw(0xeB9F);
-	c->node = f;
-}
-
-/*
- * The caller keeps the object in the slot alone at the call, which the callee
- * writes: the object is released from its mirror, once, and nothing is
- * released from the slot.
- */
-SEC("tc")
-int throw_callee_clobbers_slot(struct __sk_buff *ctx)
-{
-	struct slot_ctx c;
-	struct foo *f;
-
-	f = bpf_obj_new(typeof(*f));
-	if (!f)
-		return 1;
-	mark_acquired(f);
-	c.node = f;
-	clobber_slot_and_throw(&c);
-	bpf_obj_drop(c.node);
-	return 0;
-}
-
 /* The same, with the innermost frame spinning until its time is up. */
 static __noinline int alloc_recurse_spin(int n)
 {
@@ -2758,6 +2727,46 @@ SEC("tc")
 int cancel_recursion_check_holding(struct __sk_buff *ctx)
 {
 	return alloc_and_call_twice(60);
+}
+
+/* The object, in the stack of the frame that passes the struct to a callee. */
+struct slot_ctx {
+	struct foo *node;
+};
+
+/*
+ * Stashes the caller's object, overwrites the slot it came from with a
+ * number across the throw, and puts it back. The caller's descriptor at the
+ * call cannot list the slot: the unwinder would release the number.
+ */
+static __noinline void clobber_slot_and_throw(struct slot_ctx *c)
+{
+	struct foo *f = c->node;
+
+	c->node = (void *)(long)param;
+	bpf_throw(0xeB9F);
+	c->node = f;
+}
+
+/*
+ * The caller keeps the object in the slot alone at the call, which the callee
+ * writes: the object is released from its mirror, once, and nothing is
+ * released from the slot.
+ */
+SEC("tc")
+int throw_callee_clobbers_slot(struct __sk_buff *ctx)
+{
+	struct slot_ctx c;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	clobber_slot_and_throw(&c);
+	bpf_obj_drop(c.node);
+	return 0;
 }
 
 /* The same across the may_goto of a callback: the slot is a number while the callback spins. */

@@ -293,7 +293,7 @@ static void run_suite(const char *prefix)
 	THROW(throw_irq, 1, "0s");
 	THROW(throw_obj_after_caller_lock, 2, "01");
 	THROW(throw_sleeping_dtor_after_section, 1, "s0");
-	/* Mirrors: references no location of the frame holds on every path. */
+	/* Mirrors: references no location of the frame holds on every path, or guards where a scalar tells. */
 	THROW(throw_mirror_conflict, 1, "0");
 	THROW(throw_mirror_dead, 1, "0");
 	THROW(throw_mirror_lock_two_locations, 2, "01");
@@ -420,6 +420,25 @@ static void run_suite(const char *prefix)
 	CANCEL(cancel_arena_fetch_r0, 1, "0");
 	CANCEL(cancel_arena_loop, 1, "0");
 	CANCEL(cancel_arena_loop_helper, 1, "0");
+	/* Guards: a scalar of the frame says whether a callee or a callback released the object. */
+	RUN_AS(throw_guard_drop_if, "throw_guard_drop_if_kept", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_guard_drop_if, "throw_guard_drop_if_dropped", THROWN, 1, "", .param = 1);
+	RUN_AS(cancel_guard_drop_if, "cancel_guard_drop_if_kept", CANCELLED, 1, "0", .param = 0);
+	RUN_AS(cancel_guard_drop_if, "cancel_guard_drop_if_dropped", CANCELLED, 1, "", .param = 1);
+	RUN_AS(cancel_guard_two_levels, "cancel_guard_two_levels_kept", CANCELLED, 1, "0", .param = 0);
+	RUN_AS(cancel_guard_two_levels, "cancel_guard_two_levels_dropped", CANCELLED, 1, "",
+	       .param = 1);
+/* The callback drops the object when param has bit 0, and spins when it has bit 1; the caller spins otherwise. */
+#define GUARD_CB(pname) do {								\
+	RUN_AS(pname, #pname "_kept_after", CANCELLED, 1, "0", .param = 0);		\
+	RUN_AS(pname, #pname "_dropped_after", CANCELLED, 1, "", .param = 1);		\
+	RUN_AS(pname, #pname "_kept_in_cb", CANCELLED, 1, "0", .param = 2);		\
+	RUN_AS(pname, #pname "_dropped_in_cb", CANCELLED, 1, "", .param = 3);		\
+} while (0)
+	GUARD_CB(cancel_guard_loop_cb);
+	GUARD_CB(cancel_guard_loop_cb_inlined);
+	GUARD_CB(cancel_guard_for_each_push);
+#undef GUARD_CB
 	/* what the frames hold at call depth two */
 	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_throw", THROWN, 1, "0", .param = 1);
 	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_discard", 0, 1, "", .param = 0);

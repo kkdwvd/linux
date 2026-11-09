@@ -234,4 +234,70 @@ __naked int release_one_of_several(void)
 	: __clobber_all);
 }
 
+struct guard_obj {
+	int data;
+};
+
+/* The caller's object and a flag the callback sets when it drops it, in 4 bytes. */
+struct int_flag_ctx {
+	struct guard_obj *node;
+	int done;
+};
+
+static int drop_once_int_flag(u32 i, struct int_flag_ctx *c)
+{
+	if (!c->done) {
+		bpf_obj_drop(c->node);
+		c->done = 1;
+	}
+	return 0;
+}
+
+/*
+ * The callback drops the caller's object and says so in a flag of 4 bytes,
+ * which no guard reads: the caller cannot list the object at the call of the
+ * helper, and nothing else can release it when the callback is cancelled.
+ */
+SEC("tc")
+__description("frame_desc: a callback drops the caller's object, told by a flag no guard reads")
+__failure __msg("the callback may release the reference obtained at insn")
+int cb_release_without_guard(struct __sk_buff *skb)
+{
+	struct int_flag_ctx c = {};
+
+	c.node = bpf_obj_new(typeof(*c.node));
+	if (!c.node)
+		return 0;
+	bpf_loop(1, drop_once_int_flag, &c, 0);
+	if (!c.done)
+		bpf_obj_drop(c.node);
+	return 0;
+}
+
+static __noinline void drop_if_told(struct guard_obj *f, __u64 drop)
+{
+	if (drop)
+		bpf_obj_drop(f);
+}
+
+/*
+ * The callee drops the object when told to, and the caller throws without
+ * looking at the flag again: no scalar of the frame tells at the throw, the
+ * object goes to its mirror, and the call cannot keep the mirror right.
+ */
+SEC("tc")
+__description("frame_desc: a callee drops the object when told to, and nothing tells the caller")
+__failure __msg("neither R0 nor a stack slot tells on every path")
+int callee_release_untold(struct __sk_buff *skb)
+{
+	struct guard_obj *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	drop_if_told(f, skb->len & 1);
+	bpf_throw(0);
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";
