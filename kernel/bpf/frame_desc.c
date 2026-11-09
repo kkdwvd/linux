@@ -4353,6 +4353,7 @@ static int build_merge(struct bpf_verifier_env *env, int subprog, struct bpf_fra
 			dl->dropped = sl->dropped;
 		}
 		dl->passed |= sl->passed;
+		dl->unpassed |= sl->unpassed;
 	}
 	for (i = 0; i < src->nr_fixed; i++) {
 		const struct bpf_frame_desc_fixed *e = &src->fixed[i];
