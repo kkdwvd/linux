@@ -1476,9 +1476,12 @@ static int ref_class_in_reg(struct bpf_verifier_env *env, struct bpf_verifier_st
 	if (ref->type & REF_TYPE_LOCK_MASK)
 		return reg_is_lock(reg, ref) ? resource_of_lock(env, reg, lock_kind(ref->type)) :
 					       -ENOENT;
-	if (stack_object_find(st, ref, &objframe, &spi))
-		return reg_points_at(reg, objframe, spi) ?
-		       resource_of_object(env, bpf_stack_slot(st->frame[objframe], spi)) : -ENOENT;
+	if (stack_object_find(st, ref, &objframe, &spi)) {
+		/* a pointer to the object, or to a clone of a dynptr, which is the object as well */
+		const struct bpf_stack_state *slot = reg_object_slot(st, reg, ref->id);
+
+		return slot ? resource_of_object(env, slot) : -ENOENT;
+	}
 	if (ref->type != REF_TYPE_PTR || !reg_is_ref(reg, ref->id))
 		return -ENOENT;
 	return __resource_of_reg(env, reg, false);
