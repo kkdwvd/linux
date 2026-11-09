@@ -15,6 +15,25 @@
 #include <linux/kasan.h>
 
 /*
+ * bpf_throw_unwind() never returns: it transfers to a JITed callback, which
+ * returns to the kernel code that called the program. With a shadow call
+ * stack the return address its prologue pushed would never be popped, and the
+ * program's caller would pop it in place of its own. __noscs keeps a static
+ * shadow call stack out of the function. A dynamic one is patched in at boot
+ * in place of the pointer authentication of every function that has it, see
+ * UNWIND_PATCH_PAC_INTO_SCS, so the function has to do without that as well,
+ * which costs it nothing, as it never returns through it; the branch target
+ * identification stays.
+ */
+#if defined(CONFIG_DYNAMIC_SCS) && defined(CONFIG_ARM64_BTI_KERNEL)
+#define __bpf_unwind_entry	__noscs __attribute__((__target__("branch-protection=bti")))
+#elif defined(CONFIG_DYNAMIC_SCS)
+#define __bpf_unwind_entry	__noscs __attribute__((__target__("branch-protection=none")))
+#else
+#define __bpf_unwind_entry	__noscs
+#endif
+
+/*
  * Convert the instruction indices of the throw-site table to native offsets.
  * offsets[k] is the first byte of instruction k relative to image and
  * offsets[prog->len] the end of the program, as for bpf_prog_update_insn_ptrs().
@@ -798,6 +817,7 @@ static void bpf_unwind_frames(struct bpf_throw_ctx *ctx)
  * frames unwound hold are released from it and their callee-saved registers
  * restored for the callback. @kind says how the throw site was reached.
  */
+__bpf_unwind_entry
 void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
 	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
