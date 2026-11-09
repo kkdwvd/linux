@@ -682,7 +682,7 @@ u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena);
 struct bpf_arena_cpu_stack {
 	/*
 	 * Every invocation increments it. The one that finds 0 has the stack
-	 * and sets it to 0 when it exits.
+	 * and sets it to 0 when it exits, or the unwinder does for it.
 	 */
 	u64 busy;
 	u32 base;	/* r12 when the main program starts, the low 32 bits of the address */
@@ -699,6 +699,7 @@ int bpf_arena_stack_init(struct bpf_arena *arena);
 void __percpu *bpf_arena_stack_percpu(struct bpf_arena *arena);
 u64 bpf_arena_stack_get(struct bpf_prog_aux *aux, u64 busy);
 void bpf_arena_stack_put(struct bpf_prog_aux *aux, u32 base);
+void bpf_arena_stack_release(struct bpf_prog_aux *aux, u32 base);
 u64 bpf_arena_map_kern_vm_start(struct bpf_map *map);
 struct bpf_map *bpf_prog_arena(struct bpf_prog *prog);
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
@@ -2101,6 +2102,12 @@ struct bpf_prog_aux {
 	u32 arena_stack_size;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry;
+	/*
+	 * Where a function that takes a stack in arena keeps r12 as the stack
+	 * was taken, relative to its R10, for the unwinder to return the stack
+	 * when the exit that would is never reached. 0 when it takes none.
+	 */
+	s16 arena_stack_slot;
 	void (*recursion_detected)(struct bpf_prog *prog); /* callback if recursion is detected */
 	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
 	const struct btf_type *attach_func_proto;
