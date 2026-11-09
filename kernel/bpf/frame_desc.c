@@ -1803,6 +1803,7 @@ static int guarded(struct bpf_verifier_env *env, struct scratch *s, int k, bool 
 		 u32 origin, bool owned, bool indirect)
 {
 	struct bpf_frame_desc_loc *loc = build_loc_nth(s->build, k);
+	char name[64];
 	int ret;
 
 	if (loc->state == LOC_GUARD) {
@@ -1814,8 +1815,8 @@ static int guarded(struct bpf_verifier_env *env, struct scratch *s, int k, bool 
 		return ret;
 	env->frame_desc_conflicts++;
 	if (env->log.level & BPF_LOG_LEVEL2)
-		verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is held on some paths and not on others: guarded if a scalar tells\n",
-			s->pc, holds ? origin : loc->origin);
+		verbose(env, "frame_desc: insn %d: the reference %s is held on some paths and not on others: guarded if a scalar tells\n",
+			s->pc, bpf_origin_name(holds ? origin : loc->origin, name, sizeof(name)));
 	if (holds) {
 		loc->res = res;
 		loc->origin = origin;
@@ -2910,7 +2911,7 @@ static int feed_class(struct bpf_verifier_env *env, const struct bpf_verifier_st
 		for (j = 0; j < st->acquired_refs; j++) {
 			const struct bpf_reference_state *ref = &st->refs[j];
 
-			if (ref->origin != lst->origin || (ref->frameno == h) != lst->owned)
+			if (ref->origin != lst->origin || ref_owned(st, ref, h) != lst->owned)
 				continue;
 			if (reg ? reg_has_ref(st, reg, ref) :
 			    stack_slot_is_object(slot, ref->id) ||
@@ -5237,6 +5238,7 @@ static int passed_guard(struct bpf_verifier_env *env, struct bpf_frame_desc_buil
 	struct bpf_frame_desc_listing *l = &b->listed[k];
 	struct bpf_frame_desc_loc *loc = NULL;
 	struct bpf_guard_digest *d = NULL;
+	char name[64];
 	int j;
 
 	if (l->loc >= 0) {
@@ -5249,8 +5251,8 @@ static int passed_guard(struct bpf_verifier_env *env, struct bpf_frame_desc_buil
 		d = digest_find(b, PASS_DIGEST(l->loc));
 	slots_written_at(env, b->pc, written);
 	if (!d || !guard_decide(b, d, written, &loc->guard)) {
-		verbose(env, "frame_desc: the call at insn %d passes the reference obtained at insn %d to a callee that releases it on some paths and holds it on others, and no scalar of the frame tells\n",
-			b->pc, l->origin);
+		verbose(env, "frame_desc: the call at insn %d passes the reference %s to a callee that releases it on some paths and holds it on others, and no scalar of the frame tells\n",
+			b->pc, bpf_origin_name(l->origin, name, sizeof(name)));
 		return -EINVAL;
 	}
 	d->loc = l->loc;
@@ -5493,6 +5495,7 @@ static int guards_resolve(struct bpf_verifier_env *env)
 	DECLARE_BITMAP(written, MAX_BPF_STACK_SLOTS);
 	struct bpf_frame_desc_build *b;
 	struct build_cursor c;
+	char name[64];
 	u32 k;
 
 	for_each_build(env, &c, b) {
@@ -5509,8 +5512,8 @@ static int guards_resolve(struct bpf_verifier_env *env)
 				static const char * const ops[] = { "<", ">=", "==", "!=" };
 
 				if (env->log.level & BPF_LOG_LEVEL2)
-					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is held when %s%d %s %llu%s\n",
-						b->pc, loc->origin,
+					verbose(env, "frame_desc: insn %d: the reference %s is held when %s%d %s %llu%s\n",
+						b->pc, bpf_origin_name(loc->origin, name, sizeof(name)),
 						loc->guard.loc == BPF_FRAME_LOC_REG ? "R" : "fp",
 						loc->guard.off, ops[loc->guard.op & ~BPF_FRAME_GUARD_32],
 						loc->guard.val,
@@ -5518,8 +5521,8 @@ static int guards_resolve(struct bpf_verifier_env *env)
 				continue;
 			}
 			if (env->log.level & BPF_LOG_LEVEL2)
-				verbose(env, "frame_desc: insn %d: no scalar of the frame tells whether the reference obtained at insn %d is held: mirrored\n",
-					b->pc, loc->origin);
+				verbose(env, "frame_desc: insn %d: no scalar of the frame tells whether the reference %s is held: mirrored\n",
+					b->pc, bpf_origin_name(loc->origin, name, sizeof(name)));
 			withdraw(loc);
 		}
 		digests_free(b);
@@ -5537,6 +5540,7 @@ static int guards_resolve(struct bpf_verifier_env *env)
  */
 static int cb_release_check(struct bpf_verifier_env *env)
 {
+	char name[64];
 	u32 i, k;
 
 	for (i = 0; i < env->cb_release_cnt; i++) {
@@ -5562,8 +5566,8 @@ static int cb_release_check(struct bpf_verifier_env *env)
 			}
 		}
 		if (!listed) {
-			verbose(env, "frame_desc: insn %d: the callback may release the reference obtained at insn %d, and no scalar of the frame tells on every path\n",
-				r->call, r->origin);
+			verbose(env, "frame_desc: insn %d: the callback may release the reference %s, and no scalar of the frame tells on every path\n",
+				r->call, bpf_origin_name(r->origin, name, sizeof(name)));
 			return -EINVAL;
 		}
 	}
