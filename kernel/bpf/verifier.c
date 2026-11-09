@@ -7755,6 +7755,17 @@ static int check_cancel_site(struct bpf_verifier_env *env, bool regs_saved)
 	return bpf_frame_desc_site(env, regs_saved);
 }
 
+/*
+ * The may_goto the verifier adds in front of the insn is a cancellation point
+ * too. Its descriptor is kept in @slot until the may_goto is there.
+ */
+static int check_cancel_guard(struct bpf_verifier_env *env, struct bpf_frame_desc_build **slot)
+{
+	if (!env->cancellable)
+		return 0;
+	return bpf_frame_desc_guard_site(env, slot);
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -22119,6 +22130,15 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 		verbose(env, "loop at insn %d has no known bound in an offloaded program\n", h);
 		return -EINVAL;
 	}
+
+	/*
+	 * A timed out may_goto cancels the program instead of leaving. The
+	 * descriptor is made whenever the loop may get the guard, since the
+	 * walk may still give up on the loop after this state has been here.
+	 */
+	err = check_cancel_guard(env, &aux->guard_desc);
+	if (err)
+		return err;
 
 	/*
 	 * A guard has one way out, and only that one is looked at.
