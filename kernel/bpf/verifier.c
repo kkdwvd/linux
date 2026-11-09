@@ -23749,8 +23749,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 
 			aux->ctx_arg_info[i].ref_id = ret;
 			/* the kernel holds it, like a caller the frame descriptors do not see */
-			if (ret)
+			if (ret) {
 				state->refs[state->acquired_refs - 1].frameno = -1;
+				state->refs[state->acquired_refs - 1].origin = BPF_ORIGIN_CTX_ARG(i);
+			}
 		}
 	}
 

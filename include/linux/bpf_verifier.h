@@ -307,6 +307,13 @@ struct bpf_stack_state {
 	u8 slot_type[BPF_REG_SIZE];
 };
 
+/*
+ * The origin of the reference the kernel holds for __ref argument @argno of a
+ * struct_ops program: no insn has it, so it collides with no reference the
+ * program obtains, see bpf_frame_desc_record_release().
+ */
+#define BPF_ORIGIN_CTX_ARG(argno)	(U32_MAX - 1 - (argno))
+
 struct bpf_reference_state {
 	/* Each reference object has a type. Ensure REF_TYPE_PTR is zero to
 	 * default to pointer reference on zero initialization of a state.
@@ -335,7 +342,8 @@ struct bpf_reference_state {
 	s8 frameno;
 	/*
 	 * The insn of the owner's subprog that gave it the reference: the
-	 * acquiring call, or the call of the subprog that returned it.
+	 * acquiring call, or the call of the subprog that returned it; for a
+	 * reference the kernel holds, see BPF_ORIGIN_CTX_ARG().
 	 */
 	u32 origin;
 	union {
