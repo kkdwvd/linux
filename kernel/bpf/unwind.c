@@ -49,6 +49,13 @@ void bpf_prog_fill_frame_desc_table(struct bpf_prog *prog, const u32 *offsets, v
 	for (i = 0; i < tab->cnt; i++) {
 		struct bpf_frame_desc_site *site = &tab->site[i];
 
+		/*
+		 * A call of BPF code is a site the frame waits in; at any other
+		 * site the frame can be the innermost one of an unwind, which
+		 * bpf_check_attach_target() asks of a subprog, see there.
+		 */
+		if (!bpf_pseudo_call(&prog->insnsi[site->off]))
+			tab->innermost = true;
 		site->end = image + offsets[site->off + 1] - (void *)prog->bpf_func;
 		site->off = image + offsets[site->off] - (void *)prog->bpf_func;
 	}
@@ -888,8 +895,21 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 		cb = main_aux->bpf_cancel_cb;
 		tell = false;
 	} else if (aux->exception_cb || bpf_is_subprog(ctx.prog)) {
-		/* The verifier lets a helper run a callback with a site only with a pad. */
-		WARN_ON_ONCE(!aux->exception_cb && !aux->async_cb);
+		/*
+		 * A callback the kernel ran, asynchronous or the exception
+		 * callback. Any other kernel frame above a subprog is a bug: the
+		 * verifier lets a helper run a callback with a site only with a
+		 * pad, and only fentry may attach to a subprog an unwind can pass
+		 * through, see bpf_check_attach_target(), since the trampoline of
+		 * anything else would be that frame. Completing the frame with
+		 * the cancel value is the least that can be done then: the frames
+		 * below are not unwound, their caller takes the value for the
+		 * subprog's result, and what they hold leaks, but the kernel goes
+		 * on, and a struct_ops still hears of the cancellation.
+		 */
+		WARN_ONCE(!aux->exception_cb && !aux->async_cb,
+			  "bpf: unwinding %s stopped at %s under a frame that is not BPF code\n",
+			  main_aux->name, aux->name);
 		cookie = main_aux->cancel_retval;
 		cb = main_aux->bpf_cancel_cb;
 	} else {
@@ -900,7 +920,12 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	if (tell && main_aux->prog->type == BPF_PROG_TYPE_STRUCT_OPS && main_aux->st_ops &&
 	    main_aux->st_ops->cancel)
 		main_aux->st_ops->cancel(main_aux->prog);
-	WARN_ON_ONCE(!cb);
+	/*
+	 * Every program with a site has both callbacks, see bpf_do_misc_fixups();
+	 * without one nothing completes the frame, and there is no return from
+	 * here.
+	 */
+	BUG_ON(!cb);
 	cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }

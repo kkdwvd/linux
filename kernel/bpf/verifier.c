@@ -24417,6 +24417,59 @@ static int find_tgt_subprog(const struct bpf_prog *tgt_prog, u32 btf_id)
 }
 
 /*
+ * Can an unwind pass through a frame of @subprog of @prog? It can when a
+ * frame of the subprog, or of a subprog it calls, can be the innermost frame
+ * of an unwind. Every call of BPF code in a program whose frames are
+ * described is a site the caller waits in, so the callees are found through
+ * the calls in the instructions, which name their callee after
+ * jit_subprogs(), and a subprog's table says whether some site of its own is
+ * not such a call, see bpf_prog_fill_frame_desc_table(); a callx is such a
+ * site, whatever it calls. Returns a negative errno on failure.
+ */
+static int subprog_may_unwind(const struct bpf_prog *prog, int subprog)
+{
+	const struct bpf_prog_aux *aux = prog->aux;
+	u32 n = aux->real_func_cnt, *start, *todo, cnt = 1, i, s;
+	unsigned long *seen;
+	int ret = 0;
+
+	/* JITed as one function: nothing calls BPF code, and no subprog can be attached to */
+	if (!aux->func)
+		return 0;
+	start = kcalloc(2 * n, sizeof(*start), GFP_KERNEL);
+	seen = bitmap_zalloc(n, GFP_KERNEL);
+	if (!start || !seen) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	todo = start + n;
+	for (s = 1; s < n; s++)
+		start[s] = start[s - 1] + aux->func[s - 1]->len;
+	todo[0] = subprog;
+	__set_bit(subprog, seen);
+	while (cnt) {
+		const struct bpf_frame_desc_table *tab;
+
+		s = todo[--cnt];
+		tab = aux->func[s]->aux->frame_desc_table;
+		if (tab && tab->innermost) {
+			ret = 1;
+			break;
+		}
+		for (i = start[s]; i < start[s] + aux->func[s]->len; i++) {
+			const struct bpf_insn *insn = &prog->insnsi[i];
+
+			if (bpf_pseudo_call(insn) && !test_and_set_bit(insn->off, seen))
+				todo[cnt++] = insn->off;
+		}
+	}
+out:
+	kfree(start);
+	bitmap_free(seen);
+	return ret;
+}
+
+/*
  * The prologue of an extension gives a cloned skb a new head, unless the
  * prologue of the target program has done that. The callers of the function
  * that it replaces must not hold on to the old head.
@@ -24566,11 +24619,24 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		tgt_can_unwind = (subprog || tgt_prog->type == BPF_PROG_TYPE_EXT) &&
 				 (aux->func ? aux->func[subprog]->aux->can_unwind
 					    : aux->can_unwind);
-		/* unwind_exit would return to the trampoline that called the target */
-		if (tgt_can_unwind && !prog_extension &&
-		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
-			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
-			return -EINVAL;
+		/*
+		 * unwind_exit would return to the trampoline that called the
+		 * target, and the unwinder would stop at a frame of the target
+		 * under it, since the trampoline's frame is not BPF code and has
+		 * no pad, see bpf_stack_walker(). Only fentry leaves no frame of
+		 * its own behind while the target runs.
+		 */
+		if (!prog_extension && prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			ret = tgt_can_unwind;
+			if (!ret && subprog)
+				ret = subprog_may_unwind(tgt_prog, subprog);
+			if (ret < 0)
+				return ret;
+			if (ret) {
+				bpf_log(log, "Only fentry can attach to %s, which can unwind\n",
+					tname);
+				return -EINVAL;
+			}
 		}
 		/* What it takes of the stack is not counted, see bpf_insert_recursion_checks() */
 		if (aux->func && aux->func[subprog]->aux->in_recursion) {
