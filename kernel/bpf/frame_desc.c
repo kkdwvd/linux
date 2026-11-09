@@ -945,13 +945,6 @@ static int object_slot_id(const struct bpf_stack_state *slot)
 								    slot->spilled_ptr.id;
 }
 
-/* Does @reg point at the stack object at slot @spi of frame @frameno? */
-static bool reg_points_at(const struct bpf_reg_state *reg, int frameno, int spi)
-{
-	return reg->type == PTR_TO_STACK && reg->frameno == frameno &&
-	       tnum_is_const(reg->var_off) && (s64)reg->var_off.value == -(spi + 1) * BPF_REG_SIZE;
-}
-
 /*
  * Rank a candidate location that no earlier path lists: a location another
  * path left NULL merges best, then a stack slot or a callee-saved register,
@@ -2735,8 +2728,9 @@ static bool reg_has_ref(const struct bpf_verifier_state *st, const struct bpf_re
 
 	if (ref->type & REF_TYPE_LOCK_MASK)
 		return reg_is_lock(reg, ref);
+	/* a pointer to the object, or to a clone of a dynptr, which is the object as well */
 	if (stack_object_find(st, ref, &objframe, &spi))
-		return reg_points_at(reg, objframe, spi);
+		return reg_object_slot(st, reg, ref->id) != NULL;
 	return reg_is_ref(reg, ref->id);
 }
 
