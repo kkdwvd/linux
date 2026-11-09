@@ -780,6 +780,13 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		bpf_stack_slot(state, spi)->slot_type[i] = STACK_DYNPTR;
 		bpf_stack_slot(state, spi - 1)->slot_type[i] = STACK_DYNPTR;
 	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (state->frameno != env->cur_state->curframe) {
+		err = bpf_frame_desc_record_stack_write(env, state, -(spi + 1) * BPF_REG_SIZE,
+							-(spi - 1) * BPF_REG_SIZE);
+		if (err)
+			return err;
+	}
 
 	type = arg_to_dynptr_type(arg_type);
 	if (type == BPF_DYNPTR_TYPE_INVALID)
@@ -1080,6 +1087,14 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 			slot->slot_type[j] = STACK_ITER;
 
 		mark_stack_slot_scratched(env, spi - i);
+	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (state->frameno != env->cur_state->curframe) {
+		int err = bpf_frame_desc_record_stack_write(env, state, -(spi + 1) * BPF_REG_SIZE,
+							    -(spi - nr_slots + 1) * BPF_REG_SIZE);
+
+		if (err)
+			return err;
 	}
 
 	/* a stack object the unwinder destroys at its address, which the call takes */
@@ -4399,6 +4414,9 @@ static int check_stack_write(struct bpf_verifier_env *env,
 						reg, off, size,
 						value_regno, insn_idx);
 	}
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (!err && state->frameno != env->cur_state->curframe)
+		err = bpf_frame_desc_record_stack_write(env, state, min_off, max_off);
 	/* After the write is modelled: the insn may store a slice to its own buffer. */
 	invalidate_stack_slices(env, state->frameno, min_off, max_off);
 	return err;
@@ -8113,6 +8131,13 @@ static int check_stack_range_initialized(
 
 		min_off = reg_smin(reg) + off;
 		max_off = reg_smax(reg) + off;
+	}
+
+	/* the slots of a frame below: its descriptor at the call it waits in lists them no more */
+	if (clobber && access_size > 0 && state->frameno != env->cur_state->curframe) {
+		err = bpf_frame_desc_record_stack_write(env, state, min_off, max_off + access_size);
+		if (err)
+			return err;
 	}
 
 	/* Unprivileged outputs retain each byte's initialization state. */

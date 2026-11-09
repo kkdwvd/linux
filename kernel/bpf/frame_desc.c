@@ -355,6 +355,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
 	kvfree(env->cb_releases);
+	kvfree(env->slot_writes);
 	kvfree(env->coclaims);
 	kvfree(env->section_insns);
 	kvfree(env->resources);
@@ -364,6 +365,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	env->arrivals = NULL;
 	env->release_recs = NULL;
 	env->cb_releases = NULL;
+	env->slot_writes = NULL;
 	env->coclaims = NULL;
 	env->section_insns = NULL;
 	env->resources = NULL;
@@ -374,6 +376,7 @@ void bpf_frame_desc_reset(struct bpf_verifier_env *env)
 	env->arrival_cnt = 0;
 	env->release_rec_cnt = 0;
 	env->cb_release_cnt = 0;
+	env->slot_write_cnt = 0;
 	env->coclaim_cnt = 0;
 	env->section_insn_cnt = 0;
 	env->resource_cnt = 0;
@@ -408,6 +411,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	kvfree(env->arrivals);
 	kvfree(env->release_recs);
 	kvfree(env->cb_releases);
+	kvfree(env->slot_writes);
 	kvfree(env->coclaims);
 	kvfree(env->section_insns);
 	kvfree(env->resources);
@@ -423,6 +427,7 @@ void bpf_frame_desc_env_free(struct bpf_verifier_env *env)
 	env->arrivals = NULL;
 	env->release_recs = NULL;
 	env->cb_releases = NULL;
+	env->slot_writes = NULL;
 	env->coclaims = NULL;
 	env->section_insns = NULL;
 	env->resources = NULL;
@@ -867,12 +872,17 @@ static bool reg_points_at(const struct bpf_reg_state *reg, int frameno, int spi)
 /*
  * Rank a candidate location that no earlier path lists: a location another
  * path left NULL merges best, then a stack slot or a callee-saved register,
- * which outlive calls, before a caller-saved register. Lower is better.
+ * which outlive calls, before a caller-saved register. At a call, whose live
+ * registers are the callee-saved ones, a register comes before a slot: a
+ * callee may write the frame's stack through a pointer into it, never its
+ * callee-saved registers, see slot_writes_resolve(). Lower is better.
  */
-static int cand_rank(const struct cand *c, const struct bpf_frame_desc_loc *loc)
+static int cand_rank(const struct cand *c, const struct bpf_frame_desc_loc *loc, bool regs_saved)
 {
 	int rank = loc->state == LOC_NULL ? 0 : 4;
 
+	if (!regs_saved)
+		return rank + c->is_slot;
 	if (c->is_slot)
 		return rank;
 	return rank + (c->idx >= BPF_REG_6 ? 1 : 2);
@@ -1181,7 +1191,7 @@ static bool cand_guard(const struct bpf_guard_cand *c, struct bpf_frame_desc_gua
  * them.
  */
 static bool guard_decide(const struct bpf_frame_desc_build *b, const struct bpf_guard_digest *d,
-			 struct bpf_frame_desc_guard *g)
+			 const unsigned long *written, struct bpf_frame_desc_guard *g)
 {
 	int pass, c, from, to;
 
@@ -1199,6 +1209,9 @@ static bool guard_decide(const struct bpf_frame_desc_build *b, const struct bpf_
 			break;
 		}
 		for (c = from; c < to; c++) {
+			/* a slot a callee writes says nothing at a site inside the callee */
+			if (c >= BPF_REG_10 && test_bit(c - BPF_REG_10, written))
+				continue;
 			if (!d->cand[c].alive || !cand_guard(&d->cand[c], g))
 				continue;
 			g->loc = c < BPF_REG_10 ? BPF_FRAME_LOC_REG : BPF_FRAME_LOC_STACK;
@@ -1558,7 +1571,7 @@ static int choose(struct bpf_verifier_env *env, struct scratch *s, int nr)
 	for (i = 0; i < nr; i++) {
 		const struct cand *c = &s->cands[i];
 		struct bpf_frame_desc_loc *loc = build_loc(s->build, c);
-		int rank = cand_rank(c, loc);
+		int rank = cand_rank(c, loc, s->build->regs_saved);
 
 		if (loc->state == LOC_RES || loc->state == LOC_GUARD) {
 			if (loc->res != c->res || loc->indirect != c->indirect)
@@ -2286,7 +2299,11 @@ static int place_lock(struct bpf_verifier_env *env, struct scratch *s,
 		int rank;
 
 		c = &s->cands[k];
-		rank = c->is_slot ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
+		/* at a call a register, which a callee cannot write, see cand_rank() */
+		if (!s->build->regs_saved)
+			rank = c->is_slot;
+		else
+			rank = c->is_slot ? 0 : c->idx >= BPF_REG_6 ? 1 : 2;
 		if (rank < best) {
 			best = rank;
 			chosen = k;
@@ -3289,6 +3306,49 @@ int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delt
 		return 0;
 	return section_insn_add(env, env->insn_idx, st->frame[st->curframe]->subprogno, kind, delta,
 				false);
+}
+
+/*
+ * The current frame wrote the bytes [@min_off, @max_off) of the stack of
+ * @frame, a frame below, through a pointer into its stack: a struct the frame
+ * passed to a callee, which the callee fills, a buffer a helper writes into.
+ * The descriptor of @frame at the call it waits in was built from its state
+ * at the call and lists what the slots held then; a site in the callee would
+ * have the unwinder release what they hold now. Note the slots for the call,
+ * see slot_writes_resolve(). Where the frame above is a callback, every site
+ * inside it visits the descriptor with what the slots hold then, see
+ * guard_feed(): nothing is noted.
+ */
+int bpf_frame_desc_record_stack_write(struct bpf_verifier_env *env, const struct bpf_func_state *frame,
+				      int min_off, int max_off)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_slot_write *w;
+	u32 i, cnt = env->slot_write_cnt, call;
+	int lo, hi;
+
+	if (!env->describe_frames || st->speculative || frame->frameno >= st->curframe ||
+	    min_off >= max_off || max_off > 0)
+		return 0;
+	if (st->frame[frame->frameno + 1]->in_callback_fn)
+		return 0;
+	call = st->frame[frame->frameno + 1]->callsite;
+	lo = max_t(int, -max_off / BPF_REG_SIZE, 0);
+	hi = min_t(int, (-min_off - 1) / BPF_REG_SIZE, MAX_BPF_STACK_SLOTS - 1);
+	if (lo > hi)
+		return 0;
+	for (i = 0; i < cnt; i++) {
+		w = &env->slot_writes[i];
+		if (w->call == call && w->spi_lo <= lo && w->spi_hi >= hi)
+			return 0;
+	}
+	w = kvrealloc(env->slot_writes, array_size(cnt + 1, sizeof(*w)), GFP_KERNEL_ACCOUNT);
+	if (!w)
+		return -ENOMEM;
+	w[cnt] = (struct bpf_slot_write) { .call = call, .spi_lo = lo, .spi_hi = hi };
+	env->slot_writes = w;
+	env->slot_write_cnt = cnt + 1;
+	return 0;
 }
 
 /*
@@ -4842,6 +4902,71 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
 }
 
 /*
+ * A frame waiting in a call lists what it keeps in its stack from its state
+ * at the call, and the callee may have written some of those slots since,
+ * through a pointer into the frame's stack, see
+ * bpf_frame_desc_record_stack_write(). Withdraw what the descriptors of the
+ * call list at the written slots, under every chain: the resource is
+ * mirrored then, as one at a location the paths disagree on is, and so are a
+ * lock or IRQ flags placed there.
+ */
+static int slot_writes_resolve(struct bpf_verifier_env *env)
+{
+	struct bpf_frame_desc_build *b;
+	u32 i, spi;
+	int k, ret;
+
+	for (i = 0; i < env->slot_write_cnt; i++) {
+		const struct bpf_slot_write *w = &env->slot_writes[i];
+		u32 call = env->frame_desc_new_of[w->call];
+		int subprog = insn_subprog(env, call);
+
+		for (b = env->insn_aux_data[call].frame_desc; b; b = b->next) {
+			for (spi = w->spi_lo; spi <= w->spi_hi && spi < b->nr_slots; spi++) {
+				struct bpf_frame_desc_loc *loc = &b->slots[spi];
+
+				if (loc->state != LOC_RES && loc->state != LOC_GUARD)
+					continue;
+				env->frame_desc_conflicts++;
+				if (env->log.level & BPF_LOG_LEVEL2)
+					verbose(env, "frame_desc: insn %d: the reference obtained at insn %d is in a slot a callee writes: mirrored\n",
+						w->call, loc->origin);
+				withdraw(loc);
+			}
+			for (k = 0; k < b->nr_fixed; k++) {
+				const struct bpf_frame_desc_fixed *f = &b->fixed[k];
+
+				if (f->ent.loc != BPF_FRAME_LOC_STACK || f->origin == ACQ_NONE ||
+				    -f->ent.off / BPF_REG_SIZE - 1 < w->spi_lo ||
+				    -f->ent.off / BPF_REG_SIZE - 1 > w->spi_hi)
+					continue;
+				env->frame_desc_conflicts++;
+				ret = mirror_need(env, subprog, f->origin, f->node, f->owned);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+	return 0;
+}
+
+/* The slots of the frame that a callee of the call at @pc writes, see slot_writes_resolve(). */
+static void slots_written_at(const struct bpf_verifier_env *env, u32 pc, unsigned long *written)
+{
+	u32 i, spi;
+
+	bitmap_zero(written, MAX_BPF_STACK_SLOTS);
+	for (i = 0; i < env->slot_write_cnt; i++) {
+		const struct bpf_slot_write *w = &env->slot_writes[i];
+
+		if (w->call != pc)
+			continue;
+		for (spi = w->spi_lo; spi <= w->spi_hi; spi++)
+			__set_bit(spi, written);
+	}
+}
+
+/*
  * Decide the guards: a location that held a resource on some visits and
  * nothing to release on others lists the resource with the scalar its digest
  * found, or is withdrawn, after which what is listed there goes to its
@@ -4850,11 +4975,13 @@ static int resolve_section_counters(struct bpf_verifier_env *env)
  */
 static int guards_resolve(struct bpf_verifier_env *env)
 {
+	DECLARE_BITMAP(written, MAX_BPF_STACK_SLOTS);
 	struct bpf_frame_desc_build *b;
 	struct build_cursor c;
 	u32 k;
 
 	for_each_build(env, &c, b) {
+		slots_written_at(env, b->pc, written);
 		for (k = 0; k < BPF_REG_10 + b->nr_slots; k++) {
 			struct bpf_frame_desc_loc *loc = build_loc_nth(b, k);
 			const struct bpf_guard_digest *d;
@@ -4863,7 +4990,7 @@ static int guards_resolve(struct bpf_verifier_env *env)
 				continue;
 			d = digest_find(b, k);
 			memset(&loc->guard, 0, sizeof(loc->guard));
-			if (d && !b->fed_blind && guard_decide(b, d, &loc->guard)) {
+			if (d && !b->fed_blind && guard_decide(b, d, written, &loc->guard)) {
 				static const char * const ops[] = { "<", ">=", "==", "!=" };
 
 				if (env->log.level & BPF_LOG_LEVEL2)
@@ -4990,8 +5117,18 @@ int bpf_frame_desc_resolve(struct bpf_verifier_env *env)
 	for (i = 0; i < len; i++)
 		env->frame_desc_new_of[env->insn_aux_data[i].orig_idx] = i;
 
+	/*
+	 * A loop guard the pass described, which bpf_insert_loop_guards() did
+	 * not add after all: not a site, and nothing is mirrored for it.
+	 */
+	for (i = 0; i < len; i++) {
+		bpf_frame_desc_build_destroy(env->insn_aux_data[i].guard_desc);
+		env->insn_aux_data[i].guard_desc = NULL;
+	}
+
 	ret = merge_prefix_builds(env);
 	ret = ret ?: resolve_transfer(env);
+	ret = ret ?: slot_writes_resolve(env);
 	ret = ret ?: guards_resolve(env);
 	ret = ret ?: mirror_settle(env);
 	ret = ret ?: check_mirrors_sound(env);

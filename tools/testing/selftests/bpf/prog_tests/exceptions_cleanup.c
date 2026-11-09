@@ -317,6 +317,8 @@ static void run_suite(const char *prefix)
 	THROW(throw_callee_destroys_iter, 2, "1");
 	THROW(throw_callee_restores_irq, 2, "1");
 	THROW(throw_iter_by_callee, 1, "0");
+	/* A callee writes the slot the caller keeps the object in: released from the mirror, once. */
+	THROW(throw_callee_clobbers_slot, 1, "0");
 	/* Chains: what a callee releases under one chain of calls and not under another. */
 	RUN_AS(throw_release_if, "throw_release_if_callee", THROWN, 1, "", .param = 0);
 	RUN_AS(throw_release_if, "throw_release_if_caller", THROWN, 1, "0", .param = 1);
@@ -377,6 +379,7 @@ static void run_suite(const char *prefix)
 	CANCEL(cancel_may_goto_for_each_array, 1, "0");
 	CANCEL(cancel_may_goto_for_each_hash, 1, "0");
 	CANCEL(cancel_may_goto_for_each_helper, 1, "0");
+	CANCEL(cancel_callback_clobbers_slot, 1, "0");
 	/* The kfunc drops the node it was adding before the unwinder releases the lock. */
 	CANCEL(cancel_may_goto_rbtree_less, 2, "01", .hook = skel->progs.drop_hook);
 	CANCEL(cancel_may_goto_exception_cb, 1, "0");

@@ -1493,6 +1493,18 @@ struct bpf_release_rec {
 };
 
 /*
+ * The current frame wrote stack slots [@spi_lo, @spi_hi] of a frame below,
+ * through a pointer into its stack, while that frame waits in the call at
+ * @call: the descriptor of the frame at the call cannot list what it keeps
+ * there, see slot_writes_resolve() in frame_desc.c.
+ */
+struct bpf_slot_write {
+	u32 call;	/* orig insn */
+	u16 spi_lo;
+	u16 spi_hi;
+};
+
+/*
  * The callback of the helper or kfunc called at @call by a frame of @subprog
  * under chain @node, or a frame above the callback, may release the reference
  * of origin @origin that the frame holds, @owned or not: the frame lists it
@@ -1586,6 +1598,8 @@ struct bpf_verifier_env {
 	u32 release_rec_cnt;
 	struct bpf_cb_release *cb_releases;
 	u32 cb_release_cnt;
+	struct bpf_slot_write *slot_writes;
+	u32 slot_write_cnt;
 	u32 frame_desc_guards;			/* entries released on a run-time condition, see frame_desc.c */
 	struct bpf_coclaim *coclaims;
 	u32 coclaim_cnt;
@@ -2563,6 +2577,8 @@ int bpf_frame_desc_record_entry_of(struct bpf_verifier_env *env, struct bpf_veri
 void bpf_frame_desc_record_async_entry(struct bpf_verifier_env *env, int subprog);
 int bpf_frame_desc_record_load(struct bpf_verifier_env *env, int regno);
 int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delta);
+int bpf_frame_desc_record_stack_write(struct bpf_verifier_env *env, const struct bpf_func_state *frame,
+				      int min_off, int max_off);
 int bpf_frame_desc_record_call(struct bpf_verifier_env *env);
 int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 				 int call_idx);

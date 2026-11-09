@@ -2729,6 +2729,73 @@ int cancel_recursion_check_holding(struct __sk_buff *ctx)
 	return alloc_and_call_twice(60);
 }
 
+/* The object, in the stack of the frame that passes the struct to a callee. */
+struct slot_ctx {
+	struct foo *node;
+};
+
+/*
+ * Stashes the caller's object, overwrites the slot it came from with a
+ * number across the throw, and puts it back. The caller's descriptor at the
+ * call cannot list the slot: the unwinder would release the number.
+ */
+static __noinline void clobber_slot_and_throw(struct slot_ctx *c)
+{
+	struct foo *f = c->node;
+
+	c->node = (void *)(long)param;
+	bpf_throw(0xeB9F);
+	c->node = f;
+}
+
+/*
+ * The caller keeps the object in the slot alone at the call, which the callee
+ * writes: the object is released from its mirror, once, and nothing is
+ * released from the slot.
+ */
+SEC("tc")
+int throw_callee_clobbers_slot(struct __sk_buff *ctx)
+{
+	struct slot_ctx c;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	clobber_slot_and_throw(&c);
+	bpf_obj_drop(c.node);
+	return 0;
+}
+
+/* The same across the may_goto of a callback: the slot is a number while the callback spins. */
+static int clobber_slot_cb(u32 i, struct slot_ctx *c)
+{
+	struct foo *f = c->node;
+
+	c->node = (void *)(long)param;
+	spin();
+	c->node = f;
+	return 0;
+}
+
+SEC("tc")
+int cancel_callback_clobbers_slot(struct __sk_buff *ctx)
+{
+	struct slot_ctx c;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	c.node = f;
+	bpf_loop(loops, clobber_slot_cb, &c, loop_flags);
+	bpf_obj_drop(c.node);
+	return 0;
+}
+
 /*
  * Guards: a callee, or the callback of a helper, releases the object on a
  * run-time condition, and the caller tests the condition afterwards to find
