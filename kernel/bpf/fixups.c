@@ -800,6 +800,9 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			continue;
 		r = zero[i] ? 3 + hweight16(zero[i]) : 1;
 		aux[i + n].live_regs_before = aux[i + n + r].live_regs_before;
+		/* The frame descriptor of the guard, which the main pass gave to the insn. */
+		aux[i + n].frame_desc = aux[i + n + r].guard_desc;
+		aux[i + n + r].guard_desc = NULL;
 		n += r;
 	}
 out:
