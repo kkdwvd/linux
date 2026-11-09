@@ -3009,4 +3009,407 @@ int cancel_guard_for_each_push(struct __sk_buff *ctx)
 	return 0;
 }
 
+/* ---- what the frames hold at call depth two ---- */
+
+/*
+ * Throws holding the caller's record when told, and discards it otherwise.
+ * The pointer argument keeps the callee in the context of its callers.
+ */
+static __noinline int discard_or_throw(void *rec, const long *flag)
+{
+	if (*flag)
+		bpf_throw(0xeB9F);
+	bpf_ringbuf_discard(rec, 0);
+	return 0;
+}
+
+static __noinline int pass_down(void *rec, const long *flag)
+{
+	return discard_or_throw(rec, flag);
+}
+
+/*
+ * main -> pass_down -> discard_or_throw, all in context: the record main owns
+ * is listed by the frame that throws alone; the frame between passes it on.
+ */
+SEC("tc")
+int throw_ringbuf_depth2(struct __sk_buff *ctx)
+{
+	long flag = param;
+	void *rec;
+
+	rec = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!rec)
+		return 1;
+	mark_acquired(rec);
+	pass_down(rec, &flag);
+	return 0;
+}
+
+/*
+ * Reserves a record of its own and discards it before the throw when told,
+ * after it otherwise: under a caller that says so by a constant, the throw
+ * site holds the record under one chain and not under the other.
+ */
+__used static __noinline int reserve_and_throw(const long *flag, int drop)
+{
+	void *rec;
+
+	rec = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!rec)
+		return 1;
+	mark_acquired(rec);
+	if (drop)
+		bpf_ringbuf_discard(rec, 0);
+	if (*flag & 1)
+		bpf_throw(0xeB9F);
+	if (!drop)
+		bpf_ringbuf_discard(rec, 0);
+	return 0;
+}
+
+/* Two calls of reserve_and_throw() with a constant each, which clang would merge in C. */
+__naked static __noinline int call_twice(const long *flag)
+{
+	asm volatile (
+	"r6 = r1;"
+	"r2 = *(u64 *)(r1 + 0);"
+	"r2 &= 2;"
+	"if r2 == 0 goto 1f;"
+	"r1 = r6;"
+	"r2 = 0;"
+	"call reserve_and_throw;"
+	"exit;"
+	"1: r1 = r6;"
+	"r2 = 1;"
+	"call reserve_and_throw;"
+	"exit;"
+	:
+	:
+	: __clobber_all);
+}
+
+/*
+ * The throw site at depth two keeps a descriptor per chain, which the
+ * unwinder finds by the sites of the two frames below.
+ */
+SEC("tc")
+int throw_ringbuf_depth2_split(struct __sk_buff *ctx)
+{
+	long flag = param;
+
+	return call_twice(&flag);
+}
+
+/* Drops the object when the caller's stack says so, then throws. */
+static __noinline int drop_told_and_throw(struct foo *f, const int *dp)
+{
+	if (*dp)
+		bpf_obj_drop(f);
+	bpf_throw(0xeB9F);
+	return 0;
+}
+
+static __noinline long via_first(struct foo *f, const int *dp)
+{
+	return drop_told_and_throw(f, dp);
+}
+
+static __noinline long via_second(struct foo *f, const int *dp)
+{
+	return drop_told_and_throw(f, dp);
+}
+
+/*
+ * Two frames between main and the throw, so that main has two call sites and
+ * the throw site a chain for each, under which the object is held or not.
+ */
+SEC("tc")
+int throw_obj_depth2_two_mids(struct __sk_buff *ctx)
+{
+	int d1 = 1, d0 = 0;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (param)
+		return via_first(f, &d1) & 1;
+	return via_second(f, &d0) & 1;
+}
+
+/* Throws holding the object, or drops it; verified on its own: no pointer into a caller's stack. */
+static __noinline int drop_or_throw(struct foo *f, int drop)
+{
+	if (!drop)
+		bpf_throw(0xeB9F);
+	bpf_obj_drop(f);
+	return 0;
+}
+
+/* Passes the object down and keeps it live across the call. */
+static __noinline long middle_keeps(struct foo *f, int drop)
+{
+	long r = drop_or_throw(f, drop);
+
+	return r ^ (long)f;
+}
+
+/*
+ * main -> middle_keeps -> drop_or_throw, the callees verified on their own:
+ * the release at the leaf is recorded at the root of the chains, and has to
+ * reach the frame between and main through the calls.
+ */
+SEC("tc")
+int throw_obj_depth2(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	return middle_keeps(f, param) & 1;
+}
+
+/* Drops the object when told, then throws: holding it or not, by the caller's constant. */
+static __noinline int drop_told_then_throw(struct foo *f, int drop)
+{
+	if (drop)
+		bpf_obj_drop(f);
+	bpf_throw(0xeB9F);
+	return 0;
+}
+
+static __noinline long middle_passes(struct foo *f, int drop)
+{
+	return drop_told_then_throw(f, drop);
+}
+
+/* The same with the leaf never returning: nothing is redone in context. */
+SEC("tc")
+int throw_obj_depth2_split(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	if (param)
+		return middle_passes(f, 1) & 1;
+	return middle_passes(f, 0) & 1;
+}
+
+/* ---- the lattice across paths of different stack depth ---- */
+
+/*
+ * A throw site visited first by a path that never allocated fp-16, then by
+ * one that holds the record only there: the slot is not in the first path's
+ * frame, and holds anything on it.
+ */
+SEC("tc")
+__naked int throw_slot_unallocated(void)
+{
+	asm volatile (
+	"r6 = %[param] ll;"
+	"r6 = *(u32 *)(r6 + 0);"
+	"if r6 == 0 goto 1f;"
+	"2: r1 = 0xeB9F;"
+	"call %[bpf_throw];"
+	"exit;"
+	"1: r1 = %[ringbuf] ll;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_ringbuf_reserve];"
+	"if r0 == 0 goto 3f;"
+	"*(u64 *)(r10 - 16) = r0;"
+	"r1 = %[acquired] ll;"
+	"*(u64 *)(r1 + 0) = r0;"
+	"r2 = 1;"
+	"r1 = %[acquired_cnt] ll;"
+	"*(u32 *)(r1 + 0) = r2;"
+	"r0 = 0;"
+	"goto 2b;"
+	"3: r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(param),
+	  __imm_addr(ringbuf),
+	  __imm_addr(acquired),
+	  __imm_addr(acquired_cnt),
+	  __imm(bpf_ringbuf_reserve),
+	  __imm(bpf_throw)
+	: __clobber_all);
+}
+
+/* ---- what a call passes on some paths only ---- */
+
+/* Discards what it is given, then throws when told. */
+static __noinline int discard_then_throw(void *rec, const long *flag)
+{
+	bpf_ringbuf_discard(rec, 0);
+	if (*flag & 1)
+		bpf_throw(0xeB9F);
+	return 0;
+}
+
+/*
+ * One call site passes one of two records the caller holds, chosen at run
+ * time: the caller has to list the record it did not pass.
+ */
+SEC("tc")
+int throw_passed_some_paths(struct __sk_buff *ctx)
+{
+	long flag = param, sel = param & 2;
+	void *a, *b;
+
+	a = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!a)
+		return 1;
+	mark_acquired(a);
+	b = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!b) {
+		bpf_ringbuf_discard(a, 0);
+		return 1;
+	}
+	mark_acquired(b);
+	discard_then_throw(sel ? a : b, &flag);
+	bpf_ringbuf_discard(sel ? b : a, 0);
+	return 0;
+}
+
+/* ---- a reference that may be NULL at a site ---- */
+
+static __noinline int throw_if_told(const long *flag)
+{
+	if (*flag & 1)
+		bpf_throw(0xeB9F);
+	return 0;
+}
+
+/*
+ * A call between the acquisition and the NULL check: the task is listed at
+ * the call, where it may be NULL, which the unwinder has to skip.
+ */
+SEC("tc")
+int throw_task_maybe_null(struct __sk_buff *ctx)
+{
+	long flag = param;
+	struct task_struct *t;
+
+	t = bpf_task_from_pid(param & 2 ? test_pid : -1);
+	mark_acquired(t);
+	throw_if_told(&flag);
+	if (!t)
+		return 1;
+	bpf_task_release(t);
+	return 0;
+}
+
+/* ---- a mirror of a pointer into the object ---- */
+
+private(D) struct bpf_spin_lock pop_lock;
+private(D) struct bpf_list_head pop_head __contains(foo, node);
+
+/* Pushes a fresh object into the list the pop below takes it from. */
+__used static __noinline int push_one(void)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	mark_acquired(f);
+	bpf_spin_lock(&pop_lock);
+	bpf_list_push_front(&pop_head, &f->node);
+	bpf_spin_unlock(&pop_lock);
+	return 0;
+}
+
+/*
+ * Pops a node, which points 8 bytes into its object, and keeps it in R6 on
+ * one path and a number on the other, so that the throw releases it from the
+ * mirror of the pop. With param the list is empty and the pop returns NULL,
+ * which the mirror has to hold as NULL.
+ */
+SEC("tc")
+__naked int throw_pop_null_mirror(void)
+{
+	asm volatile (
+	"r1 = %[param] ll;"
+	"r1 = *(u32 *)(r1 + 0);"
+	"if r1 != 0 goto 1f;"
+	"call push_one;"
+	"1: r1 = %[pop_lock] ll;"
+	"call %[bpf_spin_lock];"
+	"r1 = %[pop_head] ll;"
+	"call %[bpf_list_pop_front];"
+	"r6 = r0;"
+	"r1 = %[pop_lock] ll;"
+	"call %[bpf_spin_unlock];"
+	"if r6 != 0 goto 2f;"
+	"r6 = 42;"
+	"2: r1 = 0xeB9F;"
+	"call %[bpf_throw];"
+	"exit;"
+	:
+	: __imm_addr(param),
+	  __imm_addr(pop_lock),
+	  __imm_addr(pop_head),
+	  __imm(bpf_spin_lock),
+	  __imm(bpf_spin_unlock),
+	  __imm(bpf_list_pop_front),
+	  __imm(bpf_throw)
+	: __clobber_all);
+}
+
+/* Drops the object the node belongs to when told, and hands the node back otherwise. */
+__used static __noinline struct bpf_list_node *drop_told_or_return(struct bpf_list_node *n,
+								   const long *flag)
+{
+	if (*flag) {
+		bpf_obj_drop(container_of(n, struct foo, node));
+		return NULL;
+	}
+	return n;
+}
+
+/*
+ * The node arrives in R1, 8 bytes into the object. After the call that may
+ * drop it, R6 holds the node or a number, so the throw releases it from the
+ * mirror of the arrival, which R0 refreshes after the call.
+ */
+__naked static __noinline int node_mirror_and_throw(struct bpf_list_node *n, const long *flag)
+{
+	asm volatile (
+	"call drop_told_or_return;"
+	"if r0 != 0 goto 1f;"
+	"r6 = 42;"
+	"goto 2f;"
+	"1: r6 = r0;"
+	"2: r1 = 0xeB9F;"
+	"call %[bpf_throw];"
+	"exit;"
+	:
+	: __imm(bpf_throw)
+	: __clobber_all);
+}
+
+SEC("tc")
+int throw_node_arrival_refresh(struct __sk_buff *ctx)
+{
+	long flag = param;
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 1;
+	mark_acquired(f);
+	node_mirror_and_throw(&f->node, &flag);
+	return 0;
+}
+
+
 char _license[] SEC("license") = "GPL";

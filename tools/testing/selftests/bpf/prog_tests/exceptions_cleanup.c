@@ -439,6 +439,37 @@ static void run_suite(const char *prefix)
 	GUARD_CB(cancel_guard_loop_cb_inlined);
 	GUARD_CB(cancel_guard_for_each_push);
 #undef GUARD_CB
+	/* what the frames hold at call depth two */
+	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_throw", THROWN, 1, "0", .param = 1);
+	RUN_AS(throw_ringbuf_depth2, "throw_ringbuf_depth2_discard", 0, 1, "", .param = 0);
+	RUN_AS(throw_ringbuf_depth2_split, "throw_ringbuf_depth2_split_held", THROWN, 1, "0",
+	       .param = 3);
+	RUN_AS(throw_ringbuf_depth2_split, "throw_ringbuf_depth2_split_free", THROWN, 1, "",
+	       .param = 1);
+	RUN_AS(throw_obj_depth2_two_mids, "throw_obj_depth2_two_mids_held", THROWN, 1, "0",
+	       .param = 0);
+	RUN_AS(throw_obj_depth2_two_mids, "throw_obj_depth2_two_mids_dropped", THROWN, 1, "",
+	       .param = 1);
+	RUN_AS(throw_obj_depth2, "throw_obj_depth2_held", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_obj_depth2, "throw_obj_depth2_dropped", 0, 1, "", .param = 1);
+	RUN_AS(throw_obj_depth2_split, "throw_obj_depth2_split_held", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_obj_depth2_split, "throw_obj_depth2_split_dropped", THROWN, 1, "", .param = 1);
+	/* the lattice across paths of different stack depth */
+	RUN_AS(throw_slot_unallocated, "throw_slot_unallocated_held", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_slot_unallocated, "throw_slot_unallocated_free", THROWN, 0, "", .param = 1);
+	/* what a call passes on some paths only */
+	RUN_AS(throw_passed_some_paths, "throw_passed_some_paths_a", THROWN, 2, "1", .param = 3);
+	RUN_AS(throw_passed_some_paths, "throw_passed_some_paths_b", THROWN, 2, "0", .param = 1);
+	/* a reference that may be NULL at a site */
+	RUN_AS(throw_task_maybe_null, "throw_task_maybe_null_null", THROWN, 1, "", .param = 1);
+	RUN_AS(throw_task_maybe_null, "throw_task_maybe_null_held", THROWN, 1, "0", .param = 3);
+	/* a mirror of a pointer into the object */
+	RUN_AS(throw_pop_null_mirror, "throw_pop_null_mirror_popped", THROWN, 1, "0", .param = 0);
+	RUN_AS(throw_pop_null_mirror, "throw_pop_null_mirror_empty", THROWN, 0, "", .param = 1);
+	RUN_AS(throw_node_arrival_refresh, "throw_node_arrival_refresh_held", THROWN, 1, "0",
+	       .param = 0);
+	RUN_AS(throw_node_arrival_refresh, "throw_node_arrival_refresh_dropped", THROWN, 1, "",
+	       .param = 1);
 #undef CANCEL
 #undef THROW
 #undef RUN
