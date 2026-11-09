@@ -26133,8 +26133,16 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
-	/* The entries the unwinder is reached through are only called from JITed code. */
+	/*
+	 * The entries the unwinder is reached through are only called from JITed
+	 * code, and the slow paths of the timed may_goto and of an arena fault
+	 * find the program to cancel by a return address, among the programs in
+	 * the kernel's symbol table, which a program loaded without CAP_BPF is
+	 * kept out of, see bpf_prog_kallsyms_add(): they fall back to the branch
+	 * and to the fault handler, and the frames need no description.
+	 */
 	env->cancellable = bpf_jit_supports_cancellation() && env->prog->jit_requested &&
+			   bpf_token_capable(env->prog->aux->token, CAP_BPF) &&
 			   bpf_prog_cancel_retval(env, &env->prog->aux->cancel_retval);
 	env->describe_frames |= env->cancellable;
 	ret = do_check_all(env);
