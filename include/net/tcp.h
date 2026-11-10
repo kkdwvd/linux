@@ -752,7 +752,15 @@ void tcp_push_pending_frames_now(struct sock *sk, unsigned int cur_mss,
 				 int nonagle);
 
 #ifdef CONFIG_BPF_SYSCALL
+/* What a sender does with xmit work when its socket's xmit queue has a thread. */
+enum {
+	BPF_TCP_TX_WAKE,	/* queue the socket and wake the thread */
+	BPF_TCP_TX_QUEUE,	/* queue the socket; the thread will look by itself */
+	BPF_TCP_TX_INLINE,	/* do the xmit work itself */
+};
+
 bool __tcp_bpf_tx_defer(struct sock *sk, int nonagle);
+int tcp_bpf_tx_set_mode(u32 queue, u32 mode);
 int tcp_bpf_tx_bind(u32 queue, struct task_struct *task);
 void tcp_bpf_tx_unbind(u32 queue);
 int tcp_bpf_tx_poll(u32 queue, u32 budget);

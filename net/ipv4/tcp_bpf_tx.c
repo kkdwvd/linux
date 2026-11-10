@@ -44,6 +44,14 @@
  * the xmit work is left to tcp_release_cb(), like a TSQ wakeup that finds the
  * socket owned, and the owner's release sends it back to the queue.
  *
+ * Whether handing xmit work to the thread pays depends on what the thread is
+ * doing. A thread that is asleep has to be woken for it, which costs the
+ * sender more than the work itself when sends are few, and a thread that is
+ * polling anyway needs no wake at all. The queue's thread says which it is
+ * with tcp_bpf_tx_set_mode(): senders transmit for themselves, queue and wake,
+ * or queue and leave it to the thread to look. The mode is one byte the sender
+ * reads, so a thread can change it every time it goes to sleep and wakes up.
+ *
  * A socket on a queue sends nothing until the queue's thread transmits for
  * it, and no timer of the connection would: with nothing in flight there is
  * nothing to retransmit. So a queue does not outlive its thread's attention.
@@ -62,6 +70,7 @@ struct tcp_bpf_tx_queue {
 	spinlock_t lock;		/* socks */
 	struct list_head socks;		/* through tcp_sock.bpf_tx_node */
 	struct task_struct __rcu *thread;
+	u8 mode;			/* BPF_TCP_TX_*, set by the thread */
 	/* When the queue was last polled, or stopped being empty */
 	unsigned long stamp;
 	struct timer_list timer;
@@ -93,7 +102,7 @@ bool __tcp_bpf_tx_defer(struct sock *sk, int nonagle)
 	/* An unbind waits for this section before it empties the queue. */
 	rcu_read_lock();
 	thread = rcu_dereference(q->thread);
-	if (!thread || thread == current)
+	if (!thread || thread == current || READ_ONCE(q->mode) == BPF_TCP_TX_INLINE)
 		goto out;
 
 	/* The socket lock orders this against the thread's read of it. */
@@ -105,7 +114,14 @@ bool __tcp_bpf_tx_defer(struct sock *sk, int nonagle)
 			WRITE_ONCE(q->stamp, jiffies);
 		list_add_tail(&tp->bpf_tx_node, &q->socks);
 		spin_unlock_bh(&q->lock);
-		bpf_task_wake_direct(thread);
+		/* The thread stores a mode and then looks at the queue; this
+		 * put the socket on the queue and now reads the mode. With a
+		 * full barrier on each side, a thread that stops looking by
+		 * itself either finds the socket or is woken for it.
+		 */
+		smp_mb();
+		if (READ_ONCE(q->mode) != BPF_TCP_TX_QUEUE)
+			bpf_task_wake_direct(thread);
 	}
 	deferred = true;
 out:
@@ -194,10 +210,19 @@ int tcp_bpf_tx_bind(u32 queue, struct task_struct *task)
 
 	mutex_lock(&tcp_bpf_tx_mutex);
 	old = rcu_replace_pointer(q->thread, task, lockdep_is_held(&tcp_bpf_tx_mutex));
-	/* A sender that read the old thread woke the old thread. Once all of
-	 * them are through, wake the new one for what is on the queue.
+	/* A sender that read the old thread woke the old thread, and the old
+	 * thread may have been storing a mode, see tcp_bpf_tx_set_mode(). Once
+	 * all of them are through, wake the new one for what is on the queue.
 	 */
 	synchronize_rcu();
+	/* The mode is the thread's statement about itself: a new thread
+	 * starts with the one that needs nothing from it. Stored before the
+	 * look at the queue below, with the barrier __tcp_bpf_tx_defer()
+	 * pairs with: a sender that went by the old thread's mode and woke
+	 * nobody has its socket found here.
+	 */
+	WRITE_ONCE(q->mode, BPF_TCP_TX_WAKE);
+	smp_mb();
 	/* The new thread gets the full time for sockets that wait already. */
 	WRITE_ONCE(q->stamp, jiffies);
 	mod_timer(&q->timer, jiffies + TCP_BPF_TX_STALL / 2);
@@ -319,6 +344,44 @@ int tcp_bpf_tx_poll(u32 queue, u32 budget)
 }
 
 /**
+ * tcp_bpf_tx_set_mode() - say what senders do with the xmit work of a queue
+ * @queue: index of a queue the calling thread serves
+ * @mode: BPF_TCP_TX_WAKE, BPF_TCP_TX_QUEUE or BPF_TCP_TX_INLINE
+ *
+ * After leaving BPF_TCP_TX_QUEUE the thread has to poll the queue once more
+ * before it sleeps: a sender that read the old mode may have queued a socket
+ * without a wake. Senders that queue from then on wake the thread.
+ *
+ * Return: 0 on success, -EINVAL for an index or a mode out of range, -EPERM if
+ * the caller is not the queue's thread.
+ */
+int tcp_bpf_tx_set_mode(u32 queue, u32 mode)
+{
+	struct tcp_bpf_tx_queue *q;
+
+	if (queue >= TCP_BPF_TX_QUEUES || mode > BPF_TCP_TX_INLINE)
+		return -EINVAL;
+	q = &tcp_bpf_tx_queues[queue];
+
+	/* A bind waits for this section before it stores the mode the new
+	 * thread starts with, so the store of a thread that has just been
+	 * replaced does not outlast it.
+	 */
+	rcu_read_lock();
+	if (rcu_access_pointer(q->thread) != current) {
+		rcu_read_unlock();
+		return -EPERM;
+	}
+	if (READ_ONCE(q->mode) != mode) {
+		WRITE_ONCE(q->mode, mode);
+		/* Pairs with the barrier in __tcp_bpf_tx_defer(). */
+		smp_mb();
+	}
+	rcu_read_unlock();
+	return 0;
+}
+
+/**
  * tcp_bpf_tx_sock_bind() - assign a socket to an xmit queue
  * @sk: a TCP socket
  * @queue: index of the queue, or a negative value for none
@@ -402,6 +465,30 @@ __bpf_kfunc int bpf_tcp_tx_poll(u32 queue, u32 budget)
 }
 
 /**
+ * bpf_tcp_tx_set_mode - Say what senders do with the xmit work of a queue
+ * @queue: index of a queue the calling thread serves
+ * @mode: BPF_TCP_TX_WAKE, BPF_TCP_TX_QUEUE or BPF_TCP_TX_INLINE
+ *
+ * A queue starts in BPF_TCP_TX_WAKE: a sender queues its socket and wakes the
+ * thread. In BPF_TCP_TX_QUEUE the sender queues the socket and wakes nobody,
+ * for a thread that is polling anyway and will poll the queue soon. In
+ * BPF_TCP_TX_INLINE the sender transmits itself, as if the socket had no
+ * queue, for a thread that is about to sleep and is not worth waking for it.
+ * Changing the mode is one store, cheap enough to do around every sleep.
+ *
+ * A thread that leaves BPF_TCP_TX_QUEUE must call bpf_tcp_tx_poll() once more
+ * before it parks, for the sockets queued without a wake until then; a socket
+ * queued later than that leaves a wake pending.
+ *
+ * Return: 0 on success, -EINVAL if @queue or @mode is out of range, -EPERM if
+ * the caller is not the queue's thread.
+ */
+__bpf_kfunc int bpf_tcp_tx_set_mode(u32 queue, u32 mode)
+{
+	return tcp_bpf_tx_set_mode(queue, mode);
+}
+
+/**
  * bpf_tcp_tx_sock_bind - Assign the socket of a sockops program to an xmit queue
  * @skops: the program's context
  * @queue: index of the queue, or a negative value for none
@@ -423,6 +510,7 @@ BTF_KFUNCS_START(tcp_bpf_tx_thread_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_tcp_tx_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_tcp_tx_unbind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_tcp_tx_poll, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_tcp_tx_set_mode)
 BTF_KFUNCS_END(tcp_bpf_tx_thread_kfunc_ids)
 
 BTF_KFUNCS_START(tcp_bpf_tx_sock_kfunc_ids)
