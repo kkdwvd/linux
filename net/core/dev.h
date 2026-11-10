@@ -394,6 +394,8 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task);
 void napi_bpf_unbind_locked(struct napi_struct *napi);
 struct napi_struct *napi_bpf_by_id_lock(unsigned int napi_id);
 int napi_bpf_poll(unsigned int napi_id, u64 flags);
+int napi_bpf_suspend(unsigned int napi_id, u32 wake_after);
+int napi_bpf_resume(unsigned int napi_id);
 #else
 static inline void napi_bpf_unbind_locked(struct napi_struct *napi)
 {

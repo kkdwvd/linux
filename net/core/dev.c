@@ -5218,12 +5218,16 @@ static bool napi_bpf_schedule(struct napi_struct *napi)
 static inline void ____napi_schedule(struct softnet_data *sd,
 				     struct napi_struct *napi)
 {
+	unsigned long val = READ_ONCE(napi->state);
 	struct task_struct *thread;
 
 	lockdep_assert_irqs_disabled();
 
-	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
-		if (test_bit(NAPI_STATE_BPF, &napi->state)) {
+	/* One read tells the two kinds of thread apart: an unbind clears both
+	 * bits at once, so they are never seen as a kernel thread's.
+	 */
+	if (val & NAPIF_STATE_THREADED) {
+		if (val & NAPIF_STATE_BPF) {
 			if (napi_bpf_schedule(napi))
 				return;
 			goto use_local_napi;
@@ -7439,6 +7443,7 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
 #ifdef CONFIG_BPF_SYSCALL
 static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
 				   bool *repoll);
+static void napi_bpf_softirq_work(struct napi_struct *napi, int work);
 
 /* NAPI polled by a BPF kthread.
  *
@@ -7489,22 +7494,37 @@ static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
  * for NAPI_BPF_STALL. The NAPI stays bound, polls of it fail with -ECANCELED,
  * and a new bind gives the scheduling back.
  *
+ * The thread can also let go by itself. A queue that sees a packet now and
+ * then is served more cheaply by softirq, in the interrupt's wake, than by a
+ * thread that has to be woken and switched to for each of them, and the same
+ * queue under load is better off with the thread. napi_bpf_suspend() leaves
+ * the scheduling to softirq exactly as the watchdog does and
+ * napi_bpf_resume() takes it back by setting NAPI_STATE_THREADED, both
+ * without a lock, so a thread can go back and forth as the traffic changes.
+ * For the thread to notice that it changed, softirq wakes it once it has
+ * processed a number of packets the thread chose.
+ *
  * The binding holds a reference on the thread's rcu_users, the count a task
  * kptr holds, so that the task is freed only after an RCU grace period has
  * passed since the unbind and the schedule path may use the pointer with
  * interrupts disabled.
  */
 
-/* Take the scheduling of @napi away from its BPF thread. A NAPI scheduled for
- * the thread goes to softirq: from here, or, while a poller is in the driver,
- * from napi_bpf_release() once the poller is out.
+/* Take the scheduling of @napi away from its BPF thread by clearing @bits:
+ * NAPI_STATE_THREADED, and NAPI_STATE_BPF with it to unbind. A NAPI scheduled
+ * for the thread goes to softirq: from here, or, while a poller is in the
+ * driver, from napi_bpf_release() once the poller is out. Returns false for a
+ * NAPI that is not bound.
  */
-static void napi_bpf_revoke(struct napi_struct *napi)
+static bool napi_bpf_revoke(struct napi_struct *napi, unsigned long bits)
 {
 	unsigned long new, val = READ_ONCE(napi->state);
 
 	do {
-		new = val & ~NAPIF_STATE_THREADED;
+		/* Unbound meanwhile: NAPI_STATE_THREADED may be the kernel's. */
+		if (!(val & NAPIF_STATE_BPF))
+			return false;
+		new = val & ~bits;
 		/* Softirq must be able to complete what was scheduled for the
 		 * thread, so a busy poll ends with the mark. Without the mark
 		 * NAPI_STATE_IN_BUSY_POLL is a socket's and stays.
@@ -7518,6 +7538,7 @@ static void napi_bpf_revoke(struct napi_struct *napi)
 	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
 	    NAPIF_STATE_SCHED_THREADED)
 		__napi_schedule(napi);
+	return true;
 }
 
 /* How long a NAPI may stay scheduled for its BPF thread without a poll. Long
@@ -7529,23 +7550,25 @@ static void napi_bpf_revoke(struct napi_struct *napi)
 static void napi_bpf_watchdog(struct timer_list *t)
 {
 	struct napi_struct *napi = timer_container_of(napi, t, bpf_timer);
-	const unsigned long owned = NAPIF_STATE_BPF | NAPIF_STATE_THREADED;
+	const unsigned long stuck = NAPIF_STATE_BPF | NAPIF_STATE_THREADED |
+				    NAPIF_STATE_SCHED_THREADED;
 	unsigned long val = READ_ONCE(napi->state);
 
-	/* Unbound or revoked: a bind starts the timer again. */
-	if ((val & owned) != owned)
+	/* Unbound: a bind starts the timer again. It keeps running for a NAPI
+	 * whose scheduling is with softirq for now, so that giving it back
+	 * to the thread is a matter of one bit, see napi_bpf_resume().
+	 */
+	if (!(val & NAPIF_STATE_BPF))
 		return;
 
 	/* A poller in the driver stores the stamp before it drops the claim. */
-	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
-	    NAPIF_STATE_SCHED_THREADED &&
+	if ((val & (stuck | NAPIF_STATE_BPF_POLLING)) == stuck &&
 	    time_after(jiffies, READ_ONCE(napi->bpf_stamp) + NAPI_BPF_STALL)) {
 		if (net_ratelimit())
 			netdev_warn(napi->dev,
 				    "NAPI %u not polled by its BPF thread, back to softirq\n",
 				    napi->napi_id);
-		napi_bpf_revoke(napi);
-		return;
+		napi_bpf_revoke(napi, NAPIF_STATE_THREADED);
 	}
 
 	mod_timer(t, jiffies + NAPI_BPF_STALL / 2);
@@ -7678,6 +7701,101 @@ int napi_bpf_poll(unsigned int napi_id, u64 flags)
 }
 
 /**
+ * napi_bpf_suspend() - leave a bound NAPI to softirq for the time being
+ * @napi_id: ID of the NAPI
+ * @wake_after: wake the NAPI's thread after softirq has processed this many
+ *	packets, 0 to never wake it
+ *
+ * A NAPI scheduled for its thread, a busy poll included, is passed on to
+ * softirq, which completes it and lets the driver unmask the interrupt.
+ * Softirq's count of packets is not exact: two CPUs may poll the NAPI in
+ * turn faster than they update it.
+ *
+ * Return: 0 on success, also for a NAPI that is suspended already, whose
+ * count starts anew, -ENOENT if no NAPI with this ID is bound.
+ */
+int napi_bpf_suspend(unsigned int napi_id, u32 wake_after)
+{
+	struct napi_struct *napi;
+	int ret = -ENOENT;
+
+	rcu_read_lock();
+	napi = napi_by_id(napi_id);
+	if (napi && test_bit(NAPI_STATE_BPF, &napi->state)) {
+		/* Before softirq can poll on the thread's behalf. */
+		WRITE_ONCE(napi->bpf_wake_after, wake_after);
+		local_bh_disable();
+		if (napi_bpf_revoke(napi, NAPIF_STATE_THREADED))
+			ret = 0;
+		local_bh_enable();
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+/**
+ * napi_bpf_resume() - give the scheduling of a bound NAPI back to its thread
+ * @napi_id: ID of the NAPI
+ *
+ * Undoes napi_bpf_suspend(), and what the watchdog did to a NAPI that was not
+ * polled. Takes effect at the NAPI's next schedule: softirq finishes what it
+ * is doing with the NAPI.
+ *
+ * Return: 0 on success, also for a NAPI whose thread has the scheduling,
+ * -ENOENT if no NAPI with this ID is bound.
+ */
+int napi_bpf_resume(unsigned int napi_id)
+{
+	struct napi_struct *napi;
+	unsigned long new, val;
+	int ret = -ENOENT;
+
+	rcu_read_lock();
+	napi = napi_by_id(napi_id);
+	if (!napi)
+		goto out;
+
+	/* An unbind clears NAPI_STATE_BPF first, and this sets
+	 * NAPI_STATE_THREADED only beside it, so a NAPI on its way out is not
+	 * routed to a thread again.
+	 */
+	val = READ_ONCE(napi->state);
+	do {
+		if (!(val & NAPIF_STATE_BPF))
+			goto out;
+		new = val | NAPIF_STATE_THREADED;
+	} while (!try_cmpxchg(&napi->state, &val, new));
+	ret = 0;
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
+/* Softirq processed @work packets of a NAPI that is bound but not scheduled
+ * through its thread at the moment. Wake the thread when the packets it asked
+ * to be woken after have passed, see napi_bpf_suspend().
+ */
+static void napi_bpf_softirq_work(struct napi_struct *napi, int work)
+{
+	u32 left = READ_ONCE(napi->bpf_wake_after);
+	struct task_struct *thread;
+
+	if (!left)
+		return;
+	if (work < left) {
+		WRITE_ONCE(napi->bpf_wake_after, left - work);
+		return;
+	}
+	WRITE_ONCE(napi->bpf_wake_after, 0);
+
+	rcu_read_lock();
+	thread = READ_ONCE(napi->thread);
+	if (thread)
+		bpf_task_wake_direct(thread);
+	rcu_read_unlock();
+}
+
+/**
  * napi_bpf_bind_locked() - make a BPF kthread the thread that polls a NAPI
  * @napi: NAPI context
  * @task: the BPF kthread
@@ -7762,31 +7880,28 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	netdev_assert_locked(napi->dev);
 	thread = napi->thread;
 
-	/* A NAPI that was scheduled for the thread is polled by softirq on
-	 * this CPU before this returns.
+	/* NAPI_STATE_BPF goes with the scheduling, in one step: from here on
+	 * no poll claims the NAPI and nothing gives the scheduling back to the
+	 * thread, see napi_bpf_resume(). A NAPI that was scheduled for the
+	 * thread is polled by softirq on this CPU before this returns.
 	 */
 	local_bh_disable();
-	napi_bpf_revoke(napi);
+	napi_bpf_revoke(napi, NAPIF_STATE_THREADED | NAPIF_STATE_BPF);
 	local_bh_enable();
 
 	/* A poller that was in the driver's poll at the revocation finishes
-	 * that call, and no other can claim the NAPI any more.
+	 * that call.
 	 */
 	might_sleep();
 	while (test_bit(NAPI_STATE_BPF_POLLING, &napi->state))
 		usleep_range(20, 200);
 
 	/* The watchdog does not start itself again once it has seen
-	 * NAPI_STATE_THREADED clear.
+	 * NAPI_STATE_BPF clear.
 	 */
 	timer_delete_sync(&napi->bpf_timer);
 
-	/* The thread goes before NAPI_STATE_BPF, so that a schedule path which
-	 * saw NAPI_STATE_THREADED before the revocation and finds
-	 * NAPI_STATE_BPF clear finds no thread to wake as the kernel's either.
-	 */
 	WRITE_ONCE(napi->thread, NULL);
-	clear_bit(NAPI_STATE_BPF, &napi->state);
 	put_task_struct_rcu_user(thread);
 }
 
@@ -8468,6 +8583,13 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	if (unlikely(work > weight))
 		netdev_err_once(n->dev, "NAPI poll function %pS returned %d, exceeding its budget of %d.\n",
 				n->poll, work, weight);
+
+#ifdef CONFIG_BPF_SYSCALL
+	/* Bound to a BPF thread, but polled on its behalf. */
+	if (unlikely((READ_ONCE(n->state) & (NAPIF_STATE_BPF | NAPIF_STATE_THREADED)) ==
+		     NAPIF_STATE_BPF) && work)
+		napi_bpf_softirq_work(n, work);
+#endif
 
 	if (likely(work < weight))
 		return work;
