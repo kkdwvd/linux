@@ -5169,6 +5169,46 @@ int weight_p __read_mostly = 64;           /* old backlog weight */
 int dev_weight_rx_bias __read_mostly = 1;  /* bias for backlog weight */
 int dev_weight_tx_bias __read_mostly = 1;  /* bias for output_queue quota */
 
+#ifdef CONFIG_BPF_SYSCALL
+/* Schedule a NAPI for the BPF kthread it is bound to, see the comment above
+ * napi_bpf_bind_locked(). Called with irq disabled. Returns false when the
+ * NAPI is not bound, or its thread no longer owns its scheduling.
+ */
+static bool napi_bpf_schedule(struct napi_struct *napi)
+{
+	unsigned long new, val = READ_ONCE(napi->state);
+	struct task_struct *thread;
+
+	/* Mark the NAPI as the thread's only while the thread owns its
+	 * scheduling, in one step. Whoever takes the scheduling away clears
+	 * NAPI_STATE_THREADED in one step too and then finds the mark, so a
+	 * scheduled NAPI is never left with a thread that was told to let go.
+	 */
+	do {
+		if ((val & (NAPIF_STATE_THREADED | NAPIF_STATE_BPF)) !=
+		    (NAPIF_STATE_THREADED | NAPIF_STATE_BPF))
+			return false;
+		new = val | NAPIF_STATE_SCHED_THREADED;
+	} while (!try_cmpxchg(&napi->state, &val, new));
+
+	/* Read the thread after the mark is set. A rebind stores the new
+	 * thread and then looks for the mark, so either this wakes the new
+	 * thread or the rebind does. The pointer is NULL once an unbind has
+	 * taken the NAPI back, mark included. The task is freed after an RCU
+	 * grace period, which disabled interrupts hold off.
+	 */
+	thread = READ_ONCE(napi->thread);
+	if (thread)
+		bpf_task_wake_direct(thread);
+	return true;
+}
+#else
+static bool napi_bpf_schedule(struct napi_struct *napi)
+{
+	return false;
+}
+#endif
+
 /* Called with irq disabled */
 static inline void ____napi_schedule(struct softnet_data *sd,
 				     struct napi_struct *napi)
@@ -5178,6 +5218,12 @@ static inline void ____napi_schedule(struct softnet_data *sd,
 	lockdep_assert_irqs_disabled();
 
 	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
+		if (test_bit(NAPI_STATE_BPF, &napi->state)) {
+			if (napi_bpf_schedule(napi))
+				return;
+			goto use_local_napi;
+		}
+
 		/* Paired with smp_mb__before_atomic() in
 		 * napi_enable()/netif_set_threaded().
 		 * Use READ_ONCE() to guarantee a complete
@@ -7385,6 +7431,136 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+/* NAPI polled by a BPF kthread.
+ *
+ * Threaded NAPI gives every NAPI a kernel thread of its own, which the
+ * schedule path wakes and which polls until the NAPI is complete. A BPF
+ * program that wants to decide where and when NAPIs are polled, by a pool of
+ * threads whose size follows the load, say, binds a NAPI to one of its BPF
+ * kthreads instead. The thread takes the place of the kernel's: napi->thread
+ * points to it, NAPI_STATE_THREADED routes the schedule path to it, and
+ * NAPI_STATE_SCHED_THREADED says the NAPI is scheduled and its to poll.
+ * NAPI_STATE_BPF tells the two kinds of thread apart. Several NAPIs may be
+ * bound to one thread.
+ *
+ * The schedule path wakes the thread with bpf_task_wake_direct(), since the
+ * thread sleeps in bpf_task_park() between polls. The wake names no NAPI. The
+ * thread knows which NAPIs it was given and asks for each.
+ *
+ * The NAPI stays the device's. NAPI_STATE_BPF and napi->thread change under
+ * the netdev lock only, and napi_disable() and a change of the threaded
+ * setting unbind first, so the device and its administrator never wait for a
+ * program. Scheduling is taken away from the thread by clearing
+ * NAPI_STATE_THREADED, after which the schedule path queues the NAPI for
+ * softirq as it does for any other. A NAPI that was scheduled for the thread
+ * at that point is scheduled again, for softirq.
+ *
+ * The binding holds a reference on the thread's rcu_users, the count a task
+ * kptr holds, so that the task is freed only after an RCU grace period has
+ * passed since the unbind and the schedule path may use the pointer with
+ * interrupts disabled.
+ */
+
+/* Take the scheduling of @napi away from its BPF thread. A NAPI scheduled for
+ * the thread goes to softirq.
+ */
+static void napi_bpf_revoke(struct napi_struct *napi)
+{
+	unsigned long new, val = READ_ONCE(napi->state);
+
+	do {
+		new = val & ~(NAPIF_STATE_THREADED | NAPIF_STATE_SCHED_THREADED);
+	} while (!try_cmpxchg(&napi->state, &val, new));
+
+	/* NAPI_STATE_SCHED is still set and now ours to pass on. */
+	if (val & NAPIF_STATE_SCHED_THREADED)
+		__napi_schedule(napi);
+}
+
+/**
+ * napi_bpf_bind_locked() - make a BPF kthread the thread that polls a NAPI
+ * @napi: NAPI context
+ * @task: the BPF kthread
+ *
+ * Route the scheduling of @napi to @task. A NAPI that is bound already moves
+ * to @task, which is woken if the NAPI is scheduled, and a NAPI whose
+ * scheduling was taken away from its thread is given back. A NAPI that
+ * softirq is polling at the time stays there until it completes.
+ *
+ * Return: 0 on success, -EBUSY if @napi is in the kernel's threaded mode,
+ * -EOPNOTSUPP if it cannot be polled by a thread, -ESRCH if @task is gone.
+ */
+int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
+{
+	struct task_struct *old = napi->thread;
+
+	netdev_assert_locked(napi->dev);
+
+	if (test_bit(NAPI_STATE_PERCPU, &napi->state))
+		return -EOPNOTSUPP;
+	if (old && !test_bit(NAPI_STATE_BPF, &napi->state))
+		return -EBUSY;
+
+	if (old != task) {
+		if (!refcount_inc_not_zero(&task->rcu_users))
+			return -ESRCH;
+		WRITE_ONCE(napi->thread, task);
+	}
+
+	/* Order the thread before the bits that send the schedule path to it,
+	 * and before the load of the mark below, see napi_bpf_schedule().
+	 * NAPI_STATE_BPF goes first: with NAPI_STATE_THREADED alone the
+	 * schedule path would wake the task as a kernel NAPI thread.
+	 */
+	smp_mb__before_atomic();
+	set_bit(NAPI_STATE_BPF, &napi->state);
+	set_bit(NAPI_STATE_THREADED, &napi->state);
+
+	if (test_bit(NAPI_STATE_SCHED_THREADED, &napi->state))
+		bpf_task_wake_direct(task);
+
+	if (old && old != task)
+		put_task_struct_rcu_user(old);
+	return 0;
+}
+
+/**
+ * napi_bpf_unbind_locked() - return a NAPI from its BPF kthread to softirq
+ * @napi: NAPI context
+ *
+ * Does nothing for a NAPI that is not bound.
+ */
+void napi_bpf_unbind_locked(struct napi_struct *napi)
+{
+	struct task_struct *thread;
+
+	/* Callers that change the threaded setting of a device nobody can
+	 * see yet hold no lock, and such a device has no bound NAPI.
+	 */
+	if (!test_bit(NAPI_STATE_BPF, &napi->state))
+		return;
+
+	netdev_assert_locked(napi->dev);
+	thread = napi->thread;
+
+	/* A NAPI that was scheduled for the thread is polled by softirq on
+	 * this CPU before this returns.
+	 */
+	local_bh_disable();
+	napi_bpf_revoke(napi);
+	local_bh_enable();
+
+	/* The thread goes before NAPI_STATE_BPF, so that a schedule path which
+	 * saw NAPI_STATE_THREADED before the revocation and finds
+	 * NAPI_STATE_BPF clear finds no thread to wake as the kernel's either.
+	 */
+	WRITE_ONCE(napi->thread, NULL);
+	clear_bit(NAPI_STATE_BPF, &napi->state);
+	put_task_struct_rcu_user(thread);
+}
+#endif /* CONFIG_BPF_SYSCALL */
+
 static void napi_stop_kthread(struct napi_struct *napi)
 {
 	unsigned long val, new;
@@ -7436,6 +7612,9 @@ static void napi_set_threaded_state(struct napi_struct *napi,
 int napi_set_threaded(struct napi_struct *napi,
 		      enum netdev_napi_threaded threaded)
 {
+	/* The setting is the administrator's: a BPF thread gives way to it. */
+	napi_bpf_unbind_locked(napi);
+
 	if (threaded) {
 		if (!napi->thread) {
 			int err = napi_kthread_create(napi);
@@ -7475,6 +7654,7 @@ int netif_set_threaded(struct net_device *dev,
 
 	if (threaded) {
 		list_for_each_entry(napi, &dev->napi_list, dev_list) {
+			napi_bpf_unbind_locked(napi);
 			if (!napi->thread) {
 				err = napi_kthread_create(napi);
 				if (err) {
@@ -7840,6 +8020,12 @@ void napi_disable_locked(struct napi_struct *n)
 
 	might_sleep();
 	netdev_assert_locked(n->dev);
+
+	/* Take the NAPI back from a BPF thread first: softirq then polls what
+	 * was scheduled for the thread, and clears NAPI_STATE_SCHED for the
+	 * wait below.
+	 */
+	napi_bpf_unbind_locked(n);
 
 	set_bit(NAPI_STATE_DISABLE, &n->state);
 
