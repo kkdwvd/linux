@@ -108,8 +108,8 @@ __bpf_kfunc int bpf_napi_unbind(u32 napi_id)
  * ORed with BPF_NAPI_POLL_MORE if the NAPI is still scheduled for its thread.
  * -EAGAIN if the NAPI is not scheduled for its thread, -EBUSY if another
  * caller is polling it, -ENOENT if no NAPI with this ID is bound, -ECANCELED
- * if the NAPI was taken away from its thread for not being polled and has to
- * be bound again, -EINVAL for unknown @flags.
+ * if the NAPI is suspended, or was taken away from its thread for not being
+ * polled, until bpf_napi_resume() or a new bind, -EINVAL for unknown @flags.
  */
 __bpf_kfunc int bpf_napi_poll(u32 napi_id, u64 flags)
 {
@@ -123,12 +123,53 @@ __bpf_kfunc int bpf_napi_poll(u32 napi_id, u64 flags)
 	return ret;
 }
 
+/**
+ * bpf_napi_suspend - Leave a bound NAPI to softirq for the time being
+ * @napi_id: ID of a NAPI bound with bpf_napi_bind()
+ * @wake_after: wake the NAPI's thread after softirq has processed about this
+ *	many packets, 0 to never wake it
+ *
+ * The NAPI stays bound to its thread, but softirq polls it, as if it were not:
+ * a packet costs no wakeup of the thread. A NAPI the thread held with a busy
+ * poll is completed by softirq and its interrupt unmasked. Polls of a
+ * suspended NAPI return -ECANCELED. The wake lets the thread measure the
+ * traffic it no longer sees: the time @wake_after packets took tells it the
+ * rate, and whether to take the NAPI back with bpf_napi_resume() or to
+ * suspend it again.
+ *
+ * Costs one atomic operation and takes no lock, unlike unbinding and binding.
+ *
+ * Return: 0 on success, -ENOENT if no NAPI with this ID is bound.
+ */
+__bpf_kfunc int bpf_napi_suspend(u32 napi_id, u32 wake_after)
+{
+	return napi_bpf_suspend(napi_id, wake_after);
+}
+
+/**
+ * bpf_napi_resume - Take the scheduling of a bound NAPI back from softirq
+ * @napi_id: ID of a NAPI bound with bpf_napi_bind()
+ *
+ * From the NAPI's next schedule on, its thread is woken and polls it again.
+ * Also puts a NAPI back in service that was taken away for not being polled,
+ * as a new bpf_napi_bind() does. A busy poll after this call takes the NAPI
+ * as soon as softirq is done with it.
+ *
+ * Return: 0 on success, -ENOENT if no NAPI with this ID is bound.
+ */
+__bpf_kfunc int bpf_napi_resume(u32 napi_id)
+{
+	return napi_bpf_resume(napi_id);
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(bpf_napi_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_napi_bind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_napi_unbind, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_napi_poll, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_napi_suspend)
+BTF_ID_FLAGS(func, bpf_napi_resume)
 BTF_KFUNCS_END(bpf_napi_kfunc_ids)
 
 /* NAPI IDs are global, and a BPF kthread runs with the kernel's credentials
