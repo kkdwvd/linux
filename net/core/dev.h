@@ -365,6 +365,10 @@ static inline void napi_set_irq_suspend_timeout(struct napi_struct *n,
 
 static inline enum netdev_napi_threaded napi_get_threaded(struct napi_struct *n)
 {
+	/* A BPF kthread polls it, the kernel's threaded mode is off. */
+	if (test_bit(NAPI_STATE_BPF, &n->state))
+		return NETDEV_NAPI_THREADED_DISABLED;
+
 	if (test_bit(NAPI_STATE_THREADED_BUSY_POLL, &n->state))
 		return NETDEV_NAPI_THREADED_BUSY_POLL;
 
@@ -384,6 +388,15 @@ napi_get_threaded_config(struct net_device *dev, struct napi_struct *n)
 
 int napi_set_threaded(struct napi_struct *n,
 		      enum netdev_napi_threaded threaded);
+
+#ifdef CONFIG_BPF_SYSCALL
+int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task);
+void napi_bpf_unbind_locked(struct napi_struct *napi);
+#else
+static inline void napi_bpf_unbind_locked(struct napi_struct *napi)
+{
+}
+#endif
 
 int netif_set_threaded(struct net_device *dev,
 		       enum netdev_napi_threaded threaded);

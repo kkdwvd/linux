@@ -441,6 +441,7 @@ enum {
 	NAPI_STATE_THREADED_BUSY_POLL,	/* The threaded NAPI poller will busy poll */
 	NAPI_STATE_PERCPU,		/* NAPI handler is run per-CPU - incompatible with threaded mode */
 	NAPI_STATE_DISABLED,		/* NAPI is disabled */
+	NAPI_STATE_BPF,			/* The thread is a BPF kthread, see napi_bpf_bind_locked() */
 };
 
 enum {
@@ -458,6 +459,7 @@ enum {
 	NAPIF_STATE_THREADED_BUSY_POLL	= BIT(NAPI_STATE_THREADED_BUSY_POLL),
 	NAPIF_STATE_PERCPU		= BIT(NAPI_STATE_PERCPU),
 	NAPIF_STATE_DISABLED		= BIT(NAPI_STATE_DISABLED),
+	NAPIF_STATE_BPF			= BIT(NAPI_STATE_BPF),
 };
 
 enum gro_result {
