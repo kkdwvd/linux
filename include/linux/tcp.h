@@ -387,6 +387,12 @@ struct tcp_sock {
 				 */
 	u32	compressed_ack_rcv_nxt;
 	struct list_head tsq_node; /* anchor in tsq_tasklet.head list */
+#ifdef CONFIG_BPF_SYSCALL
+	/* A BPF kthread does the socket's xmit work, see net/ipv4/tcp_bpf_tx.c */
+	struct list_head bpf_tx_node;	/* on its xmit queue while TCP_BPF_TX_QUEUED */
+	u16	bpf_tx_queue;		/* index of the xmit queue plus one, 0 for none */
+	u8	bpf_tx_nonagle;		/* the nonagle of the xmit work that was handed over */
+#endif
 
 	/* Information of the most recently (s)acked skb */
 	struct tcp_rack {
@@ -549,6 +555,7 @@ enum tsq_enum {
 				    * tcp_v{4|6}_mtu_reduced()
 				    */
 	TCP_ACK_DEFERRED,	   /* TX pure ack is deferred */
+	TCP_BPF_TX_QUEUED,	   /* xmit work waits on a BPF kthread's xmit queue */
 };
 
 enum tsq_flags {
@@ -559,6 +566,7 @@ enum tsq_flags {
 	TCPF_DELACK_TIMER_DEFERRED	= BIT(TCP_DELACK_TIMER_DEFERRED),
 	TCPF_MTU_REDUCED_DEFERRED	= BIT(TCP_MTU_REDUCED_DEFERRED),
 	TCPF_ACK_DEFERRED		= BIT(TCP_ACK_DEFERRED),
+	TCPF_BPF_TX_QUEUED		= BIT(TCP_BPF_TX_QUEUED),
 };
 
 /* Flags of interest for tcp_release_cb() */

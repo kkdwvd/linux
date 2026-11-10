@@ -4227,8 +4227,9 @@ static void tcp_xmit_recovery(struct sock *sk, int rexmit)
 		return;
 
 	if (unlikely(rexmit == REXMIT_NEW)) {
-		__tcp_push_pending_frames(sk, tcp_current_mss(sk),
-					  TCP_NAGLE_OFF);
+		/* F-RTO goes by whether new data left right here. */
+		tcp_push_pending_frames_now(sk, tcp_current_mss(sk),
+					    TCP_NAGLE_OFF);
 		if (after(tp->snd_nxt, tp->high_seq))
 			return;
 		tp->frto = 0;
