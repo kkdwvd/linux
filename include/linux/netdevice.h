@@ -410,6 +410,10 @@ struct napi_struct {
 	struct sk_buff		*skb;
 	struct gro_node		gro;
 	struct hrtimer		timer;
+#ifdef CONFIG_BPF_SYSCALL
+	/* When the NAPI was last scheduled for or polled by its BPF thread */
+	unsigned long		bpf_stamp;
+#endif
 	/* all fields past this point are write-protected by netdev_lock */
 	struct task_struct	*thread;
 	unsigned long		gro_flush_timeout;
@@ -424,6 +428,9 @@ struct napi_struct {
 	int			napi_rmap_idx;
 	int			index;
 	struct napi_config	*config;
+#ifdef CONFIG_BPF_SYSCALL
+	struct timer_list	bpf_timer;
+#endif
 };
 
 enum {

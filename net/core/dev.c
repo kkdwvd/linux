@@ -5188,6 +5188,11 @@ static bool napi_bpf_schedule(struct napi_struct *napi)
 		if ((val & (NAPIF_STATE_THREADED | NAPIF_STATE_BPF)) !=
 		    (NAPIF_STATE_THREADED | NAPIF_STATE_BPF))
 			return false;
+		/* The time the thread is given to poll starts here, and is
+		 * stored before the mark that napi_bpf_watchdog() goes by.
+		 */
+		if (!(val & NAPIF_STATE_SCHED_THREADED))
+			WRITE_ONCE(napi->bpf_stamp, jiffies);
 		new = val | NAPIF_STATE_SCHED_THREADED;
 	} while (!try_cmpxchg(&napi->state, &val, new));
 
@@ -7476,6 +7481,14 @@ static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
  * the thread side, and it is cleared together with the mark, so softirq never
  * receives a NAPI it could not complete.
  *
+ * A program is trusted to be memory safe, not to poll. A NAPI that stays
+ * scheduled for its thread is one whose interrupt stays masked, with or
+ * without a busy poll, so a thread that stops polling stalls the queue.
+ * napi_bpf_watchdog() looks at every bound NAPI periodically and takes the
+ * scheduling away from a thread that has left a NAPI scheduled and unpolled
+ * for NAPI_BPF_STALL. The NAPI stays bound, polls of it fail with -ECANCELED,
+ * and a new bind gives the scheduling back.
+ *
  * The binding holds a reference on the thread's rcu_users, the count a task
  * kptr holds, so that the task is freed only after an RCU grace period has
  * passed since the unbind and the schedule path may use the pointer with
@@ -7505,6 +7518,37 @@ static void napi_bpf_revoke(struct napi_struct *napi)
 	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
 	    NAPIF_STATE_SCHED_THREADED)
 		__napi_schedule(napi);
+}
+
+/* How long a NAPI may stay scheduled for its BPF thread without a poll. Long
+ * against any sleep a poller takes between polls and against a thread that is
+ * preempted, since the thread loses the NAPI over it.
+ */
+#define NAPI_BPF_STALL	HZ
+
+static void napi_bpf_watchdog(struct timer_list *t)
+{
+	struct napi_struct *napi = timer_container_of(napi, t, bpf_timer);
+	const unsigned long owned = NAPIF_STATE_BPF | NAPIF_STATE_THREADED;
+	unsigned long val = READ_ONCE(napi->state);
+
+	/* Unbound or revoked: a bind starts the timer again. */
+	if ((val & owned) != owned)
+		return;
+
+	/* A poller in the driver stores the stamp before it drops the claim. */
+	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
+	    NAPIF_STATE_SCHED_THREADED &&
+	    time_after(jiffies, READ_ONCE(napi->bpf_stamp) + NAPI_BPF_STALL)) {
+		if (net_ratelimit())
+			netdev_warn(napi->dev,
+				    "NAPI %u not polled by its BPF thread, back to softirq\n",
+				    napi->napi_id);
+		napi_bpf_revoke(napi);
+		return;
+	}
+
+	mod_timer(t, jiffies + NAPI_BPF_STALL / 2);
 }
 
 /* Claim @napi for one call of the driver's poll, which is a busy poll if
@@ -7621,6 +7665,7 @@ int napi_bpf_poll(unsigned int napi_id, u64 flags)
 	ret = napi ? napi_bpf_claim(napi, busy) : -ENOENT;
 	if (!ret) {
 		ret = napi_threaded_poll_once(napi, busy, &repoll);
+		WRITE_ONCE(napi->bpf_stamp, jiffies);
 		ret = min(ret, BPF_NAPI_POLL_WORK_MASK);
 		/* A NAPI taken away during the poll goes to softirq here. */
 		local_bh_disable();
@@ -7661,6 +7706,12 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
 			return -ESRCH;
 		WRITE_ONCE(napi->thread, task);
 	}
+
+	/* The thread gets the full time to poll a NAPI that is scheduled for
+	 * it already. The timer may be pending, from the binding this replaces.
+	 */
+	WRITE_ONCE(napi->bpf_stamp, jiffies);
+	mod_timer(&napi->bpf_timer, jiffies + NAPI_BPF_STALL / 2);
 
 	/* Order the thread before the bits that send the schedule path to it,
 	 * and before the load of the mark below, see napi_bpf_schedule().
@@ -7711,6 +7762,11 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	might_sleep();
 	while (test_bit(NAPI_STATE_BPF_POLLING, &napi->state))
 		usleep_range(20, 200);
+
+	/* The watchdog does not start itself again once it has seen
+	 * NAPI_STATE_THREADED clear.
+	 */
+	timer_delete_sync(&napi->bpf_timer);
 
 	/* The thread goes before NAPI_STATE_BPF, so that a schedule path which
 	 * saw NAPI_STATE_THREADED before the revocation and finds
@@ -8141,6 +8197,9 @@ void netif_napi_add_weight_locked(struct net_device *dev,
 	INIT_LIST_HEAD(&napi->poll_list);
 	INIT_HLIST_NODE(&napi->napi_hash_node);
 	hrtimer_setup(&napi->timer, napi_watchdog, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+#ifdef CONFIG_BPF_SYSCALL
+	timer_setup(&napi->bpf_timer, napi_bpf_watchdog, 0);
+#endif
 	gro_init(&napi->gro);
 	napi->skb = NULL;
 	napi->poll = poll;
