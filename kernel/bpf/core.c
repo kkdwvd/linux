@@ -36,6 +36,7 @@
 #include <linux/perf_event.h>
 #include <linux/extable.h>
 #include <linux/log2.h>
+#include <linux/bpf_unwind.h>
 #include <linux/bpf_verifier.h>
 #include <linux/nodemask.h>
 #include <linux/nospec.h>
@@ -3956,6 +3957,32 @@ void * __weak bpf_arch_throw_entry(void)
 bool __weak bpf_jit_supports_timed_may_goto(void)
 {
 	return false;
+}
+
+/*
+ * The entry a helper whose callback threw returns to, to go on unwinding from
+ * its call, or NULL; and where the unwinder finds the return address of a
+ * kernel frame and how it changes that of a JITed one, on an architecture
+ * with the entry.
+ */
+void * __weak bpf_arch_rethrow_entry(void)
+{
+	return NULL;
+}
+
+u64 * __weak bpf_arch_ret_slot(u64 bp, u64 next_sp)
+{
+	return NULL;
+}
+
+/* The slot holds the return address as it is, unless the architecture signs it. */
+u64 __weak bpf_arch_ret_addr(const u64 *slot)
+{
+	return *slot;
+}
+
+void __weak bpf_arch_set_ret_addr(u64 bp, u64 to)
+{
 }
 
 u64 __weak arch_bpf_timed_may_goto(void)

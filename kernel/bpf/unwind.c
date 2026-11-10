@@ -4,7 +4,8 @@
  * one the kernel entered, once per phase of the release order, releasing
  * what each frame holds of that phase according to the frame descriptor of
  * its site, and recovering the callee-saved registers the discarded frames
- * saved, then transfer to that frame, which returns.
+ * saved, then transfer to that frame, which returns, or leaves into the pad
+ * of the helper that ran it.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -28,6 +29,13 @@ void bpf_prog_fill_frame_desc_table(struct bpf_prog *prog, const u32 *offsets, v
 	for (i = 0; i < tab->cnt; i++) {
 		struct bpf_frame_desc_site *site = &tab->site[i];
 
+		/*
+		 * A call of BPF code is a site the frame waits in; at any other
+		 * site the frame can be the innermost one of an unwind, which
+		 * bpf_check_attach_target() asks of a subprog, see there.
+		 */
+		if (!bpf_pseudo_call(&prog->insnsi[site->off]))
+			tab->innermost = true;
 		site->end = image + offsets[site->off + 1] - (void *)prog->bpf_func;
 		site->off = image + offsets[site->off] - (void *)prog->bpf_func;
 	}
@@ -199,17 +207,34 @@ struct bpf_throw_ctx {
 	u64 bp;
 	int cnt;
 	const struct bpf_throw_regs *regs;	/* register file of the throw site, or NULL */
+	unsigned int kind;			/* BPF_THROW_*: how the throw site was reached */
 	int phase;				/* BPF_UNWIND_PHASE_*: what this walk releases */
 	/*
 	 * The callee-saved registers of the frame being walked, R6-R9 then the
 	 * architecture's own: what the throw site had, then what each frame
-	 * recovered of its caller's. After the main frame they are the ones
-	 * its caller expects back.
+	 * recovered of its caller's. After the frame the unwinder stops at they
+	 * are the ones its caller expects back.
 	 */
 	u64 saved[BPF_THROW_NR_CALLEE_SAVED];
 	/* The sections the frames hold, per kind, summed by the first walk. */
 	const struct bpf_resource *section[BPF_UNWIND_NR_SECTIONS];
 	s64 nr_sections[BPF_UNWIND_NR_SECTIONS];
+	/*
+	 * When that frame is a callback a helper ran: the pad of the helper, the
+	 * frame pointer of the last kernel frame passed, the return address of
+	 * the outermost helper into the program, where the helper keeps it, and
+	 * the hidden slot of the frame that called the helper for the cookie.
+	 */
+	u64 pad;
+	u64 kernel_bp;
+	u64 site;
+	u64 *slot;
+	u64 *cookie_slot;
+	/*
+	 * The cookie the innermost frame kept in its hidden slot, when the
+	 * unwinding goes on from the call of a helper whose callback threw.
+	 */
+	u64 cookie;
 };
 
 /*
@@ -455,13 +480,46 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	rcu_read_lock();
 	prog = bpf_prog_ksym_find(ip);
 	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
+	/*
+	 * The kernel frames below the first BPF frame are the unwinder's own.
+	 * The first one above a subprog's frame is the kernel code that ran
+	 * the subprog as a callback, where the unwinder stops: when it is a
+	 * helper with a pad, see bpf_call_cb(), the callback leaves into the
+	 * pad and the walk goes on, through the helpers the helper called with
+	 * pads of their own, to the frame of the program that called it, where
+	 * the return address of the outermost helper is found.
+	 */
+	if (!prog) {
+		if (!ctx->cnt)
+			return true;
+		if (!ctx->pad) {
+			ctx->pad = bpf_unwind_target(ip);
+			if (ctx->pad == ip) {
+				ctx->pad = 0;
+				return false;
+			}
+		}
+		ctx->kernel_bp = bp;
+		return true;
+	}
 	fn = bpf_unwind_fn(prog);
 	fp = bp + fn->frame_fp_off;
 	/* With a private stack, the frame's R10 is this CPU's private frame. */
 	if (fn->priv_stack_ptr)
 		fp = (u64)(long)this_cpu_ptr(fn->priv_stack_ptr) + fn->priv_frame_off;
+	if (ctx->pad) {
+		/*
+		 * The frame of the program that called the helper, which the
+		 * throw that follows the pad unwinds, see bpf_throw_unwind(): it
+		 * has the return address of the helper and the slot for the
+		 * cookie, and the walk ends here.
+		 */
+		ctx->site = ip;
+		ctx->slot = bpf_arch_ret_slot(ctx->kernel_bp, sp);
+		if (fn->throw_cookie_off)
+			ctx->cookie_slot = (u64 *)(long)(fp + fn->throw_cookie_off);
+		return false;
+	}
 	/*
 	 * Release what the frame holds of this walk's phase. Every frame is at
 	 * a call, whose return address is the first byte of the next
@@ -470,24 +528,37 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	 */
 	bpf_unwind_release_frame(ctx, prog, ip - 1, fp, !ctx->cnt);
 	bpf_unwind_recover(fn, bp, ctx->saved, BPF_THROW_NR_CALLEE_SAVED);
+	/* The innermost frame called the helper whose callback threw: it has the cookie. */
+	if (!ctx->cnt && ctx->kind == BPF_THROW_RETHROW && !WARN_ON_ONCE(!fn->throw_cookie_off))
+		ctx->cookie = *(u64 *)(long)(fp + fn->throw_cookie_off);
 	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
 	ctx->prog = prog;
 	ctx->sp = sp;
 	ctx->bp = bp;
-	return false;
+	/*
+	 * A program that is not a subprog was entered from the kernel or by a
+	 * tail call and is the frame the unwinder stops at; a tail called
+	 * program thus completes into the program that called it. A subprog
+	 * is unwound through, unless the kernel ran it as a callback.
+	 */
+	return bpf_is_subprog(prog);
 }
 
 /*
  * Walk the frames from the throw site outwards for one phase, from the
  * register file of the throw site again: every walk passes the same frames
- * and ends at the same one, with the same registers recovered.
+ * and ends at the same one, with the same registers recovered and the same
+ * pad found. What the walk learns of the pad is acted on once they are over.
  */
 static void bpf_unwind_walk(struct bpf_throw_ctx *ctx, int phase)
 {
 	ctx->phase = phase;
 	ctx->cnt = 0;
+	ctx->pad = 0;
+	ctx->kernel_bp = 0;
+	ctx->site = 0;
+	ctx->slot = NULL;
+	ctx->cookie_slot = NULL;
 	memcpy(ctx->saved, &ctx->regs->r[BPF_REG_6], sizeof(ctx->saved));
 	arch_bpf_stack_walk(bpf_stack_walker, ctx);
 }
@@ -513,15 +584,26 @@ static void bpf_unwind_frames(struct bpf_throw_ctx *ctx)
 }
 
 /*
- * Unwind the stack to the exception callback of the main program. @regs is the
- * register file of the throw site, which the entry of the architecture
- * captured: the resources the frames unwound hold are released from it and
- * their callee-saved registers restored for the callback.
+ * Unwind the BPF frames above the throw site up to the one the kernel
+ * entered: the main program, which its exception callback returns from, or
+ * a callback. A callback a helper ran leaves into the pad of the helper the
+ * way unwind_exit does, with the return address of the call in the program
+ * as its r0; the helper drops what it holds and returns, with that r0, to
+ * bpf_rethrow_entry(), which the unwinder made its return address, and the
+ * unwinding goes on from the call of the helper. The cookie waits in a
+ * hidden stack slot of the frame that called the helper meanwhile, since r0
+ * is all that the helper passes on. A callback the kernel ran on its own, a
+ * timer's, returns to it. @regs is the register file of the throw site,
+ * which the entry of the architecture captured: the resources the frames
+ * unwound hold are released from it and their callee-saved registers
+ * restored for the callback. @kind says how the throw site was reached.
  */
 __bpf_unwind_entry
-void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
+void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind)
 {
-	struct bpf_throw_ctx ctx = { .regs = regs };
+	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
+	struct bpf_prog_aux *aux, *main_aux;
+	u64 (*cb)(u64, u64, u64, u64, u64);
 
 	/*
 	 * The kfunc passes NULL, but the verifier retargets its call to
@@ -535,7 +617,7 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
 	BUG_ON(!regs);
 	bpf_unwind_frames(&ctx);
 	WARN_ON_ONCE(!ctx.prog);
-	WARN_ON_ONCE(ctx.prog && !ctx.prog->aux->exception_boundary);
+	WARN_ON_ONCE(ctx.prog && !ctx.prog->aux->main_prog_aux->exception_boundary);
 	WARN_ON_ONCE(!ctx.bp);
 	WARN_ON_ONCE(!ctx.cnt);
 	/*
@@ -545,6 +627,67 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie)
 	 * architectures cannot recover sp while unwinding, so fall back to bp.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	ctx.prog->aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
+	/*
+	 * The unwinding went on from the call of a helper whose callback threw:
+	 * the cookie of the throw is in the frame that called the helper.
+	 */
+	if (kind == BPF_THROW_RETHROW)
+		cookie = ctx.cookie;
+	/*
+	 * The main program completes with the cookie, through its exception
+	 * callback, which does not throw itself. A callback a helper ran leaves
+	 * into the pad of the helper, and the unwinding goes on from the call of
+	 * the helper, where the program's main frame is reached in turn; a
+	 * callback the kernel ran on its own returns 0, which the kernel code
+	 * ignores.
+	 */
+	aux = ctx.prog->aux;
+	main_aux = aux->main_prog_aux;
+	if (ctx.pad) {
+		/*
+		 * The slot may hold the address signed, see bpf_arch_ret_addr(),
+		 * which the walker strips from what it reports; the entry is
+		 * stored raw, since the pad of the helper signs what it leaves
+		 * with, see bpf_unwind_leave(). Without the slot of the cookie
+		 * or the return address of the helper the frames below cannot
+		 * be unwound, which the verifier rules out: the helper returns
+		 * to the program then, which goes on as if the callback had
+		 * returned.
+		 */
+		if (!WARN_ON_ONCE(!ctx.slot || !ctx.cookie_slot ||
+				  bpf_arch_ret_addr(ctx.slot) != ctx.site)) {
+			*ctx.cookie_slot = cookie;
+			*ctx.slot = (u64)(long)bpf_arch_rethrow_entry();
+		}
+		bpf_arch_set_ret_addr(ctx.bp, ctx.pad);
+		cookie = ctx.site;
+		cb = main_aux->bpf_unwind_ret_cb;
+	} else if (bpf_is_subprog(ctx.prog)) {
+		/*
+		 * A callback the kernel ran on its own, a timer's or a work
+		 * item's. Any other kernel frame above a subprog is a bug: the
+		 * verifier lets a helper run a callback that throws only with a
+		 * pad, and only fentry may attach to a subprog an unwind can pass
+		 * through, see bpf_check_attach_target(), since the trampoline of
+		 * anything else would be that frame. Completing the frame with 0
+		 * is the least that can be done then: the frames below are not
+		 * unwound, their caller takes the value for the subprog's result,
+		 * and what they hold leaks, but the kernel goes on.
+		 */
+		WARN_ONCE(!aux->async_cb,
+			  "bpf: unwinding %s stopped at %s under a frame that is not BPF code\n",
+			  main_aux->name, aux->name);
+		cookie = 0;
+		cb = main_aux->bpf_unwind_ret_cb;
+	} else {
+		cb = main_aux->bpf_exception_cb;
+	}
+	/*
+	 * Every program that throws has both callbacks, see bpf_do_misc_fixups();
+	 * without one nothing completes the frame, and there is no return from
+	 * here.
+	 */
+	BUG_ON(!cb);
+	cb(cookie, ctx.sp, ctx.bp, (u64)(long)ctx.saved, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }

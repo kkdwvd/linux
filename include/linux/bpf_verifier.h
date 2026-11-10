@@ -1111,6 +1111,7 @@ struct bpf_subprog_info {
 	u8 section_counter;	/* BIT(kind) */
 	u16 entry_stores;	/* insns storing mirrors at the entry, see bpf_frame_desc_emit() */
 	s16 section_off[2];
+	s16 throw_cookie_off;	/* hidden slot for the cookie of a throw in a callback, or 0 */
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1547,7 +1548,9 @@ struct bpf_verifier_env {
 	struct bpf_frame_desc_move *frame_desc_moves;	/* sites to move at the next commit */
 	u32 frame_desc_move_cnt;
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	bool throw_in_callback;			/* some bpf_throw() is reached inside a callback a helper runs */
 	int exception_callback_subprog;
+	int unwind_ret_subprog;		/* returns the cookie from the frame of a callback that threw */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are

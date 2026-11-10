@@ -5785,20 +5785,11 @@ static int check_recursion(struct bpf_verifier_env *env, struct bpf_call_graph *
 static int check_callbacks(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_insn *insn = env->prog->insnsi;
-	int i, s;
+	int s;
 
 	for_each_set_bit(s, cg->in_cb, cg->cnt) {
 		if (si[s].has_ld_abs) {
 			verbose(env, "cannot use BPF_LD_[ABS|IND] within callback\n");
-			return -EINVAL;
-		}
-		for (i = si[s].start; i < si[s + 1].start; i++) {
-			if (!bpf_is_throw_kfunc(insn + i))
-				continue;
-			verbose(env,
-				"bpf_throw kfunc (insn %d) cannot be called from callback subprog %d\n",
-				i, s);
 			return -EINVAL;
 		}
 	}
@@ -11635,6 +11626,8 @@ static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	return 0;
 }
 
+static int check_throw_in_callback(struct bpf_verifier_env *env, int callsite);
+
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int insn_idx, int subprog,
 			      set_callee_state_fn set_callee_state_cb)
@@ -11719,6 +11712,20 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	err = check_cb_unwind(env, insn, insn_idx, subprog);
 	if (err)
 		return err;
+
+	/*
+	 * A throw in the callback, or in a subprog it reaches, is unwound to
+	 * the callback, which leaves through the pad of the helper, and the
+	 * unwinding goes on from this call, see bpf_throw_unwind().
+	 */
+	if (env->subprog_info[subprog].might_throw) {
+		err = check_throw_in_callback(env, insn_idx);
+		if (err)
+			return err;
+		env->throw_in_callback = true;
+		/* the frame of the caller is unwound from this call then */
+		env->insn_aux_data[insn_idx].cb_might_throw = true;
+	}
 
 	/* for callback functions enqueue entry to callback and
 	 * proceed with next instruction within current frame.
@@ -16213,11 +16220,62 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+static bool nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
+/*
+ * A throw inside a callback that a helper or a kfunc runs, called at insn
+ * @callsite, or in a subprog the callback reaches, which may be verified on
+ * its own, without the frame of the callback: so the call of the helper is
+ * where it is checked. The unwinder stops at the callback, which leaves into the pad of
+ * its caller the way unwind_exit does, so the caller needs one, see
+ * bpf_call_cb(), and returns to the entry that goes on unwinding from the call
+ * of the helper, which the architecture has to have. The pad of
+ * bpf_rbtree_add() drops the node, which is a bpf_obj_drop() under the rule
+ * above.
+ */
+static int check_throw_in_callback(struct bpf_verifier_env *env, int callsite)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[callsite];
+	struct btf_struct_meta *meta;
+
+	if (!BPF_HAS_CB_PADS || !insn_has_cb_pad(insn) || !bpf_arch_rethrow_entry()) {
+		if (bpf_helper_call(insn))
+			verbose(env, "bpf_throw cannot be called from the callback of %s()\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env,
+				"bpf_throw cannot be called from the callback of the kfunc at insn %d\n",
+				callsite);
+		return -EINVAL;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) || !is_bpf_rbtree_add_kfunc(insn->imm) ||
+	    !nmi_unsafe_prog(env))
+		return 0;
+	meta = env->insn_aux_data[callsite].kptr_struct_meta;
+	if (meta && btf_record_has_nmi_unsafe_fields(meta->record)) {
+		verbose(env,
+			"bpf_rbtree_add with a comparator that can throw cannot be used in tracing programs on types with NMI unsafe fields\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16334,10 +16392,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
@@ -24228,6 +24283,59 @@ static int find_tgt_subprog(const struct bpf_prog *tgt_prog, u32 btf_id)
 }
 
 /*
+ * Can an unwind pass through a frame of @subprog of @prog? It can when a
+ * frame of the subprog, or of a subprog it calls, can be the innermost frame
+ * of an unwind. Every call of BPF code in a program whose frames are
+ * described is a site the caller waits in, so the callees are found through
+ * the calls in the instructions, which name their callee after
+ * jit_subprogs(), and a subprog's table says whether some site of its own is
+ * not such a call, see bpf_prog_fill_frame_desc_table(); a callx is such a
+ * site, whatever it calls. Returns a negative errno on failure.
+ */
+static int subprog_may_unwind(const struct bpf_prog *prog, int subprog)
+{
+	const struct bpf_prog_aux *aux = prog->aux;
+	u32 n = aux->real_func_cnt, *start, *todo, cnt = 1, i, s;
+	unsigned long *seen;
+	int ret = 0;
+
+	/* JITed as one function: nothing calls BPF code, and no subprog can be attached to */
+	if (!aux->func)
+		return 0;
+	start = kcalloc(2 * n, sizeof(*start), GFP_KERNEL);
+	seen = bitmap_zalloc(n, GFP_KERNEL);
+	if (!start || !seen) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	todo = start + n;
+	for (s = 1; s < n; s++)
+		start[s] = start[s - 1] + aux->func[s - 1]->len;
+	todo[0] = subprog;
+	__set_bit(subprog, seen);
+	while (cnt) {
+		const struct bpf_frame_desc_table *tab;
+
+		s = todo[--cnt];
+		tab = aux->func[s]->aux->frame_desc_table;
+		if (tab && tab->innermost) {
+			ret = 1;
+			break;
+		}
+		for (i = start[s]; i < start[s] + aux->func[s]->len; i++) {
+			const struct bpf_insn *insn = &prog->insnsi[i];
+
+			if (bpf_pseudo_call(insn) && !test_and_set_bit(insn->off, seen))
+				todo[cnt++] = insn->off;
+		}
+	}
+out:
+	kfree(start);
+	bitmap_free(seen);
+	return ret;
+}
+
+/*
  * The prologue of an extension gives a cloned skb a new head, unless the
  * prologue of the target program has done that. The callers of the function
  * that it replaces must not hold on to the old head.
@@ -24377,11 +24485,24 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		tgt_can_unwind = (subprog || tgt_prog->type == BPF_PROG_TYPE_EXT) &&
 				 (aux->func ? aux->func[subprog]->aux->can_unwind
 					    : aux->can_unwind);
-		/* unwind_exit would return to the trampoline that called the target */
-		if (tgt_can_unwind && !prog_extension &&
-		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
-			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
-			return -EINVAL;
+		/*
+		 * unwind_exit would return to the trampoline that called the
+		 * target, and the unwinder would stop at a frame of the target
+		 * under it, since the trampoline's frame is not BPF code and has
+		 * no pad, see bpf_stack_walker(). Only fentry leaves no frame of
+		 * its own behind while the target runs.
+		 */
+		if (!prog_extension && prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			ret = tgt_can_unwind;
+			if (!ret && subprog)
+				ret = subprog_may_unwind(tgt_prog, subprog);
+			if (ret < 0)
+				return ret;
+			if (ret) {
+				bpf_log(log, "Only fentry can attach to %s, which can unwind\n",
+					tname);
+				return -EINVAL;
+			}
 		}
 		/* What it takes of the stack is not counted, see bpf_insert_recursion_checks() */
 		if (aux->func && aux->func[subprog]->aux->in_recursion) {
@@ -25628,6 +25749,37 @@ static void log_program(struct bpf_verifier_env *env)
 	}
 }
 
+/*
+ * A throw inside a callback a helper ran is unwound to the callback, which
+ * leaves into the pad of the helper, and the unwinding goes on from the call
+ * of the helper, see bpf_throw_unwind(). The helper passes on r0 alone, which
+ * holds the return address of its call then, so the cookie waits in a hidden
+ * stack slot of the frame that called the helper: in a program that throws
+ * inside a callback, every subprog that calls a helper or a kfunc with a
+ * callback gets one. Nothing initializes the slot, which the unwinder writes
+ * and reads back.
+ */
+static int reserve_throw_cookie_slots(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	struct bpf_insn *insn = env->prog->insnsi;
+	int s, i, ret;
+
+	if (!env->throw_in_callback)
+		return 0;
+	for (s = 0; s < env->subprog_cnt; s++) {
+		for (i = si[s].start; i < si[s + 1].start; i++) {
+			if (!bpf_is_sync_callback_calling_insn(insn + i))
+				continue;
+			ret = bpf_reserve_stack_slots(env, s, 1, &si[s].throw_cookie_off);
+			if (ret)
+				return ret;
+			break;
+		}
+	}
+	return 0;
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	      struct bpf_log_attr *attr_log)
 {
@@ -25785,6 +25937,17 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	/* A program that may throw gets frame descriptors, see frame_desc.c. */
 	for (i = 0; i < env->subprog_cnt; i++)
 		env->describe_frames |= env->subprog_info[i].might_throw;
+	/*
+	 * The exception callback completes the program with what it returns,
+	 * which the verifier checks: a throw from it would complete the program
+	 * with its cookie instead.
+	 */
+	if (env->exception_callback_subprog &&
+	    env->subprog_info[env->exception_callback_subprog].might_throw) {
+		verbose(env, "bpf_throw cannot be called from the exception callback\n");
+		ret = -EINVAL;
+		goto skip_full_check;
+	}
 
 	ret = check_unwind_insns(env);
 	if (ret < 0)
@@ -25909,6 +26072,8 @@ skip_full_check:
 		ret = bpf_frame_desc_resolve(env);
 	if (ret == 0)
 		ret = bpf_frame_desc_emit(env);
+	if (ret == 0)
+		ret = reserve_throw_cookie_slots(env);
 
 	/* Account for the mirrors reserved by frame descriptor resolution. */
 	if (ret == 0)

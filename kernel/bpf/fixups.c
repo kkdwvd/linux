@@ -2088,6 +2088,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
+		func[i]->aux->async_cb = env->subprog_info[i].is_async_cb;
+		func[i]->aux->throw_cookie_off = env->subprog_info[i].throw_cookie_off;
 		func[i]->aux->token = prog->aux->token;
 		if (!i)
 			func[i]->aux->exception_boundary = env->seen_exception;
@@ -2199,6 +2201,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
+	if (env->unwind_ret_subprog)
+		prog->aux->bpf_unwind_ret_cb = (void *)func[env->unwind_ret_subprog]->bpf_func;
 	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
@@ -2729,7 +2733,15 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
 	s16 may_goto_slot = 0;
 
-	if (env->seen_exception && !env->exception_callback_subprog) {
+	/*
+	 * A program that throws needs the exception callback the unwinder
+	 * transfers to from the main frame, which returns the cookie unless the
+	 * program has one of its own, and the hidden callback that returns its
+	 * cookie from the frame of a callback the kernel ran, which the unwinder
+	 * completes such a frame with, see bpf_throw_unwind(): so every program
+	 * that throws gets the hidden one.
+	 */
+	if (env->seen_exception) {
 		struct bpf_insn *patch = insn_buf;
 
 		*patch++ = env->prog->insnsi[insn_cnt - 1];
@@ -2741,9 +2753,11 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		prog = env->prog;
 		insn = prog->insnsi;
 
-		env->exception_callback_subprog = env->subprog_cnt - 1;
+		if (!env->exception_callback_subprog)
+			env->exception_callback_subprog = env->subprog_cnt - 1;
+		env->unwind_ret_subprog = env->subprog_cnt - 1;
 		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
-		bpf_mark_subprog_exc_cb(env, env->exception_callback_subprog);
+		bpf_mark_subprog_exc_cb(env, env->subprog_cnt - 1);
 	}
 
 	for (i = 0; i < insn_cnt;) {

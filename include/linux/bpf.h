@@ -1936,6 +1936,12 @@ struct bpf_frame_desc_site {
 struct bpf_frame_desc_table {
 	u32 cnt;
 	bool filled;
+	/*
+	 * Some site is not a call of BPF code, which a frame waits in: a frame of
+	 * the function can be the innermost one of an unwind. Set as the table is
+	 * filled.
+	 */
+	bool innermost;
 	struct bpf_frame_desc_site site[];
 };
 
@@ -2120,6 +2126,8 @@ struct bpf_prog_aux {
 	 * restored, R6..R9 then the architecture's own, see struct bpf_throw_regs.
 	 */
 	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
+	/* Returns @cookie from the frame the unwinder stopped at: a callback, or the main program. */
+	u64 (*bpf_unwind_ret_cb)(u64 cookie, u64 sp, u64 bp, u64 saved, u64);
 	u16 freplace_link_cnt; /* counts freplace links extending this prog */
 	/*
 	 * Offsets from the native frame pointer of this JITed program at which
@@ -2132,6 +2140,14 @@ struct bpf_prog_aux {
 	s16 frame_fp_off;
 	/* With a private stack, the frame's R10 is this far into this CPU's priv_stack_ptr. */
 	u32 priv_frame_off;
+	/* This JITed function is a timer, workqueue or similar callback: its own invocation. */
+	bool async_cb;
+	/*
+	 * Offset from R10 of the hidden stack slot that carries the cookie of a
+	 * throw across a helper this function calls, see bpf_throw_unwind(); 0
+	 * when the function has none.
+	 */
+	s16 throw_cookie_off;
 #ifdef CONFIG_SECURITY
 	void *security;
 #endif
