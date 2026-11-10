@@ -7791,6 +7791,35 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 }
 
 /**
+ * napi_bpf_by_id_lock() - find a NAPI by ID in any namespace, lock its device
+ * @napi_id: ID of the NAPI
+ *
+ * netdev_napi_by_id_lock() for a caller that is not confined to a network
+ * namespace: a BPF kthread is in the initial one whoever created it, and the
+ * programs that bind NAPIs are loaded with CAP_NET_ADMIN over all of them.
+ * netdev_unlock() must be called to release the device.
+ *
+ * Return: the NAPI with its device locked, NULL if there is none.
+ */
+struct napi_struct *napi_bpf_by_id_lock(unsigned int napi_id)
+{
+	struct napi_struct *napi;
+	struct net *net = NULL;
+
+	rcu_read_lock();
+	napi = napi_by_id(napi_id);
+	if (napi)
+		net = maybe_get_net(dev_net_rcu(napi->dev));
+	rcu_read_unlock();
+	if (!net)
+		return NULL;
+
+	napi = netdev_napi_by_id_lock(net, napi_id);
+	put_net(net);
+	return napi;
+}
+
+/**
  * napi_bpf_release_task() - unbind every NAPI bound to an exiting BPF kthread
  * @task: the BPF kthread, which accepts no new binding any more
  *

@@ -363,6 +363,10 @@ extern int bpf_kthread_attach_cgroup(struct task_struct *task, struct cgroup *cg
 extern int bpf_kthread_stop(struct task_struct *task, __u64 flags) __weak __ksym;
 extern bool bpf_kthread_should_stop(void) __weak __ksym;
 
+extern int bpf_napi_bind(__u32 napi_id, struct task_struct *task, __u64 flags) __weak __ksym;
+extern int bpf_napi_unbind(__u32 napi_id) __weak __ksym;
+extern int bpf_napi_poll(__u32 napi_id, __u64 flags) __weak __ksym;
+
 struct bpf_iter_kmem_cache;
 extern int bpf_iter_kmem_cache_new(struct bpf_iter_kmem_cache *it) __weak __ksym;
 extern struct kmem_cache *bpf_iter_kmem_cache_next(struct bpf_iter_kmem_cache *it) __weak __ksym;
