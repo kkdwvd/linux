@@ -2,6 +2,10 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
+#include <linux/capability.h>
+#include <linux/filter.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
@@ -332,6 +336,137 @@ int tcp_bpf_tx_sock_bind(struct sock *sk, s32 queue)
 	WRITE_ONCE(tcp_sk(sk)->bpf_tx_queue, queue < 0 ? 0 : queue + 1);
 	return 0;
 }
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_tcp_tx_bind - Make a BPF kthread the thread that serves a TCP xmit queue
+ * @queue: index of the queue
+ * @task: a thread created by bpf_kthread_create()
+ * @flags: must be 0
+ *
+ * From now on a socket assigned to @queue, see bpf_tcp_tx_sock_bind(), does
+ * not transmit the data it is given to send: it is put on the queue, @task is
+ * woken with the wake bpf_task_wake() issues, and the xmit work waits for
+ * bpf_tcp_tx_poll(). The queues are global, their number is fixed, and what
+ * an index stands for is up to the program. Binding a queue that has a thread
+ * replaces it.
+ *
+ * The binding ends with bpf_tcp_tx_unbind(), when the thread's callback
+ * returns, and when sockets have waited on the queue for about a second
+ * without a poll; the sockets then transmit for themselves again.
+ *
+ * Return: 0 on success, -EINVAL if @flags is not 0 or @queue is out of range,
+ * -ESRCH if @task is not a BPF kthread, or one whose callback has returned or
+ * that is being stopped.
+ */
+__bpf_kfunc int bpf_tcp_tx_bind(u32 queue, struct task_struct *task, u64 flags)
+{
+	if (flags)
+		return -EINVAL;
+	return tcp_bpf_tx_bind(queue, task);
+}
+
+/**
+ * bpf_tcp_tx_unbind - Leave the xmit work of a queue's sockets to the sockets
+ * @queue: index of the queue
+ *
+ * The caller transmits for the sockets that wait on the queue.
+ *
+ * Return: 0 on success, also when the queue had no thread, -EINVAL if @queue
+ * is out of range.
+ */
+__bpf_kfunc int bpf_tcp_tx_unbind(u32 queue)
+{
+	if (queue >= TCP_BPF_TX_QUEUES)
+		return -EINVAL;
+	tcp_bpf_tx_unbind(queue);
+	return 0;
+}
+
+/**
+ * bpf_tcp_tx_poll - Do the xmit work of the sockets that wait on a TCP xmit queue
+ * @queue: index of a queue the calling thread serves
+ * @budget: serve at most this many sockets
+ *
+ * Each socket's data is transmitted as its sender would have transmitted it,
+ * on the calling thread. A socket whose owner holds its lock is skipped and
+ * comes back to the queue when the owner lets go.
+ *
+ * Return: the number of sockets taken off the queue, -EINVAL if @queue is out
+ * of range, -EPERM if the caller is not the queue's thread.
+ */
+__bpf_kfunc int bpf_tcp_tx_poll(u32 queue, u32 budget)
+{
+	return tcp_bpf_tx_poll(queue, budget);
+}
+
+/**
+ * bpf_tcp_tx_sock_bind - Assign the socket of a sockops program to an xmit queue
+ * @skops: the program's context
+ * @queue: index of the queue, or a negative value for none
+ *
+ * Takes effect the next time the socket has xmit work. While the queue has no
+ * thread the socket transmits for itself.
+ *
+ * Return: 0 on success, -EINVAL if @queue is out of range or the socket is
+ * not a full TCP socket.
+ */
+__bpf_kfunc int bpf_tcp_tx_sock_bind(struct bpf_sock_ops_kern *skops, s32 queue)
+{
+	return tcp_bpf_tx_sock_bind(skops->sk, queue);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(tcp_bpf_tx_thread_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_tcp_tx_bind, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_tcp_tx_unbind, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_tcp_tx_poll, KF_SLEEPABLE)
+BTF_KFUNCS_END(tcp_bpf_tx_thread_kfunc_ids)
+
+BTF_KFUNCS_START(tcp_bpf_tx_sock_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_tcp_tx_sock_bind)
+BTF_KFUNCS_END(tcp_bpf_tx_sock_kfunc_ids)
+
+/* The queues are global, and a BPF kthread runs with the kernel's credentials
+ * whoever created it, so there is nothing to check when a kfunc is called.
+ * The program is checked instead, when it is loaded: it may call these kfuncs
+ * only if its loader has CAP_NET_ADMIN in the initial user namespace. A BPF
+ * token, which delegates within a user namespace, does not grant that.
+ */
+static int tcp_bpf_tx_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	if (!btf_id_set8_contains(&tcp_bpf_tx_thread_kfunc_ids, kfunc_id) &&
+	    !btf_id_set8_contains(&tcp_bpf_tx_sock_kfunc_ids, kfunc_id))
+		return 0;
+	return capable(CAP_NET_ADMIN) ? 0 : -EPERM;
+}
+
+static const struct btf_kfunc_id_set tcp_bpf_tx_thread_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &tcp_bpf_tx_thread_kfunc_ids,
+	.filter = tcp_bpf_tx_kfunc_filter,
+};
+
+static const struct btf_kfunc_id_set tcp_bpf_tx_sock_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &tcp_bpf_tx_sock_kfunc_ids,
+	.filter = tcp_bpf_tx_kfunc_filter,
+};
+
+/* The queues belong to BPF kthreads, which syscall programs create; sockets
+ * are assigned where a policy sees each connection, in a sockops program.
+ */
+static int __init tcp_bpf_tx_kfunc_init(void)
+{
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &tcp_bpf_tx_thread_kfunc_set);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SOCK_OPS,
+						&tcp_bpf_tx_sock_kfunc_set);
+}
+late_initcall(tcp_bpf_tx_kfunc_init);
 
 static int __init tcp_bpf_tx_init(void)
 {
