@@ -118,7 +118,7 @@ out:
 	sched_setaffinity(0, sizeof(old), &old);
 }
 
-/* bpf_throw() doesn't return the stack. Programs run when all stacks of the cpu are taken. */
+/* The unwinder returns the stack of a program that throws: the programs after it run */
 static void test_throw(struct arena_stack *skel)
 {
 	cpu_set_t old;
