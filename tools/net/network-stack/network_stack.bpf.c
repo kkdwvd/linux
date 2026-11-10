@@ -23,6 +23,15 @@
  * unmask their interrupts, and the thread parks. The first schedule of one of
  * its NAPIs wakes it into the masked phase. With hold_ns at zero a thread is
  * always armed, which is threaded NAPI with a thread per CPU.
+ *
+ * With --tx a thread also sends. Every thread has a TCP xmit queue of its
+ * own, with the index of its slot, and a connection that is established while
+ * a thread processes its handshake, which is every connection that arrives
+ * through a NAPI the pool polls, is assigned to that thread's queue by the
+ * sockops program below. From then on the connection's sendmsg() copies and
+ * returns, and the thread transmits after each pass over its NAPIs. A queue
+ * whose thread has no NAPIs at the moment is served by another thread of the
+ * LLC, as the loader arranges.
  */
 #define BPF_NO_KFUNC_PROTOTYPES
 #include "vmlinux.h"
@@ -60,6 +69,12 @@ extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym;
 extern int bpf_napi_bind(__u32 napi_id, struct task_struct *task, __u64 flags) __ksym;
 extern int bpf_napi_unbind(__u32 napi_id) __ksym;
 extern int bpf_napi_poll(__u32 napi_id, __u64 flags) __ksym;
+/* Only kernels with TCP xmit queues have these, and only --tx uses them. */
+extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __ksym __weak;
+extern int bpf_tcp_tx_unbind(__u32 queue) __ksym __weak;
+extern int bpf_tcp_tx_poll(__u32 queue, __u32 budget) __ksym __weak;
+extern int bpf_tcp_tx_sock_bind(struct bpf_sock_ops_kern *skops, __s32 queue) __ksym __weak;
+extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
 /* Set by the loader, and read by the threads on every pass. */
 __u64 hold_ns;		/* stay masked this long after the last packet; 0: never mask */
@@ -72,6 +87,12 @@ __u64 nap_ns;		/* length of a nap with interrupts masked */
  * this long.
  */
 __u64 rest_ns;
+
+/* Set before load: without --tx no thread touches a TCP xmit queue. */
+const volatile bool tx_enabled;
+/* With --tx: one plus the xmit queue of the thread on each CPU, 0 for none. */
+__u32 cpu_txq[NS_MAX_CPUS];
+__u64 tx_socks;		/* connections assigned to a xmit queue */
 
 struct ns_thread threads[NS_MAX_THREADS];
 struct ns_napi napis[NS_MAX_NAPIS];
@@ -161,6 +182,39 @@ static __always_inline void scan(struct ns_thread *t, __u64 flags, bool *more)
 }
 
 /*
+ * Do the xmit work of the sockets that wait on the thread's TCP xmit queues.
+ * Adds how many were served to t->pass_work, kept there for the reason scan()
+ * gives, and sets *more when a queue may have more waiting.
+ */
+static __always_inline void xmit(struct ns_thread *t, bool *more)
+{
+	__u32 nr = *(volatile __u32 *)&t->nr_txqs;
+	__u64 xmits = t->xmits;
+	__u64 t0;
+	int k, ret;
+
+	if (nr > NS_THREAD_TXQS)
+		nr = NS_THREAD_TXQS;
+	t0 = bpf_ktime_get_ns();
+
+	bpf_for(k, 0, nr) {
+		if (k < 0 || k >= NS_THREAD_TXQS)
+			break;
+		/* -EPERM for a queue that is moving to or from this thread. */
+		ret = bpf_tcp_tx_poll(*(volatile __u32 *)&t->txq[k], NS_TX_BUDGET);
+		if (ret <= 0)
+			continue;
+		t->xmits += ret;
+		t->pass_work += ret;
+		if (ret >= NS_TX_BUDGET)
+			*more = true;
+	}
+	/* The loader counts this time towards the thread's load. */
+	if (t->xmits != xmits)
+		t->xmit_ns += bpf_ktime_get_ns() - t0;
+}
+
+/*
  * A park, which ends the read section the callback runs in if the thread
  * sleeps, see rest_ns. A park that finds a wake pending returns 0 at once, in
  * the section, and one that returns 0 after a sleep looks the same, so only a
@@ -215,6 +269,9 @@ static int poller(__u64 arg)
 			flags = hold && !t->armed ? BPF_NAPI_POLL_F_BUSY : 0;
 			t->pass_work = 0;
 			scan(t, flags, &more);
+			/* Xmit work counts like a packet: where there was some, more follows. */
+			if (tx_enabled)
+				xmit(t, &more);
 			now = bpf_ktime_get_ns();
 			t->scans++;
 
@@ -367,4 +424,48 @@ int ns_thread_wake(struct ns_args *args)
 		ret = bpf_task_wake(task, 0);
 	bpf_rcu_read_unlock();
 	return ret;
+}
+
+/* Make the thread of slot args->thread the one that serves xmit queue args->txq. */
+SEC("syscall")
+int ns_txq_bind(struct ns_args *args)
+{
+	struct task_struct *task;
+	int ret;
+
+	task = take(args->thread);
+	if (!task)
+		return -ESRCH;
+	ret = bpf_tcp_tx_bind(args->txq, task, 0);
+	publish(args->thread, task);
+	return ret;
+}
+
+SEC("syscall")
+int ns_txq_unbind(struct ns_args *args)
+{
+	return bpf_tcp_tx_unbind(args->txq);
+}
+
+/*
+ * Assign a connection to the xmit queue of the thread that is processing its
+ * handshake. A connection established on a CPU without a pool thread, over
+ * loopback or through a device the pool does not poll, keeps transmitting for
+ * itself.
+ */
+SEC("sockops")
+int ns_sock_assign(struct bpf_sock_ops *skops)
+{
+	__u32 cpu, txq;
+
+	if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB &&
+	    skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB)
+		return 1;
+	cpu = bpf_get_smp_processor_id();
+	if (cpu >= NS_MAX_CPUS)
+		return 1;
+	txq = cpu_txq[cpu];
+	if (txq && !bpf_tcp_tx_sock_bind(bpf_cast_to_kern_ctx(skops), txq - 1))
+		__sync_fetch_and_add(&tx_socks, 1);
+	return 1;
 }
