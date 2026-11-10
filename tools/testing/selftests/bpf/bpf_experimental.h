@@ -373,6 +373,7 @@ struct bpf_sock_ops_kern;
 extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __weak __ksym;
 extern int bpf_tcp_tx_unbind(__u32 queue) __weak __ksym;
 extern int bpf_tcp_tx_poll(__u32 queue, __u32 budget) __weak __ksym;
+extern int bpf_tcp_tx_set_mode(__u32 queue, __u32 mode) __weak __ksym;
 extern int bpf_tcp_tx_sock_bind(struct bpf_sock_ops_kern *skops, __s32 queue) __weak __ksym;
 
 struct bpf_iter_kmem_cache;
