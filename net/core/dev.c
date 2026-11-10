@@ -7432,6 +7432,9 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
 }
 
 #ifdef CONFIG_BPF_SYSCALL
+static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
+				   bool *repoll);
+
 /* NAPI polled by a BPF kthread.
  *
  * Threaded NAPI gives every NAPI a kernel thread of its own, which the
@@ -7456,6 +7459,15 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
  * softirq as it does for any other. A NAPI that was scheduled for the thread
  * at that point is scheduled again, for softirq.
  *
+ * napi_bpf_poll() is one round of service. Its caller claims the NAPI with
+ * NAPI_STATE_BPF_POLLING for the length of the driver's poll, which is what
+ * keeps two callers out of the driver at once: the thread a NAPI was bound to
+ * and the thread it has just moved to, or a thread polling a NAPI that is not
+ * its own to help. The claim succeeds only while the thread side owns the
+ * scheduling, so a NAPI that was taken away is not polled from here again. If
+ * it is taken away during the driver's poll, the poller passes it on to
+ * softirq when it lets go of the claim, and an unbind waits for that.
+ *
  * The binding holds a reference on the thread's rcu_users, the count a task
  * kptr holds, so that the task is freed only after an RCU grace period has
  * passed since the unbind and the schedule path may use the pointer with
@@ -7463,19 +7475,113 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
  */
 
 /* Take the scheduling of @napi away from its BPF thread. A NAPI scheduled for
- * the thread goes to softirq.
+ * the thread goes to softirq: from here, or, while a poller is in the driver,
+ * from napi_bpf_release() once the poller is out.
  */
 static void napi_bpf_revoke(struct napi_struct *napi)
 {
 	unsigned long new, val = READ_ONCE(napi->state);
 
 	do {
-		new = val & ~(NAPIF_STATE_THREADED | NAPIF_STATE_SCHED_THREADED);
+		new = val & ~NAPIF_STATE_THREADED;
+		if (!(val & NAPIF_STATE_BPF_POLLING))
+			new &= ~NAPIF_STATE_SCHED_THREADED;
 	} while (!try_cmpxchg(&napi->state, &val, new));
 
 	/* NAPI_STATE_SCHED is still set and now ours to pass on. */
-	if (val & NAPIF_STATE_SCHED_THREADED)
+	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
+	    NAPIF_STATE_SCHED_THREADED)
 		__napi_schedule(napi);
+}
+
+/* Claim @napi for one call of the driver's poll. */
+static int napi_bpf_claim(struct napi_struct *napi)
+{
+	unsigned long new, val = READ_ONCE(napi->state);
+
+	do {
+		if (!(val & NAPIF_STATE_BPF))
+			return -ENOENT;
+		if (!(val & NAPIF_STATE_THREADED))
+			return -ECANCELED;
+		if (val & NAPIF_STATE_BPF_POLLING)
+			return -EBUSY;
+		if (!(val & NAPIF_STATE_SCHED_THREADED))
+			return -EAGAIN;
+		new = val | NAPIF_STATE_BPF_POLLING;
+	} while (!try_cmpxchg(&napi->state, &val, new));
+
+	return 0;
+}
+
+/* Let go of the claim on @napi. Returns true if the NAPI is still scheduled
+ * for its thread.
+ */
+static bool napi_bpf_release(struct napi_struct *napi)
+{
+	unsigned long new, val = READ_ONCE(napi->state);
+	struct task_struct *thread;
+
+	do {
+		new = val & ~NAPIF_STATE_BPF_POLLING;
+		/* Taken away during the poll, see napi_bpf_revoke(). */
+		if (!(val & NAPIF_STATE_THREADED))
+			new &= ~NAPIF_STATE_SCHED_THREADED;
+	} while (!try_cmpxchg(&napi->state, &val, new));
+
+	if (!(val & NAPIF_STATE_SCHED_THREADED))
+		return false;
+	if (!(val & NAPIF_STATE_THREADED)) {
+		__napi_schedule(napi);
+		return false;
+	}
+
+	/* The NAPI's thread may have asked for the NAPI during this poll and
+	 * gone back to sleep when it found the claim taken: it was woken for a
+	 * schedule from within the driver's poll, or the NAPI moved to it.
+	 * Its next round is due now.
+	 */
+	thread = READ_ONCE(napi->thread);
+	if (thread && thread != current)
+		bpf_task_wake_direct(thread);
+	return true;
+}
+
+/**
+ * napi_bpf_poll() - one round of service of a NAPI bound to a BPF kthread
+ * @napi_id: ID of the NAPI
+ *
+ * Call the driver's poll once if the NAPI is scheduled for its thread. The
+ * NAPI's own thread is expected to call this, but any caller is safe, and a
+ * caller that is not the NAPI's thread leaves a NAPI that needs another round
+ * to that thread, which it wakes.
+ *
+ * Return: the work done, at most BPF_NAPI_POLL_WORK_MASK, ORed with
+ * BPF_NAPI_POLL_MORE if the NAPI is still scheduled for its thread and should
+ * be polled again. -EAGAIN if the NAPI is not scheduled for its thread, -EBUSY
+ * if another caller is polling it, -ENOENT if no NAPI with this ID is bound,
+ * -ECANCELED if it is bound but its scheduling was taken away from the thread.
+ */
+int napi_bpf_poll(unsigned int napi_id)
+{
+	struct napi_struct *napi;
+	bool repoll = false;
+	int ret;
+
+	rcu_read_lock();
+	napi = napi_by_id(napi_id);
+	ret = napi ? napi_bpf_claim(napi) : -ENOENT;
+	if (!ret) {
+		ret = napi_threaded_poll_once(napi, false, &repoll);
+		ret = min(ret, BPF_NAPI_POLL_WORK_MASK);
+		/* A NAPI taken away during the poll goes to softirq here. */
+		local_bh_disable();
+		if (napi_bpf_release(napi))
+			ret |= BPF_NAPI_POLL_MORE;
+		local_bh_enable();
+	}
+	rcu_read_unlock();
+	return ret;
 }
 
 /**
@@ -7550,6 +7656,13 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	local_bh_disable();
 	napi_bpf_revoke(napi);
 	local_bh_enable();
+
+	/* A poller that was in the driver's poll at the revocation finishes
+	 * that call, and no other can claim the NAPI any more.
+	 */
+	might_sleep();
+	while (test_bit(NAPI_STATE_BPF_POLLING, &napi->state))
+		usleep_range(20, 200);
 
 	/* The thread goes before NAPI_STATE_BPF, so that a schedule path which
 	 * saw NAPI_STATE_THREADED before the revocation and finds
