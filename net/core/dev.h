@@ -392,7 +392,7 @@ int napi_set_threaded(struct napi_struct *n,
 #ifdef CONFIG_BPF_SYSCALL
 int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task);
 void napi_bpf_unbind_locked(struct napi_struct *napi);
-int napi_bpf_poll(unsigned int napi_id);
+int napi_bpf_poll(unsigned int napi_id, u64 flags);
 #else
 static inline void napi_bpf_unbind_locked(struct napi_struct *napi)
 {
