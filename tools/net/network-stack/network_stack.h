@@ -15,6 +15,12 @@
 #define NS_SOFTIRQ_WAKE		64
 /* Sockets served per poll of a TCP xmit queue. */
 #define NS_TX_BUDGET		64
+/*
+ * The kernel's BPF_TCP_TX_QUEUE and BPF_TCP_TX_INLINE, spelled out so that the
+ * object also builds against a kernel without TCP xmit queues.
+ */
+#define NS_TX_QUEUE		1
+#define NS_TX_INLINE		2
 
 /*
  * What the loader tells a thread. A thread reads its list on every scan, and

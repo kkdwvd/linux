@@ -1333,6 +1333,7 @@ static void usage(void)
 "  --min-threads N        threads kept active per LLC (default 1)\n"
 "  --static               keep the placement of the start\n"
 "  --tx CGROUP            also do the TCP xmit work of CGROUP's connections in the pool\n"
+"                         while a thread polls with interrupts masked; no effect with --irq\n"
 "                         (off by default; needs a kernel with TCP xmit queues)\n"
 "\n"
 "Controller:\n"

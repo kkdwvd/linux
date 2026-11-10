@@ -40,6 +40,12 @@
  * returns, and the thread transmits after each pass over its NAPIs. A queue
  * whose thread has no NAPIs at the moment is served by another thread of the
  * LLC, as the loader arranges.
+ *
+ * The sending side follows the thread's phases. In the masked phase the
+ * thread is awake and passes over its queues constantly, so senders queue
+ * their sockets without waking it. Before it parks, the thread tells them to
+ * transmit for themselves: a sender would otherwise wake the thread for every
+ * send, at the low load where a wakeup costs more than the xmit work.
  */
 #define BPF_NO_KFUNC_PROTOTYPES
 #include "vmlinux.h"
@@ -83,6 +89,7 @@ extern int bpf_napi_resume(__u32 napi_id) __ksym;
 extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __ksym __weak;
 extern int bpf_tcp_tx_unbind(__u32 queue) __ksym __weak;
 extern int bpf_tcp_tx_poll(__u32 queue, __u32 budget) __ksym __weak;
+extern int bpf_tcp_tx_set_mode(__u32 queue, __u32 mode) __ksym __weak;
 extern int bpf_tcp_tx_sock_bind(struct bpf_sock_ops_kern *skops, __s32 queue) __ksym __weak;
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
@@ -198,11 +205,14 @@ static __always_inline void scan(struct ns_thread *t, __u64 flags, bool *more)
 }
 
 /*
- * Do the xmit work of the sockets that wait on the thread's TCP xmit queues.
- * Adds how many were served to t->pass_work, kept there for the reason scan()
- * gives, and sets *more when a queue may have more waiting.
+ * Tell the senders of the thread's TCP xmit queues what to do, NS_TX_QUEUE or
+ * NS_TX_INLINE, and do the xmit work of the sockets that wait on the queues.
+ * The mode is set before the poll, so that the poll finds what was queued
+ * without a wake under the mode before. Adds how many sockets were served to
+ * t->pass_work, kept there for the reason scan() gives, and sets *more when a
+ * queue may have more waiting.
  */
-static __always_inline void xmit(struct ns_thread *t, bool *more)
+static __always_inline void xmit(struct ns_thread *t, __u32 mode, bool *more)
 {
 	__u32 nr = *(volatile __u32 *)&t->nr_txqs;
 	__u64 xmits = t->xmits;
@@ -214,10 +224,14 @@ static __always_inline void xmit(struct ns_thread *t, bool *more)
 	t0 = bpf_ktime_get_ns();
 
 	bpf_for(k, 0, nr) {
+		__u32 q;
+
 		if (k < 0 || k >= NS_THREAD_TXQS)
 			break;
+		q = *(volatile __u32 *)&t->txq[k];
 		/* -EPERM for a queue that is moving to or from this thread. */
-		ret = bpf_tcp_tx_poll(*(volatile __u32 *)&t->txq[k], NS_TX_BUDGET);
+		bpf_tcp_tx_set_mode(q, mode);
+		ret = bpf_tcp_tx_poll(q, NS_TX_BUDGET);
 		if (ret <= 0)
 			continue;
 		t->xmits += ret;
@@ -314,9 +328,14 @@ static int poller(__u64 arg)
 			/* Polls of a suspended NAPI are refused. */
 			if (!t->suspended)
 				scan(t, flags, &more);
-			/* Xmit work counts like a packet: where there was some, more follows. */
+			/*
+			 * Xmit work counts like a packet: where there was
+			 * some, more follows. A thread that is about to park,
+			 * with its interrupts unmasked, has the senders
+			 * transmit.
+			 */
 			if (tx_enabled)
-				xmit(t, &more);
+				xmit(t, flags ? NS_TX_QUEUE : NS_TX_INLINE, &more);
 			now = bpf_ktime_get_ns();
 			t->scans++;
 
