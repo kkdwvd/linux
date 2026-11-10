@@ -2982,6 +2982,13 @@ static inline void napi_bpf_release_task(struct task_struct *task)
 {
 }
 #endif
+#ifdef CONFIG_INET
+void tcp_bpf_tx_release_task(struct task_struct *task);
+#else
+static inline void tcp_bpf_tx_release_task(struct task_struct *task)
+{
+}
+#endif
 void bpf_map_free_id(struct bpf_map *map);
 
 struct btf_field *btf_record_find(const struct btf_record *rec,

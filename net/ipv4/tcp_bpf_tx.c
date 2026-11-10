@@ -7,6 +7,8 @@
 #include <linux/rcupdate.h>
 #include <linux/sched/task.h>
 #include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h>
 #include <net/sock.h>
 #include <net/tcp.h>
 
@@ -37,14 +39,29 @@
  * The thread does not sleep on a socket. If the owner holds the socket's lock
  * the xmit work is left to tcp_release_cb(), like a TSQ wakeup that finds the
  * socket owned, and the owner's release sends it back to the queue.
+ *
+ * A socket on a queue sends nothing until the queue's thread transmits for
+ * it, and no timer of the connection would: with nothing in flight there is
+ * nothing to retransmit. So a queue does not outlive its thread's attention.
+ * A thread whose callback is over gives its queues up, see
+ * tcp_bpf_tx_release_task(), and a timer per queue unbinds a thread that has
+ * left sockets waiting for TCP_BPF_TX_STALL. Either way the waiting sockets
+ * are served at once and later xmit work stays with its senders.
  */
 
 #define TCP_BPF_TX_QUEUES	256
+
+/* How long sockets may wait on a queue without a poll of it. */
+#define TCP_BPF_TX_STALL	HZ
 
 struct tcp_bpf_tx_queue {
 	spinlock_t lock;		/* socks */
 	struct list_head socks;		/* through tcp_sock.bpf_tx_node */
 	struct task_struct __rcu *thread;
+	/* When the queue was last polled, or stopped being empty */
+	unsigned long stamp;
+	struct timer_list timer;
+	struct work_struct stall_work;
 } ____cacheline_aligned_in_smp;
 
 static struct tcp_bpf_tx_queue tcp_bpf_tx_queues[TCP_BPF_TX_QUEUES];
@@ -80,6 +97,8 @@ bool __tcp_bpf_tx_defer(struct sock *sk, int nonagle)
 	if (!test_and_set_bit(TCP_BPF_TX_QUEUED, &sk->sk_tsq_flags)) {
 		sock_hold(sk);
 		spin_lock_bh(&q->lock);
+		if (list_empty(&q->socks))
+			WRITE_ONCE(q->stamp, jiffies);
 		list_add_tail(&tp->bpf_tx_node, &q->socks);
 		spin_unlock_bh(&q->lock);
 		bpf_task_wake_direct(thread);
@@ -127,6 +146,26 @@ static void tcp_bpf_tx_xmit(struct sock *sk)
 	sock_put(sk);
 }
 
+static bool tcp_bpf_tx_stalled(struct tcp_bpf_tx_queue *q)
+{
+	return !list_empty_careful(&q->socks) &&
+	       time_after(jiffies, READ_ONCE(q->stamp) + TCP_BPF_TX_STALL);
+}
+
+static void tcp_bpf_tx_watchdog(struct timer_list *t)
+{
+	struct tcp_bpf_tx_queue *q = timer_container_of(q, t, timer);
+
+	/* Unbound: a bind starts the timer again. */
+	if (!rcu_access_pointer(q->thread))
+		return;
+	/* The unbind sleeps, so it is left to a work item. */
+	if (tcp_bpf_tx_stalled(q))
+		schedule_work(&q->stall_work);
+	else
+		mod_timer(t, jiffies + TCP_BPF_TX_STALL / 2);
+}
+
 /**
  * tcp_bpf_tx_bind() - make a BPF kthread the thread that serves an xmit queue
  * @queue: index of the queue
@@ -135,7 +174,8 @@ static void tcp_bpf_tx_xmit(struct sock *sk)
  * Replaces the queue's thread if it has one. May sleep.
  *
  * Return: 0 on success, -EINVAL for an index out of range, -ESRCH if @task is
- * gone.
+ * not a BPF kthread, or one whose callback has returned or that is being
+ * stopped.
  */
 int tcp_bpf_tx_bind(u32 queue, struct task_struct *task)
 {
@@ -145,7 +185,7 @@ int tcp_bpf_tx_bind(u32 queue, struct task_struct *task)
 	if (queue >= TCP_BPF_TX_QUEUES)
 		return -EINVAL;
 	q = &tcp_bpf_tx_queues[queue];
-	if (!refcount_inc_not_zero(&task->rcu_users))
+	if (!bpf_kthread_alive(task) || !refcount_inc_not_zero(&task->rcu_users))
 		return -ESRCH;
 
 	mutex_lock(&tcp_bpf_tx_mutex);
@@ -154,13 +194,67 @@ int tcp_bpf_tx_bind(u32 queue, struct task_struct *task)
 	 * them are through, wake the new one for what is on the queue.
 	 */
 	synchronize_rcu();
+	/* The new thread gets the full time for sockets that wait already. */
+	WRITE_ONCE(q->stamp, jiffies);
+	mod_timer(&q->timer, jiffies + TCP_BPF_TX_STALL / 2);
 	if (!list_empty_careful(&q->socks))
 		bpf_task_wake_direct(task);
 	mutex_unlock(&tcp_bpf_tx_mutex);
 
 	if (old)
 		put_task_struct_rcu_user(old);
+
+	/* A thread on its way out gives up the queues it finds bound to it
+	 * and takes no more, see tcp_bpf_tx_release_task(). Ask again now
+	 * that the thread is in the queue, so that a thread that began to
+	 * exit after the first check either found this queue or is found out
+	 * here.
+	 */
+	if (!bpf_kthread_alive(task)) {
+		tcp_bpf_tx_release_task(task);
+		return -ESRCH;
+	}
 	return 0;
+}
+
+/* Unbind @q if its thread is @only, or whatever it is when @only is NULL, and
+ * with @stalled only if its sockets have waited too long. The sockets on the
+ * queue are served here.
+ */
+static void tcp_bpf_tx_unbind_queue(struct tcp_bpf_tx_queue *q, struct task_struct *only,
+				    bool stalled)
+{
+	struct task_struct *old;
+	struct sock *sk;
+
+	mutex_lock(&tcp_bpf_tx_mutex);
+	old = rcu_dereference_protected(q->thread, lockdep_is_held(&tcp_bpf_tx_mutex));
+	if (!old || (only && old != only))
+		goto unlock;
+	if (stalled && !tcp_bpf_tx_stalled(q)) {
+		/* Polled or bound anew since the timer saw it stalled. */
+		mod_timer(&q->timer, jiffies + TCP_BPF_TX_STALL / 2);
+		goto unlock;
+	}
+	if (stalled)
+		pr_warn_ratelimited("TCP xmit queue %td is not polled by its BPF thread, unbound\n",
+				    q - tcp_bpf_tx_queues);
+
+	RCU_INIT_POINTER(q->thread, NULL);
+	/* No sender queues a socket for the old thread after this. */
+	synchronize_rcu();
+	timer_delete_sync(&q->timer);
+	while ((sk = tcp_bpf_tx_dequeue(q)))
+		tcp_bpf_tx_xmit(sk);
+	put_task_struct_rcu_user(old);
+unlock:
+	mutex_unlock(&tcp_bpf_tx_mutex);
+}
+
+static void tcp_bpf_tx_stall_work(struct work_struct *work)
+{
+	tcp_bpf_tx_unbind_queue(container_of(work, struct tcp_bpf_tx_queue, stall_work),
+				NULL, true);
 }
 
 /**
@@ -172,24 +266,23 @@ int tcp_bpf_tx_bind(u32 queue, struct task_struct *task)
  */
 void tcp_bpf_tx_unbind(u32 queue)
 {
-	struct tcp_bpf_tx_queue *q;
-	struct task_struct *old;
-	struct sock *sk;
+	if (queue < TCP_BPF_TX_QUEUES)
+		tcp_bpf_tx_unbind_queue(&tcp_bpf_tx_queues[queue], NULL, false);
+}
 
-	if (queue >= TCP_BPF_TX_QUEUES)
-		return;
-	q = &tcp_bpf_tx_queues[queue];
+/**
+ * tcp_bpf_tx_release_task() - unbind every xmit queue of an exiting BPF kthread
+ * @task: the BPF kthread, which is bound to no new queue any more
+ *
+ * May sleep.
+ */
+void tcp_bpf_tx_release_task(struct task_struct *task)
+{
+	int i;
 
-	mutex_lock(&tcp_bpf_tx_mutex);
-	old = rcu_replace_pointer(q->thread, NULL, lockdep_is_held(&tcp_bpf_tx_mutex));
-	if (old) {
-		/* No sender queues a socket for the old thread after this. */
-		synchronize_rcu();
-		while ((sk = tcp_bpf_tx_dequeue(q)))
-			tcp_bpf_tx_xmit(sk);
-		put_task_struct_rcu_user(old);
-	}
-	mutex_unlock(&tcp_bpf_tx_mutex);
+	for (i = 0; i < TCP_BPF_TX_QUEUES; i++)
+		if (rcu_access_pointer(tcp_bpf_tx_queues[i].thread) == task)
+			tcp_bpf_tx_unbind_queue(&tcp_bpf_tx_queues[i], task, false);
 }
 
 /**
@@ -217,6 +310,7 @@ int tcp_bpf_tx_poll(u32 queue, u32 budget)
 		tcp_bpf_tx_xmit(sk);
 		n++;
 	}
+	WRITE_ONCE(q->stamp, jiffies);
 	return n;
 }
 
@@ -246,6 +340,8 @@ static int __init tcp_bpf_tx_init(void)
 	for (i = 0; i < TCP_BPF_TX_QUEUES; i++) {
 		spin_lock_init(&tcp_bpf_tx_queues[i].lock);
 		INIT_LIST_HEAD(&tcp_bpf_tx_queues[i].socks);
+		timer_setup(&tcp_bpf_tx_queues[i].timer, tcp_bpf_tx_watchdog, 0);
+		INIT_WORK(&tcp_bpf_tx_queues[i].stall_work, tcp_bpf_tx_stall_work);
 	}
 	return 0;
 }
