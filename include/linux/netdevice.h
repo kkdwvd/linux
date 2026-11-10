@@ -413,6 +413,8 @@ struct napi_struct {
 #ifdef CONFIG_BPF_SYSCALL
 	/* When the NAPI was last scheduled for or polled by its BPF thread */
 	unsigned long		bpf_stamp;
+	/* Packets softirq may still process before it wakes the BPF thread */
+	u32			bpf_wake_after;
 #endif
 	/* all fields past this point are write-protected by netdev_lock */
 	struct task_struct	*thread;
