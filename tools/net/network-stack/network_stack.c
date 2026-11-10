@@ -21,7 +21,8 @@
  *
  * The threads (network_stack.bpf.c) only poll and count. This file decides
  * the placement. Every tick it takes each NAPI's cost, the share of a CPU its
- * polls used, and each thread's load, the sum over its NAPIs. A thread above
+ * polls used, and each thread's load, the sum over its NAPIs plus the share of
+ * the CPU the thread spent sending with --tx. A thread above
  * the high mark, or one whose queues wait too long between polls, hands its
  * cheapest NAPI to the least loaded active thread that stays under the target
  * with it, or to the next CPU of the order when there is none. When the last
@@ -29,9 +30,16 @@
  * number of ticks in a row, they move there and its CPU is given back. One
  * step per LLC per tick, except for a thread near saturation, which sheds
  * NAPIs until it is under the target.
+ *
+ * With --tx CGROUP the pool also sends for the TCP connections of that cgroup
+ * that arrive through the device: sendmsg() copies and returns, and the xmit
+ * work is done by a pool thread. Every thread has an xmit queue. A queue whose
+ * thread is not active is served by the first thread of its LLC, so the
+ * connections that were assigned to it keep being served from the pool.
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <net/if.h>
@@ -79,7 +87,9 @@ struct napi {
 struct thread {
 	int cpu;
 	int llc;
-	double load;			/* sum of its NAPIs' costs */
+	double load;			/* sum of its NAPIs' costs, and its xmit work */
+	double xmit;			/* share of a CPU its xmit work used over the last tick */
+	__u64 prev_xmit_ns;		/* that counter at the last tick */
 };
 
 struct llc {
@@ -101,6 +111,7 @@ static struct {
 	const char *dev;
 	const char *cpus;
 	const char *thread_cgroup;
+	const char *tx;
 	__u64 hold_us, spin_us, nap_us, rest_us;
 	__u64 tick_ms, interval_ms, duration_s;
 	__u64 gap_us;
@@ -134,6 +145,8 @@ static int nr_napis, nr_threads, nr_llcs, nr_cpusets;
 static int cpu_llc[MAX_CPUS];		/* first CPU of the CPU's LLC, -1 if offline */
 static int cpu_core[MAX_CPUS];		/* first CPU of the CPU's core */
 static struct cpumask online;
+static int txq_owner[NS_MAX_THREADS];	/* slot of the thread serving each xmit queue, -1 for none */
+static struct bpf_link *tx_link;
 static __u64 moves, grows, shrinks, rebinds;
 static bool started;			/* cleanup() has something to undo */
 static volatile sig_atomic_t stop;
@@ -648,6 +661,98 @@ static void steer_irq(struct napi *n, int cpu)
 }
 
 /*
+ * With --tx: give every xmit queue to its own thread while that is active and
+ * to the first thread of its LLC otherwise. Like a NAPI, a queue is in the
+ * new thread's list before the bind and in the old one's until after it.
+ */
+static void assign_txqs(void)
+{
+	int i, k, q, want, ret;
+
+	if (!opt.tx)
+		return;
+	for (i = 0; i < nr_llcs; i++) {
+		struct llc *l = &llcs[i];
+
+		for (k = 0; k < l->nr_threads; k++) {
+			struct ns_args args = {};
+			struct ns_thread *t;
+
+			q = l->threads[k];
+			want = k < l->active ? q : l->threads[0];
+			if (txq_owner[q] == want)
+				continue;
+			t = &skel->bss->threads[want];
+			if (t->nr_txqs == NS_THREAD_TXQS) {
+				warn("thread on CPU %d has no room for another xmit queue",
+				     threads[want].cpu);
+				continue;
+			}
+			t->txq[t->nr_txqs] = q;
+			__atomic_store_n(&t->nr_txqs, t->nr_txqs + 1, __ATOMIC_RELEASE);
+
+			args.thread = want;
+			args.txq = q;
+			ret = run_prog(skel->progs.ns_txq_bind, &args);
+			if (ret)
+				die("cannot bind xmit queue %d: %s", q, strerror(-ret));
+
+			if (txq_owner[q] >= 0) {
+				__u32 j;
+
+				t = &skel->bss->threads[txq_owner[q]];
+				for (j = 0; j < t->nr_txqs; j++) {
+					if (t->txq[j] != q)
+						continue;
+					t->txq[j] = t->txq[t->nr_txqs - 1];
+					__atomic_store_n(&t->nr_txqs, t->nr_txqs - 1,
+							 __ATOMIC_RELEASE);
+					break;
+				}
+			}
+			txq_owner[q] = want;
+		}
+	}
+}
+
+/* The set of active threads changed: move the cpusets and the xmit queues. */
+static void active_changed(void)
+{
+	apply_cpusets();
+	assign_txqs();
+}
+
+/*
+ * Bind the xmit queues and start assigning the connections of the --tx cgroup
+ * to them.
+ */
+static void start_tx(void)
+{
+	char path[PATH_MAX];
+	int i, fd;
+
+	if (!opt.tx)
+		return;
+	for (i = 0; i < nr_threads; i++) {
+		txq_owner[i] = -1;
+		skel->bss->cpu_txq[threads[i].cpu] = i + 1;
+	}
+	assign_txqs();
+
+	if (opt.tx[0] == '/' && strncmp(opt.tx, CGROOT, strlen(CGROOT)))
+		snprintf(path, sizeof(path), "%s%s", CGROOT, opt.tx);
+	else
+		snprintf(path, sizeof(path), "%s", opt.tx);
+	fd = open(path, O_RDONLY | O_DIRECTORY);
+	if (fd < 0)
+		die("no cgroup %s", path);
+	tx_link = bpf_program__attach_cgroup(skel->progs.ns_sock_assign, fd);
+	close(fd);
+	if (!tx_link)
+		die("cannot attach to cgroup %s: %s", path, strerror(errno));
+}
+
+/*
  * Give NAPI @slot to @thread. The thread has the NAPI in its list before the
  * bind wakes it for a NAPI that is scheduled, and the thread it leaves keeps
  * it in its list until then, so somebody polls it throughout.
@@ -867,6 +972,7 @@ static __u64 hand_back(int i)
 static void cleanup(void)
 {
 	struct sched_param rt = { .sched_priority = 1 }, other = {};
+	struct ns_args args = {};
 	__u64 t0, gap_max = 0;
 	bool pinned, fifo;
 	cpu_set_t own;
@@ -875,6 +981,14 @@ static void cleanup(void)
 	if (!started)
 		return;
 	started = false;
+	/* Stop assigning connections, then let the assigned ones transmit for themselves. */
+	bpf_link__destroy(tx_link);
+	for (i = 0; opt.tx && i < nr_threads; i++) {
+		if (txq_owner[i] >= 0) {
+			args.txq = i;
+			run_prog(skel->progs.ns_txq_unbind, &args);
+		}
+	}
 	/*
 	 * Give the NAPIs back to softirq on their home CPUs, one at a time, see
 	 * hand_back(), and give the pool CPUs back to the cpusets only after
@@ -931,8 +1045,17 @@ static void sample(__u64 dt_ns)
 	struct ns_args args = {};
 	int i, ret;
 
-	for (i = 0; i < nr_threads; i++)
-		threads[i].load = 0;
+	/*
+	 * A thread's load starts with its xmit work, which no NAPI
+	 * accounts for and which stays with the thread when a NAPI leaves.
+	 */
+	for (i = 0; i < nr_threads; i++) {
+		__u64 xmit_ns = skel->bss->threads[i].xmit_ns;
+
+		threads[i].xmit = (double)(xmit_ns - threads[i].prev_xmit_ns) / dt_ns;
+		threads[i].prev_xmit_ns = xmit_ns;
+		threads[i].load = threads[i].xmit;
+	}
 
 	for (i = 0; i < nr_napis; i++) {
 		struct ns_napi cur = skel->bss->napis[i];
@@ -1041,7 +1164,7 @@ static void relieve(struct llc *l, int hot)
 			dest = l->threads[l->active++];
 			grows++;
 			/* The CPU leaves the cpusets before its thread polls. */
-			apply_cpusets();
+			active_changed();
 		}
 		if (move_napi(slot, dest))
 			return;
@@ -1067,6 +1190,12 @@ static bool fold_last(struct llc *l, bool commit)
 	for (i = 0; i < nr_threads; i++) {
 		load[i] = threads[i].load;
 		nr[i] = thread_nr_napis(i);
+	}
+	/* The xmit queue of a thread that is let go moves to the LLC's first thread. */
+	if (last != l->threads[0]) {
+		load[l->threads[0]] += threads[last].xmit;
+		if (load[l->threads[0]] * 100 > opt.lo)
+			return false;
 	}
 
 	for (;;) {
@@ -1117,13 +1246,13 @@ static void control(struct llc *l)
 	l->active--;
 	shrinks++;
 	/* The CPU goes back to the cpusets now that its thread polls nothing. */
-	apply_cpusets();
+	active_changed();
 }
 
 static void report(__u64 dt_ns)
 {
-	static __u64 prev_pkts, prev_naps, prev_parks;
-	__u64 pkts = 0, naps = 0, parks = 0, gap = 0;
+	static __u64 prev_pkts, prev_naps, prev_parks, prev_xmits;
+	__u64 pkts = 0, naps = 0, parks = 0, gap = 0, xmits = 0;
 	int active = 0, i, k;
 	double max_load = 0, sum_load = 0;
 
@@ -1135,6 +1264,7 @@ static void report(__u64 dt_ns)
 	for (i = 0; i < nr_threads; i++) {
 		naps += skel->bss->threads[i].naps;
 		parks += skel->bss->threads[i].parks;
+		xmits += skel->bss->threads[i].xmits;
 	}
 	for (i = 0; i < nr_llcs; i++) {
 		active += llcs[i].active;
@@ -1153,6 +1283,10 @@ static void report(__u64 dt_ns)
 	       (naps - prev_naps) * 1e9 / dt_ns, (parks - prev_parks) * 1e9 / dt_ns,
 	       (unsigned long long)moves, (unsigned long long)grows,
 	       (unsigned long long)shrinks, (unsigned long long)rebinds);
+	if (opt.tx)
+		printf("  tx: xmits/s %.0f  connections assigned %llu\n",
+		       (xmits - prev_xmits) * 1e9 / dt_ns,
+		       (unsigned long long)skel->bss->tx_socks);
 	if (opt.verbose) {
 		for (i = 0; i < nr_llcs; i++) {
 			printf("  llc %d: %d/%d threads:", llcs[i].first_cpu, llcs[i].active,
@@ -1170,6 +1304,7 @@ static void report(__u64 dt_ns)
 	prev_pkts = pkts;
 	prev_naps = naps;
 	prev_parks = parks;
+	prev_xmits = xmits;
 }
 
 static void on_signal(int sig)
@@ -1192,6 +1327,8 @@ static void usage(void)
 "                         one thread on every pool CPU, folding down with the load)\n"
 "  --min-threads N        threads kept active per LLC (default 1)\n"
 "  --static               keep the placement of the start\n"
+"  --tx CGROUP            also do the TCP xmit work of CGROUP's connections in the pool\n"
+"                         (off by default; needs a kernel with TCP xmit queues)\n"
 "\n"
 "Controller:\n"
 "  --tick-ms N            period (default 100)\n"
@@ -1217,7 +1354,7 @@ enum {
 	OPT_DEV = 256, OPT_CPUS, OPT_CPUSET, OPT_THREAD_CGROUP, OPT_NAPIS_PER_THREAD,
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
-	OPT_DURATION, OPT_VERBOSE,
+	OPT_DURATION, OPT_VERBOSE, OPT_TX,
 };
 
 static const struct option longopts[] = {
@@ -1228,6 +1365,7 @@ static const struct option longopts[] = {
 	{ "napis-per-thread", required_argument, NULL, OPT_NAPIS_PER_THREAD },
 	{ "min-threads", required_argument, NULL, OPT_MIN_THREADS },
 	{ "static", no_argument, NULL, OPT_STATIC },
+	{ "tx", required_argument, NULL, OPT_TX },
 	{ "tick-ms", required_argument, NULL, OPT_TICK_MS },
 	{ "hi", required_argument, NULL, OPT_HI },
 	{ "target", required_argument, NULL, OPT_TARGET },
@@ -1268,6 +1406,7 @@ int main(int argc, char **argv)
 			break;
 		case OPT_MIN_THREADS: opt.min_threads = atoi(optarg); break;
 		case OPT_STATIC: opt.fixed = true; break;
+		case OPT_TX: opt.tx = optarg; break;
 		case OPT_TICK_MS: opt.tick_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_HI: opt.hi = atoi(optarg); break;
 		case OPT_TARGET: opt.target = atoi(optarg); break;
@@ -1309,16 +1448,24 @@ int main(int argc, char **argv)
 	skel->bss->spin_ns = opt.spin_us * 1000;
 	skel->bss->nap_ns = opt.nap_us * 1000;
 	skel->bss->rest_ns = opt.rest_us * 1000;
+	skel->rodata->tx_enabled = !!opt.tx;
+	if (!opt.tx) {
+		/* Their kfuncs are missing on a kernel without TCP xmit queues. */
+		bpf_program__set_autoload(skel->progs.ns_txq_bind, false);
+		bpf_program__set_autoload(skel->progs.ns_txq_unbind, false);
+		bpf_program__set_autoload(skel->progs.ns_sock_assign, false);
+	}
 	err = network_stack_bpf__load(skel);
 	if (err)
-		die("cannot load the BPF object: %s (does the kernel have the BPF NAPI kfuncs?)",
-		    strerror(-err));
+		die("cannot load the BPF object: %s (does the kernel have the BPF NAPI kfuncs%s?)",
+		    strerror(-err), opt.tx ? " and TCP xmit queues" : "");
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	started = true;
 	start_threads();
 	place_napis();
+	start_tx();
 
 	printf("%s: %d NAPIs, %d pool CPUs in %d LLCs, %s\n", opt.dev, nr_napis, nr_threads,
 	       nr_llcs, opt.fixed ? "static placement" : "dynamic placement");
