@@ -8065,43 +8065,60 @@ static int napi_thread_wait(struct napi_struct *napi)
 	return -1;
 }
 
+/* One round of service of @napi by the thread that polls it: the driver's poll
+ * with bottom halves disabled, and the per-CPU work that softirq does around
+ * it. With @busy_poll the NAPI stays scheduled across the driver's poll, so
+ * the packets GRO held back are flushed here and not in napi_complete_done().
+ * Returns the work done, and sets @repoll when the budget ran out and the
+ * NAPI wants another round.
+ */
+static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
+				   bool *repoll)
+{
+	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
+	struct softnet_data *sd;
+	void *have;
+	int work;
+
+	local_bh_disable();
+	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
+
+	sd = this_cpu_ptr(&softnet_data);
+	sd->in_napi_threaded_poll = true;
+
+	have = netpoll_poll_lock(napi);
+	work = __napi_poll(napi, repoll);
+	netpoll_poll_unlock(have);
+
+	sd->in_napi_threaded_poll = false;
+	barrier();
+
+	if (sd_has_rps_ipi_waiting(sd)) {
+		local_irq_disable();
+		net_rps_action_and_irq_enable(sd);
+	}
+	skb_defer_free_flush();
+	bpf_net_ctx_clear(bpf_net_ctx);
+
+	/* When busy poll is enabled, the old packets are not flushed in
+	 * napi_complete_done. So flush them here.
+	 */
+	if (busy_poll)
+		gro_flush_normal(&napi->gro, HZ >= 1000);
+	local_bh_enable();
+
+	return work;
+}
+
 static void napi_threaded_poll_loop(struct napi_struct *napi,
 				    unsigned long *busy_poll_last_qs)
 {
 	unsigned long last_qs = busy_poll_last_qs ? *busy_poll_last_qs : jiffies;
-	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
-	struct softnet_data *sd;
 
 	for (;;) {
 		bool repoll = false;
-		void *have;
 
-		local_bh_disable();
-		bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
-
-		sd = this_cpu_ptr(&softnet_data);
-		sd->in_napi_threaded_poll = true;
-
-		have = netpoll_poll_lock(napi);
-		__napi_poll(napi, &repoll);
-		netpoll_poll_unlock(have);
-
-		sd->in_napi_threaded_poll = false;
-		barrier();
-
-		if (sd_has_rps_ipi_waiting(sd)) {
-			local_irq_disable();
-			net_rps_action_and_irq_enable(sd);
-		}
-		skb_defer_free_flush();
-		bpf_net_ctx_clear(bpf_net_ctx);
-
-		/* When busy poll is enabled, the old packets are not flushed in
-		 * napi_complete_done. So flush them here.
-		 */
-		if (busy_poll_last_qs)
-			gro_flush_normal(&napi->gro, HZ >= 1000);
-		local_bh_enable();
+		napi_threaded_poll_once(napi, busy_poll_last_qs, &repoll);
 
 		/* Call cond_resched here to avoid watchdog warnings. */
 		if (repoll || busy_poll_last_qs) {
