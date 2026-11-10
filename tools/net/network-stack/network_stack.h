@@ -11,6 +11,8 @@
 
 /* The budget of one driver poll. A poll that returns it left packets behind. */
 #define NS_POLL_BUDGET		64
+/* Packets softirq processes for a suspended NAPI before it wakes the thread. */
+#define NS_SOFTIRQ_WAKE		64
 /* Sockets served per poll of a TCP xmit queue. */
 #define NS_TX_BUDGET		64
 
@@ -30,6 +32,8 @@ struct ns_thread {
 
 	/* The thread's own state, kept here and not in registers. */
 	__u32 armed;			/* interrupts are unmasked, the next scan is plain */
+	__u32 suspended;		/* its NAPIs are left to softirq */
+	__u64 suspend_ns;		/* when they were, or softirq's count was restarted */
 	__u64 last_work_ns;		/* end of the last scan that found packets */
 	__u64 last_rest_ns;		/* end of the last park */
 	__u64 pass_work;		/* packets and sockets the current pass found */
@@ -41,6 +45,8 @@ struct ns_thread {
 	__u64 parks;			/* parks with interrupts unmasked */
 	__u64 wakes;			/* such parks that a schedule or the loader ended */
 	__u64 rests;			/* parks forced on a thread that never slept */
+	__u64 suspends;			/* times it left its NAPIs to softirq */
+	__u64 resumes;			/* times it took them back */
 	__u64 xmits;			/* sockets whose xmit work it did */
 	__u64 xmit_ns;			/* time in polls of xmit queues that found work */
 } __attribute__((aligned(64)));

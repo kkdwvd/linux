@@ -24,6 +24,14 @@
  * its NAPIs wakes it into the masked phase. With hold_ns at zero a thread is
  * always armed, which is threaded NAPI with a thread per CPU.
  *
+ * With softirq_ns set, an armed thread goes one step further and suspends its
+ * NAPIs before it parks: softirq serves them in the interrupt's wake, on the
+ * thread's CPU, and a packet costs no wakeup of the thread. Softirq wakes the
+ * thread after NS_SOFTIRQ_WAKE packets of a NAPI. If those came within
+ * softirq_ns the queue is busy enough for the thread, which resumes its NAPIs
+ * and enters the masked phase; if they took longer it has softirq count again
+ * and parks.
+ *
  * With --tx a thread also sends. Every thread has a TCP xmit queue of its
  * own, with the index of its slot, and a connection that is established while
  * a thread processes its handshake, which is every connection that arrives
@@ -69,6 +77,8 @@ extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym;
 extern int bpf_napi_bind(__u32 napi_id, struct task_struct *task, __u64 flags) __ksym;
 extern int bpf_napi_unbind(__u32 napi_id) __ksym;
 extern int bpf_napi_poll(__u32 napi_id, __u64 flags) __ksym;
+extern int bpf_napi_suspend(__u32 napi_id, __u32 wake_after) __ksym;
+extern int bpf_napi_resume(__u32 napi_id) __ksym;
 /* Only kernels with TCP xmit queues have these, and only --tx uses them. */
 extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __ksym __weak;
 extern int bpf_tcp_tx_unbind(__u32 queue) __ksym __weak;
@@ -80,6 +90,12 @@ extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 __u64 hold_ns;		/* stay masked this long after the last packet; 0: never mask */
 __u64 spin_ns;		/* of that, spin this long before napping */
 __u64 nap_ns;		/* length of a nap with interrupts masked */
+/*
+ * A parked thread leaves its NAPIs to softirq, and takes them back when
+ * NS_SOFTIRQ_WAKE packets of one arrive within this time; 0: the thread is
+ * woken for every interrupt.
+ */
+__u64 softirq_ns;
 /*
  * A thread's callback holds a Tasks Trace RCU read section except while it
  * parks, so a thread that always finds work would hold up every such grace
@@ -215,6 +231,33 @@ static __always_inline void xmit(struct ns_thread *t, bool *more)
 }
 
 /*
+ * Leave the thread's NAPIs to softirq, or have softirq count anew for NAPIs
+ * that are, or take them back.
+ */
+static __always_inline void route(struct ns_thread *t, bool to_softirq)
+{
+	__u32 nr = *(volatile __u32 *)&t->nr_napis;
+	int k;
+
+	if (nr > NS_THREAD_NAPIS)
+		nr = NS_THREAD_NAPIS;
+
+	bpf_for(k, 0, nr) {
+		__u32 slot;
+
+		if (k < 0 || k >= NS_THREAD_NAPIS)
+			break;
+		slot = *(volatile __u32 *)&t->napi[k];
+		if (slot >= NS_MAX_NAPIS)
+			continue;
+		if (to_softirq)
+			bpf_napi_suspend(napis[slot].id, NS_SOFTIRQ_WAKE);
+		else
+			bpf_napi_resume(napis[slot].id);
+	}
+}
+
+/*
  * A park, which ends the read section the callback runs in if the thread
  * sleeps, see rest_ns. A park that finds a wake pending returns 0 at once, in
  * the section, and one that returns 0 after a sleep looks the same, so only a
@@ -268,7 +311,9 @@ static int poller(__u64 arg)
 
 			flags = hold && !t->armed ? BPF_NAPI_POLL_F_BUSY : 0;
 			t->pass_work = 0;
-			scan(t, flags, &more);
+			/* Polls of a suspended NAPI are refused. */
+			if (!t->suspended)
+				scan(t, flags, &more);
 			/* Xmit work counts like a packet: where there was some, more follows. */
 			if (tx_enabled)
 				xmit(t, &more);
@@ -281,7 +326,7 @@ static int poller(__u64 arg)
 					t->last_work_ns = now;
 				}
 				/* Packets after the interrupts were unmasked: mask again. */
-				if (hold)
+				if (hold && !t->suspended)
 					t->armed = 0;
 				if (now - t->last_rest_ns > load(&rest_ns)) {
 					t->rests++;
@@ -291,17 +336,40 @@ static int poller(__u64 arg)
 			}
 
 			if (!flags) {
+				__u64 window = load(&softirq_ns);
+
 				/*
 				 * Every NAPI is complete and its interrupt unmasked.
 				 * A schedule since then left a wake pending, so
-				 * this returns at once.
+				 * the park returns at once.
 				 */
 				t->armed = 1;
+				if (window && !t->suspended) {
+					route(t, true);
+					t->suspended = 1;
+					t->suspend_ns = now;
+					t->suspends++;
+				}
 				t->parks++;
-				if (!rest(idx, IDLE_PARK_NS) && idx < NS_MAX_THREADS) {
-					threads[idx].wakes++;
+				if (rest(idx, IDLE_PARK_NS) || idx >= NS_MAX_THREADS)
+					continue;
+
+				t = &threads[idx];
+				t->wakes++;
+				now = bpf_ktime_get_ns();
+				if (!t->suspended) {
 					if (hold)
-						threads[idx].armed = 0;
+						t->armed = 0;
+				} else if (now - t->suspend_ns < window) {
+					/* Softirq's count ran out quickly: a busy queue. */
+					route(t, false);
+					t->suspended = 0;
+					t->resumes++;
+					if (hold)
+						t->armed = 0;
+				} else {
+					route(t, true);
+					t->suspend_ns = now;
 				}
 				continue;
 			}
