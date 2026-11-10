@@ -113,6 +113,7 @@ static struct {
 	const char *thread_cgroup;
 	const char *tx;
 	__u64 hold_us, spin_us, nap_us, rest_us;
+	__u64 softirq_pps;
 	__u64 tick_ms, interval_ms, duration_s;
 	__u64 gap_us;
 	int hi, target, lo, panic;
@@ -1253,7 +1254,7 @@ static void report(__u64 dt_ns)
 {
 	static __u64 prev_pkts, prev_naps, prev_parks, prev_xmits;
 	__u64 pkts = 0, naps = 0, parks = 0, gap = 0, xmits = 0;
-	int active = 0, i, k;
+	int active = 0, suspended = 0, i, k;
 	double max_load = 0, sum_load = 0;
 
 	for (i = 0; i < nr_napis; i++) {
@@ -1265,6 +1266,7 @@ static void report(__u64 dt_ns)
 		naps += skel->bss->threads[i].naps;
 		parks += skel->bss->threads[i].parks;
 		xmits += skel->bss->threads[i].xmits;
+		suspended += skel->bss->threads[i].suspended && skel->bss->threads[i].nr_napis;
 	}
 	for (i = 0; i < nr_llcs; i++) {
 		active += llcs[i].active;
@@ -1283,6 +1285,9 @@ static void report(__u64 dt_ns)
 	       (naps - prev_naps) * 1e9 / dt_ns, (parks - prev_parks) * 1e9 / dt_ns,
 	       (unsigned long long)moves, (unsigned long long)grows,
 	       (unsigned long long)shrinks, (unsigned long long)rebinds);
+	if (opt.softirq_pps)
+		printf("  softirq: %d of %d active threads have left their NAPIs to softirq\n",
+		       suspended, active);
 	if (opt.tx)
 		printf("  tx: xmits/s %.0f  connections assigned %llu\n",
 		       (xmits - prev_xmits) * 1e9 / dt_ns,
@@ -1343,6 +1348,8 @@ static void usage(void)
 "  --hold-us N            keep interrupts masked this long after the last packet (default 2000)\n"
 "  --spin-us N            of that, spin this long before napping (default 0)\n"
 "  --nap-us N             length of a nap with interrupts masked (default 50)\n"
+"  --softirq-pps N        a parked thread leaves its NAPIs to softirq and takes one back\n"
+"                         when it receives more than N packets/s (default 0: never)\n"
 "\n"
 "  --interval-ms N        report period (default 1000)\n"
 "  --duration S           exit after S seconds\n"
@@ -1354,7 +1361,7 @@ enum {
 	OPT_DEV = 256, OPT_CPUS, OPT_CPUSET, OPT_THREAD_CGROUP, OPT_NAPIS_PER_THREAD,
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
-	OPT_DURATION, OPT_VERBOSE, OPT_TX,
+	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_SOFTIRQ_PPS,
 };
 
 static const struct option longopts[] = {
@@ -1376,6 +1383,7 @@ static const struct option longopts[] = {
 	{ "hold-us", required_argument, NULL, OPT_HOLD_US },
 	{ "spin-us", required_argument, NULL, OPT_SPIN_US },
 	{ "nap-us", required_argument, NULL, OPT_NAP_US },
+	{ "softirq-pps", required_argument, NULL, OPT_SOFTIRQ_PPS },
 	{ "interval-ms", required_argument, NULL, OPT_INTERVAL_MS },
 	{ "duration", required_argument, NULL, OPT_DURATION },
 	{ "verbose", no_argument, NULL, OPT_VERBOSE },
@@ -1417,6 +1425,7 @@ int main(int argc, char **argv)
 		case OPT_HOLD_US: opt.hold_us = strtoull(optarg, NULL, 0); break;
 		case OPT_SPIN_US: opt.spin_us = strtoull(optarg, NULL, 0); break;
 		case OPT_NAP_US: opt.nap_us = strtoull(optarg, NULL, 0); break;
+		case OPT_SOFTIRQ_PPS: opt.softirq_pps = strtoull(optarg, NULL, 0); break;
 		case OPT_INTERVAL_MS: opt.interval_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_DURATION: opt.duration_s = strtoull(optarg, NULL, 0); break;
 		case OPT_VERBOSE: opt.verbose = true; break;
@@ -1448,6 +1457,9 @@ int main(int argc, char **argv)
 	skel->bss->spin_ns = opt.spin_us * 1000;
 	skel->bss->nap_ns = opt.nap_us * 1000;
 	skel->bss->rest_ns = opt.rest_us * 1000;
+	/* The time NS_SOFTIRQ_WAKE packets take at the rate that is still softirq's. */
+	if (opt.softirq_pps)
+		skel->bss->softirq_ns = NS_SOFTIRQ_WAKE * 1000000000ULL / opt.softirq_pps;
 	skel->rodata->tx_enabled = !!opt.tx;
 	if (!opt.tx) {
 		/* Their kfuncs are missing on a kernel without TCP xmit queues. */
