@@ -123,6 +123,33 @@ static int bpf_task_park_interrupted(void)
 	return 0;
 }
 
+/**
+ * bpf_task_wake_direct - Wake a task parked in bpf_task_park() from the kernel
+ * @task: task to wake
+ *
+ * What bpf_task_wake() does where it can issue the wake at once: mark the wake
+ * pending and wake @task if it sleeps interruptibly. For kernel code that
+ * wakes a parked task on a program's behalf from a context it knows, such as
+ * an interrupt handler, where IRQs may be disabled but neither a pi_lock nor a
+ * runqueue lock is held, so the wake need not be deferred as a program's is.
+ * Not for NMI context.
+ *
+ * Return: 1 when @task was asleep and is now runnable, 0 when it was not.
+ */
+int bpf_task_wake_direct(struct task_struct *task)
+{
+	/*
+	 * xchg() is a full barrier. It orders the waker's stores before this
+	 * call, its condition, before the word, so a park that consumes the
+	 * word sees them, also when what it consumes is another waker's store
+	 * that overwrote this one. try_to_wake_up() then orders the store
+	 * before its load of the task state, pairing with set_current_state()
+	 * in bpf_task_park().
+	 */
+	xchg(&task->bpf_wake_pending, 1);
+	return wake_up_state(task, TASK_INTERRUPTIBLE);
+}
+
 __bpf_kfunc_start_defs();
 
 /**
@@ -259,20 +286,18 @@ __bpf_kfunc int bpf_task_wake(struct task_struct *task, u64 flags)
 	if (flags)
 		return -EINVAL;
 
-	/*
-	 * xchg() is a full barrier. It orders the program's stores before this
-	 * call, its condition, before the word, so a park that consumes the
-	 * word sees them, also when what it consumes is another waker's store
-	 * that overwrote this one. try_to_wake_up() then orders the store
-	 * before its load of the task state, pairing with set_current_state()
-	 * in bpf_task_park().
-	 */
-	xchg(&task->bpf_wake_pending, 1);
 	if (unlikely(irqs_disabled())) {
+		/*
+		 * The xchg() is a full barrier between the program's stores
+		 * before this call and the word, and between the word and the
+		 * claim of the task's queue node, see bpf_task_wake_direct()
+		 * and bpf_task_wake_defer().
+		 */
+		xchg(&task->bpf_wake_pending, 1);
 		bpf_task_wake_defer(task);
 		return 2;
 	}
-	return wake_up_state(task, TASK_INTERRUPTIBLE);
+	return bpf_task_wake_direct(task);
 }
 
 __bpf_kfunc_end_defs();

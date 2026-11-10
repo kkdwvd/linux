@@ -2973,6 +2973,7 @@ void bpf_prog_put(struct bpf_prog *prog);
 
 void bpf_prog_free_id(struct bpf_prog *prog);
 void bpf_prog_free_kthreads(struct bpf_prog_aux *aux);
+int bpf_task_wake_direct(struct task_struct *task);
 void bpf_map_free_id(struct bpf_map *map);
 
 struct btf_field *btf_record_find(const struct btf_record *rec,
