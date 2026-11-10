@@ -6,9 +6,13 @@
 #define NS_MAX_THREADS		256	/* poller threads, one per pool CPU */
 #define NS_MAX_NAPIS		256	/* NAPIs of the device */
 #define NS_THREAD_NAPIS		32	/* NAPIs one thread can be given */
+#define NS_THREAD_TXQS		32	/* TCP xmit queues one thread can be given */
+#define NS_MAX_CPUS		1024
 
 /* The budget of one driver poll. A poll that returns it left packets behind. */
 #define NS_POLL_BUDGET		64
+/* Sockets served per poll of a TCP xmit queue. */
+#define NS_TX_BUDGET		64
 
 /*
  * What the loader tells a thread. A thread reads its list on every scan, and
@@ -20,12 +24,15 @@
 struct ns_thread {
 	__u32 nr_napis;
 	__u32 napi[NS_THREAD_NAPIS];	/* slots in the NAPI table */
+	/* With --tx: the TCP xmit queues it serves, changed the same way. */
+	__u32 nr_txqs;
+	__u32 txq[NS_THREAD_TXQS];
 
 	/* The thread's own state, kept here and not in registers. */
 	__u32 armed;			/* interrupts are unmasked, the next scan is plain */
 	__u64 last_work_ns;		/* end of the last scan that found packets */
 	__u64 last_rest_ns;		/* end of the last park */
-	__u64 pass_work;		/* packets the current pass found */
+	__u64 pass_work;		/* packets and sockets the current pass found */
 
 	/* Cumulative counters, written by the thread. */
 	__u64 scans;			/* passes over the list */
@@ -34,6 +41,8 @@ struct ns_thread {
 	__u64 parks;			/* parks with interrupts unmasked */
 	__u64 wakes;			/* such parks that a schedule or the loader ended */
 	__u64 rests;			/* parks forced on a thread that never slept */
+	__u64 xmits;			/* sockets whose xmit work it did */
+	__u64 xmit_ns;			/* time in polls of xmit queues that found work */
 } __attribute__((aligned(64)));
 
 /* One NAPI of the device. The loader sets id; the thread polling it the rest. */
@@ -58,7 +67,7 @@ struct ns_args {
 	__u32 thread;			/* slot of the thread */
 	__u32 cpu;			/* create: the CPU to bind the thread to */
 	__u32 napi_id;			/* bind, unbind: the NAPI */
-	__u32 pad;
+	__u32 txq;			/* bind, unbind: the TCP xmit queue */
 	__u64 cgroup_id;		/* create: cgroup to place the thread in, 0 for none */
 };
 
