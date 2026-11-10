@@ -74,6 +74,7 @@ struct bpf_kthread {
 	struct task_struct *task;	/* holds one reference for this object */
 	struct bpf_prog_aux *aux;	/* the program whose callback this is */
 	struct bpf_kthread *waits_for;	/* the thread this one is stopping, under the lock */
+	bool exiting;			/* past its callback, under the lock */
 	void *callback_fn;
 	u64 arg;
 };
@@ -87,6 +88,28 @@ struct bpf_kthread {
 static LIST_HEAD(bpf_kthreads);
 static DEFINE_RAW_SPINLOCK(bpf_kthreads_lock);
 
+/*
+ * A NAPI bound to a thread is polled by nobody once the thread's callback has
+ * returned, so the thread gives its NAPIs back to the kernel on its way out.
+ * This runs in the thread, not in whoever stops it: a thread whose callback
+ * returned on its own may stay unstopped for as long as its program lives.
+ *
+ * A bind publishes the thread in the NAPI and then asks bpf_kthread_alive(),
+ * and the thread sets ->exiting and then looks for its NAPIs, both under the
+ * lock. So a bind that was told the thread is alive has published a NAPI the
+ * walk finds, and any later bind is told otherwise and undoes itself.
+ */
+static void bpf_kthread_release_napis(struct bpf_kthread *kthread)
+{
+	unsigned long irqflags;
+
+	raw_spin_lock_irqsave(&bpf_kthreads_lock, irqflags);
+	kthread->exiting = true;
+	raw_spin_unlock_irqrestore(&bpf_kthreads_lock, irqflags);
+
+	napi_bpf_release_task(current);
+}
+
 static int bpf_kthread_fn(void *data)
 {
 	struct bpf_kthread *kthread = data;
@@ -94,9 +117,14 @@ static int bpf_kthread_fn(void *data)
 	unsigned int pflags;
 	int ret;
 
-	/* Stopped before it was started: the callback does not run. */
-	if (kthread_should_stop())
+	/*
+	 * Stopped before it was started: the callback does not run. A NAPI
+	 * can have been bound to the thread all the same.
+	 */
+	if (kthread_should_stop()) {
+		bpf_kthread_release_napis(kthread);
 		return -EINTR;
+	}
 
 	/*
 	 * The callback runs as the body of a sleepable program does, with
@@ -125,6 +153,7 @@ static int bpf_kthread_fn(void *data)
 	migrate_enable();
 	rcu_read_unlock_trace();
 	no_notify_signal_restore(pflags);
+	bpf_kthread_release_napis(kthread);
 	return ret;
 }
 
@@ -138,6 +167,30 @@ static struct bpf_kthread *bpf_kthread_find(struct task_struct *task)
 		if (kthread->task == task)
 			return kthread;
 	return NULL;
+}
+
+/**
+ * bpf_kthread_alive - Whether a task is a BPF kthread that can still poll
+ * @task: any task
+ *
+ * For kernel code that hands a BPF kthread work only the thread's callback can
+ * do, and that the thread gives back when the callback is over, see
+ * bpf_kthread_release_napis().
+ *
+ * Return: true if @task is a BPF kthread whose callback has not returned and
+ * that is not being stopped.
+ */
+bool bpf_kthread_alive(struct task_struct *task)
+{
+	struct bpf_kthread *kthread;
+	unsigned long irqflags;
+	bool alive;
+
+	raw_spin_lock_irqsave(&bpf_kthreads_lock, irqflags);
+	kthread = bpf_kthread_find(task);
+	alive = kthread && !kthread->exiting;
+	raw_spin_unlock_irqrestore(&bpf_kthreads_lock, irqflags);
+	return alive;
 }
 
 /* Take a thread off both lists. Call with bpf_kthreads_lock held. */

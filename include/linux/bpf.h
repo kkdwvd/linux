@@ -2974,6 +2974,14 @@ void bpf_prog_put(struct bpf_prog *prog);
 void bpf_prog_free_id(struct bpf_prog *prog);
 void bpf_prog_free_kthreads(struct bpf_prog_aux *aux);
 int bpf_task_wake_direct(struct task_struct *task);
+bool bpf_kthread_alive(struct task_struct *task);
+#ifdef CONFIG_NET
+void napi_bpf_release_task(struct task_struct *task);
+#else
+static inline void napi_bpf_release_task(struct task_struct *task)
+{
+}
+#endif
 void bpf_map_free_id(struct bpf_map *map);
 
 struct btf_field *btf_record_find(const struct btf_record *rec,

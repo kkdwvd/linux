@@ -7688,7 +7688,8 @@ int napi_bpf_poll(unsigned int napi_id, u64 flags)
  * softirq is polling at the time stays there until it completes.
  *
  * Return: 0 on success, -EBUSY if @napi is in the kernel's threaded mode,
- * -EOPNOTSUPP if it cannot be polled by a thread, -ESRCH if @task is gone.
+ * -EOPNOTSUPP if it cannot be polled by a thread, -ESRCH if @task is not a BPF
+ * kthread, or one whose callback has returned or that is being stopped.
  */
 int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
 {
@@ -7700,6 +7701,8 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
 		return -EOPNOTSUPP;
 	if (old && !test_bit(NAPI_STATE_BPF, &napi->state))
 		return -EBUSY;
+	if (!bpf_kthread_alive(task))
+		return -ESRCH;
 
 	if (old != task) {
 		if (!refcount_inc_not_zero(&task->rcu_users))
@@ -7727,6 +7730,16 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
 
 	if (old && old != task)
 		put_task_struct_rcu_user(old);
+
+	/* A thread on its way out gives back the NAPIs it finds bound to it
+	 * and binds no more. Ask only now that the thread is in the NAPI, so
+	 * that a thread that began to exit after the check above either found
+	 * this NAPI or is found out here.
+	 */
+	if (!bpf_kthread_alive(task)) {
+		napi_bpf_unbind_locked(napi);
+		return -ESRCH;
+	}
 	return 0;
 }
 
@@ -7775,6 +7788,54 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	WRITE_ONCE(napi->thread, NULL);
 	clear_bit(NAPI_STATE_BPF, &napi->state);
 	put_task_struct_rcu_user(thread);
+}
+
+/**
+ * napi_bpf_release_task() - unbind every NAPI bound to an exiting BPF kthread
+ * @task: the BPF kthread, which accepts no new binding any more
+ *
+ * May sleep.
+ */
+void napi_bpf_release_task(struct task_struct *task)
+{
+	struct napi_struct *napi;
+	struct net_device *dev;
+	unsigned int napi_id;
+	int bkt;
+
+	might_sleep();
+
+	/* One NAPI per pass, since the netdev lock is taken outside of the RCU
+	 * read section that finds it. Every pass ends with one NAPI fewer
+	 * bound to @task: this unbinds it, or its device did meanwhile.
+	 */
+	for (;;) {
+		dev = NULL;
+		rcu_read_lock();
+		hash_for_each_rcu(napi_hash, bkt, napi, napi_hash_node) {
+			if (READ_ONCE(napi->thread) != task)
+				continue;
+			napi_id = napi->napi_id;
+			dev = napi->dev;
+			dev_hold(dev);
+			break;
+		}
+		rcu_read_unlock();
+		if (!dev)
+			return;
+
+		netdev_lock(dev);
+		rcu_read_lock();
+		napi = napi_by_id(napi_id);
+		if (napi && (napi->dev != dev || napi->thread != task))
+			napi = NULL;
+		rcu_read_unlock();
+		/* The lock keeps a NAPI of @dev from being deleted. */
+		if (napi)
+			napi_bpf_unbind_locked(napi);
+		netdev_unlock(dev);
+		dev_put(dev);
+	}
 }
 #endif /* CONFIG_BPF_SYSCALL */
 
