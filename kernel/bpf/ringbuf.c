@@ -336,12 +336,21 @@ static u32 ringbuf_total_data_sz(const struct bpf_ringbuf *rb)
 static __poll_t ringbuf_map_poll_kern(struct bpf_map *map, struct file *filp,
 				      struct poll_table_struct *pts)
 {
-	struct bpf_ringbuf_map *rb_map;
+	struct bpf_ringbuf *rb;
 
-	rb_map = container_of(map, struct bpf_ringbuf_map, map);
-	poll_wait(filp, &rb_map->rb->waitq, pts);
+	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
+	poll_wait(filp, &rb->waitq, pts);
 
-	if (ringbuf_avail_data_sz(rb_map->rb))
+	/*
+	 * There is something to read as long as the consumer is behind the
+	 * producer. ringbuf_avail_data_sz() cannot tell in overwrite mode: a
+	 * reservation moves overwrite_pos before it publishes producer_pos,
+	 * all the way to the old producer_pos if the new record takes the
+	 * place of every record in the ring, and between the two stores the
+	 * ring looks empty. A consumer that goes to sleep on that is not woken
+	 * up for the new record, which is not at the consumer position.
+	 */
+	if (smp_load_acquire(&rb->producer_pos) != smp_load_acquire(&rb->consumer_pos))
 		return EPOLLIN | EPOLLRDNORM;
 	return 0;
 }
