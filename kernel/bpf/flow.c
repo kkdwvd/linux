@@ -3131,6 +3131,9 @@ static int flow_apply_exit(struct bpf_verifier_env *env, struct flow_state *w,
 	err = bpf_copy_verifier_state(&st, &w->st);
 	if (!err)
 		err = bpf_flow_return(env, &st, &x->st, call_idx);
+	/* what the function handed over needs slots in the caller's frame */
+	if (!err)
+		err = bpf_frame_desc_record_return(env, &st);
 	if (!err)
 		err = bpf_flow_deliver(env, &st, call_idx + 1, call_idx);
 	bpf_free_verifier_state(&st, false);

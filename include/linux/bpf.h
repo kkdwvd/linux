@@ -2014,6 +2014,8 @@ struct bpf_prog_aux {
 	bool has_prologue;
 	bool might_sleep;
 	bool can_unwind;
+	/* a throw in this JITed function, or in one it reaches, unwinds its frames */
+	bool might_throw;
 	/* frames of recursive subprogs can be on the stack when it is called */
 	bool in_recursion;
 	bool kprobe_write_ctx;

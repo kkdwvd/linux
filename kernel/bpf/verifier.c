@@ -813,6 +813,10 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 	mark_dynptr_stack_regs(env, &bpf_stack_slot(state, spi)->spilled_ptr,
 			       &bpf_stack_slot(state, spi - 1)->spilled_ptr, type, parent_id);
 
+	/* a referenced dynptr is a stack object the unwinder discards at its address */
+	if (dynptr->type == BPF_DYNPTR_TYPE_INVALID && dynptr_type_referenced(type))
+		return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+						     reg - cur_regs(env), false, false);
 	return 0;
 }
 
@@ -1077,7 +1081,9 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 		mark_stack_slot_scratched(env, spi - i);
 	}
 
-	return 0;
+	/* a stack object the unwinder destroys at its address, which the call takes */
+	return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+					     reg - cur_regs(env), false, false);
 }
 
 static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
@@ -1203,7 +1209,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 		slot->slot_type[i] = STACK_IRQ_FLAG;
 
 	mark_stack_slot_scratched(env, spi);
-	return 0;
+	/* a stack object the unwinder restores at its address, which the call takes; irqsave may fail */
+	return bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+					     reg - cur_regs(env), false, kfunc_class == IRQ_LOCK_KFUNC);
 }
 
 static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
@@ -1685,6 +1693,10 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
+			int err = bpf_frame_desc_record_release(env, i);
+
+			if (err)
+				return err;
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
@@ -1715,6 +1727,10 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_IRQ)
 			continue;
 		if (state->refs[i].id == id) {
+			int err = bpf_frame_desc_record_release(env, i);
+
+			if (err)
+				return err;
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
 			bpf_diag_record_context(env, env->insn_idx, BPF_DIAG_CONTEXT_IRQ,
@@ -3720,6 +3736,25 @@ static void check_fastcall_stack_contract(struct bpf_verifier_env *env,
 	}
 }
 
+/*
+ * A frame of a program that may throw keeps the address of an iterator and of
+ * saved IRQ flags it holds in a hidden slot, and the unwinder destroys or
+ * restores what is at the address, see frame_desc.c: the program may not write
+ * over one. Without a throw, the leak such a write leaves refuses the program
+ * at its exit.
+ */
+static int check_stack_object_write(struct bpf_verifier_env *env, struct bpf_func_state *state,
+				    int spi)
+{
+	u8 type = bpf_stack_slot(state, spi)->slot_type[BPF_REG_SIZE - 1];
+
+	if (!env->describe_frames || (type != STACK_ITER && type != STACK_IRQ_FLAG))
+		return 0;
+	verbose(env, "cannot write over %s in a program that throws\n",
+		type == STACK_ITER ? "an iterator" : "saved irq flags");
+	return -EINVAL;
+}
+
 static void scrub_special_slot(struct bpf_func_state *state, int spi)
 {
 	struct bpf_stack_state *slot = bpf_stack_slot(state, spi);
@@ -3789,7 +3824,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			env->insn_aux_data[insn_idx].nospec_result = true;
 	}
 
-	err = destroy_if_dynptr_stack_slot(env, state, spi);
+	err = check_stack_object_write(env, state, spi);
+	err = err ?: destroy_if_dynptr_stack_slot(env, state, spi);
 	if (err)
 		return err;
 
@@ -3891,6 +3927,13 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 	    (!value_reg && is_bpf_st_mem(insn) && insn->imm == 0))
 		writing_zero = true;
 
+	for (i = bpf_get_spi(max_off - 1); i <= bpf_get_spi(min_off); i++) {
+		if (i >= bpf_stack_nr_slots(state))
+			break;
+		err = check_stack_object_write(env, state, i);
+		if (err)
+			return err;
+	}
 	err = destroy_dynptrs_in_stack_slots(env, state, bpf_get_spi(max_off - 1),
 					     bpf_get_spi(min_off));
 	if (err)
@@ -8477,6 +8520,11 @@ static int process_spin_lock(struct bpf_verifier_env *env, struct bpf_reg_state 
 			verbose(env, "Failed to acquire lock state\n");
 			return err;
 		}
+		/* the unwinder releases the lock at the address the call takes; a res lock may fail */
+		err = bpf_frame_desc_record_acquire(env, cur->acquired_refs - 1,
+						    reg - cur_regs(env), false, is_res_lock);
+		if (err)
+			return err;
 	} else {
 		void *ptr;
 		int type;
@@ -11115,9 +11163,18 @@ static int __release_reference_nomark(struct bpf_verifier_state *state, int id)
 
 static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
-	int err;
+	struct bpf_verifier_state *state = env->cur_state;
+	int i, err;
 
-	err = __release_reference_nomark(env->cur_state, id);
+	for (i = 0; i < state->acquired_refs; i++) {
+		if (state->refs[i].type != REF_TYPE_PTR || state->refs[i].id != id)
+			continue;
+		err = bpf_frame_desc_record_release(env, i);
+		if (err)
+			return err;
+		break;
+	}
+	err = __release_reference_nomark(state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
 	return err;
@@ -11218,9 +11275,13 @@ static int invalidate_reference(struct bpf_verifier_env *env, int id)
 
 static int release_reference(struct bpf_verifier_env *env, int id)
 {
-	if (find_reference_state(env->cur_state, id))
-		WARN_ON_ONCE(release_reference_nomark(env, id));
+	int err;
 
+	if (find_reference_state(env->cur_state, id)) {
+		err = release_reference_nomark(env, id);
+		if (err)
+			return err;
+	}
 	return invalidate_reference(env, id);
 }
 
@@ -11856,6 +11917,8 @@ static int exit_func_on_its_own(struct bpf_verifier_env *env)
 	if (err)
 		return err;
 
+	/* what the function returns with is its caller's from here on */
+	bpf_frame_desc_record_exit(env);
 	account_current_path(env);
 	err = bpf_flow_exit(env, state, env->insn_idx);
 	return err ?: PROCESS_BPF_EXIT;
@@ -12792,6 +12855,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	invalidate_stack_slices(env, callee->frameno, INT_MIN, 0);
 
 	/* What the frame holds when it returns is the caller's to release. */
+	bpf_frame_desc_record_exit(env);
 	for (i = 0; i < state->acquired_refs; i++)
 		if (state->refs[i].frameno == callee->frameno)
 			state->refs[i].frameno = caller->frameno;
@@ -12813,10 +12877,12 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	account_processed_insns(env, callee, caller);
 	/* clear everything in the callee. In case of exceptional exits using
 	 * bpf_throw, this will be done by do_check_block() for extra frames. */
-	free_func_state(callee);
 	state->frame[state->curframe--] = NULL;
 	invalidate_outgoing_stack_args(env, caller);
-	return 0;
+	/* what the callee handed over needs slots in the caller's frame */
+	err = bpf_frame_desc_record_return(env, state);
+	free_func_state(callee);
+	return err;
 }
 
 static int do_refine_retval_range(struct bpf_verifier_env *env,
@@ -12966,6 +13032,14 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type != REF_TYPE_PTR)
+			continue;
+		/*
+		 * The unwinder releases what the slots of the frames hold, see
+		 * frame_desc.c: every reference but one of a class it cannot
+		 * release, which no slot holds.
+		 */
+		if (exception_exit && bpf_arch_throw_entry() &&
+		    (state->refs[i].res || state->speculative))
 			continue;
 		/* Allow struct_ops programs to return a referenced kptr back to
 		 * kernel. Type checks are performed later in check_return_code.
@@ -13637,6 +13711,11 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		/* the unwinder releases the pointer the call returns */
+		err = bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+						    BPF_REG_0, true, false);
+		if (err)
+			return err;
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -15061,14 +15140,15 @@ static int ref_set_non_owning(struct bpf_verifier_env *env, struct bpf_reg_state
 	return 0;
 }
 
-static void ref_convert_owning_non_owning(struct bpf_verifier_env *env, u32 id)
+static int ref_convert_owning_non_owning(struct bpf_verifier_env *env, u32 id)
 {
 	struct bpf_func_state *unused;
 	struct bpf_reg_state *reg;
 	int err;
 
 	err = release_reference_nomark(env, id);
-	WARN_ON_ONCE(err);
+	if (err)
+		return err;
 
 	bpf_for_each_reg_in_vstate(env->cur_state, unused, reg, ({
 		if (reg->id == id) {
@@ -15077,7 +15157,7 @@ static void ref_convert_owning_non_owning(struct bpf_verifier_env *env, u32 id)
 		}
 	}));
 
-	return;
+	return 0;
 }
 
 /* Implementation details:
@@ -16104,11 +16184,24 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+bool bpf_nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16225,10 +16318,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = bpf_nmi_unsafe_prog(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct btf_struct_meta *struct_meta;
@@ -16303,6 +16393,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_disable = is_kfunc_bpf_preempt_disable(&meta);
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
+	/* the descriptors may count the sections of the frame in a hidden slot */
+	if (rcu_lock || rcu_unlock || preempt_disable || preempt_enable) {
+		err = bpf_frame_desc_record_section(env, rcu_lock || rcu_unlock ? 0 : 1,
+						    rcu_lock || preempt_disable ? 1 : -1);
+		if (err)
+			return err;
+	}
 	if (rcu_lock) {
 		env->cur_state->active_rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
@@ -16380,7 +16477,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (err)
 				return err;
 		} else {
-			ref_convert_owning_non_owning(env, id);
+			err = ref_convert_owning_non_owning(env, id);
+			if (err)
+				return err;
 		}
 	}
 
@@ -16605,6 +16704,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			/* the unwinder releases the pointer the call returns */
+			err = bpf_frame_desc_record_acquire(env, env->cur_state->acquired_refs - 1,
+							    BPF_REG_0, true, false);
+			if (err)
+				return err;
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -21009,10 +21113,12 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	 * prepare_func_exit to handle the case when
 	 * state->curframe > 0, it may be a callback function,
 	 * for which reference_state must match caller reference
-	 * state when it exits.
+	 * state when it exits. An unwinder that releases resources
+	 * leaves locks and sections too.
 	 */
 	int err = check_resource_leak(env, exception_exit,
-				      exception_exit || !env->cur_state->curframe,
+				      exception_exit ? !bpf_arch_throw_entry() :
+				      !env->cur_state->curframe,
 				      exception_exit ? "bpf_throw" :
 				      "BPF_EXIT instruction in main prog");
 	if (err)
@@ -21300,7 +21406,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				      insn->imm != BPF_FUNC_spin_unlock &&
 				      insn->imm != BPF_FUNC_kptr_xchg) ||
 				     (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
-				      !kfunc_spin_allowed(env, insn->imm, insn->off)))) {
+				      !kfunc_spin_allowed(env, insn->imm, insn->off) &&
+				      !(bpf_is_throw_kfunc(insn) && bpf_arch_throw_entry())))) {
 					verbose(env,
 						"function calls are not allowed while holding a lock\n");
 					bpf_diag_ctx_active(
@@ -23480,6 +23587,12 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 				goto out;
 
 			aux->ctx_arg_info[i].ref_id = ret;
+			/* the kernel passed it: the main program holds it from its entry */
+			if (!ret)
+				continue;
+			ret = bpf_frame_desc_record_ctx_arg(env, state->acquired_refs - 1, i);
+			if (ret)
+				goto out;
 		}
 	}
 
@@ -23620,6 +23733,7 @@ static int do_check_all(struct bpf_verifier_env *env)
 		bpf_vlog_reset(&env->log, min(log_pos, env->log.end_pos));
 		for (i = 0; i < env->prog->len; i++)
 			env->insn_aux_data[i].seen = 0;
+		bpf_frame_desc_reset(env);
 		for (i = 1; env->prog->aux->func_info && i < env->subprog_cnt; i++) {
 			sub_aux = subprog_aux(env, i);
 			memset(sub_aux->called, 0, sizeof(sub_aux->called));
@@ -23689,6 +23803,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->insn_processed,
 		env->max_states_per_insn, env->total_states,
 		env->peak_states);
+	if (env->log.level & BPF_LOG_STATS)
+		verbose(env, "frame descriptors: slots %u insns %u classes %u bytes %u\n",
+			env->frame_desc_slots, env->frame_desc_insns,
+			env->frame_desc_pool ? env->frame_desc_pool->resource_cnt : env->resource_cnt,
+			env->frame_desc_bytes);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
@@ -25628,6 +25747,13 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = bpf_check_cfg(env);
 	if (ret < 0)
 		goto skip_full_check;
+	/*
+	 * A program that may throw keeps what its frames hold in slots the
+	 * unwinder releases, see frame_desc.c, where the architecture has the
+	 * entry the unwinder needs; elsewhere it throws holding nothing.
+	 */
+	for (i = 0; bpf_arch_throw_entry() && i < env->subprog_cnt; i++)
+		env->describe_frames |= env->subprog_info[i].might_throw;
 
 	ret = check_unwind_insns(env);
 	if (ret < 0)
@@ -25743,6 +25869,21 @@ skip_full_check:
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
 
+	/*
+	 * The pass has seen what every frame holds and the stack is final:
+	 * reserve the slots the frames keep their handles in and emit the insns
+	 * that keep them up to date, with the insns still those the main pass
+	 * recorded.
+	 */
+	if (ret == 0)
+		ret = bpf_frame_desc_resolve(env);
+	if (ret == 0)
+		ret = bpf_frame_desc_emit(env);
+
+	/* Account for the slots reserved by frame descriptor resolution. */
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
 	/* instruction rewrites happen after this point */
 	if (ret == 0)
 		ret = bpf_optimize_bpf_loop(env);
@@ -25783,6 +25924,9 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
+
+	if (ret == 0)
+		ret = bpf_frame_desc_build(env);
 
 	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
@@ -25899,6 +26043,7 @@ err_free_env:
 		kfree(env->func_sets[i]);
 	kfree(env->func_sets);
 	kvfree(env->stack_inits);
+	bpf_frame_desc_env_free(env);
 	bpf_diag_free(env);
 	kvfree(env->idoms);
 	kvfree(env);

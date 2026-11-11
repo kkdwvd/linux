@@ -950,8 +950,7 @@ int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s
 	return 0;
 }
 
-/* Initialize the hidden slot at @off of @subprog to @imm in its prologue. */
-int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm)
+static int stack_slot_init(struct bpf_verifier_env *env, const struct bpf_stack_init *init)
 {
 	struct bpf_stack_init *inits;
 	u32 cnt = env->stack_init_cnt;
@@ -960,10 +959,29 @@ int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 
 			  GFP_KERNEL_ACCOUNT);
 	if (!inits)
 		return -ENOMEM;
-	inits[cnt] = (struct bpf_stack_init) { .subprog = subprog, .off = off, .imm = imm };
+	inits[cnt] = *init;
 	env->stack_inits = inits;
 	env->stack_init_cnt = cnt + 1;
 	return 0;
+}
+
+/* Initialize the hidden slot at @off of @subprog to @imm in its prologue. */
+int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm)
+{
+	struct bpf_stack_init init = { .subprog = subprog, .off = off, .imm = imm };
+
+	return stack_slot_init(env, &init);
+}
+
+/*
+ * Initialize the hidden slot at @off of the main program to the word at
+ * @ctx_off in the context, which R1 points at when the program is entered.
+ */
+int bpf_stack_slot_init_ctx(struct bpf_verifier_env *env, s16 off, s32 ctx_off)
+{
+	struct bpf_stack_init init = { .off = off, .imm = ctx_off, .from_ctx = true };
+
+	return stack_slot_init(env, &init);
 }
 
 /*
@@ -982,12 +1000,18 @@ static int bpf_emit_stack_inits(struct bpf_verifier_env *env)
 		j = 0;
 		do {
 			cnt = 0;
-			for (; j < env->stack_init_cnt && cnt < INSN_BUF_SIZE; j++) {
+			for (; j < env->stack_init_cnt && cnt + 2 <= INSN_BUF_SIZE; j++) {
 				const struct bpf_stack_init *init = &env->stack_inits[j];
 
-				if (init->subprog == i)
+				if (init->subprog != i)
+					continue;
+				if (!init->from_ctx) {
 					insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, init->off,
 								     init->imm);
+					continue;
+				}
+				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_1, init->imm);
+				insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX, init->off);
 			}
 			if (!cnt)
 				break;
@@ -2081,6 +2105,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->changes_pkt_data = env->subprog_info[i].changes_pkt_data;
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
+		func[i]->aux->might_throw = env->subprog_info[i].might_throw;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
 		func[i]->aux->async_cb = env->subprog_info[i].is_async_cb;
 		func[i]->aux->token = prog->aux->token;

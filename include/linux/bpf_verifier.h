@@ -333,6 +333,12 @@ struct bpf_reference_state {
 	 * function verified on its own hold, which are not in the state.
 	 */
 	s8 frameno;
+	/*
+	 * The resource class the unwinder releases it as, plus one, see
+	 * frame_desc.c; 0 for a reference the frames keep no handle of, which
+	 * a throw may not be reached with.
+	 */
+	u16 res;
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -1038,6 +1044,15 @@ struct bpf_subprog_info {
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
 	/* the frame descriptor of this subprogram in the pool of the program, plus one; see frame_desc.c */
 	u32 frame_desc;
+	/* hidden slots: the counts of the sections the frame is in, by kind, see frame_desc.c */
+	s16 section_off[2];
+	/* hidden slots: the handles a call takes, saved in front of it, and the one it releases */
+	s16 res_arg_off[2];
+	s16 res_rel_off[2];
+	/* hidden slots: R1-R5 across bpf_unwind_forget() in front of a call that runs a callback */
+	s16 res_save_off[MAX_BPF_FUNC_REG_ARGS];
+	/* a frame of the subprogram may return while it holds something: handed to its caller */
+	bool hands_over;
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1225,10 +1240,65 @@ void bpf_patch_image_install(struct bpf_prog *prog, const struct bpf_patch_image
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
-/* Initialization of a hidden stack slot, emitted in the subprogram's prologue. */
+/*
+ * The hidden stack slots a subprog keeps the handles of one resource class
+ * in, see frame_desc.c: as many as a frame of it holds of the class at once.
+ */
+struct bpf_res_pool {
+	u16 subprog;
+	u16 res;
+	u16 size;
+	s16 off;	/* of the first slot; the others follow below it */
+};
+
+/* What a call does to the resources of its frame, see frame_desc.c. */
+enum bpf_res_point_kind {
+	BPF_RES_INSERT,		/* acquires a resource of class res */
+	BPF_RES_REMOVE,		/* releases one */
+};
+
+#define BPF_RES_F_ARG		BIT(0)	/* the handle is in an argument register, not in R0 */
+#define BPF_RES_F_MAY_FAIL	BIT(1)	/* acquired only when the call returns 0 */
+#define BPF_RES_F_DEREF		BIT(2)	/* the handle is the first word of what the register points at */
+#define BPF_RES_F_FOREIGN	BIT(3)	/* some visit releases what another frame holds */
+
+struct bpf_res_point {
+	u32 insn;	/* orig insn */
+	u16 subprog;
+	u16 res;
+	u8 kind;	/* enum bpf_res_point_kind */
+	u8 reg;
+	u8 flags;	/* BPF_RES_F_* */
+	s16 adj;	/* the register points that many bytes into the object: the node of a list */
+};
+
+/*
+ * A reference the kernel holds for a __ref argument of a struct_ops program:
+ * the main program holds it from its entry, its handle loaded from the
+ * context, see frame_desc.c.
+ */
+struct bpf_res_ctx_arg {
+	u16 res;
+	u16 argno;
+	u32 ctx_off;
+};
+
+/* A call that enters or leaves a section, for the count of its frame, see frame_desc.c. */
+struct bpf_section_insn {
+	u32 insn;	/* orig insn */
+	u16 subprog;
+	u8 kind;	/* 0 RCU, 1 preemption */
+	s8 delta;
+};
+
+/*
+ * Initialization of a hidden stack slot, emitted in the subprogram's prologue:
+ * to imm, or, in the main program, to the word at imm in the context.
+ */
 struct bpf_stack_init {
 	u32 subprog;
 	s16 off;
+	bool from_ctx;
 	s32 imm;
 };
 
@@ -1259,6 +1329,24 @@ struct bpf_verifier_env {
 	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	struct bpf_stack_init *stack_inits; /* hidden slot initializations, see bpf_stack_slot_init() */
 	u32 stack_init_cnt;
+	struct bpf_resource *resources;	/* resource classes of frame descriptors */
+	u32 resource_cnt;
+	struct bpf_res_pool *res_pools;		/* see frame_desc.c */
+	u32 res_pool_cnt;
+	struct bpf_res_point *res_points;
+	u32 res_point_cnt;
+	struct bpf_section_insn *section_insns;
+	struct bpf_res_ctx_arg *res_ctx_args;
+	u32 res_ctx_arg_cnt;
+	u32 section_insn_cnt;
+	u8 section_kinds;			/* BIT(kind): the sections some subprog enters or leaves */
+	bool foreign_release;			/* some frame releases what another frame holds */
+	u32 frame_desc_slots;			/* hidden slots that hold handles and counts */
+	u32 frame_desc_insns;			/* instructions keeping them up to date */
+	u32 frame_desc_bytes;			/* descriptors and resource classes */
+	u32 frame_desc_orig_len;		/* the insns the main pass named, see frame_desc.c */
+	u32 *frame_desc_new_of;			/* their indices when the slots are emitted */
+	bool describe_frames;			/* frame descriptors are generated: the program may throw */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
@@ -1930,6 +2018,7 @@ u32 btf_func_arg_align(const struct btf *btf, const struct btf_type *t);
 
 int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
+bool bpf_nmi_unsafe_prog(struct bpf_verifier_env *env);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
 int bpf_check_cfg(struct bpf_verifier_env *env);
@@ -2204,6 +2293,21 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
 int bpf_reserve_stack_slots(struct bpf_verifier_env *env, int subprog, int nr, s16 *off);
 int bpf_stack_slot_init(struct bpf_verifier_env *env, int subprog, s16 off, s32 imm);
+int bpf_stack_slot_init_ctx(struct bpf_verifier_env *env, s16 off, s32 ctx_off);
+
+/* Functions in frame_desc.c */
+int bpf_frame_desc_record_acquire(struct bpf_verifier_env *env, int idx, int regno, bool after,
+				  bool may_fail);
+int bpf_frame_desc_record_release(struct bpf_verifier_env *env, int idx);
+int bpf_frame_desc_record_ctx_arg(struct bpf_verifier_env *env, int idx, int argno);
+int bpf_frame_desc_record_section(struct bpf_verifier_env *env, u8 kind, s8 delta);
+int bpf_frame_desc_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
+void bpf_frame_desc_record_exit(struct bpf_verifier_env *env);
+int bpf_frame_desc_resolve(struct bpf_verifier_env *env);
+int bpf_frame_desc_emit(struct bpf_verifier_env *env);
+int bpf_frame_desc_build(struct bpf_verifier_env *env);
+void bpf_frame_desc_reset(struct bpf_verifier_env *env);
+void bpf_frame_desc_env_free(struct bpf_verifier_env *env);
 int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env);
 int bpf_optimize_bpf_loop(struct bpf_verifier_env *env);
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env);

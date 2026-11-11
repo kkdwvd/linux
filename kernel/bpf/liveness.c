@@ -1814,6 +1814,22 @@ static int record_call_access(struct bpf_verifier_env *env,
 	struct bpf_call_summary cs;
 	int r, err, callee, arg_slot_cnt = 5;
 
+	/*
+	 * bpf_throw() never returns: the unwinder destroys the iterators and
+	 * restores the IRQ flags on the stack of any frame at the call, so no
+	 * slot is dead there. A state then stands for another only when the
+	 * stack objects of both are in the same slots, and a write that is
+	 * harmless on the path of the one is on the path of the other.
+	 */
+	if (bpf_is_throw_kfunc(insn)) {
+		for (r = 0; r <= instance->depth; r++) {
+			err = mark_stack_read_all(env, instance, r, insn_idx);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+
 	if (bpf_pseudo_call(insn)) {
 		/*
 		 * analyze_subprog() handles static callees. For global callees,
