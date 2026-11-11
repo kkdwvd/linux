@@ -7,6 +7,14 @@
 #define _LINUX_BPF_THROW_H
 
 /*
+ * How control reached bpf_throw_unwind(). The architecture entries are
+ * written in assembly and pass the kind as an immediate, so these are
+ * macros rather than an enum.
+ */
+#define BPF_THROW_CALL		0	/* a call to bpf_throw() */
+#define BPF_THROW_RETHROW	1	/* the return of a helper whose callback threw */
+
+/*
  * The callee-saved registers of the architecture that no BPF register maps
  * to, which the unwinder restores along with R6..R9 when it discards frames:
  * r12 on x86-64, which holds the arena base, and x23..x28 on arm64, of which
@@ -60,10 +68,26 @@ static_assert(sizeof(struct bpf_throw_regs) == BPF_THROW_REGS_SIZE);
 #define __bpf_unwind_entry	__noscs
 #endif
 
-void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie);
-/* The native entry of bpf_throw(), on an architecture that has one. */
+void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind);
+/*
+ * The native entry of bpf_throw(), on an architecture that has one, and the
+ * entry a helper whose callback threw returns to, to go on unwinding from the
+ * call of the helper.
+ */
 void bpf_throw_entry(void);
+void bpf_rethrow_entry(void);
 void *bpf_arch_throw_entry(void);
+void *bpf_arch_rethrow_entry(void);
+/*
+ * Where a kernel frame the stack walker passed keeps its return address, given
+ * the frame pointer the walker reported for it and the stack pointer it
+ * reported for the frame above; the return address such a slot holds, as the
+ * walker reports it, less what the architecture adds to it in the slot; and
+ * the way to make the JITed frame whose frame pointer is @bp return to @to.
+ */
+u64 *bpf_arch_ret_slot(u64 bp, u64 next_sp);
+u64 bpf_arch_ret_addr(const u64 *slot);
+void bpf_arch_set_ret_addr(u64 bp, u64 to);
 #endif /* __ASSEMBLER__ */
 
 #endif /* _LINUX_BPF_THROW_H */

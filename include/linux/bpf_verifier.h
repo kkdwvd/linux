@@ -1053,6 +1053,7 @@ struct bpf_subprog_info {
 	s16 res_save_off[MAX_BPF_FUNC_REG_ARGS];
 	/* a frame of the subprogram may return while it holds something: handed to its caller */
 	bool hands_over;
+	s16 throw_cookie_off;	/* hidden slot for the cookie of a throw in a callback, or 0 */
 	u16 stack_depth; /* max. stack depth used by this function */
 	/* bytes below the verified stack depth reserved for hidden slots, see bpf_reserve_stack_slots() */
 	u16 stack_extra;
@@ -1347,7 +1348,9 @@ struct bpf_verifier_env {
 	u32 frame_desc_orig_len;		/* the insns the main pass named, see frame_desc.c */
 	u32 *frame_desc_new_of;			/* their indices when the slots are emitted */
 	bool describe_frames;			/* frame descriptors are generated: the program may throw */
+	bool throw_in_callback;			/* some bpf_throw() is reached inside a callback a helper runs */
 	int exception_callback_subprog;
+	int unwind_ret_subprog;		/* returns the cookie from the frame of a callback that threw */
 	bool explore_alu_limits;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
