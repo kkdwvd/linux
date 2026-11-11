@@ -1057,6 +1057,18 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	/* Stack must be multiples of 16B */
 	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
 
+	/*
+	 * Where the exception unwinder finds this frame's BPF stack, also when
+	 * no insn of the program uses the frame pointer, since the unwinder
+	 * keeps the cookie of a throw in a hidden slot nothing else reads:
+	 * the private stack, or below the frame record, the tail call count
+	 * pair and the pairs push_callee_regs() pushed.
+	 */
+	if (ctx->priv_sp_used)
+		prog->aux->priv_frame_off = PRIV_STACK_GUARD_SZ + ctx->stack_size;
+	else
+		prog->aux->frame_fp_off = -16 - 16 * DIV_ROUND_UP(ctx->nr_used_callee_reg, 2);
+
 	if (ctx->fp_used) {
 		if (ctx->priv_sp_used) {
 			/* Set up private stack pointer */
