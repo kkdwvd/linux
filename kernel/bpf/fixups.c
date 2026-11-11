@@ -2047,6 +2047,9 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
 		func[i]->aux->linfo_idx = env->subprog_info[i].linfo_idx;
+		/* The pool is freed with the main prog. */
+		func[i]->aux->frame_desc = env->subprog_info[i].frame_desc;
+		func[i]->aux->frame_desc_pool = env->frame_desc_pool;
 		func[i]->aux->arena = prog->aux->arena;
 		func[i]->aux->arena_stack_size = prog->aux->arena_stack_size;
 		func[i]->aux->arena_stack_entry = env->subprog_info[i].arena_stack_entry;
@@ -2079,6 +2082,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
+		func[i]->aux->async_cb = env->subprog_info[i].is_async_cb;
 		func[i]->aux->token = prog->aux->token;
 		if (!i)
 			func[i]->aux->exception_boundary = env->seen_exception;
