@@ -128,6 +128,7 @@ struct bpf_throw_ctx {
 	struct bpf_prog *prog;	/* the program of the frame the unwinder stops at */
 	u64 sp;
 	u64 bp;
+	u64 fp;			/* its R10 */
 	int cnt;
 	const struct bpf_throw_regs *regs;	/* callee-saved registers of the throw site, or NULL */
 	unsigned int kind;			/* BPF_THROW_*: how the throw site was reached */
@@ -372,6 +373,7 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	ctx->prog = prog;
 	ctx->sp = sp;
 	ctx->bp = bp;
+	ctx->fp = fp;
 	/*
 	 * A program that is not a subprog was entered from the kernel or by a
 	 * tail call and is the frame the unwinder stops at; a tail called
@@ -581,6 +583,7 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	struct bpf_throw_ctx ctx = { .regs = regs, .kind = kind };
 	struct bpf_prog_aux *aux, *main_aux;
 	u64 (*cb)(u64, u64, u64, u64, u64);
+	const struct bpf_prog_aux *fn;
 
 	/*
 	 * The kfunc passes NULL, and the verifier retargets its call to
@@ -609,6 +612,19 @@ void bpf_throw_unwind(struct bpf_throw_regs *regs, u64 cookie, unsigned int kind
 	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
 	aux = ctx.prog->aux;
 	main_aux = aux->main_prog_aux;
+	/*
+	 * The frame the unwinder stops at took a stack in arena when the kernel
+	 * entered it, if the program uses r12, and never reaches the exit that
+	 * returns it, see bpf_insert_arena_stack(): return it from the slot the
+	 * frame keeps it in, now that nothing the frames held is left. A
+	 * callback a helper ran gives its stack back before it leaves into the
+	 * pad, and the frame the unwinding goes on from returns its own; the
+	 * main program's goes back before the exception callback runs in its
+	 * place, which takes one of its own when it uses r12.
+	 */
+	fn = bpf_unwind_fn(ctx.prog);
+	if (fn->arena_stack_slot)
+		bpf_arena_stack_release(main_aux, *(u64 *)(long)(ctx.fp + fn->arena_stack_slot));
 	/*
 	 * The unwinding went on from the call of a helper whose callback threw:
 	 * the cookie of the throw is in the frame that called the helper.

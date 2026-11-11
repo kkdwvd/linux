@@ -1183,6 +1183,23 @@ void bpf_arena_stack_put(struct bpf_prog_aux *aux, u32 base)
 }
 
 /*
+ * Called by the unwinder for the frame it stops at, the main program or a
+ * callback, which took a stack and does not reach the exit that returns it.
+ * @base is r12 as the stack was taken: the stack of the cpu when
+ * BPF_ARENA_STACK_SLOW is clear, which the frame holds until busy is 0 again,
+ * one of the others otherwise.
+ */
+void bpf_arena_stack_release(struct bpf_prog_aux *aux, u32 base)
+{
+	struct arena_stacks *stacks = this_cpu_ptr(aux->arena->stacks);
+
+	if (base & BPF_ARENA_STACK_SLOW)
+		bpf_arena_stack_put(aux, base);
+	else
+		WRITE_ONCE(stacks->cpu.busy, 0);
+}
+
+/*
  * Reserve an arena virtual address range without populating it. This call stops
  * bpf_arena_alloc_pages from adding pages to this range.
  */
