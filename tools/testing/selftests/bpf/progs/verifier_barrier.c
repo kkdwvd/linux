@@ -136,7 +136,7 @@ __success SPECULATES __success_unpriv
 __xlated_unpriv("r0 = 1")
 __xlated_unpriv("exit")
 __xlated_unpriv("nospec")
-__xlated_unpriv("r0 = 0")
+__xlated_unpriv("r0 = 2")
 __xlated_unpriv("exit")
 #endif
 __naked void unwind_exit(void)

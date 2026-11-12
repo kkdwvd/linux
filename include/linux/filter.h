@@ -306,8 +306,7 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
 }
 
 /*
- * The caller of the main prog doesn't tell unwind_exit from exit. An extension
- * is different: its caller is the caller of the subprog that it replaced.
+ * The caller of the main prog doesn't tell unwind_exit from exit.
  * An exception callback returns from the frame of the main prog. After freplace
  * or a tail call it returns to a prog that wasn't verified with the callback.
  */
@@ -315,7 +314,7 @@ static inline bool bpf_prog_can_unwind(const struct bpf_prog *prog)
 {
 	if (prog->aux->exception_cb)
 		return false;
-	return bpf_is_subprog(prog) || prog->type == BPF_PROG_TYPE_EXT;
+	return bpf_is_subprog(prog);
 }
 
 static inline bool insn_is_zext(const struct bpf_insn *insn)

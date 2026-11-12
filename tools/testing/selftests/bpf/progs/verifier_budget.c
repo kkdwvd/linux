@@ -121,10 +121,15 @@ __naked void loop_in_main_rcu(void)
 
 /* 0 is not what this prog may return */
 SEC("cgroup/recvmsg4")
-__description("budget: a loop in the main prog that cannot return 0 is left")
+__description("budget: a loop in the main prog that can only return 1 ends it with 1")
 __arch_x86_64
 __arch_arm64
 __success
+__xlated("...")
+__xlated("r0 = 1")
+__xlated("exit")
+__xlated("r0 = 1")
+__xlated("exit")
 __naked void loop_in_main_retval(void)
 {
 	asm volatile (

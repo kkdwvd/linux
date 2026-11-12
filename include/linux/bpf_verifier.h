@@ -610,8 +610,6 @@ struct bpf_verifier_state {
 	);
 	u32 curframe;
 	bool in_sleepable;
-	/* a global function or an extension, and what it calls: exit of frame 0 is not the end */
-	bool callers_unknown;
 	/* The callee left with unwind_exit. Next insn is unwind_goto. */
 	bool unwound;
 	/*
@@ -619,6 +617,7 @@ struct bpf_verifier_state {
 	 * and their packet pointers are not in the state, see bpf_flow_return().
 	 */
 	bool changed_pkt_data;
+	u8 unused;	/* the join_key has no holes */
 	);
 	/* Not zero in a function that is verified on its own, see bpf_flow_call() */
 	u32 instance_id;
@@ -2227,6 +2226,7 @@ static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int 
 	return aux->guard_at_header ? aux->guard_to : -1;
 }
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
+int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
 
 /* The first field that ends behind 'off'. The fields are sorted and do not overlap. */
 static inline u32 btf_record_first_field(const struct btf_record *rec, s64 off)

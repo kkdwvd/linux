@@ -577,7 +577,7 @@ static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 
 	if (!env->bypass_spec_v1)
 		buf[n++] = BPF_ST_NOSPEC();
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env, s));
 	if (bpf_ret_reg_pair(env, s))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	buf[n] = BPF_EXIT_INSN();
