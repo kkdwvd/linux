@@ -97,9 +97,9 @@
  *							   r0 = 0
  *							   exit
  *
- * A state may have the handle in several places, the CANDIDATES. Those that all visits have in
- * common stay, one of them is emitted. The calls of a pad clobber R0-R5: they are places for the
- * first argument of the first call only, see settle_ent().
+ * A state may have the handle in several places, the CANDIDATES. Those that all visits which hold
+ * the entry have in common stay, one of them is emitted. The calls of a pad clobber R0-R5: they are
+ * places for the first argument of the first call only, see settle_ent().
  *
  * A pointer that a helper or a kfunc returned and that has to be released is its own handle. A copy
  * of it, a pointer to a node in the object, a socket that a helper has cast are places of one
@@ -119,7 +119,26 @@
  *							   r0 = 0
  *							   exit
  *
- * Only the program counter tells a pad what is held: every visit has to hold every entry.
+ * WHETHER an entry is held when the pad runs, see settle_ent():
+ *   - All visits hold it: the program counter tells.
+ *   - A candidate is 0 on all visits that don't: the pad tests it. That is how the program itself
+ *     tells, a pointer that is NULL as long as there is nothing to release.
+ *   - Otherwise there is a conflict.
+ * A pointer that the program has not compared with NULL yet when it gets to the site is tested too.
+ *
+ *	t = NULL;					   r6 = 0
+ *	if (pid)					   if r1 == 0 goto 1f
+ *		t = bpf_task_from_pid(pid);		   call bpf_task_from_pid
+ *	v = wait();					   r6 = r0
+ *	if (t)						1: call wait
+ *		bpf_task_release(t);			   unwind_goto pad
+ *							   ...
+ *						      pad: r1 = r6
+ *							   if r1 == 0 goto 2f
+ *							   call bpf_task_release
+ *							2: r0 = 0
+ *							   exit
+ *
  * A pad has one order, see enum pad_turn, among equals that of refs[], the youngest first. Locks
  * and irq flags have to be released that way, and a dynptr ahead of the pointer that it was made
  * from. States that acquired them in different orders can be a conflict.
@@ -395,6 +414,8 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 	if (!plan)
 		return NULL;
 	plan->kind = kind;
+	plan->nulls.regs = U16_MAX;
+	bitmap_fill(plan->nulls.slots, MAX_BPF_STACK_SLOTS);
 	plan->next = aux->pad_plans;
 	aux->pad_plans = plan;
 	return plan;
@@ -557,7 +578,8 @@ static void add_ref_cand(struct bpf_pad_place *cand, int *nr, const struct bpf_r
 	    reg->btf_id == btf_sock_ids[BTF_SOCK_TYPE_MPTCP])
 		return;
 #endif
-	cand[(*nr)++] = (struct bpf_pad_place){ .loc = loc, .at = at, .delta = delta };
+	cand[(*nr)++] = (struct bpf_pad_place){ .loc = loc, .at = at, .delta = delta,
+						.maybe_null = type_may_be_null(reg->type) };
 }
 
 /*
@@ -593,7 +615,9 @@ static void add_cand(struct bpf_pad_place *cand, int *nr, const struct bpf_reg_s
  * in the stack of a caller @obj is its address.
  * A register or a stack slot that is not live there is no place: the passes that follow use
  * such a register, remove the store to such a slot, and states that differ in it are the same to
- * the main pass. Nor is a slot of the spills around bpf_fastcall calls: they are removed unless the
+ * the main pass. Nor is a register of which only the lower half is live: the pad reads 64 bits, and
+ * 'w6 = 0' is zero extended only if an insn of the program reads the upper half, see zext_dst.
+ * Nor is a slot of the spills around bpf_fastcall calls: they are removed unless the
  * main pass sees another access to the slot, and it does not see the pad.
  */
 static int find_cands(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
@@ -607,7 +631,7 @@ static int find_cands(struct bpf_verifier_env *env, const struct bpf_verifier_st
 	int i, off, nr = 0;
 
 	for (i = BPF_REG_6; i < BPF_REG_FP; i++)
-		if (aux->live_regs_before & BIT(i))
+		if (aux->live_hi32_before & BIT(i))
 			add_cand(cand, &nr, &frame->regs[i], ref, obj, BPF_PLACE_REG, i);
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
@@ -617,7 +641,7 @@ static int find_cands(struct bpf_verifier_env *env, const struct bpf_verifier_st
 			add_cand(cand, &nr, &slot->spilled_ptr, ref, obj, BPF_PLACE_SPILL, off);
 	}
 	for (i = BPF_REG_0; i < BPF_REG_6; i++)
-		if (aux->live_regs_before & BIT(i))
+		if (aux->live_hi32_before & BIT(i))
 			add_cand(cand, &nr, &frame->regs[i], ref, obj, BPF_PLACE_REG, i);
 	return nr;
 }
@@ -737,6 +761,39 @@ static int find_obj_cands(struct bpf_verifier_env *env, const struct bpf_verifie
 	return nr;
 }
 
+static bool reg_is_null(const struct bpf_reg_state *reg)
+{
+	return reg->type == SCALAR_VALUE && tnum_equals_const(reg->var_off, 0);
+}
+
+static void find_nulls(const struct bpf_func_state *frame, struct bpf_pad_nulls *nulls)
+{
+	const struct bpf_stack_state *slot;
+	int i, j;
+
+	memset(nulls, 0, sizeof(*nulls));
+	for (i = BPF_REG_0; i < BPF_REG_FP; i++)
+		if (reg_is_null(&frame->regs[i]))
+			nulls->regs |= BIT(i);
+	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
+		slot = bpf_stack_slot(frame, i);
+		for (j = 0; j < BPF_REG_SIZE && slot->slot_type[j] == STACK_ZERO; j++)
+			;
+		if (j == BPF_REG_SIZE ||
+		    (bpf_spill_size(slot) == BPF_REG_SIZE && reg_is_null(&slot->spilled_ptr)))
+			__set_bit(i, nulls->slots);
+	}
+}
+
+/* An address in the stack and the address of a map value are never 0 */
+static bool place_is_null(const struct bpf_pad_nulls *nulls, const struct bpf_pad_place *place)
+{
+	if (place->loc == BPF_PLACE_REG)
+		return nulls->regs & BIT(place->at);
+	return place->loc == BPF_PLACE_SPILL &&
+	       test_bit(-place->at / BPF_REG_SIZE - 1, nulls->slots);
+}
+
 /*
  * The candidates for argument @arg of the release that @ent and @new have in common go to @cand.
  * Returns how many there are.
@@ -752,7 +809,8 @@ static int common_cands(const struct bpf_pad_ent *ent, const struct bpf_pad_ent 
 			if (old[i].loc != place[j].loc || old[i].at != place[j].at ||
 			    old[i].delta != place[j].delta)
 				continue;
-			cand[n++] = old[i];
+			cand[n] = old[i];
+			cand[n++].maybe_null |= place[j].maybe_null;
 			break;
 		}
 	}
@@ -843,8 +901,6 @@ static int ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 
 	if (!reg)
 		return BPF_CONFLICT_NO_PLACE;
-	if (type_may_be_null(reg->type))
-		return BPF_CONFLICT_NOT_ALWAYS_HELD;
 	if (ref_release(env, ref, reg, false, &ent->release))
 		return BPF_CONFLICT_NO_RELEASE;
 	ent->nr_cands[0] = find_cands(env, st, insn_idx, ref, NULL, ent->cand[0]);
@@ -949,15 +1005,120 @@ static struct bpf_pad_ent *match_ent(const struct bpf_pad_plan *plan, const stru
 	return NULL;
 }
 
-/* @new is one more entry of @plan. Returns it, or NULL if there is no memory. */
-static struct bpf_pad_ent *add_ent(struct bpf_pad_plan *plan, const struct bpf_pad_ent *new)
+/*
+ * @new is one more entry of @plan, number @pos. None of the visits so far held it.
+ * Returns it, or NULL if there is no memory.
+ */
+static struct bpf_pad_ent *add_ent(struct bpf_pad_plan *plan, const struct bpf_pad_ent *new,
+				   int pos)
 {
+	struct bpf_pad_ent *ent;
+	int i;
+
 	if (!plan->ents)
 		plan->ents = kzalloc_objs(*plan->ents, BPF_PAD_MAX_ENTS, BPF_VERIFIER_GFP);
 	if (!plan->ents)
 		return NULL;
-	plan->ents[plan->nr_ents] = *new;
-	return &plan->ents[plan->nr_ents++];
+	ent = &plan->ents[pos];
+	memmove(ent + 1, ent, (plan->nr_ents++ - pos) * sizeof(*ent));
+	*ent = *new;
+	ent->always = !plan->visited;
+	/* the address of an object in the stack does not tell whether the object is set up */
+	if (ent->class == BPF_PAD_IRQ || ent->class >= BPF_PAD_ITER)
+		return ent;
+	for (i = 0; i < ent->nr_cands[0]; i++)
+		ent->cand[0][i].null = place_is_null(&plan->nulls, &ent->cand[0][i]);
+	return ent;
+}
+
+/*
+ * A visit holds the entries @a and @b of @plan, and @a has to stand before @b: the pad releases
+ * @b first. Returns false if another visit wants them the other way round, in one step or in
+ * several: no order suits both.
+ */
+static bool put_before(struct bpf_pad_plan *plan, int a, int b)
+{
+	int i;
+
+	if (plan->before[b] & BIT(a))
+		return false;
+	for (i = 0; i < plan->nr_ents; i++)
+		if (i == a || (plan->before[i] & BIT(a)))
+			plan->before[i] |= BIT(b) | plan->before[b];
+	return true;
+}
+
+/* The calls of a pad clobber it */
+static bool place_is_caller_saved(const struct bpf_pad_place *place)
+{
+	return place->loc == BPF_PLACE_REG && place->at < BPF_REG_6;
+}
+
+/*
+ * The pad finds the handle of @ent in a register that its calls clobber: the candidate that
+ * settle_ent() takes, when all visits are over
+ */
+static bool ent_is_clobbered(const struct bpf_pad_ent *ent)
+{
+	int i;
+
+	for (i = 0; i < ent->nr_cands[0] && !ent->always && !ent->cand[0][i].null; i++)
+		;
+	return i < ent->nr_cands[0] && place_is_caller_saved(&ent->cand[0][i]);
+}
+
+/*
+ * Does @a stand before @b where no visit says? The pad releases what stands last first, and that
+ * has to be the entry whose handle its calls clobber, see released_first(). Else the one that got
+ * to the frame at the lower insn stands first.
+ */
+static bool ent_stands_before(const struct bpf_pad_ent *a, const struct bpf_pad_ent *b)
+{
+	bool a_clobbered = ent_is_clobbered(a), b_clobbered = ent_is_clobbered(b);
+
+	return a_clobbered != b_clobbered ? b_clobbered : a->origin < b->origin;
+}
+
+/*
+ * All visits of @plan are over: put its entries in an order that suits each of them, see
+ * visit_refs(). There is one, since put_before() refused what would close a cycle. Of the entries
+ * that nothing stands before any more the next one is chosen by what the entries are, see
+ * ent_stands_before(), so that the order of what no visit held together does not depend on the
+ * visits either.
+ */
+static int order_ents(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
+{
+	int i, j, k, n = plan->nr_ents, next;
+	u8 row, bit;
+
+	if (plan->ordered)
+		return 0;
+	plan->ordered = true;
+	for (k = 0; k < n; k++) {
+		next = -1;
+		for (i = k; i < n; i++) {
+			for (j = k; j < n; j++)
+				if (plan->before[j] & BIT(i))
+					break;
+			if (j == n && (next < 0 ||
+				       ent_stands_before(&plan->ents[i], &plan->ents[next])))
+				next = i;
+		}
+		/* put_before() keeps a cycle out. A plan that is half in order is no plan. */
+		if (verifier_bug_if(next < 0, env, "the entries of a landing pad have no order"))
+			return -EFAULT;
+		if (next == k)
+			continue;
+		/* the entries and what is noted about them trade places */
+		swap(plan->ents[k], plan->ents[next]);
+		swap(plan->before[k], plan->before[next]);
+		for (i = 0; i < n; i++) {
+			row = plan->before[i];
+			bit = (!!(row & BIT(k)) << next) | (!!(row & BIT(next)) << k);
+			plan->before[i] = (row & ~(BIT(k) | BIT(next))) | bit;
+		}
+	}
+	return 0;
 }
 
 /* refs[@child] of @st was made from the pointer refs[@parent], see invalidate_reference() */
@@ -974,17 +1135,24 @@ static bool ref_is_child(const struct bpf_verifier_state *st, int child, int par
  * does not matter which insn acquired what is there: an iterator that is destroyed and made again
  * is one entry, two nodes that one insn in a loop took off a list are two. Where that leaves a
  * choice the origin decides.
- * Every visit has to hold every entry.
- * Locks and irq flags have to be in refs[] in the order of the plan, and so do a pointer and what
- * was made from it.
+ * An entry need not be held on all visits. What it takes to find out how the pad can tell is noted
+ * here, see settle_ent().
+ * The pad releases locks and irq flags in the reverse of the order in which a state took them,
+ * and what was made from a pointer before the pointer. Only a state that holds two entries says
+ * something about their order, and it must not matter which of the states gets here first: the
+ * state that holds both has to find them in its own order, not in the order of the visits. So a
+ * visit notes the order of the entries that it holds, pair by pair, see put_before(), and
+ * order_ents() puts them in an order that suits all visits when they are over. There is none if
+ * two states took two locks in two orders: that is the conflict.
  * Returns the reason of a conflict.
  */
 static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 		      const struct bpf_verifier_state *st, int insn_idx)
 {
 	const struct bpf_reference_state *ref;
-	struct bpf_pad_ent new, *ent;
-	int i, j, arg, pass, pos, err;
+	struct bpf_pad_ent new, *ent, *prev;
+	struct bpf_pad_nulls nulls;
+	int i, j, arg, pass, err;
 
 	/* the pad of a call runs after the call: what is live at the next insn is there */
 	insn_idx += plan->kind == BPF_SITE_CALL;
@@ -1004,34 +1172,46 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			ent = match_ent(plan, &new, !pass);
 			if (!ent && !pass)
 				continue;
-			if (!ent && plan->visited)
-				return BPF_CONFLICT_NOT_ALWAYS_HELD;
 			if (!ent && plan->nr_ents == BPF_PAD_MAX_ENTS)
 				return BPF_CONFLICT_TOO_MUCH;
-			ent = ent ?: add_ent(plan, &new);
+			/* the place of an entry is its number until order_ents() */
+			if (!ent)
+				ent = add_ent(plan, &new, plan->nr_ents);
 			if (!ent)
 				return -ENOMEM;
 			ent->ref = i;
+			/* whichever state comes first: the insn that brings it to the frame first */
+			ent->origin = min(ent->origin, new.origin);
 			for (arg = 0; arg < BPF_PAD_MAX_ARGS; arg++)
 				ent->nr_cands[arg] = common_cands(ent, &new, arg, ent->cand[arg]);
 		}
 	}
-	for (i = st->frame[st->curframe]->entry_refs, pos = 0; i < st->acquired_refs; i++) {
+	prev = NULL;
+	for (i = st->frame[st->curframe]->entry_refs; i < st->acquired_refs; i++) {
 		ent = held_ent(plan, i);
 		if (!ent || ent->class >= BPF_PAD_REF)
 			continue;
-		if (ent - plan->ents < pos)
+		if (prev && !put_before(plan, prev - plan->ents, ent - plan->ents))
 			return BPF_CONFLICT_ORDER_DIFFERS;
-		pos = ent - plan->ents;
+		prev = ent;
 	}
 	for (i = 0; i < plan->nr_ents; i++)
-		for (j = 0; j < i; j++)
+		for (j = 0; j < plan->nr_ents; j++)
 			if (plan->ents[i].ref >= 0 && plan->ents[j].ref >= 0 &&
-			    ref_is_child(st, plan->ents[j].ref, plan->ents[i].ref))
+			    ref_is_child(st, plan->ents[j].ref, plan->ents[i].ref) &&
+			    !put_before(plan, i, j))
 				return BPF_CONFLICT_ORDER_DIFFERS;
-	for (i = 0; i < plan->nr_ents; i++)
-		if (plan->ents[i].ref < 0)
-			return BPF_CONFLICT_NOT_ALWAYS_HELD;
+	find_nulls(st->frame[st->curframe], &nulls);
+	for (i = 0; i < plan->nr_ents; i++) {
+		ent = &plan->ents[i];
+		if (ent->ref >= 0)
+			continue;
+		ent->always = false;
+		for (j = 0; j < ent->nr_cands[0]; j++)
+			ent->cand[0][j].null &= place_is_null(&nulls, &ent->cand[0][j]);
+	}
+	plan->nulls.regs &= nulls.regs;
+	bitmap_and(plan->nulls.slots, plan->nulls.slots, nulls.slots, MAX_BPF_STACK_SLOTS);
 	return 0;
 }
 
@@ -1073,11 +1253,20 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	return plan;
 }
 
+/* The pad finds out by itself whether it has to release @ent: what is at the place may be 0 */
+static bool ent_is_tested(const struct bpf_pad_ent *ent)
+{
+	return !ent->always || ent->cand[0][0].maybe_null;
+}
+
 /*
- * R@reg = the handle that is at @place. Returns the number of insns.
+ * R@reg = the handle that is at @place. @test: if there is 0 the entry is not held, the second insn
+ * is a jump, and release_ents() knows where to. It comes first: 0 minus the delta is not 0.
+ * Returns the number of insns.
  */
 static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
-		       struct bpf_insn_aux_data *aux, int reg, const struct bpf_pad_place *place)
+		       struct bpf_insn_aux_data *aux, int reg, const struct bpf_pad_place *place,
+		       bool test)
 {
 	const struct bpf_map *map;
 	u64 addr = 0;
@@ -1105,6 +1294,8 @@ static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
 		buf[n++] = BPF_MOV64_IMM(reg, place->delta);
 		return n;
 	}
+	if (test)
+		buf[n++] = BPF_JMP_IMM(BPF_JEQ, reg, 0, 0);
 	if (place->delta)
 		buf[n++] = BPF_ALU64_IMM(BPF_ADD, reg, -place->delta);
 	return n;
@@ -1134,18 +1325,22 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 			enum pad_turn turn, struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
 	const struct bpf_pad_ent *ent;
-	int i, arg, n = 0;
+	int i, arg, first, n = 0;
 
 	for (i = plan->nr_ents - 1; i >= 0; i--) {
 		ent = &plan->ents[i];
 		if (release_turn(ent) != turn)
 			continue;
+		first = n;
 		for (arg = 0; arg < BPF_PAD_MAX_ARGS && ent->nr_cands[arg]; arg++)
-			n += load_handle(env, &buf[n], &aux[n], BPF_REG_1 + arg, &ent->cand[arg][0]);
+			n += load_handle(env, &buf[n], &aux[n], BPF_REG_1 + arg, &ent->cand[arg][0],
+					 !arg && ent_is_tested(ent));
 		if (is_obj_drop(&ent->release))
 			aux[n].kptr_struct_meta = btf_find_struct_meta(env->prog->aux->btf,
 								       ent->obj_type);
 		buf[n++] = ent->release;
+		if (ent_is_tested(ent))
+			buf[first + 1].off = n - first - 2;
 	}
 	return n;
 }
@@ -1189,21 +1384,21 @@ static bool released_first(const struct bpf_pad_plan *plan, const struct bpf_pad
 	       (!plan->sections[BPF_PAD_RCU] && !plan->sections[BPF_PAD_PREEMPT]);
 }
 
-/* The calls of a pad clobber it */
-static bool place_is_caller_saved(const struct bpf_pad_place *place)
-{
-	return place->loc == BPF_PLACE_REG && place->at < BPF_REG_6;
-}
-
 /*
- * The first candidate of @ent is emitted. Can the pad of @plan use it?
- * Returns the reason of a conflict.
+ * How does the pad of @plan tell whether @ent is held? See the comment at the top. The candidate
+ * that is emitted goes first. Returns the reason of a conflict.
  */
 static int settle_ent(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 		      struct bpf_pad_ent *ent)
 {
 	struct bpf_pad_place *cand = ent->cand[0];
+	int i;
 
+	for (i = 0; i < ent->nr_cands[0] && !ent->always && !cand[i].null; i++)
+		;
+	if (i == ent->nr_cands[0])
+		return BPF_CONFLICT_NOT_ALWAYS_HELD;
+	swap(cand[0], cand[i]);
 	if (place_is_caller_saved(&cand[0]) && !released_first(plan, ent))
 		return BPF_CONFLICT_CALLER_SAVED;
 	/* R1 is loaded first */
@@ -1242,7 +1437,10 @@ bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan)
 	return true;
 }
 
-/* 'spin_lock@5(r6-8)': what insn 5 brought to the frame, the arguments of its release */
+/*
+ * 'spin_lock@5(r6-8)': what insn 5 brought to the frame, the arguments of its release.
+ * 'if not 0': the pad tests the first one.
+ */
 static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *ent)
 {
 	static const char * const class[] = {
@@ -1274,7 +1472,7 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 		if (place->delta && place->loc != BPF_PLACE_IMM)
 			verbose(env, "%+d", -place->delta);
 	}
-	verbose(env, ") ");
+	verbose(env, ")%s ", ent_is_tested(ent) ? " if not 0" : "");
 }
 
 /* The plan of the site at insn @i, or why there is none */
@@ -1324,6 +1522,14 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	struct bpf_pad_plan *plan;
 	int i, err;
 
+	/* the entries take the places that suit all visits, see visit_refs() */
+	for (i = 0; i < env->prog->len; i++) {
+		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
+			err = order_ents(env, plan);
+			if (err)
+				return err;
+		}
+	}
 	for (i = 0; i < env->prog->len; i++) {
 		if (env->insn_aux_data[i].pad_plans && bpf_must_abort())
 			return -EINTR;

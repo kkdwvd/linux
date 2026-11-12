@@ -491,12 +491,12 @@ enum bpf_pad_conflict {
 
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
- * per argument of a release two to load it, the calls, three to leave.
+ * per argument of a release two to load it, per entry a test, the calls, three to leave.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
-#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 1) + \
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
 #define BPF_PAD_MAX_CANDS	6
 
@@ -511,8 +511,16 @@ enum bpf_place_loc {
 /* A PLACE: where a landing pad finds a handle when the frame is left at the site */
 struct bpf_pad_place {
 	u8 loc;			/* enum bpf_place_loc */
+	bool maybe_null:1;	/* on a visit that holds the entry the pointer is not checked yet */
+	bool null:1;		/* it is 0 on all visits that don't hold the entry */
 	s16 at;			/* number of the register | offset from R10 | index in used_maps */
 	s32 delta;		/* what is there is that much more than the handle */
+};
+
+/* The registers and the stack slots of a frame that are 0 */
+struct bpf_pad_nulls {
+	u16 regs;
+	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
 };
 
 /* An ENTRY of a plan: one resource with a handle that the frame is responsible for */
@@ -523,9 +531,10 @@ struct bpf_pad_ent {
 	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
 	u8 class;		/* enum bpf_pad_class */
 	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
+	bool always;		/* all visits hold it: the program counter tells */
 	/*
 	 * The CANDIDATES, per argument of the release: the places that have the handle on all
-	 * visits. The first one is emitted.
+	 * visits that hold the entry. The first one is emitted.
 	 */
 	u8 nr_cands[BPF_PAD_MAX_ARGS];
 	struct bpf_pad_place cand[BPF_PAD_MAX_ARGS][BPF_PAD_MAX_CANDS];
@@ -543,7 +552,14 @@ struct bpf_pad_plan {
 	bool visited;
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 nr_ents;
+	bool ordered;			/* see order_ents() */
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
+	/*
+	 * Entry i has to stand before these entries: a visit held both, and has to release them
+	 * the other way round. Bits by entry. What they have to stand before is in there too.
+	 */
+	u8 before[BPF_PAD_MAX_ENTS];
+	struct bpf_pad_nulls nulls;	/* on all visits so far */
 	/*
 	 * BPF_SITE_CALL: the subprogs that were left with unwind_exit and came back to the call,
 	 * in ascending order: a call can have more than one.
@@ -1164,6 +1180,8 @@ struct bpf_insn_aux_data {
 	u8 iv_operand;		/* the operand of the jump that tests the iv, + 1 */
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	/* those of them whose upper half is alive */
+	u16 live_hi32_before;
 	/*
 	 * Registers that it reads and writes. The arguments of a static function and of callx
 	 * are not in @use_regs. The bits above r10 are not valid.
