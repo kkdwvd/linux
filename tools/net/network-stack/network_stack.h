@@ -53,6 +53,7 @@ struct ns_thread {
 	__u64 last_work_ns;		/* end of the last scan that found packets */
 	__u64 last_rest_ns;		/* end of the last park */
 	__u64 pass_work;		/* packets and sockets the current pass found */
+	__u64 mark_ns;			/* the last clock reading of the current pass, see scan() */
 	__u32 tx_inline;		/* with --irq --tx: no interrupt came within tx_wait_ns */
 
 	/* Cumulative counters, written by the thread. */

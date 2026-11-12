@@ -183,6 +183,12 @@ static __u64 load(__u64 *p)
  * is kept in the thread's slot and not in a register: a sum that grows with
  * every NAPI would be a new state for each, where the verifier does not widen
  * it, and the loop would never converge.
+ *
+ * The clock is read once at the start of the pass and once after each poll
+ * that ran the driver, and such a poll is charged the time since the reading
+ * before, t->mark_ns. A poll refused because its NAPI was not scheduled costs
+ * no reading: in IRQ mode most are, and a reading orders the pipeline. Its
+ * little time goes to the next poll that ran the driver.
  */
 static __always_inline void scan(struct ns_thread *t, __u64 flags, bool *more)
 {
@@ -205,9 +211,7 @@ static __always_inline void scan(struct ns_thread *t, __u64 flags, bool *more)
 			continue;
 		n = &napis[slot];
 
-		t0 = bpf_ktime_get_ns();
 		ret = bpf_napi_poll(n->id, flags);
-		t1 = bpf_ktime_get_ns();
 		if (ret < 0) {
 			/* Nothing scheduled, or the thread it moved from is still in it. */
 			if (ret == -EAGAIN || ret == -EBUSY)
@@ -220,6 +224,9 @@ static __always_inline void scan(struct ns_thread *t, __u64 flags, bool *more)
 			continue;
 		}
 
+		t0 = t->mark_ns;
+		t1 = bpf_ktime_get_ns();
+		t->mark_ns = t1;
 		w = ret & BPF_NAPI_POLL_WORK_MASK;
 		n->polls++;
 		/*
@@ -261,7 +268,7 @@ static __always_inline void xmit(struct ns_thread *t, __u32 mode, bool *more)
 
 	if (nr > NS_THREAD_TXQS)
 		nr = NS_THREAD_TXQS;
-	t0 = bpf_ktime_get_ns();
+	t0 = t->mark_ns;
 
 	bpf_for(k, 0, nr) {
 		__u32 q;
@@ -280,8 +287,10 @@ static __always_inline void xmit(struct ns_thread *t, __u32 mode, bool *more)
 			*more = true;
 	}
 	/* The loader counts this time towards the thread's load. */
-	if (t->xmits != xmits)
-		t->xmit_ns += bpf_ktime_get_ns() - t0;
+	if (t->xmits != xmits) {
+		t->mark_ns = bpf_ktime_get_ns();
+		t->xmit_ns += t->mark_ns - t0;
+	}
 }
 
 /*
@@ -380,6 +389,7 @@ static int poller(__u64 arg)
 			if (bpf_kthread_should_stop())
 				return 0;
 
+			t->mark_ns = bpf_ktime_get_ns();
 			flags = hold && !t->armed ? BPF_NAPI_POLL_F_BUSY : 0;
 			t->pass_work = 0;
 			/* Polls of a suspended NAPI are refused. */
@@ -395,14 +405,23 @@ static int poller(__u64 arg)
 					t->tx_inline = 0;
 				xmit(t, tx_mode(t, flags, hold), &more);
 			}
-			now = bpf_ktime_get_ns();
+			now = t->mark_ns;
 			t->scans++;
+			if (t->pass_work) {
+				t->busy_scans++;
+				t->last_work_ns = now;
+			}
 
-			if (t->pass_work || more) {
-				if (t->pass_work) {
-					t->busy_scans++;
-					t->last_work_ns = now;
-				}
+			/*
+			 * In IRQ mode, a pass whose polls all completed left every
+			 * interrupt unmasked, and the thread parks at once: a
+			 * schedule since then left a wake pending, and another
+			 * pass would only find the NAPIs not scheduled. Masked
+			 * mode, xmit work, the softirq window and a due rest go
+			 * round again as before; a rest may consume that wake.
+			 */
+			if (more || (t->pass_work && (hold || tx_enabled || load(&softirq_ns) ||
+						       now - t->last_rest_ns > load(&rest_ns)))) {
 				/* Packets after the interrupts were unmasked: mask again. */
 				if (hold && !t->suspended)
 					t->armed = 0;
@@ -449,11 +468,13 @@ static int poller(__u64 arg)
 					continue;
 				}
 				t->wakes++;
-				now = bpf_ktime_get_ns();
 				if (!t->suspended) {
 					if (hold)
 						t->armed = 0;
-				} else if (now - t->suspend_ns < window) {
+					continue;
+				}
+				now = bpf_ktime_get_ns();
+				if (now - t->suspend_ns < window) {
 					/* Softirq's count ran out quickly: a busy queue. */
 					route(t, false);
 					t->suspended = 0;
