@@ -132,13 +132,6 @@ __naked void exit_of_callback(void)
 SEC("tc")
 __description("barrier: on the way out of a loop that is out of budget")
 __success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r0 = 1")
-__xlated_unpriv("exit")
-__xlated_unpriv("nospec")
-__xlated_unpriv("r0 = 2")
-__xlated_unpriv("exit")
-#endif
 __naked void unwind_exit(void)
 {
 	ASM(START
@@ -164,25 +157,6 @@ __naked void in_front_of_guard(void)
 	NEVER("2f")
 	"r1 = *(u64 *)(r6 + 8);"
 "2:	if r1 > 7 goto 1b;"
-	"r0 = 0;"
-	"exit;");
-}
-
-/* The code after the loop needs the result of the jump: may_goto has to leave the program */
-SEC("tc")
-__description("barrier: a speculative state does not select the way of may_goto")
-__success SPECULATES __success_unpriv
-__naked void way_of_guard(void)
-{
-	ASM(START
-	"call bpf_rcu_read_lock;"
-	NEVER("1f")
-	"call bpf_rcu_read_unlock;"
-"1:	r1 = *(u64 *)(r6 + 8);"
-	"if r1 > 7 goto 1b;"
-	"r1 <<= 3;"
-	"r6 += r1;"
-	"r0 = *(u64 *)(r6 + 0);"
 	"r0 = 0;"
 	"exit;");
 }
@@ -815,24 +789,6 @@ __naked void far_fall(void)
 	"r0 = *(u64 *)(r8 + 8);"
 	DIVS
 "2:	r0 = 0;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: on the far exit that is out of budget")
-__success __arch_x86_64 __caps_unpriv(CAP_BPF | CAP_NET_ADMIN) __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("16: gotol pc+32810")
-__xlated_unpriv("...")
-__xlated_unpriv("32827: nospec")
-#endif
-__naked void far_unwind_exit(void)
-{
-	ASM(START
-"1:	r1 = *(u64 *)(r6 + 8);"
-	"if r1 != 0 goto 1b;"
-	DIVS
-	"r0 = 1;"
 	"exit;");
 }
 

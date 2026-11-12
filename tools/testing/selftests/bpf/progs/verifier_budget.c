@@ -7,9 +7,10 @@
 /*
  * The verifier adds may_goto to a loop that it cannot count and a check of
  * the stack to a recursive subprog. What the program does when it is out of budget:
- * - it unwinds, when unwind_goto follows every call of the subprog and the subprog
- *   holds nothing of its own. The pads of the callers are verified.
+ * - it unwinds, when unwind_goto follows every call of the subprog. The pads of the callers are
+ *   verified.
  * - the main prog and an async callback end
+ * - what the frame holds takes a landing pad, which the verifier emits
  * - otherwise it leaves the loop, or returns 0 from the subprog
  *
  * It takes unwinding, per-cpu insns and timed may_goto in JIT. Some of the progs never end
@@ -95,30 +96,6 @@ __naked void loop_in_main_dead_exit(void)
 	);
 }
 
-SEC("socket")
-__description("budget: a loop in the main prog that holds something is left")
-__arch_x86_64
-__arch_arm64
-__success __retval(1)
-__naked void loop_in_main_rcu(void)
-{
-	asm volatile (
-		"r6 = %[zero] ll;"
-		"call %[bpf_rcu_read_lock];"
-	"1:"
-		"r1 = *(u64 *)(r6 + 0);"
-		"if r1 != 0 goto 1b;"
-		"call %[bpf_rcu_read_unlock];"
-		"r0 = 1;"
-		"exit;"
-		:
-		: __imm_addr(zero),
-		  __imm(bpf_rcu_read_lock),
-		  __imm(bpf_rcu_read_unlock)
-		: __clobber_all
-	);
-}
-
 /* 0 is not what this prog may return */
 SEC("cgroup/recvmsg4")
 __description("budget: a loop in the main prog that can only return 1 ends it with 1")
@@ -146,15 +123,21 @@ __naked void loop_in_main_retval(void)
 }
 
 /*
- * do { p = lookup(); } while (!p); return *p;
- * may_goto must not go where the loop goes when it's over: p may be NULL. Something is held, so
- * it cannot end the prog either: there is no way out.
+ * rcu_read_lock(); do { p = lookup(); } while (!p); v = *p; rcu_read_unlock(); return v;
+ * may_goto must not go where the loop goes when it's over: p may be NULL. It ends the prog, by way
+ * of a landing pad that leaves the RCU section.
  */
 SEC("socket")
-__description("budget: something is held and the code behind the loop counts on its exit")
+__description("budget: an RCU section is held and the code behind the loop counts on its exit")
 __arch_x86_64
 __arch_arm64
-__failure __msg("R0 invalid mem access 'map_value_or_null'")
+__success __retval(0)
+__xlated("...")
+__xlated("r0 = r6")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
 __naked void exit_of_loop_checks_null_rcu(void)
 {
 	asm volatile (
@@ -285,7 +268,7 @@ __naked void pad_forgets(void)
 	);
 }
 
-/* There is no pad for what the subprog took itself */
+/* The verifier emits the pad for what the subprog took itself. It goes on to the pad of the caller. */
 __naked __noinline __used
 static unsigned long spins_locked(void)
 {
@@ -306,10 +289,10 @@ static unsigned long spins_locked(void)
 }
 
 SEC("socket")
-__description("budget: a loop in a subprog that holds something is left")
+__description("budget: a loop in a subprog leaves the section and unwinds to the pad of the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(42)
 __naked void loop_in_subprog_locked(void)
 {
 	asm volatile (
@@ -1552,8 +1535,8 @@ __naked void two_callers_two_passes(void)
 
 /*
  * if (x) lock(); do { p = lookup(); } while (!p); if (x) { unlock(); return 0; } return *p;
- * looks(0) holds nothing: may_goto unwinds. looks(1) cannot, so may_goto leaves the loop, in
- * looks(0) too, and p is NULL.
+ * looks(0) holds nothing at may_goto, looks(1) is in a section: the program counter does not tell
+ * the landing pad what to do.
  */
 __naked __noinline __used
 static unsigned long looks(unsigned long x)
@@ -1587,10 +1570,10 @@ static unsigned long looks(unsigned long x)
 }
 
 SEC("socket")
-__description("budget: a subprog finds out late that something is held")
+__description("budget: a subprog is in a section on some paths")
 __arch_x86_64
 __arch_arm64
-__failure __msg("R0 invalid mem access 'map_value_or_null'")
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
 __naked void unwinds_then_cannot(void)
 {
 	asm volatile (

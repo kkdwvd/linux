@@ -444,6 +444,44 @@ static inline u64 bpf_xreg(u32 frameno, u32 xregno)
  *                                        |  widened |----+
  *                                        +----------+
  */
+/* Landing pads that the verifier emits, see kernel/bpf/pads.c */
+
+/* The kinds of site. An insn has at most one site of a kind. */
+enum bpf_site_kind {
+	BPF_SITE_GUARD,		/* may_goto that the verifier adds before the insn */
+	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
+};
+
+/* The classes of resources that a landing pad can release */
+enum bpf_pad_class {
+	/* Sections. A state has the number of them and nothing else. */
+	BPF_PAD_RCU,		/* bpf_rcu_read_lock() */
+	BPF_PAD_PREEMPT,	/* bpf_preempt_disable() */
+	BPF_PAD_NR_SECTIONS,
+};
+
+/* Why no landing pad serves all states that get to a site */
+enum bpf_pad_conflict {
+	BPF_NO_CONFLICT,
+	BPF_CONFLICT_SECTIONS_DIFFER,
+	BPF_CONFLICT_TOO_MUCH,
+	BPF_CONFLICT_NO_RELEASE,
+};
+
+/* A landing pad has a limit: that many sections of a class, and that many insns. */
+#define BPF_PAD_MAX_SECTIONS	8
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
+/* What the landing pad of a site releases, see bpf_pad_visit() */
+struct bpf_pad_plan {
+	struct bpf_pad_plan *next;	/* of the same insn */
+	u8 kind;			/* enum bpf_site_kind */
+	u8 conflict;			/* enum bpf_pad_conflict */
+	bool visited;
+	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
+	/* emission: the pad is that many insns after the last one of the subprog */
+	u32 pad;
+};
+
 struct loop_stack_entry {
 	struct bpf_loop *loop;
 	struct bpf_header_state *header_state;	/* see failing_path_trip() */
@@ -1073,6 +1111,8 @@ struct bpf_insn_aux_data {
 	struct bpf_loop *loop;
 	/* the call of a callback, or the first insn of a recursive function */
 	struct bpf_loop *callback_loop, *recursion_loop;
+	/* the sites at this instruction, as far as the round of the main pass got to them */
+	struct bpf_pad_plan *pad_plans;
 };
 
 /*
@@ -1894,10 +1934,28 @@ int bpf_flow_edge_unproven(struct bpf_verifier_env *env, struct bpf_verifier_sta
 #define BPF_EXIT_NEEDS_CALLER	1	/* verify the call in the frames of the caller */
 int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		    const struct bpf_verifier_state *exit, int call_idx);
-int bpf_insert_loop_guards(struct bpf_verifier_env *env);
+int bpf_insert_sites(struct bpf_verifier_env *env);
 bool bpf_insn_is_iter_next(struct bpf_verifier_env *env, struct bpf_insn *insn);
 bool bpf_insn_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
+
+/* pads.c */
+struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind);
+struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
+				      enum bpf_site_kind kind);
+void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
+void bpf_pads_new_round(struct bpf_verifier_env *env);
+void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pad_plan **plans, bool save);
+void bpf_pads_free_moved(struct bpf_pad_plan **plans, u32 cnt);
+struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
+				   const struct bpf_verifier_state *st, int insn_idx,
+				   enum bpf_site_kind kind);
+int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
+		  struct bpf_insn *buf);
+void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
+int bpf_pads_settle(struct bpf_verifier_env *env);
+bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
+void bpf_pads_log(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);

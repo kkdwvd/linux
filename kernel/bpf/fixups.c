@@ -278,7 +278,7 @@ static void patch_list_adj_aux(struct bpf_prog *prog, struct bpf_insn_patch *p,
 		slot[i].seen = last->seen ?: i > p->self;
 		/* messages name the insn of the original program */
 		slot[i].orig_idx = last->orig_idx;
-		/* for may_goto in front of the insn, see bpf_insert_loop_guards() */
+		/* for may_goto in front of the insn, see bpf_insert_sites() */
 		slot[i].live_regs_before = last->live_regs_before;
 		slot[i].zext_dst = bpf_insn_def32(prog, &patch[i]) >= 0;
 		/*
@@ -569,10 +569,23 @@ out:
 	return err;
 }
 
-/* How subprog @s leaves when it has to stop, see push_unwind_exit(). Returns the length. */
-static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *buf)
+/* The insn that subprog @s leaves with when it has to stop: unwind_exit if it can do that */
+static struct bpf_insn unwind_exit_insn(struct bpf_verifier_env *env, int s)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
+	struct bpf_insn insn = BPF_EXIT_INSN();
+
+	if (sub->bail_unwinds) {
+		insn.src_reg = BPF_UNWIND_EXIT;
+		sub->can_unwind = true;
+		env->prog->jit_required = 1;
+	}
+	return insn;
+}
+
+/* How subprog @s leaves when it has to stop, see unwind_frame(). Returns the length. */
+static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *buf)
+{
 	int n = 0;
 
 	if (!env->bypass_spec_v1)
@@ -580,24 +593,82 @@ static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env, s));
 	if (bpf_ret_reg_pair(env, s))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
-	buf[n] = BPF_EXIT_INSN();
-	if (sub->bail_unwinds) {
-		buf[n].src_reg = BPF_UNWIND_EXIT;
-		sub->can_unwind = true;
-		env->prog->jit_required = 1;
-	}
-	return n + 1;
+	buf[n++] = unwind_exit_insn(env, s);
+	return n;
 }
 
 /*
- * Add may_goto in front of the insns that the main pass marked, see
- * check_loop_guard(). It verified the edge from the insn to where may_goto goes.
+ * The landing pad of a site in subprog @s. The only exit of a pad is its last insn. Nothing in a
+ * pad is hardened against a cpu that mispredicts: only a program that is loaded with CAP_PERFMON
+ * gets one, see state_can_unwind().
+ * Returns the number of insns, BPF_PAD_MAX_INSNS + 1 at most.
+ */
+static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_plan *plan,
+		    struct bpf_insn *buf)
+{
+	int n = 0;
+
+	n += bpf_pad_insns(env, plan, s, buf + n);
+	buf[n++] = unwind_exit_insn(env, s);
+	return n;
+}
+
+/*
+ * The landing pads of the sites of subprog @s go after its last insn. Sites whose pads have the
+ * same insns share one. @new has room for a pad. Returns the insns in @pads and their number.
+ */
+static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new,
+			struct bpf_insn **pads)
+{
+	int last = env->subprog_info[s + 1].start - 1, cnt = 0, i, n, pad, len;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_insn *buf = *pads, *insn;
+	struct bpf_pad_plan *plan;
+
+	for (i = env->subprog_info[s].start; i <= last; i++) {
+		if (!aux[i].loop_guard || !aux[i].guard_unwinds)
+			continue;
+		/* no state got there in the pass: the empty plan will do */
+		if (!bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
+			return -ENOMEM;
+		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			/* bpf_insert_recursion_checks() emits the pad of the check */
+			if (plan->kind == BPF_SITE_RECURSION)
+				continue;
+			n = emit_pad(env, s, plan, new);
+			for (pad = 0; pad < cnt; pad += len) {
+				for (len = 1; buf[pad + len - 1].code != (BPF_JMP | BPF_EXIT);
+				     len++)
+					;
+				if (len == n && !memcmp(&buf[pad], new, n * sizeof(*buf)))
+					break;
+			}
+			plan->pad = pad;
+			if (pad < cnt)
+				continue;
+			insn = kvrealloc(buf, (cnt + n) * sizeof(*buf), BPF_VERIFIER_GFP);
+			if (!insn)
+				return -ENOMEM;
+			*pads = buf = insn;
+			memcpy(&buf[cnt], new, n * sizeof(*buf));
+			cnt += n;
+		}
+	}
+	return cnt;
+}
+
+/*
+ * Emit what the main pass decided about the sites: may_goto before the insns that it
+ * marked, see check_loop_guard(), and the landing pads. It verified the edge from the insn to
+ * where may_goto goes. What a pad does it did to the states that left the frame at the site, see
+ * unwind_frame().
  *
- *	may_goto to		or	may_goto leave		see push_unwind_exit()
+ *	may_goto to		or	may_goto pad
  *	insn				insn
  *					...
  *					last insn of the subprog
- *				leave:	r0 = 0
+ *				pad:	the releases
+ *					r0 = bpf_unwound_retval()
  *					exit
  *
  * bpf_do_misc_fixups() keeps the address of the count of may_goto in a register that is
@@ -606,40 +677,59 @@ static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
  *  - The guard of a jump goes where the jump goes.
  *  - What is live where the guard at the head of a loop goes is live at the head,
  *    see bpf_head_guard_target().
- *  - On the way out of the subprog R0, and R2 of a pair, are set to 0.
+ *  - A landing pad reads no register.
  */
-int bpf_insert_loop_guards(struct bpf_verifier_env *env)
+int bpf_insert_sites(struct bpf_verifier_env *env)
 {
 	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	struct bpf_insn leave[4], *insn;
+	struct bpf_insn *pads = NULL, *new, *insn;
+	const struct bpf_pad_plan *plan;
 	struct bpf_subprog_info *sub;
-	int i, s, n, err;
+	int i, s, cnt, err = 0;
 
-	for (s = 0; s < env->subprog_cnt; s++) {
+	new = kvzalloc_objs(*new, BPF_PAD_MAX_INSNS + 1, BPF_VERIFIER_GFP);
+	if (!new)
+		return -ENOMEM;
+	for (s = 0; s < env->subprog_cnt && !err; s++) {
 		sub = &env->subprog_info[s];
-		for (i = sub->start, n = 0; i < sub[1].start; i++) {
+		cnt = collect_pads(env, s, new, &pads);
+		if (cnt < 0) {
+			err = cnt;
+			break;
+		}
+		/* see emit_pad() */
+		if (verifier_bug_if(cnt && !bpf_may_unwind(env), env,
+				    "func#%d has landing pads without CAP_PERFMON", s)) {
+			err = -EFAULT;
+			break;
+		}
+		for (i = sub->start; i < sub[1].start; i++) {
 			if (!aux[i].loop_guard)
 				continue;
 			/* A jump to itself is a back edge. It goes through may_goto too. */
 			patch[1] = env->prog->insnsi[i];
 			insn = bpf_patch_list_add(env, i, patch, 2);
-			if (IS_ERR(insn))
-				return PTR_ERR(insn);
+			if (IS_ERR(insn)) {
+				err = PTR_ERR(insn);
+				goto out;
+			}
 			if (!aux[i].guard_unwinds) {
 				bpf_patch_list_jump(&env->patch_list, insn - 1, aux[i].guard_to, 0);
 				continue;
 			}
-			n = emit_unwind_exit(env, s, leave);
-			bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start, n);
+			/* however far the pad is, see bpf_patch_list_jump() */
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_GUARD);
+			bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start,
+					    cnt - plan->pad);
 		}
-		if (!n)
-			continue;
-		err = bpf_patch_list_append(env, i - 1, leave, n);
-		if (err)
-			return err;
+		if (cnt)
+			err = bpf_patch_list_append(env, i - 1, pads, cnt);
 	}
-	return bpf_patch_list_commit(env);
+out:
+	kvfree(new);
+	kvfree(pads);
+	return err ?: bpf_patch_list_commit(env);
 }
 
 /*
@@ -774,6 +864,7 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 		free_loop(aux_data[i].callback_loop);
 		free_loop(aux_data[i].recursion_loop);
 		aux_data[i].loop = aux_data[i].callback_loop = aux_data[i].recursion_loop = NULL;
+		bpf_pad_plans_free(&aux_data[i]);
 	}
 }
 

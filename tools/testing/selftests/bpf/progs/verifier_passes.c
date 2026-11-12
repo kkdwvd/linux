@@ -1829,9 +1829,11 @@ __naked void spilled_iv_is_no_guess(void)
 }
 
 /*
- * With @bound 7 no execution disables preemption. The joined state does, and then may_goto of
- * the loop at 3 cannot return 0. It goes to the load, with r0 = NULL.
- * With @bound 8 an execution with r6 == 8 disables preemption, so the error is real.
+ * With @bound 7 no execution disables preemption. The joined state does, and then the landing
+ * pad of may_goto of the loop at 3 has two numbers of sections to leave: a conflict. A pass
+ * that keeps r6 apart has none.
+ * With @bound 8 an execution with r6 == 8 disables preemption, once for each trip of the loop
+ * at 2, so the conflict is real.
  */
 #define GUARD_OF_THE_JOIN(bound)					\
 	asm volatile (							\
@@ -1867,7 +1869,7 @@ __naked void spilled_iv_is_no_guess(void)
 	:: OPS, __imm(bpf_preempt_disable) : __clobber_all)
 
 SEC("tc")
-__description("failing_path: a joined state selects the target of may_goto")
+__description("failing_path: a joined state is in a section at may_goto")
 __success
 __naked void guess_takes_target_of_join(void)
 {
@@ -1875,17 +1877,19 @@ __naked void guess_takes_target_of_join(void)
 }
 
 SEC("tc")
-__description("failing_path: a real state selects the target of may_goto")
-__failure __msg("R0 invalid mem access 'map_value_or_null'") __msg("this path has a guess")
+__description("failing_path: a real state is in a section at may_goto")
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__not_msg("this path has a guess")
 __naked void guess_takes_real_target(void)
 {
 	GUARD_OF_THE_JOIN(8);
 }
 
 SEC("tc")
-__description("failing_path: level 2 marks a path with a guess")
-__failure __log_level(2) __msg("path-sensitive run after pass 0")
-__msg("this path has a guess") __msg("pass 1")
+__description("failing_path: level 2 has the path-sensitive run and the next pass")
+__failure __log_level(2) __msg("path-sensitive run after pass 0") __msg("pass 1")
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
 __naked void guess_in_level_2(void)
 {
 	GUARD_OF_THE_JOIN(8);
