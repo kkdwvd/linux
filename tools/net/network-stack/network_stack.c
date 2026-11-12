@@ -726,6 +726,32 @@ static void active_changed(void)
 }
 
 /*
+ * Run ns_mark_socks() over every TCP socket: mark the --tx cgroup's existing
+ * connections for assignment, or with tx_unmark take the marks back.
+ */
+static void run_mark_iter(void)
+{
+	struct bpf_link *link;
+	char buf[64];
+	int fd;
+
+	link = bpf_program__attach_iter(skel->progs.ns_mark_socks, NULL);
+	if (!link) {
+		warn("cannot run the TCP socket iterator: %s", strerror(errno));
+		return;
+	}
+	fd = bpf_iter_create(bpf_link__fd(link));
+	if (fd < 0) {
+		warn("cannot run the TCP socket iterator: %s", strerror(errno));
+	} else {
+		while (read(fd, buf, sizeof(buf)) > 0)
+			;
+		close(fd);
+	}
+	bpf_link__destroy(link);
+}
+
+/*
  * Bind the xmit queues and start assigning the connections of the --tx cgroup
  * to them.
  */
@@ -753,6 +779,11 @@ static void start_tx(void)
 	close(fd);
 	if (!tx_link)
 		die("cannot attach to cgroup %s: %s", path, strerror(errno));
+	/* Now that marked connections find ns_sock_assign() attached. */
+	skel->bss->tx_cgroup_id = cgroup_id(opt.tx);
+	run_mark_iter();
+	printf("tx: %llu existing connections marked for assignment\n",
+	       (unsigned long long)skel->bss->tx_marked);
 }
 
 /*
@@ -984,8 +1015,15 @@ static void cleanup(void)
 	if (!started)
 		return;
 	started = false;
-	/* Stop assigning connections, then let the assigned ones transmit for themselves. */
+	/*
+	 * Stop assigning connections, give the ones still marked their flags
+	 * back, then let the assigned ones transmit for themselves.
+	 */
 	bpf_link__destroy(tx_link);
+	if (opt.tx) {
+		skel->bss->tx_unmark = true;
+		run_mark_iter();
+	}
 	for (i = 0; opt.tx && i < nr_threads; i++) {
 		if (txq_owner[i] >= 0) {
 			args.txq = i;
@@ -1480,6 +1518,7 @@ int main(int argc, char **argv)
 		bpf_program__set_autoload(skel->progs.ns_txq_bind, false);
 		bpf_program__set_autoload(skel->progs.ns_txq_unbind, false);
 		bpf_program__set_autoload(skel->progs.ns_sock_assign, false);
+		bpf_program__set_autoload(skel->progs.ns_mark_socks, false);
 	}
 	err = network_stack_bpf__load(skel);
 	if (err)
