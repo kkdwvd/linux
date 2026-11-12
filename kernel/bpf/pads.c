@@ -6,6 +6,7 @@
  * for that:
  *   - may_goto that the verifier adds
  *   - the check at the entry of a recursive subprog
+ *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
  * then 'r0 = 0' and unwind_exit, or exit in a frame that cannot unwind.
@@ -52,6 +53,27 @@
  * not live is gone before the states meet, see bpf_clean_verifier_state().
  *
  * Plans live as long as a pass. A pass that is kept keeps its plans, see bpf_pads_move().
+ *
+ * The frames of a program are unwound one by one. The pad of a frame ends in unwind_exit, which
+ * goes to unwind_goto after the call in the caller, and that goes to the pad of the caller:
+ *
+ *	static int wait(void)				wait:
+ *	{						1: ...
+ *		do {					   may_goto pad
+ *			...				   if r0 == 0 goto 1b
+ *		} while (!p);				   ...
+ *		return *p;				   exit
+ *	}					      pad: r0 = 0
+ *							   unwind_exit
+ *	bpf_rcu_read_lock();				prog:
+ *	v = wait();					   call bpf_rcu_read_lock
+ *	bpf_rcu_read_unlock();				   call wait
+ *	return v;					   unwind_goto pad
+ *							   ...
+ *							   exit
+ *						      pad: call bpf_rcu_read_unlock
+ *							   r0 = 0
+ *							   exit
  *
  * A section has no handle: the plan has their number. Every other resource that the frame
  * acquired is an ENTRY of the plan. Its release takes a handle: the address of the lock, of
@@ -142,6 +164,35 @@ struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_
 	return NULL;
 }
 
+/* @callee came back to the call of @plan: it takes its place in the list */
+static int plan_add_callee(struct bpf_verifier_env *env, struct bpf_pad_plan *plan, u32 callee)
+{
+	u32 n = plan->nr_callees, mid, lo = 0, hi = n, *list;
+
+	while (lo < hi) {
+		mid = (lo + hi) / 2;
+		if (plan->callee[mid] < callee)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo < n && plan->callee[lo] == callee)
+		return 0;
+	/* the list has room for the next power of two */
+	if (!(n & (n - 1))) {
+		list = krealloc_array(plan->callee, n ? 2 * n : 1, sizeof(*list), BPF_VERIFIER_GFP);
+		if (!list)
+			return -ENOMEM;
+		plan->callee = list;
+	}
+	/* callx can have many callees, and each new one moves those above it */
+	bpf_add_cost(env, (n - lo) * sizeof(*list) / 64, BPF_COST_SCAN);
+	memmove(&plan->callee[lo + 1], &plan->callee[lo], (n - lo) * sizeof(*list));
+	plan->callee[lo] = callee;
+	plan->nr_callees++;
+	return 0;
+}
+
 /* A new plan is the empty one: the pad releases nothing. NULL if there is no memory. */
 struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
 				      enum bpf_site_kind kind)
@@ -160,6 +211,16 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 	return plan;
 }
 
+/* @callee was left with unwind_exit and comes back to the call at @call_idx, which is a site */
+int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee)
+{
+	struct bpf_pad_plan *plan = bpf_pad_plan_get(env, call_idx, BPF_SITE_CALL);
+
+	if (!plan)
+		return -ENOMEM;
+	return plan_add_callee(env, plan, callee);
+}
+
 static void free_plans(struct bpf_pad_plan *plan)
 {
 	struct bpf_pad_plan *next;
@@ -167,6 +228,7 @@ static void free_plans(struct bpf_pad_plan *plan)
 	for (; plan; plan = next) {
 		next = plan->next;
 		kfree(plan->ents);
+		kfree(plan->callee);
 		kfree(plan);
 	}
 }
@@ -529,6 +591,8 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	struct bpf_pad_ent new, *ent;
 	int i, arg, pass, pos, err;
 
+	/* the pad of a call runs after the call: what is live at the next insn is there */
+	insn_idx += plan->kind == BPF_SITE_CALL;
 	for (i = 0; i < plan->nr_ents; i++)
 		plan->ents[i].ref = -1;
 	for (pass = 0; pass < 2; pass++) {
@@ -732,6 +796,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	static const char * const kind[] = {
 		[BPF_SITE_GUARD]		= "may_goto",
 		[BPF_SITE_RECURSION]		= "recursion check",
+		[BPF_SITE_CALL]			= "call",
 	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
@@ -740,6 +805,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
 		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
 		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
+		[BPF_CONFLICT_CANNOT_UNWIND]	= "the frame cannot unwind",
 	};
 	int j;
 

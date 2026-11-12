@@ -455,6 +455,7 @@ static inline u64 bpf_xreg(u32 frameno, u32 xregno)
 enum bpf_site_kind {
 	BPF_SITE_GUARD,		/* may_goto that the verifier adds before the insn */
 	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
+	BPF_SITE_CALL,		/* unwind_goto that the verifier adds after the insn, a call */
 };
 
 /* The classes of resources that a landing pad can release */
@@ -479,6 +480,7 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_NOT_ALWAYS_HELD,
 	BPF_CONFLICT_NO_PLACE,
 	BPF_CONFLICT_ORDER_DIFFERS,
+	BPF_CONFLICT_CANNOT_UNWIND,
 };
 
 /*
@@ -520,6 +522,10 @@ struct bpf_pad_ent {
 	struct bpf_pad_place cand[BPF_PAD_MAX_ARGS][BPF_PAD_MAX_CANDS];
 };
 
+/* Each subprog @s that came back to the call of @plan, see 'callee' of struct bpf_pad_plan */
+#define bpf_pad_for_each_callee(plan, s)						\
+	for (u32 __n = 0; __n < (plan)->nr_callees && ((s) = (plan)->callee[__n], true); __n++)
+
 /* What the landing pad of a site releases, see bpf_pad_visit() */
 struct bpf_pad_plan {
 	struct bpf_pad_plan *next;	/* of the same insn */
@@ -529,6 +535,12 @@ struct bpf_pad_plan {
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 nr_ents;
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
+	/*
+	 * BPF_SITE_CALL: the subprogs that were left with unwind_exit and came back to the call,
+	 * in ascending order: a call can have more than one.
+	 */
+	u32 *callee;
+	u32 nr_callees;
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
 };
@@ -667,6 +679,12 @@ struct bpf_equations {
 	u32 clean_sym_cnt;	/* after the last bpf_equations_clean() */
 };
 
+/* see 'unwound' of struct bpf_verifier_state */
+enum {
+	BPF_UNWOUND = 1,
+	BPF_UNWOUND_CB,
+};
+
 struct bpf_verifier_state {
 	struct bpf_equations equations;
 	/* call stack tracking */
@@ -699,8 +717,13 @@ struct bpf_verifier_state {
 	);
 	u32 curframe;
 	bool in_sleepable;
-	/* The callee left with unwind_exit. Next insn is unwind_goto. */
-	bool unwound;
+	/*
+	 * The callee left with unwind_exit. Next insn is unwind_goto, or the verifier adds it
+	 * before that insn, see check_unwound_arrival().
+	 * BPF_UNWOUND_CB: the callee is a callback. Next insn is the call of the helper or the kfunc
+	 * that called it, once more, see prepare_func_exit().
+	 */
+	u8 unwound;
 	/*
 	 * A function that is verified on its own changed packet data. Its callers
 	 * and their packet pointers are not in the state, see bpf_flow_return().
@@ -1313,10 +1336,13 @@ struct bpf_subprog_info {
 	bool loads_pkt_end: 1;
 	/* a call of it was verified on its own: its insns are not in insns_total of the caller */
 	bool on_its_own: 1;
-	/* it can leave with unwind_exit: it has one, or unwind_goto follows every call of it */
+	/*
+	 * It can leave with unwind_exit: unwind_goto follows every call of it, or the verifier
+	 * adds it. Not after the call of a helper, see subprog_cannot_unwind().
+	 */
 	bool bail_unwinds: 1;
-	/* some call of it is not followed by unwind_goto */
-	bool plain_call: 1;
+	/* it has unwind_exit, or a state left it that way in this pass */
+	bool did_unwind: 1;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -1994,6 +2020,7 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
 struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind);
 struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
 				      enum bpf_site_kind kind);
+int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee);
 void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
 void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pad_plan **plans, bool save);

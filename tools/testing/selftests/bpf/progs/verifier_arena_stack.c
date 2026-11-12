@@ -230,6 +230,7 @@ __naked void recursion(void)
 	"r2 = %[first_r12] ll;"
 	"*(u64 *)(r2 + 0) = r1;"
 	"call goes_down;"
+	".8byte %[unwind_goto];"
 	"r1 = %[last_r12] ll;"
 	"r1 = *(u64 *)(r1 + 0);"
 	"r2 = %[first_r12] ll;"
@@ -244,7 +245,8 @@ __naked void recursion(void)
 	: __imm_addr(first_r12),
 	  __imm_addr(last_r12),
 	  __imm_insn(adj, ADJ(32)),
-	  __imm_insn(mov, MOV(BPF_REG_1))
+	  __imm_insn(mov, MOV(BPF_REG_1)),
+	  __imm_insn(unwind_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0))
 	: __clobber_all);
 }
 

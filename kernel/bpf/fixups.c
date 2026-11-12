@@ -241,7 +241,10 @@ int bpf_patch_list_insert(struct bpf_verifier_env *env, u32 off,
 	return patch_list_insert(env, off, insns, cnt, false);
 }
 
-/* Queue insns to go behind insn 'off', which does not fall through. They are not dead code. */
+/*
+ * Queue insns to go behind insn 'off'. They are not dead code: 'off' does not fall through and
+ * a jump gets to them, or it is a call and they are what the call comes back to.
+ */
 int bpf_patch_list_append(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt)
 {
@@ -600,7 +603,7 @@ static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 /*
  * The landing pad of a site in subprog @s. The only exit of a pad is its last insn. Nothing in a
  * pad is hardened against a cpu that mispredicts: only a program that is loaded with CAP_PERFMON
- * gets one, see state_can_unwind().
+ * gets one, see frame_can_unwind().
  * Returns the number of insns, BPF_PAD_MAX_INSNS + 1 at most.
  */
 static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_plan *plan,
@@ -613,11 +616,65 @@ static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_pl
 	return n;
 }
 
-/* Does the site of @plan at an insn with @aux get a landing pad after its subprog? */
-static bool plan_has_pad(const struct bpf_insn_aux_data *aux, const struct bpf_pad_plan *plan)
+static bool guard_leaves_subprog(const struct bpf_insn_aux_data *aux)
+{
+	return aux->loop_guard && aux->guard_unwinds;
+}
+
+/* Does the program leave the frame at the site of @plan, which is at insn @i? */
+static bool site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	int s;
+
+	switch (plan->kind) {
+	case BPF_SITE_GUARD:
+		return guard_leaves_subprog(&env->insn_aux_data[i]);
+	case BPF_SITE_RECURSION:
+		return bpf_find_containing_subprog(env, i)->recursive;
+	case BPF_SITE_CALL:
+		if (!plan->visited || plan->conflict)
+			return false;
+		bpf_pad_for_each_callee(plan, s)
+			if (env->subprog_info[s].can_unwind)
+				return true;
+	}
+	return false;
+}
+
+/*
+ * The main pass looked at more ways to unwind than the program has in the end: a loop that has a
+ * trip count after all has no may_goto. Find the subprogs that get unwind_exit: those that are
+ * left at a site. A call is a site if it calls one of them.
+ */
+static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
+	struct bpf_subprog_info *sub;
+	bool changed;
+	int i, s;
+
+	do {
+		changed = false;
+		for (s = 0; s < env->subprog_cnt; s++) {
+			sub = &env->subprog_info[s];
+			if (sub->can_unwind || !sub->bail_unwinds)
+				continue;
+			for (i = sub->start; i < sub[1].start && !sub->can_unwind; i++) {
+				sub->can_unwind = guard_leaves_subprog(&aux[i]);
+				for (plan = aux[i].pad_plans; plan; plan = plan->next)
+					sub->can_unwind |= site_is_used(env, i, plan);
+			}
+			changed |= sub->can_unwind;
+		}
+	} while (changed);
+}
+
+/* Does the site of @plan at insn @i get a landing pad after its subprog? */
+static bool plan_has_pad(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
 	/* bpf_insert_recursion_checks() emits the pad of the check */
-	return plan->kind != BPF_SITE_RECURSION && aux->loop_guard && aux->guard_unwinds;
+	return plan->kind != BPF_SITE_RECURSION && site_is_used(env, i, plan);
 }
 
 /*
@@ -634,13 +691,11 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 	struct bpf_pad_plan *plan;
 
 	for (i = env->subprog_info[s].start; i <= last; i++) {
-		if (!aux[i].loop_guard || !aux[i].guard_unwinds)
-			continue;
 		/* no state got there in the pass: the empty plan will do */
-		if (!bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
+		if (guard_leaves_subprog(&aux[i]) && !bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
 			return -ENOMEM;
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
-			if (!plan_has_pad(&aux[i], plan))
+			if (!plan_has_pad(env, i, plan))
 				continue;
 			n = emit_pad(env, s, plan, new, new_aux);
 			for (pad = 0; pad < cnt; pad += len) {
@@ -665,10 +720,44 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 }
 
 /*
+ * Add unwind_goto after the calls that are sites, see check_unwound_arrival(). Nothing stands
+ * between a call and its unwind_goto, and jumps to the insn that follows the call go past it.
+ * The pads are in the program: a call that has may_goto before it would need two jumps of one
+ * patch, see bpf_patch_list_jump(). @added: how many insns the pads after each subprog have.
+ */
+static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
+{
+	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_patch_list *pl = &env->patch_list;
+	const struct bpf_subprog_info *sub;
+	const struct bpf_pad_plan *plan;
+	const struct bpf_insn_patch *p;
+	int i, s, err;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++) {
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
+			if (!plan || !site_is_used(env, i, plan))
+				continue;
+			/* the insn that follows the call may be dead code, what is appended is not */
+			err = bpf_patch_list_append(env, i, &unwind_goto, 1);
+			if (err)
+				return err;
+			p = &pl->patches[pl->cnt - 1];
+			bpf_patch_list_jump(pl, &pl->insns[p->start + p->len - 1],
+					    sub[1].start - added[s] + plan->pad, 0);
+		}
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
- * marked, see check_loop_guard(), and the landing pads. It verified the edge from the insn to
- * where may_goto goes. What a pad does it did to the states that left the frame at the site, see
- * unwind_frame().
+ * marked, see check_loop_guard(), unwind_goto after calls, and the landing pads. It verified the
+ * edge from the insn to where may_goto goes. What a pad does it did to the states that left the
+ * frame at the site, see unwind_frame().
  *
  *	may_goto to		or	may_goto pad
  *	insn				insn
@@ -704,6 +793,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		err = -ENOMEM;
 		goto out;
 	}
+	mark_subprogs_that_unwind(env);
 	for (s = 0; s < env->subprog_cnt && !err; s++) {
 		sub = &env->subprog_info[s];
 		cnt = collect_pads(env, s, new, pad_aux, &pads);
@@ -749,10 +839,11 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		sub = &env->subprog_info[s];
 		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++)
 			for (plan = aux[i].pad_plans; plan; plan = plan->next)
-				if (plan_has_pad(&aux[i], plan))
+				if (plan_has_pad(env, i, plan))
 					emit_pad(env, s, plan, new,
 						 &aux[sub[1].start - added[s] + plan->pad]);
 	}
+	err = insert_unwind_gotos(env, added);
 out:
 	kvfree(added);
 	kvfree(new);

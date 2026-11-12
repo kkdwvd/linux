@@ -1097,7 +1097,7 @@ static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 SEC("tc")
 __description("calls: the function tests a reference of the caller for NULL")
 __arch_x86_64
-__failure __msg("invalid mem access 'scalar'") __not_msg("verifier bug")
+__failure __msg("conflict: the frame cannot unwind") __not_msg("verifier bug")
 int callee_tests_null(struct __sk_buff *skb)
 {
 	struct pair *n = bpf_obj_new(typeof(*n)), *copy;
@@ -1536,10 +1536,16 @@ __naked void ctx_moves(void)
 	EXIT_AT_9);
 }
 
-/* The verifier can't tell that the loop ends. It adds may_goto, which leaves with r7 = 0. */
+/*
+ * The verifier can't tell that the loop ends. It adds may_goto, which unwinds the function: no
+ * path continues with r7 = 0. Where a subprog cannot unwind may_goto leaves the loop.
+ */
 SEC("tc")
-__description("failing_path: the path continues where may_goto leaves an infinite loop")
-__failure __msg("R7 invalid mem access 'scalar'")
+__description("failing_path: no path continues where may_goto ends an infinite loop")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success
 __naked void exit_of_infinite_loop(void)
 {
 	ASM(VALUE_IN_R9

@@ -181,7 +181,8 @@ static __naked __noinline __used int recurse(void)
 
 SEC("tc")
 __description("barrier: a speculative state holds more in a recursion")
-__success SPECULATES __success_unpriv
+__failure __msg("loop at insn 12 acquires more than it releases")
+SPECULATES __success_unpriv __not_msg_unpriv("acquires more than it releases")
 __naked void recursion(void)
 {
 	ASM(START
@@ -209,9 +210,19 @@ static __naked __noinline __used int recurse_in_frames(void)
 	"exit;" ::: __clobber_all);
 }
 
+/*
+ * This prog loads on a kernel where the check of a recursion returns 0 to the caller, which goes on
+ * and leaves the section. Here the check unwinds, and no landing pad serves the call in the prog.
+ * The function leaves the section of its caller and enters one of its own. When its first check
+ * fails the prog is in the section that it entered. When a deeper one does the pad of the function
+ * has left the only section there is. A pad is a fixed number of calls, and no store of the prog
+ * can count what its callee leaves: a hidden slot follows the insns of its own frame.
+ * Without CAP_PERFMON the check returns 0 as before.
+ */
 SEC("tc")
 __description("barrier: at the call of a recursion in the frames of the callers")
-__success SPECULATES __success_unpriv
+__failure __msg("landing pad of call at 2: conflict: the number of sections differs")
+SPECULATES __success_unpriv __not_msg_unpriv("conflict")
 #ifdef SPEC_V1
 __xlated_unpriv("r1 += -1")
 __xlated_unpriv("nospec")
