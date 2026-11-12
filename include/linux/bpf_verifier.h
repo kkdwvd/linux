@@ -377,8 +377,9 @@ struct bpf_reference_state {
 	 * instruction creates the reference multiple times (eg, via CALL).
 	 */
 	int id;
-	/* Instruction where the allocation of this reference occurred. This
-	 * is used purely to inform the user of a reference leak.
+	/*
+	 * Instruction where the allocation of this reference occurred. It tells the user about
+	 * a reference leak, and a landing pad which function releases the reference.
 	 */
 	int insn_idx;
 	u32 diag_id;	/* finds the acquire in the report of a leak, it is not renumbered */
@@ -469,6 +470,7 @@ enum bpf_pad_class {
 	BPF_PAD_RES_LOCK,	/* bpf_res_spin_lock() */
 	BPF_PAD_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave(): two of refs[], one release */
 	BPF_PAD_SPIN_LOCK,	/* bpf_spin_lock() */
+	BPF_PAD_REF,		/* a pointer that a helper or a kfunc returned, REF_TYPE_PTR */
 };
 
 /* Why no landing pad serves all states that get to a site */
@@ -481,6 +483,7 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_NO_PLACE,
 	BPF_CONFLICT_ORDER_DIFFERS,
 	BPF_CONFLICT_CANNOT_UNWIND,
+	BPF_CONFLICT_CALLER_SAVED,
 };
 
 /*
@@ -499,6 +502,7 @@ enum bpf_place_loc {
 	BPF_PLACE_REG,		/* in a register. R10: the handle is an address in the stack */
 	BPF_PLACE_SPILL,	/* in 8 bytes of the stack of the frame */
 	BPF_PLACE_MAP_VALUE,	/* it is the address of the only value of a map */
+	BPF_PLACE_IMM,		/* no handle: the release takes a constant as well, 'delta' */
 };
 
 /* A PLACE: where a landing pad finds a handle when the frame is left at the site */
@@ -513,6 +517,7 @@ struct bpf_pad_ent {
 	u32 origin;		/* see struct bpf_reference_state. Of the first visit that held it. */
 	int ref;		/* the visit that is going on: its index in refs[], or -1 */
 	struct bpf_insn release; /* the call that releases it */
+	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
 	u8 class;		/* enum bpf_pad_class */
 	/*
 	 * The CANDIDATES, per argument of the release: the places that have the handle on all
@@ -729,7 +734,11 @@ struct bpf_verifier_state {
 	 * and their packet pointers are not in the state, see bpf_flow_return().
 	 */
 	bool changed_pkt_data;
-	u8 unused;	/* the join_key has no holes */
+	/*
+	 * The same for non-owning references: they went while a lock stayed
+	 * held, which may be the lock of a caller.
+	 */
+	bool invalidated_non_owning;
 	);
 	/* Not zero in a function that is verified on its own, see bpf_flow_call() */
 	u32 instance_id;
@@ -2038,6 +2047,7 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
+bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 void bpf_pads_log(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_state *dst_state,
@@ -2368,6 +2378,8 @@ static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int 
 }
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
 int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
+bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);
+bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id);
 
 /* The first field that ends behind 'off'. The fields are sorted and do not overlap. */
 static inline u32 btf_record_first_field(const struct btf_record *rec, s64 off)

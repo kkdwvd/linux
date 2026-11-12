@@ -11205,6 +11205,9 @@ static void invalidate_non_owning_refs(struct bpf_verifier_env *env)
 			mark_reg_invalid(env, reg);
 		}
 	}));
+	/* the lock that is still held may be that of a caller, who is not here */
+	if (env->cur_state->instance_id && env->cur_state->active_locks)
+		env->cur_state->invalidated_non_owning = true;
 }
 
 static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
@@ -11879,9 +11882,11 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	/*
 	 * Keep only what the function held all the time. The state at its exit looks the same if
 	 * the function released a lock and acquired it again. Else verify the function in the
-	 * instance of the caller.
+	 * instance of the caller. The caller has non-owning references only under a lock, which
+	 * is one of what it holds.
 	 */
-	if (callee->entry_refs < nheld || callee->entry_rcu_locks < caller->active_rcu_locks ||
+	if (callee->entry_refs < nheld || (exit->invalidated_non_owning && nheld) ||
+	    callee->entry_rcu_locks < caller->active_rcu_locks ||
 	    callee->entry_preempt_locks < caller->active_preempt_locks) {
 		if (exit->speculative)
 			return -EACCES;
@@ -15969,7 +15974,7 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
  * turn. A type of the program has no other field that runs code when it is freed, see
  * btf_parse_struct_metas().
  */
-static bool obj_free_runs_dtor(const struct btf *btf, u32 btf_id)
+bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id)
 {
 	const struct btf_struct_meta *meta = btf_find_struct_meta(btf, btf_id);
 
@@ -15981,7 +15986,6 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16100,10 +16104,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	nmi_prog = is_tracing_prog_type(prog_type) ||
-		   /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-		   (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-		    && !env->prog->sleepable);
+	nmi_prog = bpf_prog_may_run_in_nmi(env);
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
 	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && nmi_prog) {
 		struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
@@ -16148,7 +16149,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		 * keep the irq flags in one word, so none may take another one.
 		 */
 		if (bpf_subprog_unwinds(&env->subprog_info[meta.subprogno]) &&
-		    obj_free_runs_dtor(meta.arg_btf, meta.arg_btf_id)) {
+		    bpf_obj_free_runs_dtor(meta.arg_btf, meta.arg_btf_id)) {
 			verbose(env,
 				"%s with a comparator that unwinds cannot be used on types that take a lock when freed\n",
 				func_name);
@@ -21786,14 +21787,16 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = cur_func(env);
-	u32 locks = st->active_locks;
+	u32 refs = st->acquired_refs;
 	struct bpf_reference_state *ref;
 	int id, err;
 
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
-		if (ref->type == REF_TYPE_IRQ)
+		if (ref->type == REF_TYPE_PTR)
+			err = release_reference(env, ref->id);
+		else if (ref->type == REF_TYPE_IRQ)
 			err = release_irq_state(env, ref->id);
 		else
 			err = release_lock_state(env, ref->type, ref->id, ref->ptr);
@@ -21801,7 +21804,8 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 			return -EFAULT;
 		unmark_stack_obj(env, id);
 	}
-	if (st->active_locks != locks)
+	/* a lock went, or an object was freed under the lock of a caller, who may point to it */
+	if (st->acquired_refs != refs)
 		invalidate_non_owning_refs(env);
 	st->active_rcu_locks = frame->entry_rcu_locks;
 	st->active_preempt_locks = frame->entry_preempt_locks;
@@ -22692,6 +22696,17 @@ static bool is_tracing_prog_type(enum bpf_prog_type type)
 	default:
 		return false;
 	}
+}
+
+/* Such a program must not free what has NMI unsafe fields, see check_kfunc_call() */
+bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
 }
 
 static bool bpf_map_is_cgroup_storage(struct bpf_map *map)

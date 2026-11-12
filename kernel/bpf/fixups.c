@@ -699,7 +699,7 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 			if (!plan_has_pad(env, i, plan))
 				continue;
 			n = emit_pad(env, s, plan, new, new_aux);
-			for (pad = 0; pad < cnt; pad += len) {
+			for (pad = bpf_pad_can_be_shared(plan) ? 0 : cnt; pad < cnt; pad += len) {
 				for (len = 1; buf[pad + len - 1].code != (BPF_JMP | BPF_EXIT);
 				     len++)
 					;
