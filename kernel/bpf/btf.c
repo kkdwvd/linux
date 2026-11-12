@@ -10174,6 +10174,48 @@ int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag)
 	return res;
 }
 
+/* Is @func_id of @btf void (*)(struct type *), with @btf_id as the type? */
+static bool btf_kfunc_takes_only(const struct btf *btf, u32 func_id, u32 btf_id)
+{
+	const struct btf_type *proto, *t;
+	u32 arg_id;
+
+	proto = btf_type_by_id(btf, btf_type_by_id(btf, func_id)->type);
+	if (btf_type_vlen(proto) != 1 || !btf_type_is_void(btf_type_by_id(btf, proto->type)))
+		return false;
+	t = btf_type_skip_modifiers(btf, btf_params(proto)[0].type, NULL);
+	if (!btf_type_is_ptr(t))
+		return false;
+	t = btf_type_skip_modifiers(btf, t->type, &arg_id);
+	return __btf_type_is_struct(t) && arg_id == btf_id;
+}
+
+/*
+ * The kfunc of @btf that @prog can call to release a reference to struct @btf_id: it is KF_RELEASE
+ * and the reference is all that it takes. The verifier lets a program release a reference with any
+ * such kfunc, whichever kfunc acquired it, so the first one will do. Any other flag asks for what
+ * the caller may not have: an argument more, a capability, an RCU section.
+ */
+s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id, const struct bpf_prog *prog)
+{
+	enum btf_kfunc_hook hooks[] = { BTF_KFUNC_HOOK_COMMON,
+					bpf_prog_type_to_kfunc_hook(resolve_prog_type(prog)) };
+	const struct btf_id_set8 *set;
+	u32 i, h, id;
+
+	for (h = 0; btf->kfunc_set_tab && h < ARRAY_SIZE(hooks); h++) {
+		set = hooks[h] < BTF_KFUNC_HOOK_MAX ? btf->kfunc_set_tab->sets[hooks[h]] : NULL;
+		for (i = 0; set && i < set->cnt; i++) {
+			id = set->pairs[i].id;
+			if ((set->pairs[i].flags & ~(KF_SLEEPABLE | KF_SPINLOCK_SAFE)) == KF_RELEASE &&
+			    btf_kfunc_takes_only(btf, id, btf_id) &&
+			    __btf_kfunc_is_allowed(btf, hooks[h], id, prog))
+				return id;
+		}
+	}
+	return -ENOENT;
+}
+
 u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
 				const struct bpf_prog *prog)
 {
