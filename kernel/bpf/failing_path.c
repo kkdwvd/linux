@@ -70,9 +70,10 @@ static int compute_hops(struct bpf_verifier_env *env)
 				/* see check_loop_guard() and check_recursion_guard() */
 				if (aux->guard_place)
 					changed |= shorter_via(prec, n, aux->guard_to);
+				/* the function is left there, see unwind_frame() */
 				if ((aux->guard_place || (sub[s].cycle && n == sub[s].start)) &&
-				    sub[s].bail_insn >= 0)
-					changed |= shorter_via(prec, n, sub[s].bail_insn);
+				    sub[s].exit_idx != U32_MAX)
+					changed |= shorter(&prec->hops_to_exit[n], 0);
 				if (!bpf_calls_function(env, n))
 					continue;
 				t = bpf_insn_callee(env, n);

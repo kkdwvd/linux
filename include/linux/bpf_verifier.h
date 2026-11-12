@@ -1228,7 +1228,6 @@ struct bpf_subprog_info {
 	/* some call of it is not followed by unwind_goto */
 	bool plain_call: 1;
 	u8 code_stack_args;
-	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
 };
@@ -2210,10 +2209,10 @@ struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
  * Where the program goes from may_goto and from the checks that the verifier adds:
  * - May_goto before a jump goes where the jump goes, with the registers and the stack
  *   as they are before the jump. bpf_insn_successors() has that edge.
- * - A subprog that is out of budget goes to bail_insn, an exit. No such edge.
+ * - A subprog that is out of budget is left at once, see unwind_frame(). No insn of it follows.
  * - May_goto before the header of a loop goes to where the loops around it are left: from
- *   @idx to what is returned here, -1 if there is none. No such edge either. The registers
- *   and the stack are what they are before @idx.
+ *   @idx to what is returned here, -1 if there is none. No such edge. The registers and the
+ *   stack are what they are before @idx.
  *
  * The main pass looks at the states that go there. What is computed from the graph before
  * the main pass has to take these edges into account where the main pass relies on it:

@@ -1433,7 +1433,7 @@ __naked void name(void)							\
 	:: __imm(bpf_get_prandom_u32) : __clobber_all);			\
 }
 
-STEPS(steps_one_walk, __success __log_level(4) __msg("processed 15 insns"), "")
+STEPS(steps_one_walk, __success __log_level(4) __msg("processed 14 insns"), "")
 /* the last write gives r6 its value again, and one path goes around that write */
 STEPS(steps_wrong_guess,
       __failure __msg("invalid write to stack"),

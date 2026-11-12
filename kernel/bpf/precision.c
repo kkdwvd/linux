@@ -920,9 +920,9 @@ int bpf_compute_deps(struct bpf_verifier_env *env, unsigned long *masks,
 			s = env->subprog_topo_order[k];
 			bits = prec->func[s].words * BITS_PER_LONG;
 			for (i = sub[s].postorder_start; i <= sub[s + 1].postorder_start; i++) {
-				/* it can be dead code, see push_unwind_exit() */
+				/* it can be dead code, see unwind_frame() */
 				idx = i < sub[s + 1].postorder_start ? env->cfg.insn_postorder[i] :
-				      sub[s].bail_insn;
+				      sub[s].exit_idx;
 				if (idx < 0)
 					break;
 				bitmap_zero(in, bits);

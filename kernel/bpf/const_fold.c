@@ -267,14 +267,11 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
 
 		for (r = 0; r < MAX_BPF_REG; r++)
 			ci_in[start][r] = unknown;
-		/*
-		 * The subprog gets there from where it is out of budget too, see
-		 * push_unwind_exit(). That is not an edge of the graph.
-		 */
-		for (r = 0; r < MAX_BPF_REG && env->subprog_info[i].bail_insn >= 0; r++)
-			ci_in[env->subprog_info[i].bail_insn][r] = unknown;
 	}
-	/* The same from the head of a loop to where the loop is left, once the loops are known. */
+	/*
+	 * The program gets from the head of a loop to where the loop is left, once the loops are
+	 * known. That is not an edge of the graph.
+	 */
 	for (i = 0; i < insn_cnt; i++) {
 		t = bpf_head_guard_target(env, i);
 		for (r = 0; r < MAX_BPF_REG && t >= 0; r++)
