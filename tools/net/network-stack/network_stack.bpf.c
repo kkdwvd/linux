@@ -137,6 +137,8 @@ __u64 tx_socks;		/* connections assigned to a xmit queue */
 __u64 tx_cgroup_id;
 __u64 tx_marked;
 bool tx_unmark;
+/* Percent of the --tx cgroup's connections to assign, picked at random. */
+__u32 tx_share = 100;
 
 /* A marked connection's sockops callback flags from before the mark. */
 struct {
@@ -629,6 +631,9 @@ int ns_sock_assign(struct bpf_sock_ops *skops)
 		   skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
 		return 1;
 	}
+	/* A marked connection was picked when it was marked. */
+	if (skops->op != BPF_SOCK_OPS_RTT_CB && bpf_get_prandom_u32() % 100 >= tx_share)
+		return 1;
 	cpu = bpf_get_smp_processor_id();
 	if (cpu >= NS_MAX_CPUS)
 		return 1;
@@ -674,6 +679,8 @@ int ns_mark_socks(struct bpf_iter__tcp *ctx)
 
 	if (sk->__sk_common.skc_state != TCP_ESTABLISHED ||
 	    sk->sk_cgrp_data.cgroup->kn->id != tx_cgroup_id)
+		return 0;
+	if (bpf_get_prandom_u32() % 100 >= tx_share)
 		return 0;
 	if (bpf_getsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags)) ||
 	    (flags & BPF_SOCK_OPS_RTT_CB_FLAG))
