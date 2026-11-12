@@ -8078,13 +8078,25 @@ static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
 	struct softnet_data *sd;
 	void *have;
-	int work;
+	int work, cpu;
 
 	local_bh_disable();
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 
 	sd = this_cpu_ptr(&softnet_data);
 	sd->in_napi_threaded_poll = true;
+
+	/* The poll owns @napi on this CPU with bottom halves disabled, as
+	 * softirq does once ____napi_schedule() has put it on the CPU's list:
+	 * let page_pool put the pages freed meanwhile in its direct cache.
+	 * Free the skbs other CPUs deferred to this one now, as
+	 * net_rx_action() does before each poll, so that the NAPI's own go
+	 * there too: a poll that completes lets the NAPI go before the
+	 * flush below.
+	 */
+	cpu = smp_processor_id();
+	WRITE_ONCE(napi->list_owner, cpu);
+	skb_defer_free_flush();
 
 	have = netpoll_poll_lock(napi);
 	work = __napi_poll(napi, repoll);
@@ -8105,6 +8117,12 @@ static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
 	 */
 	if (busy_poll)
 		gro_flush_normal(&napi->gro, HZ >= 1000);
+
+	/* Unless napi_complete_done() let the NAPI go, and maybe softirq
+	 * on another CPU took it since.
+	 */
+	if (READ_ONCE(napi->list_owner) == cpu)
+		WRITE_ONCE(napi->list_owner, -1);
 	local_bh_enable();
 
 	return work;
