@@ -115,6 +115,7 @@ static struct {
 	__u64 hold_us, spin_us, nap_us, rest_us;
 	__u64 softirq_pps;
 	__u64 tx_wait_us;
+	int tx_share;
 	__u64 tick_ms, interval_ms, duration_s;
 	__u64 gap_us;
 	int hi, target, lo, panic;
@@ -128,6 +129,7 @@ static struct {
 	.nap_us = 50,
 	.rest_us = 4000,
 	.tx_wait_us = 100,
+	.tx_share = 100,
 	.tick_ms = 100,
 	.interval_ms = 1000,
 	.gap_us = 5000,
@@ -1382,6 +1384,8 @@ static void usage(void)
 "  --tx-wait-us N         with --irq: the longest park with sockets queued, after which\n"
 "                         senders transmit for themselves until packets return\n"
 "                         (default 100, 0 to have them always transmit with --irq)\n"
+"  --tx-share PCT         assign this share of the connections, picked at random\n"
+"                         (default 100)\n"
 "\n"
 "Controller:\n"
 "  --tick-ms N            period (default 100)\n"
@@ -1409,7 +1413,7 @@ enum {
 	OPT_DEV = 256, OPT_CPUS, OPT_CPUSET, OPT_THREAD_CGROUP, OPT_NAPIS_PER_THREAD,
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
-	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_TX_WAIT_US, OPT_SOFTIRQ_PPS,
+	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_TX_WAIT_US, OPT_TX_SHARE, OPT_SOFTIRQ_PPS,
 };
 
 static const struct option longopts[] = {
@@ -1422,6 +1426,7 @@ static const struct option longopts[] = {
 	{ "static", no_argument, NULL, OPT_STATIC },
 	{ "tx", required_argument, NULL, OPT_TX },
 	{ "tx-wait-us", required_argument, NULL, OPT_TX_WAIT_US },
+	{ "tx-share", required_argument, NULL, OPT_TX_SHARE },
 	{ "tick-ms", required_argument, NULL, OPT_TICK_MS },
 	{ "hi", required_argument, NULL, OPT_HI },
 	{ "target", required_argument, NULL, OPT_TARGET },
@@ -1465,6 +1470,7 @@ int main(int argc, char **argv)
 		case OPT_STATIC: opt.fixed = true; break;
 		case OPT_TX: opt.tx = optarg; break;
 		case OPT_TX_WAIT_US: opt.tx_wait_us = strtoull(optarg, NULL, 0); break;
+		case OPT_TX_SHARE: opt.tx_share = atoi(optarg); break;
 		case OPT_TICK_MS: opt.tick_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_HI: opt.hi = atoi(optarg); break;
 		case OPT_TARGET: opt.target = atoi(optarg); break;
@@ -1511,8 +1517,12 @@ int main(int argc, char **argv)
 	if (opt.softirq_pps)
 		skel->bss->softirq_ns = NS_SOFTIRQ_WAKE * 1000000000ULL / opt.softirq_pps;
 	skel->rodata->tx_enabled = !!opt.tx;
-	if (opt.tx)
+	if (opt.tx_share < 1 || opt.tx_share > 100)
+		die("--tx-share must be 1 to 100");
+	if (opt.tx) {
 		skel->bss->tx_wait_ns = opt.tx_wait_us * 1000;
+		skel->data->tx_share = opt.tx_share;
+	}
 	if (!opt.tx) {
 		/* Their kfuncs are missing on a kernel without TCP xmit queues. */
 		bpf_program__set_autoload(skel->progs.ns_txq_bind, false);
