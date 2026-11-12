@@ -5661,4 +5661,33 @@ __naked void known_sum_three_trips(void)
 	SUM_FROM("0");
 }
 
+__naked __noinline __used
+static unsigned long counts_to_ten(void)
+{
+	asm volatile (
+	"r0 = 0;"
+"1:	r0 += 1;"
+	"if r0 < 10 goto 1b;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/*
+ * The first pass takes the edge of may_goto in every loop: it knows the trip count when it ends.
+ * This loop gets no may_goto, so the subprog is not left there and its call is no site. The prog
+ * loads in one pass and has no landing pad, also where no frame can unwind: without a JIT.
+ */
+SEC("socket")
+__success __retval(10) __log_level(2)
+__msg("has trip count 10") __not_msg("{{landing pad of|pass 1}}")
+__xlated("0: call pc+1")
+__xlated("1: exit")
+__naked void counted_loop_in_subprog(void)
+{
+	asm volatile (
+	"call counts_to_ten;"
+	"exit;"
+	::: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";

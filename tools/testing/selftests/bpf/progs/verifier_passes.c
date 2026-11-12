@@ -1621,6 +1621,16 @@ __naked void guess_skips_sum(void)
 	NO_CONSTANT_STEP(+=, 1000, 499500);
 }
 
+/* The path that skips the trips is marked in the log of level 2. A pass that peels them follows. */
+SEC("tc")
+__description("failing_path: level 2 marks the path that skips the trips of a sum as a guess")
+__success __log_level(2)
+__msg("path-sensitive run after pass 0") __msg("this path has a guess") __msg("pass 1")
+__naked void guess_of_sum_in_level_2(void)
+{
+	NO_CONSTANT_STEP(+=, 1000, 499500);
+}
+
 SEC("tc")
 __description("failing_path: a guess skips the trips of xor")
 __success __retval(0)

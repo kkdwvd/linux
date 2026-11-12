@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
+#include <sys/resource.h>
 #include "verifier_unwind.skel.h"
 #include "unwind_attach.skel.h"
 
@@ -84,6 +85,33 @@ static void helper_with_pad(void)
 	unwind_attach__destroy(skel);
 }
 
+/* An extension of an LSM prog whose time slice is over denies */
+static void extension_of_lsm_prog(void)
+{
+	struct unwind_attach *tgt = unwind_attach__open(), *ext = unwind_attach__open();
+
+	if (!ASSERT_OK_PTR(tgt, "open tgt") || !ASSERT_OK_PTR(ext, "open ext"))
+		goto out;
+	bpf_program__set_autoload(tgt->progs.lsm_setnice, true);
+	if (!ASSERT_OK(unwind_attach__load(tgt), "load lsm_setnice") ||
+	    !ASSERT_OK(unwind_attach__attach(tgt), "attach lsm_setnice"))
+		goto out;
+	tgt->bss->lsm_pid = getpid();
+	ASSERT_OK(setpriority(PRIO_PROCESS, 0, 0), "setpriority");
+
+	bpf_program__set_autoload(ext->progs.freplace_policy_spins, true);
+	bpf_program__set_attach_target(ext->progs.freplace_policy_spins,
+				       bpf_program__fd(tgt->progs.lsm_setnice), "lsm_policy");
+	if (!ASSERT_OK(unwind_attach__load(ext), "load freplace_policy_spins") ||
+	    !ASSERT_OK(unwind_attach__attach(ext), "attach freplace_policy_spins"))
+		goto out;
+	ASSERT_EQ(setpriority(PRIO_PROCESS, 0, 0), -1, "setpriority");
+	ASSERT_EQ(errno, EPERM, "errno");
+out:
+	unwind_attach__destroy(ext);
+	unwind_attach__destroy(tgt);
+}
+
 void test_unwind_attach(void)
 {
 	struct verifier_unwind *tgt;
@@ -130,6 +158,7 @@ void test_unwind_attach(void)
 	attach(plain_fd, "global_never_unwinds", "freplace_unwinds",
 	       "unwind_exit in the main program of an extension", 0);
 	ASSERT_EQ(run(tgt_fd), 15, "retval");
+	extension_of_lsm_prog();
 
 	/*
 	 * The pad of the main prog calls the exception callback and leaves with

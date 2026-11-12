@@ -46,6 +46,33 @@ __naked unsigned long freplace_unwinds(void)
 	);
 }
 
+volatile unsigned long forever = 1;
+
+int lsm_pid;
+
+__noinline int lsm_policy(int nice)
+{
+	return forever ? 0 : nice;
+}
+
+SEC("?lsm/task_setnice")
+int BPF_PROG(lsm_setnice, void *task, int nice, int ret)
+{
+	if (bpf_get_current_pid_tgid() >> 32 != lsm_pid)
+		return ret;
+	ret = lsm_policy(nice);
+	return ret < 0 && ret >= -4095 ? ret : 0;
+}
+
+/* Every path allows. Unwound it returns what the prog that it extends returns then: -EPERM. */
+SEC("?freplace/lsm_policy")
+int freplace_policy_spins(int nice)
+{
+	while (forever)
+		;
+	return 0;
+}
+
 /* Not naked: the argument has to have a name in BTF */
 __noinline int throws_cb(__u64 cookie)
 {

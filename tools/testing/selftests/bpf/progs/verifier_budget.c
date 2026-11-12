@@ -28,6 +28,10 @@
 
 extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
+extern void bpf_local_irq_save(unsigned long *flags) __ksym;
+extern void bpf_local_irq_restore(unsigned long *flags) __ksym;
+
+extern void bpf_throw(__u64 cookie) __ksym;
 
 extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
@@ -36,6 +40,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __ksym;
 /* The verifier doesn't know what is in there */
 unsigned long zero;
 unsigned long one = 1;
+unsigned long no_index = 4;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -115,6 +120,58 @@ __naked void loop_in_main_retval(void)
 	);
 }
 
+/* 0 is BPF_OK: the packet would go on */
+SEC("lwt_in")
+__description("budget: a loop in the main prog of lwt ends it with BPF_DROP")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+int loop_in_main_lwt(struct __sk_buff *skb)
+{
+	while (*(volatile unsigned long *)&one)
+		;
+	return 7;
+}
+
+/* The prog has no exit insn. Out of budget it is unwound all the same. */
+SEC("tc")
+__description("budget: a loop that is left only through bpf_throw()")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+int loop_left_through_throw(struct __sk_buff *skb)
+{
+	for (;;)
+		if (!*(volatile unsigned long *)&one)
+			bpf_throw(3);
+}
+
+/* 0 lets the operation go on */
+SEC("lsm/file_mprotect")
+__description("budget: a loop in the main prog on an LSM hook ends it with -EPERM")
+__arch_x86_64
+__arch_arm64
+__success
+__xlated("...")
+__xlated("r0 = -13")
+__xlated("exit")
+__xlated("r0 = -1")
+__xlated("exit")
+__naked void loop_in_main_lsm(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = -13;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
 /*
  * rcu_read_lock(); do { p = lookup(); } while (!p); v = *p; rcu_read_unlock(); return v;
  * may_goto must not go where the loop goes when it's over: p may be NULL. It ends the prog, by way
@@ -156,6 +213,112 @@ __naked void exit_of_loop_checks_null_rcu(void)
 	);
 }
 
+struct locked {
+	struct bpf_spin_lock lock;
+	long t[4];
+};
+
+struct locked locked_global SEC(".data.locked") __hidden;
+
+/* r6 = a value of @map */
+#define LOOKUP(map)					\
+		"r1 = 0;"				\
+		"*(u32 *)(r10 - 4) = r1;"		\
+		"r2 = r10;"				\
+		"r2 += -4;"				\
+		"r1 = %[" #map "] ll;"			\
+		"call %[bpf_map_lookup_elem];"		\
+		"if r0 != 0 goto +1;"			\
+		"exit;"					\
+		"r6 = r0;"
+
+/* may_goto must not go where the loop goes when it's over: i may be anything */
+SEC("tc")
+__description("budget: a spin lock is held and the code behind the loop counts on its exit")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = 0x{{.*}}")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+int lock_in_global(void *ctx)
+{
+	unsigned long i;
+	long v;
+
+	bpf_spin_lock(&locked_global.lock);
+	do {
+		i = *(volatile unsigned long *)&no_index;
+	} while (i > 3);
+	v = locked_global.t[i];
+	bpf_spin_unlock(&locked_global.lock);
+	return v + 1;
+}
+
+#define SAVES_IRQ_FLAGS(name)				\
+__naked __noinline __used				\
+static unsigned long name(unsigned long *flags)		\
+{							\
+	asm volatile (					\
+		"call %[bpf_local_irq_save];"		\
+		"r0 = 0;"				\
+		"exit;"					\
+		:					\
+		: __imm(bpf_local_irq_save)		\
+	);						\
+}
+
+SAVES_IRQ_FLAGS(saves_first)
+SAVES_IRQ_FLAGS(saves_second)
+
+#define IRQ_FLAGS(off, func)				\
+		"r1 = r10;"				\
+		"r1 += " #off ";"			\
+		"call " #func ";"
+
+/* Irq flags are restored youngest first, and a landing pad has one order */
+SEC("tc")
+__description("budget: a loop holds irq flags which were saved in two orders")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the order of the releases differs")
+__naked void loop_with_irq_flags_in_two_orders(void)
+{
+	asm volatile (
+		"r7 = %[one] ll;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"if r6 == 0 goto 1f;"
+	IRQ_FLAGS(-8, saves_first)
+	IRQ_FLAGS(-16, saves_second)
+		"goto 2f;"
+	"1:"
+	IRQ_FLAGS(-16, saves_second)
+	IRQ_FLAGS(-8, saves_first)
+	"2:"
+		"r1 = *(u64 *)(r7 + 0);"
+		"if r1 != 0 goto 2b;"
+		"if r6 == 0 goto 3f;"
+	IRQ_FLAGS(-16, %[bpf_local_irq_restore])
+	IRQ_FLAGS(-8, %[bpf_local_irq_restore])
+		"goto 4f;"
+	"3:"
+	IRQ_FLAGS(-8, %[bpf_local_irq_restore])
+	IRQ_FLAGS(-16, %[bpf_local_irq_restore])
+	"4:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one),
+		  __imm_addr(zero),
+		  __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
 __naked __noinline __used
 static unsigned long spins(void)
 {
@@ -187,6 +350,258 @@ static unsigned long spins_caught(void)
 	);
 }
 
+__naked __noinline __used
+static unsigned long counts_to_ten(void)
+{
+	asm volatile (
+		"r0 = 0;"
+	"1:"
+		"r0 += 1;"
+		"if r0 < 10 goto 1b;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * The first pass takes the edge of may_goto in every loop: it knows the trip count when it ends.
+ * A loop that has one gets no may_goto, so its function is not left there, and what a state
+ * found on that way does not count: here, that the caller holds more than a landing pad
+ * releases, 9 RCU sections.
+ */
+SEC("tc")
+__description("budget: a counted loop in a subprog, no landing pad would do for the caller")
+__arch_x86_64 __arch_arm64
+__success __retval(10)
+__log_level(2)
+__not_msg("{{landing pad of|pass 1}}")
+__xlated("8: call kernel-function")
+__xlated("9: call pc+")
+__xlated("10: r6 = r0")
+__xlated("11: call kernel-function")
+__naked void counted_loop_no_pad_will_do(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"call counts_to_ten;"
+		"r6 = r0;"
+		".rept 9;"
+		"call %[bpf_rcu_read_unlock];"
+		".endr;"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+/* r0 = 0; do r0 += r1; while (r0 != r2); */
+__naked __noinline __used
+static unsigned long counts_by(void)
+{
+	asm volatile (
+		"r0 = 0;"
+	"1:"
+		"r0 += r1;"
+		"if r0 != r2 goto 1b;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * Each call alone has a trip count. The two calls joined have none: the step is 1 or -1 and the
+ * end is one of two numbers, with nothing that says which goes with which. So the loop of the
+ * joined calls gets may_goto, the function is left there, and its caller holds more than a landing
+ * pad releases. The calls have to be kept apart for that: then no call is left at may_goto.
+ */
+SEC("tc")
+__description("budget: two calls of a counted loop, only their join has no trip count")
+__arch_x86_64 __arch_arm64
+__success __retval(7)
+__naked void later_counted_loop_no_pad_will_do(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"r1 = 1;"
+		"r2 = 1000000;"
+		"call counts_by;"
+		"r6 = r0;"
+		"r1 = -1;"
+		"r2 = -999993;"
+		"call counts_by;"
+		"r6 += r0;"
+		".rept 9;"
+		"call %[bpf_rcu_read_unlock];"
+		".endr;"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+/* It calls itself r1 times */
+__naked __noinline __used
+static unsigned long calls_itself(void)
+{
+	asm volatile (
+		"if r1 == 0 goto 1f;"
+		"r1 += -1;"
+		"call calls_itself;"
+	"1:	r0 = 0;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* Returns 5. If r1 * r1 is not r2 it calls a function that calls itself first. One exit. */
+__naked __noinline __used
+static unsigned long recurses_unless_square(void)
+{
+	asm volatile (
+		"r3 = r1;"
+		"r3 *= r1;"
+		"if r3 == r2 goto 1f;"
+		"r1 = 3;"
+		"call calls_itself;"
+	"1:	r0 = 5;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * No call gets to the function that calls itself: 2 * 2 is 4 and 3 * 3 is 9. The two calls joined
+ * do, and that function is left where it checks its recursion, which is no insn of the program and
+ * no loop: the call of it is where the frame above is left. The jump that skips that call is what
+ * has to be kept apart.
+ */
+SEC("tc")
+__description("budget: two calls that skip a recursion, only their join gets to it")
+__arch_x86_64 __arch_arm64
+__success __retval(10)
+__naked void recursion_only_in_join(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"r1 = 2;"
+		"r2 = 4;"
+		"call recurses_unless_square;"
+		"r6 = r0;"
+		"r1 = 3;"
+		"r2 = 9;"
+		"call recurses_unless_square;"
+		"r6 += r0;"
+		".rept 9;"
+		"call %[bpf_rcu_read_unlock];"
+		".endr;"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+/* r0 = 0; for (;;) for (r4 = 0; r4 < 2; r4++) { r0 += r1; if (r0 == r2) return r0; } */
+__naked __noinline __used
+static unsigned long counts_by_in_pairs(void)
+{
+	asm volatile (
+		"r0 = 0;"
+	"1:	r4 = 0;"
+	"2:	r0 += r1;"
+		"if r0 == r2 goto 3f;"
+		"r4 += 1;"
+		"if r4 < 2 goto 2b;"
+		"goto 1b;"
+	"3:	exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * The same where the loop that gets may_goto has no jump of its own that leaves it: its way out is
+ * in the loop inside it, which has a trip count whatever the arguments are.
+ */
+SEC("tc")
+__description("budget: two calls of a counted loop that is left from a loop inside it")
+__arch_x86_64 __arch_arm64
+__success __retval(2)
+__naked void later_nested_counted_loop_no_pad_will_do(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"r1 = 1;"
+		"r2 = 5;"
+		"call counts_by_in_pairs;"
+		"r6 = r0;"
+		"r1 = -1;"
+		"r2 = -3;"
+		"call counts_by_in_pairs;"
+		"r6 += r0;"
+		".rept 9;"
+		"call %[bpf_rcu_read_unlock];"
+		".endr;"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+__naked __noinline __used
+static unsigned long unwinds_at_once(void)
+{
+	asm volatile (
+		"r0 = 0;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog has unwind_exit of its own. That is no site which a state would have noted when the
+ * conflict of its call is an error of the pass: the log names it all the same.
+ */
+SEC("tc")
+__description("budget: no landing pad would do for the call of a subprog that has unwind_exit")
+__arch_x86_64 __arch_arm64
+__failure
+__msg("what the call at {{[0-9]+}} calls is left at: unwind_exit")
+__msg("landing pad of call at {{[0-9]+}} for unwind_exit: conflict: too much is held")
+__naked void unwind_exit_no_pad_will_do(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"call unwinds_at_once;"
+		".rept 9;"
+		"call %[bpf_rcu_read_unlock];"
+		".endr;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
 SEC("socket")
 __description("budget: a loop in a subprog unwinds, the verifier adds kgoto")
 __arch_x86_64
@@ -210,6 +625,82 @@ __naked void loop_in_subprog(void)
 		"call spins;"
 		"exit;"
 		::: __clobber_all
+	);
+}
+
+/*
+ * 16 bits don't get may_goto and kgoto to the landing pad that they share. gotol does it for
+ * may_goto. kgoto has 32 bits: nothing is added to the way from the call to the next insn.
+ */
+SEC("socket")
+__description("budget: a loop and a call that are far from their landing pad")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("goto pc+1")
+__xlated("gotol pc+33006")
+__xlated("if r1 != 0x0 goto pc-")
+__xlated("call pc+")
+__xlated("kgoto pc+33003")
+__xlated("call kernel-function")
+__naked void far_from_the_pad(void)
+{
+	asm volatile (
+		"call %[bpf_rcu_read_lock];"
+		"r2 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"call spins;"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		".rept 33000;"
+		"r0 += 1;"
+		".endr;"
+		"exit;"
+		:
+		: __imm_addr(zero),
+		  __imm(bpf_rcu_read_lock),
+		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+__noinline int global_spins(void)
+{
+	while (*(volatile unsigned long *)&one)
+		;
+	return 7;
+}
+
+/* A global subprog is verified after its callers. They find out late that it unwinds. */
+SEC("socket")
+__description("budget: a loop in a global subprog, the caller is in an RCU section")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("call pc+")
+__xlated("kgoto pc+4")
+__xlated("...")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__naked void loop_in_global(void)
+{
+	asm volatile (
+		"call %[bpf_rcu_read_lock];"
+		"call global_spins;"
+		"r6 = r0;"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock),
+		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
 	);
 }
 
@@ -701,6 +1192,46 @@ __naked void callback_arms_itself(void)
 		"exit;"
 		:
 		: __imm_addr(timers), __imm_addr(arms_itself), __imm(bpf_map_lookup_elem),
+		  __imm(bpf_timer_set_callback)
+		: __clobber_all
+	);
+}
+
+static __used int spins_in_rcu(void *map, int *key, void *value)
+{
+	bpf_rcu_read_lock();
+	while (*(volatile unsigned long *)&one)
+		;
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* The kernel calls the callback: there is nothing to unwind to */
+SEC("socket")
+__description("budget: the landing pad of a callback that only the kernel calls ends in exit")
+__arch_x86_64
+__arch_arm64
+__success
+__xlated("...")
+__xlated("= r13")
+__xlated("...")
+__xlated("call kernel-function")
+__xlated("{{[rw]}}0 = 0")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("{{[0-9]+}}: exit")
+__naked void loop_in_timer_callback(void)
+{
+	asm volatile (
+	LOOKUP(timers)
+		"r1 = r6;"
+		"r2 = %[spins_in_rcu] ll;"
+		"call %[bpf_timer_set_callback];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(timers), __imm_addr(spins_in_rcu), __imm(bpf_map_lookup_elem),
 		  __imm(bpf_timer_set_callback)
 		: __clobber_all
 	);
@@ -1424,6 +1955,8 @@ void __kfunc_btf_root(void)
 {
 	bpf_rcu_read_lock();
 	bpf_rcu_read_unlock();
+	bpf_local_irq_save(0);
+	bpf_local_irq_restore(0);
 	bpf_iter_num_new(0, 0, 0);
 	bpf_iter_num_next(0);
 	bpf_iter_num_destroy(0);
