@@ -537,6 +537,7 @@ static bool is_ptr_cast_function(enum bpf_func_id func_id)
 }
 
 static bool is_sync_callback_calling_kfunc(u32 btf_id);
+static bool insn_has_cb_pad(const struct bpf_insn *insn);
 static bool is_async_callback_calling_kfunc(u32 btf_id);
 static bool is_call_rcu_kfunc(u32 btf_id);
 static bool is_callback_calling_kfunc(u32 btf_id);
@@ -3367,6 +3368,16 @@ static int record_callx_edge(struct bpf_verifier_env *env, int caller, int calle
 	return 0;
 }
 
+/*
+ * callx, or a helper that has a pad for its callback: it leaves like the callback did. To the rules
+ * about who can unwind both are a call of a subprog whose address is taken. The main pass knows
+ * which, see record_callx_edge().
+ */
+static bool is_indirect_call(const struct bpf_insn *insn)
+{
+	return bpf_is_callx(insn) || insn_has_cb_pad(insn);
+}
+
 /* What calls @subprog at this insn has no landing pad: it doesn't expect @subprog to unwind */
 static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 {
@@ -3381,22 +3392,39 @@ static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 	return 0;
 }
 
+static bool callee_did_unwind(struct bpf_verifier_env *env, int insn_idx)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	struct bpf_subprog_info *si = env->subprog_info;
+	u32 e;
+
+	if (bpf_pseudo_call(insn))
+		return si[bpf_find_subprog(env, insn_idx + insn->imm + 1)].did_unwind;
+	if (!is_indirect_call(insn))
+		return false;
+	/* the edges that the pass has so far */
+	for (e = bpf_find_containing_subprog(env, insn_idx)->callx_edge; e;
+	     e = env->callx_edges[e - 1].next)
+		if (si[env->callx_edges[e - 1].callee].did_unwind)
+			return true;
+	return false;
+}
+
 /*
  * A subprog unwinds. What calls it without unwind_goto is unwound in turn, and so on. The callers
  * of a global subprog among them have to know, see unwind_frame(): one more round will do for all.
  */
 static void mark_unwind_above(struct bpf_verifier_env *env)
 {
-	struct bpf_subprog_info *si = env->subprog_info, *caller;
 	const struct bpf_insn *insn = env->prog->insnsi;
+	struct bpf_subprog_info *caller;
 	bool changed;
 	int i;
 
 	do {
 		changed = false;
 		for (i = 0; i < env->prog->len; i++) {
-			if (!bpf_pseudo_call(&insn[i]) || bpf_is_unwind_goto(&insn[i + 1]) ||
-			    !si[bpf_find_subprog(env, i + insn[i].imm + 1)].did_unwind)
+			if (!callee_did_unwind(env, i) || bpf_is_unwind_goto(&insn[i + 1]))
 				continue;
 			caller = bpf_find_containing_subprog(env, i);
 			changed |= !caller->did_unwind;
@@ -6025,8 +6053,8 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	struct bpf_insn *insn = env->prog->insnsi;
 	int cnt = env->subprog_cnt, i, j, s, err;
 	struct bpf_call_graph cg;
-	/* the program calls the subprog, or callx may | a helper may | such a subprog gets to it */
-	enum { CALLED = 1, CB = 2, BELOW_CB = 4 };
+	/* the program calls the subprog, or its address may get to an indirect call */
+	enum { CALLED = 1 };
 
 	/* callx calls node 'cnt', which calls each subprog whose address is taken */
 	err = bpf_call_graph_init(&cg, cnt + 1);
@@ -6054,7 +6082,7 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				if (bpf_pseudo_call(&insn[i]) ||
 				    !func_is_kept_for_later(env, i, si[s + 1].start)) {
 					err = bpf_call_graph_add(&cg, s, j);
-					cg.marks[j] |= bpf_pseudo_call(&insn[i]) ? CALLED : CB;
+					cg.marks[j] |= CALLED;
 				}
 				if (bpf_pseudo_func(&insn[i]))
 					si[j].addr_taken = true;
@@ -6078,18 +6106,12 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 
 	bpf_call_graph_sort(&cg, 0);
 
-	/* A helper doesn't expect its callback to unwind, so what the callback calls cannot either */
-	for (s = 0; s < cnt; s++)
-		if (cg.marks[s] & CB)
-			cg.marks[s] |= BELOW_CB;
-	bpf_call_graph_mark_callees(&cg, BELOW_CB);
-
 	/* What only the kernel calls returns to it: the main prog, the callback of a timer. */
 	for (s = 0; s < cnt; s++) {
 		si[s].bail_unwinds = si[s].can_unwind ||
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
-				      (cg.marks[s] & (CALLED | BELOW_CB)) == CALLED);
+				      (cg.marks[s] & CALLED));
 		si[s].did_unwind = si[s].can_unwind;
 	}
 
@@ -11513,10 +11535,11 @@ static bool kfunc_has_cb_pad(u32 btf_id)
 	return is_bpf_rbtree_add_kfunc(btf_id);
 }
 
-static bool insn_has_cb_pad(struct bpf_insn *insn)
+static bool insn_has_cb_pad(const struct bpf_insn *insn)
 {
-	return (bpf_helper_call(insn) && helper_has_cb_pad(insn->imm)) ||
-	       (bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm));
+	return BPF_HAS_CB_PADS &&
+	       ((bpf_helper_call(insn) && helper_has_cb_pad(insn->imm)) ||
+		(bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm)));
 }
 
 /*
@@ -11527,28 +11550,18 @@ static bool insn_has_cb_pad(struct bpf_insn *insn)
  * calls the callback with bpf_call_cb(), drops what it holds when the callback
  * unwinds and leaves to the pad of its own caller with the r0 of the callback.
  * So a call with such a callback that can unwind is a call of something that
- * can unwind, and unwind_goto has to follow it.
+ * can unwind: unwind_goto follows it, or the verifier adds it, as after the call
+ * of a subprog, see check_unwound_return().
  *
- * A callback has no unwind_exit and unwinds all the same when it is recursive
- * and unwind_goto follows every call of it that mark_recursive_subprogs() saw:
- * its check of the recursion leaves with unwind_exit then, see
- * check_recursion_guard(). The call of a helper that got the callback from a
- * table of functions is not one of those calls. It is known here.
+ * A callback has no unwind_exit and unwinds all the same when it is recursive:
+ * its check of the recursion leaves with unwind_exit, see
+ * check_recursion_guard(), also when a helper got the callback from a table of
+ * functions.
  */
-static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			   int insn_idx, int subprog)
+static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn, int subprog)
 {
 	if (!bpf_subprog_unwinds(&env->subprog_info[subprog]))
 		return 0;
-	if (!bpf_is_unwind_goto(insn + 1)) {
-		if (bpf_helper_call(insn))
-			verbose(env, "no unwind_goto after the call of %s()\n",
-				func_id_name(insn->imm));
-		else
-			verbose(env, "no unwind_goto after the call of the kfunc at insn %d\n",
-				insn_idx);
-		return -EINVAL;
-	}
 	/* The helpers have pads with asm goto outputs only, see bpf_call_cb() */
 	if (!BPF_HAS_CB_PADS) {
 		verbose(env, "callback cannot unwind: the helpers have no pads\n");
@@ -11643,11 +11656,10 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	else
 		env->subprog_info[subprog].is_other_cb = true;
 
-	err = check_cb_unwind(env, insn, insn_idx, subprog);
+	err = check_cb_unwind(env, insn, subprog);
 	if (err)
 		return err;
-	/* the helper has no pad, or nothing takes the program from its call to a pad */
-	if (!insn_has_cb_pad(insn) || !bpf_is_unwind_goto(insn + 1)) {
+	if (!insn_has_cb_pad(insn)) {
 		err = subprog_cannot_unwind(env, subprog);
 		if (err)
 			return err;
@@ -12628,10 +12640,10 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		/*
 		 * A callback returns into the helper that called it, and to the
 		 * pad of the helper when the helper has one. check_cb_unwind()
-		 * has seen to that, and to the unwind_goto after the call of
-		 * the helper, where the helper leaves to right away, with the
-		 * r0 of the callback as it is: the pad gets its state, as the
-		 * pad after a subprog call does.
+		 * has seen to that. From there the helper leaves right away to
+		 * the unwind_goto after its call, with the r0 of the callback
+		 * as it is: the pad gets its state, as the pad after a subprog
+		 * call does.
 		 */
 		err = check_unwound_return(env, callee->callsite, callee->subprogno);
 		if (err)
@@ -16138,14 +16150,21 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		 * unwinds, the destructors of its fields included, which is a
 		 * bpf_obj_drop() under the rule above. The comparator unwinds
 		 * from the check of its recursion too, see check_cb_unwind().
+		 * Any other comparator without unwind_exit doesn't get one
+		 * there.
 		 */
-		if (bpf_subprog_unwinds(&env->subprog_info[meta.subprogno]) && nmi_prog) {
+		if (nmi_prog) {
 			struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
 			if (struct_meta && btf_record_has_nmi_unsafe_fields(struct_meta->record)) {
-				verbose(env,
-					"%s with a comparator that unwinds cannot be used in tracing programs on types with NMI unsafe fields\n",
-					func_name);
-				return -EINVAL;
+				if (bpf_subprog_unwinds(&env->subprog_info[meta.subprogno])) {
+					verbose(env,
+						"%s with a comparator that unwinds cannot be used in tracing programs on types with NMI unsafe fields\n",
+						func_name);
+					return -EINVAL;
+				}
+				err = subprog_cannot_unwind(env, meta.subprogno);
+				if (err)
+					return err;
 			}
 		}
 		/*
@@ -16154,12 +16173,16 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		 * kernel object runs code of its owner, and all bpf_spin_locks of a cpu
 		 * keep the irq flags in one word, so none may take another one.
 		 */
-		if (bpf_subprog_unwinds(&env->subprog_info[meta.subprogno]) &&
-		    bpf_obj_free_runs_dtor(meta.arg_btf, meta.arg_btf_id)) {
-			verbose(env,
-				"%s with a comparator that unwinds cannot be used on types that take a lock when freed\n",
-				func_name);
-			return -EINVAL;
+		if (bpf_obj_free_runs_dtor(meta.arg_btf, meta.arg_btf_id)) {
+			if (bpf_subprog_unwinds(&env->subprog_info[meta.subprogno])) {
+				verbose(env,
+					"%s with a comparator that unwinds cannot be used on types with a list head, an rb root or a referenced kptr\n",
+					func_name);
+				return -EINVAL;
+			}
+			err = subprog_cannot_unwind(env, meta.subprogno);
+			if (err)
+				return err;
 		}
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rbtree_add_callback_state);
@@ -21624,7 +21647,7 @@ static bool frame_holds_resources(const struct bpf_verifier_state *st)
  *
  * False when it cannot:
  * - The subprog cannot leave with unwind_exit, see bail_unwinds.
- * - A helper that calls a callback doesn't expect it to unwind.
+ * - A helper that has no pad for its callback doesn't expect it to unwind.
  * Then the program goes on along a path that it has, like after may_goto of
  * its own. It releases what it holds there.
  *
@@ -21643,7 +21666,7 @@ static bool frame_can_unwind(struct bpf_verifier_env *env, const struct bpf_veri
 	/* a landing pad has no barrier: only a loader with CAP_PERFMON gets one */
 	if (!bpf_may_unwind(env))
 		return false;
-	if (frame->in_callback_fn)
+	if (frame->in_callback_fn && !sub->bail_unwinds)
 		return false;
 	return frame_is_top(st) || sub->bail_unwinds || or_exit;
 }

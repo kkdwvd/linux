@@ -7,6 +7,7 @@
  *   - may_goto that the verifier adds
  *   - the check at the entry of a recursive subprog
  *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
+ *   - a call of a helper whose callback comes back that way
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
  * then 'r0 = 0' and unwind_exit, or exit in a frame that cannot unwind.
@@ -78,6 +79,10 @@
  *						      pad: call bpf_rcu_read_unlock
  *							   r0 = 0
  *							   exit
+ *
+ * With bpf_loop(n, wait, ...) in place of wait() it is the same code. The helper is a frame of the
+ * kernel between the two. It has a pad of its own, see bpf_call_cb(): unwind_exit of the callback
+ * goes there, the helper releases what it holds itself and goes to unwind_goto after its call.
  *
  * A section has no handle: the plan has their number. Every other resource that the frame
  * acquired is an ENTRY of the plan. Its release takes a handle: the address of the lock, of

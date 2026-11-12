@@ -1369,7 +1369,7 @@ struct bpf_subprog_info {
 	bool on_its_own: 1;
 	/*
 	 * It can leave with unwind_exit: unwind_goto follows every call of it, or the verifier
-	 * adds it. Not after the call of a helper, see subprog_cannot_unwind().
+	 * adds it. Not after the call of a helper that has no pad, see subprog_cannot_unwind().
 	 */
 	bool bail_unwinds: 1;
 	/*

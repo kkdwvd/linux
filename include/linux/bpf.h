@@ -182,6 +182,7 @@ struct bpf_map_ops {
 	int (*map_set_for_each_callback_args)(struct bpf_verifier_env *env,
 					      struct bpf_func_state *caller,
 					      struct bpf_func_state *callee);
+	/* It has a pad for callback_fn, which may unwind: see bpf_call_cb() */
 	long (*map_for_each_callback)(struct bpf_map *map,
 				     bpf_callback_t callback_fn,
 				     void *callback_ctx, u64 flags);
