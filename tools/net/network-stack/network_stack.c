@@ -728,8 +728,7 @@ static void active_changed(void)
 }
 
 /*
- * Run ns_mark_socks() over every TCP socket: mark the --tx cgroup's existing
- * connections for assignment, or with tx_unmark take the marks back.
+ * Run ns_mark_socks() over every TCP socket, in the mode tx_mark_mode says.
  */
 static void run_mark_iter(void)
 {
@@ -754,6 +753,52 @@ static void run_mark_iter(void)
 }
 
 /*
+ * Give marked connections up to @max_ms to have their RTT callback, until the
+ * assignments made and taken back stop changing for 300 ms. The connections
+ * that carry traffic are sampled within milliseconds; idle ones may never be.
+ */
+static void settle_marks(__u64 max_ms)
+{
+	__u64 t0, last, seen, cur;
+
+	t0 = last = now_ns();
+	seen = skel->bss->tx_socks + skel->bss->tx_unassigned;
+	while (now_ns() - t0 < max_ms * 1000000ULL) {
+		usleep(50000);
+		cur = skel->bss->tx_socks + skel->bss->tx_unassigned;
+		if (cur != seen) {
+			seen = cur;
+			last = now_ns();
+		} else if (now_ns() - last > 300000000ULL) {
+			break;
+		}
+	}
+}
+
+/*
+ * A connection keeps its queue's index after the tool is gone, and a later run
+ * that binds the same queue would take its xmit work over: one that marked a
+ * share of 25% of the connections moved almost all of them, left assigned by
+ * a run before it. Mark every assigned connection to lose its
+ * assignment on its next RTT sample, give the active ones up to 2 s for that,
+ * with ns_sock_assign() attached and assigning nothing new, and put the flags
+ * of the rest back. Those keep their index; the next run's start takes it
+ * back from the ones it does not pick.
+ */
+static void tx_unassign_all(void)
+{
+	if (!opt.tx)
+		return;
+	skel->bss->tx_mark_mode = NS_MARK_EXIT;
+	run_mark_iter();
+	settle_marks(2000);
+	skel->bss->tx_mark_mode = NS_MARK_RESTORE;
+	run_mark_iter();
+	fprintf(stderr, "network-stack: %llu connections lost their xmit queue assignment\n",
+		(unsigned long long)skel->bss->tx_unassigned);
+}
+
+/*
  * Bind the xmit queues and start assigning the connections of the --tx cgroup
  * to them.
  */
@@ -768,7 +813,6 @@ static void start_tx(void)
 		txq_owner[i] = -1;
 		skel->bss->cpu_txq[threads[i].cpu] = i + 1;
 	}
-	assign_txqs();
 
 	if (opt.tx[0] == '/' && strncmp(opt.tx, CGROOT, strlen(CGROOT)))
 		snprintf(path, sizeof(path), "%s%s", CGROOT, opt.tx);
@@ -781,11 +825,19 @@ static void start_tx(void)
 	close(fd);
 	if (!tx_link)
 		die("cannot attach to cgroup %s: %s", path, strerror(errno));
-	/* Now that marked connections find ns_sock_assign() attached. */
+	/*
+	 * Mark now that marked connections find ns_sock_assign() attached,
+	 * and bind the queues only once the marks have settled: the ones an
+	 * earlier run left assigned, and that this run does not pick, would
+	 * otherwise have their xmit work taken over until then.
+	 */
 	skel->bss->tx_cgroup_id = cgroup_id(opt.tx);
 	run_mark_iter();
-	printf("tx: %llu existing connections marked for assignment\n",
-	       (unsigned long long)skel->bss->tx_marked);
+	settle_marks(1000);
+	assign_txqs();
+	printf("tx: %llu existing connections marked, %llu assigned, %llu assignments taken back\n",
+	       (unsigned long long)skel->bss->tx_marked, (unsigned long long)skel->bss->tx_socks,
+	       (unsigned long long)skel->bss->tx_unassigned);
 }
 
 /*
@@ -1018,14 +1070,10 @@ static void cleanup(void)
 		return;
 	started = false;
 	/*
-	 * Stop assigning connections, give the ones still marked their flags
-	 * back, then let the assigned ones transmit for themselves.
+	 * Let the assigned connections transmit for themselves. Their
+	 * assignments are taken back after the NAPIs, see tx_unassign_all():
+	 * under overload the NAPIs are the urgent part.
 	 */
-	bpf_link__destroy(tx_link);
-	if (opt.tx) {
-		skel->bss->tx_unmark = true;
-		run_mark_iter();
-	}
 	for (i = 0; opt.tx && i < nr_threads; i++) {
 		if (txq_owner[i] >= 0) {
 			args.txq = i;
@@ -1078,6 +1126,8 @@ static void cleanup(void)
 	wait_irqs_home();
 	for (i = 0; i < nr_cpusets; i++)
 		write_file(cpusets[i].path, cpusets[i].orig);
+	tx_unassign_all();
+	bpf_link__destroy(tx_link);
 	/* Releasing the program stops its threads. */
 	network_stack_bpf__destroy(skel);
 }
