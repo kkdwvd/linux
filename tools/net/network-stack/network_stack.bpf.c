@@ -36,8 +36,11 @@
  * own, with the index of its slot, and a connection that is established while
  * a thread processes its handshake, which is every connection that arrives
  * through a NAPI the pool polls, is assigned to that thread's queue by the
- * sockops program below. From then on the connection's sendmsg() copies and
- * returns, and the thread transmits after each pass over its NAPIs. A queue
+ * sockops program below. Connections that were established before, which are
+ * most of a server's, are marked at the start and assigned the same way on
+ * their next RTT sample, see ns_mark_socks(). From then on the connection's
+ * sendmsg() copies and returns, and the thread transmits after each pass over
+ * its NAPIs. A queue
  * whose thread has no NAPIs at the moment is served by another thread of the
  * LLC, as the loader arranges.
  *
@@ -68,6 +71,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define ESRCH		3
 #define ECANCELED	125
 #define ETIMEDOUT	110
+#define SOL_TCP		6
 #define NSEC_PER_MSEC	1000000ULL
 #define LOOP_BOUND	(1 << 23)	/* BPF_MAX_LOOPS */
 #define IDLE_PARK_NS	(1000 * NSEC_PER_MSEC)
@@ -125,6 +129,22 @@ const volatile bool tx_enabled;
 /* With --tx: one plus the xmit queue of the thread on each CPU, 0 for none. */
 __u32 cpu_txq[NS_MAX_CPUS];
 __u64 tx_socks;		/* connections assigned to a xmit queue */
+/*
+ * The connections of the --tx cgroup that were established before the start,
+ * see ns_mark_socks(): the cgroup, set before the iterator runs, how many were
+ * marked, and whether a run of the iterator takes the marks back instead.
+ */
+__u64 tx_cgroup_id;
+__u64 tx_marked;
+bool tx_unmark;
+
+/* A marked connection's sockops callback flags from before the mark. */
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, int);
+} marked SEC(".maps");
 
 struct ns_thread threads[NS_MAX_THREADS];
 struct ns_napi napis[NS_MAX_NAPIS];
@@ -586,11 +606,29 @@ int ns_txq_unbind(struct ns_args *args)
 SEC("sockops")
 int ns_sock_assign(struct bpf_sock_ops *skops)
 {
+	struct bpf_sock *sk;
 	__u32 cpu, txq;
+	int *orig;
 
-	if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB &&
-	    skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB)
+	if (skops->op == BPF_SOCK_OPS_RTT_CB) {
+		/*
+		 * A connection marked at the start, and this runs where its
+		 * ACKs are processed. Its flags go back as they were, so this
+		 * happens once, and a connection that asks for RTT callbacks
+		 * for some other program was never marked.
+		 */
+		sk = skops->sk;
+		if (!sk)
+			return 1;
+		orig = bpf_sk_storage_get(&marked, sk, 0, 0);
+		if (!orig)
+			return 1;
+		bpf_sock_ops_cb_flags_set(skops, *orig);
+		bpf_sk_storage_delete(&marked, sk);
+	} else if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB &&
+		   skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
 		return 1;
+	}
 	cpu = bpf_get_smp_processor_id();
 	if (cpu >= NS_MAX_CPUS)
 		return 1;
@@ -598,4 +636,56 @@ int ns_sock_assign(struct bpf_sock_ops *skops)
 	if (txq && !bpf_tcp_tx_sock_bind(bpf_cast_to_kern_ctx(skops), txq - 1))
 		__sync_fetch_and_add(&tx_socks, 1);
 	return 1;
+}
+
+/*
+ * Mark the established connections of the --tx cgroup, which were set up
+ * before ns_sock_assign() was attached and so never assigned: ask for a sockops
+ * callback on each one's next RTT sample, which comes with an ACK and runs on
+ * the CPU that processes it, and ns_sock_assign() assigns the connection there
+ * as it would have at the handshake. A connection that already asks for RTT
+ * callbacks has them for some other program and is left alone. With
+ * tx_unmark, give the connections that are still marked their flags back.
+ */
+SEC("iter/tcp")
+int ns_mark_socks(struct bpf_iter__tcp *ctx)
+{
+	struct sock_common *skc = ctx->sk_common;
+	struct tcp_sock *tp;
+	struct sock *sk;
+	int flags, *orig;
+
+	if (!skc)
+		return 0;
+	tp = bpf_skc_to_tcp_sock(skc);
+	if (!tp)
+		return 0;
+	sk = (struct sock *)tp;
+
+	if (tx_unmark) {
+		orig = bpf_sk_storage_get(&marked, sk, 0, 0);
+		if (orig) {
+			flags = *orig;
+			bpf_setsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags));
+			bpf_sk_storage_delete(&marked, sk);
+		}
+		return 0;
+	}
+
+	if (sk->__sk_common.skc_state != TCP_ESTABLISHED ||
+	    sk->sk_cgrp_data.cgroup->kn->id != tx_cgroup_id)
+		return 0;
+	if (bpf_getsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags)) ||
+	    (flags & BPF_SOCK_OPS_RTT_CB_FLAG))
+		return 0;
+	orig = bpf_sk_storage_get(&marked, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!orig)
+		return 0;
+	*orig = flags;
+	flags |= BPF_SOCK_OPS_RTT_CB_FLAG;
+	if (bpf_setsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags)))
+		bpf_sk_storage_delete(&marked, sk);
+	else
+		__sync_fetch_and_add(&tx_marked, 1);
+	return 0;
 }
