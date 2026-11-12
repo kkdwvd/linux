@@ -1546,6 +1546,7 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 	if (err)
 		return NULL;
 	state->refs[new_ofs].insn_idx = insn_idx;
+	state->refs[new_ofs].origin = insn_idx;
 
 	return &state->refs[new_ofs];
 }
@@ -11863,8 +11864,10 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	err = resize_reference_state(caller, exit->acquired_refs);
 	if (err)
 		return err;
-	for (i = nheld; i < exit->acquired_refs; i++)
+	for (i = nheld; i < exit->acquired_refs; i++) {
 		caller->refs[i] = exit->refs[i];
+		caller->refs[i].origin = call_idx;
+	}
 	caller->held = exit->held;
 
 	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
@@ -12612,6 +12615,9 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			bpf_diag_mod_end(env);
 		}
 		hide_returned_stack_ptrs(env, nregs, caller->regs);
+		/* and with what it acquired and did not release */
+		for (i = callee->entry_refs; i < state->acquired_refs; i++)
+			state->refs[i].origin = callee->callsite;
 	}
 
 	/* Invalidate callee-local dynptrs and their slices before the frame goes away. */
@@ -21550,7 +21556,7 @@ static bool frame_holds_resources(const struct bpf_verifier_state *st)
  *
  * False when it cannot:
  * - This frame acquired something itself, and there is no landing pad for that: the verifier
- *   emits one for sections only.
+ *   emits none for references.
  * - There is a call of the subprog that unwind_goto doesn't follow. That is every
  *   program that is compiled without unwinding.
  * - A helper that calls a callback doesn't expect it to unwind.
@@ -21565,6 +21571,7 @@ static bool state_can_unwind(struct bpf_verifier_env *env, const struct bpf_veri
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
+	int i;
 
 	/* see unwind_frame() */
 	if (sub->exit_idx == U32_MAX)
@@ -21572,8 +21579,9 @@ static bool state_can_unwind(struct bpf_verifier_env *env, const struct bpf_veri
 	/* a landing pad has no barrier: only a loader with CAP_PERFMON gets one */
 	if (!bpf_may_unwind(env))
 		return false;
-	if (st->acquired_refs != frame->entry_refs)
-		return false;
+	for (i = frame->entry_refs; i < st->acquired_refs; i++)
+		if (st->refs[i].type == REF_TYPE_PTR)
+			return false;
 	if (frame->in_callback_fn)
 		return false;
 	return frame_is_top(st) || sub->bail_unwinds || or_exit;
@@ -21686,17 +21694,49 @@ out:
 	return err;
 }
 
+/* Irq flags, @id, are released. A caller may have the object: it is none any more. */
+static void unmark_stack_obj(struct bpf_verifier_env *env, int id)
+{
+	u32 mask = 1 << STACK_IRQ_FLAG;
+	struct bpf_stack_state *slot;
+	struct bpf_func_state *frame;
+	struct bpf_reg_state *reg;
+
+	bpf_for_each_reg_in_vstate_mask(env->cur_state, frame, reg, slot, mask, ({
+		if (slot && reg->id == id) {
+			bpf_mark_reg_not_init(env, reg);
+			memset(slot->slot_type, STACK_INVALID, sizeof(slot->slot_type));
+		}
+	}));
+}
+
 /*
  * The current frame is left at a site, and its landing pad releases what the frame acquired since
  * its entry. Do to the current state what the calls of the pad do to it, with the functions that
- * such a call of the program ends up in. The callers may have pointers that are good as long as a
- * lock or a section is held.
+ * such a call of the program ends up in, and unmark_stack_obj(). The callers may have pointers that
+ * are good as long as a lock or a section is held.
  */
 static int release_frame_resources(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = cur_func(env);
+	u32 locks = st->active_locks;
+	struct bpf_reference_state *ref;
+	int id, err;
 
+	while (st->acquired_refs > frame->entry_refs) {
+		ref = &st->refs[st->acquired_refs - 1];
+		id = ref->id;
+		if (ref->type == REF_TYPE_IRQ)
+			err = release_irq_state(env, ref->id);
+		else
+			err = release_lock_state(env, ref->type, ref->id, ref->ptr);
+		if (verifier_bug_if(err, env, "the youngest of refs[] cannot be released"))
+			return -EFAULT;
+		unmark_stack_obj(env, id);
+	}
+	if (st->active_locks != locks)
+		invalidate_non_owning_refs(env);
 	st->active_rcu_locks = frame->entry_rcu_locks;
 	st->active_preempt_locks = frame->entry_preempt_locks;
 	if (!in_rcu_cs(env))

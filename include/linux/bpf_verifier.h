@@ -382,6 +382,11 @@ struct bpf_reference_state {
 	 */
 	int insn_idx;
 	u32 diag_id;	/* finds the acquire in the report of a leak, it is not renumbered */
+	/*
+	 * The instruction that brought it to the frame which is responsible for it: insn_idx, or
+	 * the call of the subprog that returned with it.
+	 */
+	int origin;
 	union {
 		/* For REF_TYPE_PTR */
 		struct {
@@ -458,6 +463,11 @@ enum bpf_pad_class {
 	BPF_PAD_RCU,		/* bpf_rcu_read_lock() */
 	BPF_PAD_PREEMPT,	/* bpf_preempt_disable() */
 	BPF_PAD_NR_SECTIONS,
+	/* Each of the others is an entry of refs[] and has a handle, which the release takes. */
+	BPF_PAD_IRQ = BPF_PAD_NR_SECTIONS, /* bpf_local_irq_save() */
+	BPF_PAD_RES_LOCK,	/* bpf_res_spin_lock() */
+	BPF_PAD_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave(): two of refs[], one release */
+	BPF_PAD_SPIN_LOCK,	/* bpf_spin_lock() */
 };
 
 /* Why no landing pad serves all states that get to a site */
@@ -466,11 +476,50 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_SECTIONS_DIFFER,
 	BPF_CONFLICT_TOO_MUCH,
 	BPF_CONFLICT_NO_RELEASE,
+	BPF_CONFLICT_NOT_ALWAYS_HELD,
+	BPF_CONFLICT_NO_PLACE,
+	BPF_CONFLICT_ORDER_DIFFERS,
 };
 
-/* A landing pad has a limit: that many sections of a class, and that many insns. */
+/*
+ * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
+ * per argument of a release two to load it, the calls, three to leave.
+ */
 #define BPF_PAD_MAX_SECTIONS	8
-#define BPF_PAD_MAX_INSNS	(BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
+#define BPF_PAD_MAX_ENTS	8
+#define BPF_PAD_MAX_ARGS	2
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 1) + \
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
+#define BPF_PAD_MAX_CANDS	6
+
+/* Where a place is */
+enum bpf_place_loc {
+	BPF_PLACE_REG,		/* in a register. R10: the handle is an address in the stack */
+	BPF_PLACE_SPILL,	/* in 8 bytes of the stack of the frame */
+	BPF_PLACE_MAP_VALUE,	/* it is the address of the only value of a map */
+};
+
+/* A PLACE: where a landing pad finds a handle when the frame is left at the site */
+struct bpf_pad_place {
+	u8 loc;			/* enum bpf_place_loc */
+	s16 at;			/* number of the register | offset from R10 | index in used_maps */
+	s32 delta;		/* what is there is that much more than the handle */
+};
+
+/* An ENTRY of a plan: one resource with a handle that the frame is responsible for */
+struct bpf_pad_ent {
+	u32 origin;		/* see struct bpf_reference_state. Of the first visit that held it. */
+	int ref;		/* the visit that is going on: its index in refs[], or -1 */
+	struct bpf_insn release; /* the call that releases it */
+	u8 class;		/* enum bpf_pad_class */
+	/*
+	 * The CANDIDATES, per argument of the release: the places that have the handle on all
+	 * visits. The first one is emitted.
+	 */
+	u8 nr_cands[BPF_PAD_MAX_ARGS];
+	struct bpf_pad_place cand[BPF_PAD_MAX_ARGS][BPF_PAD_MAX_CANDS];
+};
+
 /* What the landing pad of a site releases, see bpf_pad_visit() */
 struct bpf_pad_plan {
 	struct bpf_pad_plan *next;	/* of the same insn */
@@ -478,6 +527,8 @@ struct bpf_pad_plan {
 	u8 conflict;			/* enum bpf_pad_conflict */
 	bool visited;
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
+	u8 nr_ents;
+	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
 };
@@ -1951,7 +2002,7 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st, int insn_idx,
 				   enum bpf_site_kind kind);
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
-		  struct bpf_insn *buf);
+		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
