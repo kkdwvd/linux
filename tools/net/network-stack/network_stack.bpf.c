@@ -136,16 +136,25 @@ __u64 tx_socks;		/* connections assigned to a xmit queue */
  */
 __u64 tx_cgroup_id;
 __u64 tx_marked;
-bool tx_unmark;
+__u32 tx_mark_mode;	/* NS_MARK_* */
+__u64 tx_unassigned;	/* connections whose assignment was taken back */
 /* Percent of the --tx cgroup's connections to assign, picked at random. */
 __u32 tx_share = 100;
 
-/* A marked connection's sockops callback flags from before the mark. */
+/*
+ * A marked connection: its sockops callback flags from before the mark, and
+ * whether its next RTT callback assigns it or takes its assignment back.
+ */
+struct mark {
+	int flags;
+	bool unassign;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, int);
+	__type(value, struct mark);
 } marked SEC(".maps");
 
 struct ns_thread threads[NS_MAX_THREADS];
@@ -609,30 +618,40 @@ SEC("sockops")
 int ns_sock_assign(struct bpf_sock_ops *skops)
 {
 	struct bpf_sock *sk;
+	struct mark *m;
 	__u32 cpu, txq;
-	int *orig;
 
 	if (skops->op == BPF_SOCK_OPS_RTT_CB) {
 		/*
-		 * A connection marked at the start, and this runs where its
-		 * ACKs are processed. Its flags go back as they were, so this
-		 * happens once, and a connection that asks for RTT callbacks
-		 * for some other program was never marked.
+		 * A connection marked by ns_mark_socks(), and this runs where
+		 * its ACKs are processed. Its flags go back as they were, so
+		 * this happens once, and a connection that asks for RTT
+		 * callbacks for some other program was never marked.
 		 */
 		sk = skops->sk;
 		if (!sk)
 			return 1;
-		orig = bpf_sk_storage_get(&marked, sk, 0, 0);
-		if (!orig)
+		m = bpf_sk_storage_get(&marked, sk, 0, 0);
+		if (!m)
 			return 1;
-		bpf_sock_ops_cb_flags_set(skops, *orig);
+		bpf_sock_ops_cb_flags_set(skops, m->flags);
+		if (m->unassign) {
+			bpf_sk_storage_delete(&marked, sk);
+			if (!bpf_tcp_tx_sock_bind(bpf_cast_to_kern_ctx(skops), -1))
+				__sync_fetch_and_add(&tx_unassigned, 1);
+			return 1;
+		}
 		bpf_sk_storage_delete(&marked, sk);
 	} else if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB &&
 		   skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
 		return 1;
 	}
-	/* A marked connection was picked when it was marked. */
-	if (skops->op != BPF_SOCK_OPS_RTT_CB && bpf_get_prandom_u32() % 100 >= tx_share)
+	/*
+	 * A marked connection was picked when it was marked, and nothing new
+	 * is assigned once the exit has begun.
+	 */
+	if (skops->op != BPF_SOCK_OPS_RTT_CB &&
+	    (tx_mark_mode != NS_MARK_START || bpf_get_prandom_u32() % 100 >= tx_share))
 		return 1;
 	cpu = bpf_get_smp_processor_id();
 	if (cpu >= NS_MAX_CPUS)
@@ -644,13 +663,17 @@ int ns_sock_assign(struct bpf_sock_ops *skops)
 }
 
 /*
- * Mark the established connections of the --tx cgroup, which were set up
- * before ns_sock_assign() was attached and so never assigned: ask for a sockops
- * callback on each one's next RTT sample, which comes with an ACK and runs on
- * the CPU that processes it, and ns_sock_assign() assigns the connection there
- * as it would have at the handshake. A connection that already asks for RTT
- * callbacks has them for some other program and is left alone. With
- * tx_unmark, give the connections that are still marked their flags back.
+ * Marks connections of the --tx cgroup for a sockops callback on their next
+ * RTT sample, which comes with an ACK and runs on the CPU that processes it,
+ * where ns_sock_assign() acts on the mark. A queue assignment outlives the
+ * tool: a connection keeps its queue's index, and a later run that binds the
+ * same queue to a thread would take its xmit work over. So the marks go both
+ * ways, see NS_MARK_*. At the start, the established connections picked for
+ * --tx-share are marked to be assigned, which they were not, having been set
+ * up before ns_sock_assign() was attached, and the others that carry an
+ * assignment from an earlier run to lose it. At exit, every assigned
+ * connection is marked to lose it. A connection that already asks for RTT
+ * callbacks has them for some other program and is left alone.
  */
 SEC("iter/tcp")
 int ns_mark_socks(struct bpf_iter__tcp *ctx)
@@ -658,7 +681,9 @@ int ns_mark_socks(struct bpf_iter__tcp *ctx)
 	struct sock_common *skc = ctx->sk_common;
 	struct tcp_sock *tp;
 	struct sock *sk;
-	int flags, *orig;
+	bool unassign;
+	struct mark *m;
+	int flags;
 
 	if (!skc)
 		return 0;
@@ -667,10 +692,10 @@ int ns_mark_socks(struct bpf_iter__tcp *ctx)
 		return 0;
 	sk = (struct sock *)tp;
 
-	if (tx_unmark) {
-		orig = bpf_sk_storage_get(&marked, sk, 0, 0);
-		if (orig) {
-			flags = *orig;
+	if (tx_mark_mode == NS_MARK_RESTORE) {
+		m = bpf_sk_storage_get(&marked, sk, 0, 0);
+		if (m) {
+			flags = m->flags;
 			bpf_setsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags));
 			bpf_sk_storage_delete(&marked, sk);
 		}
@@ -680,15 +705,29 @@ int ns_mark_socks(struct bpf_iter__tcp *ctx)
 	if (sk->__sk_common.skc_state != TCP_ESTABLISHED ||
 	    sk->sk_cgrp_data.cgroup->kn->id != tx_cgroup_id)
 		return 0;
-	if (bpf_get_prandom_u32() % 100 >= tx_share)
+	if (tx_mark_mode == NS_MARK_EXIT) {
+		if (!tp->bpf_tx_queue)
+			return 0;
+		unassign = true;
+	} else {
+		unassign = bpf_get_prandom_u32() % 100 >= tx_share;
+		if (unassign && !tp->bpf_tx_queue)
+			return 0;
+	}
+	/* Marked at the start and not sampled since: change the mark. */
+	m = bpf_sk_storage_get(&marked, sk, 0, 0);
+	if (m) {
+		m->unassign = unassign;
 		return 0;
+	}
 	if (bpf_getsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags)) ||
 	    (flags & BPF_SOCK_OPS_RTT_CB_FLAG))
 		return 0;
-	orig = bpf_sk_storage_get(&marked, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
-	if (!orig)
+	m = bpf_sk_storage_get(&marked, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!m)
 		return 0;
-	*orig = flags;
+	m->flags = flags;
+	m->unassign = unassign;
 	flags |= BPF_SOCK_OPS_RTT_CB_FLAG;
 	if (bpf_setsockopt(tp, SOL_TCP, TCP_BPF_SOCK_OPS_CB_FLAGS, &flags, sizeof(flags)))
 		bpf_sk_storage_delete(&marked, sk);

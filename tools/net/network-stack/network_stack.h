@@ -23,6 +23,16 @@
 #define NS_TX_INLINE		2
 
 /*
+ * What a run of ns_mark_socks() does: mark the --tx cgroup's connections at the
+ * start, to be assigned or to lose an assignment left by an earlier run; mark
+ * every assigned connection to lose its assignment at exit; or put the flags of
+ * the connections still marked back.
+ */
+#define NS_MARK_START		0
+#define NS_MARK_EXIT		1
+#define NS_MARK_RESTORE		2
+
+/*
  * What the loader tells a thread. A thread reads its list on every scan, and
  * the loader changes it while the thread runs: it appends a slot and then
  * raises nr_napis, or overwrites the slot to remove with the last one and
