@@ -244,6 +244,7 @@ void bpf_pads_new_round(struct bpf_verifier_env *env)
 {
 	int i;
 
+	env->pads_late = false;
 	for (i = 0; i < env->prog->len; i++)
 		bpf_pad_plans_free(&env->insn_aux_data[i]);
 }

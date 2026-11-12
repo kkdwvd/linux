@@ -1341,7 +1341,10 @@ struct bpf_subprog_info {
 	 * adds it. Not after the call of a helper, see subprog_cannot_unwind().
 	 */
 	bool bail_unwinds: 1;
-	/* it has unwind_exit, or a state left it that way in this pass */
+	/*
+	 * It has unwind_exit, or a state left it that way in this pass, or that is expected of
+	 * it, see mark_unwind_above(). For a global subprog one pass gives it to the next pass.
+	 */
 	bool did_unwind: 1;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1537,6 +1540,7 @@ struct bpf_verifier_env {
 	bool run_over_budget;		/* in one of its functions, see find_failing_path() */
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_needs_guard() */
+	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
 	bool calls_joined;		/* see flow_may_add_instance() */
 	bool extra_values;		/* a state can have constants that no run has */
 	bool new_linear_xreg;		/* see bpf_same_insns_unproven() */
@@ -2012,6 +2016,7 @@ int bpf_flow_edge_unproven(struct bpf_verifier_env *env, struct bpf_verifier_sta
 int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		    const struct bpf_verifier_state *exit, int call_idx);
 int bpf_insert_sites(struct bpf_verifier_env *env);
+void bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env);
 bool bpf_insn_is_iter_next(struct bpf_verifier_env *env, struct bpf_insn *insn);
 bool bpf_insn_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);

@@ -3376,6 +3376,30 @@ static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 }
 
 /*
+ * A subprog unwinds. What calls it without unwind_goto is unwound in turn, and so on. The callers
+ * of a global subprog among them have to know, see unwind_frame(): one more round will do for all.
+ */
+static void mark_unwind_above(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *si = env->subprog_info, *caller;
+	const struct bpf_insn *insn = env->prog->insnsi;
+	bool changed;
+	int i;
+
+	do {
+		changed = false;
+		for (i = 0; i < env->prog->len; i++) {
+			if (!bpf_pseudo_call(&insn[i]) || bpf_is_unwind_goto(&insn[i + 1]) ||
+			    !si[bpf_find_subprog(env, i + insn[i].imm + 1)].did_unwind)
+				continue;
+			caller = bpf_find_containing_subprog(env, i);
+			changed |= !caller->did_unwind;
+			caller->did_unwind = true;
+		}
+	} while (changed);
+}
+
+/*
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
@@ -6054,14 +6078,10 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 			cg.marks[s] |= BELOW_CB;
 	bpf_call_graph_mark_callees(&cg, BELOW_CB);
 
-	/*
-	 * What only the kernel calls returns to it: the main prog, the callback of a timer.
-	 * Callers of a global subprog look at can_unwind before the subprog is verified.
-	 */
+	/* What only the kernel calls returns to it: the main prog, the callback of a timer. */
 	for (s = 0; s < cnt; s++) {
 		si[s].bail_unwinds = si[s].can_unwind ||
-				     (s && !bpf_subprog_is_global(env, s) &&
-				      env->prog->jit_requested && bpf_jit_supports_unwind() &&
+				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
 				      (cg.marks[s] & (CALLED | BELOW_CB)) == CALLED);
 		si[s].did_unwind = si[s].can_unwind;
@@ -12083,7 +12103,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
-		if (env->subprog_info[subprog].can_unwind) {
+		/* No state comes out of a global subprog, see unwind_frame() */
+		if (env->subprog_info[subprog].did_unwind &&
+		    env->subprog_info[subprog].bail_unwinds) {
 			struct bpf_verifier_state *branch;
 
 			err = check_unwound_return(env, *insn_idx, subprog);
@@ -21844,6 +21866,16 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	bpf_equations_forget_xreg(env, st, bpf_xreg(st->curframe, BPF_REG_2));
 
 	st->unwound = sub->bail_unwinds && !frame_is_top(st);
+	/*
+	 * The callers of a global subprog are verified ahead of it. They look at what follows
+	 * when it unwinds once it is known to do that: all is done again, if it does at the end
+	 * of the pass, see settle_late_unwinds().
+	 */
+	if (st->unwound && !sub->did_unwind && bpf_subprog_is_global(env, frame->subprogno)) {
+		sub->did_unwind = true;
+		mark_unwind_above(env);
+		env->pads_late = true;
+	}
 	sub->did_unwind |= st->unwound;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
@@ -22384,7 +22416,8 @@ process_bpf_exit:
 /* What the pass assumed about loops does not hold, see do_check_all() */
 static bool pass_needs_restart(struct bpf_verifier_env *env)
 {
-	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late;
+	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late ||
+	       env->pads_late;
 }
 
 /*
@@ -23959,12 +23992,43 @@ static int check_after_pass(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * A global subprog was left with unwind_exit, and its callers did not know. Does it unwind, as
+ * far as the pass got? In pass 0 every loop that is not bounded has the edges of may_goto, and a
+ * loop that has a trip count after all is going to have no may_goto. Ask what the emission asks,
+ * see bpf_insert_sites(). A subprog that unwinds, and what calls it, is expected to in the pass
+ * that follows: did_unwind of a global subprog is what one pass gives to the next pass.
+ */
+static void settle_late_unwinds(struct bpf_verifier_env *env, const struct bpf_snapshot *initial)
+{
+	struct bpf_subprog_info *sub = env->subprog_info;
+	bool unwinds, late = false;
+	int s;
+
+	bpf_flow_drop_guards(env);
+	bpf_mark_subprogs_that_unwind(env);
+	for (s = 0; s < env->subprog_cnt; s++, sub++) {
+		unwinds = sub->can_unwind;
+		sub->can_unwind = initial->subprogs[s].can_unwind;
+		late |= unwinds && !initial->subprogs[s].did_unwind &&
+			bpf_subprog_is_global(env, s);
+		sub->did_unwind = unwinds;
+	}
+	if (late)
+		mark_unwind_above(env);
+	env->pads_late = late;
+}
+
 /* Returns the first error */
 static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initial)
 {
 	u32 level = env->log.level;
-	int ret;
+	int i, ret;
 
+	/* see settle_late_unwinds() */
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (bpf_subprog_is_global(env, i))
+			initial->subprogs[i].did_unwind |= env->subprog_info[i].did_unwind;
 	restore_snapshot(env, initial);
 	kvfree(env->callx_edges);
 	kvfree(env->callx_index.slots);
@@ -23973,6 +24037,8 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 	bpf_flow_new_pass(env);
 	bpf_pads_new_round(env);
 	ret = do_check_main(env) ?: do_check_subprogs(env) ?: bpf_check_limits(env);
+	if (env->pads_late)
+		settle_late_unwinds(env, initial);
 	env->log.level = level;
 	env->pass_max_cost = U64_MAX;
 	return ret == -EINTR ? ret : env->err ?: ret;
@@ -24135,7 +24201,8 @@ static int log_failing_path(struct bpf_verifier_env *env, struct bpf_snapshot *i
  * There is no more precision when the budget is used up, or when no state was imprecise.
  *
  * A pass assumes what stops each loop, and checks it, see pass_needs_restart(). If the
- * assumption is wrong, the pass starts again.
+ * assumption is wrong, the pass starts again. The same when a global subprog unwinds whose
+ * callers didn't know, see unwind_frame() and settle_late_unwinds().
  *
  * The log has the failing path. If there is none, or if it has a guess and the error of a pass
  * is real, the log has the basic block of an error. Below level 2 the later passes and the
