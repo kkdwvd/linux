@@ -46,6 +46,13 @@
  * their sockets without waking it. Before it parks, the thread tells them to
  * transmit for themselves: a sender would otherwise wake the thread for every
  * send, at the low load where a wakeup costs more than the xmit work.
+ *
+ * With hold_ns at zero a thread parks after every pass, but under load the
+ * interrupts of its NAPIs wake it again within microseconds, so senders still
+ * queue without a wake and the sockets ride on the next interrupt's wake. To
+ * bound their wait when the traffic stops, such a thread parks for at most
+ * tx_wait_ns; a park that runs out has the senders transmit for themselves
+ * until a pass finds packets again.
  */
 #define BPF_NO_KFUNC_PROTOTYPES
 #include "vmlinux.h"
@@ -110,6 +117,8 @@ __u64 softirq_ns;
  * this long.
  */
 __u64 rest_ns;
+/* With --tx and hold_ns at zero: the longest park with sockets queued without a wake. */
+__u64 tx_wait_ns;
 
 /* Set before load: without --tx no thread touches a TCP xmit queue. */
 const volatile bool tx_enabled;
@@ -245,6 +254,22 @@ static __always_inline void xmit(struct ns_thread *t, __u32 mode, bool *more)
 }
 
 /*
+ * What the senders of the thread's xmit queues do while it is on this pass and
+ * the park after it. In the masked phase they queue. In masked mode an armed
+ * thread is about to park until an interrupt, and they transmit for
+ * themselves. With hold_ns at zero they queue as long as the thread's parks
+ * end in interrupts, see the comment at the top.
+ */
+static __always_inline __u32 tx_mode(struct ns_thread *t, __u64 flags, __u64 hold)
+{
+	if (flags)
+		return NS_TX_QUEUE;
+	if (!hold && load(&tx_wait_ns) && !t->tx_inline)
+		return NS_TX_QUEUE;
+	return NS_TX_INLINE;
+}
+
+/*
  * Leave the thread's NAPIs to softirq, or have softirq count anew for NAPIs
  * that are, or take them back.
  */
@@ -317,8 +342,9 @@ static int poller(__u64 arg)
 		bpf_repeat(LOOP_BOUND) {
 			struct ns_thread *t = &threads[idx];
 			__u64 hold = load(&hold_ns);
-			__u64 flags, now, idle;
+			__u64 flags, now, idle, wait;
 			bool more = false;
+			int ret;
 
 			if (bpf_kthread_should_stop())
 				return 0;
@@ -330,12 +356,14 @@ static int poller(__u64 arg)
 				scan(t, flags, &more);
 			/*
 			 * Xmit work counts like a packet: where there was
-			 * some, more follows. A thread that is about to park,
-			 * with its interrupts unmasked, has the senders
-			 * transmit.
+			 * some, more follows. Packets from the NAPIs mean the
+			 * traffic is back, and senders may queue again.
 			 */
-			if (tx_enabled)
-				xmit(t, flags ? NS_TX_QUEUE : NS_TX_INLINE, &more);
+			if (tx_enabled) {
+				if (t->pass_work)
+					t->tx_inline = 0;
+				xmit(t, tx_mode(t, flags, hold), &more);
+			}
 			now = bpf_ktime_get_ns();
 			t->scans++;
 
@@ -369,11 +397,26 @@ static int poller(__u64 arg)
 					t->suspend_ns = now;
 					t->suspends++;
 				}
+				wait = tx_enabled && tx_mode(t, flags, hold) == NS_TX_QUEUE ?
+				       load(&tx_wait_ns) : 0;
 				t->parks++;
-				if (rest(idx, IDLE_PARK_NS) || idx >= NS_MAX_THREADS)
+				ret = rest(idx, wait ? wait : IDLE_PARK_NS);
+				if (idx >= NS_MAX_THREADS)
 					continue;
 
 				t = &threads[idx];
+				if (ret) {
+					/*
+					 * No interrupt within tx_wait_ns, with
+					 * sockets perhaps queued: the next pass
+					 * serves them under the inline mode.
+					 */
+					if (ret == -ETIMEDOUT && wait) {
+						t->tx_inline = 1;
+						t->tx_quiets++;
+					}
+					continue;
+				}
 				t->wakes++;
 				now = bpf_ktime_get_ns();
 				if (!t->suspended) {

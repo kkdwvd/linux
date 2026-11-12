@@ -43,6 +43,7 @@ struct ns_thread {
 	__u64 last_work_ns;		/* end of the last scan that found packets */
 	__u64 last_rest_ns;		/* end of the last park */
 	__u64 pass_work;		/* packets and sockets the current pass found */
+	__u32 tx_inline;		/* with --irq --tx: no interrupt came within tx_wait_ns */
 
 	/* Cumulative counters, written by the thread. */
 	__u64 scans;			/* passes over the list */
@@ -55,6 +56,7 @@ struct ns_thread {
 	__u64 resumes;			/* times it took them back */
 	__u64 xmits;			/* sockets whose xmit work it did */
 	__u64 xmit_ns;			/* time in polls of xmit queues that found work */
+	__u64 tx_quiets;		/* parks that tx_wait_ns ended, see tx_mode() */
 } __attribute__((aligned(64)));
 
 /* One NAPI of the device. The loader sets id; the thread polling it the rest. */

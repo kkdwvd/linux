@@ -114,6 +114,7 @@ static struct {
 	const char *tx;
 	__u64 hold_us, spin_us, nap_us, rest_us;
 	__u64 softirq_pps;
+	__u64 tx_wait_us;
 	__u64 tick_ms, interval_ms, duration_s;
 	__u64 gap_us;
 	int hi, target, lo, panic;
@@ -126,6 +127,7 @@ static struct {
 	.hold_us = 2000,
 	.nap_us = 50,
 	.rest_us = 4000,
+	.tx_wait_us = 100,
 	.tick_ms = 100,
 	.interval_ms = 1000,
 	.gap_us = 5000,
@@ -1252,8 +1254,8 @@ static void control(struct llc *l)
 
 static void report(__u64 dt_ns)
 {
-	static __u64 prev_pkts, prev_naps, prev_parks, prev_xmits;
-	__u64 pkts = 0, naps = 0, parks = 0, gap = 0, xmits = 0;
+	static __u64 prev_pkts, prev_naps, prev_parks, prev_xmits, prev_quiets;
+	__u64 pkts = 0, naps = 0, parks = 0, gap = 0, xmits = 0, quiets = 0;
 	int active = 0, suspended = 0, i, k;
 	double max_load = 0, sum_load = 0;
 
@@ -1266,6 +1268,7 @@ static void report(__u64 dt_ns)
 		naps += skel->bss->threads[i].naps;
 		parks += skel->bss->threads[i].parks;
 		xmits += skel->bss->threads[i].xmits;
+		quiets += skel->bss->threads[i].tx_quiets;
 		suspended += skel->bss->threads[i].suspended && skel->bss->threads[i].nr_napis;
 	}
 	for (i = 0; i < nr_llcs; i++) {
@@ -1289,9 +1292,10 @@ static void report(__u64 dt_ns)
 		printf("  softirq: %d of %d active threads have left their NAPIs to softirq\n",
 		       suspended, active);
 	if (opt.tx)
-		printf("  tx: xmits/s %.0f  connections assigned %llu\n",
+		printf("  tx: xmits/s %.0f  connections assigned %llu  quiet parks/s %.0f\n",
 		       (xmits - prev_xmits) * 1e9 / dt_ns,
-		       (unsigned long long)skel->bss->tx_socks);
+		       (unsigned long long)skel->bss->tx_socks,
+		       (quiets - prev_quiets) * 1e9 / dt_ns);
 	if (opt.verbose) {
 		for (i = 0; i < nr_llcs; i++) {
 			printf("  llc %d: %d/%d threads:", llcs[i].first_cpu, llcs[i].active,
@@ -1310,6 +1314,7 @@ static void report(__u64 dt_ns)
 	prev_naps = naps;
 	prev_parks = parks;
 	prev_xmits = xmits;
+	prev_quiets = quiets;
 }
 
 static void on_signal(int sig)
@@ -1333,8 +1338,12 @@ static void usage(void)
 "  --min-threads N        threads kept active per LLC (default 1)\n"
 "  --static               keep the placement of the start\n"
 "  --tx CGROUP            also do the TCP xmit work of CGROUP's connections in the pool\n"
-"                         while a thread polls with interrupts masked; no effect with --irq\n"
+"                         while a thread polls with interrupts masked, or with --irq\n"
+"                         while its interrupts keep coming\n"
 "                         (off by default; needs a kernel with TCP xmit queues)\n"
+"  --tx-wait-us N         with --irq: the longest park with sockets queued, after which\n"
+"                         senders transmit for themselves until packets return\n"
+"                         (default 100, 0 to have them always transmit with --irq)\n"
 "\n"
 "Controller:\n"
 "  --tick-ms N            period (default 100)\n"
@@ -1362,7 +1371,7 @@ enum {
 	OPT_DEV = 256, OPT_CPUS, OPT_CPUSET, OPT_THREAD_CGROUP, OPT_NAPIS_PER_THREAD,
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
-	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_SOFTIRQ_PPS,
+	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_TX_WAIT_US, OPT_SOFTIRQ_PPS,
 };
 
 static const struct option longopts[] = {
@@ -1374,6 +1383,7 @@ static const struct option longopts[] = {
 	{ "min-threads", required_argument, NULL, OPT_MIN_THREADS },
 	{ "static", no_argument, NULL, OPT_STATIC },
 	{ "tx", required_argument, NULL, OPT_TX },
+	{ "tx-wait-us", required_argument, NULL, OPT_TX_WAIT_US },
 	{ "tick-ms", required_argument, NULL, OPT_TICK_MS },
 	{ "hi", required_argument, NULL, OPT_HI },
 	{ "target", required_argument, NULL, OPT_TARGET },
@@ -1416,6 +1426,7 @@ int main(int argc, char **argv)
 		case OPT_MIN_THREADS: opt.min_threads = atoi(optarg); break;
 		case OPT_STATIC: opt.fixed = true; break;
 		case OPT_TX: opt.tx = optarg; break;
+		case OPT_TX_WAIT_US: opt.tx_wait_us = strtoull(optarg, NULL, 0); break;
 		case OPT_TICK_MS: opt.tick_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_HI: opt.hi = atoi(optarg); break;
 		case OPT_TARGET: opt.target = atoi(optarg); break;
@@ -1462,6 +1473,8 @@ int main(int argc, char **argv)
 	if (opt.softirq_pps)
 		skel->bss->softirq_ns = NS_SOFTIRQ_WAKE * 1000000000ULL / opt.softirq_pps;
 	skel->rodata->tx_enabled = !!opt.tx;
+	if (opt.tx)
+		skel->bss->tx_wait_ns = opt.tx_wait_us * 1000;
 	if (!opt.tx) {
 		/* Their kfuncs are missing on a kernel without TCP xmit queues. */
 		bpf_program__set_autoload(skel->progs.ns_txq_bind, false);
