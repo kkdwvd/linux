@@ -1142,15 +1142,11 @@ static bool is_iter_reg_valid_uninit(struct bpf_verifier_env *env,
 	return true;
 }
 
-static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
-				   struct btf *btf, u32 btf_id, int nr_slots)
+/* Are the @nr_slots stack slots of @state from @spi down an iterator of type (@btf, @btf_id)? */
+int bpf_iter_slots_valid_init(const struct bpf_func_state *state, int spi, const struct btf *btf,
+			      u32 btf_id, int nr_slots)
 {
-	struct bpf_func_state *state = bpf_func(env, reg);
-	int spi, i, j;
-
-	spi = iter_get_spi(env, reg, nr_slots);
-	if (spi < 0)
-		return -EINVAL;
+	int i, j;
 
 	for (i = 0; i < nr_slots; i++) {
 		struct bpf_stack_state *slot = bpf_stack_slot(state, spi - i);
@@ -1172,6 +1168,16 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 	}
 
 	return 0;
+}
+
+static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+				   struct btf *btf, u32 btf_id, int nr_slots)
+{
+	int spi = iter_get_spi(env, reg, nr_slots);
+
+	if (spi < 0)
+		return -EINVAL;
+	return bpf_iter_slots_valid_init(bpf_func(env, reg), spi, btf, btf_id, nr_slots);
 }
 
 static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx);
@@ -21761,17 +21767,27 @@ out:
 	return err;
 }
 
-/* Irq flags, @id, are released. A caller may have the object: it is none any more. */
+/*
+ * Irq flags or an iterator, @id, are released. A caller may have the object: its slots are none any
+ * more.
+ */
 static void unmark_stack_obj(struct bpf_verifier_env *env, int id)
 {
-	u32 mask = 1 << STACK_IRQ_FLAG;
+	u32 mask = (1 << STACK_IRQ_FLAG) | (1 << STACK_ITER);
 	struct bpf_stack_state *slot;
 	struct bpf_func_state *frame;
 	struct bpf_reg_state *reg;
+	int nr;
 
 	bpf_for_each_reg_in_vstate_mask(env->cur_state, frame, reg, slot, mask, ({
-		if (slot && reg->id == id) {
-			bpf_mark_reg_not_init(env, reg);
+		/* a lock in a global variable has no id, nor have the other slots of an iterator */
+		if (!slot || !id || reg->id != id)
+			continue;
+		nr = 1;
+		if (slot->slot_type[0] == STACK_ITER)
+			nr = btf_type_by_id(reg->iter.btf, reg->iter.btf_id)->size / BPF_REG_SIZE;
+		for (; nr; nr--, slot--) {
+			bpf_mark_reg_not_init(env, &slot->spilled_ptr);
 			memset(slot->slot_type, STACK_INVALID, sizeof(slot->slot_type));
 		}
 	}));

@@ -471,6 +471,9 @@ enum bpf_pad_class {
 	BPF_PAD_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave(): two of refs[], one release */
 	BPF_PAD_SPIN_LOCK,	/* bpf_spin_lock() */
 	BPF_PAD_REF,		/* a pointer that a helper or a kfunc returned, REF_TYPE_PTR */
+	/* Objects in the stack that are REF_TYPE_PTR as well */
+	BPF_PAD_ITER,		/* bpf_iter_<type>_new() */
+	BPF_PAD_DYNPTR,		/* bpf_ringbuf_reserve_dynptr(), bpf_dynptr_from_file() */
 };
 
 /* Why no landing pad serves all states that get to a site */
@@ -519,6 +522,7 @@ struct bpf_pad_ent {
 	struct bpf_insn release; /* the call that releases it */
 	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
 	u8 class;		/* enum bpf_pad_class */
+	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
 	/*
 	 * The CANDIDATES, per argument of the release: the places that have the handle on all
 	 * visits. The first one is emitted.
@@ -2380,6 +2384,8 @@ bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
 int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
 bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);
 bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id);
+int bpf_iter_slots_valid_init(const struct bpf_func_state *state, int spi, const struct btf *btf,
+			      u32 btf_id, int nr_slots);
 
 /* The first field that ends behind 'off'. The fields are sorted and do not overlap. */
 static inline u32 btf_record_first_field(const struct btf_record *rec, s64 off)

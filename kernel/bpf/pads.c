@@ -103,8 +103,9 @@
  *
  * A pointer that a helper or a kfunc returned and that has to be released is its own handle. A copy
  * of it, a pointer to a node in the object, a socket that a helper has cast are places of one
- * entry. What releases it follows from its type, see ref_release(). If a caller has
- * irq flags, a pointer to them is a place.
+ * entry. What releases it follows from its type, see ref_release(). An iterator
+ * and a dynptr that has to be released are objects in the stack, like irq flags. If a caller has
+ * the object, a pointer to it is a place.
  * The release and the place tell the entries of a plan apart, see visit_refs().
  *
  *	t = bpf_task_from_pid(pid);			   call bpf_task_from_pid
@@ -120,8 +121,8 @@
  *
  * Only the program counter tells a pad what is held: every visit has to hold every entry.
  * A pad has one order, see enum pad_turn, among equals that of refs[], the youngest first. Locks
- * and irq flags have to be released that way. If states acquired them in different orders there is
- * a conflict.
+ * and irq flags have to be released that way, and a dynptr ahead of the pointer that it was made
+ * from. States that acquired them in different orders can be a conflict.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -142,6 +143,9 @@ BTF_ID(func, bpf_res_spin_unlock_irqrestore)
 BTF_ID_LIST(pad_obj_drop)
 BTF_ID(func, bpf_obj_drop)
 BTF_ID(func, bpf_percpu_obj_drop)
+
+/* It releases the dynptr of bpf_dynptr_from_file() */
+BTF_ID_LIST_SINGLE(pad_file_discard, func, bpf_dynptr_file_discard)
 
 static struct bpf_insn helper_call(enum bpf_func_id func_id)
 {
@@ -173,6 +177,30 @@ static bool takes_flags(const struct bpf_insn *insn)
 		return true;
 	}
 	return false;
+}
+
+/*
+ * bpf_iter_<type>_destroy() for the iterator whose first slot is @iter: the type of the object
+ * names it, see btf_check_iter_kfuncs(). If that is a type of a module, the index of its BTF in
+ * fd_array goes to *@off, from @insn if that is a call of a kfunc of the same BTF.
+ */
+static s32 iter_destroy_kfunc(struct bpf_verifier_env *env, const struct bpf_reg_state *iter,
+			      const struct bpf_insn *insn, s16 *off)
+{
+	const struct btf *btf = iter->iter.btf;
+	const struct btf_type *t = btf_type_by_id(btf, iter->iter.btf_id);
+	struct bpf_call_arg_meta meta;
+	char name[128];
+
+	*off = 0;
+	if (btf_is_module(btf)) {
+		if (!bpf_pseudo_kfunc_call(insn) || !insn->imm ||
+		    bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta) || meta.btf != btf)
+			return -ENOENT;
+		*off = insn->off;
+	}
+	snprintf(name, sizeof(name), "%s_destroy", btf_name_by_offset(btf, t->name_off));
+	return btf_find_by_name_kind(btf, name, BTF_KIND_FUNC);
 }
 
 /* Does bpf_sk_release() take what is in @reg? A socket, or what a helper has cast one to. */
@@ -225,10 +253,11 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
 }
 
 /*
- * The call that releases the pointer @ref, which is in @reg.
+ * The call that releases the pointer @ref, which is in @reg. If @ref is an object in the stack
+ * @reg is its first slot, @iter: that of an iterator.
  * What the main pass compares before one state stands for another decides: the type of what is in
- * @reg and whether @ref came with a __ref argument, see same_refs() and bpf_same_join_key(). The
- * insn that acquired @ref is not compared, and a join keeps one of two.
+ * @reg, the kind of the object, and whether @ref came with a __ref argument, see same_refs() and
+ * bpf_same_join_key(). The insn that acquired @ref is not compared, and a join keeps one of two.
  * It is asked what the type leaves open:
  *   - Which helper made a socket or a record of a ring buffer. That is believed only where @reg
  *     is what such a helper returns.
@@ -243,10 +272,26 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
  *     function it is no kfunc there, and that is a conflict.
  */
 static int ref_release(struct bpf_verifier_env *env, const struct bpf_reference_state *ref,
-		       const struct bpf_reg_state *reg, struct bpf_insn *release)
+		       const struct bpf_reg_state *reg, bool iter, struct bpf_insn *release)
 {
 	const struct bpf_insn *insn = &env->prog->insnsi[ref->insn_idx];
+	s16 off;
+	s32 id;
 
+	if (iter) {
+		id = iter_destroy_kfunc(env, reg, insn, &off);
+		*release = BPF_CALL_KFUNC(off, id);
+		return min(id, 0);
+	}
+	if (reg->type == CONST_PTR_TO_DYNPTR) {
+		if (reg->dynptr.type == BPF_DYNPTR_TYPE_FILE)
+			*release = BPF_CALL_KFUNC(0, pad_file_discard[0]);
+		else if (reg->dynptr.type == BPF_DYNPTR_TYPE_RINGBUF)
+			*release = helper_call(BPF_FUNC_ringbuf_discard_dynptr);
+		else
+			return -ENOENT;
+		return 0;
+	}
 	/* no insn acquired a __ref argument of struct_ops */
 	if (ref->ctx_arg)
 		return type_release(env, reg, 0, release);
@@ -621,7 +666,24 @@ static const struct bpf_reg_state *ref_reg(const struct bpf_verifier_state *st,
 	return NULL;
 }
 
-/* Is slot @spi of @frame the irq flags @ref? */
+/*
+ * Slot @spi of @frame is the first one of an iterator. Is the iterator all that its destructor asks
+ * for? The program can write to the other slots, and it can leave what protects an iterator that
+ * RCU protects. Then nothing can destroy the iterator any more.
+ */
+static bool iter_is_valid(const struct bpf_func_state *frame, int spi)
+{
+	const struct bpf_reg_state *reg = &bpf_stack_slot(frame, spi)->spilled_ptr;
+	const struct btf_type *t = btf_type_by_id(reg->iter.btf, reg->iter.btf_id);
+
+	return !bpf_iter_slots_valid_init(frame, spi, reg->iter.btf, reg->iter.btf_id,
+					  t->size / BPF_REG_SIZE);
+}
+
+/*
+ * Is slot @spi of @frame the first one of the object @ref: irq flags, an iterator, a dynptr?
+ * A store to a slot of irq flags or of a dynptr leaves nothing of them.
+ */
 static bool slot_is_obj(const struct bpf_func_state *frame, int spi,
 			const struct bpf_reference_state *ref)
 {
@@ -630,6 +692,13 @@ static bool slot_is_obj(const struct bpf_func_state *frame, int spi,
 	switch (bpf_stack_slot(frame, spi)->slot_type[BPF_REG_SIZE - 1]) {
 	case STACK_IRQ_FLAG:
 		return reg->id == ref->id;
+	case STACK_ITER:
+		return reg->id == ref->id && iter_is_valid(frame, spi);
+	case STACK_DYNPTR:
+		/* any other dynptr is made from a pointer, and that is what @ref is */
+		return reg->dynptr.first_slot && reg->parent_id == ref->id &&
+		       (reg->dynptr.type == BPF_DYNPTR_TYPE_RINGBUF ||
+			reg->dynptr.type == BPF_DYNPTR_TYPE_FILE);
 	}
 	return false;
 }
@@ -637,8 +706,8 @@ static bool slot_is_obj(const struct bpf_func_state *frame, int spi,
 /*
  * If @ref is an object in the stack: the places that have its address at @insn_idx. R10 if the
  * current frame of @st has the object. If a caller has it, what find_cands() finds: the function
- * got a pointer and made the object there, like the constructor of a guard.
- * *@obj: the first slot of the object.
+ * got a pointer and made the object there, like the constructor of a guard. A clone of a dynptr is
+ * one more place of the same resource. *@obj: the first slot of the object.
  */
 static int find_obj_cands(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  int insn_idx, const struct bpf_reference_state *ref,
@@ -713,8 +782,12 @@ static bool can_free_obj(struct bpf_verifier_env *env, const struct bpf_insn *re
 
 /*
  * Can a pad of @frame make the call of @ent, which releases a pointer, an iterator or a dynptr,
- * under the locks of its callers? What the callers hold is in the first entry_refs of refs[] of
- * @st. The pad has released the locks of its own frame by then.
+ * under the locks that are held then? Those of its callers are: what the callers hold is in the
+ * first entry_refs of refs[] of @st. The pad has released the locks of its own frame by then,
+ * unless RCU protects @ent: such an iterator goes ahead of them, see enum pad_turn, and every
+ * lock in refs[] counts. The frame takes its locks behind the insn that made the iterator, where
+ * a hidden slot got its release, so for them the visit asks: ref_ent() is called for every
+ * state that holds the iterator.
  * Under a lock a program may call only a kfunc that is KF_SPINLOCK_SAFE, see do_check_insn(), and
  * so may its pad: the release of a kernel object runs code of its owner. The program has no such
  * call for an object of its own. The pad frees one there all the same if that runs no destructor
@@ -724,14 +797,14 @@ static bool can_release_under_lock(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st,
 				   const struct bpf_func_state *frame, const struct bpf_pad_ent *ent)
 {
+	u32 i, nr = ent->rcu ? st->acquired_refs : frame->entry_refs;
 	struct bpf_call_arg_meta meta;
-	u32 i;
 
 	if (ent->class < BPF_PAD_REF)
 		return true;
-	for (i = 0; i < frame->entry_refs && !(st->refs[i].type & REF_TYPE_LOCK_MASK); i++)
+	for (i = 0; i < nr && !(st->refs[i].type & REF_TYPE_LOCK_MASK); i++)
 		;
-	if (i == frame->entry_refs)
+	if (i == nr)
 		return true;
 	if (is_obj_drop(&ent->release))
 		return !bpf_obj_free_runs_dtor(env->prog->aux->btf, ent->obj_type);
@@ -772,12 +845,27 @@ static int ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		return BPF_CONFLICT_NO_PLACE;
 	if (type_may_be_null(reg->type))
 		return BPF_CONFLICT_NOT_ALWAYS_HELD;
-	if (ref_release(env, ref, reg, &ent->release))
+	if (ref_release(env, ref, reg, false, &ent->release))
 		return BPF_CONFLICT_NO_RELEASE;
 	ent->nr_cands[0] = find_cands(env, st, insn_idx, ref, NULL, ent->cand[0]);
 	if (!ent->nr_cands[0] && reg >= &regs[BPF_REG_0] && reg <= &regs[BPF_REG_5])
 		return BPF_CONFLICT_CALLER_SAVED;
 	return ent_imm(env, ent, reg);
+}
+
+/* See ref_ent(). @ref is an iterator or a dynptr, and @slot the first one that it has. */
+static int obj_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
+		   const struct bpf_reference_state *ref, const struct bpf_stack_state *slot)
+{
+	if (ref_release(env, ref, &slot->spilled_ptr, slot->slot_type[0] == STACK_ITER, &ent->release))
+		return BPF_CONFLICT_NO_RELEASE;
+	if (slot->slot_type[0] == STACK_ITER) {
+		ent->class = BPF_PAD_ITER;
+		ent->rcu = slot->spilled_ptr.type & MEM_RCU;
+	} else {
+		ent->class = BPF_PAD_DYNPTR;
+	}
+	return ent_imm(env, ent, &slot->spilled_ptr);
 }
 
 /*
@@ -803,7 +891,9 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		ent->nr_cands[0] = find_obj_cands(env, st, insn_idx, ref, ent->cand[0], &obj);
 	else
 		ent->nr_cands[0] = find_lock_cands(env, st, insn_idx, ref, ent->cand[0]);
-	if (class == BPF_PAD_REF)
+	if (class == BPF_PAD_REF && obj)
+		err = obj_ent(env, ent, ref, obj);
+	else if (class == BPF_PAD_REF)
 		err = ptr_ent(env, ent, st, insn_idx, ref);
 	if (class == BPF_PAD_RES_LOCK_IRQ) {
 		/* The same insn saved irq flags, the next of refs[]: the second argument. */
@@ -848,7 +938,7 @@ static struct bpf_pad_ent *match_ent(const struct bpf_pad_plan *plan, const stru
 		ent = &plan->ents[i];
 		if (ent->ref >= 0 || (origin && ent->origin != new->origin) ||
 		    memcmp(&ent->release, &new->release, sizeof(ent->release)) ||
-		    ent->obj_type != new->obj_type)
+		    ent->obj_type != new->obj_type || ent->rcu != new->rcu)
 			continue;
 		for (arg = 0; arg < BPF_PAD_MAX_ARGS; arg++)
 			if (new->nr_cands[arg] && !common_cands(ent, new, arg, cand))
@@ -870,13 +960,23 @@ static struct bpf_pad_ent *add_ent(struct bpf_pad_plan *plan, const struct bpf_p
 	return &plan->ents[plan->nr_ents++];
 }
 
+/* refs[@child] of @st was made from the pointer refs[@parent], see invalidate_reference() */
+static bool ref_is_child(const struct bpf_verifier_state *st, int child, int parent)
+{
+	return st->refs[child].type == REF_TYPE_PTR && st->refs[parent].type == REF_TYPE_PTR &&
+	       st->refs[child].parent_id == st->refs[parent].id;
+}
+
 /*
  * The resources with a handle that the current frame of @st acquired: refs[] from
  * entry_refs on, oldest first. Which entry is one of them? What a pad does with an entry is a call
  * with what it finds at a place, so that is what an entry is, like a variable with a destructor. It
- * does not matter which insn acquired what is there. Where that leaves a choice the origin decides.
+ * does not matter which insn acquired what is there: an iterator that is destroyed and made again
+ * is one entry, two nodes that one insn in a loop took off a list are two. Where that leaves a
+ * choice the origin decides.
  * Every visit has to hold every entry.
- * Locks and irq flags have to be in refs[] in the order of the plan.
+ * Locks and irq flags have to be in refs[] in the order of the plan, and so do a pointer and what
+ * was made from it.
  * Returns the reason of a conflict.
  */
 static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
@@ -884,7 +984,7 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 {
 	const struct bpf_reference_state *ref;
 	struct bpf_pad_ent new, *ent;
-	int i, arg, pass, pos, err;
+	int i, j, arg, pass, pos, err;
 
 	/* the pad of a call runs after the call: what is live at the next insn is there */
 	insn_idx += plan->kind == BPF_SITE_CALL;
@@ -924,6 +1024,11 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			return BPF_CONFLICT_ORDER_DIFFERS;
 		pos = ent - plan->ents;
 	}
+	for (i = 0; i < plan->nr_ents; i++)
+		for (j = 0; j < i; j++)
+			if (plan->ents[i].ref >= 0 && plan->ents[j].ref >= 0 &&
+			    ref_is_child(st, plan->ents[j].ref, plan->ents[i].ref))
+				return BPF_CONFLICT_ORDER_DIFFERS;
 	for (i = 0; i < plan->nr_ents; i++)
 		if (plan->ents[i].ref < 0)
 			return BPF_CONFLICT_NOT_ALWAYS_HELD;
@@ -1007,15 +1112,20 @@ static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
 
 /*
  * The turns of a pad. Few functions can be called under a lock, and a release may sleep: locks and
- * irq flags go first, then the pad leaves the sections, pointers go last.
+ * irq flags go first, then the pad leaves the sections, pointers and objects go last.
+ * An iterator that RCU protects goes ahead of them all: a section or irq flags may be what protects
+ * it, see in_rcu_cs(). So it goes under the locks of the frame, see can_release_under_lock().
  */
 enum pad_turn {
+	PAD_TURN_RCU_ITERS,
 	PAD_TURN_LOCKS,
 	PAD_TURN_POINTERS,
 };
 
 static enum pad_turn release_turn(const struct bpf_pad_ent *ent)
 {
+	if (ent->rcu)
+		return PAD_TURN_RCU_ITERS;
 	return ent->class < BPF_PAD_REF ? PAD_TURN_LOCKS : PAD_TURN_POINTERS;
 }
 
@@ -1051,7 +1161,8 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 {
 	int class, i, n;
 
-	n = release_ents(env, plan, PAD_TURN_LOCKS, buf, aux);
+	n = release_ents(env, plan, PAD_TURN_RCU_ITERS, buf, aux);
+	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
@@ -1140,6 +1251,8 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 		[BPF_PAD_RES_LOCK_IRQ]		= "res_lock_irq",
 		[BPF_PAD_SPIN_LOCK]		= "spin_lock",
 		[BPF_PAD_REF]			= "ref",
+		[BPF_PAD_ITER]			= "iter",
+		[BPF_PAD_DYNPTR]		= "dynptr",
 	};
 	const struct bpf_pad_place *place;
 	int arg;
