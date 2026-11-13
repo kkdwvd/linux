@@ -593,20 +593,26 @@ static struct bpf_insn budget_exit_insn(struct bpf_verifier_env *env, struct bpf
  *  - What is live where the guard at the head of a loop goes is live at the head,
  *    see bpf_head_guard_target().
  *  - On the way out of the subprog R0, and R2 of a pair, are set to 0.
+ *
+ * The pads of all sites are added here, behind their subprogs and behind 'leave'.
  */
 int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 {
 	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
 	struct bpf_insn leave[3] = { BPF_MOV64_IMM(BPF_REG_0, 0) };
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_insn *pads;
 	struct bpf_subprog_info *sub;
 	struct bpf_insn *insn;
-	int i, s, n, err;
+	int i, s, n, pad_cnt, err;
 	bool leaves;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
 		n = bpf_ret_reg_pair(env, s) ? 3 : 2;
+		pad_cnt = bpf_cancel_build_pads(env, s, &pads);
+		if (pad_cnt < 0)
+			return pad_cnt;
 		leaves = false;
 		for (i = sub->start; i < sub[1].start; i++) {
 			if (!aux[i].loop_guard)
@@ -619,16 +625,22 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			if (aux[i].guard_no_unwind)
 				bpf_patch_list_jump(&env->patch_list, insn - 1, aux[i].guard_to, 0);
 			else
-				bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start, n);
+				bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start,
+						    n + pad_cnt);
 			leaves |= !aux[i].guard_no_unwind;
 		}
-		if (!leaves)
-			continue;
-		leave[1] = BPF_MOV64_IMM(BPF_REG_2, 0);
-		leave[n - 1] = budget_exit_insn(env, sub);
-		err = bpf_patch_list_append(env, i - 1, leave, n);
-		if (err)
-			return err;
+		if (leaves) {
+			leave[1] = BPF_MOV64_IMM(BPF_REG_2, 0);
+			leave[n - 1] = budget_exit_insn(env, sub);
+			err = bpf_patch_list_append(env, i - 1, leave, n);
+			if (err)
+				return err;
+		}
+		if (pad_cnt) {
+			err = bpf_patch_list_append(env, i - 1, pads, pad_cnt);
+			if (err)
+				return err;
+		}
 	}
 	return bpf_patch_list_commit(env);
 }
@@ -681,6 +693,9 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  *	exit;
  * body:
  *
+ * In a subprog that can be cancelled the pad of the check is at bail, see
+ * bpf_cancel_entry_pad(): the invocation ends instead of going on in the caller.
+ *
  * It is the stack as it is: whatever is there is counted, be it the callers of the prog in the
  * kernel, another prog, a trampoline or a helper that calls a callback. An invocation in
  * another stack has nothing to do with it.
@@ -696,9 +711,11 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_insn buf[24], nop = BPF_JMP_A(0), *insn;
+	struct bpf_insn buf[24], bail[3], nop = BPF_JMP_A(0), *insn;
 	bool found = false;
-	int s, n, jmp, err;
+	int s, n, m, jmp, err;
+
+	BUILD_BUG_ON(BPF_CANCEL_PAD_EXIT_INSNS > ARRAY_SIZE(bail));
 
 	for (s = 1; s < env->subprog_cnt; s++)
 		found |= si[s].recursive;
@@ -718,15 +735,21 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
 		}
+		/* at bail: the pad of the check, or leave with 0 for the caller to go on with */
+		m = bpf_cancel_entry_pad(env, s, bail);
+		if (!m) {
+			bail[m++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+			if (bpf_ret_reg_pair(env, s))
+				bail[m++] = BPF_MOV64_IMM(BPF_REG_2, 0);
+			bail[m++] = budget_exit_insn(env, &si[s]);
+		}
 		jmp = n++;
-		n += emit_stack_check(buf + n, bpf_ret_reg_pair(env, s) ? 4 : 3);
+		n += emit_stack_check(buf + n, m + 1);
 		/* The arguments are not needed any more */
 		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_recursion);
 		buf[jmp] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, n - jmp - 1, 0);
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
-		if (bpf_ret_reg_pair(env, s))
-			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
-		buf[n++] = budget_exit_insn(env, &si[s]);
+		memcpy(buf + n, bail, m * sizeof(*bail));
+		n += m;
 		/* calls get to the check, jumps to the first insn do not */
 		err = bpf_patch_list_insert(env, si[s].start, buf, n);
 		if (err)
