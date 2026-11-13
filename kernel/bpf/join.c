@@ -420,7 +420,8 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 			return false;
 		if (fa->entry_refs != fb->entry_refs ||
 		    fa->entry_rcu_locks != fb->entry_rcu_locks ||
-		    fa->entry_preempt_locks != fb->entry_preempt_locks)
+		    fa->entry_preempt_locks != fb->entry_preempt_locks ||
+		    fa->gave != fb->gave)
 			return false;
 		if (!join_loop_stack(fa, fb))
 			return false;

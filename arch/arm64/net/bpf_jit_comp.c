@@ -1796,7 +1796,8 @@ static long bpf_cancel_fixup(u64 lr)
  * unwind_exit: return to the pad. LR in the frame record is signed. Instead of
  * signing the address of the pad, let the epilogue authenticate LR as it is and
  * add the offset of the pad to it. r0 and r2 are returned.
- * cancel_exit: the same with the pad of cancel_goto. It has to keep r0 only.
+ * cancel_exit: the same with the pad of cancel_goto. r2 tells that pad what the
+ * frame released for its caller, see bpf_cancel_note_args().
  */
 static void emit_unwind_exit(struct jit_ctx *ctx, long (*fixup)(u64 lr))
 {
