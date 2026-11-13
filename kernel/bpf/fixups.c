@@ -991,6 +991,8 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 		free_loop(aux_data[i].recursion_loop);
 		aux_data[i].loop = aux_data[i].callback_loop = aux_data[i].recursion_loop = NULL;
 		bpf_pad_plans_free(&aux_data[i]);
+		kfree(aux_data[i].pad_note);
+		aux_data[i].pad_note = NULL;
 	}
 }
 

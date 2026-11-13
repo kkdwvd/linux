@@ -457,44 +457,56 @@ void bpf_pad_plans_free(struct bpf_insn_aux_data *aux)
 /* A pass or a path-sensitive run begins */
 void bpf_pads_new_round(struct bpf_verifier_env *env)
 {
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	int i;
 
 	env->pads_late = false;
-	for (i = 0; i < env->prog->len; i++)
-		bpf_pad_plans_free(&env->insn_aux_data[i]);
+	for (i = 0; i < env->prog->len; i++, aux++) {
+		bpf_pad_plans_free(aux);
+		kfree(aux->pad_note);
+		aux->pad_note = NULL;
+	}
 }
 
 /*
- * The plans are what a pass found, like the fixups of the insns, and a pass that is kept can
- * become the result when a later one has an error. So the plans move with the snapshot of the
- * pass, see copy_snapshot(): to @plans, which has an entry per insn, if @save, else back from
- * there. What was at the destination is freed, and the source has no plans after that.
+ * The plans and the notes are what a pass found, like the fixups of the insns, and a pass that
+ * is kept can become the result when a later one has an error. So they move with the snapshot
+ * of the pass, see copy_snapshot(): to @moved, which has an entry per insn, if @save, else back
+ * from there. What was at the destination is freed, and the source has nothing after that.
  */
-void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pad_plan **plans, bool save)
+void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	int i;
 
-	for (i = 0; i < env->prog->len; i++, aux++) {
+	for (i = 0; i < env->prog->len; i++, aux++, moved++) {
 		if (save) {
-			free_plans(plans[i]);
-			plans[i] = aux->pad_plans;
+			free_plans(moved->plans);
+			kfree(moved->note);
+			moved->plans = aux->pad_plans;
+			moved->note = aux->pad_note;
 			aux->pad_plans = NULL;
+			aux->pad_note = NULL;
 		} else {
 			free_plans(aux->pad_plans);
-			aux->pad_plans = plans[i];
-			plans[i] = NULL;
+			kfree(aux->pad_note);
+			aux->pad_plans = moved->plans;
+			aux->pad_note = moved->note;
+			moved->plans = NULL;
+			moved->note = NULL;
 		}
 	}
 }
 
-/* The snapshot that has @plans of @cnt insns is freed */
-void bpf_pads_free_moved(struct bpf_pad_plan **plans, u32 cnt)
+/* The snapshot that has @moved of @cnt insns is freed */
+void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt)
 {
 	u32 i;
 
-	for (i = 0; i < cnt; i++)
-		free_plans(plans[i]);
+	for (i = 0; i < cnt; i++) {
+		free_plans(moved[i].plans);
+		kfree(moved[i].note);
+	}
 }
 
 /* How many sections of @class the current frame of @st has entered and not left */
@@ -1256,6 +1268,281 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	}
 	plan->visited = true;
 	return plan;
+}
+
+/* The group of @class */
+static int class_group(int class)
+{
+	if (class < BPF_PAD_NR_SECTIONS)
+		return class;
+	return class < BPF_PAD_REF ? BPF_PAD_GROUP_LOCKS : BPF_PAD_GROUP_REFS;
+}
+
+/* How many of refs[@from] .. refs[@to - 1] of @st are of @group */
+static int count_refs(const struct bpf_verifier_state *st, int from, int to, int group)
+{
+	int i, n = 0;
+
+	for (i = from; i < to; i++)
+		n += class_group(ref_class(&st->refs[i])) == group;
+	return n;
+}
+
+/* NULL if there is no memory */
+static struct bpf_pad_note *pad_note_get(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+
+	if (!aux->pad_note)
+		aux->pad_note = kzalloc_obj(*aux->pad_note, BPF_VERIFIER_GFP);
+	return aux->pad_note;
+}
+
+/*
+ * What the current insn does to a resource of @group concerns a frame that waits in a call, where
+ * no store can follow it. It may be the same object that another frame holds once more. So none
+ * of the functions on the stack gets hidden slots for @group.
+ */
+void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+	int f;
+
+	for (f = 0; f <= st->curframe; f++)
+		env->subprog_info[st->frame[f]->subprogno].no_slots |= BIT(group);
+}
+
+/*
+ * Make @ent what a hidden slot is to a plan if it has what is in @reg: the handle of @ref, which
+ * is one of refs[] of @st, plus a constant. @by_type: no insn of the function acquired @ref.
+ * False if there is no such entry.
+ */
+static bool slot_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
+		     const struct bpf_verifier_state *st, const struct bpf_reference_state *ref,
+		     const struct bpf_reg_state *reg, bool by_type)
+{
+	s64 off = reg->var_off.value;
+	int err = 0;
+
+	if (!tnum_is_const(reg->var_off))
+		return false;
+	memset(ent, 0, sizeof(*ent));
+	ent->ref = -1;
+	ent->class = ref_class(ref);
+	ent->nr_cands[0] = 1;
+	ent->cand[0][0] = (struct bpf_pad_place){ .loc = BPF_PLACE_SPILL, .null = true };
+	if (ent->class == BPF_PAD_RES_LOCK_IRQ)
+		ent->cand[1][ent->nr_cands[1]++] = ent->cand[0][0];
+	if (ent->class != BPF_PAD_REF) {
+		ent->release = release_call(ent->class);
+	} else if (reg->type == PTR_TO_STACK) {
+		err = obj_ent(env, ent, ref, bpf_stack_slot(st->frame[reg->frameno],
+							    -off / BPF_REG_SIZE - 1));
+	} else {
+		ent->cand[0][0].delta = off;
+		err = by_type ? type_release(env, reg, 0, &ent->release) :
+				ref_release(env, ref, reg, false, &ent->release);
+		err = err ?: ent_imm(env, ent, reg);
+		err = err ?: off != (s16)off;
+	}
+	return !err;
+}
+
+/*
+ * The call at @insn_idx, in @sub, brings @ent to a frame that holds @held of the group. R@src goes
+ * to the slot. The stores at an insn and the entry of its slots are code: all states that get to
+ * the insn have to agree on them. Locks and irq flags are released in the order of the run, which
+ * slots don't have: one at a time.
+ */
+static void note_acquire(struct bpf_verifier_env *env, struct bpf_subprog_info *sub, int insn_idx,
+			 const struct bpf_pad_ent *ent, int src, int held)
+{
+	struct bpf_pad_note *note = pad_note_get(env, insn_idx);
+	int group = class_group(ent->class);
+
+	if (!note) {
+		sub->no_slots |= BIT(group);
+		return;
+	}
+	if (!note->acquires) {
+		note->acquires = true;
+		note->src = src;
+		note->ent = *ent;
+		note->ent.origin = insn_idx;
+	}
+	if (note->src != src || note->ent.class != ent->class || note->ent.rcu != ent->rcu ||
+	    memcmp(&note->ent.release, &ent->release, sizeof(ent->release)) ||
+	    note->ent.obj_type != ent->obj_type ||
+	    note->ent.cand[0][0].delta != ent->cand[0][0].delta ||
+	    held >= BPF_PAD_MAX_ENTS || (held && group == BPF_PAD_GROUP_LOCKS))
+		sub->no_slots |= BIT(group) | BIT(class_group(note->ent.class));
+	else
+		note->held = max_t(int, note->held, held);
+}
+
+/*
+ * The current insn acquired the youngest of refs[]. @reg has what the release takes: R0, or the
+ * argument that is the address of the lock or of the object in the stack.
+ * No slot: the argument is in the stack. A reference with a parent, which has to be released
+ * first. bpf_map_lookup_elem(): what it returns has to be released if the map has sockets.
+ */
+void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
+	const struct bpf_verifier_state *st = env->cur_state;
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_reference_state *ref = &st->refs[st->acquired_refs - 1];
+	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
+	int group = class_group(ref_class(ref));
+	struct bpf_pad_ent ent;
+
+	if (reg < &frame->regs[BPF_REG_0] || reg > &frame->regs[BPF_REG_5] ||
+	    (ref->type == REF_TYPE_PTR && ref->parent_id) ||
+	    (bpf_helper_call(insn) && insn->imm == BPF_FUNC_map_lookup_elem) ||
+	    !slot_ent(env, &ent, st, ref, reg, false) ||
+	    !can_release_under_lock(env, st, frame, &ent))
+		sub->no_slots |= BIT(group);
+	else
+		note_acquire(env, sub, env->insn_idx, &ent, reg - frame->regs,
+			     count_refs(st, frame->entry_refs, st->acquired_refs - 1, group));
+}
+
+/*
+ * If @ref is an object in the stack: its first slot, and its address goes to @addr.
+ * NULL otherwise.
+ */
+static const struct bpf_stack_state *find_obj(const struct bpf_verifier_state *st,
+					      const struct bpf_reference_state *ref,
+					      struct bpf_reg_state *addr)
+{
+	int f, i;
+
+	for (f = st->curframe; f >= 0 && !(ref->type & REF_TYPE_LOCK_MASK); f--) {
+		for (i = 0; i < bpf_stack_nr_slots(st->frame[f]); i++) {
+			if (!slot_is_obj(st->frame[f], i, ref))
+				continue;
+			*addr = st->frame[f]->regs[BPF_REG_FP];
+			addr->var_off = tnum_const(-(i + 1) * BPF_REG_SIZE);
+			return bpf_stack_slot(st->frame[f], i);
+		}
+	}
+	return NULL;
+}
+
+/* The current insn, in @sub, releases a resource of @group. R@reg has the handle plus @delta. */
+static void note_release(struct bpf_verifier_env *env, struct bpf_subprog_info *sub, int group,
+			 int reg, int delta)
+{
+	struct bpf_pad_note *note = pad_note_get(env, env->insn_idx);
+
+	if (!note) {
+		sub->no_slots |= BIT(group);
+		return;
+	}
+	if (!note->releases) {
+		note->releases = true;
+		note->group = group;
+		note->reg = reg;
+		note->delta = delta;
+	}
+	if (note->group != group || note->reg != reg || note->delta != delta)
+		sub->no_slots |= BIT(group) | BIT(note->group);
+}
+
+/*
+ * The current insn releases refs[@idx] of the current state. The slot that has the handle is found
+ * at run time, by the register among R1-R5 that has it too. A register that the insn does not
+ * read may have anything in a state that was not looked at.
+ */
+void bpf_pad_note_release(struct bpf_verifier_env *env, int idx)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
+	int r, nr = 0, group = class_group(ref_class(ref));
+	const struct bpf_stack_state *obj;
+	struct bpf_pad_place place = {};
+	struct bpf_reg_state addr;
+
+	if (env->pad_releases)
+		return;
+	if (idx < frame->entry_refs) {
+		bpf_pad_no_slots(env, group);
+		return;
+	}
+	obj = find_obj(st, ref, &addr);
+	/* irq flags that a lock saved are the second word of its slot */
+	if (ref->type == REF_TYPE_IRQ && obj && obj->spilled_ptr.irq.kfunc_class == IRQ_LOCK_KFUNC)
+		return;
+	for (r = BPF_REG_1; r <= BPF_REG_5 && !nr; r++)
+		if (env->insn_aux_data[env->insn_idx].live_regs_before & BIT(r))
+			add_cand(&place, &nr, &frame->regs[r], ref, obj ? &addr : NULL,
+				 BPF_PLACE_REG, r);
+	if (!nr || place.delta != (s16)place.delta)
+		sub->no_slots |= BIT(group);
+	else
+		note_release(env, sub, group, place.at, place.delta);
+}
+
+/* The current insn enters a section of @class, or leaves one. It has not changed the state yet. */
+void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class, bool enter)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_subprog_info *sub = &env->subprog_info[st->frame[st->curframe]->subprogno];
+	struct bpf_pad_ent ent = {
+		.ref = -1,
+		.class = class,
+		.release = release_call(class),
+		.nr_cands[0] = 1,
+		.cand[0][0] = { .loc = BPF_PLACE_SPILL, .null = true },
+	};
+
+	if (enter)
+		note_acquire(env, sub, env->insn_idx, &ent, 0, frame_sections(st, class));
+	else if (frame_sections(st, class))
+		note_release(env, sub, class, 0, 0);
+	else
+		bpf_pad_no_slots(env, class_group(class));
+}
+
+/*
+ * The current frame of @st returns to the call at @call_idx in @caller, with what it acquired and
+ * did not release. @plain: with exit, and it is no callback.
+ * One pointer that is in R0 is what a kfunc returns: the call acquires it. What releases it follows
+ * from its type: states with the same pointer from different insns are the same to the main pass.
+ * The store after the call takes R0 as it is, so it has to be 0 when nothing comes with it.
+ * Nothing else has a store: it goes past the store if the frame unwinds.
+ */
+void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			 const struct bpf_func_state *caller, int call_idx, bool plain)
+{
+	const struct bpf_func_state *callee = st->frame[st->curframe];
+	const struct bpf_reference_state *ref = &st->refs[callee->entry_refs];
+	struct bpf_subprog_info *sub = &env->subprog_info[caller->subprogno];
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[call_idx];
+	const struct bpf_reg_state *r0 = &callee->regs[BPF_REG_0];
+	int i, nr = st->acquired_refs - callee->entry_refs, in_r0 = 0;
+	struct bpf_pad_place place;
+	struct bpf_pad_ent ent;
+
+	for (i = 0; i < BPF_PAD_NR_SECTIONS; i++)
+		if (frame_sections(st, i))
+			sub->no_slots |= BIT(i);
+	if (plain && nr == 1 && ref->type == REF_TYPE_PTR && !ref->parent_id)
+		add_ref_cand(&place, &in_r0, r0, ref, BPF_PLACE_REG, BPF_REG_0);
+	if (in_r0 && slot_ent(env, &ent, st, ref, r0, true) &&
+	    can_release_under_lock(env, st, caller, &ent)) {
+		note_acquire(env, sub, call_idx, &ent, BPF_REG_0,
+			     count_refs(st, caller->entry_refs, callee->entry_refs,
+					BPF_PAD_GROUP_REFS));
+	} else {
+		for (i = 0; i < nr; i++)
+			sub->no_slots |= BIT(class_group(ref_class(&ref[i])));
+		aux->call_brings_nothing |= plain && !reg_is_null(r0);
+	}
+	if (aux->call_brings_nothing && aux->pad_note && aux->pad_note->acquires)
+		sub->no_slots |= BIT(BPF_PAD_GROUP_REFS);
 }
 
 /* The pad finds out by itself whether it has to release @ent: what is at the place may be 0 */

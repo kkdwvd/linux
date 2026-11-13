@@ -207,7 +207,8 @@ struct bpf_verifier_stack_elem {
 #define BPF_PRIV_STACK_MIN_SIZE		64
 
 static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id);
-static int release_reference_nomark(struct bpf_verifier_state *state, int id);
+static int __release_reference_nomark(struct bpf_verifier_state *state, int id);
+static int release_reference_nomark(struct bpf_verifier_env *env, int id);
 static int release_reference(struct bpf_verifier_env *env, int id);
 static int invalidate_reference(struct bpf_verifier_env *env, int id);
 static u32 reg_lifetime_id(struct bpf_verifier_env *env,
@@ -818,6 +819,12 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 	mark_dynptr_stack_regs(env, &bpf_stack_slot(state, spi)->spilled_ptr,
 			       &bpf_stack_slot(state, spi - 1)->spilled_ptr, type, parent_id);
 
+	/* either of a dynptr and its clone releases, and the other may be overwritten */
+	if (dynptr_type_referenced(type) && dynptr->type != BPF_DYNPTR_TYPE_INVALID)
+		bpf_pad_no_slots(env, BPF_PAD_GROUP_REFS);
+	else if (dynptr_type_referenced(type))
+		bpf_pad_note_acquire(env, reg);
+
 	return 0;
 }
 
@@ -1081,6 +1088,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 
 		mark_stack_slot_scratched(env, spi - i);
 	}
+	bpf_pad_note_acquire(env, reg);
 
 	return 0;
 }
@@ -1214,6 +1222,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 		slot->slot_type[i] = STACK_IRQ_FLAG;
 
 	mark_stack_slot_scratched(env, spi);
+	/* irq flags that a lock saves come and go with the lock */
+	if (kfunc_class == IRQ_NATIVE_KFUNC)
+		bpf_pad_note_acquire(env, reg);
 	return 0;
 }
 
@@ -1683,6 +1694,7 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
+			bpf_pad_note_release(env, i);
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
@@ -1713,6 +1725,7 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_IRQ)
 			continue;
 		if (state->refs[i].id == id) {
+			bpf_pad_note_release(env, i);
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
 			bpf_diag_record_context(env, env->insn_idx, BPF_DIAG_CONTEXT_IRQ,
@@ -8488,6 +8501,7 @@ static int process_spin_lock(struct bpf_verifier_env *env, struct bpf_reg_state 
 			verbose(env, "Failed to acquire lock state\n");
 			return err;
 		}
+		bpf_pad_note_acquire(env, reg);
 	} else {
 		void *ptr;
 		int type;
@@ -11106,7 +11120,7 @@ static void mark_pkt_end(struct bpf_verifier_state *vstate, int regn, bool range
 		reg->range = AT_PKT_END;
 }
 
-static int release_reference_nomark(struct bpf_verifier_state *state, int id)
+static int __release_reference_nomark(struct bpf_verifier_state *state, int id)
 {
 	int i;
 
@@ -11119,6 +11133,18 @@ static int release_reference_nomark(struct bpf_verifier_state *state, int id)
 		}
 	}
 	return -EINVAL;
+}
+
+/* The current insn releases the reference @id of the current state */
+static int release_reference_nomark(struct bpf_verifier_env *env, int id)
+{
+	struct bpf_verifier_state *state = env->cur_state;
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_PTR && state->refs[i].id == id)
+			bpf_pad_note_release(env, i);
+	return __release_reference_nomark(state, id);
 }
 
 static int idstack_push(struct bpf_idmap *idmap, u32 id)
@@ -11217,7 +11243,7 @@ static int invalidate_reference(struct bpf_verifier_env *env, int id)
 static int release_reference(struct bpf_verifier_env *env, int id)
 {
 	if (find_reference_state(env->cur_state, id))
-		WARN_ON_ONCE(release_reference_nomark(env->cur_state, id));
+		WARN_ON_ONCE(release_reference_nomark(env, id));
 
 	return invalidate_reference(env, id);
 }
@@ -11261,7 +11287,7 @@ static int ref_convert_alloc_rcu_protected(struct bpf_verifier_env *env, u32 id)
 	struct bpf_reg_state *reg;
 	int err;
 
-	err = release_reference_nomark(env->cur_state, id);
+	err = release_reference_nomark(env, id);
 	if (err)
 		return err;
 
@@ -11935,6 +11961,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		return BPF_EXIT_NEEDS_CALLER;
 	}
 
+	bpf_pad_note_return(env, exit, frame, call_idx, !exit->unwound);
 	for (i = 0; i < CALLER_SAVED_REGS; i++)
 		bpf_mark_reg_not_init(env, &frame->regs[caller_saved[i]]);
 	for (i = 0; i < frame->out_stack_arg_cnt; i++)
@@ -12650,6 +12677,8 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			return err;
 		state->unwound = callee->in_callback_fn ? BPF_UNWOUND_CB : BPF_UNWOUND;
 	}
+	bpf_pad_note_return(env, state, caller, callee->callsite,
+			    !unwinds && !callee->in_callback_fn);
 	if (callee->in_callback_fn && !unwinds) {
 		/* the helper continues after the barrier of its call */
 		if (state->speculative)
@@ -13612,6 +13641,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -15056,7 +15086,7 @@ static void ref_convert_owning_non_owning(struct bpf_verifier_env *env, u32 id)
 	struct bpf_reg_state *reg;
 	int err;
 
-	err = release_reference_nomark(env->cur_state, id);
+	err = release_reference_nomark(env, id);
 	WARN_ON_ONCE(err);
 
 	bpf_for_each_reg_in_vstate(env->cur_state, unused, reg, ({
@@ -16230,6 +16260,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
 	if (rcu_lock) {
+		bpf_pad_note_section(env, BPF_PAD_RCU, true);
 		env->cur_state->active_rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
 					env->cur_state->active_rcu_locks);
@@ -16241,6 +16272,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				"Remove the extra bpf_rcu_read_unlock() call, or ensure this path first enters an RCU read lock region.");
 			return -EINVAL;
 		}
+		bpf_pad_note_section(env, BPF_PAD_RCU, false);
 		env->cur_state->active_rcu_locks--;
 		release_context_state(env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
@@ -16248,6 +16280,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (!in_rcu_cs(env))
 			invalidate_rcu_protected_refs(env);
 	} else if (preempt_disable) {
+		bpf_pad_note_section(env, BPF_PAD_PREEMPT, true);
 		env->cur_state->active_preempt_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, true,
 					env->cur_state->active_preempt_locks);
@@ -16259,6 +16292,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				"Remove the extra bpf_preempt_enable() call, or ensure this path first disables preemption.");
 			return -EINVAL;
 		}
+		bpf_pad_note_section(env, BPF_PAD_PREEMPT, false);
 		env->cur_state->active_preempt_locks--;
 		release_context_state(env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
@@ -16533,6 +16567,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -19296,7 +19331,7 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
 		 * No one could have freed the reference state before
 		 * doing the NULL check.
 		 */
-		WARN_ON_ONCE(release_reference_nomark(vstate, id));
+		WARN_ON_ONCE(__release_reference_nomark(vstate, id));
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
 		mark_ptr_or_null_reg(state, reg, id, is_null);
@@ -21764,6 +21799,8 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 	struct bpf_reference_state *ref;
 	int id, err;
 
+	/* no insn of the program releases them */
+	env->pad_releases = true;
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
@@ -21777,6 +21814,7 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 			return -EFAULT;
 		unmark_stack_obj(env, id);
 	}
+	env->pad_releases = false;
 	/* a lock went, or an object was freed under the lock of a caller, who may point to it */
 	if (st->acquired_refs != refs)
 		invalidate_non_owning_refs(env);
@@ -23751,8 +23789,11 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 				goto out;
 
 			aux->ctx_arg_info[i].ref_arg = ret ? i + 1 : 0;
-			if (ret)
+			if (ret) {
 				state->refs[state->acquired_refs - 1].ctx_arg = i + 1;
+				/* no insn acquires it */
+				bpf_pad_no_slots(env, BPF_PAD_GROUP_REFS);
+			}
 		}
 	}
 
@@ -23872,7 +23913,7 @@ struct bpf_snapshot {
 	struct bpf_env_per_pass env;
 	struct bpf_prog_aux aux;
 	struct bpf_insn_fixups *insns;
-	struct bpf_pad_plan **plans;	/* per insn, see bpf_pads_move() */
+	struct bpf_pads_moved *pads;	/* per insn, see bpf_pads_move() */
 	struct bpf_subprog_info *subprogs;
 	struct bpf_func_info_aux *funcs;
 	struct bpf_prog prog;
@@ -23904,7 +23945,7 @@ static void copy_snapshot(struct bpf_verifier_env *env, struct bpf_snapshot *sna
 	COPY_AUX(kprobe_write_ctx);
 	for (i = 0; i < env->prog->len; i++)
 		COPY(snapshot->insns[i], env->insn_aux_data[i].fixups);
-	bpf_pads_move(env, snapshot->plans, save);
+	bpf_pads_move(env, snapshot->pads, save);
 	for (i = 0, sub = env->subprog_info; i < env->subprog_cnt; i++, sub++) {
 		/* the sum over all passes */
 		snapshot->subprogs[i].insns_total = sub->insns_total;
@@ -23922,21 +23963,21 @@ static struct bpf_snapshot *save_snapshot(struct bpf_verifier_env *env,
 					  struct bpf_snapshot *snapshot)
 {
 	size_t insns = array_size(env->prog->len, sizeof(*snapshot->insns));
-	size_t plans = array_size(env->prog->len, sizeof(*snapshot->plans));
+	size_t pads = array_size(env->prog->len, sizeof(*snapshot->pads));
 	size_t subprogs = env->subprog_cnt * sizeof(*snapshot->subprogs);
 
 	if (!snapshot) {
 		snapshot = kvmalloc(size_add(sizeof(*snapshot) + subprogs +
 					     env->prog->aux->func_info_cnt *
-					     sizeof(*snapshot->funcs), size_add(insns, plans)),
+					     sizeof(*snapshot->funcs), size_add(insns, pads)),
 				    BPF_VERIFIER_GFP);
 		if (!snapshot)
 			return NULL;
-		env->mem += insns + plans + subprogs;
+		env->mem += insns + pads + subprogs;
 		snapshot->insns = (void *)(snapshot + 1);
-		snapshot->plans = (void *)snapshot->insns + insns;
-		memset(snapshot->plans, 0, plans);
-		snapshot->subprogs = (void *)snapshot->plans + plans;
+		snapshot->pads = (void *)snapshot->insns + insns;
+		memset(snapshot->pads, 0, pads);
+		snapshot->subprogs = (void *)snapshot->pads + pads;
 		snapshot->funcs = (void *)snapshot->subprogs + subprogs;
 	}
 	copy_snapshot(env, snapshot, true);
@@ -23947,7 +23988,7 @@ static void free_snapshot(struct bpf_verifier_env *env, struct bpf_snapshot *sna
 {
 	if (!snapshot)
 		return;
-	bpf_pads_free_moved(snapshot->plans, env->prog->len);
+	bpf_pads_free_moved(snapshot->pads, env->prog->len);
 	kvfree(snapshot);
 }
 

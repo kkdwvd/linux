@@ -574,6 +574,42 @@ struct bpf_pad_plan {
 	u32 pad;
 };
 
+/*
+ * The groups of classes. A function has HIDDEN SLOTS for all that it acquires of a group or for
+ * nothing of it, see kernel/bpf/pads.c
+ */
+enum bpf_pad_group {
+	BPF_PAD_GROUP_RCU,	/* BPF_PAD_RCU */
+	BPF_PAD_GROUP_PREEMPT,	/* BPF_PAD_PREEMPT */
+	BPF_PAD_GROUP_LOCKS,	/* locks and irq flags: they are released in an order */
+	BPF_PAD_GROUP_REFS,	/* REF_TYPE_PTR: pointers, iterators, dynptrs */
+	BPF_PAD_NR_GROUPS,
+};
+
+/*
+ * What the main pass notes about a call for the hidden slots of the function that the call is in.
+ * It holds for all states that got to the call in the pass. Like the plans it moves with the
+ * snapshot of the pass, see bpf_pads_move().
+ */
+struct bpf_pad_note {
+	/* The call acquires a resource, or it calls a subprog that returns with one. */
+	bool acquires;
+	u8 src;			/* the register that goes to the slot */
+	u8 held;		/* the most that the frame holds of the group when it gets there */
+	struct bpf_pad_ent ent;	/* what a slot of the call is to a plan, but for the offset */
+	/* The call releases a resource that the frame acquired. */
+	bool releases;
+	u8 group;		/* enum bpf_pad_group */
+	u8 reg;			/* the register that has the handle */
+	s16 delta;		/* what is there is that much more than the handle */
+};
+
+/* What a snapshot keeps for the landing pads of an insn, see bpf_pads_move() */
+struct bpf_pads_moved {
+	struct bpf_pad_plan *plans;
+	struct bpf_pad_note *note;
+};
+
 struct loop_stack_entry {
 	struct bpf_loop *loop;
 	struct bpf_header_state *header_state;	/* see failing_path_trip() */
@@ -1146,6 +1182,8 @@ struct bpf_insn_aux_data {
 	u64 non_arena_load:1;
 	u64 indirect_target:1; /* if it is an indirect jump target */
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
+	/* a subprog returned here with no pointer to release and R0 may be not 0 */
+	u64 call_brings_nothing:1;
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
@@ -1215,6 +1253,7 @@ struct bpf_insn_aux_data {
 	struct bpf_loop *callback_loop, *recursion_loop;
 	/* the sites at this instruction, as far as the round of the main pass got to them */
 	struct bpf_pad_plan *pad_plans;
+	struct bpf_pad_note *pad_note;	/* of the pass too */
 };
 
 /*
@@ -1378,6 +1417,8 @@ struct bpf_subprog_info {
 	bool unwinds_for_sure: 1;
 	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
 	bool below_conflict: 1;
+	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
+	u8 no_slots: 4;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -1573,6 +1614,7 @@ struct bpf_verifier_env {
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_needs_guard() */
 	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
+	bool pad_releases;		/* see release_frame_resources() */
 	bool calls_joined;		/* see flow_may_add_instance() */
 	bool extra_values;		/* a state can have constants that no run has */
 	bool new_linear_xreg;		/* see bpf_same_insns_unproven() */
@@ -2062,10 +2104,16 @@ struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_
 struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
 				      enum bpf_site_kind kind);
 int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee);
+void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
+void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+void bpf_pad_note_release(struct bpf_verifier_env *env, int idx);
+void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class, bool enter);
+void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			 const struct bpf_func_state *caller, int call_idx, bool plain);
 void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
-void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pad_plan **plans, bool save);
-void bpf_pads_free_moved(struct bpf_pad_plan **plans, u32 cnt);
+void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save);
+void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
 struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st, int insn_idx,
 				   enum bpf_site_kind kind);
