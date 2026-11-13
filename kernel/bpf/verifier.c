@@ -908,6 +908,13 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 		return -EINVAL;
 	}
 
+	/*
+	 * Another dynptr keeps the reference. But the frame may wait in a call, and its
+	 * pad would release the reference through this one, see cancel_collect_dynptr().
+	 */
+	if (dynptr_type_referenced(slot->spilled_ptr.dynptr.type))
+		bpf_cancel_foreign_release(env, state->frameno);
+
 	/* Invalidate the dynptr and any derived slices */
 	err = release_reference(env, slot->spilled_ptr.id);
 	if (!err) {

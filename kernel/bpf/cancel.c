@@ -25,6 +25,8 @@
  *   is found at an address that is known, or through a live pointer of the
  *   frame to what the lock is in.
  * - open-coded iterators: the pad calls bpf_iter_<type>_destroy().
+ * - dynptrs that hold a reference: the pad discards the ringbuf record, or frees
+ *   the reader of the file.
  * - RCU read sections and preemption-disabled sections: the pad leaves the ones
  *   that its frame entered.
  * A frame that holds anything else of its own declines. So does the frame that
@@ -67,6 +69,11 @@ enum cancel_kind {
 	CANCEL_RES_LOCK,
 	/* or bpf_res_spin_unlock_irqrestore(), which restores the IRQ flags of the lock too */
 	CANCEL_RES_LOCK_IRQ,
+	/*
+	 * A dynptr in the stack of the frame that holds a reference, see cancel_collect_dynptr().
+	 * In front of what the reference may be the child of: an iterator, another reference.
+	 */
+	CANCEL_KIND_DYNPTR,
 	/* an open-coded iterator in the stack of the frame, see cancel_collect_iter() */
 	CANCEL_KIND_ITER,
 	/*
@@ -118,6 +125,8 @@ enum cancel_reason {
 	CANCEL_LOCK_PLACE,
 	/* it holds an iterator that its pad cannot find or may not destroy */
 	CANCEL_ITER,
+	/* it holds a reference through dynptrs that its pad cannot find or may not release */
+	CANCEL_DYNPTR,
 	__CANCEL_REASONS,
 };
 
@@ -133,6 +142,7 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_FOREIGN]	= "foreign",
 	[CANCEL_LOCK_PLACE]	= "lock",
 	[CANCEL_ITER]		= "iter",
+	[CANCEL_DYNPTR]		= "dynptr",
 };
 
 /* The place of an entry that has no handle */
@@ -805,6 +815,104 @@ static int cancel_collect_iter(struct bpf_verifier_env *env, const struct bpf_ve
 	return cancel_list_add(visit, &e);
 }
 
+BTF_ID_LIST_SINGLE(cancel_dynptr_file_discard_id, func, bpf_dynptr_file_discard)
+
+/*
+ * The dynptr at the lowest address of @frame that has refs[] entry @id for its reference: the
+ * offset from r10, and its type in @type. 0 if the frame has none.
+ *
+ * The constructor of a dynptr of the types of dynptr_type_referenced() takes a reference, and
+ * the dynptr and its clones have the id of that as parent_id. A dynptr of another type may
+ * have the id of a reference there too: that of the object which it was made from.
+ */
+static int cancel_find_dynptr(const struct bpf_func_state *frame, u32 id,
+			      enum bpf_dynptr_type *type)
+{
+	const struct bpf_stack_state *slot;
+	const struct bpf_reg_state *reg;
+	int spi;
+
+	for (spi = (int)bpf_stack_nr_slots(frame) - 1; spi > 0; spi--) {
+		slot = bpf_stack_slot(frame, spi);
+		reg = &slot->spilled_ptr;
+		if (slot->slot_type[BPF_REG_SIZE - 1] != STACK_DYNPTR || !reg->dynptr.first_slot ||
+		    reg->parent_id != id)
+			continue;
+		if (reg->dynptr.type != BPF_DYNPTR_TYPE_RINGBUF &&
+		    reg->dynptr.type != BPF_DYNPTR_TYPE_FILE)
+			continue;
+		*type = reg->dynptr.type;
+		return -(spi + 1) * BPF_REG_SIZE;
+	}
+	return 0;
+}
+
+/*
+ * May a pad of the current frame of @st release what a dynptr of type @type holds? It calls
+ * what the program calls with the address of the dynptr: the kfunc bpf_dynptr_file_discard(),
+ * or the helper bpf_ringbuf_discard_dynptr(). The helper has to pass what check_helper_call()
+ * asks of it, and under a lock the program calls no such helper, see do_check_insn().
+ */
+static bool cancel_dynptr_ok(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			     enum bpf_dynptr_type type)
+{
+	u32 func_id = cancel_dynptr_file_discard_id[0];
+	const struct bpf_func_proto *fn;
+	struct btf *btf;
+
+	if (type == BPF_DYNPTR_TYPE_FILE) {
+		btf = bpf_get_btf_vmlinux();
+		return !IS_ERR_OR_NULL(btf) && func_id &&
+		       cancel_kfunc_ok(env, st, btf, func_id, KF_RELEASE);
+	}
+	return !cancel_lock_below(st) &&
+	       !bpf_get_helper_proto(env, BPF_FUNC_ringbuf_discard_dynptr, &fn) &&
+	       (env->prog->gpl_compatible || !fn->gpl_only) &&
+	       (!fn->allowed || fn->allowed(env->prog)) && !fn->might_sleep;
+}
+
+/*
+ * A dynptr that holds a reference: a ringbuf record, or the reader of a file. refs[@idx] is
+ * the reference that its constructor took, see mark_stack_slots_dynptr(). The dynptr and its
+ * clones point to the one record or reader, or are all empty, so the pad releases through
+ * any one of them: the one at the lowest address of the frame, for the visits to agree.
+ *
+ * stacksafe() compares the type and the ids of a dynptr slot, in slots that are dead too: the
+ * dynptr is there in every state that this one stands for, which may have clones more. The
+ * program may overwrite a dynptr while a clone is left. destroy_if_dynptr_stack_slot() tells
+ * when it does that to the dynptr of a frame which waits in a call.
+ */
+static int cancel_collect_dynptr(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+				 u32 idx, struct cancel_list *visit)
+{
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	struct cancel_entry e = { .kind = CANCEL_KIND_DYNPTR };
+	enum bpf_dynptr_type type;
+	u32 fr;
+
+	/*
+	 * The reference may have an iterator for its parent: bpf_dynptr_from_file() of the file
+	 * of a vma that bpf_iter_task_vma_next() returned. The program cannot destroy the
+	 * iterator first, see invalidate_reference(), and a pad doesn't.
+	 */
+	BUILD_BUG_ON(CANCEL_KIND_DYNPTR > CANCEL_KIND_ITER);
+
+	if (ref->type != REF_TYPE_PTR)
+		return CANCEL_REFS;
+	e.place = cancel_find_dynptr(st->frame[st->curframe], ref->id, &type);
+	if (!e.place) {
+		/* all in the stacks of frames below: this pad has no address for them */
+		for (fr = 0; fr < st->curframe; fr++)
+			if (cancel_find_dynptr(st->frame[fr], ref->id, &type))
+				return CANCEL_DYNPTR;
+		return CANCEL_REFS;
+	}
+	if (!cancel_dynptr_ok(env, st, type))
+		return CANCEL_DYNPTR;
+	e.arg = type;
+	return cancel_list_add(visit, &e);
+}
+
 /*
  * refs[@idx] of @st is for the current frame to release. Each kind that has entries in
  * refs[] is asked in turn. It adds an entry to @visit and returns 0, or returns CANCEL_REFS
@@ -825,6 +933,8 @@ static int cancel_collect_ref(struct bpf_verifier_env *env, const struct bpf_ver
 		reason = cancel_collect_lock(env, st, type, idx, visit);
 	if (reason == CANCEL_REFS)
 		reason = cancel_collect_iter(env, st, idx, visit);
+	if (reason == CANCEL_REFS)
+		reason = cancel_collect_dynptr(env, st, idx, visit);
 	return reason;
 }
 
@@ -1154,6 +1264,8 @@ static const char *cancel_shape_text(u8 reason)
 		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot when no stack pointer is passed)";
 	case CANCEL_ITER:
 		return "the frame holds an iterator that a pad cannot destroy there";
+	case CANCEL_DYNPTR:
+		return "the frame holds a dynptr that a pad cannot release there";
 	default:
 		return NULL;
 	}
@@ -1356,6 +1468,11 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 		return cancel_add_kfunc(env, cancel_section_kfunc(e->kind), 0, CANCEL_SECTION);
 	case CANCEL_KIND_ITER:
 		return cancel_add_kfunc(env, (u32)e->arg, e->arg >> 32, CANCEL_ITER);
+	case CANCEL_KIND_DYNPTR:
+		/* the program has the helper, see cancel_dynptr_ok() */
+		if (e->arg != BPF_DYNPTR_TYPE_FILE)
+			return 0;
+		return cancel_add_kfunc(env, cancel_dynptr_file_discard_id[0], 0, CANCEL_DYNPTR);
 	default:
 		return 0;
 	}
@@ -1582,6 +1699,25 @@ static int cancel_emit_iter(const struct cancel_entry *e, int place, struct bpf_
 }
 
 /*
+ * bpf_dynptr_file_discard(r10 + @place) or bpf_ringbuf_discard_dynptr(r10 + @place, 0). The
+ * helper is called by its id, like in a program: bpf_do_misc_fixups() finds the function.
+ */
+static int cancel_emit_dynptr(const struct cancel_entry *e, int place, struct bpf_insn *buf)
+{
+	int n = 0;
+
+	buf[n++] = BPF_MOV64_REG(BPF_REG_1, BPF_REG_FP);
+	buf[n++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, place);
+	if (e->arg == BPF_DYNPTR_TYPE_FILE) {
+		buf[n++] = BPF_CALL_KFUNC(0, cancel_dynptr_file_discard_id[0]);
+		return n;
+	}
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
+	buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_ringbuf_discard_dynptr);
+	return n;
+}
+
+/*
  * The insns that release @e, into @buf: CANCEL_ENTRY_INSNS at most. Returns how many. The
  * handle is in @place: R6-R9 or a stack slot, whatever e->place says. The insns may clobber
  * R0-R5 and nothing else.
@@ -1601,6 +1737,8 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 		return cancel_emit_section(e, buf);
 	case CANCEL_KIND_ITER:
 		return cancel_emit_iter(e, place, buf);
+	case CANCEL_KIND_DYNPTR:
+		return cancel_emit_dynptr(e, place, buf);
 	default:
 		verifier_bug(env, "cancel: no pad releases kind %d", e->kind);
 		return -EFAULT;
