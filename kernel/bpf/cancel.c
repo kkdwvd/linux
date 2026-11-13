@@ -19,10 +19,12 @@
  * An entry that only some visits have takes a condition. A site at which the
  * frame holds what has no entry declines.
  *
- * RCU read sections and preemption-disabled sections are described: a pad leaves
- * the ones that its frame entered. A frame that holds anything else of its own
- * declines. So does the frame that waits in a call when a callee releases what
- * the frame holds: its pad would release that again.
+ * A pad restores the IRQ flags that its frame saved with bpf_local_irq_save(),
+ * the ones that were saved last first, and leaves the RCU read sections and the
+ * preemption-disabled sections that its frame entered. No other kind of resource
+ * is described yet: a frame that holds anything else of its own declines. So does
+ * the frame that waits in a call when a callee releases what the frame holds: its
+ * pad would release that again.
  *
  * After the main pass bpf_cancel_resolve() finds the subprogs that can be
  * cancelled, and with them the sites that get a pad. The pads go behind the last
@@ -52,6 +54,8 @@
  * sections go last: an object may only live inside of one.
  */
 enum cancel_kind {
+	/* IRQ flags that bpf_local_irq_save() saved to a slot of the stack */
+	CANCEL_IRQ,
 	/*
 	 * The sections that the frame entered, see cancel_collect_section(). These two are
 	 * the last ones. Which of them is left first makes no difference: either kind nests by
@@ -61,6 +65,18 @@ enum cancel_kind {
 	CANCEL_PREEMPT,
 	__CANCEL_KINDS,
 };
+
+/*
+ * Locks and IRQ flags are one phase: the first kinds. Within it the order is not that of the
+ * kinds. Each release puts back what its acquisition found: the flags of an outer
+ * bpf_local_irq_save() that are restored in front of those of an inner one leave interrupts
+ * off for good. So the pad releases what the frame took last first, see rank in struct
+ * cancel_entry.
+ */
+static bool cancel_kind_ordered(u8 kind)
+{
+	return kind == CANCEL_IRQ;
+}
 
 /* The most insns that a pad takes to release an entry */
 #define CANCEL_ENTRY_INSNS	8
@@ -84,6 +100,8 @@ enum cancel_reason {
 	CANCEL_NO_JIT,
 	/* a callee releases what the frame holds at the call */
 	CANCEL_FOREIGN,
+	/* it holds a lock or IRQ flags that a pad has no way to */
+	CANCEL_LOCK_PLACE,
 	__CANCEL_REASONS,
 };
 
@@ -97,6 +115,7 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_RETVAL]		= "retval",
 	[CANCEL_NO_JIT]		= "jit",
 	[CANCEL_FOREIGN]	= "foreign",
+	[CANCEL_LOCK_PLACE]	= "lock",
 };
 
 /* The place of an entry that has no handle */
@@ -108,6 +127,11 @@ struct cancel_entry {
 	bool cond;	/* some visits are without it: its release takes a condition */
 	/* where the handle is: a register, or below 0 the offset of a stack slot from r10 */
 	s16 place;
+	/*
+	 * Of a lock or IRQ flags: how many of the two the frame took before it. refs[] has them
+	 * in that order.
+	 */
+	u16 rank;
 	u64 arg;	/* how to release it, in the terms of the kind */
 };
 
@@ -192,6 +216,14 @@ static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *
  */
 static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_entry *b)
 {
+	/*
+	 * A lock or IRQ flags are released at their rank. Visits that took the same in another
+	 * order have other entries, and the site declines: no pad is right for both. So it
+	 * does when one visit holds one more in front of what both hold: that shifts the ranks
+	 * behind it.
+	 */
+	if (cancel_kind_ordered(a->kind) && a->rank != b->rank)
+		return false;
 	return a->kind == b->kind && a->place == b->place && a->arg == b->arg;
 }
 
@@ -254,6 +286,103 @@ static struct cancel_site *cancel_get_site(struct bpf_verifier_env *env, u32 ins
 	return site;
 }
 
+/* The kfuncs that a pad calls for locks and IRQ flags */
+enum cancel_lock_kfunc {
+	CANCEL_KF_local_irq_restore,
+};
+
+BTF_ID_LIST(cancel_lock_kfuncs)
+BTF_ID(func, bpf_local_irq_restore)
+
+/*
+ * The rank of refs[@idx] of @st, a lock or IRQ flags: how many of the two are in front of it
+ * among the entries of its owner. refs[] is in the order of acquisition: a new entry goes to
+ * the end, and release_reference_state() keeps the order of the rest. It is the same order in
+ * every state that this one stands for, since refs[] is compared entry by entry.
+ */
+static u32 cancel_lock_rank(const struct bpf_verifier_state *st, u32 idx)
+{
+	u32 i, rank = 0;
+
+	for (i = 0; i < idx; i++)
+		if (st->refs[i].frameno == st->refs[idx].frameno &&
+		    (st->refs[i].type & (REF_TYPE_IRQ | REF_TYPE_LOCK_MASK)))
+			rank++;
+	return rank;
+}
+
+/*
+ * The slot of the current frame of @st that has the IRQ flags of refs[@idx], below 0 if it
+ * has none: the flags may be in a slot of a caller that the frame was given a pointer to.
+ *
+ * The slot needs no register that is live. Such slots are compared in every state, and the
+ * flags are there as long as the slot is: a write of the program turns it into another kind
+ * of slot. The entry stays in refs[] then and nothing can restore the flags any more, so
+ * that program is rejected when it gets to its exit.
+ */
+static int cancel_irq_slot(const struct bpf_verifier_state *st, u32 idx)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_stack_state *slot;
+	u32 spi;
+	int i;
+
+	for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
+		slot = bpf_stack_slot(frame, spi);
+		for (i = 0; i < BPF_REG_SIZE; i++)
+			if (slot->slot_type[i] != STACK_IRQ_FLAG)
+				break;
+		if (i == BPF_REG_SIZE && slot->spilled_ptr.id == st->refs[idx].id)
+			return spi;
+	}
+	return -ENOENT;
+}
+
+/*
+ * IRQ flags that bpf_local_irq_save() saved: the pad calls bpf_local_irq_restore() with the
+ * slot. The flags that bpf_res_spin_lock_irqsave() saved are released with the lock, which
+ * is another kind.
+ */
+static int cancel_collect_irq(const struct bpf_verifier_state *st, u32 idx,
+			      struct cancel_list *visit)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	struct cancel_entry e = { .kind = CANCEL_IRQ };
+	u32 rank;
+	int spi;
+
+	if (st->refs[idx].type != REF_TYPE_IRQ)
+		return CANCEL_REFS;
+	spi = cancel_irq_slot(st, idx);
+	rank = cancel_lock_rank(st, idx);
+	if (spi < 0 || rank > U16_MAX)
+		return CANCEL_LOCK_PLACE;
+	if (bpf_stack_slot(frame, spi)->spilled_ptr.irq.kfunc_class != IRQ_NATIVE_KFUNC)
+		return CANCEL_REFS;
+	e.place = -(spi + 1) * BPF_REG_SIZE;
+	e.rank = rank;
+	return cancel_list_add(visit, &e);
+}
+
+/*
+ * refs[@idx] of @st is for the current frame to release. Each kind that has entries in
+ * refs[] is asked in turn. It adds an entry to @visit and returns 0, or returns CANCEL_REFS
+ * for what is not of its kind, or the reason why the site declines.
+ *
+ * Whatever a kind takes from the state has to hold in every state that this one stands
+ * for: the type of a register or a slot, which of them have the same id, a constant.
+ * Not what is merely within bounds here.
+ */
+static int cancel_collect_ref(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			      enum bpf_cancel_site_type type, u32 idx, struct cancel_list *visit)
+{
+	int reason = CANCEL_REFS;
+
+	if (reason == CANCEL_REFS)
+		reason = cancel_collect_irq(st, idx, visit);
+	return reason;
+}
+
 /* The most sections of one kind that a pad leaves: it calls the unlock once for each */
 #define CANCEL_SECTION_MAX	4
 static_assert(CANCEL_SECTION_MAX <= CANCEL_ENTRY_INSNS);
@@ -294,18 +423,24 @@ static int cancel_collect_section(struct cancel_list *visit, u8 kind, u32 nr)
  * entries of its resources here. Returns the reason when the frame holds what has no entry,
  * below 0 on error.
  *
- * Its own is what the frame has not got from its callers: refs[] from entry_refs on and the
- * sections that it entered. The callers are recorded with what they hold at their calls.
+ * Its own is what the frame is to release: the entries of refs[] that it owns, see
+ * bpf_frame_owns_ref(), and the sections that it entered. The callers are recorded with
+ * what they hold at their calls.
  */
 static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  enum bpf_cancel_site_type type, struct cancel_list *visit)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	int reason;
+	u32 i;
 
-	/* references, locks, IRQ flags */
-	if (st->acquired_refs != frame->entry_refs)
-		return CANCEL_REFS;
+	for (i = 0; i < st->acquired_refs; i++) {
+		if (!bpf_frame_owns_ref(st, st->curframe, i))
+			continue;
+		reason = cancel_collect_ref(env, st, type, i, visit);
+		if (reason)
+			return reason;
+	}
 	reason = cancel_collect_section(visit, CANCEL_RCU,
 					st->active_rcu_locks - frame->entry_rcu_locks);
 	if (reason)
@@ -514,6 +649,8 @@ static const char *cancel_shape_text(u8 reason)
 		return "the frame holds a resource on some paths only, or in different places";
 	case CANCEL_FOREIGN:
 		return "a callee releases what the frame holds";
+	case CANCEL_LOCK_PLACE:
+		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot when no stack pointer is passed)";
 	default:
 		return NULL;
 	}
@@ -676,6 +813,18 @@ static int cancel_add_kfunc(struct bpf_verifier_env *env, u32 func_id, u16 offse
 }
 
 /*
+ * A program that saved IRQ flags or took a lock has the kfunc that undoes it: the two are in
+ * one set of kfuncs, and no path gets to an exit without the call. An id of 0 is a kfunc that
+ * the kernel was built without.
+ */
+static int cancel_add_lock_kfunc(struct bpf_verifier_env *env, enum cancel_lock_kfunc kf)
+{
+	if (!cancel_lock_kfuncs[kf])
+		return CANCEL_LOCK_PLACE;
+	return cancel_add_kfunc(env, cancel_lock_kfuncs[kf], 0, CANCEL_LOCK_PLACE);
+}
+
+/*
  * The main pass is over and @e may get into a pad. What the release needs of the program
  * is set up here, like the kfunc that it calls, see cancel_add_kfunc(). Returns the reason
  * why the site declines when that cannot be had, below 0 on error.
@@ -683,6 +832,8 @@ static int cancel_add_kfunc(struct bpf_verifier_env *env, u32 func_id, u16 offse
 static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cancel_entry *e)
 {
 	switch (e->kind) {
+	case CANCEL_IRQ:
+		return cancel_add_lock_kfunc(env, CANCEL_KF_local_irq_restore);
 	case CANCEL_RCU:
 	case CANCEL_PREEMPT:
 		return cancel_add_kfunc(env, cancel_section_kfunc(e->kind), 0, CANCEL_SECTION);
@@ -696,6 +847,9 @@ static int cancel_entry_cmp(const void *a, const void *b)
 {
 	const struct cancel_entry *x = a, *y = b;
 
+	/* locks and IRQ flags: the one that was taken last goes first, see cancel_kind_ordered() */
+	if (cancel_kind_ordered(x->kind) && cancel_kind_ordered(y->kind) && x->rank != y->rank)
+		return x->rank > y->rank ? -1 : 1;
 	if (x->kind != y->kind)
 		return x->kind < y->kind ? -1 : 1;
 	if (x->place != y->place)
@@ -830,6 +984,23 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 	return err;
 }
 
+/* @reg = r10 + @off: the address of a slot of the stack */
+static int cancel_emit_slot_addr(int reg, int off, struct bpf_insn *buf)
+{
+	buf[0] = BPF_MOV64_REG(reg, BPF_REG_FP);
+	buf[1] = BPF_ALU64_IMM(BPF_ADD, reg, off);
+	return 2;
+}
+
+/* bpf_local_irq_restore() of the flags in the slot at @place */
+static int cancel_emit_irq(int place, struct bpf_insn *buf)
+{
+	int n = cancel_emit_slot_addr(BPF_REG_1, place, buf);
+
+	buf[n++] = BPF_CALL_KFUNC(0, cancel_lock_kfuncs[CANCEL_KF_local_irq_restore]);
+	return n;
+}
+
 /*
  * Leave the sections of @e, one call each. The fixups keep bpf_rcu_read_unlock() and
  * bpf_preempt_enable() as calls in every program, sleepable or not, and take nothing about
@@ -853,6 +1024,8 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 			     int place, struct bpf_insn *buf)
 {
 	switch (e->kind) {
+	case CANCEL_IRQ:
+		return cancel_emit_irq(place, buf);
 	case CANCEL_RCU:
 	case CANCEL_PREEMPT:
 		return cancel_emit_section(e, buf);
