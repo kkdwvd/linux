@@ -825,6 +825,11 @@ int probe_cpumask(void *ctx)
 	return 0;
 }
 
+/*
+ * A socket that a lookup returned and a record of a ring buffer are released by a helper. The
+ * pad calls bpf_sk_release() with the socket, bpf_ringbuf_discard() with the record and 0.
+ */
+
 /* The connection that the progs look up, as the packets of the peer have it */
 __u32 tuple_saddr;
 __u32 tuple_daddr;
@@ -837,6 +842,90 @@ static __always_inline void fill_tuple(struct bpf_sock_tuple *tuple)
 	tuple->ipv4.daddr = tuple_daddr;
 	tuple->ipv4.sport = tuple_sport;
 	tuple->ipv4.dport = tuple_dport;
+}
+
+/* The prog tests the socket behind the call only: the pad makes the test */
+SEC("tc")
+__description("cancel refs: a socket that may be NULL is tested and released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int sock_at_call(struct __sk_buff *skb)
+{
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *sk;
+
+	fill_tuple(&tuple);
+	sk = bpf_sk_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	dives();
+	behind++;
+	if (sk)
+		bpf_sk_release(sk);
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel refs: a socket of bpf_skc_lookup_tcp() is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int skc_at_call(struct __sk_buff *skb)
+{
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *sk;
+
+	fill_tuple(&tuple);
+	sk = bpf_skc_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (!sk)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_sk_release(sk);
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel refs: a ringbuf record that may be NULL is tested and discarded")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int ringbuf_at_call(struct __sk_buff *skb)
+{
+	void *rec;
+
+	rec = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	dives();
+	behind++;
+	if (rec)
+		bpf_ringbuf_discard(rec, 0);
+	return TC_ACT_OK;
+}
+
+int sock_refcnt;
+
+/* The references to the socket of the connection, this one among them */
+SEC("tc")
+int probe_sock(struct __sk_buff *skb)
+{
+	struct bpf_sock_tuple tuple = {};
+	struct tcp_sock *tp;
+	struct bpf_sock *sk;
+
+	fill_tuple(&tuple);
+	sk = bpf_skc_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (!sk)
+		return TC_ACT_OK;
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (tp)
+		sock_refcnt = tp->inet_conn.icsk_inet.sk.__sk_common.skc_refcnt.refs.counter;
+	bpf_sk_release(sk);
+	return TC_ACT_OK;
 }
 
 /*
