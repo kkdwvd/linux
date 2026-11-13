@@ -29,6 +29,8 @@
  *   the reader of the file.
  * - RCU read sections and preemption-disabled sections: the pad leaves the ones
  *   that its frame entered.
+ * - references to kernel objects whose handle the frame has in a register or in
+ *   a stack slot, where a kfunc releases them, see cancel_collect_ptr().
  * A frame that holds anything else of its own declines. So does the frame that
  * waits in a call when a callee releases what the frame holds: its pad would
  * release that again.
@@ -76,6 +78,8 @@ enum cancel_kind {
 	CANCEL_KIND_DYNPTR,
 	/* an open-coded iterator in the stack of the frame, see cancel_collect_iter() */
 	CANCEL_KIND_ITER,
+	/* a reference whose handle is a pointer in a register or in a stack slot */
+	CANCEL_PTR,
 	/*
 	 * The sections that the frame entered, see cancel_collect_section(). These two are
 	 * the last ones. Which of them is left first makes no difference: either kind nests by
@@ -127,6 +131,10 @@ enum cancel_reason {
 	CANCEL_ITER,
 	/* it holds a reference through dynptrs that its pad cannot find or may not release */
 	CANCEL_DYNPTR,
+	/* the handle of a reference is in no register or stack slot that a pad can read */
+	CANCEL_PLACE,
+	/* nothing that a pad may call there releases a reference */
+	CANCEL_RELEASE,
 	__CANCEL_REASONS,
 };
 
@@ -143,6 +151,8 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_LOCK_PLACE]	= "lock",
 	[CANCEL_ITER]		= "iter",
 	[CANCEL_DYNPTR]		= "dynptr",
+	[CANCEL_PLACE]		= "place",
+	[CANCEL_RELEASE]	= "release",
 };
 
 /* The place of an entry that has no handle */
@@ -161,6 +171,7 @@ struct cancel_entry {
 	u16 rank;
 	/* of a lock that was taken with IRQ flags: the offset of their slot from r10 */
 	s16 irq_off;
+	u8 flags;	/* of the kind, they go with arg */
 	u64 arg;	/* how to release it, in the terms of the kind */
 	/*
 	 * Of a lock at a known address: a place leads to it as well, with the lock alt_arg
@@ -266,7 +277,8 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 	 */
 	if (cancel_kind_ordered(a->kind) && (a->rank != b->rank || a->irq_off != b->irq_off))
 		return false;
-	return a->kind == b->kind && a->place == b->place && a->arg == b->arg;
+	return a->kind == b->kind && a->place == b->place && a->flags == b->flags &&
+	       a->arg == b->arg;
 }
 
 static bool cancel_list_has(const struct cancel_list *list, const struct cancel_entry *e)
@@ -914,6 +926,124 @@ static int cancel_collect_dynptr(struct bpf_verifier_env *env, const struct bpf_
 }
 
 /*
+ * CANCEL_PTR: the pad calls what releases the reference with the handle in R1. arg is the
+ * BTF id of a kfunc, and from bit 32 on off of its call, see struct bpf_release_kfunc.
+ */
+
+/* flags: the handle is NULL if nothing was acquired, and the pad tests it */
+#define CANCEL_PTR_NULL		BIT(0)
+
+/*
+ * Is reference @id the one of an iterator or of a dynptr, in the stack of whichever frame?
+ * These are other kinds, and no register has the id.
+ */
+static bool cancel_ref_of_stack_obj(const struct bpf_verifier_state *st, u32 id)
+{
+	const struct bpf_stack_state *slot;
+	const struct bpf_func_state *frame;
+	int fr, spi;
+
+	for (fr = 0; fr <= st->curframe; fr++) {
+		frame = st->frame[fr];
+		for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
+			slot = bpf_stack_slot(frame, spi);
+			switch (slot->slot_type[BPF_REG_SIZE - 1]) {
+			case STACK_ITER:
+				if (slot->spilled_ptr.id == id)
+					return true;
+				break;
+			case STACK_DYNPTR:
+				/* of a record or a file: its reference is the parent */
+				if (slot->spilled_ptr.parent_id == id &&
+				    (slot->spilled_ptr.dynptr.type == BPF_DYNPTR_TYPE_RINGBUF ||
+				     slot->spilled_ptr.dynptr.type == BPF_DYNPTR_TYPE_FILE))
+					return true;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * @reg is in @place, which a pad can read, and has the id of a reference that the current
+ * frame of @st is to release. Can the pad release the reference out of it? Returns 0 with
+ * @e filled in if so. If not, the reason why the site declines: @reason, which the places
+ * before this one left, where @reg is no handle at all.
+ *
+ * A pad makes the call that the program would make, so @reg has to be what the verifier
+ * takes for the argument of that call, see check_func_arg(): the pointer that was acquired
+ * and not one into the object, of the type that the release function is declared with.
+ * What a helper like bpf_tcp_sock() made of a reference has the id as well, and is a
+ * handle only where the program may release through it.
+ *
+ * A pointer that may be NULL is one that the program did not test since it was acquired:
+ * the verifier drops the reference where the test finds NULL. Nothing was acquired then,
+ * so the pad makes the test and leaves the call out. If a callee made the test, the place
+ * of the caller has the same NULL.
+ */
+static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			     const struct bpf_reg_state *reg, int place, int reason,
+			     struct cancel_entry *e)
+{
+	u32 flags = type_flag(reg->type) & ~PTR_MAYBE_NULL;
+	struct bpf_release_kfunc rel;
+
+	if (!tnum_equals_const(reg->var_off, 0))
+		return reason;
+	/* a kernel object: referenced is as good as trusted for the argument of a release kfunc */
+	if (base_type(reg->type) != PTR_TO_BTF_ID || (flags & ~PTR_TRUSTED))
+		return CANCEL_REFS;
+	/* the kfunc takes a pointer to this very type, which is all that a release kfunc accepts */
+	if (bpf_find_release_kfunc(env, reg->btf, reg->btf_id, false, &rel))
+		return CANCEL_RELEASE;
+	if (cancel_lock_below(st) && !(rel.flags & KF_SPINLOCK_SAFE))
+		return CANCEL_RELEASE;
+
+	e->kind = CANCEL_PTR;
+	e->place = place;
+	e->flags = type_may_be_null(reg->type) ? CANCEL_PTR_NULL : 0;
+	e->arg = rel.func_id | (u64)rel.offset << 32;
+	return 0;
+}
+
+/*
+ * refs[@idx] of @st is a reference to an object, and the pad releases it like the program
+ * does: by a call with the handle. Find the handle in a place of the current frame. It has
+ * the id of the reference there, which a state that stands for another one has in the same
+ * places as that one: ids are compared along with the types, in what is live.
+ *
+ * Where more than one place has the handle the visits of a site have to pick the same one:
+ * R6-R9 come first, then the stack, the lowest number first.
+ */
+static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			      enum bpf_cancel_site_type type, u32 idx, struct cancel_list *visit)
+{
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_stack_state *slot;
+	int reason = CANCEL_PLACE, i, spi;
+	struct cancel_entry e = {};
+
+	if (ref->type != REF_TYPE_PTR || cancel_ref_of_stack_obj(st, ref->id))
+		return CANCEL_REFS;
+
+	for (i = BPF_REG_6; i <= BPF_REG_9 && reason; i++)
+		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, type, i))
+			reason = cancel_ptr_handle(env, st, &frame->regs[i], i, reason, &e);
+	for (spi = 0; spi < bpf_stack_nr_slots(frame) && reason; spi++) {
+		slot = bpf_stack_slot(frame, spi);
+		if (bpf_is_spilled_reg(slot) && slot->spilled_ptr.id == ref->id &&
+		    cancel_spill_is_place(env, st, type, spi))
+			reason = cancel_ptr_handle(env, st, &slot->spilled_ptr,
+						   -(spi + 1) * BPF_REG_SIZE, reason, &e);
+	}
+	return reason ?: cancel_list_add(visit, &e);
+}
+
+/*
  * refs[@idx] of @st is for the current frame to release. Each kind that has entries in
  * refs[] is asked in turn. It adds an entry to @visit and returns 0, or returns CANCEL_REFS
  * for what is not of its kind, or the reason why the site declines.
@@ -935,6 +1065,8 @@ static int cancel_collect_ref(struct bpf_verifier_env *env, const struct bpf_ver
 		reason = cancel_collect_iter(env, st, idx, visit);
 	if (reason == CANCEL_REFS)
 		reason = cancel_collect_dynptr(env, st, idx, visit);
+	if (reason == CANCEL_REFS)
+		reason = cancel_collect_ptr(env, st, type, idx, visit);
 	return reason;
 }
 
@@ -1266,6 +1398,10 @@ static const char *cancel_shape_text(u8 reason)
 		return "the frame holds an iterator that a pad cannot destroy there";
 	case CANCEL_DYNPTR:
 		return "the frame holds a dynptr that a pad cannot release there";
+	case CANCEL_PLACE:
+		return "no register or stack slot that a pad can read has a reference of the frame as it was acquired (at a call: R6-R9, or a slot when no stack pointer is passed)";
+	case CANCEL_RELEASE:
+		return "nothing that a pad may call there releases a reference of the frame";
 	default:
 		return NULL;
 	}
@@ -1473,6 +1609,8 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 		if (e->arg != BPF_DYNPTR_TYPE_FILE)
 			return 0;
 		return cancel_add_kfunc(env, cancel_dynptr_file_discard_id[0], 0, CANCEL_DYNPTR);
+	case CANCEL_PTR:
+		return cancel_add_kfunc(env, (u32)e->arg, e->arg >> 32, CANCEL_RELEASE);
 	default:
 		return 0;
 	}
@@ -1490,6 +1628,8 @@ static int cancel_entry_cmp(const void *a, const void *b)
 		return x->kind < y->kind ? -1 : 1;
 	if (x->place != y->place)
 		return x->place < y->place ? -1 : 1;
+	if (x->flags != y->flags)
+		return x->flags < y->flags ? -1 : 1;
 	return x->arg < y->arg ? -1 : x->arg > y->arg;
 }
 
@@ -1698,6 +1838,21 @@ static int cancel_emit_iter(const struct cancel_entry *e, int place, struct bpf_
 	return n;
 }
 
+/* Release the reference whose handle is in @place, unless there is none: CANCEL_PTR_NULL */
+static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_insn *buf)
+{
+	int n = 0;
+
+	if (cancel_place_is_reg(place))
+		buf[n++] = BPF_MOV64_REG(BPF_REG_1, place);
+	else
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, place);
+	if (e->flags & CANCEL_PTR_NULL)
+		buf[n++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 1);
+	buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
+	return n;
+}
+
 /*
  * bpf_dynptr_file_discard(r10 + @place) or bpf_ringbuf_discard_dynptr(r10 + @place, 0). The
  * helper is called by its id, like in a program: bpf_do_misc_fixups() finds the function.
@@ -1739,6 +1894,8 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 		return cancel_emit_iter(e, place, buf);
 	case CANCEL_KIND_DYNPTR:
 		return cancel_emit_dynptr(e, place, buf);
+	case CANCEL_PTR:
+		return cancel_emit_ptr(e, place, buf);
 	default:
 		verifier_bug(env, "cancel: no pad releases kind %d", e->kind);
 		return -EFAULT;
