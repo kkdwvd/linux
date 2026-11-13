@@ -13,8 +13,11 @@ struct at_entry {
 
 /*
  * A prog that is cancelled runs nothing behind the point, so what its pads released shows in
- * the run that follows. Every prog is run twice. Both runs note what they were entered in, see
- * enter() in progs/cancel_locks.c: the second one has to find what the first one found.
+ * the run that follows. Every prog is run twice. The second run takes the locks of the first:
+ * a bpf_res_spin_lock that was left locked is not to be had, and a prog stays away from a
+ * bpf_spin_lock that it finds locked, which would hang it. Both runs note what they were
+ * entered in, see enter() in progs/cancel_locks.c: the second one has to find what the first
+ * one found.
  *
  * The two runs of a tc prog are one BPF_PROG_TEST_RUN, with nothing but the loop of
  * bpf_test_run() between them, so the second run begins in what the pads of the first left
@@ -36,10 +39,21 @@ struct test {
 };
 
 static const struct test tests[] = {
+	{ "spin_lock_global_at_call" },
+	{ "spin_lock_in_map_at_call" },
+	{ "spin_lock_spilled_at_call" },
+	{ "res_lock_global_at_call" },
+	{ "res_lock_in_map_at_call" },
+	{ "res_lock_irqsave_at_call" },
 	{ "irq_save_at_call" },
 	{ "irq_save_twice_at_call" },
 	{ "irq_save_twice_slots_swapped" },
 	{ "irq_save_in_two_frames" },
+	{ "spin_lock_in_irq_save_at_call" },
+	{ "res_lock_irqsave_in_spin_lock_at_call" },
+	{ "res_locks_irqsave_ab_at_call" },
+	{ "res_locks_irqsave_ba_at_call" },
+	{ "res_locks_in_irq_save_at_call" },
 	{ "rcu_at_call" },
 	{ "preempt_at_call" },
 	{ "sections_max_at_call" },
@@ -47,6 +61,8 @@ static const struct test tests[] = {
 	{ "sections_in_two_frames" },
 	{ "sleepable_rcu_at_call" },
 	{ "sleepable_preempt_at_call" },
+	{ "spin_lock_in_irq_save_in_rcu_at_call" },
+	{ "spin_lock_in_irq_save_in_rcu_two_frames" },
 };
 
 /* Returns what the second run returned, below 0 if the runs failed */
@@ -71,8 +87,8 @@ static int run_twice(struct bpf_program *prog)
 }
 
 /*
- * The prog gets an object of its own, like in the test loader: one that does not load is not
- * in the way of the others.
+ * The prog gets an object of its own, like in the test loader: one that does not load, or that
+ * leaves a lock locked, is not in the way of the others.
  */
 static void run_test(const struct test *t)
 {
@@ -105,7 +121,10 @@ static void run_test(const struct test *t)
 	/* and neither went on from there */
 	ASSERT_EQ(skel->bss->behind, 0, "behind");
 
-	/* the second run was entered in what the first one was entered in */
+	/* the second run found the locks free */
+	ASSERT_EQ(skel->bss->stuck, 0, "stuck");
+	ASSERT_EQ(skel->bss->lock_err, 0, "lock_err");
+	/* and was entered in what the first one was entered in */
 	ASSERT_EQ(skel->bss->found[1].irq, skel->bss->found[0].irq, "interrupts");
 	ASSERT_EQ(skel->bss->found[1].preempt, skel->bss->found[0].preempt, "preempt count");
 	ASSERT_EQ(skel->bss->found[1].rcu, skel->bss->found[0].rcu, "RCU nesting");
