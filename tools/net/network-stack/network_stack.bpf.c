@@ -109,6 +109,13 @@ __u64 hold_ns;		/* stay masked this long after the last packet; 0: never mask */
 __u64 spin_ns;		/* of that, spin this long before napping */
 __u64 nap_ns;		/* length of a nap with interrupts masked */
 /*
+ * A masked thread completes its NAPIs with a pass of plain polls this often,
+ * so that the driver tells the device how far the rings were consumed; a
+ * driver may do that only when it completes a NAPI. 0: never, the phase ends
+ * only with the traffic.
+ */
+__u64 refresh_ns;
+/*
  * A parked thread leaves its NAPIs to softirq, and takes them back when
  * NS_SOFTIRQ_WAKE packets of one arrive within this time; 0: the thread is
  * woken for every interrupt.
@@ -377,6 +384,7 @@ static int poller(__u64 arg)
 		return -EINVAL;
 	threads[idx].armed = 1;
 	threads[idx].last_rest_ns = bpf_ktime_get_ns();
+	threads[idx].last_plain_ns = threads[idx].last_rest_ns;
 
 	bpf_repeat(LOOP_BOUND) {
 		bpf_repeat(LOOP_BOUND) {
@@ -410,6 +418,18 @@ static int poller(__u64 arg)
 			if (t->pass_work) {
 				t->busy_scans++;
 				t->last_work_ns = now;
+			}
+			if (!flags) {
+				t->last_plain_ns = now;
+			} else if (load(&refresh_ns) &&
+				   now - t->last_plain_ns >= load(&refresh_ns)) {
+				/*
+				 * Time to let the drivers complete the NAPIs:
+				 * the next pass is plain, see refresh_ns.
+				 */
+				t->refreshes++;
+				t->armed = 1;
+				continue;
 			}
 
 			/*
