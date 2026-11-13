@@ -1754,6 +1754,7 @@ int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_s
 			     int call_idx, int frame, int from, u32 first,
 			     struct bpf_reg_state *r0);
 void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx);
+void bpf_cancel_record_move(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
 void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
 void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
 			   const struct bpf_verifier_state *b);
