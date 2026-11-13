@@ -6,11 +6,19 @@
 
 /*
  * The verifier adds may_goto to a loop that it cannot count and a check of
- * the stack to a recursive subprog. What the program does when it is out of budget:
+ * the stack to a recursive subprog. A program that is out of budget is cancelled: every
+ * frame leaves through a pad that the verifier made, nothing of the program runs behind that
+ * point, and the main prog returns the cancel value of its type, 0 for a socket filter. See
+ * cancel.c for the pads.
+ *
+ * A callback that a helper calls cannot be cancelled, and neither can what it calls: the
+ * helper has no pad to come back to. What the program does there when it is out of budget:
  * - it unwinds, when unwind_goto follows every call of the subprog and the subprog
  *   holds nothing of its own. The pads of the callers are verified.
  * - the main prog and an async callback end
  * - otherwise it leaves the loop, or returns 0 from the subprog
+ * The main pass verifies these ways out in every program. The tests that take them at run
+ * time do it in a callback of bpf_loop(), see RUN_IN_CALLBACK().
  *
  * It takes unwinding, per-cpu insns and timed may_goto in JIT. Some of the progs never end
  * on their own.
@@ -49,6 +57,50 @@ struct {
 	__type(key, int);
 	__type(value, long[2]);
 } pairs SEC(".maps");
+
+/* What a callback leaves for the main prog to return */
+unsigned long result;
+
+/* The main prog: bpf_loop() calls @cb one time. Nothing that @cb calls is cancelled. */
+#define RUN_IN_CALLBACK(cb)				\
+		"r1 = 1;"				\
+		"r2 = %[" #cb "] ll;"			\
+		"r3 = 0;"				\
+		"r4 = 0;"				\
+		"call %[bpf_loop];"			\
+		"r1 = %[result] ll;"			\
+		"r0 = *(u64 *)(r1 + 0);"		\
+		"exit;"					\
+		:					\
+		: __imm_addr(cb),			\
+		  __imm_addr(result),			\
+		  __imm(bpf_loop)			\
+		: __clobber_all
+
+/* The end of a callback: result = r0 */
+#define CALLBACK_RETURNS_R0				\
+		"r1 = %[result] ll;"			\
+		"*(u64 *)(r1 + 0) = r0;"		\
+		"r0 = 0;"				\
+		"exit;"
+
+/*
+ * A callback: result = fn() + add. A program that is cancelled returns 0, so a test that
+ * looks for the 0 of fn() adds something.
+ */
+#define CALLBACK(cb, fn, add)				\
+__naked __noinline __used				\
+static unsigned long cb(void)				\
+{							\
+	asm volatile (					\
+		"call " #fn ";"				\
+		"r0 += " #add ";"			\
+		CALLBACK_RETURNS_R0			\
+		:					\
+		: __imm_addr(result)			\
+		: __clobber_all				\
+	);						\
+}
 
 SEC("socket")
 __description("budget: a loop in the main prog ends it")
@@ -352,16 +404,29 @@ __naked void recursion(void)
 	);
 }
 
+/* The one that is called too deep finds no room in the stack. Nothing looks at the sum. */
+SEC("socket")
+__description("budget: recursion that is too deep ends the prog")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__naked void recursion_too_deep(void)
+{
+	asm volatile (
+		"r1 = 1000;"
+		"call sum_to;"
+		"r0 = 1;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
 /*
  * The one that is called too deep returns 0: 1000 + 999 + ... down to where it was: more than
  * 1000, less than 500500
  */
-SEC("socket")
-__description("budget: recursion that is too deep returns 0 when there is no unwind_goto")
-__arch_x86_64
-__arch_arm64
-__success __retval(1)
-__naked void recursion_too_deep(void)
+__naked __noinline __used
+static unsigned long sums_too_deep(void)
 {
 	asm volatile (
 		"r1 = 1000;"
@@ -371,9 +436,21 @@ __naked void recursion_too_deep(void)
 		"if r1 <= 1000 goto +2;"
 		"if r1 >= 500500 goto +1;"
 		"r0 = 1;"
-		"exit;"
-		::: __clobber_all
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_addr(result)
+		: __clobber_all
 	);
+}
+
+SEC("socket")
+__description("budget: in a callback, recursion that is too deep returns 0 when there is no unwind_goto")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__naked void recursion_too_deep_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(sums_too_deep));
 }
 
 unsigned long lowest_r10;
@@ -394,14 +471,11 @@ static unsigned long goes_down(void)
 
 /*
  * The stack of a task is aligned to its size, 16K at least. r10 of the last frame whose body
- * runs is right above the middle.
+ * runs is right above the middle. The code that looks at it runs behind the recursion, so it
+ * is in a callback.
  */
-SEC("socket")
-__description("budget: recursion ends in the middle of the kernel stack")
-__arch_x86_64
-__arch_arm64
-__success __retval(1)
-__naked void recursion_ends_in_the_middle(void)
+__naked __noinline __used
+static unsigned long goes_down_and_looks(void)
 {
 	asm volatile (
 		"call goes_down;"
@@ -412,11 +486,22 @@ __naked void recursion_ends_in_the_middle(void)
 		"r0 = 1;"
 		"if r1 < 256 goto +1;"
 		"r0 = 0;"
-		"exit;"
+		CALLBACK_RETURNS_R0
 		:
-		: __imm_addr(lowest_r10)
+		: __imm_addr(lowest_r10),
+		  __imm_addr(result)
 		: __clobber_all
 	);
+}
+
+SEC("socket")
+__description("budget: recursion ends in the middle of the kernel stack")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__naked void recursion_ends_in_the_middle(void)
+{
+	asm volatile (RUN_IN_CALLBACK(goes_down_and_looks));
 }
 
 __naked __noinline __used
@@ -490,10 +575,10 @@ __naked void recursion_caught(void)
 }
 
 SEC("socket")
-__description("budget: recursion that is too deep unwinds")
+__description("budget: recursion that is too deep ends the prog when there is unwind_goto")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
 __naked void recursion_too_deep_caught(void)
 {
 	asm volatile (
@@ -507,6 +592,34 @@ __naked void recursion_too_deep_caught(void)
 		: __imm_unwind_goto(1)
 		: __clobber_all
 	);
+}
+
+__naked __noinline __used
+static unsigned long catches_sum_too_deep(void)
+{
+	asm volatile (
+		"r1 = 1000;"
+		"call sum_to_caught;"
+		unwind_goto(1)
+		"goto 1f;"
+		"r0 = 42;"
+	"1:"
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_unwind_goto(1),
+		  __imm_addr(result)
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: in a callback, recursion that is too deep unwinds")
+__arch_x86_64
+__arch_arm64
+__success __retval(42)
+__naked void recursion_too_deep_caught_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(catches_sum_too_deep));
 }
 
 /* r1: how deep to go. It calls itself twice: 2^r1 calls */
@@ -588,8 +701,8 @@ __naked void loop_calls_recursion_tree(void)
 
 /*
  * Every frame loops forever and calls itself in every trip. The call that finds no room in the
- * stack returns at once. When the time slice is over every frame that is on the stack leaves
- * its loop.
+ * stack ends the prog. Where it cannot be cancelled that call returns at once, and when the
+ * time slice is over every frame that is on the stack leaves its loop.
  */
 __naked __noinline __used
 static unsigned long calls_itself_in_a_loop(void)
@@ -611,7 +724,7 @@ SEC("socket")
 __description("budget: a subprog that calls itself in a loop that never ends")
 __arch_x86_64
 __arch_arm64
-__success __retval(1)
+__success __retval(0)
 __naked void recursion_in_a_loop(void)
 {
 	asm volatile (
@@ -620,6 +733,18 @@ __naked void recursion_in_a_loop(void)
 		"exit;"
 		::: __clobber_all
 	);
+}
+
+CALLBACK(calls_what_calls_itself_in_a_loop, calls_itself_in_a_loop, 1)
+
+SEC("socket")
+__description("budget: in a callback, a subprog that calls itself in a loop that never ends")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__naked void recursion_in_a_loop_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(calls_what_calls_itself_in_a_loop));
 }
 
 /*
