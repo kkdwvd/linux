@@ -352,6 +352,66 @@ __naked void spin_lock_two_places(void)
 	);
 }
 
+/* r1: a pointer to a slot of the caller. It writes to the slot and dives. */
+__naked __noinline __used
+static unsigned long fills_slot_and_dives(void)
+{
+	asm volatile (
+		"r2 = 7;"
+		"*(u64 *)(r1 + 0) = r2;"
+		"call dives;"
+		"r0 = 0;"
+		"exit;"
+		:
+		:
+		: __clobber_all
+	);
+}
+
+/*
+ * The pointer to the element is in a stack slot only, and the callee is given a pointer to
+ * another slot. It is verified with the frame of its caller in the state, and every site in
+ * there finds the pointer to the element as the call left it: the pad of the call reads it.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value, a slot points to the value and the callee writes to another one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__stderr("ERROR: Program was cancelled")
+__naked void spin_lock_spilled_stack_written(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r1 = r0;"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"r1 = r10;"
+		"r1 += -24;"
+		"call fills_slot_and_dives;"
+		"r1 = *(u64 *)(r10 - 16);"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
 /* A lock that the pad left locked tells the second run so: it is not to be had */
 SEC("tc")
 __description("cancel: bpf_res_spin_lock in a global variable, held at a call")
