@@ -824,3 +824,348 @@ int probe_cpumask(void *ctx)
 	bpf_cpumask_release(mask);
 	return 0;
 }
+
+/* The connection that the progs look up, as the packets of the peer have it */
+__u32 tuple_saddr;
+__u32 tuple_daddr;
+__u16 tuple_sport;
+__u16 tuple_dport;
+
+static __always_inline void fill_tuple(struct bpf_sock_tuple *tuple)
+{
+	tuple->ipv4.saddr = tuple_saddr;
+	tuple->ipv4.daddr = tuple_daddr;
+	tuple->ipv4.sport = tuple_sport;
+	tuple->ipv4.dport = tuple_dport;
+}
+
+/*
+ * Kernel objects of other subsystems. Each subsystem registers the release kfunc of its type,
+ * and the pad calls it where the prog may: bpf_put_file() in an LSM prog, bpf_ct_release() in
+ * tc and XDP, bpf_xdp_xfrm_state_release() in XDP, the ones of a kernel socket and of the
+ * wakeup sources in a syscall prog.
+ */
+
+/*
+ * bpf_kfunc_call_test_acquire() is the kfunc of a module, so r0 has the BTF of the module. The
+ * type is one of vmlinux, and bpf_kfunc_call_test_release() is registered for it there.
+ */
+SEC("tc")
+__description("cancel refs: a reference of a module's kfunc to a type of vmlinux is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int test_ref_at_call(struct __sk_buff *skb)
+{
+	struct prog_test_ref_kfunc *ref;
+	unsigned long scalar = 0;
+
+	ref = bpf_kfunc_call_test_acquire(&scalar);
+	if (!ref)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_kfunc_call_test_release(ref);
+	return TC_ACT_OK;
+}
+
+int test_ref_cnt;
+
+/* The references to the object of bpf_kfunc_call_test_acquire(), this one among them */
+SEC("tc")
+int probe_test_ref(struct __sk_buff *skb)
+{
+	struct prog_test_ref_kfunc *ref;
+	unsigned long scalar = 0;
+
+	ref = bpf_kfunc_call_test_acquire(&scalar);
+	if (!ref)
+		return TC_ACT_OK;
+	test_ref_cnt = ref->cnt.refs.counter;
+	bpf_kfunc_call_test_release(ref);
+	return TC_ACT_OK;
+}
+
+/*
+ * A reference to the memory cgroup of a cgroup keeps the cgroup as well: the runner removes
+ * the cgroup and waits for its release, as it does for cgroup_at_call().
+ */
+SEC("tc")
+__description("cancel refs: the memory cgroup of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int memcg_at_call(struct __sk_buff *skb)
+{
+	struct mem_cgroup *memcg;
+	struct cgroup *cgrp;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return TC_ACT_OK;
+	memcg = bpf_get_mem_cgroup(&cgrp->self);
+	bpf_cgroup_release(cgrp);
+	if (!memcg)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_put_mem_cgroup(memcg);
+	return TC_ACT_OK;
+}
+
+/* The thread whose setpriority() the LSM prog is for */
+int tid;
+
+/*
+ * Only an LSM prog takes a file. It is on the hook of setpriority(): the hook refuses when the
+ * prog is cancelled, and the runner gets EPERM.
+ */
+SEC("lsm/task_setnice")
+__description("cancel refs: the file of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int BPF_PROG(file_at_call, struct task_struct *p, int nice)
+{
+	struct file *file;
+
+	if ((int)bpf_get_current_pid_tgid() != tid)
+		return 0;
+	file = bpf_get_task_exe_file(p);
+	if (!file)
+		return 0;
+	dives();
+	behind++;
+	bpf_put_file(file);
+	return 0;
+}
+
+long exe_file_refs;
+
+/* The references to the file that the task which runs the progs was executed from, less one */
+SEC("tc")
+int probe_exe_file(struct __sk_buff *skb)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	struct mm_struct *mm = task->mm;
+	struct file *file;
+
+	if (!mm)
+		return TC_ACT_OK;
+	file = mm->exe_file;
+	if (file)
+		exe_file_refs = file->f_ref.refcnt.counter;
+	return TC_ACT_OK;
+}
+
+struct ksock_val {
+	struct bpf_ksock __kptr *ks;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct ksock_val);
+} ksocks SEC(".maps");
+
+/* As for the cpumask, the map has a second reference when the prog is cancelled */
+SEC("syscall")
+__description("cancel refs: the kernel socket of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int ksock_at_call(void *ctx)
+{
+	struct bpf_ksock_create_opts opts = { .family = AF_INET, .type = SOCK_DGRAM };
+	struct bpf_ksock *ks, *held, *old;
+	struct ksock_val *v;
+	int key = 0, err;
+
+	v = bpf_map_lookup_elem(&ksocks, &key);
+	if (!v)
+		return 1;
+	ks = bpf_ksock_create(&opts, sizeof(opts), &err);
+	if (!ks)
+		return 1;
+	held = bpf_ksock_acquire(ks);
+	if (!held) {
+		bpf_ksock_release(ks);
+		return 1;
+	}
+	old = bpf_kptr_xchg(&v->ks, held);
+	if (old)
+		bpf_ksock_release(old);
+	dives();
+	behind++;
+	bpf_ksock_release(ks);
+	return 1;
+}
+
+int ksock_usage;
+
+/* The references to the socket that ksock_at_call() left in the map, this one among them */
+SEC("syscall")
+int probe_ksock(void *ctx)
+{
+	struct bpf_ksock *ks;
+	struct ksock_val *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&ksocks, &key);
+	if (!v)
+		return 1;
+	ks = bpf_kptr_xchg(&v->ks, NULL);
+	if (!ks)
+		return 1;
+	ksock_usage = ks->usage.refs.counter;
+	bpf_ksock_release(ks);
+	return 0;
+}
+
+/* Put the conntrack entry that the next two progs look up into the table, for 30 s */
+SEC("tc")
+int ct_insert(struct __sk_buff *skb)
+{
+	struct bpf_ct_opts opts = { .netns_id = BPF_F_CURRENT_NETNS, .l4proto = IPPROTO_UDP };
+	struct bpf_sock_tuple tuple = {};
+	struct nf_conn___init *init;
+	struct nf_conn *ct;
+
+	fill_tuple(&tuple);
+	init = bpf_skb_ct_alloc(skb, &tuple, sizeof(tuple.ipv4), &opts, sizeof(opts));
+	if (!init)
+		return TC_ACT_OK;
+	bpf_ct_set_timeout(init, 30000);
+	ct = bpf_ct_insert_entry(init);
+	if (ct)
+		bpf_ct_release(ct);
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel refs: the conntrack entry of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int ct_at_call(struct __sk_buff *skb)
+{
+	struct bpf_ct_opts opts = { .netns_id = BPF_F_CURRENT_NETNS, .l4proto = IPPROTO_UDP };
+	struct bpf_sock_tuple tuple = {};
+	struct nf_conn *ct;
+
+	fill_tuple(&tuple);
+	ct = bpf_skb_ct_lookup(skb, &tuple, sizeof(tuple.ipv4), &opts, sizeof(opts));
+	if (!ct)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_ct_release(ct);
+	return TC_ACT_OK;
+}
+
+int ct_use;
+
+/* The references to the conntrack entry, this one among them */
+SEC("tc")
+int probe_ct(struct __sk_buff *skb)
+{
+	struct bpf_ct_opts opts = { .netns_id = BPF_F_CURRENT_NETNS, .l4proto = IPPROTO_UDP };
+	struct bpf_sock_tuple tuple = {};
+	struct nf_conn *ct;
+
+	fill_tuple(&tuple);
+	ct = bpf_skb_ct_lookup(skb, &tuple, sizeof(tuple.ipv4), &opts, sizeof(opts));
+	if (!ct)
+		return TC_ACT_OK;
+	ct_use = ct->ct_general.use.refs.counter;
+	bpf_ct_release(ct);
+	return TC_ACT_OK;
+}
+
+/* The xfrm state that the progs look up, as the runner added it */
+__u32 xfrm_daddr;
+__u32 xfrm_spi;
+
+static __always_inline void fill_xfrm_opts(struct bpf_xfrm_state_opts *opts)
+{
+	opts->netns_id = BPF_F_CURRENT_NETNS;
+	opts->daddr.a4 = xfrm_daddr;
+	opts->spi = xfrm_spi;
+	opts->proto = IPPROTO_ESP;
+	opts->family = AF_INET;
+}
+
+/* A cancelled XDP prog returns XDP_ABORTED */
+SEC("xdp")
+__description("cancel refs: the xfrm state of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int xfrm_state_at_call(struct xdp_md *xdp)
+{
+	struct bpf_xfrm_state_opts opts = {};
+	struct xfrm_state *x;
+
+	fill_xfrm_opts(&opts);
+	x = bpf_xdp_get_xfrm_state(xdp, &opts, sizeof(opts));
+	if (!x)
+		return XDP_PASS;
+	dives();
+	behind++;
+	bpf_xdp_xfrm_state_release(x);
+	return XDP_PASS;
+}
+
+int xfrm_refcnt;
+
+/* The references to the xfrm state, this one among them */
+SEC("xdp")
+int probe_xfrm_state(struct xdp_md *xdp)
+{
+	struct bpf_xfrm_state_opts opts = {};
+	struct xfrm_state *x;
+
+	fill_xfrm_opts(&opts);
+	x = bpf_xdp_get_xfrm_state(xdp, &opts, sizeof(opts));
+	if (!x)
+		return XDP_PASS;
+	xfrm_refcnt = x->refcnt.refs.counter;
+	bpf_xdp_xfrm_state_release(x);
+	return XDP_PASS;
+}
+
+/*
+ * The lock of the wakeup sources is an SRCU read lock, and the reference is its index plus
+ * one. A wakeup source is not removed while the lock is held, which is how the runner tells
+ * that the pad released it.
+ */
+SEC("syscall")
+__description("cancel refs: the lock of the wakeup sources is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int ws_lock_at_call(void *ctx)
+{
+	struct bpf_ws_lock *lock;
+
+	lock = bpf_wakeup_sources_read_lock();
+	dives();
+	behind++;
+	bpf_wakeup_sources_read_unlock(lock);
+	return 1;
+}
