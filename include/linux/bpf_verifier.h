@@ -349,6 +349,14 @@ struct bpf_reference_state {
 	 */
 	int insn_idx;
 	/*
+	 * The insn that brought it to the frame that is to release it: the call
+	 * that acquired it, or the call of the subprog that returned with it.
+	 * Below 0 if no insn of that frame did. Nothing compares it when a state
+	 * is found to be within another one or when two states are joined, see
+	 * bpf_cancel_alias_refs().
+	 */
+	int origin;
+	/*
 	 * The frame that is to release it: the one that acquired it, the callee
 	 * that a call moved it into, see bpf_cancel_ref_moves(), or the caller
 	 * that a returning frame left it with. BPF_INHERITED_FRAME for what the
@@ -960,8 +968,10 @@ struct bpf_insn_aux_data {
 	s32 guard_to;
 	/* the first cancel site at this instruction + 1, see bpf_cancel_record() */
 	u32 cancel_site;
-	/* the origin of the references that this call acquires + 1, see bpf_cancel_record_origin() */
+	/* the origin of what this call brings to its frame + 1, see bpf_cancel_record_origin() */
 	u32 cancel_origin;
+	/* what the visits of this call took away from its frame + 1, see bpf_cancel_record_release() */
+	u32 cancel_release;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 };
@@ -1638,11 +1648,29 @@ enum bpf_cancel_site_type {
 /* the insns at the end of a pad that leave the frame */
 #define BPF_CANCEL_PAD_EXIT_INSNS	3
 
+/* What tells that a call brought a resource to its frame, see bpf_cancel_record_acquire() */
+enum bpf_cancel_acquire {
+	/* nothing does: not every visit of the call brings one */
+	BPF_CANCEL_ACQUIRE_SOMETIMES,
+	/* that it returned */
+	BPF_CANCEL_ACQUIRE_ALWAYS,
+	/* R0: the pointer that was acquired, NULL if nothing was */
+	BPF_CANCEL_ACQUIRE_R0,
+	/* R0: 0 if the lock was taken */
+	BPF_CANCEL_ACQUIRE_R0_ZERO,
+};
+
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
 bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  u32 idx, int subprog);
 int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx);
+void bpf_cancel_record_acquire(struct bpf_verifier_env *env, enum bpf_cancel_acquire how);
+int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			     int call_idx, int frame, int from, u32 first,
+			     struct bpf_reg_state *r0);
+void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx);
+void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
 void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
 			   const struct bpf_verifier_state *b);
 int bpf_cancel_resolve(struct bpf_verifier_env *env);

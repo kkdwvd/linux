@@ -241,17 +241,55 @@ struct cancel_sub {
 };
 
 /*
- * The origin of a reference to an object is the call that acquired it: refs[] has the insn.
- * Nothing compares these insns when a state is found to be within another one, or when two
- * states are joined. So the origin in a state is one of several calls that may have acquired
- * the reference when the program gets there: the one of the state, and those of the states
- * that it stands for. Such origins are one class, see bpf_cancel_alias_refs(). What is to
- * be known about a reference by its origin has to hold for the class.
+ * The origin of a resource is the insn that brought it to the frame which is to release
+ * it: the call that acquired it, or the call of the subprog that returned with it. refs[]
+ * has the insn, see origin in struct bpf_reference_state. Nothing compares these insns when
+ * a state is found to be within another one, or when two states are joined. So the origin in
+ * a state is one of several insns that may have brought the resource when the program gets
+ * there: the one of the state, and those of the states that it stands for. Such origins are
+ * one class, see bpf_cancel_alias_refs(). What is to be known about a resource by its origin
+ * has to hold for the class.
+ *
+ * The main pass notes what tells whether a frame holds a resource of a class at run time:
+ * how each origin brings one, which insns take one away, and whether a frame holds two at
+ * a time.
  */
 struct cancel_origin {
-	u32 insn_idx;	/* the call, in the program as the main pass has it */
+	u32 insn_idx;	/* in the program as the main pass has it */
 	u32 up;		/* towards the origin that stands for the class, which has itself here */
+	u32 subprog;	/* the one that the insn is in */
+	/*
+	 * What tells behind the insn that it brought a resource, enum bpf_cancel_acquire.
+	 * Nothing does until a visit says what.
+	 */
+	u8 how;
+	/* a return through the call brought nothing, and NULL in R0 */
+	bool null_ret;
+	/* nothing tells whether a frame holds a resource of the origin */
+	bool inexact;
+	/* a frame held two resources of the origin at a time */
+	bool multi;
 };
+
+/*
+ * A visit of the call at @insn_idx took a resource of @origin away from the frame that the
+ * call is in. The visits of an insn are found through the insn.
+ */
+struct cancel_release {
+	u32 insn_idx;	/* in the program as the main pass has it */
+	u32 next;	/* the next one of the insn + 1 */
+	u32 origin;	/* CANCEL_NO_ORIGIN: a visit took nothing away that has an origin */
+};
+
+#define CANCEL_NO_ORIGIN	U32_MAX
+
+/* A frame held a resource of origin @a and one of origin @b at a time */
+struct cancel_pair {
+	u32 a, b;
+};
+
+/* With more pairs than that no class is known to be held once at a time */
+#define CANCEL_PAIRS_MAX	256
 
 struct bpf_cancel {
 	struct cancel_site *sites;
@@ -266,10 +304,20 @@ struct bpf_cancel {
 	/* the pads of one subprog, see bpf_cancel_append_pads() */
 	struct bpf_insn *insns;
 	u32 cap_insns;
-	/* the calls that acquire references to objects, see bpf_cancel_record_origin() */
+	/* the insns that bring resources to their frames, see bpf_cancel_record_origin() */
 	struct cancel_origin *origins;
 	u32 nr_origins;
 	u32 cap_origins;
+	/* what takes them away, see bpf_cancel_record_release() */
+	struct cancel_release *releases;
+	u32 nr_releases;
+	u32 cap_releases;
+	bool no_releases;	/* not all of them are here */
+	/* what is held together, see cancel_add_pair() */
+	struct cancel_pair *pairs;
+	u32 nr_pairs;
+	u32 cap_pairs;
+	bool no_pairs;		/* not all of them are here */
 };
 
 static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *e)
@@ -326,6 +374,38 @@ static struct cancel_entry *cancel_list_find(const struct cancel_list *list,
 		if (cancel_entry_same(&list->entries[i], e))
 			return &list->entries[i];
 	return NULL;
+}
+
+/* The origin of @ref, below 0 if it has none: no insn of its frame brought it there */
+static int cancel_ref_origin(struct bpf_verifier_env *env, const struct bpf_reference_state *ref)
+{
+	u32 o;
+
+	if (ref->origin < 0)
+		return -1;
+	o = env->insn_aux_data[ref->origin].cancel_origin;
+	if (verifier_bug_if(!o, env, "cancel: insn %d is no origin", ref->origin))
+		return -1;
+	return o - 1;
+}
+
+/* The origin that stands for the class of origin @o */
+static u32 cancel_class(struct bpf_cancel *c, u32 o)
+{
+	struct cancel_origin *origins = c->origins;
+
+	while (origins[o].up != o) {
+		origins[o].up = origins[origins[o].up].up;
+		o = origins[o].up;
+	}
+	return o;
+}
+
+/* The classes of origins @x and @y become one */
+static void cancel_union(struct bpf_cancel *c, u32 x, u32 y)
+{
+	x = cancel_class(c, x);
+	c->origins[x].up = cancel_class(c, y);
 }
 
 static struct cancel_site *cancel_find_site(struct bpf_verifier_env *env, u32 insn_idx,
@@ -1545,11 +1625,8 @@ bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifie
 	return !cancel_ref_of_stack_obj(st, ref->id);
 }
 
-/*
- * The insn at @insn_idx acquires a reference to an object, and is its origin. All such
- * references come from acquire_reference(), which makes the origin first.
- */
-int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
+/* The origin that the insn at @insn_idx is, a new one if it is none yet. Below 0 on error. */
+static int cancel_get_origin(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
 	struct bpf_cancel *c = env->cancel;
@@ -1557,7 +1634,7 @@ int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
 	u32 cap;
 
 	if (aux->cancel_origin)
-		return 0;
+		return aux->cancel_origin - 1;
 	if (!c) {
 		c = kzalloc_obj(*c, GFP_KERNEL_ACCOUNT);
 		if (!c)
@@ -1576,38 +1653,274 @@ int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
 	memset(o, 0, sizeof(*o));
 	o->insn_idx = insn_idx;
 	o->up = c->nr_origins;
+	o->subprog = bpf_find_containing_subprog(env, insn_idx) - env->subprog_info;
 	aux->cancel_origin = ++c->nr_origins;
+	return c->nr_origins - 1;
+}
+
+/*
+ * A frame holds a resource of origin @a and one of origin @b at a time. Whether that is
+ * two of one class is known when the classes are: after the main pass.
+ */
+static int cancel_add_pair(struct bpf_cancel *c, u32 a, u32 b)
+{
+	struct cancel_pair *pairs;
+	u32 i, cap;
+
+	if (a == b) {
+		c->origins[a].multi = true;
+		return 0;
+	}
+	if (a > b)
+		swap(a, b);
+	for (i = 0; i < c->nr_pairs; i++)
+		if (c->pairs[i].a == a && c->pairs[i].b == b)
+			return 0;
+	if (c->nr_pairs == CANCEL_PAIRS_MAX) {
+		c->no_pairs = true;
+		return 0;
+	}
+	if (c->nr_pairs == c->cap_pairs) {
+		cap = max(2 * c->cap_pairs, 8U);
+		pairs = krealloc_array(c->pairs, cap, sizeof(*pairs), GFP_KERNEL_ACCOUNT);
+		if (!pairs)
+			return -ENOMEM;
+		c->pairs = pairs;
+		c->cap_pairs = cap;
+	}
+	c->pairs[c->nr_pairs].a = a;
+	c->pairs[c->nr_pairs++].b = b;
 	return 0;
 }
 
-/* The origin of @ref, a reference to an object. It has one, see bpf_cancel_record_origin(). */
-static int cancel_ref_origin(struct bpf_verifier_env *env, const struct bpf_reference_state *ref)
+/*
+ * Frame @frame of @st comes to hold a resource of origin @x: together with what it holds
+ * already, but for the entries of refs[] from @first on that are frame @from's.
+ */
+static int cancel_add_pairs(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			    int frame, u32 x, int from, u32 first)
 {
-	u32 o = env->insn_aux_data[ref->insn_idx].cancel_origin;
+	struct bpf_cancel *c = env->cancel;
+	int y, err;
+	u32 i;
 
-	if (verifier_bug_if(!o, env, "cancel: the reference of insn %d has no origin",
-			    ref->insn_idx))
-		return -EFAULT;
-	return o - 1;
+	for (i = 0; i < st->acquired_refs && !c->no_pairs; i++) {
+		if (st->refs[i].frameno != frame || (i >= first && st->refs[i].frameno == from))
+			continue;
+		y = cancel_ref_origin(env, &st->refs[i]);
+		if (y < 0)
+			continue;
+		err = cancel_add_pair(c, x, y);
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
-/* The origin that stands for the class of origin @o */
-static u32 cancel_class(struct bpf_cancel *c, u32 o)
+/*
+ * The current frame is about to hold one more entry of refs[], which the insn at @insn_idx
+ * acquires: the insn is its origin. All entries come from acquire_reference_state(), which
+ * makes the origin first.
+ */
+int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
 {
-	struct cancel_origin *origins = c->origins;
+	const struct bpf_verifier_state *st = env->cur_state;
+	int x;
 
-	while (origins[o].up != o) {
-		origins[o].up = origins[origins[o].up].up;
-		o = origins[o].up;
+	x = cancel_get_origin(env, insn_idx);
+	if (x < 0)
+		return x;
+	return cancel_add_pairs(env, st, st->curframe, x, -1, st->acquired_refs);
+}
+
+/* Visits of an origin have to agree on what tells that it brought a resource */
+static void cancel_note_how(struct cancel_origin *o, u8 how)
+{
+	if (how == BPF_CANCEL_ACQUIRE_SOMETIMES || (o->how && o->how != how))
+		o->inexact = true;
+	else
+		o->how = how;
+}
+
+/*
+ * The current insn is a call of a helper or of a kfunc that acquired the last entry of
+ * refs[]. @how tells whether a visit of the call did, see enum bpf_cancel_acquire: the insn
+ * that says at run time that the frame holds the resource is behind the call and has
+ * nothing else to go by. BPF_CANCEL_ACQUIRE_R0 is for a reference to an object, and R0 is
+ * what the call returns by now.
+ *
+ * A pointer that may be NULL has a reference in refs[] until the program tests it, see
+ * mark_ptr_or_null_regs(). Nothing is held when the pointer is NULL, and nothing takes the
+ * entry away but the test. So the call did not bring a resource then.
+ */
+void bpf_cancel_record_acquire(struct bpf_verifier_env *env, enum bpf_cancel_acquire how)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+	const struct bpf_reference_state *ref = &st->refs[st->acquired_refs - 1];
+	int x = cancel_ref_origin(env, ref);
+
+	if (x < 0)
+		return;
+	if (how == BPF_CANCEL_ACQUIRE_R0 &&
+	    st->frame[st->curframe]->regs[BPF_REG_0].id != ref->id)
+		how = BPF_CANCEL_ACQUIRE_SOMETIMES;
+	cancel_note_how(&env->cancel->origins[x], how);
+}
+
+/* May a test for NULL still find that reference @id was never acquired? */
+static bool cancel_ref_may_be_null(struct bpf_verifier_state *st, u32 id)
+{
+	struct bpf_func_state *frame;
+	struct bpf_reg_state *reg;
+	bool ret = false;
+
+	bpf_for_each_reg_in_vstate(st, frame, reg, ({
+		if (reg->id == id && type_may_be_null(reg->type))
+			ret = true;
+	}));
+	return ret;
+}
+
+/*
+ * A subprog returns to the call at @call_idx, which frame @frame of @st made. What it
+ * returns with is for that frame to release from now on: the entries of refs[] from @first
+ * on that are frame @from's. The call brought them to the frame and is their origin there.
+ * @r0 is R0 as the subprog leaves it.
+ *
+ * The insn that says at run time that the frame holds such a resource is behind the call.
+ * It has R0 to go by: the pointer to the object, when that is what the subprog returns, or
+ * NULL when a return brought nothing. A return that unwinds does not get to that insn: then
+ * nothing tells. A helper or a kfunc that calls a callback returns whether the callback ran
+ * or not: what a callback leaves to the frame that it was called for has no origin.
+ */
+int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			     int call_idx, int frame, int from, u32 first,
+			     struct bpf_reg_state *r0)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[call_idx];
+	bool callback = !bpf_pseudo_call(insn) && !bpf_is_callx(insn);
+	struct bpf_reference_state *ref;
+	struct cancel_origin *o = NULL;
+	u32 i, nr = 0;
+	int x = -1, how;
+
+	if (!callback) {
+		x = cancel_get_origin(env, call_idx);
+		if (x < 0)
+			return x;
+		o = &env->cancel->origins[x];
 	}
-	return o;
+	for (i = first; i < st->acquired_refs; i++) {
+		ref = &st->refs[i];
+		if (ref->frameno != from)
+			continue;
+		ref->origin = callback ? -1 : call_idx;
+		if (callback)
+			continue;
+		nr++;
+		how = BPF_CANCEL_ACQUIRE_ALWAYS;
+		if (st->unwound)
+			how = BPF_CANCEL_ACQUIRE_SOMETIMES;
+		else if (ref->type == REF_TYPE_PTR && r0->id == ref->id)
+			how = BPF_CANCEL_ACQUIRE_R0;
+		else if (ref->type == REF_TYPE_PTR && cancel_ref_may_be_null(st, ref->id))
+			how = BPF_CANCEL_ACQUIRE_SOMETIMES;
+		cancel_note_how(o, how);
+	}
+	if (callback)
+		return 0;
+	if (!nr) {
+		if (bpf_register_is_null(r0))
+			o->null_ret = true;
+		else
+			o->inexact = true;
+		return 0;
+	}
+	if (nr > 1)
+		o->multi = true;
+	return cancel_add_pairs(env, st, frame, x, from, first);
+}
+
+/*
+ * A visit of the current insn takes refs[@idx] of the current state away, or takes nothing
+ * away when @idx is below 0 although other visits of the insn do. Every such visit is to be
+ * noted: an insn in front of the call says at run time that the frame of the call does not
+ * hold the resource any more, whatever the visit. That is right where every visit takes
+ * away a resource of one class that its frame holds. Else nothing tells:
+ * - A frame that does not hold the resource takes it away. Its owner is not told.
+ * - The insn is no call of a helper or of a kfunc, where the insn in front has its place.
+ *
+ * Nothing is noted where a test for NULL takes a reference away: the call that acquired it
+ * did not bring a resource, see bpf_cancel_record_acquire(). Or where a frame leaves with
+ * what it holds, see bpf_cancel_record_return(), or leaves it to a callee, see
+ * bpf_cancel_ref_moved().
+ */
+void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+	const struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
+	const struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_cancel *c = env->cancel;
+	struct cancel_release *rel;
+	u32 x = CANCEL_NO_ORIGIN, r, cap;
+	int o = -1;
+
+	/* nothing has an origin */
+	if (!c)
+		return;
+	if (idx >= 0)
+		o = cancel_ref_origin(env, &st->refs[idx]);
+	if (o >= 0 && st->refs[idx].frameno == st->curframe &&
+	    (bpf_helper_call(insn) || bpf_pseudo_kfunc_call(insn)))
+		x = o;
+	else if (o >= 0)
+		c->origins[o].inexact = true;
+
+	for (r = aux->cancel_release; r; r = rel->next) {
+		rel = &c->releases[r - 1];
+		if (rel->origin == x)
+			return;
+	}
+	if (c->nr_releases == c->cap_releases) {
+		cap = max(2 * c->cap_releases, 16U);
+		rel = kvrealloc(c->releases, cap * sizeof(*rel), GFP_KERNEL_ACCOUNT);
+		if (!rel) {
+			c->no_releases = true;
+			return;
+		}
+		c->releases = rel;
+		c->cap_releases = cap;
+	}
+	rel = &c->releases[c->nr_releases];
+	rel->insn_idx = env->insn_idx;
+	rel->origin = x;
+	rel->next = aux->cancel_release;
+	aux->cancel_release = ++c->nr_releases;
+}
+
+/*
+ * No insn of the frame that is to release refs[@idx] of @st brings it there, or it leaves
+ * the frame with no insn that takes it away: the kernel holds the reference for an argument
+ * of the program, or the frame leaves it to a callee at a call. Whatever makes another frame
+ * the owner of an entry without bpf_cancel_record_return() has to tell before it does.
+ * Nothing tells at run time whether a frame holds such a resource. The entry has no origin
+ * from now on.
+ */
+void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx)
+{
+	int x = cancel_ref_origin(env, &st->refs[idx]);
+
+	if (x >= 0)
+		env->cancel->origins[x].inexact = true;
+	st->refs[idx].origin = -1;
 }
 
 /*
  * @a stands for @b from now on: @b is within it, or it is the join of the two. They hold the
- * same references, and the origins of the two that are in the same entry of refs[] become
+ * same resources, and the origins of the two that are in the same entry of refs[] become
  * one class. This only takes notes: whether a state stands for another one does not depend
- * on the origins.
+ * on the origins. A resource that has no origin in one of the two is not known by its
+ * origin in the other one either.
  *
  * What the callers of a function that is verified on its own hold is left out. The state at
  * the entry of the function is shared by calls from anywhere, each with what its caller
@@ -1622,15 +1935,19 @@ void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifi
 	u32 i;
 
 	for (i = 0; i < a->acquired_refs; i++) {
-		if (a->refs[i].type != REF_TYPE_PTR || a->refs[i].insn_idx == b->refs[i].insn_idx ||
+		if (a->refs[i].origin == b->refs[i].origin ||
 		    a->refs[i].frameno == BPF_INHERITED_FRAME)
 			continue;
 		x = cancel_ref_origin(env, &a->refs[i]);
 		y = cancel_ref_origin(env, &b->refs[i]);
-		if (x < 0 || y < 0)
+		if (x >= 0 && y >= 0) {
+			cancel_union(c, x, y);
 			continue;
-		x = cancel_class(c, x);
-		c->origins[x].up = cancel_class(c, y);
+		}
+		if (x >= 0)
+			c->origins[x].inexact = true;
+		if (y >= 0)
+			c->origins[y].inexact = true;
 	}
 }
 
@@ -2454,6 +2771,12 @@ void bpf_cancel_reset(struct bpf_verifier_env *env)
 	for (i = 0; i < c->nr_origins; i++)
 		env->insn_aux_data[c->origins[i].insn_idx].cancel_origin = 0;
 	c->nr_origins = 0;
+	for (i = 0; i < c->nr_releases; i++)
+		env->insn_aux_data[c->releases[i].insn_idx].cancel_release = 0;
+	c->nr_releases = 0;
+	c->no_releases = false;
+	c->nr_pairs = 0;
+	c->no_pairs = false;
 }
 
 void bpf_cancel_free(struct bpf_verifier_env *env)
@@ -2471,6 +2794,8 @@ void bpf_cancel_free(struct bpf_verifier_env *env)
 	kvfree(c->pads);
 	kvfree(c->insns);
 	kvfree(c->origins);
+	kvfree(c->releases);
+	kfree(c->pairs);
 	kfree(c);
 	env->cancel = NULL;
 }

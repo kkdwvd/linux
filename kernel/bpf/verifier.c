@@ -800,6 +800,8 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 			id = acquire_reference(env, insn_idx, parent_id);
 			if (id < 0)
 				return id;
+			/* every visit of a call that makes such a dynptr does */
+			bpf_cancel_record_acquire(env, BPF_CANCEL_ACQUIRE_ALWAYS);
 
 			parent_id = id;
 		}
@@ -1056,6 +1058,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 	id = acquire_reference(env, insn_idx, 0);
 	if (id < 0)
 		return id;
+	bpf_cancel_record_acquire(env, BPF_CANCEL_ACQUIRE_ALWAYS);
 
 	for (i = 0; i < nr_slots; i++) {
 		struct bpf_stack_state *slot = bpf_stack_slot(state, spi - i);
@@ -1194,6 +1197,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	id = acquire_irq_state(env, insn_idx);
 	if (id < 0)
 		return id;
+	bpf_cancel_record_acquire(env, BPF_CANCEL_ACQUIRE_ALWAYS);
 
 	slot = bpf_stack_slot(state, spi);
 	st = &slot->spilled_ptr;
@@ -1546,10 +1550,16 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 	int new_ofs = state->acquired_refs;
 	int err;
 
+	/* the insn brings it to the current frame, see bpf_cancel_alias_refs() */
+	err = bpf_cancel_record_origin(env, insn_idx);
+	if (err)
+		return NULL;
+
 	err = resize_reference_state(state, state->acquired_refs + 1);
 	if (err)
 		return NULL;
 	state->refs[new_ofs].insn_idx = insn_idx;
+	state->refs[new_ofs].origin = insn_idx;
 	state->refs[new_ofs].frameno = state->curframe;
 
 	return &state->refs[new_ofs];
@@ -1558,12 +1568,6 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id)
 {
 	struct bpf_reference_state *s;
-	int err;
-
-	/* the insn is the origin of the reference, see bpf_cancel_alias_refs() */
-	err = bpf_cancel_record_origin(env, insn_idx);
-	if (err)
-		return err;
 
 	s = acquire_reference_state(env, insn_idx);
 	if (!s)
@@ -1700,6 +1704,7 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
 			bpf_cancel_foreign_release(env, state->refs[i].frameno);
+			bpf_cancel_record_release(env, i);
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
@@ -1731,6 +1736,7 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 			continue;
 		if (state->refs[i].id == id) {
 			bpf_cancel_foreign_release(env, state->refs[i].frameno);
+			bpf_cancel_record_release(env, i);
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
 			bpf_diag_record_context(env, env->insn_idx, BPF_DIAG_CONTEXT_IRQ,
@@ -8658,6 +8664,9 @@ static int process_spin_lock(struct bpf_verifier_env *env, struct bpf_reg_state 
 			verbose(env, "Failed to acquire lock state\n");
 			return err;
 		}
+		/* the state in which the lock is not taken has left, see check_kfunc_call() */
+		bpf_cancel_record_acquire(env, is_res_lock ? BPF_CANCEL_ACQUIRE_R0_ZERO :
+							     BPF_CANCEL_ACQUIRE_ALWAYS);
 	} else {
 		void *ptr;
 		int type;
@@ -11303,6 +11312,7 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_PTR || state->refs[i].id != id)
 			continue;
 		bpf_cancel_foreign_release(env, state->refs[i].frameno);
+		bpf_cancel_record_release(env, i);
 		break;
 	}
 	err = __release_reference_nomark(state, id);
@@ -12098,6 +12108,11 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 			caller->refs[i].parent_id = fresh_id(env, idmap, caller->refs[i].parent_id);
 		caller->refs[i].frameno = caller->curframe;
 	}
+	/* and the call brought it there */
+	err = bpf_cancel_record_return(env, caller, call_idx, caller->curframe, caller->curframe,
+				       nheld, &frame->regs[BPF_REG_0]);
+	if (err)
+		return err;
 	caller->active_irq_id = fresh_id(env, idmap, caller->active_irq_id);
 	caller->active_lock_id = fresh_id(env, idmap, caller->active_lock_id);
 	/* fresh_id() had no room for an id, or there are no ids left */
@@ -12940,7 +12955,11 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		return err;
 	invalidate_stack_slices(env, callee->frameno, INT_MIN, 0);
 
-	/* What the frame returns with is for the caller to release. */
+	/* What the frame returns with is for the caller to release: the call brings it there. */
+	err = bpf_cancel_record_return(env, state, callee->callsite, caller->frameno,
+				       callee->frameno, 0, r0);
+	if (err)
+		return err;
 	for (i = 0; i < state->acquired_refs; i++)
 		if (bpf_frame_owns_ref(state, callee->frameno, i))
 			state->refs[i].frameno = caller->frameno;
@@ -13327,10 +13346,13 @@ static const char *non_sleepable_context_description(struct bpf_verifier_env *en
 static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 		       bool convert_rcu, bool release_dynptr)
 {
+	int nr = env->cur_state->acquired_refs;
 	int err = -EINVAL;
 
-	if (bpf_register_is_null(reg))
+	if (bpf_register_is_null(reg)) {
+		bpf_cancel_record_release(env, -1);
 		return 0;
+	}
 
 	if (release_dynptr)
 		err = unmark_stack_slots_dynptr(env, reg);
@@ -13339,6 +13361,9 @@ static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 	else if (reg_is_referenced(env, reg))
 		err = release_reference(env, reg->id);
 
+	/* this visit of the call takes nothing away, like the one with NULL above */
+	if (!err && env->cur_state->acquired_refs == nr)
+		bpf_cancel_record_release(env, -1);
 	return err;
 }
 
@@ -13773,6 +13798,9 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		/* a lookup acquires in the visits that have a map of sockets only */
+		bpf_cancel_record_acquire(env, is_acquire_function(func_id, NULL) ?
+					       BPF_CANCEL_ACQUIRE_R0 : BPF_CANCEL_ACQUIRE_SOMETIMES);
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -16725,6 +16753,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			bpf_cancel_record_acquire(env, BPF_CANCEL_ACQUIRE_R0);
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -23565,6 +23594,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 			ret = aux->ctx_arg_info[i].refcounted ? acquire_reference(env, 0, 0) : 0;
 			if (ret < 0)
 				goto out;
+			/* the kernel holds it, and no insn of the program brought it */
+			if (ret)
+				bpf_cancel_ref_moved(env, env->cur_state,
+						     env->cur_state->acquired_refs - 1);
 
 			aux->ctx_arg_info[i].ref_id = ret;
 		}
