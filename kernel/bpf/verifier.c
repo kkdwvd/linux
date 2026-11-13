@@ -20225,6 +20225,67 @@ static bool program_returns_void(struct bpf_verifier_env *env)
 	return false;
 }
 
+/*
+ * What the main program returns when it is cancelled. None of its code runs to choose, so it is
+ * the value of the type that refuses, drops or changes nothing:
+ *
+ *	tc					TC_ACT_SHOT
+ *	lwt, flow dissector			BPF_DROP
+ *	lsm, the hook returns an errno		-EPERM
+ *	lsm, the hook returns a bool		0
+ *	cgroup lsm, skb, sock, sock_addr,	0, the kernel makes -EPERM of it
+ *	device, sysctl, sockopt
+ *	socket filter, xdp, netfilter		0, the packet is dropped
+ *	sk_skb, sk_msg, sk_lookup, sk_reuseport	0, SK_DROP
+ *	sock_ops				0, the reply is not used
+ *	kprobe, tracepoint, perf_event		0, perf doesn't get the event
+ *	struct_ops				0, NULL for a pointer
+ *	tracing, raw_tp, syscall, lirc		0, as from a program that did nothing
+ *
+ * Where one value is accepted there is no choice: 1 for getsockname, getpeername and recvmsg of
+ * sock_addr and for cgroup lsm on a void hook, which cannot refuse.
+ * An extension is verified as a program of the type that it extends, and returns its value.
+ *
+ * False: no value is known to be right, the program cannot be cancelled.
+ */
+bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *val)
+{
+	struct bpf_retval_range range;
+
+	*val = 0;
+	if (program_returns_void(env))
+		return true;
+
+	switch (resolve_prog_type(env->prog)) {
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		*val = TC_ACT_SHOT;
+		break;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		*val = BPF_DROP;
+		break;
+	case BPF_PROG_TYPE_LSM:
+		/* An extension doesn't name the hook, and can move to a program on another one */
+		if (env->prog->type == BPF_PROG_TYPE_EXT)
+			return false;
+		if (get_func_retval_range(env->prog, &range) && range.minval < 0)
+			*val = -EPERM;
+		break;
+	default:
+		break;
+	}
+
+	if (!return_retval_range(env, &range))
+		return true;
+	if (range.minval == range.maxval)
+		*val = range.minval;
+	return range.minval <= *val && *val <= range.maxval;
+}
+
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name)
 {
 	const char *exit_ctx = "At program exit";

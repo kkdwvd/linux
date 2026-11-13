@@ -3982,6 +3982,31 @@ u64 bpf_prog_report_recursion(void)
 	return 0;
 }
 
+/*
+ * Called by the pad of the outermost frame of a cancelled program, when the frames have released
+ * what they held. The cancellation point has told why, with the stack that was there. This tells
+ * that the program didn't go on from it.
+ */
+u64 bpf_prog_report_cancel(void)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_stream_stage ss;
+	struct bpf_prog *prog;
+
+	prog = bpf_prog_find_from_stack();
+	if (!prog)
+		return 0;
+	/*
+	 * Not held back like the report of a recursion: there is one line per invocation, and the
+	 * stream is not empty when the point has just written its report.
+	 */
+	bpf_stream_stage(ss, prog, BPF_STDERR, ({
+		bpf_stream_printk(ss, "ERROR: Program was cancelled\n");
+	}));
+#endif
+	return 0;
+}
+
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
 {
 	u64 time = ktime_get_mono_fast_ns();

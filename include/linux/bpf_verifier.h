@@ -1593,6 +1593,7 @@ void bpf_mark_reg_not_init(const struct bpf_verifier_env *env,
 void bpf_mark_reg_known_scalar(struct bpf_reg_state *reg, u64 imm);
 void bpf_mark_reg_unknown(struct bpf_reg_state *reg);
 int bpf_grow_stack_state(struct bpf_verifier_env *env, struct bpf_func_state *state, int size);
+bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *val);
 
 static inline int bpf_get_spi(s32 off)
 {
