@@ -1584,17 +1584,21 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 	int arena_reg = FIELD_GET(BPF_FIXUP_ARENA_REG_MASK, ex->fixup);
 	bool is_arena = !!(ex->fixup & BPF_ARENA_ACCESS);
 	bool is_write = !!(ex->fixup & BPF_ARENA_WRITE);
+	unsigned long end = regs->pc + AARCH64_INSN_SIZE, pad = end;
 	unsigned long addr;
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		bpf_arena_fault(is_write, addr, regs->pc, regs->pc + AARCH64_INSN_SIZE);
+		pad = bpf_arena_fault(is_write, addr, regs->pc, end);
 	}
 
-	if (dst_reg != DONT_CLEAR)
+	/*
+	 * No landing pad: skip the faulting instruction. The landing pad gets the
+	 * registers as they were before the access.
+	 */
+	if (pad == end && dst_reg != DONT_CLEAR)
 		regs->regs[dst_reg] = 0;
-	/* Skip the faulting instruction */
-	regs->pc += AARCH64_INSN_SIZE;
+	regs->pc = pad;
 
 	return true;
 }
@@ -1705,6 +1709,8 @@ static bool unwind_goto_after_helper(const struct bpf_insn *insn)
  * the pad, or the way into it. unwind_exit adds .fixup to its LR.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
+ * After an access to arena ret_addr is the end of its code, and a fault in it
+ * goes to bpf_fault_unwind_target() of that, see ex_handler_bpf().
  */
 static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
 {
@@ -1801,6 +1807,18 @@ u64 bpf_unwind_target(u64 ret_addr)
 	scoped_guard(rcu)
 		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
 	return ret_addr;
+}
+
+/*
+ * The same for the end of the code of an access to arena that faulted, see
+ * ex_handler_bpf(). No entry is no lost unwind_exit there: no unwind_goto
+ * follows the access, and it is skipped.
+ */
+u64 bpf_fault_unwind_target(u64 end)
+{
+	const struct exception_table_entry *e = search_bpf_extables(end - 1);
+
+	return e ? end + e->fixup : end;
 }
 
 /* The offset that the epilogue adds to LR once it is authenticated */
@@ -2464,6 +2482,9 @@ emit_cond_jmp:
 		if (unwind_goto_after_helper(insn)) {
 			ctx->landing_ex[ctx->landing_idx++] = ctx->exentry_idx;
 			target = ret_addr;
+		} else if (BPF_CLASS(insn[-1].code) != BPF_JMP) {
+			/* An access to arena is in front. The insn that faults is its last one. */
+			ret_addr = ctx->idx;
 		}
 		ret = add_unwind_exentry(ctx, ret_addr, target);
 		if (ret)
