@@ -58,11 +58,28 @@ static bool is_may_goto_setup(const struct bpf_insn *insn)
 	return false;
 }
 
-/* Whether 'r0 = mark' is at 'off', or behind the insns inserted in front of a function. */
+/* src_reg of cancel_goto, see include/linux/filter.h */
+#define BPF_CANCEL_GOTO	2
+
+/*
+ * cancel_goto names the pad of the call in front of it, when what is called can be cancelled.
+ * It is inserted in front of the insn behind the call, and gets the line of that insn.
+ */
+static bool is_cancel_goto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_CANCEL_GOTO;
+}
+
+/*
+ * Whether 'r0 = mark' is at 'off', or behind the insns inserted in front of a function or
+ * behind a call.
+ */
 static bool mark_is_at(const struct bpf_insn *insns, __u32 cnt, __u32 off, bool func_start,
 		       int mark)
 {
 	while (func_start && off < cnt && is_may_goto_setup(&insns[off]))
+		off++;
+	if (off < cnt && is_cancel_goto(&insns[off]))
 		off++;
 	return off < cnt && insns[off].code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
 	       insns[off].dst_reg == BPF_REG_0 && insns[off].imm == mark;

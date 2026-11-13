@@ -345,7 +345,8 @@ __naked void callback_returns_to_loop_head(void)
 
 /*
  * may_goto doesn't leave the loop, so it's not what stops it. The address is greater than 10:
- * the loop spins until may_goto that the verifier adds ends the prog.
+ * the loop spins until may_goto that the verifier adds ends the prog. Where the prog can be
+ * cancelled its own may_goto ends it too when the time is up.
  */
 int tmp_var;
 SEC("socket")
@@ -576,17 +577,28 @@ int cond_break3(const void *ctx)
 	return loop();
 }
 
+/*
+ * When the time of may_goto is up a prog that can be cancelled ends there, and nothing behind
+ * the loop runs. A callback that a helper calls is never cancelled: cond_break breaks out of
+ * its loop, and the prog goes on. The two tests below loop in a callback of bpf_loop().
+ */
+static int cond_break4_cb(__u64 idx, int *cnt)
+{
+	for (;;) {
+		/* should eventually break out of the loop */
+		cond_break;
+		(*cnt)++;
+	}
+	return 0;
+}
+
 SEC("socket")
 __success __retval(1)
 int cond_break4(const void *ctx)
 {
 	int cnt = zero;
 
-	for (;;) {
-		/* should eventually break out of the loop */
-		cond_break;
-		cnt++;
-	}
+	bpf_loop(1, cond_break4_cb, &cnt, 0);
 	/* if we looped a bit, it's a success */
 	return cnt > 1 ? 1 : 0;
 }
@@ -603,9 +615,7 @@ static __noinline int static_subprog(void)
 	return cnt;
 }
 
-SEC("socket")
-__success __retval(1)
-int cond_break5(const void *ctx)
+static int cond_break5_cb(__u64 idx, int *ok)
 {
 	int cnt1 = zero, cnt2;
 
@@ -620,8 +630,19 @@ int cond_break5(const void *ctx)
 
 	cnt2 = static_subprog();
 
-	/* main and subprog have to loop a bit */
-	return cnt1 > 1 && cnt2 > 1 ? 1 : 0;
+	/* the callback and the subprog have to loop a bit */
+	*ok = cnt1 > 1 && cnt2 > 1 ? 1 : 0;
+	return 0;
+}
+
+SEC("socket")
+__success __retval(1)
+int cond_break5(const void *ctx)
+{
+	int ok = 0;
+
+	bpf_loop(1, cond_break5_cb, &ok, 0);
+	return ok;
 }
 
 #define ARR2_SZ 1000

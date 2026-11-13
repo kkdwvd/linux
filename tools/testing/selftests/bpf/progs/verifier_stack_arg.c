@@ -982,12 +982,15 @@ static long spins_then_reads_8args(long a, long b, long c, long d, long e, long 
 	);
 }
 
-SEC("tc")
-__description("stack_arg: the time of may_goto is up, then the callee reads its args")
-__success __retval(876)
-__naked void stack_arg_may_goto_timeout_in_callee(void)
+/*
+ * may_goto whose time is up ends a prog that can be cancelled. In a callback that a helper
+ * calls it jumps, and the callee goes on to read its args.
+ */
+__naked __noinline __used
+static long calls_spins_then_reads_8args(void)
 {
 	asm volatile (
+		"r6 = r2;"
 		"r1 = 1;"
 		"r2 = 2;"
 		"r3 = 3;"
@@ -997,8 +1000,33 @@ __naked void stack_arg_may_goto_timeout_in_callee(void)
 		"*(u64 *)(r11 - 16) = 70;"
 		"*(u64 *)(r11 - 8) = 6;"
 		"call spins_then_reads_8args;"
+		"*(u64 *)(r6 + 0) = r0;"
+		"r0 = 0;"
 		"exit;"
 		::: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("stack_arg: the time of may_goto is up, then the callee reads its args")
+__success __retval(876)
+__naked void stack_arg_may_goto_timeout_in_callee(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = 1;"
+		"r2 = %[calls_spins_then_reads_8args] ll;"
+		"r3 = r10;"
+		"r3 += -8;"
+		"r4 = 0;"
+		"call %[bpf_loop];"
+		"r0 = *(u64 *)(r10 - 8);"
+		"exit;"
+		:
+		: __imm_addr(calls_spins_then_reads_8args),
+		  __imm(bpf_loop)
+		: __clobber_all
 	);
 }
 

@@ -85,7 +85,10 @@ __naked void patch_list_backward(void)
 	: __clobber_all);
 }
 
-/* The jump of may_goto leaves its own patch and crosses another one. */
+/*
+ * The jump of may_goto leaves its own patch and crosses another one. It goes to the pad behind
+ * the last insn, which ends the prog when the time is up, not to the exit that the prog names.
+ */
 SEC("raw_tp")
 __description("patch list: may_goto between patched insns")
 __arch_x86_64
@@ -104,13 +107,16 @@ __xlated("11: r0 /= r1")
 __xlated("12: r2 = ")
 __xlated("14: r2 = &(void __percpu *)(r2)")
 __xlated("15: r13 = *(u64 *)(r2 +0)")
-__xlated("16: if r13 == 0x0 goto pc+9")
+__xlated("16: if r13 == 0x0 goto pc+10")
 __xlated("...")
 __xlated("22: if r1 != 0x0 goto pc+2")
 __xlated("23: w0 ^= w0")
 __xlated("24: goto pc+1")
 __xlated("25: r0 /= r1")
 __xlated("26: exit")
+__xlated("27: call unknown")
+__xlated("28: r0 = 0")
+__xlated("29: exit")
 __naked void patch_list_may_goto(void)
 {
 	asm volatile (
@@ -211,18 +217,14 @@ int patch_list_indirect(void)
  * may_goto jumps back by 8195 insns, by 32768 once each of the 8191
  * divisions is guarded by a patch of 4 insns. That still fits the 16 bits of
  * may_goto, but not the jump it expands to, which has to become gotol. Once
- * the budget runs out, may_goto jumps back with r6 set and the program exits.
+ * the budget runs out, may_goto jumps back with r6 set and the function exits.
+ *
+ * may_goto of a prog that can be cancelled goes to a pad behind the last insn
+ * instead. A callback that a helper calls cannot be cancelled, so the jump
+ * is in a callback of bpf_loop().
  */
-SEC("raw_tp")
-__description("patch list: backward may_goto expanded to gotol")
-__arch_x86_64
-__arch_arm64
-__success
-__xlated("12: if r6 != 0x0 goto pc-3")
-__xlated("...")
-__xlated("32783: if r13 != 0x0 goto pc+1")
-__xlated("32784: gotol pc-32773")
-__naked void patch_list_may_goto_gotol(void)
+__naked __noinline __used
+static unsigned long patch_list_far_back(void)
 {
 	asm volatile ("					\
 	call %[bpf_get_prandom_u32];			\
@@ -243,6 +245,31 @@ __naked void patch_list_may_goto_gotol(void)
 "	:
 	: __imm(bpf_get_prandom_u32),
 	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, -8195 /* offset */, 0))
+	: __clobber_all);
+}
+
+SEC("raw_tp")
+__description("patch list: backward may_goto expanded to gotol")
+__arch_x86_64
+__arch_arm64
+__success
+__xlated("45: if r6 != 0x0 goto pc-3")
+__xlated("...")
+__xlated("32816: if r13 != 0x0 goto pc+1")
+__xlated("32817: gotol pc-32773")
+__naked void patch_list_may_goto_gotol(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"r2 = %[patch_list_far_back] ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(patch_list_far_back),
+	  __imm(bpf_loop)
 	: __clobber_all);
 }
 
@@ -376,13 +403,13 @@ __naked void patch_list_call_over_removed(void)
 /*
  * A goto or a may_goto that jumps over nops only is a nop. The nops are not
  * dead code: may_goto falls through to its nop, 'if' jumps to the other one.
+ *
+ * may_goto of a prog that can be cancelled goes to a pad instead, and stays.
+ * So this one is in a callback of bpf_loop(), which cannot be cancelled: all
+ * that is left of the callback follows the exit of the main prog.
  */
-SEC("raw_tp")
-__description("patch list: may_goto over a nop")
-__success
-__xlated("0: r0 = 1")
-__xlated("1: exit")
-__naked void patch_list_may_goto_over_nop(void)
+__naked __noinline __used
+static unsigned long patch_list_over_nop(void)
 {
 	asm volatile (
 	".8byte %[may_goto];"
@@ -391,6 +418,29 @@ __naked void patch_list_may_goto_over_nop(void)
 	"exit;"
 	:
 	: __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 1 /* offset */, 0))
+	: __clobber_all);
+}
+
+SEC("raw_tp")
+__description("patch list: may_goto over a nop")
+__success
+__xlated("...")
+__xlated("exit")
+__xlated("r0 = 1")
+__xlated("exit")
+__naked void patch_list_may_goto_over_nop(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"r2 = %[patch_list_over_nop] ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm_addr(patch_list_over_nop),
+	  __imm(bpf_loop)
 	: __clobber_all);
 }
 

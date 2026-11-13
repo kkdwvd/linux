@@ -912,11 +912,11 @@ __xlated("6: r1 = 1")
 __xlated("...")
 __xlated("8: r0 = &(void __percpu *)(r0)")
 __xlated("...")
-/* may_goto expansion starts, r0 and r1 are live */
+/* may_goto expansion starts, r0 and r1 are live. It goes to the pad behind exit. */
 __xlated("10: r2 = ")
 __xlated("12: r2 = &(void __percpu *)(r2)")
 __xlated("13: r13 = *(u64 *)(r2 +0)")
-__xlated("14: if r13 == 0x0 goto pc+6")
+__xlated("14: if r13 == 0x0 goto pc+7")
 __xlated("15: r13 -= 1")
 __xlated("16: if r13 != 0x0 goto pc+2")
 __xlated("17: r13 = r2")
@@ -925,6 +925,10 @@ __xlated("19: *(u64 *)(r2 +0) = r13")
 /* may_goto expansion ends */
 __xlated("20: *(u64 *)(r10 -8) = r1")
 __xlated("21: exit")
+/* the pad ends the prog when the time is up */
+__xlated("22: call unknown")
+__xlated("23: r0 = 0")
+__xlated("24: exit")
 __success
 __naked void may_goto_interaction_x86_64(void)
 {
@@ -955,11 +959,14 @@ __xlated("2: r0 = &(void __percpu *)(r0)")
 __xlated("...")
 __xlated("6: r1 = 1")
 __xlated("7: call bpf_get_smp_processor_id")
-/* may_goto expansion starts, r0 and r1 are live */
+/*
+ * may_goto expansion starts, r0 and r1 are live. It goes to exit, or to the pad behind exit
+ * on arm64, where the prog is cancelled when the time is up.
+ */
 __xlated("8: r2 = ")
 __xlated("10: r2 = &(void __percpu *)(r2)")
 __xlated("11: r13 = *(u64 *)(r2 +0)")
-__xlated("12: if r13 == 0x0 goto pc+6")
+__xlated("12: if r13 == 0x0 goto pc+{{[67]}}")
 __xlated("13: r13 -= 1")
 __xlated("14: if r13 != 0x0 goto pc+2")
 __xlated("15: r13 = r2")
