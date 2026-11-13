@@ -11870,6 +11870,16 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 			entry.refs[i].parent_id = inherited_id(state, entry.refs[i].parent_id);
 		/* its owner is not in the state, and calls from any depth share the state */
 		entry.refs[i].frameno = BPF_INHERITED_FRAME;
+		/*
+		 * What the call moved is for the function to release, see move_refs_to_callee().
+		 * The call waits as it got to the insn, with the caller as the owner: that is what
+		 * the caller is again when the function returns with the reference, see
+		 * bpf_flow_return(), and what it is when the call is done again.
+		 */
+		if (bpf_frame_owns_ref(state, state->curframe + 1, i)) {
+			entry.refs[i].frameno = 0;
+			state->refs[i].frameno = state->curframe;
+		}
 	}
 	entry.active_irq_id = inherited_id(state, entry.active_irq_id);
 	entry.active_lock_id = inherited_id(state, entry.active_lock_id);
@@ -12012,6 +12022,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		id = held[i].id ? BPF_INHERITED_ID + j : 0;
 		if (caller->refs[i].id != id || caller->refs[i].type != held[i].type)
 			break;
+		/* with the caller as the owner, of what the call moved into the function too */
 		caller->refs[i] = held[i];
 		kept++;
 	}
@@ -12047,6 +12058,31 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		verbose(env, "too many ids at the call at insn %d\n", call_idx);
 		return -E2BIG;
 	}
+	return 0;
+}
+
+/*
+ * @state calls static subprog @subprog. A reference that the caller gives away in the call
+ * is for the frame of the callee to release, see bpf_cancel_ref_moves(). It gets that owner
+ * here, in front of the record of the call, which is without it then, and before it is known
+ * how the callee is verified: setup_func_entry() adds the frame, or call_func_on_its_own()
+ * makes it frame 0 of the function. A callee that returns with the reference leaves it with
+ * the caller like one that it took itself, see prepare_func_exit().
+ *
+ * A speculative state moves like any other: it is compared with the others.
+ */
+static int move_refs_to_callee(struct bpf_verifier_env *env, struct bpf_verifier_state *state,
+			       int subprog)
+{
+	int err;
+	u32 i;
+
+	err = bpf_live_stack_query_init(env, state);
+	if (err)
+		return err;
+	for (i = 0; i < state->acquired_refs; i++)
+		if (bpf_cancel_ref_moves(env, state, i, subprog))
+			state->refs[i].frameno = state->curframe + 1;
 	return 0;
 }
 
@@ -12088,6 +12124,9 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
+	err = move_refs_to_callee(env, state, subprog);
+	if (err)
+		return err;
 	/* every state that calls gets here, however the callee is verified */
 	err = bpf_cancel_record(env, BPF_CANCEL_SITE_CALL);
 	if (err)

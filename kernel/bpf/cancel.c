@@ -37,6 +37,11 @@
  * waits in a call when a callee releases what the frame holds: its pad would
  * release that again.
  *
+ * A reference that a frame gives away in a call is the callee's from the call
+ * on: the frame passes the handle in an argument and keeps it in no place that
+ * is live, see bpf_cancel_ref_moves(). The callee releases it, in its code or
+ * in its pads, or returns with it and the frame holds it again.
+ *
  * After the main pass bpf_cancel_resolve() finds the subprogs that can be
  * cancelled, and with them the sites that get a pad. The pads go behind the last
  * insn of their subprog, see bpf_insert_loop_guards().
@@ -1366,7 +1371,8 @@ int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type ty
 	c->visit.nr = 0;
 	/*
 	 * The stack check is in front of the first insn and only calls get to it: the
-	 * frame has taken nothing yet, whatever a state that jumps to that insn holds.
+	 * frame has taken nothing yet, whatever a state that jumps to that insn holds,
+	 * and no call moves a reference into it, see bpf_cancel_ref_moves().
 	 */
 	reason = 0;
 	if (type != BPF_CANCEL_SITE_ENTRY) {
@@ -1417,6 +1423,109 @@ void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner)
 	site = cancel_find_site(env, st->frame[owner + 1]->callsite, BPF_CANCEL_SITE_CALL);
 	if (site && !site->decline)
 		site->decline = CANCEL_FOREIGN;
+}
+
+/*
+ * Can the program have pads at all? These are the reasons of cancel_sub_reason() that hold
+ * for every subprog. Where there are no pads it makes no difference which frame owns a
+ * reference.
+ */
+static bool cancel_prog_may_have_pads(struct bpf_verifier_env *env)
+{
+	return bpf_prog_has_invocation_budget(env->prog) && bpf_jit_supports_cancel() &&
+	       !bpf_prog_is_offloaded(env->prog->aux) && env->bpf_capable && env->bypass_spec_v1;
+}
+
+/*
+ * @frame calls static subprog @subprog. The argument that the callee gets the handle with
+ * @id in, 0 if it gets it in none: 1-5 for R1-R5, where the callee reads the register, then
+ * the stack arguments that the callee takes. A register that the callee doesn't read is
+ * left over from what was there before.
+ */
+static int cancel_arg_of(struct bpf_verifier_env *env, const struct bpf_func_state *frame,
+			 int subprog, u32 id)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	u16 live = env->insn_aux_data[sub->start].live_regs_before;
+	const struct bpf_reg_state *reg;
+	int i;
+
+	for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+		if ((live & BIT(i)) && frame->regs[i].id == id)
+			return i;
+	for (i = 0; i < bpf_in_stack_arg_cnt(sub) && i < frame->out_stack_arg_cnt; i++) {
+		reg = &frame->stack_arg_regs[i];
+		if (reg->type != NOT_INIT && reg->id == id)
+			return MAX_BPF_FUNC_REG_ARGS + 1 + i;
+	}
+	return 0;
+}
+
+/*
+ * The current frame of @st calls static subprog @subprog at env->insn_idx. Does refs[@idx]
+ * move: is it for the frame of the callee to release from the call on?
+ *
+ * A caller that passes the handle in an argument and keeps it nowhere else has given the
+ * reference away. Only the callee gets to release it, or to hand it back by returning with
+ * it, see prepare_func_exit(). While the caller is the owner the call declines: its pad has
+ * no place to release from, and a callee that releases makes the release a foreign one, see
+ * bpf_cancel_foreign_release(). With the callee as the owner the record of the call is
+ * without the reference, and the sites of the callee have it, in the places of the callee.
+ *
+ * The reference moves when all of this holds:
+ * - The caller owns it, and its handle is a pointer, see cancel_collect_ptr(). An iterator
+ *   and a dynptr are found by their address in the stack of the frame that has them.
+ * - The callee is given the handle, see cancel_arg_of().
+ * - The caller keeps no copy: none of R6-R9 has the handle and is live in front of the call,
+ *   and neither does a slot of the caller's stack. A slot counts even when no pad of the call
+ *   could read it, see cancel_spill_is_place(): the caller reads it again.
+ * - No other reference is its child. A child is released before its parent, and the pad of
+ *   the callee runs before the pad of the frame that has the child.
+ * - The callee is not recursive: the pad of its stack check releases nothing, see
+ *   bpf_cancel_record().
+ *
+ * No pad depends on the choice: whichever frame is the owner, its sites find the handle in
+ * a place of that frame or decline. But the owner is compared when states are pruned and
+ * joined, see refsafe(), and states that are related but for the owner have to make the same
+ * choice, or more states are verified than without it. So the choice is made of what is
+ * compared in them: the registers and the slots that are live. A register or a slot that one
+ * state never wrote to stands for the handle that the other state has there. These two
+ * choose differently, and are verified apart while they are in the callee. Nothing moves in
+ * a program that cannot have pads: its states are compared as they were.
+ *
+ * bpf_live_stack_query_init() was called for @st.
+ */
+bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			  u32 idx, int subprog)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	const struct bpf_stack_state *slot;
+	u32 i;
+
+	if (ref->type != REF_TYPE_PTR || !bpf_frame_owns_ref(st, st->curframe, idx) ||
+	    sub->recursive || !cancel_prog_may_have_pads(env))
+		return false;
+	if (!cancel_arg_of(env, frame, subprog, ref->id))
+		return false;
+
+	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
+		if (frame->regs[i].id == ref->id &&
+		    cancel_reg_is_place(env, BPF_CANCEL_SITE_CALL, i))
+			return false;
+	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
+		slot = bpf_stack_slot(frame, i);
+		if (bpf_is_spilled_reg(slot) && slot->spilled_ptr.id == ref->id &&
+		    bpf_stack_slot_alive(env, st->curframe, i * 2) &&
+		    bpf_stack_slot_alive(env, st->curframe, i * 2 + 1))
+			return false;
+	}
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].type == REF_TYPE_PTR && st->refs[i].parent_id == ref->id)
+			return false;
+	return !cancel_ref_of_stack_obj(st, ref->id);
 }
 
 /* A point is where a cancellation begins. A call passes it on. */

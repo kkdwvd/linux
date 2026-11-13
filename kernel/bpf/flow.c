@@ -2324,7 +2324,8 @@ static void flow_shape_ctx(const struct bpf_verifier_state *st, struct flow_shap
 			   upper_32_bits((unsigned long)st->active_lock_ptr), ctx);
 	for (i = 0; i < st->acquired_refs; i++) {
 		ref = &st->refs[i];
-		ctx = jhash_1word(ref->type, ctx);
+		/* the owner doesn't follow from entry_refs: a call may move a reference */
+		ctx = jhash_2words(ref->type, ref->frameno, ctx);
 		if (ref->type != REF_TYPE_PTR && ref->type != REF_TYPE_IRQ)
 			ctx = jhash_2words(lower_32_bits((unsigned long)ref->ptr),
 					   upper_32_bits((unsigned long)ref->ptr), ctx);
