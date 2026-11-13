@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_verifier.h>
 #include <linux/cfi.h>
 #include <linux/extable.h>
 #include <linux/filter.h>
@@ -1689,16 +1690,21 @@ static int add_exception_handler(const struct bpf_insn *insn,
 }
 
 /*
- * There is no branch for unwind_goto, only an extable entry
- *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }
- * where ret_addr is the return address of the call in front of it. unwind_exit
- * adds .fixup to its LR.
- * ret_addr - 1, because what follows the call can have an entry of its own.
- * No insn starts there, so a fault cannot hit the entry.
- * 'bl foo; mov x8, x0' is in front of unwind_goto. The pad doesn't miss the mov:
- * r0 is x8 and the epilogue of the callee copies it to x0 and leaves x8 as it is.
+ * There is no branch for unwind_goto and cancel_goto, only an extable entry
+ *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }	unwind_goto
+ *   { .insn = ret_addr - 2, .fixup = pad - ret_addr }	cancel_goto
+ * where ret_addr is the return address of the call in front of them. unwind_exit
+ * adds .fixup of the first one to its LR, cancel_exit that of the second one.
+ * Both are inside the call, because what follows it can have an entry of its own.
+ * No insn starts there, so a fault cannot hit the entries.
+ * 'bl foo; mov x8, x0' is in front of unwind_goto and cancel_goto. The pad doesn't
+ * miss the mov: r0 is x8 and the epilogue of the callee copies it to x0 and leaves
+ * x8 as it is.
  */
-static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
+#define UNWIND_EX_KEY	1
+#define CANCEL_EX_KEY	2
+
+static int add_pad_exentry(struct jit_ctx *ctx, int pad, int key)
 {
 	int ret_addr = ctx->idx - 1;
 	struct exception_table_entry *ex;
@@ -1713,7 +1719,7 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 		return -EINVAL;
 
 	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
-	ins_offset = (long)&ctx->ro_image[ret_addr] - 1 - (long)&ex->insn;
+	ins_offset = (long)&ctx->ro_image[ret_addr] - key - (long)&ex->insn;
 	if (WARN_ON_ONCE(ins_offset >= 0 || ins_offset < INT_MIN))
 		return -ERANGE;
 
@@ -1727,14 +1733,61 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 	return 0;
 }
 
+/*
+ * 'call foo; [unwind_goto X;] cancel_goto P'. The table is searched by bisection,
+ * so the entry of cancel_goto has to be in front of the one of unwind_goto.
+ * unwind_goto leaves its entry to the cancel_goto behind it.
+ */
+static int add_goto_exentries(struct jit_ctx *ctx, const struct bpf_insn *insn, int i)
+{
+	const struct bpf_insn *insns = ctx->prog->insnsi, *unwind = NULL;
+	int call = i - 1;
+	int ret, pad;
+
+	if (!bpf_is_cancel_goto(insn)) {
+		if (i + 1 < ctx->prog->len && bpf_is_cancel_goto(insn + 1))
+			return 0;
+		return add_pad_exentry(ctx, i + 1 + insn->off, UNWIND_EX_KEY);
+	}
+	/* the offset of the pad of cancel_goto has 32 bits and is in imm */
+	pad = i + 1 + insn->imm;
+
+	if (call >= 0 && bpf_is_unwind_goto(&insns[call])) {
+		unwind = &insns[call];
+		call--;
+	}
+	/* Behind anything else there is no return address to key the entry on */
+	if (call < 0 || !(bpf_pseudo_call(&insns[call]) || bpf_is_callx(&insns[call]))) {
+		pr_err_once("cancel_goto at insn %d doesn't follow a call of a subprog\n", i);
+		return -EINVAL;
+	}
+
+	ret = add_pad_exentry(ctx, pad, CANCEL_EX_KEY);
+	if (ret || !unwind)
+		return ret;
+	return add_pad_exentry(ctx, i + unwind->off, UNWIND_EX_KEY);
+}
+
 static long bpf_unwind_fixup(u64 lr)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - 1);
+	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - UNWIND_EX_KEY);
 	/*
 	 * The verifier made sure that unwind_goto follows a call in a prog. When
 	 * the kernel called an async callback, it's exit.
+	 */
+	return e ? e->fixup : 0;
+}
+
+static long bpf_cancel_fixup(u64 lr)
+{
+	const struct exception_table_entry *e;
+
+	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - CANCEL_EX_KEY);
+	/*
+	 * The verifier puts cancel_goto behind every call of a function that has
+	 * cancel_exit. No entry: the kernel called the function, and it's exit.
 	 */
 	return e ? e->fixup : 0;
 }
@@ -1743,8 +1796,9 @@ static long bpf_unwind_fixup(u64 lr)
  * unwind_exit: return to the pad. LR in the frame record is signed. Instead of
  * signing the address of the pad, let the epilogue authenticate LR as it is and
  * add the offset of the pad to it. r0 and r2 are returned.
+ * cancel_exit: the same with the pad of cancel_goto. It has to keep r0 only.
  */
-static void emit_unwind_exit(struct jit_ctx *ctx)
+static void emit_unwind_exit(struct jit_ctx *ctx, long (*fixup)(u64 lr))
 {
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 r0 = bpf2a64[BPF_REG_0];
@@ -1752,7 +1806,7 @@ static void emit_unwind_exit(struct jit_ctx *ctx)
 
 	emit(A64_PUSH(r0, r2, A64_SP), ctx);
 	emit(A64_LDR64I(A64_R(0), A64_FP, 8), ctx);
-	emit_call((u64)bpf_unwind_fixup, ctx);
+	emit_call((u64)fixup, ctx);
 	emit(A64_MOV(1, tmp, A64_R(0)), ctx);
 	emit(A64_POP(r0, r2, A64_SP), ctx);
 	build_epilogue(ctx, false, true);
@@ -2374,16 +2428,21 @@ emit_cond_jmp:
 		if (emit_bpf_tail_call(ctx))
 			return -EFAULT;
 		break;
-	/* unwind_goto. The verifier expanded may_goto. */
+	/* unwind_goto, cancel_goto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
-		ret = add_unwind_exentry(ctx, i + 1 + off);
+		ret = add_goto_exentries(ctx, insn, i);
 		if (ret)
 			return ret;
 		break;
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
 		if (bpf_is_unwind_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
-			emit_unwind_exit(ctx);
+			emit_unwind_exit(ctx, bpf_unwind_fixup);
+			break;
+		}
+		/* bpf_prog_can_unwind(): the caller can be a prog. The kernel has no pad. */
+		if (bpf_is_cancel_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
+			emit_unwind_exit(ctx, bpf_cancel_fixup);
 			break;
 		}
 		/* Optimization: when last instruction is EXIT,
@@ -2928,6 +2987,11 @@ bool bpf_jit_supports_kfunc_ret_reg_pair(void)
 }
 
 bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_cancel(void)
 {
 	return true;
 }
