@@ -5,6 +5,7 @@
 #include <test_progs.h>
 #include <sys/mman.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <time.h>
 #include <sched.h>
 #include <signal.h>
@@ -18,6 +19,7 @@
 #include "test_ringbuf_map_key.lskel.h"
 #include "test_ringbuf_write.lskel.h"
 #include "test_ringbuf_overwrite.lskel.h"
+#include "test_ringbuf_overwrite_poll.skel.h"
 
 #define EDONE 7777
 
@@ -701,6 +703,85 @@ cleanup:
 	test_ringbuf_overwrite_lskel__destroy(skel);
 }
 
+struct overwrite_poll_ctx {
+	int prog_fd;
+	volatile bool stop;
+};
+
+static void *overwrite_poll_producer(void *arg)
+{
+	struct overwrite_poll_ctx *ctx = arg;
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+	while (!ctx->stop) {
+		if (bpf_prog_test_run_opts(ctx->prog_fd, &opts))
+			break;
+	}
+	return NULL;
+}
+
+/*
+ * poll() has to report the ring buffer as readable whenever the consumer is
+ * behind the producer. Check that while every new record overwrites all the
+ * records in the ring buffer.
+ */
+static void ringbuf_overwrite_poll_subtest(void)
+{
+	struct pollfd pfd = { .events = POLLIN };
+	struct test_ringbuf_overwrite_poll *skel;
+	struct overwrite_poll_ctx ctx = {};
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+	__u64 end, polls = 0, empty = 0;
+	pthread_t thread;
+	int err;
+
+	skel = test_ringbuf_overwrite_poll__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		return;
+
+	bpf_map__set_max_entries(skel->maps.ringbuf, getpagesize());
+	skel->rodata->rec_size = getpagesize() / 2;
+
+	err = test_ringbuf_overwrite_poll__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto cleanup;
+
+	pfd.fd = bpf_map__fd(skel->maps.ringbuf);
+	ctx.prog_fd = bpf_program__fd(skel->progs.produce);
+
+	ASSERT_EQ(poll(&pfd, 1, 0), 0, "poll_empty");
+
+	/* Nothing is consumed, so the consumer is behind after the first record. */
+	err = bpf_prog_test_run_opts(ctx.prog_fd, &opts);
+	if (!ASSERT_OK(err, "produce") || !ASSERT_OK(opts.retval, "produce_retval"))
+		goto cleanup;
+	ASSERT_EQ(skel->bss->reserve_failed, 0, "reserve_failed");
+	ASSERT_EQ(poll(&pfd, 1, 0), 1, "poll_readable");
+
+	err = pthread_create(&thread, NULL, overwrite_poll_producer, &ctx);
+	if (!ASSERT_OK(err, "pthread_create"))
+		goto cleanup;
+
+	end = get_time_ns() + 500000000ULL;
+	while (get_time_ns() < end) {
+		if (poll(&pfd, 1, 0) != 1)
+			empty++;
+		polls++;
+	}
+
+	ctx.stop = true;
+	pthread_join(thread, NULL);
+
+	ASSERT_GT(polls, 0, "polls");
+	ASSERT_EQ(empty, 0, "polls_that_found_the_ring_empty");
+	ASSERT_EQ(skel->bss->reserve_failed, 0, "reserve_failed_overwriting");
+	if (env.verbosity > VERBOSE_NONE)
+		printf("%llu polls, %llu found the ring empty\n", polls, empty);
+
+cleanup:
+	test_ringbuf_overwrite_poll__destroy(skel);
+}
+
 void test_ringbuf(void)
 {
 	if (test__start_subtest("ringbuf"))
@@ -717,4 +798,6 @@ void test_ringbuf(void)
 		ringbuf_overwrite_callback_subtest();
 	if (test__start_subtest("ringbuf_overwrite_mode"))
 		ringbuf_overwrite_mode_subtest();
+	if (test__start_subtest("ringbuf_overwrite_poll"))
+		ringbuf_overwrite_poll_subtest();
 }
