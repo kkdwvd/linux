@@ -103,8 +103,9 @@ void test_unwind_attach(void)
 	/* unwind_exit would return to the trampoline */
 	attach(tgt_fd, "global_unwinds", "fexit_unwind",
 	       "Only fentry can attach to global_unwinds", 0);
-	attach(tgt_fd, "global_unwinds", "freplace_returns", NULL, 9);
 	/* Nothing unwinds from an extension into the prog that it extends */
+	attach(tgt_fd, "global_unwinds", "freplace_returns",
+	       "Only fentry can attach to global_unwinds", 0);
 	attach(plain_fd, "global_never_unwinds", "freplace_unwinds",
 	       "unwind_exit in the main program of an extension", 0);
 	ASSERT_EQ(run(tgt_fd), 15, "retval");

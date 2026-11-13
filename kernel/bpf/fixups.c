@@ -651,7 +651,8 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
  * The main pass looked at more ways to unwind than the program has in the end: a loop that has a
  * trip count after all has no may_goto. Find the subprogs that get unwind_exit: those that are
  * left at a site. A call is a site if it calls one of them. The main pass asks the same when a
- * global subprog unwinds, see settle_late_unwinds().
+ * global subprog unwinds, see settle_late_unwinds(). The main program leaves with exit: it is
+ * marked for bpf_check_attach_target(), see bpf_insert_sites().
  */
 void bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 {
@@ -665,7 +666,7 @@ void bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 		changed = false;
 		for (s = 0; s < env->subprog_cnt; s++) {
 			sub = &env->subprog_info[s];
-			if (sub->can_unwind || !sub->bail_unwinds)
+			if (sub->can_unwind || (s && !sub->bail_unwinds))
 				continue;
 			for (i = sub->start; i < sub[1].start && !sub->can_unwind; i++) {
 				sub->can_unwind = aux[i].loop_guard ||
@@ -898,6 +899,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		goto out;
 	}
 	bpf_mark_subprogs_that_unwind(env);
+	env->prog->aux->can_unwind = env->subprog_info[0].can_unwind;
 	for (s = 0; s < env->subprog_cnt && !err; s++) {
 		sub = &env->subprog_info[s];
 		cnt = collect_pads(env, s, new, pad_aux, &pads);

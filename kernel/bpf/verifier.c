@@ -25208,10 +25208,12 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 				prog_extension ? "Extension" : "Tracing");
 			return -EINVAL;
 		}
-		/* unwind_exit of the main prog is exit */
-		tgt_can_unwind = subprog && aux->func && aux->func[subprog]->aux->can_unwind;
-		/* unwind_exit would return to the trampoline that called the target */
-		if (tgt_can_unwind && !prog_extension &&
+		tgt_can_unwind = aux->func ? aux->func[subprog]->aux->can_unwind : aux->can_unwind;
+		/*
+		 * unwind_exit would return to the trampoline that called the target. The main
+		 * prog leaves with exit. An extension never takes the place of what can unwind.
+		 */
+		if (tgt_can_unwind && (subprog || prog_extension) &&
 		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
 			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
 			return -EINVAL;
