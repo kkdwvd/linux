@@ -1551,11 +1551,11 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+--------+-------------+-----------+-----------+----------+
- * |   31-27   | 26-23  |      22     |     21    |   20-16   |   15-0   |
- * |           |        |             |           |           |          |
- * | FIXUP_REG | Unused | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
- * +-----------+--------+-------------+-----------+-----------+----------+
+ * +-----------+--------+--------------+-------------+-----------+-----------+----------+
+ * |   31-27   | 26-24  |      23      |      22     |     21    |   20-16   |   15-0   |
+ * |           |        |              |             |           |           |          |
+ * | FIXUP_REG | Unused | ARENA_CANCEL | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
+ * +-----------+--------+--------------+-------------+-----------+-----------+----------+
  *
  * - OFFSET (16 bits): Offset used to compute address for Load/Store instruction.
  * - ARENA_REG (5 bits): Register that is used to calculate the address for load/store when
@@ -1566,14 +1566,30 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  *                        memory and reads the old value into a register.
  * - FIXUP_REG (5 bits): Destination register for the load instruction (cleared on fault) or set to
  *                       DONT_CLEAR if the instruction does not read into a register.
+ * - ARENA_CANCEL (1 bit): cancel_goto is behind the access. A fault does not resume behind the
+ *                         faulting instruction but at the pad that cancel_goto names, with no
+ *                         register cleared. The pad is in an entry of its own, see
+ *                         ARENA_CANCEL_EX_KEY.
  */
 
 #define BPF_FIXUP_OFFSET_MASK      GENMASK(15, 0)
 #define BPF_FIXUP_ARENA_REG_MASK   GENMASK(20, 16)
 #define BPF_ARENA_ACCESS           BIT(21)
 #define BPF_ARENA_WRITE            BIT(22)
+#define BPF_ARENA_CANCEL           BIT(23)
 #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
 #define DONT_CLEAR 5 /* Unused ARM64 register from BPF's POV */
+
+/*
+ * 'access; cancel_goto pad': the pad of an access of arena is in an extable entry
+ *   { .insn = resume - 1, .fixup = pad - resume }
+ * where resume is the address behind the instruction of the access that faults, at which
+ * a fault goes on when there is no cancel_goto. resume - 1 is inside that instruction: no
+ * instruction starts there, so no fault hits the entry, and the instruction is not a call,
+ * so it is not the entry of an unwind_goto or of the cancel_goto of a call either, see
+ * add_pad_exentry().
+ */
+#define ARENA_CANCEL_EX_KEY	1
 
 bool ex_handler_bpf(const struct exception_table_entry *ex,
 		    struct pt_regs *regs)
@@ -1583,11 +1599,25 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 	int arena_reg = FIELD_GET(BPF_FIXUP_ARENA_REG_MASK, ex->fixup);
 	bool is_arena = !!(ex->fixup & BPF_ARENA_ACCESS);
 	bool is_write = !!(ex->fixup & BPF_ARENA_WRITE);
+	const struct exception_table_entry *pad;
 	unsigned long addr;
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
 		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+	}
+
+	if (ex->fixup & BPF_ARENA_CANCEL) {
+		pad = search_bpf_extables(regs->pc + AARCH64_INSN_SIZE - ARENA_CANCEL_EX_KEY);
+		/*
+		 * The frame is cancelled. Its pad reads the registers that were live in front
+		 * of the access: the instructions of the access in front of the one that
+		 * faults change the temporary registers of the JIT only.
+		 */
+		if (!WARN_ON_ONCE(!pad)) {
+			regs->pc += AARCH64_INSN_SIZE + pad->fixup;
+			return true;
+		}
 	}
 
 	if (dst_reg != DONT_CLEAR)
@@ -1681,6 +1711,10 @@ static int add_exception_handler(const struct bpf_insn *insn,
 
 		ex->fixup |=  FIELD_PREP(BPF_FIXUP_OFFSET_MASK, off) |
 			      FIELD_PREP(BPF_FIXUP_ARENA_REG_MASK, arena_reg);
+
+		/* access; cancel_goto: the entry of the pad comes next, see add_goto_exentries() */
+		if (insn + 1 < ctx->prog->insnsi + ctx->prog->len && bpf_is_cancel_goto(insn + 1))
+			ex->fixup |= BPF_ARENA_CANCEL;
 	}
 
 	ex->type = EX_TYPE_BPF;
@@ -1700,13 +1734,16 @@ static int add_exception_handler(const struct bpf_insn *insn,
  * 'bl foo; mov x8, x0' is in front of unwind_goto and cancel_goto. The pad doesn't
  * miss the mov: r0 is x8 and the epilogue of the callee copies it to x0 and leaves
  * x8 as it is.
+ *
+ * cancel_goto behind an access of arena has an entry of the same form, see
+ * ARENA_CANCEL_EX_KEY. @ret_addr is the instruction behind the access then, where a
+ * fault would go on.
  */
 #define UNWIND_EX_KEY	1
 #define CANCEL_EX_KEY	2
 
-static int add_pad_exentry(struct jit_ctx *ctx, int pad, int key)
+static int add_pad_exentry(struct jit_ctx *ctx, int ret_addr, int pad, int key)
 {
-	int ret_addr = ctx->idx - 1;
 	struct exception_table_entry *ex;
 	off_t ins_offset;
 
@@ -1741,16 +1778,26 @@ static int add_pad_exentry(struct jit_ctx *ctx, int pad, int key)
 static int add_goto_exentries(struct jit_ctx *ctx, const struct bpf_insn *insn, int i)
 {
 	const struct bpf_insn *insns = ctx->prog->insnsi, *unwind = NULL;
+	/* 'bl foo; mov x8, x0' */
+	int ret_addr = ctx->idx - 1;
 	int call = i - 1;
 	int ret, pad;
 
 	if (!bpf_is_cancel_goto(insn)) {
 		if (i + 1 < ctx->prog->len && bpf_is_cancel_goto(insn + 1))
 			return 0;
-		return add_pad_exentry(ctx, i + 1 + insn->off, UNWIND_EX_KEY);
+		return add_pad_exentry(ctx, ret_addr, i + 1 + insn->off, UNWIND_EX_KEY);
 	}
 	/* the offset of the pad of cancel_goto has 32 bits and is in imm */
 	pad = i + 1 + insn->imm;
+
+	/*
+	 * 'access; cancel_goto P'. The instruction of the access that faults was emitted
+	 * last, and its entry was added last: this one is behind it in the table, and
+	 * has the higher address.
+	 */
+	if (i && bpf_is_arena_access(&insns[i - 1]))
+		return add_pad_exentry(ctx, ctx->idx, pad, ARENA_CANCEL_EX_KEY);
 
 	if (call >= 0 && bpf_is_unwind_goto(&insns[call])) {
 		unwind = &insns[call];
@@ -1762,10 +1809,10 @@ static int add_goto_exentries(struct jit_ctx *ctx, const struct bpf_insn *insn, 
 		return -EINVAL;
 	}
 
-	ret = add_pad_exentry(ctx, pad, CANCEL_EX_KEY);
+	ret = add_pad_exentry(ctx, ret_addr, pad, CANCEL_EX_KEY);
 	if (ret || !unwind)
 		return ret;
-	return add_pad_exentry(ctx, i + unwind->off, UNWIND_EX_KEY);
+	return add_pad_exentry(ctx, ret_addr, i + unwind->off, UNWIND_EX_KEY);
 }
 
 static long bpf_unwind_fixup(u64 lr)
@@ -2993,6 +3040,11 @@ bool bpf_jit_supports_unwind(void)
 }
 
 bool bpf_jit_supports_cancel(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_arena_cancel(void)
 {
 	return true;
 }
