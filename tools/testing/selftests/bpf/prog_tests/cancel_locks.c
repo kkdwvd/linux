@@ -42,6 +42,7 @@ static const struct test tests[] = {
 	{ "spin_lock_global_at_call" },
 	{ "spin_lock_in_map_at_call" },
 	{ "spin_lock_spilled_at_call" },
+	{ "spin_lock_two_places", .two_ways = true },
 	{ "res_lock_global_at_call" },
 	{ "res_lock_in_map_at_call" },
 	{ "res_lock_one_of_two_at_call", .two_ways = true },

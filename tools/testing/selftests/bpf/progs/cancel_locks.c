@@ -295,6 +295,63 @@ __naked void spin_lock_spilled_at_call(void)
 	);
 }
 
+/*
+ * Both paths to the call have the pointer in the slot. One of them has it in r6 as well, which
+ * a visit picks first, and the other one has something else there. The pad reads the slot.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value, a register points to the value on one path only")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -16)")
+__xlated("r1 += 8")
+__xlated("call unknown")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void spin_lock_two_places(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 2f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 2f;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r6 = r0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"r6 = r10;"
+	"1:"
+		"r1 = *(u64 *)(r10 - 16);"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r1 = *(u64 *)(r10 - 16);"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		/* r6 is live at the call */
+		"r7 = r6;"
+		asm_count(behind)
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
 /* A lock that the pad left locked tells the second run so: it is not to be had */
 SEC("tc")
 __description("cancel: bpf_res_spin_lock in a global variable, held at a call")
