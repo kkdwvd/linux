@@ -1109,6 +1109,107 @@ int callee_unlocks(struct __sk_buff *ctx)
 	return TC_ACT_OK;
 }
 
+/*
+ * r1: a pointer to the element of res_locks whose lock the caller holds. It dives with the
+ * lock held as it is, or unlocks for its caller first: zero says which.
+ */
+__naked __noinline __used
+static unsigned long may_unlock_arg(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"call dives;"
+		asm_count(behind)
+		"r0 = 0;"
+		"exit;"
+	"1:"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_res_spin_unlock];"
+		"call dives;"
+		asm_count(behind)
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_unlock),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The callee got the pointer that leads to the lock in r1, and its pads tell in r2 whether it
+ * unlocked: bit 1. The pad of the call here keeps r2 in a hidden byte and unlocks through r7
+ * unless the bit is set. The runner cancels in front of the unlock of the callee and behind
+ * it: an unlock too many shows in the preempt count of the second run.
+ */
+SEC("tc")
+__description("cancel: a callee that unlocks the lock that it got a pointer to tells its caller")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("*(u32 *)(r10 -12) = r2")
+__xlated("r1 = *(u32 *)(r10 -12)")
+__xlated("if r1 & 0x2 goto pc+3")
+__xlated("r1 = r7")
+__xlated("r1 += 8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("...")
+__xlated("r0 = 1")
+__xlated("exit")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__xlated("r2 = 2")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__stderr("ERROR: Program was cancelled")
+__naked void res_lock_unlocked_by_callee(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(res_locks)
+		"if r0 == 0 goto 1f;"
+		"r7 = r0;"
+		"r1 = r7;"
+		"r1 += 8;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 2f;"
+		"r1 = r7;"
+		"call may_unlock_arg;"
+		"if r0 != 0 goto 3f;"
+		"r1 = r7;"
+		"r1 += 8;"
+		"call %[bpf_res_spin_unlock];"
+	"3:"
+		asm_count(behind)
+		"goto 1f;"
+	"2:"
+		asm_count(lock_err)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_res_spin_lock),
+		  __imm(bpf_res_spin_unlock),
+		  __imm_addr(res_locks),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
 static __noinline int restores_and_dives(unsigned long *flags)
 {
 	bpf_local_irq_restore(flags);

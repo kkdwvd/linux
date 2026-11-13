@@ -61,6 +61,7 @@ static const struct test tests[] = {
 	{ "spin_lock_in_one_visit", .two_ways = true },
 	{ "res_lock_in_one_visit", .two_ways = true },
 	{ "res_lock_irqsave_in_one_visit", .two_ways = true },
+	{ "res_lock_unlocked_by_callee", .two_ways = true },
 	{ "rcu_at_call" },
 	{ "preempt_at_call" },
 	{ "sections_max_at_call" },

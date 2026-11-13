@@ -1287,6 +1287,780 @@ __naked void only_copy_in_stack_arg(void)
 #endif
 
 /*
+ * r6: a task that the caller holds and keeps a copy of. Release the task for the caller if give
+ * says so, and return whether that was done. Dive in front of that unless late is set, and
+ * behind the release unless late is 2.
+ */
+#define MAY_RELEASE_R6				\
+		"r1 = %[late] ll;"		\
+		"r1 = *(u64 *)(r1 + 0);"	\
+		"if r1 != 0 goto 1f;"		\
+		"call dives;"			\
+		COUNT(behind)			\
+	"1:"					\
+		"r1 = %[give] ll;"		\
+		"r1 = *(u64 *)(r1 + 0);"	\
+		"if r1 == 0 goto 3f;"		\
+		"r1 = r6;"			\
+		"call %[bpf_task_release];"	\
+		"r1 = %[late] ll;"		\
+		"r1 = *(u64 *)(r1 + 0);"	\
+		"if r1 == 2 goto 2f;"		\
+		"call dives;"			\
+		COUNT(behind)			\
+	"2:"					\
+		"r0 = 1;"			\
+		"exit;"				\
+	"3:"					\
+		"r0 = 0;"			\
+		"exit;"
+
+/* r1: the task */
+__naked __noinline __used
+static unsigned long may_release_arg(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		MAY_RELEASE_R6
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(late),
+		  __imm_addr(give),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame keeps the task in r6 over the call, and releases it unless the callee says that
+ * it did. The task does not move into the callee, and the pad of the call has it in r6: that is
+ * right for a cancellation in front of the release in the callee and wrong behind it. So the
+ * pads of the callee tell in r2 what the callee released: a bit for the argument register that
+ * it got the task in, r1 here. The pad of its first call of dives() leaves 0 there and the pad
+ * of the second one 2. The pad of the call here keeps r2 in a hidden byte, since the release
+ * clobbers r2, and leaves the task alone where bit 1 is set.
+ */
+SEC("tc")
+__description("cancel refs: a task that the callee may release is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x2 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r2 = 2")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void callee_may_release(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call may_release_arg;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * r2: a task that a frame below holds. It releases the task if give says so, dives behind that
+ * unless late is set, and returns whether it released.
+ */
+__naked __noinline __used
+static unsigned long releases_second_arg(void)
+{
+	asm volatile (
+		"r6 = r2;"
+		"r1 = %[give] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r1 = %[late] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"call dives;"
+		COUNT(behind)
+	"1:"
+		"r0 = 1;"
+		"exit;"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(late),
+		  __imm_addr(give),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a task that the caller holds. It passes the task on in r2, and dives behind that call if
+ * the callee released the task and late is set. It returns what the callee returned.
+ */
+__naked __noinline __used
+static unsigned long passes_task_on(void)
+{
+	asm volatile (
+		"r2 = r1;"
+		"call releases_second_arg;"
+		"if r0 == 0 goto 2f;"
+		"r1 = %[late] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call dives;"
+		COUNT(behind)
+	"1:"
+		"r0 = 1;"
+		"exit;"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(late),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The task goes through two calls, in r1 and then in r2, and the frame at the end releases it.
+ * Each frame tells the one below by the register that it got the task in. The pad of
+ * releases_second_arg() leaves bit 2 in r2. The pad of the call in passes_task_on() makes
+ * bit 1 of that for the pad of the call here, and the pad of dives() behind that call has bit 1
+ * at once: the frame knows by then that the task is released.
+ */
+SEC("tc")
+__description("cancel refs: a task that the callee of a callee may release is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 6 padded 6 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x2 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("*(u32 *)(r10 -4) = 0")
+__xlated("r2 = r1")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r2 = 2")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r2 = 0")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x4 goto pc+1")
+__xlated("goto pc+1")
+__xlated("r2 |= 2")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__xlated("r6 = r2")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r2 = 4")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void callee_of_callee_may_release(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call passes_task_on;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+#if defined(__BPF_FEATURE_STACK_ARGUMENT)
+
+/* The sixth argument, which is on the stack: the task */
+__naked __noinline __used
+static unsigned long may_release_stack_arg(void)
+{
+	asm volatile (
+		"r6 = *(u64 *)(r11 + 8);"
+		MAY_RELEASE_R6
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(late),
+		  __imm_addr(give),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The callee gets the task in a stack argument, its sixth argument. That is the name of the
+ * task between the two: the pads of the callee tell by bit 6.
+ */
+SEC("tc")
+__description("cancel refs: a task that the callee may release from a stack argument is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x40 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r2 = 64")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void callee_may_release_stack_arg(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"*(u64 *)(r11 - 8) = r6;"
+		"call may_release_stack_arg;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/* The sixth argument, which is on the stack: a task that the caller holds. It goes on in r1. */
+__naked __noinline __used
+static unsigned long passes_stack_arg_on(void)
+{
+	asm volatile (
+		"r1 = *(u64 *)(r11 + 8);"
+		"call may_release_arg;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * The frame between gets the task in a stack argument and passes it on in r1. The pad of its
+ * call makes bit 6 of bit 1 for the pad of the call here.
+ */
+SEC("tc")
+__description("cancel refs: a task that goes on from a stack argument in a register is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 6 padded 6 declined")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x40 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("...")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r2 = 0")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x2 goto pc+1")
+__xlated("goto pc+1")
+__xlated("r2 |= 64")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void stack_arg_goes_on(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"*(u64 *)(r11 - 8) = r6;"
+		"call passes_stack_arg_on;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+#endif
+
+/*
+ * r1: a task or NULL, which the caller holds and did not test. It tests the task, releases it
+ * for its caller if there is one and give says so, and dives whichever of the three it found.
+ * It returns whether the caller is left with a task to release.
+ */
+__naked __noinline __used
+static unsigned long tests_and_may_release(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"if r1 != 0 goto 1f;"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 0;"
+		"exit;"
+	"1:"
+		"r1 = %[give] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 0;"
+		"exit;"
+	"2:"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(give),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The callee takes the task away from its caller in two ways, and the pad of the call tells
+ * them apart. Where the callee found NULL nothing was released: no bit is set, r6 has the NULL,
+ * and the test of the pad finds it, see callee_tests_task(). Where the callee released the
+ * task bit 1 is set, and the pad does not look at r6.
+ */
+SEC("tc")
+__description("cancel refs: a task that the callee tests for NULL and may release is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 6 padded 6 declined")
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x2 goto pc+3")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_tests_and_may_release(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"r6 = r0;"
+		"r1 = r0;"
+		"call tests_and_may_release;"
+		"if r0 == 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * Behind a call that returns the frame is told nothing: the paths of the program tell. Here
+ * the path on which the callee released the task and the one on which it did not meet at the
+ * call of dives(). The frame holds the task on some paths only there, and no insn of the frame
+ * clears a flag for a task that another frame released.
+ */
+SEC("?tc")
+__description("cancel refs: paths that meet behind the call of a callee that may release are rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(inexact)")
+__naked void callee_released_or_not_at_call(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call may_release_arg;"
+		"r7 = r0;"
+		"call dives;"
+		"if r7 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a task that the caller holds. It releases the task if give says so, dives whichever it
+ * did, and returns whether it released.
+ */
+__naked __noinline __used
+static unsigned long releases_or_not_and_dives(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"r2 = %[give] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"if r2 == 0 goto 1f;"
+		"call %[bpf_task_release];"
+		"r6 = 1;"
+	"1:"
+		"call dives;"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(give)
+		: __clobber_all
+	);
+}
+
+/*
+ * A pad has one mask for all the paths to its site. The paths to the call of dives() in the
+ * callee differ in whether the callee released the task of its caller.
+ */
+SEC("?tc")
+__description("cancel refs: a callee that released for its caller on one path to a call is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call: the frame has released what a caller of it holds on some paths only (foreign)")
+__naked void callee_released_on_one_path(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call releases_or_not_and_dives;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/* r1: a task that the caller holds. It releases the task and dives. */
+__naked __noinline __used
+static unsigned long releases_arg_and_dives(void)
+{
+	asm volatile (
+		"call %[bpf_task_release];"
+		"call dives;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame holds two tasks, and passes the one or the other in r1 to a callee that releases
+ * what it gets there. Bit 1 of the mask names another entry of the pad on each path.
+ */
+SEC("?tc")
+__description("cancel refs: a callee that releases one of two tasks of its caller is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call: a callee releases what it gets in an argument, and the paths to the call differ in what they pass there (foreign)")
+__naked void callee_releases_one_of_two(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 4f;"
+		"r6 = r0;"
+		TASK_FROM(pid2)
+		"if r0 == 0 goto 3f;"
+		"r7 = r0;"
+		"r8 = %[zero] ll;"
+		"r8 = *(u64 *)(r8 + 0);"
+		"r1 = r6;"
+		"if r8 == 0 goto 1f;"
+		"r1 = r7;"
+	"1:"
+		"call releases_arg_and_dives;"
+		"if r8 == 0 goto 2f;"
+		"r7 = r6;"
+	"2:"
+		"r6 = r7;"
+	"3:"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"4:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(pid2),
+		  __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a pointer to a slot of the caller that has a task. It releases the task if give says so,
+ * dives behind that, and returns whether it released.
+ */
+__naked __noinline __used
+static unsigned long may_release_from_slot(void)
+{
+	asm volatile (
+		"r2 = %[give] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"if r2 == 0 goto 1f;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"call %[bpf_task_release];"
+		"call dives;"
+		"r0 = 1;"
+		"exit;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(give)
+		: __clobber_all
+	);
+}
+
+/*
+ * The callee finds the task through a pointer to the stack of its caller. No argument register
+ * had the handle, so no bit of the mask names the task, and the pad of the call would release
+ * it again from r6.
+ */
+SEC("?tc")
+__description("cancel refs: a callee that releases a task that it got in no argument register is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call: a callee releases what the frame holds (foreign)")
+__naked void callee_releases_from_slot(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call may_release_from_slot;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/* It releases the task that its caller holds, dives, and throws */
+static __noinline __used int releases_and_throws(struct task_struct *task)
+{
+	bpf_task_release(task);
+	dives();
+	behind++;
+	bpf_throw(0);
+	return 0;
+}
+
+/*
+ * The callee never returns, so it is only ever verified on its own, without the frame of its
+ * caller. The record of the call says which register had the task, and that is all the pad of
+ * the call needs to go by what the callee tells.
+ */
+SEC("tc")
+__description("cancel refs: a task that a callee which never returns releases is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__xlated("*(u32 *)(r10 -4) = r2")
+__xlated("r1 = *(u32 *)(r10 -4)")
+__xlated("if r1 & 0x2 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_releases_and_throws(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call releases_and_throws;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/* r1: a pointer to a slot of the caller that has a task. It passes the task on in r1. */
+__naked __noinline __used
+static unsigned long passes_on_from_slot(void)
+{
+	asm volatile (
+		"r1 = *(u64 *)(r1 + 0);"
+		"call may_release_arg;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * The frame between got the task in no argument register, and has no bit to tell its caller
+ * by what the callee tells it in bit 1. Both calls are named: the one whose pad would release
+ * again, and the one whose pad cannot pass on what it is told.
+ */
+SEC("?tc")
+__description("cancel refs: a callee of a callee that releases a task which came through the stack is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call: a callee releases what the frame holds (foreign)")
+__msg("the program cannot be cancelled at this call: a callee releases what a caller of the frame holds, and the frame did not get it in an argument (foreign)")
+__naked void callee_passes_on_from_slot(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call passes_on_from_slot;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
  * One path gets to the call with the task in r6. The other one has a task there that is not
  * the frame's to release: the one that runs the prog. Only the run of the prog knows which it
  * is, so the frame gets a drop flag: a hidden byte of its stack that is 1 while the frame holds
