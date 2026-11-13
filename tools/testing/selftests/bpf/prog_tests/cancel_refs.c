@@ -65,6 +65,30 @@ static void cancelled(struct cancel_refs *skel, struct bpf_program *prog)
 	ASSERT_HAS_SUBSTR(read_stream(prog), "ERROR: Program was cancelled", what(prog, "stream"));
 }
 
+static int records;
+
+static int on_record(void *ctx, void *data, size_t size)
+{
+	records++;
+	return 0;
+}
+
+/*
+ * A record that was neither submitted nor discarded stops the consumer in front of it for
+ * good. The ring buffer of the progs has no such record and none that was submitted: it is
+ * empty, and a record that is submitted now gets to the consumer.
+ */
+static void ringbuf_is_clean(struct cancel_refs *skel, struct ring_buffer *rb, const char *name)
+{
+	records = 0;
+	ring_buffer__consume(rb);
+	ASSERT_EQ(records, 0, name);
+	ASSERT_EQ(ring__avail_data_size(ring_buffer__ring(rb, 0)), 0, name);
+	run(skel->progs.ringbuf_submit);
+	ring_buffer__consume(rb);
+	ASSERT_EQ(records, 1, name);
+}
+
 static void test_iters(struct cancel_refs *skel)
 {
 	/* bpf_iter_num and the iterator of the module leave nothing behind that could be found */
@@ -74,8 +98,43 @@ static void test_iters(struct cancel_refs *skel)
 	cancelled(skel, skel->progs.task_iter_in_rcu);
 }
 
+/* The references to the task that runs the progs, and the users of its mm */
+static void current_users(struct cancel_refs *skel, int *usage, int *mm_users)
+{
+	run(skel->progs.probe_current);
+	*usage = skel->bss->cur_usage;
+	*mm_users = skel->bss->cur_mm_users;
+}
+
+static void test_dynptrs(struct cancel_refs *skel, struct ring_buffer *rb)
+{
+	int usage, mm_users, usage_now, mm_users_now, i;
+
+	cancelled(skel, skel->progs.ringbuf_dynptr_at_call);
+	ringbuf_is_clean(skel, rb, "ringbuf_dynptr_at_call");
+	cancelled(skel, skel->progs.dynptr_clone_at_call);
+	ringbuf_is_clean(skel, rb, "dynptr_clone_at_call");
+
+	/*
+	 * bpf_iter_task_vma holds the task and its mm until it is destroyed. Nothing tells
+	 * whether the reader of the file was freed in front of that.
+	 */
+	current_users(skel, &usage, &mm_users);
+	cancelled(skel, skel->progs.file_dynptr_in_vma_loop);
+	/* anything may hold the task for a moment. What a pad did not release stays. */
+	for (i = 0; i < 100; i++) {
+		current_users(skel, &usage_now, &mm_users_now);
+		if (usage_now == usage && mm_users_now == mm_users)
+			break;
+		usleep(10000);
+	}
+	ASSERT_EQ(usage_now, usage, "file_dynptr_in_vma_loop task");
+	ASSERT_EQ(mm_users_now, mm_users, "file_dynptr_in_vma_loop mm");
+}
+
 void serial_test_cancel_refs(void)
 {
+	struct ring_buffer *rb = NULL;
 	struct cancel_refs *skel;
 
 	/* The interpreter runs no pads. */
@@ -93,8 +152,15 @@ void serial_test_cancel_refs(void)
 	skel = cancel_refs__open_and_load();
 	if (!ASSERT_OK_PTR(skel, "cancel_refs__open_and_load"))
 		return;
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.ringbuf), on_record, NULL, NULL);
+	if (!ASSERT_OK_PTR(rb, "ring_buffer__new"))
+		goto out;
 
 	if (test__start_subtest("iterators"))
 		test_iters(skel);
+	if (test__start_subtest("dynptrs"))
+		test_dynptrs(skel, rb);
+out:
+	ring_buffer__free(rb);
 	cancel_refs__destroy(skel);
 }
