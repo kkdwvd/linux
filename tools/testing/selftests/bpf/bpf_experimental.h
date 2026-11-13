@@ -26,19 +26,19 @@ extern void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it) __ksym;
 /* Description
  *	Throw a BPF exception from the program, immediately terminating its
  *	execution and unwinding the stack. The supplied 'cookie' parameter
- *	will be the return value of the program when an exception is thrown,
- *	and the default exception callback is used. Otherwise, if an exception
- *	callback is set using the '__exception_cb(callback)' declaration tag
- *	on the main program, the 'cookie' parameter will be the callback's only
- *	input argument.
+ *	will be the return value of the program when an exception is thrown.
+ *	Otherwise, if an exception callback is set using the
+ *	'__exception_cb(callback)' declaration tag on the main program, the
+ *	'cookie' parameter will be the callback's only input argument.
  *
- *	Thus, in case of default exception callback, 'cookie' is subjected to
+ *	Thus, without an exception callback, 'cookie' is subjected to
  *	constraints on the program's return value (as with R0 on exit).
  *	Otherwise, the return value of the marked exception callback will be
  *	subjected to the same checks.
  *
- *	Note that throwing an exception with lingering resources (locks,
- *	references, etc.) will lead to a verification error.
+ *	Each frame releases the resources that it holds (locks, references,
+ *	etc.) on the way, in a landing pad that the verifier emits. If it
+ *	cannot tell what a frame holds there is a verification error.
  *
  *	Note that callbacks *cannot* call this helper.
  * Returns

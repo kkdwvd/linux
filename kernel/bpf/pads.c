@@ -9,6 +9,7 @@
  *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
  *   - a call of a helper whose callback comes back that way
  *   - a load, a store or an atomic insn in arena, when it faults
+ *   - a call of bpf_throw(). No call is made: the insn becomes a jump to the pad.
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
  * then the value in r0 and unwind_exit, or exit in a frame that the kernel called.
@@ -179,8 +180,14 @@
  * after a call passes on what unwind_exit of the callee left in R0. Its own calls clobber R0, so
  * the value waits in a hidden word of the frame, below the stack of the function. A pad without a
  * call has none.
+ * The pad of bpf_throw() starts with the argument, in R1. The pads of the main program hand the
+ * value to the exception callback if there is one, and return what that returns.
  *
- *						      pad: *(u64 *)(r10 - 8) = r0
+ *	t = bpf_task_from_pid(pid);			   ...
+ *	if (bad)					   r1 = 7
+ *		bpf_throw(7);				   gotol pad
+ *	bpf_task_release(t);				   ...
+ *						      pad: *(u64 *)(r10 - 8) = r1
  *							   r1 = r6
  *							   call bpf_task_release
  *							   r0 = *(u64 *)(r10 - 8)
@@ -1743,10 +1750,14 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
 	int value_off = env->subprog_info[subprog].value_off;
+	int src = bpf_site_value_reg(plan->kind), dst = BPF_REG_0;
 	int class, i, n = 0;
 
+	/* the main program hands the value to the exception callback */
+	if (!subprog && env->exception_callback_subprog)
+		dst = BPF_REG_1;
 	if (plan_saves_value(env, plan))
-		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, value_off);
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, src, value_off);
 	n += release_ents(env, plan, PAD_TURN_RCU_ITERS, &buf[n], &aux[n]);
 	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
@@ -1754,9 +1765,11 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
 	if (plan_saves_value(env, plan))
-		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_FP, value_off);
+		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);
 	else if (!bpf_site_has_value(env, plan->kind))
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env));
+		buf[n++] = BPF_MOV64_IMM(dst, bpf_unwound_retval(env));
+	else if (src != dst)
+		buf[n++] = BPF_MOV64_REG(dst, src);
 	if (bpf_ret_reg_pair(env, subprog))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	return n;
@@ -2244,6 +2257,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_SITE_RECURSION]		= "recursion check",
 		[BPF_SITE_CALL]			= "call",
 		[BPF_SITE_FAULT]		= "arena access",
+		[BPF_SITE_THROW]		= "bpf_throw",
 	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",

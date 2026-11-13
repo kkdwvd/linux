@@ -1906,6 +1906,7 @@ struct bpf_prog_aux {
 	u32 id;
 	u32 func_cnt; /* used by non-func prog as the number of func progs */
 	u32 real_func_cnt; /* includes hidden progs, only used for JIT and freeing progs */
+	u32 exception_callback_subprog; /* index in func[], 0 if there is none */
 	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
 	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
 	u32 attach_st_ops_member_off;

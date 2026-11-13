@@ -111,9 +111,9 @@ void test_unwind_attach(void)
 	ASSERT_EQ(run(tgt_fd), 15, "retval");
 
 	/*
-	 * An exception callback returns from the frame of the main prog. Here
-	 * that's a return to a call that unwind_goto follows. unwind_exit of
-	 * the callback has to be exit: the pad wasn't verified with it.
+	 * The pad of the main prog calls the exception callback and leaves with
+	 * exit. unwind_exit of the callback gets to that exit like its exit
+	 * does: nothing unwinds into the prog that is extended.
 	 */
 	shared_fd = bpf_program__fd(tgt->progs.shared_pad);
 	attach(shared_fd, "global_never_unwinds", "freplace_throws", NULL, 3);

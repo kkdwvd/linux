@@ -1087,6 +1087,9 @@ int calls_hold_other_things(struct __sk_buff *skb)
  * a recursive function is verified on its own, also with an argument that can be NULL. When its
  * check of the stack fails it is unwound, and the landing pad of the caller drops the object: it
  * returns only with a pointer that it has tested.
+ * bpf_throw() unwinds through the callers as well. On the path with NULL the function still has
+ * the reference of its caller, who tests the pointer: it stays on its own.
+ * The progs call kfuncs and are unwound, which takes a JIT: without one they are not loaded.
  */
 static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 {

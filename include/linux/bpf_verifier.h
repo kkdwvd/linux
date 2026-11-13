@@ -465,6 +465,7 @@ enum bpf_site_kind {
 	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
 	BPF_SITE_CALL,		/* unwind_goto that the verifier adds after the insn, a call */
 	BPF_SITE_FAULT,		/* the same after an access to arena, for when it faults */
+	BPF_SITE_THROW,		/* the insn is a call of bpf_throw() */
 };
 
 /* The classes of resources that a landing pad can release */
@@ -505,13 +506,13 @@ enum bpf_pad_conflict {
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
  * per argument of a release two to load it, per entry a test, the calls, one to save the value,
- * three to leave.
+ * four to leave.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
-				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 4)
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 5)
 #define BPF_PAD_MAX_CANDS	6
 /*
  * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
@@ -1393,7 +1394,7 @@ struct bpf_subprog_info {
 	 */
 	s16 fastcall_stack_off;
 	bool has_tail_call: 1;
-	bool might_throw: 1;
+	bool might_throw: 1; /* it calls bpf_throw(), or what it calls does, see may_not_return() */
 	bool can_unwind: 1; /* has unwind_exit. Subprog 0: has a site, only freplace asks */
 	bool recursive: 1; /* on a cycle of the call graph */
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
@@ -1404,6 +1405,7 @@ struct bpf_subprog_info {
 	bool is_cb: 1;
 	bool is_async_cb: 1;
 	bool is_exception_cb: 1;
+	bool in_exception_cb: 1; /* it is the exception callback, or that may get to it */
 	/* bpf_loop() or bpf_for_each_map_elem() call it in a loop */
 	bool is_loop_cb: 1;
 	/* another helper or a kfunc calls it */
@@ -1676,7 +1678,6 @@ struct bpf_verifier_env {
 	bool seen_direct_write;
 	/* a register may point to the stack and is not PTR_TO_STACK, see bpf_reg_state::buf */
 	bool seen_stack_slice;
-	bool seen_exception;
 	bool sleepable_async_cb;
 	u32 id_gen;			/* used to generate unique reg IDs */
 	u32 max_stack_depth;		/* maximum combined stack depth */
@@ -1694,7 +1695,6 @@ struct bpf_verifier_env {
 	u32 used_map_cnt;		/* number of used maps */
 	u32 used_btf_cnt;		/* number of used BTF objects */
 	u32 insn_array_map_cnt;		/* number of used maps of type BPF_MAP_TYPE_INSN_ARRAY */
-	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	int exception_callback_subprog;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -2164,7 +2164,13 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
  */
 static inline bool bpf_site_has_value(const struct bpf_verifier_env *env, enum bpf_site_kind kind)
 {
-	return env->has_throw && kind == BPF_SITE_CALL;
+	return env->has_throw && (kind == BPF_SITE_CALL || kind == BPF_SITE_THROW);
+}
+
+/* The register that has it: what unwind_exit left in R0, the argument of bpf_throw() */
+static inline int bpf_site_value_reg(enum bpf_site_kind kind)
+{
+	return kind == BPF_SITE_THROW ? BPF_REG_1 : BPF_REG_0;
 }
 
 struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind);
@@ -2807,7 +2813,6 @@ static inline void bpf_free_kfunc_tab(struct bpf_kfunc_desc_tab *tab)
 }
 
 /* Functions exported from verifier.c, used by fixups.c */
-void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog);
 bool bpf_allow_tail_call_in_subprogs(struct bpf_verifier_env *env);
 bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm);
 int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);

@@ -71,7 +71,8 @@ static int compute_hops(struct bpf_verifier_env *env)
 				 * The function is left there, see check_loop_guard(),
 				 * check_recursion_guard() and unwind_frame().
 				 */
-				if ((aux->guard_place || (sub[s].cycle && n == sub[s].start)) &&
+				if ((aux->guard_place || (sub[s].cycle && n == sub[s].start) ||
+				     bpf_is_throw_kfunc(&env->prog->insnsi[n])) &&
 				    sub[s].exit_idx != U32_MAX)
 					changed |= shorter(&prec->hops_to_exit[n], 0);
 				if (!bpf_calls_function(env, n))

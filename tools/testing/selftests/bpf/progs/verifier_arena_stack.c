@@ -501,38 +501,7 @@ __naked void kfunc_stack_args(void)
 	: __clobber_all);
 }
 
-/*
- * bpf_throw() finds the registers that the main program saved from its stack pointer at the
- * call. x86 moves rsp for a kfunc that has stack arguments. bpf_throw() is not one of them.
- */
-SEC("syscall")
-__description("arena stack: no move of the stack pointer in front of bpf_throw()")
-__success
-__arch_x86_64
-__jited("	movq	%r9, {{.*}}(%rbp)")
-__jited("	callq	{{.*}}")
-__naked void throw_stack_args_jit(void)
-{
-	asm volatile (
-	".8byte %[adj];"
-	"r1 = 1;"
-	"r2 = 2;"
-	"r3 = 3;"
-	"r4 = 4;"
-	"r5 = 5;"
-	"*(u64 *)(r11 - 16) = 7;"
-	"*(u64 *)(r11 - 8) = 6;"
-	"call callee_7args;"
-	"r1 = r0;"
-	"call %[bpf_throw];"
-	"exit;"
-	:
-	: __imm(bpf_throw),
-	  __imm_insn(adj, ADJ(16))
-	: __clobber_all);
-}
-
-/* The caller of the program goes on with the registers that the exception callback restores */
+/* The landing pad leaves through the epilogue of the program, like any exit */
 SEC("syscall")
 __description("arena stack: the main program has stack arguments and throws")
 __success __retval(675)

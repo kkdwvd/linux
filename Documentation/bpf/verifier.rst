@@ -920,8 +920,9 @@ A recursion in frames is not joined. It has to end in ``MAX_CALL_FRAMES``.
 
 An async callback, for example of a timer, runs later. It starts as a new state
 with an empty stack. ``callx`` is checked as a call of each function that the
-register can hold. ``bpf_throw()`` ends the program from any frame, so nothing
-can be held there.
+register can hold. ``bpf_throw()`` unwinds the program from any frame, like
+``may_goto`` of the verifier: each frame is left through a landing pad that
+releases what the frame holds.
 
 After an error
 ==============
@@ -1274,10 +1275,10 @@ A speculative state is joined only with speculative states, and it subsumes
 only speculative states.
 
 A landing pad has no barrier, and no speculative state is verified on the way
-to one. So a program gets landing pads, and can have ``unwind_exit`` and
-``unwind_goto``, only with ``CAP_PERFMON``. Without it no function can unwind:
-a loop that needs ``may_goto`` of the verifier and a recursion are conflicts,
-and ``may_goto`` of the program jumps.
+to one. So a program gets landing pads, and can have ``unwind_exit``,
+``unwind_goto`` and ``bpf_throw()``, only with ``CAP_PERFMON``. Without it no
+function can unwind: a loop that needs ``may_goto`` of the verifier and a
+recursion are conflicts, and ``may_goto`` of the program jumps.
 
 Some mechanisms depend on a capability. The last line is there because the cpu
 can go past the jump that a proof needs:

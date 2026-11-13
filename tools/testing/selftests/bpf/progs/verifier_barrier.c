@@ -311,16 +311,14 @@ static __naked __noinline __used int throw_if_zero(void)
 	"exit;");
 }
 
-/* The code after the first call is dead. The load must not replace it. */
+/*
+ * The code after the first call is dead. bpf_throw() unwinds through the landing pad of the call,
+ * and a prog that is loaded without CAP_PERFMON gets none.
+ */
 SEC("tc")
-__description("barrier: after a call that never returns")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r1 = 0")
-__xlated_unpriv("call pc+")
-__xlated_unpriv("nospec")
-__xlated_unpriv("goto pc-2")
-#endif
+__description("bpf_throw() needs CAP_PERFMON")
+__success SPECULATES __failure_unpriv
+__msg_unpriv("CAP_PERFMON is required to unwind")
 __naked void never_returns(void)
 {
 	ASM(START

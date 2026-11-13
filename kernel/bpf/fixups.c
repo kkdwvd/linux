@@ -415,9 +415,7 @@ static bool patch_list_subprog_gone(const struct bpf_subprog_info *info, u32 cnt
 }
 
 /*
- * Remove the subprogs whose insns are all removed, with their func_info. The
- * passes that remove insns run before the hidden subprog, which has no
- * func_info, is added.
+ * Remove the subprogs whose insns are all removed, with their func_info.
  */
 static void patch_list_del_subprogs(struct bpf_verifier_env *env,
 				    const u32 *new_off)
@@ -608,14 +606,27 @@ static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
  * The landing pad of a site in subprog @s. The only exit of a pad is its last insn. Nothing in a
  * pad is hardened against a cpu that mispredicts: only a program that is loaded with CAP_PERFMON
  * gets one, see frame_cannot_unwind().
- * Returns the number of insns, BPF_PAD_MAX_INSNS + 1 at most.
+ * The main program returns what the exception callback makes of the value. The pad has no index
+ * yet: bpf_insert_sites() sets the offset of the call. The callback is not called a second time:
+ * its unwind_exit gets to the exit of the pad like its exit does. unwind_goto says so, to
+ * bpf_unwind_target(): a return address in a program without an entry is a lost unwind_exit.
+ * Only a callback that can leave with unwind_exit gets it, and such a program needs a JIT that
+ * knows both insns already. A pad of any other program is plain BPF: the interpreter and the other
+ * JITs run it. bpf_mark_subprogs_that_unwind() ran, so it is known which callback that is.
+ * Returns the number of insns, BPF_PAD_MAX_INSNS + 2 at most.
  */
 static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_plan *plan,
 		    struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
+	int cb = env->exception_callback_subprog;
 	int n = 0;
 
 	n += bpf_pad_insns(env, plan, s, buf + n, aux + n);
+	if (!s && cb) {
+		buf[n++] = BPF_CALL_REL(0);
+		if (bpf_subprog_unwinds(&env->subprog_info[cb]))
+			buf[n++] = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
+	}
 	buf[n++] = unwind_exit_insn(env, s);
 	return n;
 }
@@ -634,6 +645,8 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 		return env->insn_aux_data[i].loop_guard;
 	case BPF_SITE_RECURSION:
 		return bpf_find_containing_subprog(env, i)->recursive;
+	case BPF_SITE_THROW:
+		return true;
 	case BPF_SITE_CALL:
 		if (!plan->visited)
 			return false;
@@ -863,9 +876,9 @@ static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf
 
 /*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
- * marked, see check_loop_guard(), unwind_goto after calls and after accesses to arena, the landing
- * pads, and the stores to the hidden slots that the pads read. What a pad does it did to the states
- * that left the frame at the site, see unwind_frame().
+ * marked, see check_loop_guard(), unwind_goto after calls and after accesses to arena, a jump in
+ * place of a call of bpf_throw(), the landing pads, and the stores to the hidden slots that the pads
+ * read. What a pad does it did to the states that left the frame at the site, see unwind_frame().
  *
  *	may_goto pad
  *	insn
@@ -891,9 +904,9 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 
 	/* how many insns the pads after the subprog have */
 	added = kvzalloc_objs(int, env->subprog_cnt, BPF_VERIFIER_GFP);
-	new = kvzalloc_objs(*new, max(BPF_PAD_MAX_INSNS + 1, BPF_PAD_MAX_SLOT_INSNS),
+	new = kvzalloc_objs(*new, max(BPF_PAD_MAX_INSNS + 2, BPF_PAD_MAX_SLOT_INSNS),
 			    BPF_VERIFIER_GFP);
-	pad_aux = kvzalloc_objs(*pad_aux, BPF_PAD_MAX_INSNS + 1, BPF_VERIFIER_GFP);
+	pad_aux = kvzalloc_objs(*pad_aux, BPF_PAD_MAX_INSNS + 2, BPF_VERIFIER_GFP);
 	if (!added || !new || !pad_aux) {
 		err = -ENOMEM;
 		goto out;
@@ -947,8 +960,17 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 				emit_pad(env, s, plan, new, &aux[cnt]);
 				if (plan->kind == BPF_SITE_FAULT && aux[i].fault_unwinds)
 					sub->fault_pad = cnt;
+				/* no call is made, see check_kfunc_call() */
+				if (plan->kind == BPF_SITE_THROW)
+					env->prog->insnsi[i] = BPF_RAW_INSN(BPF_JMP32 | BPF_JA, 0, 0, 0,
+									    cnt - i - 1);
 			}
 		}
+		/* the only calls of a subprog in pads, see emit_pad() */
+		for (insn = &env->prog->insnsi[i]; added[s] && i < sub[1].start; i++, insn++)
+			if (bpf_pseudo_call(insn))
+				insn->imm = env->subprog_info[env->exception_callback_subprog].start -
+					    i - 1;
 	}
 	err = insert_slot_stores(env, new, added);
 	err = err ?: insert_unwind_gotos(env, added);
@@ -1248,7 +1270,6 @@ void bpf_lower_cast_mov(struct bpf_verifier_env *env)
  *  - the main program takes a stack when it starts and returns it when it exits:
  *    the stack of the cpu when it's free, without a call.
  *    See struct bpf_arena_cpu_stack. So does a callback.
- *    bpf_throw() doesn't return it: the stack stays taken until the arena is freed.
  *  - a function that has a frame drops it before exit.
  *  - 'rX = r12' gives the address like user space sees it, as other addresses
  *    in arena are.
@@ -2101,14 +2122,11 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		}
 		func[i]->aux->num_exentries = num_exentries;
 		func[i]->aux->tail_call_reachable = env->subprog_info[i].tail_call_reachable;
-		func[i]->aux->exception_cb = env->subprog_info[i].is_exception_cb;
 		func[i]->aux->changes_pkt_data = env->subprog_info[i].changes_pkt_data;
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
 		func[i]->aux->token = prog->aux->token;
-		if (!i)
-			func[i]->aux->exception_boundary = env->seen_exception;
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -2139,7 +2157,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		 * the imm field of a call has the subprog id, an index for this list
 		 */
 		func[i]->aux->func = func;
-		func[i]->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
+		func[i]->aux->func_cnt = env->subprog_cnt;
 		func[i]->aux->real_func_cnt = env->subprog_cnt;
 	}
 	for (i = 0; i < env->subprog_cnt; i++) {
@@ -2197,11 +2215,9 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->num_exentries = func[0]->aux->num_exentries;
 	prog->aux->fault_pad = func[0]->aux->fault_pad;
 	prog->aux->func = func;
-	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
+	prog->aux->func_cnt = env->subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;
-	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
-	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
-	prog->aux->stack_arg_sp_adjust = func[0]->aux->stack_arg_sp_adjust;
+	prog->aux->exception_callback_subprog = env->exception_callback_subprog;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
@@ -2390,31 +2406,6 @@ int bpf_fixup_call_args(struct bpf_verifier_env *env)
 	err = 0;
 #endif
 	return err;
-}
-
-static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *patch, int len)
-{
-	struct bpf_subprog_info *info = env->subprog_info;
-	int err, cnt = env->subprog_cnt;
-	struct bpf_prog *prog;
-
-	/* We only reserve one slot for hidden subprogs in subprog_info. */
-	if (env->hidden_subprog_cnt) {
-		verifier_bug(env, "only one hidden subprog supported");
-		return -EFAULT;
-	}
-	err = bpf_patch_list_append(env, env->prog->len - 1, patch, len) ?:
-	      bpf_patch_list_commit(env);
-	if (err)
-		return err;
-	prog = env->prog;
-	info[cnt + 1].start = info[cnt].start;
-	info[cnt].start = prog->len - len;
-	/* The patch ends with the exit. */
-	info[cnt].exit_idx = prog->len - 1;
-	env->subprog_cnt++;
-	env->hidden_subprog_cnt++;
-	return 0;
 }
 
 /*
@@ -2659,22 +2650,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	/* arch_bpf_timed_may_goto() takes and returns AX in a cpu register: for JITs only */
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
-
-	if (env->seen_exception && !env->exception_callback_subprog) {
-		struct bpf_insn *patch = insn_buf;
-
-		*patch++ = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);
-		*patch++ = BPF_EXIT_INSN();
-		ret = add_hidden_subprog(env, insn_buf, patch - insn_buf);
-		if (ret < 0)
-			return ret;
-		prog = env->prog;
-		insn = prog->insnsi;
-
-		env->exception_callback_subprog = env->subprog_cnt - 1;
-		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
-		bpf_mark_subprog_exc_cb(env, env->exception_callback_subprog);
-	}
 
 	for (i = 0; i < insn_cnt;) {
 		if (is_addr_space_cast32(env->prog, insn)) {
