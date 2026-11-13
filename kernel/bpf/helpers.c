@@ -5284,9 +5284,17 @@ static const struct btf_kfunc_id_set user_mem_kfunc_set = {
 BTF_ID_LIST(generic_dtor_ids)
 BTF_ID(struct, task_struct)
 BTF_ID(func, bpf_task_release_dtor)
+BTF_ID(func, bpf_task_release)
 #ifdef CONFIG_CGROUPS
 BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release_dtor)
+BTF_ID(func, bpf_cgroup_release)
+#endif
+
+#ifdef CONFIG_KEYS
+BTF_ID_LIST(bpf_key_release_ids)
+BTF_ID(struct, bpf_key)
+BTF_ID(func, bpf_key_put)
 #endif
 
 BTF_KFUNCS_START(common_btf_ids)
@@ -5396,13 +5404,22 @@ static int __init kfunc_init(void)
 	int ret;
 	const struct btf_id_dtor_kfunc generic_dtors[] = {
 		{
-			.btf_id       = generic_dtor_ids[0],
-			.kfunc_btf_id = generic_dtor_ids[1]
+			.btf_id         = generic_dtor_ids[0],
+			.kfunc_btf_id   = generic_dtor_ids[1],
+			.release_btf_id = generic_dtor_ids[2],
 		},
 #ifdef CONFIG_CGROUPS
 		{
-			.btf_id       = generic_dtor_ids[2],
-			.kfunc_btf_id = generic_dtor_ids[3]
+			.btf_id         = generic_dtor_ids[3],
+			.kfunc_btf_id   = generic_dtor_ids[4],
+			.release_btf_id = generic_dtor_ids[5],
+		},
+#endif
+#ifdef CONFIG_KEYS
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id         = bpf_key_release_ids[0],
+			.release_btf_id = bpf_key_release_ids[1],
 		},
 #endif
 	};
