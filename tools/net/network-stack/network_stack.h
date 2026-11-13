@@ -52,6 +52,7 @@ struct ns_thread {
 	__u64 suspend_ns;		/* when they were, or softirq's count was restarted */
 	__u64 last_work_ns;		/* end of the last scan that found packets */
 	__u64 last_rest_ns;		/* end of the last park */
+	__u64 last_plain_ns;		/* end of the last pass of plain polls, see refresh_ns */
 	__u64 pass_work;		/* packets and sockets the current pass found */
 	__u64 mark_ns;			/* the last clock reading of the current pass, see scan() */
 	__u32 tx_inline;		/* with --irq --tx: no interrupt came within tx_wait_ns */
@@ -68,6 +69,7 @@ struct ns_thread {
 	__u64 xmits;			/* sockets whose xmit work it did */
 	__u64 xmit_ns;			/* time in polls of xmit queues that found work */
 	__u64 tx_quiets;		/* parks that tx_wait_ns ended, see tx_mode() */
+	__u64 refreshes;		/* masked passes cut short to complete the NAPIs */
 } __attribute__((aligned(64)));
 
 /* One NAPI of the device. The loader sets id; the thread polling it the rest. */

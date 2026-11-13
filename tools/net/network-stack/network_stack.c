@@ -113,6 +113,7 @@ static struct {
 	const char *thread_cgroup;
 	const char *tx;
 	__u64 hold_us, spin_us, nap_us, rest_us;
+	__u64 refresh_us;
 	__u64 softirq_pps;
 	__u64 tx_wait_us;
 	int tx_share;
@@ -128,6 +129,7 @@ static struct {
 	.hold_us = 2000,
 	.nap_us = 50,
 	.rest_us = 4000,
+	.refresh_us = 0,
 	.tx_wait_us = 100,
 	.tx_share = 100,
 	.tick_ms = 100,
@@ -1450,6 +1452,8 @@ static void usage(void)
 "  --hold-us N            keep interrupts masked this long after the last packet (default 2000)\n"
 "  --spin-us N            of that, spin this long before napping (default 0)\n"
 "  --nap-us N             length of a nap with interrupts masked (default 50)\n"
+"  --refresh-us N         complete the NAPIs once every N us while masked, so the driver\n"
+"                         updates the device's consumer indices (default 0: never)\n"
 "  --softirq-pps N        a parked thread leaves its NAPIs to softirq and takes one back\n"
 "                         when it receives more than N packets/s (default 0: never)\n"
 "\n"
@@ -1464,6 +1468,7 @@ enum {
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
 	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_TX_WAIT_US, OPT_TX_SHARE, OPT_SOFTIRQ_PPS,
+	OPT_REFRESH_US,
 };
 
 static const struct option longopts[] = {
@@ -1487,6 +1492,7 @@ static const struct option longopts[] = {
 	{ "hold-us", required_argument, NULL, OPT_HOLD_US },
 	{ "spin-us", required_argument, NULL, OPT_SPIN_US },
 	{ "nap-us", required_argument, NULL, OPT_NAP_US },
+	{ "refresh-us", required_argument, NULL, OPT_REFRESH_US },
 	{ "softirq-pps", required_argument, NULL, OPT_SOFTIRQ_PPS },
 	{ "interval-ms", required_argument, NULL, OPT_INTERVAL_MS },
 	{ "duration", required_argument, NULL, OPT_DURATION },
@@ -1531,6 +1537,7 @@ int main(int argc, char **argv)
 		case OPT_HOLD_US: opt.hold_us = strtoull(optarg, NULL, 0); break;
 		case OPT_SPIN_US: opt.spin_us = strtoull(optarg, NULL, 0); break;
 		case OPT_NAP_US: opt.nap_us = strtoull(optarg, NULL, 0); break;
+		case OPT_REFRESH_US: opt.refresh_us = strtoull(optarg, NULL, 0); break;
 		case OPT_SOFTIRQ_PPS: opt.softirq_pps = strtoull(optarg, NULL, 0); break;
 		case OPT_INTERVAL_MS: opt.interval_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_DURATION: opt.duration_s = strtoull(optarg, NULL, 0); break;
@@ -1563,6 +1570,7 @@ int main(int argc, char **argv)
 	skel->bss->spin_ns = opt.spin_us * 1000;
 	skel->bss->nap_ns = opt.nap_us * 1000;
 	skel->bss->rest_ns = opt.rest_us * 1000;
+	skel->bss->refresh_ns = opt.refresh_us * 1000;
 	/* The time NS_SOFTIRQ_WAKE packets take at the rate that is still softirq's. */
 	if (opt.softirq_pps)
 		skel->bss->softirq_ns = NS_SOFTIRQ_WAKE * 1000000000ULL / opt.softirq_pps;
