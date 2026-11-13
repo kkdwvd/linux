@@ -8,6 +8,7 @@
 #include <bpf_arena_common.h>
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
+#include "arena_skipped.h"
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARENA);
@@ -298,6 +299,7 @@ int uaf(const void *ctx)
 	uaf_r0_after_src_r0 = 1;
 	uaf_reread = 1;
 
+	skip_faults();
 	page32 = (__u32 __arena *)page;
 	uaf_sink += __sync_fetch_and_add(page32, 1);
 	uaf_recovery_fails -= 1;
@@ -417,6 +419,7 @@ int uaf(const void *ctx)
 	: : [page]"r"(page64),
 	    __imm_addr(uaf_reread)
 	: "r1", "r2", "r3", "memory");
+	unwind_faults();
 #endif
 
 	return 0;

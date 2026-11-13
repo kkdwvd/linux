@@ -241,6 +241,12 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 			  env->insn_aux_data[bpf_frame_insn_idx(dst, j.fr)].live_regs_before);
 	bpf_equations_post_join(env, dst, src);
 	dst->max_held_cnt = max(dst->max_held_cnt, src->max_held_cnt);
+	/*
+	 * See check_arena_site(). @dst describes more than it did, and a state that is within it
+	 * is dropped: the callers never saw their frames as that state has them.
+	 */
+	dst->frame[dst->curframe]->fault_edge &= src->frame[src->curframe]->fault_edge &&
+						 !dst->curframe;
 	/* no equation is found over a limit */
 	if (env->test_reg_invariants && !bpf_state_subsumes(env, dst, src) &&
 	    verifier_bug_if(!bpf_check_limits(env), env, "join at %d", dst->insn_idx))

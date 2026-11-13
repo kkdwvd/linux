@@ -457,6 +457,7 @@ enum bpf_site_kind {
 	BPF_SITE_GUARD,		/* may_goto that the verifier adds before the insn */
 	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
 	BPF_SITE_CALL,		/* unwind_goto that the verifier adds after the insn, a call */
+	BPF_SITE_FAULT,		/* the same after an access to arena, for when it faults */
 };
 
 /* The classes of resources that a landing pad can release */
@@ -481,6 +482,7 @@ enum bpf_pad_conflict {
 	BPF_NO_CONFLICT,
 	BPF_CONFLICT_SECTIONS_DIFFER,
 	BPF_CONFLICT_TOO_MUCH,
+	BPF_CONFLICT_SLOTS_FULL,	/* the hidden slots of the function are more than a pad has */
 	BPF_CONFLICT_NO_RELEASE,
 	BPF_CONFLICT_NOT_ALWAYS_HELD,
 	BPF_CONFLICT_NO_PLACE,
@@ -687,6 +689,11 @@ struct bpf_func_state {
 	u32 frame_id;
 	);
 	bool no_stack_arg_load;
+	/*
+	 * A copy of the state left the frame at an access to arena, and since then the frame made
+	 * no call and no store to the stack of a caller, see check_arena_site()
+	 */
+	bool fault_edge;
 	/*
 	 * Unique diagnostic identity for this function invocation. Frame depth is
 	 * reused after returns, while this ID is preserved across state clones.
@@ -1192,12 +1199,16 @@ struct bpf_insn_aux_data {
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
 	/* a subprog returned here with no pointer to release and R0 may be not 0 */
 	u64 call_brings_nothing:1;
+	/* An access to arena, see check_arena_site() */
+	u64 fault_skips:1; /* when it faults it is skipped: there is no pad, or no way to unwind */
+	u64 fault_empty:1; /* in this pass a state that holds nothing went by without a visit */
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
 	u32 non_speculative_first:1; /* speculative states end here, their fixups did not fit */
 	u32 acquires:1; /* a reference or a lock */
 	u32 releases:1;
+	u32 fault_full:1; /* an access to arena: all states visit the plan, see check_arena_site() */
 
 	/* below flags are initialized once */
 	u32 bb_end:1; /* last instruction of a basic block */
@@ -1416,11 +1427,19 @@ struct bpf_subprog_info {
 	 * adds it. Not after the call of a helper that has no pad, see subprog_cannot_unwind().
 	 */
 	bool bail_unwinds: 1;
+	/* bail_unwinds before a pass found out more, see check_funcs() */
+	bool bail_unwinds_at_first: 1;
 	/*
 	 * It has unwind_exit, or a state left it that way in this pass, or that is expected of
 	 * it, see mark_unwind_above(). For a global subprog one pass gives it to the next pass.
 	 */
 	bool did_unwind: 1;
+	/*
+	 * It did so where there is no other way out: at may_goto, at a recursion check, at
+	 * unwind_exit that it has, at a call of such a subprog. An access to arena that faults
+	 * has one: it is skipped. See bpf_pads_must_unwind().
+	 */
+	bool must_unwind: 1;
 	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
 	bool unwinds_for_sure: 1;
 	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
@@ -1607,6 +1626,7 @@ struct bpf_verifier_env {
 	bool replay;			/* the good pass, once more for the driver */
 	bool path_sensitive;		/* no joins, see run_path_sensitive() */
 	bool for_log;			/* the verdict is known, see do_check_all() */
+	bool pass_again;		/* the pass is done again, see pass_needs_restart() */
 	bool fallthrough_first;		/* see find_failing_path() */
 	bool run_has_guess;		/* see run_path_sensitive() */
 	u32 failing_path_budget_shift;	/* see func_failing_path_budget() */
@@ -1632,6 +1652,7 @@ struct bpf_verifier_env {
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_needs_guard() */
 	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
+	bool faults_late;		/* a site is not what it seemed: see check_arena_site() */
 	bool pad_releases;		/* see release_frame_resources() */
 	bool calls_joined;		/* see flow_may_add_instance() */
 	bool extra_values;		/* a state can have constants that no run has */
@@ -2138,9 +2159,11 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
+bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
+void bpf_pads_must_unwind(struct bpf_verifier_env *env);
 void bpf_pads_mark_used(struct bpf_verifier_env *env);
 int bpf_pads_settle(struct bpf_verifier_env *env);
-bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
+bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_data *aux);
 void bpf_pads_note_causes(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 int bpf_hidden_slots_fit(struct bpf_verifier_env *env);

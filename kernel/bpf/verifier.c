@@ -223,6 +223,7 @@ static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_st
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static bool in_rcu_callback(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 
 static void bpf_map_ptr_store(struct bpf_insn_aux_data *aux,
 			      struct bpf_map *map,
@@ -3395,12 +3396,17 @@ static bool is_indirect_call(const struct bpf_insn *insn)
 static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	bool did_unwind = sub->did_unwind && sub->bail_unwinds;
 
-	if (sub->did_unwind) {
+	if (did_unwind)
+		bpf_pads_must_unwind(env);
+	if (did_unwind && sub->must_unwind) {
 		verbose(env, "callback cannot unwind at insn %d: %s() does\n",
 			env->insn_idx, bpf_subprog_name(env, subprog));
 		return -EINVAL;
 	}
+	/* It did at accesses to arena only. They are skipped, and the pass is done again. */
+	env->faults_late |= did_unwind;
 	sub->bail_unwinds = false;
 	return 0;
 }
@@ -4394,6 +4400,8 @@ static int check_stack_write(struct bpf_verifier_env *env,
 	int max_off = reg_smax(reg) + off + size;
 	int err;
 
+	if (state != cur_func(env))
+		cur_func(env)->fault_edge = false;
 	if (tnum_is_const(reg->var_off)) {
 		off += reg->var_off.value;
 		err = check_stack_write_fixed_off(env, state, off, size,
@@ -6125,7 +6133,15 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
 				      (cg.marks[s] & CALLED));
-		si[s].did_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
+		si[s].bail_unwinds_at_first = si[s].bail_unwinds;
+		si[s].must_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
+		/*
+		 * The callers of a global subprog are verified ahead of it, see unwind_frame().
+		 * Where there is an arena expect it to unwind, that saves a pass.
+		 */
+		si[s].did_unwind = si[s].can_unwind ||
+				   (env->prog->aux->arena && si[s].bail_unwinds &&
+				    bpf_subprog_is_global(env, s));
 	}
 
 	for (s = 0; s < cnt; s++) {
@@ -7776,6 +7792,10 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	src_reg_type = regs[insn->src_reg].type;
+	err = check_arena_site(env, &regs[insn->src_reg]);
+	if (err)
+		return err;
+
 	/* A flexible array has no end, see btf_struct_access(). A far load from it can fault. */
 	if (base_type(src_reg_type) == PTR_TO_BTF_ID && offset_is_far(&regs[insn->src_reg])) {
 		if (BPF_CLASS(insn->code) != BPF_LDX) {
@@ -7846,6 +7866,9 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	dst_reg_type = regs[insn->dst_reg].type;
+	err = check_arena_site(env, &regs[insn->dst_reg]);
+	if (err)
+		return err;
 
 	/* Check if (dst_reg + off) is writeable. */
 	err = check_mem_access(env, env->insn_idx, regs + insn->dst_reg,
@@ -7904,6 +7927,11 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 			reg_type_str(env, reg_state(env, insn->dst_reg)->type));
 		return -EACCES;
 	}
+
+	/* load_reg may be dst_reg. Look at dst_reg before it's marked as unknown. */
+	err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+	if (err)
+		return err;
 
 	load_reg = bpf_atomic_load_reg(insn);
 	if (load_reg >= 0) {
@@ -21025,6 +21053,11 @@ static int check_arena_sp_insn(struct bpf_verifier_env *env, struct bpf_insn *in
 		return err;
 	}
 
+	/* An access to the stack in arena is probed like any arena access. */
+	err = check_arena_site(env, &arena);
+	if (err)
+		return err;
+
 	if (is_arena_sp_ldx(insn)) {
 		err = check_reg_arg(env, insn->dst_reg, DST_OP_NO_MARK);
 		if (err)
@@ -21090,6 +21123,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			return err;
 
 		dst_reg_type = cur_regs(env)[insn->dst_reg].type;
+		err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+		if (err)
+			return err;
 
 		err = check_mem_access(env, env->insn_idx, cur_regs(env) + insn->dst_reg,
 				       argno_from_reg(insn->dst_reg),
@@ -21105,6 +21141,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 		u8 opcode = BPF_OP(insn->code);
 
 		if (opcode == BPF_CALL) {
+			cur_func(env)->fault_edge = false;
 			if (env->cur_state->active_locks) {
 				/* similar to static subprog calls callx is allowed under a lock */
 				if (!bpf_is_callx(insn) &&
@@ -21816,6 +21853,79 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 	return err;
 }
 
+/* Is all that the current frame of @st holds a pointer, which is NULL where nothing is held? */
+static bool frame_holds_pointers_only(const struct bpf_verifier_state *st)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int i;
+
+	for (i = frame->entry_refs; i < st->acquired_refs; i++)
+		if (st->refs[i].type != REF_TYPE_PTR)
+			return false;
+	return st->active_rcu_locks == frame->entry_rcu_locks &&
+	       st->active_preempt_locks == frame->entry_preempt_locks;
+}
+
+/*
+ * An access through an arena pointer, @reg, faults when the page is not mapped. Then the program
+ * is unwound. The site is the access itself, with the state before it takes effect, since the
+ * fault precedes any write of its result.
+ *
+ * This site has another way out, which costs nothing: the access is skipped, a load reads 0. It
+ * is taken where the frame cannot unwind and where no pad serves all states: a conflict here does
+ * not reject the program. There are many of them. The normal path pays nothing, the main pass little:
+ *
+ *   The frame holds nothing, in all states that get here: there is no plan and no visit.
+ *
+ *   It holds something: each state visits the plan, as it is. If states went by without a visit
+ *   the plan does not know what is NULL where nothing is held, see visit_refs(). All is done again,
+ *   and then all states visit. Unless what is held is no pointer: no test tells.
+ *
+ *   A copy of the state leaves the frame, see unwind_frame(), once per stretch of insns
+ *   without a call and without a store to the stack of a caller. They alone change what gets to the
+ *   caller: what the frame holds is dropped, R0 is set. See 'fault_edge', and bpf_states_join().
+ */
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	struct bpf_insn_aux_data *aux = cur_aux(env);
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_func_state *frame = cur_func(env);
+	struct bpf_pad_plan *plan;
+	bool visits;
+
+	/* frame_cannot_unwind() does not ask the JIT about a frame that the kernel called */
+	if (reg->type != PTR_TO_ARENA || aux->fault_skips ||
+	    !bpf_jit_supports_unwind())
+		return 0;
+	visits = frame_holds_resources(st) || aux->fault_full || bpf_pad_plan(aux, BPF_SITE_FAULT);
+	if (!visits) {
+		aux->fault_empty = true;
+		if (frame->fault_edge)
+			return 0;
+	}
+	if (frame_cannot_unwind(env, st)) {
+		aux->fault_skips = true;
+		return 0;
+	}
+	if (visits) {
+		if (aux->fault_empty && !aux->fault_full) {
+			if (!frame_holds_pointers_only(st)) {
+				aux->fault_skips = true;
+				return 0;
+			}
+			aux->fault_full = true;
+			env->faults_late = true;
+		}
+		plan = bpf_pad_visit(env, st, env->insn_idx, BPF_SITE_FAULT);
+		if (IS_ERR(plan))
+			return PTR_ERR(plan);
+		if (plan->conflict || frame->fault_edge)
+			return 0;
+	}
+	frame->fault_edge = true;
+	return push_unwind_edge(env, BPF_SITE_FAULT);
+}
+
 /*
  * Irq flags or an iterator, @id, are released. A caller may have the object: its slots are none any
  * more.
@@ -21918,7 +22028,9 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
  *
  * With a conflict there is no pad: the site is an unproven insn in @st, which ends here. The pass
  * goes on, and a pass that keeps more apart may have no such state.
- * A frame that cannot unwind is a conflict.
+ * A frame that cannot unwind is a conflict. At an access to arena check_arena_site() saw to both.
+ * At a call that has only such accesses below it a conflict is no error: @st is dropped, and
+ * bpf_pads_settle() has the accesses skipped.
  * Nor is it one at a site that the program may not have in the end, see site_is_certain(): @st is
  * dropped, the plan keeps the conflict, and bpf_pads_settle() makes it an error of the pass if the
  * site is still there.
@@ -21929,32 +22041,34 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
 	struct bpf_verifier_state *cur = env->cur_state;
-	int cur_idx = env->insn_idx, err;
-	struct bpf_pad_plan *plan;
-	bool print_state, certain;
+	int cur_idx = env->insn_idx, err = 0;
+	struct bpf_pad_plan *plan = NULL;
+	bool print_state, certain = false;
 	u32 cnt;
 
 	env->cur_state = st;
 	env->insn_idx = insn_idx;
-	/* its suspects are those of a conflict that only bpf_pads_settle() finds */
-	env->insn_aux_data[insn_idx].suspect_loops |= st->suspect_loops;
-	plan = bpf_pad_visit(env, st, insn_idx, kind);
-	err = PTR_ERR_OR_ZERO(plan);
-	if (err)
-		goto out;
-	/* there is no other way out */
-	if (!plan->conflict)
-		plan->conflict = frame_cannot_unwind(env, st);
-	certain = site_is_certain(env, plan, insn_idx);
-	if (plan->conflict && certain) {
-		bpf_pad_log(env, insn_idx, plan);
-		/* for bpf_pads_note_causes() */
-		plan->failed = true;
-		err = -EINVAL;
-		goto unproven;
+	if (kind != BPF_SITE_FAULT) {
+		/* its suspects are those of a conflict that only bpf_pads_settle() finds */
+		env->insn_aux_data[insn_idx].suspect_loops |= st->suspect_loops;
+		plan = bpf_pad_visit(env, st, insn_idx, kind);
+		err = PTR_ERR_OR_ZERO(plan);
+		if (err)
+			goto out;
+		if (!plan->conflict)
+			plan->conflict = frame_cannot_unwind(env, st);
+		certain = site_is_certain(env, plan, insn_idx);
+		/* there is no other way out */
+		if (plan->conflict && bpf_pad_must_unwind(env, plan) && certain) {
+			bpf_pad_log(env, insn_idx, plan);
+			/* for bpf_pads_note_causes() */
+			plan->failed = true;
+			err = -EINVAL;
+			goto unproven;
+		}
+		if (plan->conflict)
+			goto out;
 	}
-	if (plan->conflict)
-		goto out;
 
 	err = release_frame_resources(env);
 	if (err)
@@ -21978,7 +22092,8 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		env->pads_late = true;
 	}
 	sub->did_unwind |= st->unwound;
-	sub->unwinds_for_sure |= st->unwound && certain;
+	sub->must_unwind |= st->unwound && plan && bpf_pad_must_unwind(env, plan);
+	sub->unwinds_for_sure |= st->unwound && plan && bpf_pad_must_unwind(env, plan) && certain;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
@@ -22518,7 +22633,7 @@ process_bpf_exit:
 static bool pass_needs_restart(struct bpf_verifier_env *env)
 {
 	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late ||
-	       env->pads_late;
+	       env->pads_late || env->faults_late;
 }
 
 /*
@@ -24157,10 +24272,26 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 	u32 level = env->log.level;
 	int i, ret;
 
-	/* see settle_late_unwinds() */
-	for (i = 1; i < env->subprog_cnt; i++)
+	for (i = 1; i < env->subprog_cnt; i++) {
+		/* see settle_late_unwinds() */
 		if (bpf_subprog_is_global(env, i))
 			initial->subprogs[i].did_unwind |= env->subprog_info[i].did_unwind;
+		/*
+		 * The accesses to arena in it are skipped and the pass is done again, see
+		 * subprog_cannot_unwind() and skip_faults(). The second run has to know from its
+		 * start that the subprog cannot unwind, or it finds out late once more.
+		 * No other run knows: like all else about a subprog that is what one pass finds. A
+		 * pass that keeps more apart, and a path-sensitive run, may not get to the call
+		 * that has no landing pad for the subprog, or may have no conflict at its
+		 * caller. Then the subprog is left where it has to unwind, and it can.
+		 */
+		if (!env->pass_again)
+			initial->subprogs[i].bail_unwinds =
+				initial->subprogs[i].bail_unwinds_at_first;
+		else if (env->faults_late)
+			initial->subprogs[i].bail_unwinds &= env->subprog_info[i].bail_unwinds;
+	}
+	env->pass_again = false;
 	restore_snapshot(env, initial);
 	kvfree(env->callx_edges);
 	kvfree(env->callx_index.slots);
@@ -24194,7 +24325,11 @@ static int check_pass(struct bpf_verifier_env *env, struct bpf_snapshot *initial
 	 * stack of a function: the plans are settled before the stack is checked.
 	 */
 	mark_used_sites(env, initial);
-	ret = bpf_pads_settle(env) ?: check_after_pass(env);
+	ret = bpf_pads_settle(env);
+	/* accesses to arena are skipped after all, see skip_faults() */
+	if (!ret && pass_needs_restart(env))
+		return 0;
+	ret = ret ?: check_after_pass(env);
 	if (ret) {
 		bpf_find_unproven_after_pass(env);
 		bpf_pads_note_causes(env);
@@ -24394,8 +24529,10 @@ static int do_check_all(struct bpf_verifier_env *env)
 			bpf_restore_precision(env);
 		} else if (!ret) {
 			bpf_flow_drop_guards(env);
-			if (pass_needs_restart(env))
+			if (pass_needs_restart(env)) {
+				env->pass_again = true;
 				continue;
+			}
 			if (env->for_log && (!offload || replay))
 				break;
 			max_cost = good_pass ? max_cost : env->max_cost;

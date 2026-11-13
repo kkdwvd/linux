@@ -9,6 +9,7 @@
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
 #include <bpf_arena_common.h>
+#include "arena_skipped.h"
 
 #define private(name) SEC(".bss." #name) __hidden __attribute__((aligned(8)))
 
@@ -80,7 +81,7 @@ int basic_alloc1(void *ctx)
 	bpf_arena_free_pages(&arena, (void __arena *)page2, 1);
 	if (*page1 != 1)
 		return 6;
-	if (*page2 != 0) /* use-after-free should return 0 */
+	if (skipped(*page2) != 0) /* use-after-free should return 0 */
 		return 7;
 	page3 = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
 	if (!page3)
@@ -136,24 +137,24 @@ int basic_alloc2_nosleep(void *ctx)
 	page4 = page1 - __PAGE_SIZE;
 	*page1 = 1;
 	*page2 = 2;
-	*page3 = 3;
-	*page4 = 4;
+	skipped(*page3 = 3);
+	skipped(*page4 = 4);
 	if (*page1 != 1)
 		return 1;
 	if (*page2 != 2)
 		return 2;
-	if (*page3 != 0)
+	if (skipped(*page3) != 0)
 		return 3;
-	if (*page4 != 0)
+	if (skipped(*page4) != 0)
 		return 4;
 	bpf_arena_free_pages(&arena, (void __arena *)page1, 2);
-	if (*page1 != 0 && *page1 != 1)
+	if (skipped(*page1) != 0 && skipped(*page1) != 1)
 		return 5;
-	if (*page2 != 0 && *page2 != 2)
+	if (skipped(*page2) != 0 && skipped(*page2) != 2)
 		return 6;
-	if (*page3 != 0)
+	if (skipped(*page3) != 0)
 		return 7;
-	if (*page4 != 0)
+	if (skipped(*page4) != 0)
 		return 8;
 	return 0;
 }
@@ -173,24 +174,24 @@ int basic_alloc2(void *ctx)
 	page4 = page1 - __PAGE_SIZE;
 	*page1 = 1;
 	*page2 = 2;
-	*page3 = 3;
-	*page4 = 4;
+	skipped(*page3 = 3);
+	skipped(*page4 = 4);
 	if (*page1 != 1)
 		return 1;
 	if (*page2 != 2)
 		return 2;
-	if (*page3 != 0)
+	if (skipped(*page3) != 0)
 		return 3;
-	if (*page4 != 0)
+	if (skipped(*page4) != 0)
 		return 4;
 	bpf_arena_free_pages(&arena, (void __arena *)page1, 2);
-	if (*page1 != 0)
+	if (skipped(*page1) != 0)
 		return 5;
-	if (*page2 != 0)
+	if (skipped(*page2) != 0)
 		return 6;
-	if (*page3 != 0)
+	if (skipped(*page3) != 0)
 		return 7;
-	if (*page4 != 0)
+	if (skipped(*page4) != 0)
 		return 8;
 	return 0;
 }

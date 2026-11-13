@@ -711,7 +711,7 @@ void bpf_find_unproven_after_pass(struct bpf_verifier_env *env)
 	for (i = 0; i < env->subprog_cnt; i++)
 		note_unproven_after_pass(env, env->subprog_info[i].deepest_insn);
 	for (i = 0; i < env->prog->len; i++, insn++, aux++) {
-		if (aux->pessimized || bpf_pads_conflict(aux)) {
+		if (aux->pessimized || bpf_pads_conflict(env, aux)) {
 			note_unproven_after_pass(env, i);
 		} else if (aux->seen && (bpf_calls_function(env, i) || is_stack_arg_st(insn) ||
 					 is_stack_arg_stx(insn))) {
