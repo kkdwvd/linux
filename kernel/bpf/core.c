@@ -3990,6 +3990,7 @@ u64 bpf_prog_report_recursion(void)
 u64 bpf_prog_report_cancel(void)
 {
 #ifdef CONFIG_BPF_SYSCALL
+	const struct bpf_struct_ops *st_ops;
 	struct bpf_stream_stage ss;
 	struct bpf_prog *prog;
 
@@ -4003,6 +4004,13 @@ u64 bpf_prog_report_cancel(void)
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
 		bpf_stream_printk(ss, "ERROR: Program was cancelled\n");
 	}));
+	/*
+	 * What the 0 of an operator means is up to the struct_ops. This is the context of the
+	 * program, with the locks of the caller of the operator: see what ->cancel() may do.
+	 */
+	st_ops = prog->aux->st_ops;
+	if (st_ops && st_ops->cancel)
+		st_ops->cancel(prog);
 #endif
 	return 0;
 }

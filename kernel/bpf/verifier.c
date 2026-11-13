@@ -20239,20 +20239,25 @@ static bool program_returns_void(struct bpf_verifier_env *env)
  *	sk_skb, sk_msg, sk_lookup, sk_reuseport	0, SK_DROP
  *	sock_ops				0, the reply is not used
  *	kprobe, tracepoint, perf_event		0, perf doesn't get the event
- *	struct_ops				0, NULL for a pointer
+ *	struct_ops				0, NULL for a pointer. See ->cancel()
  *	tracing, raw_tp, syscall, lirc		0, as from a program that did nothing
  *
  * Where one value is accepted there is no choice: 1 for getsockname, getpeername and recvmsg of
  * sock_addr and for cgroup lsm on a void hook, which cannot refuse.
  * An extension is verified as a program of the type that it extends, and returns its value.
  *
- * False: no value is known to be right, the program cannot be cancelled.
+ * False: no value is known to be right, or the struct_ops would not be told. The program cannot
+ * be cancelled.
  */
 bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *val)
 {
 	struct bpf_retval_range range;
 
 	*val = 0;
+	/* ->cancel() is for the programs of a struct_ops. An extension is not one of them */
+	if (env->prog->type == BPF_PROG_TYPE_EXT &&
+	    resolve_prog_type(env->prog) == BPF_PROG_TYPE_STRUCT_OPS)
+		return false;
 	if (program_returns_void(env))
 		return true;
 
@@ -23621,6 +23626,14 @@ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 
 	prog->aux->st_ops = st_ops;
 	prog->aux->attach_st_ops_member_off = member_off;
+	/*
+	 * ->cancel() is called for as long as the prog runs. An async callback of it can run
+	 * when no struct_ops map holds the module any more.
+	 */
+	if (st_ops->cancel && env->attach_btf_mod) {
+		__module_get(env->attach_btf_mod);
+		prog->aux->mod = env->attach_btf_mod;
+	}
 
 	prog->aux->attach_func_proto = func_proto;
 	prog->aux->attach_func_name = mname;
