@@ -6327,8 +6327,9 @@ static void free_call_graph(struct bpf_verifier_env *env)
 
 /*
  * What holds for the calls of the program whatever the size of a frame is. The graph stays
- * for check_max_stack_depth(). Until then no call of a subprog and no subprog is added or
- * removed: the pads that are added in between call the kernel only.
+ * for check_max_stack_depth(). Until then a frame may take hidden slots that count for the
+ * limits, see bpf_reserve_zeroed_stack(), but no call of a subprog and no subprog is added
+ * or removed: the pads that are added in between call the kernel only.
  */
 static int check_call_graph(struct bpf_verifier_env *env)
 {
@@ -6372,6 +6373,8 @@ static int check_call_graph(struct bpf_verifier_env *env)
 		return ret;
 	}
 	mark_arena_stack_entries(env, cg);
+	/* for bpf_stack_depth_fits(): check_max_stack_depth() looks at the frames again */
+	set_priv_stack_modes(env, cg);
 	return 0;
 }
 
@@ -6383,6 +6386,44 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	ret = check_call_depth(env, env->call_graph);
 	free_call_graph(env);
 	return ret;
+}
+
+/*
+ * Whether check_max_stack_depth() passes when the frame of @subprog has @depth bytes and all
+ * else is as it is now. The frames in the private stack are those that set_priv_stack_modes()
+ * found last. A frame that has grown enough to move there since is held against the kernel
+ * stack, which is the stricter of the two.
+ */
+bool bpf_stack_depth_fits(struct bpf_verifier_env *env, int subprog, u32 depth)
+{
+	u32 log_level = env->log.level, max_depth = env->max_stack_depth;
+	struct bpf_subprog_info *si = env->subprog_info;
+	int cnt = env->subprog_cnt, s, err;
+	u16 *depths;
+
+	if (verifier_bug_if(!env->call_graph, env, "no call graph to hold a frame against"))
+		return false;
+	depths = kvmalloc_array(cnt, sizeof(*depths), GFP_KERNEL_ACCOUNT);
+	if (!depths)
+		return false;
+	for (s = 0; s < cnt; s++)
+		depths[s] = si[s].stack_depth;
+	si[subprog].stack_depth = depth;
+
+	/*
+	 * Not a word: the caller does without the bytes. What check_call_depth() leaves behind
+	 * and is not put back below doesn't depend on the size of a frame.
+	 */
+	env->log.level = 0;
+	err = check_call_depth(env, env->call_graph);
+	env->log.level = log_level;
+
+	/* pad_recursive_frames() changed them too */
+	for (s = 0; s < cnt; s++)
+		si[s].stack_depth = depths[s];
+	env->max_stack_depth = max_depth;
+	kvfree(depths);
+	return !err;
 }
 
 static int __check_buffer_access(struct bpf_verifier_env *env,
@@ -25795,6 +25836,11 @@ skip_full_check:
 	if (ret == 0)
 		ret = check_call_graph(env);
 
+	/*
+	 * Hidden slots that count for the limits go in here, see bpf_reserve_zeroed_stack().
+	 * A pad may need one, and a site gets a pad or declines for good when the pads are
+	 * found: so that is done here, where it is known whether a frame has the room.
+	 */
 	if (ret == 0)
 		ret = bpf_cancel_resolve(env);
 

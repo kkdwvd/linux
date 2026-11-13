@@ -1922,6 +1922,8 @@ static int cancel_assign_pad(struct bpf_verifier_env *env, struct cancel_site *s
 /*
  * The main pass is over and no insn has moved yet. Find the subprogs that can be cancelled,
  * and what becomes of each site: it gets a pad, it declines, or no cancellation gets there.
+ * The frames are as large as the program makes them, and may still take hidden slots that
+ * count for the limits of the stack, see bpf_reserve_zeroed_stack().
  */
 int bpf_cancel_resolve(struct bpf_verifier_env *env)
 {

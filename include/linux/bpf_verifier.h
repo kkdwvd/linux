@@ -1060,7 +1060,15 @@ struct bpf_subprog_info {
 	u32 exit_idx;
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
 	u16 stack_depth; /* max. stack depth used by this function */
+	/*
+	 * Hidden stack slots, see reserve_stack_slots(). stack_extra is what they
+	 * add to stack_depth. The zeroed_stack_size bytes from -zeroed_stack_off
+	 * up are zero when the function is entered.
+	 */
 	u16 stack_extra;
+	u16 zeroed_stack_off;
+	u16 zeroed_stack_size;
+	s16 may_goto_off; /* hidden slot that the may_goto of this function share, 0: none */
 	u16 arena_stack_depth; /* size of the frame in the stack in arena */
 	u32 insns_total;
 	u32 insns_self;
@@ -2234,6 +2242,7 @@ struct bpf_kfunc_desc_tab {
 /* Functions exported from verifier.c, used by fixups.c */
 void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog);
 bool bpf_allow_tail_call_in_subprogs(struct bpf_verifier_env *env);
+bool bpf_stack_depth_fits(struct bpf_verifier_env *env, int subprog, u32 depth);
 bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm);
 int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);
 int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
@@ -2299,6 +2308,13 @@ static inline void bpf_patch_list_free(struct bpf_verifier_env *env)
 int bpf_patch_list_del(struct bpf_verifier_env *env, u32 off);
 int bpf_patch_list_insert(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt);
+
+/*
+ * Hidden stack that is zero when the subprog is entered, see fixups.c. Only between
+ * check_call_graph() and check_max_stack_depth().
+ */
+bool bpf_zeroed_stack_fits(struct bpf_verifier_env *env, int subprog, u32 size);
+int bpf_reserve_zeroed_stack(struct bpf_verifier_env *env, int subprog, u32 size, s16 *off);
 
 int bpf_flip_opcode(u32 opcode);
 u8 bpf_rev_opcode(u8 opcode);
