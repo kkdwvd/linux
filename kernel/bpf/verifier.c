@@ -915,7 +915,7 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	 * pad would release the reference through this one, see cancel_collect_dynptr().
 	 */
 	if (dynptr_type_referenced(slot->spilled_ptr.dynptr.type))
-		bpf_cancel_foreign_release(env, state->frameno);
+		bpf_cancel_foreign_release(env, state->frameno, -1);
 
 	/* Invalidate the dynptr and any derived slices */
 	err = release_reference(env, slot->spilled_ptr.id);
@@ -1658,7 +1658,7 @@ static void release_context_state(struct bpf_verifier_env *env)
 		frame = state->frame[fr];
 		if (frame->entry_rcu_locks > state->active_rcu_locks ||
 		    frame->entry_preempt_locks > state->active_preempt_locks) {
-			bpf_cancel_foreign_release(env, fr - 1);
+			bpf_cancel_foreign_release(env, fr - 1, -1);
 			break;
 		}
 	}
@@ -1705,7 +1705,7 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
-			bpf_cancel_foreign_release(env, state->refs[i].frameno);
+			bpf_cancel_foreign_release(env, state->refs[i].frameno, i);
 			bpf_cancel_record_release(env, i);
 			release_reference_state(state, i);
 			state->active_locks--;
@@ -1737,7 +1737,7 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_IRQ)
 			continue;
 		if (state->refs[i].id == id) {
-			bpf_cancel_foreign_release(env, state->refs[i].frameno);
+			bpf_cancel_foreign_release(env, state->refs[i].frameno, i);
 			bpf_cancel_record_release(env, i);
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
@@ -11313,7 +11313,7 @@ static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type != REF_TYPE_PTR || state->refs[i].id != id)
 			continue;
-		bpf_cancel_foreign_release(env, state->refs[i].frameno);
+		bpf_cancel_foreign_release(env, state->refs[i].frameno, i);
 		bpf_cancel_record_release(env, i);
 		break;
 	}

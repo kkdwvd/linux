@@ -2336,7 +2336,7 @@ static void flow_shape_ctx(const struct bpf_verifier_state *st, struct flow_shap
 		frame = st->frame[fr];
 		chain = jhash_3words(frame->subprogno, frame->callsite, frame->loop_stack_cnt,
 				     chain);
-		ctx = jhash_2words(frame->entry_refs, frame->in_rcu_callback_fn, ctx);
+		ctx = jhash_3words(frame->entry_refs, frame->in_rcu_callback_fn, frame->gave, ctx);
 		ctx = jhash_2words(frame->entry_rcu_locks, frame->entry_preempt_locks, ctx);
 		for (i = 0; i < frame->loop_stack_cnt; i++) {
 			entry = &frame->loop_stack[i];

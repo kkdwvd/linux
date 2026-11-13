@@ -35,9 +35,15 @@
  *   where a kfunc or a helper releases them: a kernel object, a socket, a
  *   ringbuf record, an object that the program owns, see
  *   cancel_collect_ptr().
- * A frame that holds anything else of its own declines. So does the frame that
- * waits in a call when a callee releases what the frame holds: its pad would
- * release that again.
+ * A frame that holds anything else of its own declines.
+ *
+ * A callee may release what the frame that waits in its call holds. The pad of
+ * the call would release that again, so the pads of the callee tell: they
+ * leave a mask in R2, which cancel_exit keeps, with a bit for each argument
+ * that the callee got such a resource in, a register or a stack argument, see
+ * bpf_cancel_note_args(). The pad of the call leaves out what the mask names.
+ * The call declines when the callee releases what it did not get in an
+ * argument.
  *
  * A reference that a frame gives away in a call is the callee's from the call
  * on: the frame passes the handle in an argument and keeps it in no place that
@@ -116,6 +122,17 @@ static bool cancel_kind_ordered(u8 kind)
 #define CANCEL_ENTRY_INSNS	8
 /* and to test the flag of an entry with a condition */
 #define CANCEL_FLAG_INSNS	2
+/* and to test the mask of the callee for an entry that the callee may have released */
+#define CANCEL_TOLD_INSNS	2
+/* and to tell its caller what the callee told about one argument, see cancel_emit_exit() */
+#define CANCEL_FWD_INSNS	3
+
+/*
+ * The arguments of a call of a static subprog have numbers: 1-5 are R1-R5, and the stack
+ * arguments follow. A mask of arguments has the bit of each number.
+ */
+#define CANCEL_MAX_ARG		MAX_BPF_STATIC_FUNC_ARGS
+#define CANCEL_ARGS		GENMASK(CANCEL_MAX_ARG, 1)
 
 /* Why a site declines */
 enum cancel_reason {
@@ -134,7 +151,7 @@ enum cancel_reason {
 	CANCEL_RETVAL,
 	/* no JIT that runs pads compiles the program */
 	CANCEL_NO_JIT,
-	/* a callee releases what the frame holds at the call */
+	/* a callee releases what the frame holds at the call, and its pads cannot tell the frame */
 	CANCEL_FOREIGN,
 	/* it holds a lock or IRQ flags that a pad has no way to */
 	CANCEL_LOCK_PLACE,
@@ -181,6 +198,24 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_STACK]		= "stack",
 };
 
+/*
+ * A callee tells the pad of its call what it released by the arguments that it got that
+ * in, see bpf_cancel_note_args(). Why a site declines all the same, for the log. All but
+ * the last one are CANCEL_FOREIGN.
+ */
+enum cancel_untold {
+	/* the callee got it in no argument, or it is a section */
+	CANCEL_NOT_PASSED,
+	/* the visits of the site differ in what the frame released for its caller */
+	CANCEL_GAVE_DIFFERS,
+	/* the visits of the call differ in what the callee gets in an argument */
+	CANCEL_PASSED_DIFFERS,
+	/* the frame passes on what it got in no argument itself */
+	CANCEL_NOT_FORWARDED,
+	/* CANCEL_STACK: the frame has no room to keep what the callee tells */
+	CANCEL_NO_MASK,
+};
+
 /* The place of an entry that has no handle */
 #define CANCEL_NO_PLACE		S16_MAX
 
@@ -198,6 +233,11 @@ struct cancel_entry {
 	/* of a lock that was taken with IRQ flags: the offset of their slot from r10 */
 	s16 irq_off;
 	u8 flags;	/* of the kind, they go with arg */
+	/*
+	 * At a call: the argument that has the handle, 0 if none has. The callee tells by
+	 * it that the resource is released, see bpf_cancel_note_args().
+	 */
+	u8 passed;
 	u64 arg;	/* how to release it, in the terms of the kind */
 	/* of an object that the program owns: the pointer in place is that many bytes into it */
 	s32 off;
@@ -273,9 +313,33 @@ struct cancel_site {
 	bool visited;
 	/* what the frame holds, over all visits */
 	struct cancel_list held;
+	/*
+	 * What the frame tells its caller there, see bpf_func_state.gave: the same in every
+	 * visit. At a call it is what the frame gave before the call.
+	 */
+	u32 gave;
+	/*
+	 * At a call, for each argument of the callee: the argument that the frame itself got
+	 * the resource in which it passes on there, 0 if it passes none on. The pad of the
+	 * call tells the caller of the frame what the callee tells it.
+	 */
+	u8 fwd[CANCEL_MAX_ARG + 1];
+	/*
+	 * The arguments of the callee that the pad of the call cannot go by: the visits pass
+	 * different resources there,
+	 */
+	u32 unsure;
+	/* or one that the frame got in no argument, and cannot tell its caller of */
+	u32 unnamed;
+	/* why the pad cannot tell or be told, for the log: enum cancel_untold */
+	u8 untold;
 	/* The rest is found by bpf_cancel_resolve() */
 	u32 subprog;	/* the one that the insn is in */
 	int callee;	/* of a call insn */
+	/* of a call: the bits of the mask of the callee that the pad reads */
+	u32 told;
+	/* and the offset from r10 of the word that it keeps the mask in */
+	s16 mask;
 	bool padded;
 	/* no cancellation gets here: it has no pad and does not decline */
 	bool unused;
@@ -300,6 +364,11 @@ struct cancel_sub {
 	/* and a cancellation comes out of it: the calls of it need pads */
 	bool raises;
 	u32 pads;	/* its first pad + 1 */
+	/* the bits that its pads may set in the mask for its caller, see cancel_find_gives() */
+	u32 gives;
+	/* the word that the pads of its calls keep the mask of the callee in: the offset from r10 */
+	s16 mask;
+	bool no_mask;	/* its frame has no room for the word */
 };
 
 /*
@@ -1505,6 +1574,9 @@ static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifie
 			e = &visit->entries[nr];
 			e->origin = cancel_ref_origin(env, &st->refs[i]) + 1;
 			e->stray = !e->origin;
+			/* and the callee tells by the argument that it got it in */
+			if (type == BPF_CANCEL_SITE_CALL)
+				e->passed = st->refs[i].args[st->curframe + 1];
 		}
 	}
 	reason = cancel_collect_section(visit, CANCEL_RCU,
@@ -1666,6 +1738,24 @@ static bool cancel_null_in_place(struct bpf_verifier_env *env, const struct bpf_
 }
 
 /*
+ * The current frame of @st waits in a call and is without @e. Did a frame above release what
+ * the entry holds, and do its pads say so? The callee has the bit of the argument that the
+ * handle was passed in then, see bpf_func_state.gave.
+ *
+ * The bit tells a release from the other reasons why a visit is without an entry. What a
+ * callee tested and found to be NULL was not released, and neither was a resource whose place
+ * a callee wrote to: no frame has a bit for these. A path that never held the entry was
+ * without it at the call, where the entry took its condition whatever is found here. And an
+ * argument names one resource of a call, see bpf_cancel_note_args(): the bit is that of
+ * another one only where the visits of the call differ in what they pass there, and then the
+ * pad does not go by the argument, see cancel_site_told().
+ */
+static bool cancel_told(const struct bpf_verifier_state *st, const struct cancel_entry *e)
+{
+	return e->passed && (st->frame[st->curframe + 1]->gave & BIT(e->passed));
+}
+
+/*
  * A visit of @site found c->visit. An entry that this visit or one before it
  * is without takes a condition. So does a resource that the visits have in
  * different places and that finds no place for all of them: these are two
@@ -1692,6 +1782,13 @@ static int cancel_merge(struct bpf_verifier_env *env, struct cancel_site *site,
 	for (i = 0; i < held->nr; i++) {
 		e = &held->entries[i];
 		v = cancel_list_find(visit, e);
+		/*
+		 * A frame above released it and tells, see bpf_cancel_foreign_release(): the
+		 * mask says so when a cancellation gets to the pad from here, and the pad leaves
+		 * the entry alone. This visit is neither with the entry nor without it.
+		 */
+		if (!v && waits && cancel_told(waits, e))
+			continue;
 		if (!v && waits && cancel_null_in_place(env, waits, e)) {
 			/* no other place is known to have the NULL in this visit */
 			e->regs = 0;
@@ -1712,6 +1809,9 @@ static int cancel_merge(struct bpf_verifier_env *env, struct cancel_site *site,
 		/* see cancel_soft_flags() */
 		e->flags |= v->flags;
 		e->stray |= v->stray;
+		/* the callee names one of the two by the argument that the other one is in */
+		if (e->passed != v->passed)
+			site->unsure |= (BIT(e->passed) | BIT(v->passed)) & CANCEL_ARGS;
 		if (e->origin && v->origin)
 			cancel_union(c, e->origin - 1, v->origin - 1);
 		else if (v->origin)
@@ -1731,10 +1831,56 @@ static int cancel_merge(struct bpf_verifier_env *env, struct cancel_site *site,
 }
 
 /*
+ * The current frame of @st gets to @site. Record what its pad there tells the caller of the
+ * frame, see bpf_cancel_note_args(): the arguments that the frame got and that are released
+ * by now, and at a call the arguments of the callee that stand for arguments of the frame.
+ *
+ * A pad has one mask for every state that gets to its site, so the visits have to agree. A
+ * visit that tells something else declines the site. At a call the visits may differ in what
+ * they pass in an argument, or pass what came to the frame in no argument: the pad cannot go
+ * by what the callee tells about that argument. That is of no account unless a callee does
+ * tell about it, see cancel_site_told().
+ *
+ * All of it is made of what states are compared by, see refsafe() and func_states_equal(): it
+ * holds for the states that this one stands for.
+ */
+static void cancel_record_told(struct cancel_site *site, const struct bpf_verifier_state *st)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_reference_state *ref;
+	u8 fwd[CANCEL_MAX_ARG + 1] = {};
+	u32 i, r;
+
+	if (site->visited && site->gave != frame->gave) {
+		site->untold = CANCEL_GAVE_DIFFERS;
+		site->decline = CANCEL_FOREIGN;
+		return;
+	}
+	site->gave = frame->gave;
+	if (site->type != BPF_CANCEL_SITE_CALL)
+		return;
+	for (i = 0; i < st->acquired_refs; i++) {
+		ref = &st->refs[i];
+		r = ref->args[st->curframe + 1];
+		if (!r || ref->frameno >= (int)st->curframe)
+			continue;
+		fwd[r] = ref->args[st->curframe];
+		if (!fwd[r])
+			site->unnamed |= BIT(r);
+	}
+	for (r = 1; r <= CANCEL_MAX_ARG; r++) {
+		if (site->visited && site->fwd[r] != fwd[r])
+			site->unsure |= BIT(r);
+		site->fwd[r] = fwd[r];
+	}
+}
+
+/*
  * A visit of @site by a frame whose state is @st, with the frame as the current one. Record
  * what the frame holds there. Whatever the reason, a site that declines once declines.
  * @waits: the frame got to the site before and waits in the call, see
- * cancel_record_callers().
+ * cancel_record_callers(). What its pad tells is what the visit at the call found: a frame
+ * above may have released since what the frame passes on.
  */
 static int cancel_record_visit(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			       struct cancel_site *site, bool waits)
@@ -1752,6 +1898,10 @@ static int cancel_record_visit(struct bpf_verifier_env *env, const struct bpf_ve
 		site->decline = reason;
 		return 0;
 	}
+	if (!waits)
+		cancel_record_told(site, st);
+	if (site->decline)
+		return 0;
 	return cancel_merge(env, site, waits ? st : NULL);
 }
 
@@ -1774,8 +1924,9 @@ static int cancel_record_visit(struct bpf_verifier_env *env, const struct bpf_ve
  *
  * A frame that holds nothing does not visit a call that no visit held anything at. One that
  * held something does: what a callee tested and found to be NULL is an entry that this
- * visit is without, see cancel_null_in_place(). What a callee released declines the call
- * before that, see bpf_cancel_foreign_release().
+ * visit is without, see cancel_null_in_place(). What a callee released is told to the pad
+ * when it runs, see cancel_told(), or declines the call before that, see
+ * bpf_cancel_foreign_release().
  */
 static int cancel_record_callers(struct bpf_verifier_env *env, const struct bpf_verifier_state *st)
 {
@@ -1864,34 +2015,74 @@ int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state)
 }
 
 /*
- * The current frame released what frame @owner of the current state is to release, or left
- * a section that it entered. The owner waits in a call, and the record of the call says that
- * it holds that: its pad would release it once more. The call declines.
+ * The current frame released refs[@idx] of @st, which frame @owner is to release, and the
+ * owner waits in a call. Do the pads of the frames above the owner tell that it is released?
  *
- * Nothing is to be done for what the frame owns itself.
+ * They do when each of these frames got the handle in an argument, see
+ * bpf_cancel_note_args(): the argument is the name of the resource between the frame and the
+ * call that it was entered by. Each frame keeps the bit of its argument from now on, and its
+ * pads leave the bits in R2 for the pad of that call, see cancel_emit_exit().
+ *
+ * A frame that got the handle in another way has no name for the resource, and nothing to
+ * tell the frames below it. The frames above it keep their bits all the same: what a frame
+ * tells does not depend on who calls it, so the sites of a function agree on it however the
+ * function is verified.
+ */
+static bool cancel_tell_release(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				int owner, int idx)
+{
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	struct bpf_func_state *frame;
+	int fr;
+
+	for (fr = st->curframe; fr > owner; fr--) {
+		if (!ref->args[fr])
+			return false;
+		frame = st->frame[fr];
+		frame->gave |= BIT(ref->args[fr]);
+		env->subprog_info[frame->subprogno].cancel_gives |= BIT(ref->args[fr]);
+	}
+	return true;
+}
+
+/*
+ * The current frame released what frame @owner of the current state is to release: refs[@idx]
+ * of the state, or below 0 a section that the owner entered, or a dynptr of the owner that
+ * its pad would release through. The owner waits in a call, and the record of the call says
+ * that it holds that: its pad would release it once more.
+ *
+ * Nothing is to be done for what the frame owns itself. Where the pads of the frames above the
+ * owner tell, the pad of the call leaves out what is released, see cancel_tell_release(). Else
+ * the call declines.
  *
  * The callers of a function that is verified on its own are not in the state: @owner is
- * below 0 when one of them is the owner. Such a function is verified again in the context of
- * every caller that holds something, see func_is_on_its_own(), but only after it has
- * returned to one, see bpf_flow_return(). It may not return, when it throws say, and then the
- * call of the owner is never found. So the function cannot be cancelled, and with it nothing
- * that it calls: no cancellation comes back to the owner from behind the release. Little is
- * given away: where the call of the owner is found it declines, and what it gets to cannot be
- * cancelled either.
+ * below 0 when one of them is the owner. Frame 0 of the function tells like any other frame,
+ * and its callers go by the records of their calls, see cancel_find_gives(). Where it cannot
+ * tell: such a function is verified again in the context of every caller that holds something,
+ * see func_is_on_its_own(), but only after it has returned to one, see bpf_flow_return(). It
+ * may not return, when it throws say, and then the call of the owner is never found. So the
+ * function cannot be cancelled, and with it nothing that it calls: no cancellation comes back
+ * to the owner from behind the release. Little is given away: where the call of the owner is
+ * found it declines, and what it gets to cannot be cancelled either.
+ *
+ * A speculative state keeps its bits like any other, since states are compared by them. It
+ * declines nothing: the program doesn't get there.
  */
-void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner)
+void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner, int idx)
 {
-	const struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_verifier_state *st = env->cur_state;
 	struct cancel_site *site;
 
+	if (owner >= (int)st->curframe)
+		return;
+	if (idx >= 0 && cancel_tell_release(env, st, owner, idx))
+		return;
 	if (st->speculative)
 		return;
 	if (owner < 0) {
 		env->subprog_info[st->frame[0]->subprogno].cancel_foreign = true;
 		return;
 	}
-	if (owner >= st->curframe)
-		return;
 	/* every state that calls is recorded. A helper or a kfunc that calls a callback is no site. */
 	site = cancel_find_site(env, st->frame[owner + 1]->callsite, BPF_CANCEL_SITE_CALL);
 	if (site && !site->decline)
@@ -2010,13 +2201,16 @@ bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifie
  *		return 0;
  *	bpf_task_release(p);
  *
- * A frame that releases for its owner is to tell which resource that was.
+ * Behind the call the paths of the program tell whether the frame holds p. A cancellation in
+ * the callee comes back to the pad of the call, which has to be told: the pads of the callee
+ * leave a mask in R2, with a bit for each argument that the callee got such a resource in and
+ * that is released since.
  *
  * Each entry of refs[] notes the argument here: the first one that has its handle, see
  * cancel_arg_of(). The argument is the name of the resource for the callee, whoever calls it,
- * and for the record of this call. It is made of what is compared in front of the call, the
- * ids of live registers and of stack arguments, and compared itself from here on, see
- * refsafe(): it is the same in every state that this one stands for.
+ * and for the record of this call, see cancel_collect(). It is made of what is compared in
+ * front of the call, the ids of live registers and of stack arguments, and compared itself
+ * from here on, see refsafe(): it is the same in every state that this one stands for.
  *
  * An argument names one resource. A lock in an object that the program owns has the id of the
  * reference to the object: neither has a name then. What has no id is in no argument: a lock
@@ -2589,6 +2783,14 @@ static bool cancel_reject(struct bpf_verifier_env *env, const struct cancel_site
 	/* the function was verified on its own, see bpf_cancel_foreign_release() */
 	if (of_subprog && site->decline == CANCEL_FOREIGN)
 		text = "the function of the frame releases what a caller of it holds";
+	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_GAVE_DIFFERS)
+		text = "the frame has released what a caller of it holds on some paths only";
+	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_PASSED_DIFFERS)
+		text = "a callee releases what it gets in an argument, and the paths to the call differ in what they pass there";
+	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_NOT_FORWARDED)
+		text = "a callee releases what a caller of the frame holds, and the frame did not get it in an argument";
+	else if (site->decline == CANCEL_STACK && site->untold == CANCEL_NO_MASK)
+		text = "a callee tells what it released for the frame, and the stack of the frame has no room to keep that";
 	verbose(env, "insn %d: the program cannot be cancelled at this %s: %s (%s)\n",
 		site->insn_idx, cancel_site_str(site), text, cancel_reason_str[site->decline]);
 	return true;
@@ -2763,15 +2965,27 @@ static int cancel_entry_cmp(const void *a, const void *b)
 	return x->off < y->off ? -1 : x->off > y->off;
 }
 
+/* The bit of the mask of the callee that the pad of @site tests for @e, 0 if it tests none */
+static u32 cancel_entry_told(const struct cancel_site *site, const struct cancel_entry *e)
+{
+	return BIT(e->passed) & site->told;
+}
+
+/* Is one pad right for both: do they hold the same, and tell and get told the same? */
 static bool cancel_same_held(const struct cancel_site *a, const struct cancel_site *b)
 {
 	u32 i;
 
-	if (a->held.nr != b->held.nr)
+	if (a->held.nr != b->held.nr || a->gave != b->gave || a->told != b->told)
 		return false;
 	for (i = 0; i < a->held.nr; i++)
 		if (!cancel_entry_same(&a->held.entries[i], &b->held.entries[i]) ||
-		    a->held.entries[i].flags != b->held.entries[i].flags)
+		    a->held.entries[i].flags != b->held.entries[i].flags ||
+		    cancel_entry_told(a, &a->held.entries[i]) !=
+		    cancel_entry_told(b, &b->held.entries[i]))
+			return false;
+	for (i = 1; i <= CANCEL_MAX_ARG; i++)
+		if ((a->told & BIT(i)) && a->fwd[i] != b->fwd[i])
 			return false;
 	return true;
 }
@@ -2997,6 +3211,116 @@ static void cancel_find_used(struct bpf_verifier_env *env)
 }
 
 /*
+ * What the pads of each subprog may tell their callers. A frame keeps the bit of an argument
+ * when it or a frame above it releases what the argument has, and the main pass noted the bits
+ * of all frames of a subprog, see cancel_tell_release(). The frames below a function that is
+ * verified on its own are not in the state then. They tell what the function tells them: the
+ * pad of a call has the bit of an argument of its frame when the callee has the bit of the
+ * argument that the frame passed the resource on in, see fwd in struct cancel_site.
+ */
+static void cancel_find_gives(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_site *site;
+	struct cancel_sub *sub;
+	bool changed;
+	u32 i, r;
+	u32 gives;
+	int t;
+
+	for (t = 0; t < env->subprog_cnt; t++)
+		c->subs[t].gives = env->subprog_info[t].cancel_gives;
+	do {
+		changed = false;
+		for (i = 0; i < c->nr_sites; i++) {
+			site = &c->sites[i];
+			if (site->type != BPF_CANCEL_SITE_CALL)
+				continue;
+			sub = &c->subs[site->subprog];
+			gives = sub->gives;
+			cancel_for_each_callee(env, site, t)
+				for (r = 1; r <= CANCEL_MAX_ARG; r++)
+					if (site->fwd[r] && (c->subs[t].gives & BIT(r)))
+						gives |= BIT(site->fwd[r]);
+			changed |= gives != sub->gives;
+			sub->gives = gives;
+		}
+	} while (changed);
+}
+
+/*
+ * The bits of the mask of the callee that the pad of the call at @site goes by, in
+ * site->told: those that a callee may set and that name an entry of the site, or an argument
+ * of the frame that its pad tells the caller about in turn. The pad of a frame that the
+ * kernel entered has nobody to tell.
+ *
+ * Returns the reason why the site declines: a callee tells by an argument that the pad cannot
+ * go by, see cancel_record_told(), or the frame has no room for the mask.
+ */
+static u8 cancel_site_told(struct bpf_verifier_env *env, struct cancel_site *site)
+{
+	struct bpf_cancel *c = env->cancel;
+	u32 gives = 0, names = 0;
+	u32 i;
+	int t;
+
+	if (site->type != BPF_CANCEL_SITE_CALL)
+		return CANCEL_OK;
+	cancel_for_each_callee(env, site, t)
+		gives |= c->subs[t].gives;
+	if ((site->unsure | site->unnamed) & gives) {
+		site->untold = site->unsure & gives ? CANCEL_PASSED_DIFFERS : CANCEL_NOT_FORWARDED;
+		return CANCEL_FOREIGN;
+	}
+	for (i = 0; i < site->held.nr; i++)
+		names |= BIT(site->held.entries[i].passed);
+	for (i = 1; i <= CANCEL_MAX_ARG && !cancel_sub_is_top(env, site->subprog); i++)
+		if (site->fwd[i])
+			names |= BIT(i);
+	site->told = names & gives & CANCEL_ARGS;
+	if (!site->told || !c->subs[site->subprog].no_mask)
+		return CANCEL_OK;
+	site->untold = CANCEL_NO_MASK;
+	return CANCEL_STACK;
+}
+
+/*
+ * The pad of a call that goes by the mask of its callee keeps the mask in a hidden word of
+ * its frame: R2 does not last beyond the first release. One word serves all such pads of a
+ * subprog, and only the sites that get a pad as things are take room, like for the flags.
+ * Returns the number of subprogs whose frames have no room, below 0 on error.
+ */
+static int cancel_reserve_masks(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_site *site;
+	struct cancel_sub *sub;
+	bool has_point, jit_required;
+	int err, failed = 0;
+	u32 i;
+
+	for (i = 0; i < c->nr_sites; i++) {
+		site = &c->sites[i];
+		sub = &c->subs[site->subprog];
+		if (!site->told || site->decline || sub->why || sub->mask || sub->no_mask ||
+		    !cancel_gets_to(env, site, &has_point))
+			continue;
+		/* see cancel_reserve_flags() */
+		jit_required = env->prog->jit_required;
+		env->prog->jit_required = 1;
+		err = bpf_reserve_zeroed_stack(env, site->subprog, sizeof(u32), &sub->mask);
+		if (err && err != -ENOSPC)
+			return err;
+		if (err) {
+			env->prog->jit_required = jit_required;
+			sub->no_mask = true;
+			failed++;
+		}
+	}
+	return failed;
+}
+
+/*
  * Reserve the flags that are used and have no room yet: a byte each, in the frame of the
  * subprog that the origins of the class are in. A subprog is asked once, for all of its
  * flags. Returns the number of subprogs whose frames have no room, below 0 on error.
@@ -3047,13 +3371,20 @@ static int cancel_reserve_flags(struct bpf_verifier_env *env)
 	return failed;
 }
 
-/* @site gets a pad: its entries that only some visits have go by the flags of their classes */
+/*
+ * @site gets a pad: its entries that only some visits have go by the flags of their classes,
+ * and what the callee tells is kept in the word of the subprog.
+ */
 static int cancel_set_flags(struct bpf_verifier_env *env, struct cancel_site *site)
 {
 	struct bpf_cancel *c = env->cancel;
 	struct cancel_entry *e;
 	u32 i;
 
+	site->mask = c->subs[site->subprog].mask;
+	if (verifier_bug_if(site->told && !site->mask, env,
+			    "cancel: no mask for the call at insn %u", site->insn_idx))
+		return -EFAULT;
 	for (i = 0; i < site->held.nr; i++) {
 		e = &site->held.entries[i];
 		if (!e->cond)
@@ -3104,6 +3435,7 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 		c->subs[s].why = cancel_sub_reason(env, s);
 	cancel_find_stuck(env);
 	cancel_find_flag_classes(env);
+	cancel_find_gives(env);
 	/* a site that cannot have what its pad needs declines, before the calls are looked at */
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
@@ -3115,23 +3447,33 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 				return reason;
 			site->decline = reason;
 		}
+		/* in front of the flags: what a callee released for the frame has none */
+		if (!site->decline)
+			site->decline = cancel_site_told(env, site);
 		if (!site->decline)
 			site->decline = cancel_site_flags(env, site);
 	}
 	cancel_drop_subs(env);
 	cancel_find_raising(env);
 	/*
-	 * Only the flags of sites that get a pad take room. A site whose frame has none
-	 * declines after all, and fewer sites get a pad then: that is found once more.
+	 * Only the flags of sites that get a pad take room, and the masks of their callees.
+	 * A site whose frame has none declines after all, and fewer sites get a pad then:
+	 * that is found once more.
 	 */
 	cancel_find_used(env);
 	err = cancel_reserve_flags(env);
 	if (err < 0)
 		return err;
-	if (err) {
+	reason = cancel_reserve_masks(env);
+	if (reason < 0)
+		return reason;
+	if (err || reason) {
 		for (i = 0; i < c->nr_sites; i++) {
 			site = &c->sites[i];
-			if (!site->decline && !c->subs[site->subprog].why)
+			if (site->decline || c->subs[site->subprog].why)
+				continue;
+			site->decline = cancel_site_told(env, site);
+			if (!site->decline)
 				site->decline = cancel_site_flags(env, site);
 		}
 		for (s = 0; s < env->subprog_cnt; s++)
@@ -3335,15 +3677,33 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 }
 
 /*
- * Leave the frame of subprog @s: BPF_CANCEL_PAD_EXIT_INSNS at most. cancel_exit returns to
- * the pad of the call that the frame was called by. The kernel entered the main program or
- * an async callback, and nothing else does, see cancel_sub_reason(): all frames are done.
- * The pad tells that the program was cancelled and returns to the kernel like any exit.
+ * Leave the frame of subprog @s. cancel_exit returns to the pad of the call that the frame
+ * was called by. The kernel entered the main program or an async callback, and nothing else
+ * does, see cancel_sub_reason(): all frames are done. The pad tells that the program was
+ * cancelled and returns to the kernel like any exit.
+ *
+ * The pad of a subprog that a call entered tells the pad of that call in R2 which arguments
+ * of the frame are released, see bpf_cancel_note_args(). Every such pad does, so that a pad
+ * may go by the mask whatever it was called by: 0 says that all is as the call left it.
+ * @site is the site of the pad, NULL for the stack check, where the frame did nothing yet:
+ * BPF_CANCEL_PAD_EXIT_INSNS at most then. The mask has what the frame gave when it got to
+ * the site, and at a call the bit of each argument of the frame that the callee was passed
+ * and tells about: the mask of the callee is in the word of the frame, see cancel_emit_pad().
+ *
+ *	r2 = gave
+ *	r1 = *(u32 *)(r10 + mask)
+ *	if r1 & BIT(the argument of the callee) goto +1
+ *	goto +1
+ *	r2 |= BIT(the argument of the frame)
+ *	r0 = 0
+ *	cancel_exit
  */
-static int cancel_emit_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *buf)
+static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct cancel_site *site,
+			    struct bpf_insn *buf)
 {
+	u32 fwd = 0;
 	s32 val = 0;
-	int n = 0;
+	int n = 0, r;
 
 	if (cancel_sub_is_top(env, s)) {
 		/* it didn't refuse in cancel_sub_reason() */
@@ -3354,6 +3714,19 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 		buf[n++] = BPF_EXIT_INSN();
 		return n;
 	}
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_2, site ? site->gave : 0);
+	for (r = 1; site && r <= CANCEL_MAX_ARG; r++)
+		if ((site->told & BIT(r)) && site->fwd[r])
+			fwd |= BIT(r);
+	if (fwd)
+		buf[n++] = BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_FP, site->mask);
+	for (r = 1; r <= CANCEL_MAX_ARG; r++) {
+		if (!(fwd & BIT(r)))
+			continue;
+		buf[n++] = BPF_JMP_IMM(BPF_JSET, BPF_REG_1, BIT(r), 1);
+		buf[n++] = BPF_JMP_A(1);
+		buf[n++] = BPF_ALU64_IMM(BPF_OR, BPF_REG_2, BIT(site->fwd[r]));
+	}
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
 	buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_CANCEL_EXIT, 0, 0);
 	env->subprog_info[s].can_cancel = true;
@@ -3361,29 +3734,52 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 	return n;
 }
 
-/* The pad of @site: release what the frame holds there, kind by kind, and leave the frame */
+/*
+ * The pad of @site: release what the frame holds there, kind by kind, and leave the frame.
+ *
+ * The pad of a call gets the mask of the callee in R2, see cancel_emit_exit(), and every
+ * release is a call that clobbers R2. So the first insn of such a pad stores the mask to
+ * the word of the frame, in front of all else. Then the releases, each behind the tests
+ * that say whether it is to be made: the bit of the mask is set when the callee released
+ * the entry for the frame, and the flag is clear when the frame did not get to hold it.
+ *
+ *	*(u32 *)(r10 + mask) = r2
+ *	r1 = *(u32 *)(r10 + mask)
+ *	if r1 & BIT(the argument that had the handle) goto next
+ *	r1 = *(u8 *)(r10 + flag)
+ *	if r1 == 0 goto next
+ *	release
+ * next:
+ */
 static int cancel_emit_pad(struct bpf_verifier_env *env, const struct cancel_site *site,
 			   struct bpf_insn *buf)
 {
-	int n = 0, cnt, skip, place;
+	int n = 0, cnt, skip, told, place;
 	const struct cancel_entry *e;
 	u32 i;
 
+	if (site->told)
+		buf[n++] = BPF_STX_MEM(BPF_W, BPF_REG_FP, BPF_REG_2, site->mask);
 	for (i = 0; i < site->held.nr; i++) {
 		place = site->held.entries[i].place;
 		/* the flag of an entry that only some visits have tells whether it is there */
 		e = &site->held.entries[i];
+		told = cancel_entry_told(site, e) ? CANCEL_TOLD_INSNS : 0;
 		skip = e->flag ? CANCEL_FLAG_INSNS : 0;
-		cnt = cancel_emit_entry(env, e, place, buf + n + skip);
+		cnt = cancel_emit_entry(env, e, place, buf + n + told + skip);
 		if (cnt < 0)
 			return cnt;
-		if (skip) {
-			buf[n] = BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_FP, e->flag);
-			buf[n + 1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, cnt);
+		if (told) {
+			buf[n] = BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_FP, site->mask);
+			buf[n + 1] = BPF_JMP_IMM(BPF_JSET, BPF_REG_1, BIT(e->passed), skip + cnt);
 		}
-		n += skip + cnt;
+		if (skip) {
+			buf[n + told] = BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_FP, e->flag);
+			buf[n + told + 1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, cnt);
+		}
+		n += told + skip + cnt;
 	}
-	return n + cancel_emit_exit(env, site->subprog, buf + n);
+	return n + cancel_emit_exit(env, site->subprog, site, buf + n);
 }
 
 bool bpf_cancel_has_pads(const struct bpf_verifier_env *env)
@@ -3407,8 +3803,11 @@ int bpf_cancel_append_pads(struct bpf_verifier_env *env, int s, const struct bpf
 		return 0;
 	for (p = c->subs[s].pads; p; p = pad->next) {
 		pad = &c->pads[p - 1];
-		need += c->sites[pad->site].held.nr * (CANCEL_ENTRY_INSNS + CANCEL_FLAG_INSNS);
+		need += c->sites[pad->site].held.nr *
+			(CANCEL_ENTRY_INSNS + CANCEL_FLAG_INSNS + CANCEL_TOLD_INSNS);
 		need += BPF_CANCEL_PAD_EXIT_INSNS;
+		/* the store of the mask, its load and what is told on, see cancel_emit_exit() */
+		need += 2 + CANCEL_MAX_ARG * CANCEL_FWD_INSNS;
 	}
 	if (need > c->cap_insns) {
 		insn = kvrealloc(c->insns, need * sizeof(*insn), GFP_KERNEL_ACCOUNT);
@@ -3454,7 +3853,7 @@ int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int s, struct bpf_insn *b
 {
 	if (!env->subprog_info[s].cancel_entry)
 		return 0;
-	return cancel_emit_exit(env, s, buf);
+	return cancel_emit_exit(env, s, NULL, buf);
 }
 
 /*

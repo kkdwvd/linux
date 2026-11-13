@@ -315,8 +315,10 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
  * to it and execution falls through it. The pads are behind the last insn of their
  * subprog, however long that is: the offset of the pad has 32 bits and is in imm,
  * like that of gotol, and off is 0.
- * cancel_exit returns to the pad of the call that it returns from, with R0 as it is.
- * A call without a pad is one that the kernel made. There it is exit.
+ * cancel_exit returns to the pad of the call that it returns from, with R0 and R2 as
+ * they are: the pad of the frame that leaves tells in R2 what the frame released for
+ * its caller, see bpf_cancel_note_args(). A call without a pad is one that the kernel
+ * made. There it is exit.
  */
 #define BPF_CANCEL_GOTO	2
 #define BPF_CANCEL_EXIT	2

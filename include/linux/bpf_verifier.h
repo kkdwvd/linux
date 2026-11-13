@@ -554,6 +554,13 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * The arguments that the frame was entered with the handle of a caller's resource in
+	 * which is released since, by this frame or by one above it: the bit of the number of
+	 * each, see bpf_reference_state.args. It is what the frame tells its caller when it is
+	 * cancelled, see bpf_cancel_foreign_release().
+	 */
+	u32 gave;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
@@ -1152,10 +1159,15 @@ struct bpf_subprog_info {
 	/* its stack check has a pad, see bpf_cancel_entry_pad() */
 	bool cancel_entry: 1;
 	/*
-	 * Verified on its own it released what a caller holds: it cannot be cancelled,
-	 * see bpf_cancel_foreign_release().
+	 * Verified on its own it released what a caller holds and its pads cannot tell
+	 * of: it cannot be cancelled, see bpf_cancel_foreign_release().
 	 */
 	bool cancel_foreign: 1;
+	/*
+	 * The arguments that a frame of it got a resource of a caller in which the frame or
+	 * one above it released: its pads tell by these, see bpf_func_state.gave.
+	 */
+	u32 cancel_gives;
 	u8 code_stack_args;
 	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1672,7 +1684,7 @@ enum bpf_cancel_acquire {
 
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
 int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state);
-void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
+void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner, int idx);
 bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  u32 idx, int subprog);
 void bpf_cancel_note_args(struct bpf_verifier_env *env, struct bpf_verifier_state *st,

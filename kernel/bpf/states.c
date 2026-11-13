@@ -631,7 +631,8 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	/* what the frame did to what its callers hold is a part of what it tells them */
 	if (old->entry_refs != cur->entry_refs ||
 	    old->entry_rcu_locks != cur->entry_rcu_locks ||
-	    old->entry_preempt_locks != cur->entry_preempt_locks)
+	    old->entry_preempt_locks != cur->entry_preempt_locks ||
+	    old->gave != cur->gave)
 		return false;
 
 	for (i = 0; i < MAX_BPF_REG; i++)
