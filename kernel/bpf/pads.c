@@ -715,8 +715,9 @@ static int find_lock_cands(struct bpf_verifier_env *env, const struct bpf_verifi
 			   int insn_idx, const struct bpf_reference_state *ref,
 			   struct bpf_pad_place *cand)
 {
+	struct bpf_pad_place kept[BPF_PAD_MAX_CANDS];
 	const struct bpf_map *map;
-	int i, off, nr = 0;
+	int i, off, nr = 0, nr_kept;
 	u64 addr;
 
 	/* A lock in a global variable, the only value of an array: no id, a constant address. */
@@ -729,7 +730,10 @@ static int find_lock_cands(struct bpf_verifier_env *env, const struct bpf_verifi
 		cand[nr++] = (struct bpf_pad_place){ .loc = BPF_PLACE_MAP_VALUE, .at = i,
 						     .delta = -off };
 	}
-	return ref->id ? find_cands(env, st, insn_idx, ref, NULL, cand) : nr;
+	/* One insn may take one of several such locks. The program keeps the address to unlock. */
+	nr_kept = min(find_cands(env, st, insn_idx, ref, NULL, kept), BPF_PAD_MAX_CANDS - nr);
+	memcpy(&cand[nr], kept, nr_kept * sizeof(*cand));
+	return nr + nr_kept;
 }
 
 /*
