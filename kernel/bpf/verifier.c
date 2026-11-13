@@ -22071,6 +22071,11 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 		return -EINVAL;
 	}
 
+	/* what the frame holds in front of may_goto */
+	err = bpf_cancel_record(env, BPF_CANCEL_SITE_GUARD);
+	if (err)
+		return err;
+
 	/*
 	 * A guard has one way out, and only that one is looked at.
 	 *

@@ -611,14 +611,17 @@ static struct bpf_insn budget_exit_insn(struct bpf_verifier_env *env, struct bpf
  */
 #define BPF_GUARD_NEAR	2048
 
+/* in zero[] of bpf_insert_loop_guards(): no register, the guard goes to a pad that is far */
+#define BPF_GUARD_FAR_PAD	BIT(MAX_BPF_REG)
+
 static bool guard_leaves_subprog(const struct bpf_insn_aux_data *aux)
 {
 	return aux->loop_guard && !aux->guard_no_unwind;
 }
 
 /*
- * 'r0 = 0; exit' behind the last insn of the subprog, for all its guards that are near.
- * @tail is that insn, and on return the last insn of what is queued.
+ * 'r0 = 0; exit' behind the last insn of the subprog, for all its guards that are near
+ * and have no pad. @tail is that insn, and on return the last insn of what is queued.
  * Returns the number of insns that are going to be added.
  */
 static int append_budget_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *tail)
@@ -628,7 +631,8 @@ static int append_budget_exit(struct bpf_verifier_env *env, int s, struct bpf_in
 	struct bpf_insn buf[4], *insn;
 
 	for (i = max_t(int, sub->start, last + 1 - BPF_GUARD_NEAR); i <= last; i++)
-		if (guard_leaves_subprog(&env->insn_aux_data[i]))
+		if (guard_leaves_subprog(&env->insn_aux_data[i]) &&
+		    bpf_cancel_guard_pad(env, i) < 0)
 			break;
 	if (i > last)
 		return 0;
@@ -646,7 +650,8 @@ static int append_budget_exit(struct bpf_verifier_env *env, int s, struct bpf_in
 /*
  * Add may_goto in front of the insns that the main pass marked, see
  * check_loop_guard(). It verified the edge from the insn to where may_goto goes.
- * The pads of all sites are added here, behind their subprogs.
+ * Where the insn has a pad may_goto goes there instead and the invocation ends, see
+ * bpf_cancel_resolve(). The pads of all sites are added here, behind their subprogs.
  */
 int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 {
@@ -729,7 +734,13 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 	for (i = 0; i < len; i++) {
 		s = bpf_find_containing_subprog(env, i) - env->subprog_info;
 		target[i] = aux[i].loop_guard ? aux[i].guard_to + moved[s] : -1;
-		if (guard_leaves_subprog(&aux[i])) {
+		to = aux[i].loop_guard ? bpf_cancel_guard_pad(env, i) : -1;
+		if (to >= 0) {
+			/* neither the loop nor the subprog is left: the invocation ends */
+			target[i] = to;
+			if (to - i > BPF_GUARD_NEAR)
+				zero[i] = BPF_GUARD_FAR_PAD;
+		} else if (guard_leaves_subprog(&aux[i])) {
 			/* see push_budget_exit() */
 			if (leave[s] && leave[s] - i <= BPF_GUARD_NEAR) {
 				target[i] = leave[s];
@@ -747,16 +758,16 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 		if (to == -1)
 			continue;
 		/*
-		 *	may_goto to		or	may_goto +1
-		 *	insn				goto +N
-		 *					r0 = 0, ...
-		 *					exit
-		 *					insn
+		 *	may_goto to	or	may_goto +1	or	may_goto +1
+		 *	insn			goto +N			goto +1
+		 *				r0 = 0, ...		gotol pad
+		 *				exit			insn
+		 *				insn
 		 */
 		n = 0;
 		if (zero[i]) {
 			patch[n++] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 1, 0);
-			patch[n++] = BPF_JMP_A(hweight16(zero[i]) + 1);
+			patch[n++] = BPF_JMP_A(hweight16(zero[i] & ~BPF_GUARD_FAR_PAD) + 1);
 			for (r = BPF_REG_0; r < BPF_REG_FP; r++)
 				if (zero[i] & BIT(r))
 					patch[n++] = BPF_MOV64_IMM(r, 0);
@@ -769,12 +780,15 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			off = to - i + n - jmp - 1;
 		else
 			off = to - (i + jmp) - 1;
-		if (off > S16_MAX || off < S16_MIN) {
+		if (zero[i] & BPF_GUARD_FAR_PAD) {
+			patch[jmp] = BPF_JMP32_A(off);
+		} else if (off > S16_MAX || off < S16_MIN) {
 			verbose(env, "exit of the loop is too far from insn %d for may_goto\n", i);
 			err = -ERANGE;
 			break;
+		} else {
+			patch[jmp] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, off, 0);
 		}
-		patch[jmp] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, off, 0);
 		if (to == -2)
 			patch[jmp] = budget_exit_insn(env, bpf_find_containing_subprog(env, i));
 		patch[n] = env->prog->insnsi[i];
@@ -805,12 +819,13 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 	 *  - What is live where the guard at the head of a loop goes is live at the head,
 	 *    see bpf_head_guard_target().
 	 *  - On the way out of the subprog R0, and R2 of a pair, are set to 0.
+	 *  - A pad reads no register that is dead in front of the insns that it is for.
 	 */
 	aux = env->insn_aux_data;
 	for (i = 0, n = 0; i < len; i++) {
 		if (target[i] == -1)
 			continue;
-		r = zero[i] ? 3 + hweight16(zero[i]) : 1;
+		r = zero[i] ? 3 + hweight16(zero[i] & ~BPF_GUARD_FAR_PAD) : 1;
 		aux[i + n].live_regs_before = aux[i + n + r].live_regs_before;
 		n += r;
 	}

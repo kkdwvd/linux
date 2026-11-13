@@ -3,13 +3,14 @@
 /*
  * Cancellation of a program on pads that the verifier generates.
  *
- * When a cancellation point fires the invocation ends there. A point is the
- * stack check of a recursive subprog that finds no room. Each frame of the call
- * chain runs a pad, from the frame at the point to the frame that the kernel
- * entered. A pad releases what its frame holds and leaves the frame with
- * cancel_exit, which returns to the pad of the call in the caller: 'cancel_goto
- * pad' behind the call names it. The pad of the main program returns to the
- * kernel. A cancellation runs pads only, never the code of the program again.
+ * When a cancellation point fires the invocation ends there. A point is may_goto
+ * of the verifier whose time is up, or the stack check of a recursive subprog
+ * that finds no room. Each frame of the call chain runs a pad, from the frame at
+ * the point to the frame that the kernel entered. A pad releases what its frame
+ * holds and leaves the frame with cancel_exit, which returns to the pad of the
+ * call in the caller: 'cancel_goto pad' behind the call names it. The pad of the
+ * main program returns to the kernel. A cancellation runs pads only, never the
+ * code of the program again.
  *
  * A site is an insn at which a frame can be cancelled: a point, or the call of
  * a subprog, which a cancellation comes back through. The main pass records
@@ -54,9 +55,9 @@
  * cancelled, and with them the sites that get a pad. The pads go behind the last
  * insn of their subprog, see bpf_insert_loop_guards().
  *
- * The main pass verifies what it always did: the stack check leaves the
- * subprog. That is what the program does at a site that declines. A site with a
- * pad doesn't get there any more.
+ * The main pass verifies what it always did: may_goto leaves the loop or the
+ * subprog, the stack check leaves the subprog. That is what the program does
+ * at a site that declines. A site with a pad doesn't get there any more.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -122,6 +123,8 @@ static bool cancel_kind_ordered(u8 kind)
 #define CANCEL_ENTRY_INSNS	8
 /* and to test the flag of an entry with a condition */
 #define CANCEL_FLAG_INSNS	2
+/* and to move the handles that are in R0-R5 to R6-R9, see cancel_regs_fit() */
+#define CANCEL_MOVE_INSNS	(BPF_REG_9 - BPF_REG_6 + 1)
 /* and to test the mask of the callee for an entry that the callee may have released */
 #define CANCEL_TOLD_INSNS	2
 /* and to tell its caller what the callee told about one argument, see cancel_emit_exit() */
@@ -153,6 +156,8 @@ enum cancel_reason {
 	CANCEL_NO_JIT,
 	/* a callee releases what the frame holds at the call, and its pads cannot tell the frame */
 	CANCEL_FOREIGN,
+	/* more handles are in registers than the calls of a pad keep */
+	CANCEL_REGS,
 	/* it holds a lock or IRQ flags that a pad has no way to */
 	CANCEL_LOCK_PLACE,
 	/* it holds an iterator that its pad cannot find or may not destroy */
@@ -187,6 +192,7 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_RETVAL]		= "retval",
 	[CANCEL_NO_JIT]		= "jit",
 	[CANCEL_FOREIGN]	= "foreign",
+	[CANCEL_REGS]		= "regs",
 	[CANCEL_LOCK_PLACE]	= "lock",
 	[CANCEL_ITER]		= "iter",
 	[CANCEL_DYNPTR]		= "dynptr",
@@ -296,6 +302,8 @@ static int cancel_common_place(const struct cancel_entry *a, const struct cancel
 		return BPF_REG_6 + __ffs(regs >> BPF_REG_6);
 	if (slots)
 		return -(int)(__ffs64(slots) + 1) * BPF_REG_SIZE;
+	if (regs)
+		return __ffs(regs);
 	return CANCEL_NO_PLACE;
 }
 
@@ -343,7 +351,7 @@ struct cancel_site {
 	bool padded;
 	/* no cancellation gets here: it has no pad and does not decline */
 	bool unused;
-	u32 pad;	/* of a call that is padded */
+	u32 pad;	/* of a guard or a call that is padded */
 };
 
 /* The sites of a subprog that hold the same have one pad */
@@ -912,7 +920,7 @@ static void cancel_lock_at(const struct bpf_reg_state *reg, const struct bpf_ref
 /*
  * The live places of the current frame of @st that lead to the lock of @ref, into alt_place
  * and alt_arg of @e: CANCEL_NO_PLACE if it has none. R6-R9 are asked first, then the slots
- * of the stack, the lowest number first: visits that have the pointer in several
+ * of the stack, then R0-R5, the lowest number first: visits that have the pointer in several
  * places pick the same one where they can, and note the others, see
  * cancel_agree_on_places(). @one_elem: see cancel_reg_at_lock().
  */
@@ -935,6 +943,9 @@ static void cancel_lock_place(struct bpf_verifier_env *env, const struct bpf_ver
 			cancel_lock_at(&slot->spilled_ptr, ref, one_elem,
 				       -(i + 1) * BPF_REG_SIZE, e);
 	}
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++)
+		if (cancel_reg_is_place(env, st, type, i))
+			cancel_lock_at(&frame->regs[i], ref, one_elem, i, e);
 }
 
 /*
@@ -1455,7 +1466,7 @@ static int cancel_ptr_place(struct bpf_verifier_env *env, const struct bpf_verif
  * places as that one: ids are compared along with the types, in what is live.
  *
  * Where more than one place has the handle the visits of a site pick the same one where they
- * can: R6-R9 come first, then the stack, the lowest number first. The entry
+ * can: R6-R9 come first, then the stack, then R0-R5, the lowest number first. The entry
  * notes the other places, for the visits that cannot, see cancel_agree_on_places().
  */
 static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
@@ -1480,6 +1491,9 @@ static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_ver
 			reason = cancel_ptr_place(env, st, &slot->spilled_ptr,
 						  -(spi + 1) * BPF_REG_SIZE, reason, &e);
 	}
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++)
+		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, st, type, i))
+			reason = cancel_ptr_place(env, st, &frame->regs[i], i, reason, &e);
 	return reason ?: cancel_list_add(visit, &e);
 }
 
@@ -2616,6 +2630,9 @@ void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifi
 /* A point is where a cancellation begins. A call passes it on. */
 static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_site *site)
 {
+	/* every place for may_goto is recorded, and its loop may have got none */
+	if (site->type == BPF_CANCEL_SITE_GUARD)
+		return env->insn_aux_data[site->insn_idx].loop_guard;
 	/*
 	 * The main pass records the stack check of every subprog that may be on a cycle.
 	 * check_recursion() has found the ones that are, and only they get the check.
@@ -2703,6 +2720,8 @@ static const char *cancel_shape_text(u8 reason)
 		return "the paths to it are in different numbers of RCU or preemption-disabled sections";
 	case CANCEL_FOREIGN:
 		return "a callee releases what the frame holds";
+	case CANCEL_REGS:
+		return "more handles are in registers than a pad can keep";
 	case CANCEL_LOCK_PLACE:
 		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot that the callee is seen to leave alone)";
 	case CANCEL_ITER:
@@ -2729,6 +2748,8 @@ static const char *cancel_shape_text(u8 reason)
 static const char *cancel_site_str(const struct cancel_site *site)
 {
 	switch (site->type) {
+	case BPF_CANCEL_SITE_GUARD:
+		return "loop";
 	case BPF_CANCEL_SITE_ENTRY:
 		return "recursive call";
 	default:
@@ -2944,6 +2965,25 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 	default:
 		return 0;
 	}
+}
+
+/*
+ * A release is a call, and a call clobbers R0-R5. The pad moves the handles that are there
+ * to R6-R9 before it releases anything: the frame is done with what these hold, unless that
+ * is a handle too. Is there room for all of them?
+ */
+static bool cancel_regs_fit(const struct cancel_site *site)
+{
+	u16 regs = 0;
+	int place;
+	u32 i;
+
+	for (i = 0; i < site->held.nr; i++) {
+		place = site->held.entries[i].place;
+		if (cancel_place_is_reg(place))
+			regs |= BIT(place);
+	}
+	return hweight16(regs) <= CANCEL_MOVE_INSNS;
 }
 
 /* The order of the entries in a pad: kind by kind */
@@ -3447,6 +3487,8 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 				return reason;
 			site->decline = reason;
 		}
+		if (!site->decline && !cancel_regs_fit(site))
+			site->decline = CANCEL_REGS;
 		/* in front of the flags: what a callee released for the frame has none */
 		if (!site->decline)
 			site->decline = cancel_site_told(env, site);
@@ -3739,9 +3781,10 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct ca
  *
  * The pad of a call gets the mask of the callee in R2, see cancel_emit_exit(), and every
  * release is a call that clobbers R2. So the first insn of such a pad stores the mask to
- * the word of the frame, in front of all else. Then the releases, each behind the tests
- * that say whether it is to be made: the bit of the mask is set when the callee released
- * the entry for the frame, and the flag is clear when the frame did not get to hold it.
+ * the word of the frame, in front of all else. The handles that are moved come next: none
+ * at a call, where R0-R5 are no places. Then the releases, each behind the tests that say
+ * whether it is to be made: the bit of the mask is set when the callee released the entry
+ * for the frame, and the flag is clear when the frame did not get to hold it.
  *
  *	*(u32 *)(r10 + mask) = r2
  *	r1 = *(u32 *)(r10 + mask)
@@ -3754,14 +3797,35 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct ca
 static int cancel_emit_pad(struct bpf_verifier_env *env, const struct cancel_site *site,
 			   struct bpf_insn *buf)
 {
-	int n = 0, cnt, skip, told, place;
+	int n = 0, cnt, skip, told, place, reg = BPF_REG_6;
 	const struct cancel_entry *e;
+	/* where the handle in R0-R5 goes */
+	u8 to[BPF_REG_6] = {};
+	u16 busy = 0;
 	u32 i;
 
 	if (site->told)
 		buf[n++] = BPF_STX_MEM(BPF_W, BPF_REG_FP, BPF_REG_2, site->mask);
 	for (i = 0; i < site->held.nr; i++) {
 		place = site->held.entries[i].place;
+		if (cancel_place_is_reg(place) && place >= BPF_REG_6)
+			busy |= BIT(place);
+	}
+	/* there is room, see cancel_regs_fit() */
+	for (i = 0; i < site->held.nr; i++) {
+		place = site->held.entries[i].place;
+		if (!cancel_place_is_reg(place) || place >= BPF_REG_6 || to[place])
+			continue;
+		while (busy & BIT(reg))
+			reg++;
+		busy |= BIT(reg);
+		to[place] = reg;
+		buf[n++] = BPF_MOV64_REG(reg, place);
+	}
+	for (i = 0; i < site->held.nr; i++) {
+		place = site->held.entries[i].place;
+		if (cancel_place_is_reg(place) && place < BPF_REG_6)
+			place = to[place];
 		/* the flag of an entry that only some visits have tells whether it is there */
 		e = &site->held.entries[i];
 		told = cancel_entry_told(site, e) ? CANCEL_TOLD_INSNS : 0;
@@ -3805,7 +3869,7 @@ int bpf_cancel_append_pads(struct bpf_verifier_env *env, int s, const struct bpf
 		pad = &c->pads[p - 1];
 		need += c->sites[pad->site].held.nr *
 			(CANCEL_ENTRY_INSNS + CANCEL_FLAG_INSNS + CANCEL_TOLD_INSNS);
-		need += BPF_CANCEL_PAD_EXIT_INSNS;
+		need += CANCEL_MOVE_INSNS + BPF_CANCEL_PAD_EXIT_INSNS;
 		/* the store of the mask, its load and what is told on, see cancel_emit_exit() */
 		need += 2 + CANCEL_MAX_ARG * CANCEL_FWD_INSNS;
 	}
@@ -3842,6 +3906,20 @@ int bpf_cancel_append_pads(struct bpf_verifier_env *env, int s, const struct bpf
 static int cancel_pad_idx(struct bpf_verifier_env *env, const struct cancel_site *site)
 {
 	return env->subprog_info[site->subprog + 1].start - env->cancel->pads[site->pad].back;
+}
+
+/*
+ * Where may_goto in front of @insn_idx goes to end the invocation, -1 if the insn has no
+ * pad. Before the pads are in the program only that much is known.
+ */
+int bpf_cancel_guard_pad(struct bpf_verifier_env *env, int insn_idx)
+{
+	const struct cancel_site *site;
+
+	site = cancel_find_site(env, insn_idx, BPF_CANCEL_SITE_GUARD);
+	if (!site || !site->padded)
+		return -1;
+	return cancel_pad_idx(env, site);
 }
 
 /*
@@ -3920,8 +3998,9 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
  *	insn
  *
  * The flag is set in front of the insn that follows the call, and of may_goto that is
- * there: a jump to that insn brought nothing. Behind the call of a subprog cancel_goto
- * comes first, which only a cancellation takes.
+ * there: a jump to that insn brought nothing, and the pad of may_goto is for a frame that
+ * holds the resource. Behind the call of a subprog cancel_goto comes first, which only a
+ * cancellation takes.
  *
  * The flag is cleared right in front of the call, behind what jumps to the call and behind
  * its may_goto: the frame holds the resource until the call is made. The call of a helper or
