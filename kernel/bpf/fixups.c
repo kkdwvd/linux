@@ -605,12 +605,6 @@ static struct bpf_insn budget_exit_insn(struct bpf_verifier_env *env, struct bpf
 	return BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0);
 }
 
-/*
- * may_goto has 16 bits for the offset, and what is between it and its target is going
- * to grow: may_goto itself becomes 10 insns, 14 when it has to save a register.
- */
-#define BPF_GUARD_NEAR	2048
-
 /* in zero[] of bpf_insert_loop_guards(): no register, the guard goes to a pad that is far */
 #define BPF_GUARD_FAR_PAD	BIT(MAX_BPF_REG)
 

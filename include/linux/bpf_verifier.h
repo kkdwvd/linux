@@ -1647,6 +1647,11 @@ int bpf_flow_loop_leave(struct bpf_verifier_env *env, bool *enters);
 int bpf_flow_loop_enter(struct bpf_verifier_env *env, bool *backedge, bool *drop, bool *ends_walk);
 int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		    const struct bpf_verifier_state *exit, int call_idx);
+/*
+ * may_goto has 16 bits for the offset, and what is between it and its target is going
+ * to grow: may_goto itself becomes 10 insns, 14 when it has to save a register.
+ */
+#define BPF_GUARD_NEAR	2048
 int bpf_insert_loop_guards(struct bpf_verifier_env *env);
 u16 bpf_call_const_arg_regs(struct bpf_verifier_env *env, struct bpf_insn *insn);
 u16 bpf_call_checked_arg_regs(struct bpf_verifier_env *env, struct bpf_insn *insn);
@@ -1663,6 +1668,8 @@ int bpf_next_callx_callee(struct bpf_verifier_env *env, int caller, int from);
 enum bpf_cancel_site_type {
 	/* where the verifier adds may_goto, see check_loop_guard() */
 	BPF_CANCEL_SITE_GUARD,
+	/* may_goto of the program */
+	BPF_CANCEL_SITE_MAY_GOTO,
 	/* the stack check of a recursive subprog, see check_recursion_guard() */
 	BPF_CANCEL_SITE_ENTRY,
 	/* the call of a subprog */
@@ -1708,6 +1715,7 @@ int bpf_cancel_append_pads(struct bpf_verifier_env *env, int subprog,
 int bpf_cancel_guard_pad(struct bpf_verifier_env *env, int insn_idx);
 int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int subprog, struct bpf_insn *buf);
 int bpf_cancel_insert_gotos(struct bpf_verifier_env *env);
+int bpf_cancel_retarget_may_gotos(struct bpf_verifier_env *env);
 int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env);
 void bpf_cancel_reset(struct bpf_verifier_env *env);
 void bpf_cancel_free(struct bpf_verifier_env *env);

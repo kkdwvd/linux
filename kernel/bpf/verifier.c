@@ -20015,6 +20015,16 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		struct bpf_verifier_state *queued_st;
 		int idx = *insn_idx;
 
+		/*
+		 * What the frame holds in front of may_goto of the program. One that goes to the
+		 * next insn is a nop that bpf_opt_remove_nops() drops: it stays one.
+		 */
+		if (insn->off) {
+			err = bpf_cancel_record(env, BPF_CANCEL_SITE_MAY_GOTO);
+			if (err)
+				return err;
+		}
+
 		/* branch out 'fallthrough' insn as a new state to explore */
 		queued_st = push_stack(env, idx + 1, idx, false);
 		if (IS_ERR(queued_st))
@@ -25914,6 +25924,9 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = bpf_cancel_insert_gotos(env);
+
+	if (ret == 0)
+		ret = bpf_cancel_retarget_may_gotos(env);
 
 	if (ret == 0)
 		ret = bpf_cancel_insert_flag_stores(env);
