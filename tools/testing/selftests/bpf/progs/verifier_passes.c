@@ -1121,6 +1121,126 @@ int callee_tests_null(struct __sk_buff *skb)
 	return 0;
 }
 
+/*
+ * The same function, and a caller that does not read through what it returns. With NULL the
+ * function throws, and the caller holds nothing then: its landing pad tests the pointer.
+ */
+SEC("tc")
+__description("calls: the function throws if the reference of the caller is NULL")
+__arch_x86_64
+__load_if_JITed()
+__success __retval(0) __log_level(2) __not_msg("verifier bug")
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0")
+int callee_throws_on_null(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+
+	throw_if_null(n, skb->mark);
+	barrier_var(n);
+	if (n)
+		bpf_obj_drop(n);
+	return 0;
+}
+
+/*
+ * The same at run time, with a reference that is NULL there: no task has that pid. The function
+ * throws, and the landing pad of the caller runs with 0 in the place of the task. It releases
+ * nothing, and the prog returns what was thrown. With the task of pid 1 the function returns, and
+ * the prog releases the task itself.
+ */
+static __noinline struct task_struct *throw_if_no_task(struct task_struct *t, long depth)
+{
+	if (!t)
+		bpf_throw(7);
+	if (depth)
+		throw_if_no_task(t, depth - 1);
+	barrier_var(t);
+	return t;
+}
+
+int no_such_pid = 0x7fffffff;
+int init_pid = 1;
+
+#define THROWS_IF_NO_TASK(name, desc, pid, ret)						\
+SEC("tc")										\
+__description("calls: " desc)								\
+__arch_x86_64										\
+__load_if_JITed()									\
+__success __retval(ret) __log_level(2)							\
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0") \
+int name(struct __sk_buff *skb)								\
+{											\
+	struct task_struct *t = bpf_task_from_pid(pid);					\
+											\
+	throw_if_no_task(t, skb->mark);							\
+	barrier_var(t);									\
+	if (t)										\
+		bpf_task_release(t);							\
+	return 0;									\
+}
+
+THROWS_IF_NO_TASK(callee_throws_on_null_run, "the function throws, the reference of the caller is NULL when it runs",
+		  no_such_pid, 7)
+THROWS_IF_NO_TASK(callee_returns_on_task_run, "the function returns, the caller holds the reference when it runs",
+		  init_pid, 0)
+
+/*
+ * A function that returns when it finds the reference of its caller to be NULL. The caller may
+ * rely on what the function found: on the path with NULL it holds nothing. So such a call is
+ * verified in the frames of the caller, where the test is one of the caller's state, like a
+ * call that releases the reference. With a depth that is known the frames are enough.
+ */
+static __noinline long null_is_error(struct pair *p, long depth)
+{
+	long r = 1;
+
+	if (!p)
+		return -1;
+	if (depth)
+		r = null_is_error(p, depth - 1);
+	barrier_var(r);
+	return r;
+}
+
+SEC("tc")
+__description("calls: the caller believes the function that found its reference NULL")
+__arch_x86_64
+__load_if_JITed()
+__success __retval(0)
+int caller_believes_callee(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+	long depth = 2;
+
+	barrier_var(depth);
+	if (null_is_error(n, depth) < 0)
+		return 0;
+	if (n)
+		bpf_obj_drop(n);
+	return 0;
+}
+
+/*
+ * With a depth that is not known the frames have no end. That is a limit, the prog is safe: its
+ * caller tests the pointer itself. Only a function that is unwound when it finds NULL stays on
+ * its own, see throw_if_null().
+ */
+SEC("tc")
+__description("calls: a recursion of any depth returns if the reference of the caller is NULL")
+__arch_x86_64
+__load_if_JITed()
+__failure __msg("the call stack of {{[0-9]+}} frames is too deep")
+int callee_returns_on_null(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+
+	null_is_error(n, skb->mark);
+	barrier_var(n);
+	if (n)
+		bpf_obj_drop(n);
+	return 0;
+}
+
 static __noinline int submit(void *p)
 {
 	bpf_ringbuf_submit(p, 0);

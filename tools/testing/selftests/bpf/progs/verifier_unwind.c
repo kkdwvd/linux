@@ -654,6 +654,137 @@ __naked int calls_global_unwinds(void)
 	);
 }
 
+/*
+ * The callers of a global subprog take what comes out of it for a number, also when it unwinds
+ * and also when it returns nothing: unwind_exit needs a number in r0 there. The exit insn of the
+ * same subprogs leaves r0 unwritten, which a subprog that returns nothing may do.
+ *
+ * This one leaves a pointer to its stack in r0 when it unwinds.
+ */
+__naked __noinline __used
+void global_void_unwinds_with_ptr(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"exit;"
+	"1:"
+		"r0 = r10;"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: unwind_exit of a global subprog that returns nothing needs a number in r0")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("At subprogram exit the register R0 is not a scalar value (fp)")
+__naked int global_void_unwinds_ptr(void)
+{
+	asm volatile (
+		"call global_void_unwinds_with_ptr;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/* Nor a pointer that a callee left there, which its pad passes on with unwind_exit of its own */
+__naked __noinline __used
+static unsigned long unwinds_with_ptr(void)
+{
+	asm volatile (
+		"r0 = %[one] ll;"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+__naked __noinline __used
+void global_void_passes_ptr_on(void)
+{
+	asm volatile (
+		"call unwinds_with_ptr;"
+		unwind_goto(1)
+		"exit;"
+		unwind_exit
+		:
+		: __imm_unwind_goto(1),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a pad in a global subprog that returns nothing cannot pass a pointer on")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("At subprogram exit the register R0 is not a scalar value (map_value)")
+__naked int global_void_passes_ptr(void)
+{
+	asm volatile (
+		"call global_void_passes_ptr_on;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/* Nor a register that it has not written */
+__naked __noinline __used
+void global_void_unwinds_without_r0(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"exit;"
+	"1:"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: unwind_exit of a global subprog that returns nothing needs r0")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("R0 !read_ok")
+__naked int global_void_unwinds_no_r0(void)
+{
+	asm volatile (
+		"call global_void_unwinds_without_r0;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
 /* The verifier doesn't look inside */
 SEC("tc")
 __description("unwind: the pad of a call of a global subprog is always checked")

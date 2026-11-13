@@ -605,6 +605,24 @@ __naked void throw_stack_args(void)
 	: __clobber_all);
 }
 
+__noinline int exception_cb_uses_r12(__u64 cookie)
+{
+	asm volatile (".8byte %[adj];" :: __imm_insn(adj, ADJ(16)) : __clobber_all);
+	return 0;
+}
+
+SEC("syscall")
+__description("arena stack: the landing pads call the exception callback, which uses r12")
+__failure __msg("exception_cb_uses_r12() uses R12 and is both called and a callback")
+__attribute__((btf_decl_tag("exception_callback:exception_cb_uses_r12")))
+int exception_cb_with_r12(void *ctx)
+{
+	extern void bpf_throw(__u64 cookie) __ksym;
+
+	bpf_throw(5);
+	return 0;
+}
+
 /* The second half of the struct is argument 6 for the JIT: slots count, not arguments */
 SEC("tc")
 __description("arena stack: a kfunc with 5 arguments in 6 slots")

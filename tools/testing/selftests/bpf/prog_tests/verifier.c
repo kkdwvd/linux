@@ -154,6 +154,7 @@
 #include "verifier_typedef.skel.h"
 #include "verifier_uninit.skel.h"
 #include "verifier_unpriv.skel.h"
+#include "verifier_throw.skel.h"
 #include "verifier_unwind.skel.h"
 #include "verifier_unwind_cb.skel.h"
 #include "verifier_unwind_cb_recursion.skel.h"
@@ -385,6 +386,7 @@ void test_verifier_trip_count(void)           { RUN(verifier_trip_count); }
 void test_verifier_typedef(void)              { RUN(verifier_typedef); }
 void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
+void test_verifier_throw(void)                { RUN(verifier_throw); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
 /* The helpers have pads with asm goto outputs only, and the kernel says -ENOTSUPP without */
 static bool cb_pads_supported(void)
