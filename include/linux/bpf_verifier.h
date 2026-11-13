@@ -2235,6 +2235,22 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);
 int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			 struct bpf_insn *insn_buf, int insn_idx, int *cnt);
 
+/*
+ * The call that releases a reference to a kernel type, as found by
+ * bpf_find_release_kfunc(): BPF_CALL_KFUNC(offset, func_id) with the reference
+ * in R1. Like every kfunc call it needs bpf_add_kfunc_call(env, func_id, offset)
+ * before bpf_do_misc_fixups() resolves it.
+ */
+struct bpf_release_kfunc {
+	struct btf *btf;	/* BTF of the kfunc */
+	u32 func_id;		/* BTF id of the kfunc, imm of the call */
+	u16 offset;		/* off of the call: 0, or the fd_array index of a module's btf */
+	u32 flags;		/* KF_* flags of the kfunc for this program */
+};
+
+int bpf_find_release_kfunc(struct bpf_verifier_env *env, struct btf *btf, u32 btf_id,
+			   bool sleepable, struct bpf_release_kfunc *rel);
+
 /* Functions exported from verifier.c, used by trampoline.c */
 int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 btf_id,
 				  struct bpf_attach_target_info *tgt_info);

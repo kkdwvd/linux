@@ -10190,21 +10190,83 @@ int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset)
 }
 EXPORT_SYMBOL_GPL(register_btf_fmodret_id_set);
 
-s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
+/*
+ * Find the entry of @btf_id that has a destructor, or the one that has a
+ * release kfunc. A type may be registered more than once, with its destructor
+ * in one place and its release kfunc in another, and the entries of a type are
+ * adjacent in the sorted table.
+ */
+static const struct btf_id_dtor_kfunc *btf_find_dtor_entry(const struct btf *btf, u32 btf_id,
+							    bool release)
 {
 	struct btf_id_dtor_kfunc_tab *tab = btf->dtor_kfunc_tab;
-	struct btf_id_dtor_kfunc *dtor;
+	const struct btf_id_dtor_kfunc *dtor, *end;
 
 	if (!tab)
-		return -ENOENT;
-	/* Even though the size of tab->dtors[0] is > sizeof(u32), we only need
+		return NULL;
+	/*
+	 * Even though the size of tab->dtors[0] is > sizeof(u32), we only need
 	 * to compare the first u32 with btf_id, so we can reuse btf_id_cmp_func.
 	 */
 	BUILD_BUG_ON(offsetof(struct btf_id_dtor_kfunc, btf_id) != 0);
 	dtor = bsearch(&btf_id, tab->dtors, tab->cnt, sizeof(tab->dtors[0]), btf_id_cmp_func);
 	if (!dtor)
+		return NULL;
+	while (dtor > tab->dtors && dtor[-1].btf_id == btf_id)
+		dtor--;
+	for (end = tab->dtors + tab->cnt; dtor < end && dtor->btf_id == btf_id; dtor++) {
+		if (release ? dtor->release_btf_id : dtor->kfunc_btf_id)
+			return dtor;
+	}
+	return NULL;
+}
+
+s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
+{
+	const struct btf_id_dtor_kfunc *dtor = btf_find_dtor_entry(btf, btf_id, false);
+
+	return dtor ? dtor->kfunc_btf_id : -ENOENT;
+}
+
+/*
+ * Return the id of the kfunc registered as releasing a reference to struct
+ * @btf_id. @btf has to be the BTF that defines the type: its release kfunc is
+ * registered there, and the returned id is one of @btf.
+ *
+ * Registration takes the entry as it is, so make sure here that the kfunc is
+ * void (*)(struct type *): it is then called with the reference as its only
+ * argument, as a program would call it. Whether it is a KF_RELEASE kfunc
+ * depends on the kfunc id set that applies to a program, which the caller
+ * checks.
+ */
+s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id)
+{
+	const struct btf_type *func, *proto, *t;
+	const struct btf_id_dtor_kfunc *dtor;
+	u32 arg_id;
+
+	if (btf_id < btf->start_id)
 		return -ENOENT;
-	return dtor->kfunc_btf_id;
+	dtor = btf_find_dtor_entry(btf, btf_id, true);
+	if (!dtor)
+		return -ENOENT;
+
+	func = btf_type_by_id(btf, dtor->release_btf_id);
+	if (!func || !btf_type_is_func(func))
+		return -EINVAL;
+	proto = btf_type_by_id(btf, func->type);
+	if (!proto || !btf_type_is_func_proto(proto) || btf_type_vlen(proto) != 1)
+		return -EINVAL;
+	t = btf_type_by_id(btf, proto->type);
+	if (!t || !btf_type_is_void(t))
+		return -EINVAL;
+	t = btf_type_skip_modifiers(btf, btf_params(proto)[0].type, NULL);
+	if (!t || !btf_type_is_ptr(t))
+		return -EINVAL;
+	t = btf_type_skip_modifiers(btf, t->type, &arg_id);
+	if (!t || !__btf_type_is_struct(t) || arg_id != btf_id)
+		return -EINVAL;
+	return dtor->release_btf_id;
 }
 
 static int btf_check_dtor_kfuncs(struct btf *btf, const struct btf_id_dtor_kfunc *dtors, u32 cnt)
@@ -10215,6 +10277,10 @@ static int btf_check_dtor_kfuncs(struct btf *btf, const struct btf_id_dtor_kfunc
 	u32 nr_args, i;
 
 	for (i = 0; i < cnt; i++) {
+		/* A type that is never stored in a map has only a release kfunc */
+		if (!dtors[i].kfunc_btf_id && dtors[i].release_btf_id)
+			continue;
+
 		dtor_btf_id = btf_relocate_id(btf, dtors[i].kfunc_btf_id);
 
 		dtor_func = btf_type_by_id(btf, dtor_btf_id);
@@ -10311,8 +10377,13 @@ int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors, u32 add_c
 
 	/* remap BTF ids based on BTF relocation (if any) */
 	for (i = tab_cnt; i < tab_cnt + add_cnt; i++) {
-		tab->dtors[i].btf_id = btf_relocate_id(btf, tab->dtors[i].btf_id);
-		tab->dtors[i].kfunc_btf_id = btf_relocate_id(btf, tab->dtors[i].kfunc_btf_id);
+		struct btf_id_dtor_kfunc *dtor = &tab->dtors[i];
+
+		dtor->btf_id = btf_relocate_id(btf, dtor->btf_id);
+		if (dtor->kfunc_btf_id)
+			dtor->kfunc_btf_id = btf_relocate_id(btf, dtor->kfunc_btf_id);
+		if (dtor->release_btf_id)
+			dtor->release_btf_id = btf_relocate_id(btf, dtor->release_btf_id);
 	}
 
 	tab->cnt += add_cnt;

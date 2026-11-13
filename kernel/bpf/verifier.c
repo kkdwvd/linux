@@ -3179,6 +3179,101 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	return 0;
 }
 
+/* The BTF that defines type @id of @btf: a split BTF does not define the types of its base */
+static struct btf *type_owner_btf(struct btf *btf, u32 id)
+{
+	struct btf *base;
+
+	while ((base = btf_base_btf(btf)) && id < btf_nr_types(base))
+		btf = base;
+	return btf;
+}
+
+/*
+ * Find the kfunc that generated code calls to release a reference to type
+ * @btf_id of @btf, the type of a referenced PTR_TO_BTF_ID, and describe the
+ * call in @rel. @sleepable says whether the code may sleep where it makes the
+ * call. Nothing is logged and nothing in @env changes.
+ *
+ * The call is the one the program would make with the reference in R1, so the
+ * program must be allowed to make it. What depends on the state in which the
+ * call is made, other than @sleepable, is left to the caller: under a
+ * bpf_spin_lock only a kfunc with KF_SPINLOCK_SAFE in @rel->flags may be
+ * called.
+ *
+ * Returns -ENOENT if the type has no release kfunc, or has one in the BTF of a
+ * module that the program calls no kfunc of, -EINVAL if what is registered is
+ * not a release kfunc that takes only a pointer to the type, and -EACCES if
+ * the program may not call it.
+ */
+int bpf_find_release_kfunc(struct bpf_verifier_env *env, struct btf *btf, u32 btf_id,
+			   bool sleepable, struct bpf_release_kfunc *rel)
+{
+	struct bpf_kfunc_btf_tab *btf_tab = env->prog->aux->kfunc_btf_tab;
+	const struct btf_type *t;
+	u32 *kfunc_flags, flags;
+	u16 offset = 0;
+	s32 func_id;
+	u32 i;
+
+	if (!btf_is_kernel(btf))
+		return -ENOENT;
+	t = btf_type_skip_modifiers(btf, btf_id, &btf_id);
+	if (!t || !__btf_type_is_struct(t))
+		return -ENOENT;
+	/* R0 of a module's kfunc has the BTF of the module, also for a type of vmlinux */
+	btf = type_owner_btf(btf, btf_id);
+
+	if (btf_is_module(btf)) {
+		/*
+		 * A call names the BTF of a module by an index into fd_array, and the
+		 * program has one for every such BTF it calls a kfunc of. The entry
+		 * also holds the module, which makes it safe to look at the BTF's
+		 * tables below.
+		 */
+		for (i = 0; btf_tab && i < btf_tab->nr_descs; i++) {
+			if (btf_tab->descs[i].btf == btf)
+				break;
+		}
+		if (!btf_tab || i == btf_tab->nr_descs)
+			return -ENOENT;
+		offset = btf_tab->descs[i].offset;
+	}
+
+	func_id = btf_find_release_kfunc(btf, btf_id);
+	if (func_id < 0)
+		return func_id;
+
+	/* what add_kfuncs() and bpf_add_kfunc_call() ask of a program that calls a kfunc */
+	if (!env->bpf_capable || !env->prog->gpl_compatible || !env->prog->jit_requested ||
+	    !bpf_jit_supports_kfunc_call())
+		return -EACCES;
+
+	kfunc_flags = btf_kfunc_flags(btf, func_id, env->prog);
+	if (!kfunc_flags || !btf_kfunc_is_allowed(btf, func_id, env->prog))
+		return -EACCES;
+	flags = *kfunc_flags;
+
+	/* R1 is the only argument set up for the call, and R0 is not looked at after it */
+	if (!(flags & KF_RELEASE) || (flags & (KF_ACQUIRE | KF_IMPLICIT_ARGS)))
+		return -EINVAL;
+	if ((flags & KF_DESTRUCTIVE) && !capable(CAP_SYS_BOOT))
+		return -EACCES;
+	if ((flags & KF_PERFMON) && !env->allow_ptr_leaks)
+		return -EACCES;
+	if ((flags & KF_SLEEPABLE) && !sleepable)
+		return -EACCES;
+	/* the caller does not say whether the call is made in an RCU read section */
+	if (flags & KF_RCU_PROTECTED)
+		return -EACCES;
+
+	rel->btf = btf;
+	rel->func_id = func_id;
+	rel->offset = offset;
+	rel->flags = flags;
+	return 0;
+}
+
 static int add_subprogs(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *subprog = env->subprog_info;
