@@ -105,6 +105,71 @@ __naked void recursion_socket(void)
 	);
 }
 
+/*
+ * Without a pad may_goto ends a main program with 0 as well. That is TC_ACT_OK, and not what
+ * a tc program returns when it is cancelled.
+ */
+SEC("tc")
+__description("cancel: a loop in the main program that is out of time ends it with TC_ACT_SHOT")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__stderr("ERROR: Timeout detected for may_goto instruction")
+__stderr("...")
+__stderr("ERROR: Program was cancelled")
+__naked void loop_in_main(void)
+{
+	asm volatile (
+		"r6 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+__naked __noinline __used
+static unsigned long spins(void)
+{
+	asm volatile (
+		"r2 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/* Without pads may_goto leaves the loop, and the program returns the 7 of spins() */
+SEC("socket")
+__description("cancel: a loop in a subprog that is out of time ends the program")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(0) __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+__stderr("ERROR: Timeout detected for may_goto instruction")
+__stderr("...")
+__stderr("ERROR: Program was cancelled")
+__naked void loop_in_subprog(void)
+{
+	asm volatile (
+		"call spins;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
 #define CLOCK_MONOTONIC 1
 
 struct elem {
@@ -152,6 +217,40 @@ int timer_recursion(void *ctx)
 	if (bpf_timer_start(&e->timer, 0, 0))
 		return 4;
 	return 0;
+}
+
+/* The target of the progs in cancel_attach.c */
+__naked __noinline __used
+unsigned long global_spins(void)
+{
+	asm volatile (
+		"r2 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/* A global subprog is verified on its own. Its pad is like that of any other subprog. */
+SEC("tc")
+__description("cancel: a loop in a global subprog has a pad")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+__naked void calls_global_spins(void)
+{
+	asm volatile (
+		"call global_spins;"
+		"exit;"
+		::: __clobber_all
+	);
 }
 
 /*
@@ -221,6 +320,29 @@ __naked void insns_of_pads(void)
  * that, or the program is not loaded: see cancel_locks.c and cancel_refs.c.
  */
 
+static int spins_in_callback(__u32 i, void *ctx)
+{
+	volatile unsigned long *go = &one;
+
+	while (*go)
+		;
+	return 0;
+}
+
+/* The helper that calls a callback has no pad: it would go on with what the callback left */
+SEC("socket")
+__description("cancel: a loop in a callback of bpf_loop() declines")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 0 declined refs 0 section 0 cond 0 callback 1")
+int loop_in_callback(void *ctx)
+{
+	bpf_loop(1, spins_in_callback, NULL, zero);
+	return 1;
+}
+
 static int calls_dives(__u32 i, void *ctx)
 {
 	dives();
@@ -270,6 +392,33 @@ int recursion_through_callback(void *ctx)
 {
 	calls_loop(0);
 	return 1;
+}
+
+/*
+ * cancel_exit finds the pad of its call through the symbols of the program, and what is behind
+ * the call runs speculatively on what the pads left: CAP_BPF alone is not enough. may_goto ends
+ * the main program like it does without pads.
+ */
+SEC("socket")
+__description("cancel: a program that is loaded without CAP_PERFMON declines")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success_unpriv __caps_unpriv(CAP_BPF) __log_level(4)
+__msg_unpriv("cancel sites 1 padded 0 declined refs 0 section 0 cond 0 callback 0 caller 0 retval 0 jit 1")
+__naked void loop_without_perfmon(void)
+{
+	asm volatile (
+		"r6 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
 }
 
 char _license[] SEC("license") = "GPL";

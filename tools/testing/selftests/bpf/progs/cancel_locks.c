@@ -943,6 +943,129 @@ int res_locks_in_irq_save_at_call(struct __sk_buff *ctx)
 }
 
 /*
+ * The frame at the point holds the flags, which it saved twice, and the lock: the site is
+ * may_goto that the verifier adds to the loop. Only r3 points to the element there, and the calls
+ * of the pad clobber r3. So the pad begins with a move of the pointer to a register that they
+ * keep, and then unlocks and restores like the code behind the loop does.
+ *
+ * It spins for 250 ms. The runner runs it, the test loader only loads it.
+ */
+SEC("tc")
+__description("cancel: a loop in a frame that holds IRQ flags and a bpf_spin_lock in a map value")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("exit")
+__xlated("r6 = r3")
+__xlated("r1 = r6")
+__xlated("r1 += 8")
+__xlated("call unknown")
+__xlated("r1 = r10")
+__xlated("r1 += -24")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void spin_lock_in_irq_save_at_guard(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -24;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		asm_count(spins)
+		/* r6 is dead from here on */
+		"r3 = r6;"
+		"r2 = %[one] ll;"
+	"2:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 2b;"
+		"r1 = r3;"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		"r1 = r10;"
+		"r1 += -24;"
+		"call %[bpf_local_irq_restore];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(spins),
+		  __imm_addr(one),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+static __noinline int spins_with_res_locks(void)
+{
+	volatile unsigned long *go = &one;
+	unsigned long flags;
+
+	if (bpf_res_spin_lock(&res_a)) {
+		lock_err++;
+		return 0;
+	}
+	if (bpf_res_spin_lock_irqsave(&res_b, &flags)) {
+		bpf_res_spin_unlock(&res_a);
+		lock_err++;
+		return 0;
+	}
+	spins++;
+	while (*go)
+		;
+	bpf_res_spin_unlock_irqrestore(&res_b, &flags);
+	bpf_res_spin_unlock(&res_a);
+	behind++;
+	return 0;
+}
+
+/*
+ * The frame at the point is that of a subprog: its pad unlocks and leaves with cancel_exit, for
+ * the pad of the call in the main program, which holds nothing. 250 ms as well.
+ */
+SEC("tc")
+__description("cancel: a loop in a subprog that holds two bpf_res_spin_lock, one with IRQ flags")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+int res_locks_at_guard(struct __sk_buff *ctx)
+{
+	if (enter())
+		return TC_ACT_OK;
+	spins_with_res_locks();
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
  * What no pad releases. A cancellation gets to a site where the frame holds something that its
  * pad has no way to release, or would release once more: the program is not loaded. The log has
  * a line for the site, with the kind of insn, the limit, and the word of the stats for the reason.
@@ -1836,6 +1959,33 @@ int sections_in_two_frames(struct __sk_buff *ctx)
 	return TC_ACT_OK;
 }
 
+/* The frame at the point is in the sections. It spins for 250 ms, the runner runs it. */
+SEC("tc")
+__description("cancel: a loop in a frame that is in RCU read sections and has preemption disabled")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+int sections_at_guard(struct __sk_buff *ctx)
+{
+	volatile unsigned long *go = &one;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_rcu_read_lock();
+	bpf_preempt_disable();
+	bpf_rcu_read_lock();
+	spins++;
+	while (*go)
+		;
+	bpf_rcu_read_unlock();
+	bpf_preempt_enable();
+	bpf_rcu_read_unlock();
+	behind++;
+	return TC_ACT_OK;
+}
+
 /*
  * A program that may sleep is in no RCU read section of the kernel, and its preemption is on:
  * the sections that it enters are all there is. Its pads call the same kfuncs.
@@ -2070,6 +2220,49 @@ int spin_lock_in_irq_save_in_rcu_two_frames(struct __sk_buff *ctx)
 	bpf_local_irq_save(&flags);
 	locks_and_dives();
 	bpf_local_irq_restore(&flags);
+	bpf_rcu_read_unlock();
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
+ * The frame at the point holds five things: a section of each kind, saved IRQ flags, a
+ * bpf_spin_lock, and inside of that a lock with IRQ flags of its own. It spins for 250 ms, the
+ * runner runs it.
+ */
+SEC("tc")
+__description("cancel: a loop inside of two locks, saved IRQ flags and a section of each kind")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+int locks_in_irq_save_in_sections_at_guard(struct __sk_buff *ctx)
+{
+	volatile unsigned long *go = &one;
+	unsigned long flags, lock_flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_rcu_read_lock();
+	bpf_preempt_disable();
+	bpf_local_irq_save(&flags);
+	bpf_spin_lock(&spin_a);
+	if (bpf_res_spin_lock_irqsave(&res_a, &lock_flags)) {
+		bpf_spin_unlock(&spin_a);
+		bpf_local_irq_restore(&flags);
+		bpf_preempt_enable();
+		bpf_rcu_read_unlock();
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	spins++;
+	while (*go)
+		;
+	bpf_res_spin_unlock_irqrestore(&res_a, &lock_flags);
+	bpf_spin_unlock(&spin_a);
+	bpf_local_irq_restore(&flags);
+	bpf_preempt_enable();
 	bpf_rcu_read_unlock();
 	behind++;
 	return TC_ACT_OK;

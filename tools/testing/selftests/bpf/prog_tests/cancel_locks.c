@@ -57,6 +57,8 @@ static const struct test tests[] = {
 	{ "res_locks_irqsave_ab_at_call" },
 	{ "res_locks_irqsave_ba_at_call" },
 	{ "res_locks_in_irq_save_at_call" },
+	{ "spin_lock_in_irq_save_at_guard", .loop = true },
+	{ "res_locks_at_guard", .loop = true },
 	{ "irq_save_orders_differ", .two_ways = true },
 	{ "spin_lock_in_one_visit", .two_ways = true },
 	{ "res_lock_in_one_visit", .two_ways = true },
@@ -67,10 +69,12 @@ static const struct test tests[] = {
 	{ "sections_max_at_call" },
 	{ "sections_of_callee_at_call" },
 	{ "sections_in_two_frames" },
+	{ "sections_at_guard", .loop = true },
 	{ "sleepable_rcu_at_call" },
 	{ "sleepable_preempt_at_call" },
 	{ "spin_lock_in_irq_save_in_rcu_at_call" },
 	{ "spin_lock_in_irq_save_in_rcu_two_frames" },
+	{ "locks_in_irq_save_in_sections_at_guard", .loop = true },
 };
 
 /* Returns what the second run returned, below 0 if the runs failed */
@@ -127,7 +131,10 @@ static void run_test(const struct test *t, unsigned long zero)
 	ASSERT_EQ(skel->bss->runs, 2, "runs");
 
 	/* both runs got to the point, */
-	ASSERT_GT(skel->bss->frames, 8, "frames");
+	if (t->loop)
+		ASSERT_EQ(skel->bss->spins, 2, "spins");
+	else
+		ASSERT_GT(skel->bss->frames, 8, "frames");
 	/* and neither went on from there */
 	ASSERT_EQ(skel->bss->behind, 0, "behind");
 
@@ -142,6 +149,7 @@ out:
 	cancel_locks__destroy(skel);
 }
 
+/* Serial: some progs spin for 250 ms with interrupts or preemption off */
 void serial_test_cancel_locks(void)
 {
 	int i;
