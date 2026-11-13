@@ -593,8 +593,11 @@ static struct bpf_insn budget_exit_insn(struct bpf_verifier_env *env, struct bpf
  *  - What is live where the guard at the head of a loop goes is live at the head,
  *    see bpf_head_guard_target().
  *  - On the way out of the subprog R0, and R2 of a pair, are set to 0.
+ *  - A pad reads no register that is dead in front of the insns that it is for.
  *
- * The pads of all sites are added here, behind their subprogs and behind 'leave'.
+ * Where the insn has a pad may_goto goes there instead and the invocation ends, see
+ * bpf_cancel_resolve(). The pads of all sites are added here, behind their subprogs and
+ * behind 'leave'.
  */
 int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 {
@@ -606,6 +609,7 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 	struct bpf_insn *insn;
 	int i, s, n, pad_cnt, err;
 	bool leaves;
+	u32 back;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -622,12 +626,17 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			insn = bpf_patch_list_add(env, i, patch, 2);
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
-			if (aux[i].guard_no_unwind)
+			back = bpf_cancel_guard_pad(env, i);
+			if (back) {
+				/* neither the loop nor the subprog is left: the invocation ends */
+				bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start, back);
+			} else if (aux[i].guard_no_unwind) {
 				bpf_patch_list_jump(&env->patch_list, insn - 1, aux[i].guard_to, 0);
-			else
+			} else {
 				bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start,
 						    n + pad_cnt);
-			leaves |= !aux[i].guard_no_unwind;
+				leaves = true;
+			}
 		}
 		if (leaves) {
 			leave[1] = BPF_MOV64_IMM(BPF_REG_2, 0);
