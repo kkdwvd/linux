@@ -668,6 +668,39 @@ static void note_unproven_after_pass(struct bpf_verifier_env *env, u32 idx)
 	suspect_loops_of_insn(env, idx);
 }
 
+/*
+ * The insn at @idx is a cause of an error that shows at another insn: the next pass keeps apart
+ * what it reads. Its own check did not fail, unless a state said so before. The pass is over: an
+ * insn that is noted while states still get to it is not noted with the state that fails there,
+ * see do_check().
+ */
+void bpf_note_unproven_cause(struct bpf_verifier_env *env, u32 idx)
+{
+	bool failed = test_bit(idx, env->precision->err_insns);
+
+	note_unproven_after_pass(env, idx);
+	if (failed)
+		__set_bit(idx, env->precision->err_insns);
+}
+
+/*
+ * The insn at @idx is a cause of an error that shows at another insn, and nothing that it reads
+ * has a part in it: a call that leaves its frame whatever it is given, an access that faults. Only
+ * the jumps that can skip it matter. So the insn is controlled, like a call on the way to an
+ * unproven insn, see find_calls_to_unproven(), and no seed: the next pass keeps apart what those
+ * jumps read, in its function and in the callers, and not what the insn reads.
+ */
+void bpf_note_controlled_cause(struct bpf_verifier_env *env, u32 idx)
+{
+	struct bpf_subprog_info *sub = bpf_find_containing_subprog(env, idx);
+
+	if (!sub)
+		return;
+	__set_bit(idx, env->precision->this_pass.call_insns);
+	__set_bit(sub - env->subprog_info, env->precision->this_pass.unproven_funcs);
+	suspect_loops_of_insn(env, idx);
+}
+
 /* check_after_pass() or bpf_pads_settle() found an error. Which insns caused it? */
 void bpf_find_unproven_after_pass(struct bpf_verifier_env *env)
 {

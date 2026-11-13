@@ -21853,6 +21853,8 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	certain = site_is_certain(env, plan, insn_idx);
 	if (plan->conflict && certain) {
 		bpf_pad_log(env, insn_idx, plan);
+		/* for bpf_pads_note_causes() */
+		plan->failed = true;
 		err = -EINVAL;
 		goto unproven;
 	}
@@ -24084,15 +24086,20 @@ static int check_pass(struct bpf_verifier_env *env, struct bpf_snapshot *initial
 		verbose(env, "pass %u\n", env->pass);
 	bpf_precision_new_pass(env);
 	ret = check_funcs(env, initial);
+	/* what the next pass keeps apart may have no state that unwinds to a call */
+	if (ret && env->err)
+		bpf_pads_note_causes(env);
 	if (ret || pass_needs_restart(env))
 		return ret;
 	/* a state that never gets to a site makes no conflict there */
 	mark_used_sites(env, initial);
 	ret = check_after_pass(env) ?: bpf_pads_settle(env);
-	if (ret)
+	if (ret) {
 		bpf_find_unproven_after_pass(env);
-	else
+		bpf_pads_note_causes(env);
+	} else {
 		bpf_pads_log(env);
+	}
 	env->err = ret;
 	return ret;
 }

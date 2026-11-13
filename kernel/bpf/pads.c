@@ -1588,6 +1588,168 @@ bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux)
 	return false;
 }
 
+/* The loop @l is the loop @h, or a loop inside it */
+static bool loop_is_in(struct bpf_verifier_env *env, int l, int h)
+{
+	return l == h || bpf_is_nested_loop(env, l, h);
+}
+
+/*
+ * Is @n a conditional jump that leaves the loop @h? From the loop itself, as
+ * bpf_insn_leaves_loop() asks, or from a loop inside it: a loop can have its only way out there.
+ */
+static bool jump_leaves_loop(struct bpf_verifier_env *env, int h, int n)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[n];
+
+	if (!bpf_insn_is_cond_jump(insn->code) || BPF_OP(insn->code) == BPF_JCOND ||
+	    !loop_is_in(env, bpf_loop_at_index(env, n), h))
+		return false;
+	return !loop_is_in(env, bpf_loop_at_index(env, n + insn->off + 1), h) ||
+	       !loop_is_in(env, bpf_loop_at_index(env, n + 1), h);
+}
+
+/*
+ * The landing pad of the call of @plan has a conflict, and that is an error: what the call calls
+ * is unwound. Where that is at may_goto that the verifier adds, it depends on the
+ * values that got to the loop: may_goto is there because a state went around without a trip
+ * count. A function is verified for its calls together, and two calls of which each has a trip
+ * count can make such a state between them:
+ *
+ *	static long count(long step, long end)		count(1, 1000000);
+ *	{						count(-1, -999993);
+ *		long i = 0;
+ *							step is 1 or -1, end is one of two
+ *		do					numbers: any pair, and no trip count
+ *			i += step;
+ *		while (i != end);
+ *		return i;
+ *	}
+ *
+ * Kept apart no call is left at may_goto, the call is no site, and what its frame holds does not
+ * matter. Nothing in the call tells: its arguments are constants. So the jumps that leave such a
+ * loop are a cause of the error as well, in each function that came back unwound to the call or
+ * to a call below it. What they read decides the trip count, and the next pass keeps it apart,
+ * see bpf_note_unproven_cause(), down to the arguments of the function. Such a jump can be in a
+ * loop inside the one that has may_goto, see jump_leaves_loop().
+ * Only a loop of which the pass knows that it has no trip count counts, see
+ * bpf_flow_guard_is_guess().
+ */
+static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	struct bpf_subprog_info *sub = env->subprog_info;
+	int s;
+
+	if (plan->kind != BPF_SITE_CALL)
+		return;
+	bpf_pad_for_each_callee(plan, s)
+		sub[s].below_conflict = true;
+}
+
+/*
+ * The causes of all conflicts of the pass, see note_causes(), which has marked the functions that
+ * came back to their calls. One walk serves them all: what a function has of causes is the same
+ * for every conflict above it, a function is scanned once for the jumps that leave its loops, and
+ * a pass can have a conflict at every call.
+ */
+static void note_causes_below(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_subprog_info *sub = env->subprog_info;
+	int i, n, h, s, c, top = 0, cnt = env->subprog_cnt;
+	const struct bpf_pad_plan *below;
+	bool guards;
+	int *stack;
+
+	for (s = 0; s < cnt && !sub[s].below_conflict; s++)
+		;
+	if (s == cnt)
+		return;
+	/* a function is walked once, for its calls: it is on the stack once, when it gets its mark */
+	stack = kvmalloc_array(cnt, sizeof(*stack), BPF_VERIFIER_GFP);
+	if (!stack) {
+		env->no_mem = true;
+		return;
+	}
+	for (; s < cnt; s++)
+		if (sub[s].below_conflict)
+			stack[top++] = s;
+	while (top) {
+		s = stack[--top];
+		/*
+		 * A signal ends the load. The budget of the pass does not: the pass that has the
+		 * error can be over it, and the passes behind it need the notes all the same.
+		 */
+		bpf_add_cost(env, sub[s + 1].start - sub[s].start, BPF_COST_SCAN);
+		env->aborted |= bpf_must_abort();
+		if (env->aborted)
+			break;
+		for (i = sub[s].start; i < sub[s + 1].start; i++) {
+			for (below = aux[i].pad_plans; below; below = below->next) {
+				if (below->kind != BPF_SITE_CALL || !below->visited)
+					continue;
+				/*
+				 * The frame is left at this call, whatever what it calls
+				 * was left at: the check of a recursion is no insn to
+				 * note. The jumps that can skip the call are a cause.
+				 */
+				bpf_note_controlled_cause(env, i);
+				bpf_pad_for_each_callee(below, c) {
+					if (sub[c].below_conflict)
+						continue;
+					sub[c].below_conflict = true;
+					stack[top++] = c;
+				}
+			}
+		}
+	}
+	kvfree(stack);
+	for (s = 0; s < cnt; s++) {
+		guards = false;
+		for (i = sub[s].start; sub[s].below_conflict && i < sub[s + 1].start; i++) {
+			if (!aux[i].loop_guard || bpf_flow_guard_is_guess(env, i))
+				continue;
+			h = bpf_loop_at_index(env, i);
+			aux[h].loop->guard_is_cause = guards = true;
+		}
+		if (!guards)
+			continue;
+		/* a jump is asked about the marked loops that it is in: LOOP_STACK_SIZE at most */
+		bpf_add_cost(env, sub[s + 1].start - sub[s].start, BPF_COST_SCAN);
+		for (n = sub[s].start; n < sub[s + 1].start; n++) {
+			for (h = bpf_loop_at_index(env, n); h >= 0; h = aux[h].loop_header) {
+				if (!aux[h].loop->guard_is_cause || !jump_leaves_loop(env, h, n))
+					continue;
+				bpf_note_unproven_cause(env, n);
+				break;
+			}
+		}
+		for (n = sub[s].start; n < sub[s + 1].start; n++)
+			if (aux[n].loop)
+				aux[n].loop->guard_is_cause = false;
+	}
+}
+
+/*
+ * The pass is over and has an error. Note the causes of the conflicts that are one: those that a
+ * state made an error where it visited, see unwind_frame(), and those that bpf_pads_settle() found.
+ */
+void bpf_pads_note_causes(struct bpf_verifier_env *env)
+{
+	const struct bpf_pad_plan *plan;
+	int i, s;
+
+	for (s = 0; s < env->subprog_cnt; s++)
+		env->subprog_info[s].below_conflict = false;
+	for (i = 0; i < env->prog->len; i++)
+		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
+			if (plan->failed || (plan->used && plan->conflict))
+				note_causes(env, plan);
+	note_causes_below(env);
+	/* the caller looks at the limits before it goes on. This is for a load that is to end. */
+	bpf_check_limits(env);
+}
+
 /* The plans of the sites that the program has */
 void bpf_pads_log(struct bpf_verifier_env *env)
 {

@@ -553,6 +553,7 @@ struct bpf_pad_plan {
 	u8 conflict;			/* enum bpf_pad_conflict */
 	bool visited;
 	bool used;			/* the program leaves the frame there, see bpf_pads_mark_used() */
+	bool failed;			/* a state made the conflict an error of the pass */
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
@@ -1041,6 +1042,7 @@ struct bpf_loop {
 	bool partitioned;	/* the last partition was for this loop */
 	bool peeled_joined;	/* at the start of a peeled trip, against the join rule */
 	bool changed;		/* see flow_forget_loop() */
+	bool guard_is_cause;	/* scratch of bpf_pads_note_causes(): its jumps out are noted */
 	bool guarded;		/* states take the edges of may_goto */
 	bool was_infinite;	/* at the start of the last path-sensitive run */
 	bool infinite;		/* see failing_path_trip() */
@@ -1374,6 +1376,8 @@ struct bpf_subprog_info {
 	bool did_unwind: 1;
 	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
 	bool unwinds_for_sure: 1;
+	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
+	bool below_conflict: 1;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -1958,6 +1962,8 @@ void bpf_note_unproven_insn(struct bpf_verifier_env *env,
 			    const struct bpf_verifier_state *st, u32 idx);
 bool bpf_insn_is_unproven(struct bpf_verifier_env *env);
 void bpf_note_fixups_differ(struct bpf_verifier_env *env);
+void bpf_note_unproven_cause(struct bpf_verifier_env *env, u32 idx);
+void bpf_note_controlled_cause(struct bpf_verifier_env *env, u32 idx);
 void bpf_find_unproven_after_pass(struct bpf_verifier_env *env);
 int bpf_partition_for_pessimized(struct bpf_verifier_env *env);
 void bpf_restore_precision(struct bpf_verifier_env *env);
@@ -2069,6 +2075,7 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 void bpf_pads_mark_used(struct bpf_verifier_env *env);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
+void bpf_pads_note_causes(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 void bpf_pads_log(struct bpf_verifier_env *env);
 
