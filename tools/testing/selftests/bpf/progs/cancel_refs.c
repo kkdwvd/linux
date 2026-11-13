@@ -33,6 +33,11 @@ unsigned long behind;
 /* How many times the code behind a loop ran */
 unsigned long after;
 
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} ringbuf SEC(".maps");
+
 /* @var++ in assembly, with r1 and r2 */
 #define COUNT(var)				\
 	"r1 = %[" #var "] ll;"			\
@@ -230,11 +235,223 @@ __naked void iter_in_callers_stack(void)
 	);
 }
 
+/*
+ * A dynptr that holds a ringbuf record is released like the prog does it: the pad calls
+ * bpf_ringbuf_discard_dynptr() with the address of the dynptr, fp-16, and 0.
+ */
+SEC("tc")
+__description("cancel refs: the ringbuf dynptr of a frame that waits in a call is discarded")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("r2 = 0")
+__xlated("call unknown")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void ringbuf_dynptr_at_call(void)
+{
+	asm volatile (
+		"r6 = r10;"
+		"r6 += -16;"
+		"r1 = %[ringbuf] ll;"
+		"r2 = 8;"
+		"r3 = 0;"
+		"r4 = r6;"
+		"call %[bpf_ringbuf_reserve_dynptr];"
+		"call dives;"
+		COUNT(behind)
+		"r1 = r6;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard_dynptr];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_reserve_dynptr),
+		  __imm(bpf_ringbuf_discard_dynptr),
+		  __imm_addr(ringbuf),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* A dynptr and its clone are one record. The pad discards it once, through one of them. */
+SEC("tc")
+__description("cancel refs: a ringbuf dynptr that has a clone is discarded once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int dynptr_clone_at_call(struct __sk_buff *skb)
+{
+	struct bpf_dynptr ptr, clone;
+
+	bpf_ringbuf_reserve_dynptr(&ringbuf, 8, 0, &ptr);
+	bpf_dynptr_clone(&ptr, &clone);
+	dives();
+	behind++;
+	bpf_ringbuf_discard_dynptr(&clone, 0);
+	return TC_ACT_OK;
+}
+
+/*
+ * The file of a vma is good as long as the iterator stays where it is, so the reader of the
+ * file goes first: the pad frees the reader of the dynptr at fp-24, then it destroys the
+ * iterator at fp-8. The task is the one that runs the prog, which has a vma with a file.
+ */
+SEC("tc")
+__description("cancel refs: a file dynptr is discarded in front of the iterator that its file is from")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("r1 = r10")
+__xlated("r1 += -24")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void file_dynptr_in_vma_loop(void)
+{
+	asm volatile (
+		"call %[bpf_get_current_task_btf];"
+		"r2 = r0;"
+		"r6 = r10;"
+		"r6 += -8;"
+		"r1 = r6;"
+		"r3 = 0;"
+		"call %[bpf_iter_task_vma_new];"
+	"1:"
+		"r1 = r6;"
+		"call %[bpf_iter_task_vma_next];"
+		"if r0 == 0 goto 2f;"
+		"r1 = *(u64 *)(r0 + %[vm_file]);"
+		"if r1 == 0 goto 1b;"
+		"r7 = r10;"
+		"r7 += -24;"
+		"r2 = 0;"
+		"r3 = r7;"
+		"call %[bpf_dynptr_from_file];"
+		"call dives;"
+		COUNT(behind)
+		"r1 = r7;"
+		"call %[bpf_dynptr_file_discard];"
+	"2:"
+		"r1 = r6;"
+		"call %[bpf_iter_task_vma_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_iter_task_vma_new),
+		  __imm(bpf_iter_task_vma_next),
+		  __imm(bpf_iter_task_vma_destroy),
+		  __imm(bpf_dynptr_from_file),
+		  __imm(bpf_dynptr_file_discard),
+		  __imm_const(vm_file, offsetof(struct vm_area_struct, vm_file)),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
 /* clang makes no BTF for a kfunc that only asm calls, and libbpf needs it to link the prog */
 void __kfunc_btf_root(void)
 {
 	bpf_iter_num_new(0, 0, 0);
 	bpf_iter_num_destroy(0);
+	bpf_iter_task_vma_new(0, 0, 0);
+	bpf_iter_task_vma_next(0);
+	bpf_iter_task_vma_destroy(0);
+	bpf_dynptr_from_file(0, 0, 0);
+	bpf_dynptr_file_discard(0);
+}
+
+__naked __noinline __used
+static unsigned long makes_dynptr(void)
+{
+	asm volatile (
+		"r4 = r1;"
+		"r1 = %[ringbuf] ll;"
+		"r2 = 8;"
+		"r3 = 0;"
+		"call %[bpf_ringbuf_reserve_dynptr];"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_reserve_dynptr),
+		  __imm_addr(ringbuf),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* Like iter_in_callers_stack(): the pad of makes_dynptr() has no address for the dynptr */
+SEC("?tc")
+__description("cancel refs: a dynptr in the stack of the caller is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(dynptr)")
+__naked void dynptr_in_callers_stack(void)
+{
+	asm volatile (
+		"r6 = r10;"
+		"r6 += -16;"
+		"r1 = r6;"
+		"call makes_dynptr;"
+		"r1 = r6;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard_dynptr];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_discard_dynptr)
+		: __clobber_all
+	);
+}
+
+/* The runner looks at what the progs above held through the next two */
+
+int cur_usage;
+int cur_mm_users;
+
+/* The references to the task that runs the progs, and the users of its mm */
+SEC("tc")
+int probe_current(struct __sk_buff *skb)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	struct mm_struct *mm = task->mm;
+
+	cur_usage = task->usage.refs.counter;
+	cur_mm_users = mm ? mm->mm_users.counter : -1;
+	return TC_ACT_OK;
+}
+
+/* The ring buffer takes a record and hands it to the consumer */
+SEC("tc")
+int ringbuf_submit(struct __sk_buff *skb)
+{
+	long *rec;
+
+	rec = bpf_ringbuf_reserve(&ringbuf, sizeof(*rec), 0);
+	if (!rec)
+		return TC_ACT_OK;
+	*rec = 1;
+	bpf_ringbuf_submit(rec, 0);
+	return TC_ACT_OK;
 }
 
 /* What the progs take: the task with this pid, another task, and the cgroup with this id */
