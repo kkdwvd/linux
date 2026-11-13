@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include <linux/pkt_cls.h>
+#include <sys/epoll.h>
+#include <sys/resource.h>
 #include "cgroup_helpers.h"
+#include "network_helpers.h"
 #include "cancel_refs.skel.h"
 
 #define CGROUP	"/cancel_refs"
@@ -212,9 +215,10 @@ out:
 
 /*
  * A cgroup that was removed is released when the last reference to it is gone, and never if
- * a pad left one behind.
+ * a pad left one behind. A reference to its memory cgroup keeps it as well, and it has one:
+ * setup_cgroup_environment() enables every controller. @prog takes the one or the other.
  */
-static void test_cgroup(struct cancel_refs *skel)
+static void test_cgroup(struct cancel_refs *skel, struct bpf_program *prog)
 {
 	struct bpf_link *link;
 	int fd, i;
@@ -233,11 +237,11 @@ static void test_cgroup(struct cancel_refs *skel)
 		goto out;
 	}
 
-	cancelled(skel, skel->progs.cgroup_at_call);
+	cancelled(skel, prog);
 	remove_cgroup(CGROUP);
 	for (i = 0; i < 1000 && !skel->bss->cgroup_released; i++)
 		usleep(10000);
-	ASSERT_EQ(skel->bss->cgroup_released, 1, "cgroup_at_call");
+	ASSERT_EQ(skel->bss->cgroup_released, 1, bpf_program__name(prog));
 	bpf_link__destroy(link);
 out:
 	cleanup_cgroup_environment();
@@ -250,6 +254,176 @@ static void test_cpumask(struct cancel_refs *skel)
 	skel->bss->cpumask_usage = -1;
 	ASSERT_EQ(run(skel->progs.probe_cpumask), 0, "probe_cpumask");
 	ASSERT_EQ(skel->bss->cpumask_usage, 1, "cpumask_at_call");
+}
+
+/* The references to the object of the test kfuncs, as probe_test_ref() counts them */
+static int test_ref_users(struct cancel_refs *skel)
+{
+	skel->bss->test_ref_cnt = -1;
+	run(skel->progs.probe_test_ref);
+	return skel->bss->test_ref_cnt;
+}
+
+static void test_test_ref(struct cancel_refs *skel)
+{
+	int users = test_ref_users(skel);
+
+	if (!ASSERT_GT(users, 0, "test_ref_users"))
+		return;
+	cancelled(skel, skel->progs.test_ref_at_call);
+	ASSERT_EQ(test_ref_users(skel), users, "test_ref_at_call");
+}
+
+/* The references to the file that this task was executed from, as probe_exe_file() counts them */
+static long exe_file_users(struct cancel_refs *skel)
+{
+	skel->bss->exe_file_refs = -1;
+	run(skel->progs.probe_exe_file);
+	return skel->bss->exe_file_refs;
+}
+
+/*
+ * An LSM prog has no test run. It is attached to the hook of setpriority(), which this thread
+ * calls: the prog is cancelled, and the hook refuses with the cancel value of an LSM prog.
+ */
+static void test_file(struct cancel_refs *skel)
+{
+	struct bpf_program *prog = skel->progs.file_at_call;
+	long users, users_now = -1;
+	struct bpf_link *link;
+	int err, i;
+
+	users = exe_file_users(skel);
+	if (!ASSERT_GE(users, 0, "exe_file_users"))
+		return;
+	link = bpf_program__attach(prog);
+	if (!ASSERT_OK_PTR(link, "attach"))
+		return;
+	skel->bss->tid = sys_gettid();
+	skel->bss->behind = 0;
+	errno = 0;
+	err = setpriority(PRIO_PROCESS, 0, 0);
+	ASSERT_EQ(err, -1, "file_at_call setpriority");
+	ASSERT_EQ(errno, EPERM, "file_at_call errno");
+	bpf_link__destroy(link);
+	ASSERT_EQ(skel->bss->behind, 0, "file_at_call behind");
+	ASSERT_HAS_SUBSTR(read_stream(prog), "ERROR: Program was cancelled", "file_at_call stream");
+
+	/* a mapping of the file that comes or goes changes the count. What a pad left stays. */
+	for (i = 0; i < 100; i++) {
+		users_now = exe_file_users(skel);
+		if (users_now == users)
+			break;
+		usleep(10000);
+	}
+	ASSERT_EQ(users_now, users, "file_at_call");
+}
+
+static void test_ksock(struct cancel_refs *skel)
+{
+	cancelled(skel, skel->progs.ksock_at_call);
+	/* the map has a reference, which the probe takes. The one of the prog is gone. */
+	skel->bss->ksock_usage = -1;
+	ASSERT_EQ(run(skel->progs.probe_ksock), 0, "probe_ksock");
+	ASSERT_EQ(skel->bss->ksock_usage, 1, "ksock_at_call");
+}
+
+/* The references to the conntrack entry of the progs, as probe_ct() counts them */
+static int ct_users(struct cancel_refs *skel)
+{
+	skel->bss->ct_use = -1;
+	run(skel->progs.probe_ct);
+	return skel->bss->ct_use;
+}
+
+/* The references to the xfrm state of the progs, as probe_xfrm_state() counts them */
+static int xfrm_state_users(struct cancel_refs *skel)
+{
+	skel->bss->xfrm_refcnt = -1;
+	run(skel->progs.probe_xfrm_state);
+	return skel->bss->xfrm_refcnt;
+}
+
+#define NETNS		"cancel_refs"
+#define XFRM_SRC	"198.51.100.1"
+#define XFRM_DST	"198.51.100.2"
+#define XFRM_SPI	0x1234
+#define XFRM_AUTH	"0x1111111111111111111111111111111111111111"
+#define XFRM_ENC	"0x22222222222222222222222222222222"
+
+/*
+ * A conntrack entry and an xfrm state, in a network namespace that takes them with it. A test
+ * run has the loopback device of the namespace that the runner is in.
+ */
+static void test_net(struct cancel_refs *skel)
+{
+	struct netns_obj *ns;
+	int users;
+
+	ns = netns_new(NETNS, true);
+	if (!ASSERT_OK_PTR(ns, "netns_new"))
+		return;
+
+	inet_pton(AF_INET, XFRM_SRC, &skel->bss->tuple_saddr);
+	inet_pton(AF_INET, XFRM_DST, &skel->bss->tuple_daddr);
+	skel->bss->tuple_sport = htons(7);
+	skel->bss->tuple_dport = htons(9);
+	run(skel->progs.ct_insert);
+	users = ct_users(skel);
+	if (ASSERT_GT(users, 0, "ct_users")) {
+		cancelled(skel, skel->progs.ct_at_call);
+		ASSERT_EQ(ct_users(skel), users, "ct_at_call");
+	}
+
+	SYS(out, "ip xfrm state add src %s dst %s proto esp spi %d mode tunnel "
+		 "auth-trunc 'hmac(sha1)' %s 96 enc 'cbc(aes)' %s",
+	    XFRM_SRC, XFRM_DST, XFRM_SPI, XFRM_AUTH, XFRM_ENC);
+	inet_pton(AF_INET, XFRM_DST, &skel->bss->xfrm_daddr);
+	skel->bss->xfrm_spi = htonl(XFRM_SPI);
+	users = xfrm_state_users(skel);
+	if (ASSERT_GT(users, 0, "xfrm_state_users")) {
+		cancelled(skel, skel->progs.xfrm_state_at_call);
+		ASSERT_EQ(xfrm_state_users(skel), users, "xfrm_state_at_call");
+	}
+out:
+	netns_free(ns);
+}
+
+/*
+ * Removing a wakeup source waits for every holder of the lock. An epoll instance has one for
+ * itself and one for an EPOLLWAKEUP entry, and close() removes them. A child does that:
+ * nothing would end its wait for a lock that a pad left held.
+ */
+static bool wakeup_sources_go(void)
+{
+	struct epoll_event ev = { .events = EPOLLIN | EPOLLWAKEUP };
+	int fds[2], ep, status, i;
+	pid_t pid;
+
+	pid = fork();
+	if (pid == 0) {
+		ep = epoll_create1(0);
+		if (ep < 0 || pipe(fds) || epoll_ctl(ep, EPOLL_CTL_ADD, fds[0], &ev))
+			_exit(1);
+		close(ep);
+		_exit(0);
+	}
+	if (!ASSERT_GT(pid, 0, "fork"))
+		return false;
+	for (i = 0; i < 1000; i++) {
+		if (waitpid(pid, &status, WNOHANG) == pid)
+			return WIFEXITED(status) && !WEXITSTATUS(status);
+		usleep(10000);
+	}
+	return false;
+}
+
+static void test_wakeup_sources(struct cancel_refs *skel)
+{
+	if (!ASSERT_TRUE(wakeup_sources_go(), "wakeup_sources_go"))
+		return;
+	cancelled(skel, skel->progs.ws_lock_at_call);
+	ASSERT_TRUE(wakeup_sources_go(), "ws_lock_at_call");
 }
 
 void serial_test_cancel_refs(void)
@@ -283,9 +457,21 @@ void serial_test_cancel_refs(void)
 	if (test__start_subtest("tasks"))
 		test_tasks(skel);
 	if (test__start_subtest("cgroup"))
-		test_cgroup(skel);
+		test_cgroup(skel, skel->progs.cgroup_at_call);
 	if (test__start_subtest("cpumask"))
 		test_cpumask(skel);
+	if (test__start_subtest("test kfunc"))
+		test_test_ref(skel);
+	if (test__start_subtest("memcg"))
+		test_cgroup(skel, skel->progs.memcg_at_call);
+	if (test__start_subtest("file"))
+		test_file(skel);
+	if (test__start_subtest("ksock"))
+		test_ksock(skel);
+	if (test__start_subtest("net"))
+		test_net(skel);
+	if (test__start_subtest("wakeup sources"))
+		test_wakeup_sources(skel);
 out:
 	ring_buffer__free(rb);
 	cancel_refs__destroy(skel);
