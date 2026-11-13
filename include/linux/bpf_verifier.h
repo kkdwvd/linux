@@ -1761,6 +1761,7 @@ int bpf_cancel_build_pads(struct bpf_verifier_env *env, int subprog,
 			  const struct bpf_insn **insns);
 int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int subprog, struct bpf_insn *buf);
 int bpf_cancel_insert_gotos(struct bpf_verifier_env *env);
+int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env);
 void bpf_cancel_reset(struct bpf_verifier_env *env);
 void bpf_cancel_free(struct bpf_verifier_env *env);
 void bpf_cancel_print_stats(struct bpf_verifier_env *env);
