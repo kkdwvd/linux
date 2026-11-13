@@ -611,7 +611,8 @@ void test_stream_partial_read(void)
 	stream__destroy(skel);
 }
 
-static void test_address(struct bpf_program *prog, unsigned long *fault_addr_p)
+/* @retval: 0, or 1 from a prog that looks at the register which the fault cleared */
+static void test_address(struct bpf_program *prog, unsigned long *fault_addr_p, int retval)
 {
 	LIBBPF_OPTS(bpf_test_run_opts, opts);
 	LIBBPF_OPTS(bpf_prog_stream_read_opts, ropts);
@@ -623,7 +624,7 @@ static void test_address(struct bpf_program *prog, unsigned long *fault_addr_p)
 
 	ret = bpf_prog_test_run_opts(prog_fd, &opts);
 	ASSERT_OK(ret, "ret");
-	ASSERT_OK(opts.retval, "retval");
+	ASSERT_EQ(opts.retval, retval, "retval");
 
 	sprintf(fault_addr, "0x%lx", *fault_addr_p);
 
@@ -653,15 +654,15 @@ void test_stream_arena_fault_address(void)
 		return;
 
 	if (test__start_subtest("read_fault"))
-		test_address(skel->progs.stream_arena_read_fault, &skel->bss->fault_addr);
+		test_address(skel->progs.stream_arena_read_fault, &skel->bss->fault_addr, 0);
 	if (test__start_subtest("write_fault"))
-		test_address(skel->progs.stream_arena_write_fault, &skel->bss->fault_addr);
+		test_address(skel->progs.stream_arena_write_fault, &skel->bss->fault_addr, 0);
 	if (test__start_subtest("load_acquire_fault"))
-		test_address(skel->progs.stream_arena_load_acquire_fault, &skel->bss->fault_addr);
+		test_address(skel->progs.stream_arena_load_acquire_fault, &skel->bss->fault_addr, 1);
 	if (test__start_subtest("xchg_fault"))
-		test_address(skel->progs.stream_arena_xchg_fault, &skel->bss->fault_addr);
+		test_address(skel->progs.stream_arena_xchg_fault, &skel->bss->fault_addr, 1);
 	if (test__start_subtest("cmpxchg_fault"))
-		test_address(skel->progs.stream_arena_cmpxchg_fault, &skel->bss->fault_addr);
+		test_address(skel->progs.stream_arena_cmpxchg_fault, &skel->bss->fault_addr, 1);
 
 	stream__destroy(skel);
 }

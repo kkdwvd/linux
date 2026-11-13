@@ -357,11 +357,14 @@ __naked void arena_ptr(void)
 /*
  * Result of a 32-bit cmpxchg is always explicitly zero extended.
  * Check that this holds for arenas (BPF_PROBE_ATOMIC instruction flavor).
+ * Where a fault cancels the program, cancel_goto of the access is in between.
  */
 SEC("socket")
 __success
 __xlated("probe r0 = atomic_cmpxchg((u32 *)(r1 +0), r0, r2)")
+__xlated("...")
 __xlated("w0 = w0")
+__xlated("r0 >>= 32")
 __naked void zext_arena_cmpxchg32(void)
 {
 	asm volatile ("					\
