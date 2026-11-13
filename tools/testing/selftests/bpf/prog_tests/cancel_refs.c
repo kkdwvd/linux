@@ -61,13 +61,15 @@ static bool is_tc(struct bpf_program *prog)
 /*
  * @prog is cancelled: it returns the cancel value of its type where its last insn returns
  * something else, its pad says so in the stream, and nothing ran behind a call of the
- * recursion.
+ * recursion or behind the loop.
  */
 static void cancelled(struct cancel_refs *skel, struct bpf_program *prog)
 {
 	skel->bss->behind = 0;
+	skel->bss->after = 0;
 	ASSERT_EQ(run(prog), is_tc(prog) ? TC_ACT_SHOT : 0, what(prog, "retval"));
 	ASSERT_EQ(skel->bss->behind, 0, what(prog, "behind"));
+	ASSERT_EQ(skel->bss->after, 0, what(prog, "after"));
 	ASSERT_HAS_SUBSTR(read_stream(prog), "ERROR: Program was cancelled", what(prog, "stream"));
 }
 
@@ -120,6 +122,9 @@ static void test_dynptrs(struct cancel_refs *skel, struct ring_buffer *rb)
 	ringbuf_is_clean(skel, rb, "ringbuf_dynptr_at_call");
 	cancelled(skel, skel->progs.dynptr_clone_at_call);
 	ringbuf_is_clean(skel, rb, "dynptr_clone_at_call");
+	/* 250 ms */
+	cancelled(skel, skel->progs.iter_dynptr_at_guard);
+	ringbuf_is_clean(skel, rb, "iter_dynptr_at_guard");
 
 	/*
 	 * bpf_iter_task_vma holds the task and its mm until it is destroyed. Nothing tells
@@ -246,6 +251,9 @@ static void test_tasks(struct cancel_refs *skel)
 	ASSERT_EQ(task_users(skel), users, "task_maybe_null_spilled");
 	cancelled(skel, skel->progs.tasks_in_regs_and_slots);
 	ASSERT_EQ(task_users(skel), users, "tasks_in_regs_and_slots");
+	/* 250 ms */
+	cancelled(skel, skel->progs.tasks_at_guard);
+	ASSERT_EQ(task_users(skel), users, "tasks_at_guard");
 	/* the callee that was given the task releases it */
 	cancelled(skel, skel->progs.only_copy_in_arg);
 	ASSERT_EQ(task_users(skel), users, "only_copy_in_arg");
@@ -508,6 +516,10 @@ static void test_sockets(struct cancel_refs *skel, struct ring_buffer *rb)
 	ASSERT_EQ(sock_users(skel), users, "sock_at_call");
 	cancelled(skel, skel->progs.skc_at_call);
 	ASSERT_EQ(sock_users(skel), users, "skc_at_call");
+	/* 250 ms */
+	cancelled(skel, skel->progs.sock_ringbuf_at_guard);
+	ASSERT_EQ(sock_users(skel), users, "sock_ringbuf_at_guard");
+	ringbuf_is_clean(skel, rb, "sock_ringbuf_at_guard");
 
 	/* Nothing has port 0: the handle is NULL, and the pad calls nothing with it. */
 	skel->bss->tuple_dport = 0;
@@ -742,6 +754,9 @@ static void test_objects(struct cancel_refs *skel)
 
 	/* a per-CPU object leaves nothing behind that could be found */
 	cancelled(skel, skel->progs.percpu_obj_at_call);
+	/* 250 ms */
+	cancelled(skel, skel->progs.objs_at_guard);
+	ASSERT_EQ(task_users(skel), users, "objs_at_guard");
 out:
 	stop_child(&child);
 }
@@ -765,6 +780,10 @@ out:
 	stop_child(&child);
 }
 
+/*
+ * Serial: some progs spin for 250 ms in an RCU read-side critical section, see
+ * timed_may_goto.c.
+ */
 void serial_test_cancel_refs(void)
 {
 	struct ring_buffer *rb = NULL;

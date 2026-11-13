@@ -2,7 +2,9 @@
 #include <test_progs.h>
 #include <linux/pkt_cls.h>
 #include "cancel.skel.h"
+#include "cancel_attach.skel.h"
 
+static char log_buf[16 * 1024];
 static char stream[64 * 1024];
 
 static int run(struct bpf_program *prog)
@@ -66,6 +68,86 @@ static void test_timer(struct cancel *skel)
 	ASSERT_EQ(skel->bss->behind, 0, "behind");
 }
 
+/*
+ * Load prog @name of cancel_attach.c for global_spins() of @tgt. Returns the skeleton, with
+ * what the load returned in @err and what the verifier said in log_buf.
+ */
+static struct cancel_attach *load_for_target(struct bpf_program *tgt, const char *name, int *err)
+{
+	struct cancel_attach *skel;
+	struct bpf_program *prog;
+
+	skel = cancel_attach__open();
+	if (!ASSERT_OK_PTR(skel, "cancel_attach__open"))
+		return NULL;
+	prog = bpf_object__find_program_by_name(skel->obj, name);
+	if (!ASSERT_OK_PTR(prog, name))
+		goto err;
+	bpf_program__set_autoload(prog, true);
+	log_buf[0] = 0;
+	bpf_program__set_log_buf(prog, log_buf, sizeof(log_buf));
+	/* the stats */
+	bpf_program__set_log_level(prog, 4);
+	if (!ASSERT_OK(bpf_program__set_attach_target(prog, bpf_program__fd(tgt), "global_spins"),
+		       "set_attach_target"))
+		goto err;
+	*err = cancel_attach__load(skel);
+	return skel;
+err:
+	cancel_attach__destroy(skel);
+	return NULL;
+}
+
+/* The loop of the extension declines: the caller of its frame has no pad for it */
+static const char freplace_stats[] =
+	"cancel sites 1 padded 0 declined refs 0 section 0 cond 0 callback 0 caller 1";
+
+static void test_attach(struct cancel *tgt)
+{
+	struct bpf_program *tgt_prog = tgt->progs.calls_global_spins;
+	struct cancel_attach *skel;
+	struct bpf_link *link;
+	int err;
+
+	/* cancel_exit of the target would return to the trampoline, which returns to the caller */
+	skel = load_for_target(tgt_prog, "fexit_cancel", &err);
+	if (!skel)
+		return;
+	ASSERT_ERR(err, "fexit_cancel");
+	ASSERT_HAS_SUBSTR(log_buf, "Only fentry can attach to global_spins, which can be cancelled",
+			  "fexit_cancel");
+	cancel_attach__destroy(skel);
+
+	/*
+	 * The trampoline of fentry returns into the target, and the target to the pad of its
+	 * call. The loop spins until the time slice is over.
+	 */
+	skel = load_for_target(tgt_prog, "fentry_cancel", &err);
+	if (!skel)
+		return;
+	link = NULL;
+	if (ASSERT_OK(err, "fentry_cancel"))
+		link = bpf_program__attach(skel->progs.fentry_cancel);
+	if (!err && ASSERT_OK_PTR(link, "attach")) {
+		ASSERT_EQ(run(tgt_prog), TC_ACT_SHOT, "retval");
+		ASSERT_EQ(skel->bss->fentry_cnt, 1, "fentry_cnt");
+	}
+	bpf_link__destroy(link);
+	cancel_attach__destroy(skel);
+
+	/* An extension can replace the target. It is not cancelled itself. */
+	skel = load_for_target(tgt_prog, "freplace_spins", &err);
+	if (!skel)
+		return;
+	if (ASSERT_OK(err, "freplace_spins"))
+		ASSERT_HAS_SUBSTR(log_buf, freplace_stats, "freplace_spins");
+	cancel_attach__destroy(skel);
+}
+
+/*
+ * Serial: some progs spin for 250 ms in an RCU read-side critical section, see
+ * timed_may_goto.c.
+ */
 void serial_test_cancel(void)
 {
 	struct bpf_program *prog;
@@ -88,7 +170,8 @@ void serial_test_cancel(void)
 	bpf_object__for_each_program(prog, skel->obj)
 		bpf_program__set_autoload(prog, prog == skel->progs.recursion_tc ||
 						prog == skel->progs.recursion_socket ||
-						prog == skel->progs.timer_recursion);
+						prog == skel->progs.timer_recursion ||
+						prog == skel->progs.calls_global_spins);
 	if (!ASSERT_OK(cancel__load(skel), "cancel__load"))
 		goto out;
 
@@ -98,6 +181,8 @@ void serial_test_cancel(void)
 	}
 	if (test__start_subtest("timer"))
 		test_timer(skel);
+	if (test__start_subtest("attach"))
+		test_attach(skel);
 out:
 	cancel__destroy(skel);
 }

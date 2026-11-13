@@ -380,6 +380,33 @@ void __kfunc_btf_root(void)
 	bpf_dynptr_file_discard(0);
 }
 
+/*
+ * The frame at the point holds the two: when the loop is out of time may_goto of the verifier
+ * goes to the pad, and neither leaves the loop nor the prog with 0.
+ */
+SEC("tc")
+__description("cancel refs: an iterator and a dynptr of the frame at a loop are released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+int iter_dynptr_at_guard(struct __sk_buff *skb)
+{
+	volatile unsigned long *go = &one;
+	struct bpf_dynptr ptr;
+	struct bpf_iter_num it;
+
+	bpf_iter_num_new(&it, 0, 3);
+	bpf_ringbuf_reserve_dynptr(&ringbuf, 8, 0, &ptr);
+	while (*go)
+		;
+	after++;
+	bpf_ringbuf_discard_dynptr(&ptr, 0);
+	bpf_iter_num_destroy(&it);
+	return TC_ACT_OK;
+}
+
 __naked __noinline __used
 static unsigned long makes_dynptr(void)
 {
@@ -675,6 +702,56 @@ __naked void tasks_in_regs_and_slots(void)
 		  __imm(bpf_task_release),
 		  __imm_addr(pid),
 		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame at the point holds two tasks, one of them in r0. A release is a call, which
+ * clobbers r0, so the pad moves that handle to r7 first: r6 has the other one.
+ */
+SEC("tc")
+__description("cancel refs: a task in r0 at a loop is moved to r7 and released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r7 = r0")
+__xlated("r1 = r7")
+__xlated("call kernel-function")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void tasks_at_guard(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"r6 = r0;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 2f;"
+	"1:"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1b;"
+		COUNT(after)
+		"r1 = r0;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(one),
+		  __imm_addr(after)
 		: __clobber_all
 	);
 }
@@ -2959,6 +3036,159 @@ __naked void given_task_held_on_one_path(void)
 	);
 }
 
+/*
+ * The frame is as large as the stack of a prog may be: it has no room for the byte of a flag.
+ * The site is the loop here, which the frame gets to with and without the task.
+ */
+SEC("?tc")
+__description("cancel refs: a task that one path holds is rejected when the stack has no room")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this loop:")
+__msg("(stack)")
+__naked void held_on_one_path_full_stack(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"r7 = 0;"
+		"*(u64 *)(r10 - 2048) = r6;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r7 = 1;"
+	"1:"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1b;"
+		"if r7 == 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a task that the caller holds. It releases the task if give says so, spins behind that,
+ * and returns whether it released. It has no stack of its own.
+ */
+__naked __noinline __used
+static unsigned long may_release_and_spin(void)
+{
+	asm volatile (
+		"r2 = %[give] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"if r2 == 0 goto 2f;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = 1;"
+		"exit;"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(give),
+		  __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/*
+ * The pad of the call keeps what the callee tells in a hidden byte of its frame, like a flag,
+ * and the frame here has no room for one either.
+ */
+SEC("?tc")
+__description("cancel refs: a task that the callee may release is rejected when the stack has no room")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call: a callee tells what it released for the frame, and the stack of the frame has no room to keep that (stack)")
+__naked void callee_may_release_full_stack(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"*(u64 *)(r10 - 2048) = r6;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call may_release_and_spin;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * A pad moves the handles that are in r0-r5 to r6-r9 before its first call. Here r6-r9 have
+ * handles of their own, and the fifth one is in r0.
+ */
+SEC("?tc")
+__description("cancel refs: five tasks in registers at a loop are rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this loop:")
+__msg("(regs)")
+__naked void five_handles_in_regs(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"r6 = r0;"
+		TASK_FROM_PID
+		"r7 = r0;"
+		TASK_FROM_PID
+		"r8 = r0;"
+		TASK_FROM_PID
+		"r9 = r0;"
+		TASK_FROM_PID
+	"1:"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1b;"
+		RELEASE_TASK(r0)
+		RELEASE_TASK(r6)
+		RELEASE_TASK(r7)
+		RELEASE_TASK(r8)
+		RELEASE_TASK(r9)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(one)
+		: __clobber_all
+	);
+}
+
 /* The runner looks at what the progs above held through the next three */
 
 int task_rcu_users;
@@ -3088,6 +3318,37 @@ int ringbuf_at_call(struct __sk_buff *skb)
 	behind++;
 	if (rec)
 		bpf_ringbuf_discard(rec, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel refs: a socket and a ringbuf record of the frame at a loop are released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+int sock_ringbuf_at_guard(struct __sk_buff *skb)
+{
+	volatile unsigned long *go = &one;
+	struct bpf_sock_tuple tuple = {};
+	struct bpf_sock *sk;
+	void *rec;
+
+	fill_tuple(&tuple);
+	sk = bpf_sk_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (!sk)
+		return TC_ACT_OK;
+	rec = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	if (!rec) {
+		bpf_sk_release(sk);
+		return TC_ACT_OK;
+	}
+	while (*go)
+		;
+	after++;
+	bpf_ringbuf_discard(rec, 0);
+	bpf_sk_release(sk);
 	return TC_ACT_OK;
 }
 
@@ -3718,6 +3979,36 @@ __naked void pointer_into_task(void)
 		  __imm_addr(pid)
 		: __clobber_all
 	);
+}
+
+SEC("tc")
+__description("cancel refs: the objects of the frame at a loop are dropped")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+int objs_at_guard(struct __sk_buff *skb)
+{
+	volatile unsigned long *go = &one;
+	struct pcpu_val __percpu_kptr *p;
+	struct holder *h;
+
+	h = bpf_obj_new(typeof(*h));
+	if (!h)
+		return TC_ACT_OK;
+	hold_task(&h->task);
+	p = bpf_percpu_obj_new(struct pcpu_val);
+	if (!p) {
+		bpf_obj_drop(h);
+		return TC_ACT_OK;
+	}
+	while (*go)
+		;
+	after++;
+	bpf_percpu_obj_drop(p);
+	bpf_obj_drop(h);
+	return TC_ACT_OK;
 }
 
 /*
