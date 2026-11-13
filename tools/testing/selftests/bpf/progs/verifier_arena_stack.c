@@ -253,6 +253,43 @@ __naked void recursion(void)
 	: __clobber_all);
 }
 
+extern void bpf_rcu_read_lock(void) __ksym;
+extern void bpf_rcu_read_unlock(void) __ksym;
+
+/* The loop is in an RCU section on some paths: the frame in the kernel stack has a hidden slot */
+static __naked __noinline __used long goes_down_with_slot(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+	"r6 = %[first_r12] ll;"
+	"r7 = *(u64 *)(r6 + 0);"
+	"if r7 == 0 goto +1;"
+	"call %[bpf_rcu_read_lock];"
+"1:"
+	"r1 = *(u64 *)(r6 + 0);"
+	"if r1 != 0 goto 1b;"
+	"if r7 == 0 goto +1;"
+	"call %[bpf_rcu_read_unlock];"
+	"call goes_down_with_slot;"
+	"exit;"
+	:
+	: __imm_addr(first_r12), __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock),
+	  __imm_insn(adj, ADJ(1024))
+	: __clobber_all);
+}
+
+/* 'r12 += 1024' stays first: the check of the recursion takes the frame that its exit drops */
+SEC("syscall")
+__description("arena stack: recursion with a hidden slot in the kernel stack")
+__success
+__xlated("...")
+__xlated("*(u64 *)(r10 -8) = 0")
+__xlated("r6 = 0x")
+__naked void recursion_with_slot(void)
+{
+	asm volatile ("call goes_down_with_slot; exit;" ::: __clobber_all);
+}
+
 static __naked __noinline __used long large_frame(void)
 {
 	asm volatile (
@@ -455,6 +492,8 @@ void __kfunc_btf_root(void)
 	bpf_kfunc_call_stack_arg(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	bpf_kfunc_call_test_pair_arg_nofit(0, 0, 0, 0, s);
 	bpf_throw(0);
+	bpf_rcu_read_lock();
+	bpf_rcu_read_unlock();
 }
 
 static __naked __noinline __used
