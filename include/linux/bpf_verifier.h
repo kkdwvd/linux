@@ -1189,6 +1189,11 @@ struct bpf_subprog_info {
 	bool async_ret_nonzero: 1;
 	/* its stack check has a pad, see bpf_cancel_entry_pad() */
 	bool cancel_entry: 1;
+	/*
+	 * Verified on its own it released what a caller holds: it cannot be cancelled,
+	 * see bpf_cancel_foreign_release().
+	 */
+	bool cancel_foreign: 1;
 	u8 code_stack_args;
 	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1705,6 +1710,7 @@ enum bpf_cancel_site_type {
 #define BPF_CANCEL_PAD_EXIT_INSNS	3
 
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
+void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
 int bpf_cancel_resolve(struct bpf_verifier_env *env);
 int bpf_cancel_build_pads(struct bpf_verifier_env *env, int subprog,
 			  const struct bpf_insn **insns);
