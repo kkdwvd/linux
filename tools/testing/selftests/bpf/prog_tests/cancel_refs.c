@@ -181,6 +181,21 @@ static int task_users(struct cancel_refs *skel)
 	return skel->bss->task_rcu_users;
 }
 
+/*
+ * The callee was given the task in a stack argument and releases it. The prog is there when
+ * the compiler has stack arguments.
+ */
+static void test_only_copy_in_stack_arg(struct cancel_refs *skel, int users)
+{
+	struct bpf_program *prog;
+
+	prog = bpf_object__find_program_by_name(skel->obj, "only_copy_in_stack_arg");
+	if (!prog)
+		return;
+	cancelled(skel, prog);
+	ASSERT_EQ(task_users(skel), users, "only_copy_in_stack_arg");
+}
+
 static void test_tasks(struct cancel_refs *skel)
 {
 	struct child child;
@@ -203,6 +218,11 @@ static void test_tasks(struct cancel_refs *skel)
 	ASSERT_EQ(task_users(skel), users, "task_maybe_null_spilled");
 	cancelled(skel, skel->progs.tasks_in_regs_and_slots);
 	ASSERT_EQ(task_users(skel), users, "tasks_in_regs_and_slots");
+	/* the callee that was given the task releases it */
+	cancelled(skel, skel->progs.only_copy_in_arg);
+	ASSERT_EQ(task_users(skel), users, "only_copy_in_arg");
+	/* and so does the one that was given it in a stack argument */
+	test_only_copy_in_stack_arg(skel, users);
 
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;
