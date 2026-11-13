@@ -1671,6 +1671,7 @@ int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_s
 			     int call_idx, int frame, int from, u32 first,
 			     struct bpf_reg_state *r0);
 void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx);
+void bpf_cancel_record_move(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
 void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
 void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
 			   const struct bpf_verifier_state *b);
@@ -2343,6 +2344,7 @@ static inline void bpf_patch_list_free(struct bpf_verifier_env *env)
 int bpf_patch_list_del(struct bpf_verifier_env *env, u32 off);
 int bpf_patch_list_insert(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt);
+int bpf_adj_moved_insn(struct bpf_insn *insn, u32 delta);
 
 /*
  * Hidden stack that is zero when the subprog is entered, see fixups.c. Only between

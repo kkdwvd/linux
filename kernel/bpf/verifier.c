@@ -12147,8 +12147,8 @@ static int move_refs_to_callee(struct bpf_verifier_env *env, struct bpf_verifier
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (!bpf_cancel_ref_moves(env, state, i, subprog))
 			continue;
-		/* no insn of the callee brings it there: it has no drop flag from here on */
-		bpf_cancel_ref_moved(env, state, i);
+		/* the call takes it away from the caller, and no insn of the callee brings it there */
+		bpf_cancel_record_move(env, state, i);
 		state->refs[i].frameno = state->curframe + 1;
 	}
 	return 0;

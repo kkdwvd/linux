@@ -2229,39 +2229,15 @@ int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_s
 }
 
 /*
- * A visit of the current insn takes refs[@idx] of the current state away, or takes nothing
- * away when @idx is below 0 although other visits of the insn do. Every such visit is to be
- * noted: an insn in front of the call says at run time that the frame of the call does not
- * hold the resource any more, whatever the visit. That is right where every visit takes
- * away a resource of one class that its frame holds. Else nothing tells:
- * - A frame that does not hold the resource takes it away. Its owner is not told.
- * - The insn is no call of a helper or of a kfunc, where the insn in front has its place.
- *
- * Nothing is noted where a test for NULL takes a reference away: the call that acquired it
- * did not bring a resource, see bpf_cancel_record_acquire(). Or where a frame leaves with
- * what it holds, see bpf_cancel_record_return(), or leaves it to a callee, see
- * bpf_cancel_ref_moved().
+ * A visit of the current insn takes a resource of origin @x away from the frame of the insn,
+ * or nothing that has an origin: CANCEL_NO_ORIGIN.
  */
-void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx)
+static void cancel_add_release(struct bpf_verifier_env *env, u32 x)
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
-	const struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
-	const struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_cancel *c = env->cancel;
 	struct cancel_release *rel;
-	u32 x = CANCEL_NO_ORIGIN, r, cap;
-	int o = -1;
-
-	/* nothing has an origin */
-	if (!c)
-		return;
-	if (idx >= 0)
-		o = cancel_ref_origin(env, &st->refs[idx]);
-	if (o >= 0 && st->refs[idx].frameno == st->curframe &&
-	    (bpf_helper_call(insn) || bpf_pseudo_kfunc_call(insn)))
-		x = o;
-	else if (o >= 0)
-		c->origins[o].inexact = true;
+	u32 r, cap;
 
 	for (r = aux->cancel_release; r; r = rel->next) {
 		rel = &c->releases[r - 1];
@@ -2286,12 +2262,66 @@ void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx)
 }
 
 /*
- * No insn of the frame that is to release refs[@idx] of @st brings it there, or it leaves
- * the frame with no insn that takes it away: the kernel holds the reference for an argument
- * of the program, or the frame leaves it to a callee at a call. Whatever makes another frame
- * the owner of an entry without bpf_cancel_record_return() has to tell before it does.
- * Nothing tells at run time whether a frame holds such a resource. The entry has no origin
- * from now on.
+ * A visit of the current insn takes refs[@idx] of the current state away, or takes nothing
+ * away when @idx is below 0 although other visits of the insn do. Every such visit is to be
+ * noted: an insn in front of the call says at run time that the frame of the call does not
+ * hold the resource any more, whatever the visit. That is right where every visit takes
+ * away a resource of one class that its frame holds. Else nothing tells:
+ * - A frame that does not hold the resource takes it away. Its owner is not told.
+ * - The insn is no call of a helper or of a kfunc, where the insn in front has its place.
+ *
+ * Nothing is noted where a test for NULL takes a reference away: the call that acquired it
+ * did not bring a resource, see bpf_cancel_record_acquire(). Or where a frame leaves with
+ * what it holds, see bpf_cancel_record_return(). The call of a subprog that a resource moves
+ * into has bpf_cancel_record_move().
+ */
+void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
+	const struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_cancel *c = env->cancel;
+	u32 x = CANCEL_NO_ORIGIN;
+	int o = -1;
+
+	/* nothing has an origin */
+	if (!c)
+		return;
+	if (idx >= 0)
+		o = cancel_ref_origin(env, &st->refs[idx]);
+	if (o >= 0 && st->refs[idx].frameno == st->curframe &&
+	    (bpf_helper_call(insn) || bpf_pseudo_kfunc_call(insn)))
+		x = o;
+	else if (o >= 0)
+		c->origins[o].inexact = true;
+	cancel_add_release(env, x);
+}
+
+/*
+ * The call at the current insn moves refs[@idx] of @st into its callee, see
+ * bpf_cancel_ref_moves(). The frame of the call gives the resource up there, as it does at a
+ * call that releases it, and the flag is cleared in front of the call, whatever the visit.
+ * That is right where no visit of the call leaves a resource of the class with the frame. A
+ * visit that keeps one takes no note here: the record of the call has what the frame holds
+ * behind the move, see cancel_move_keeps().
+ *
+ * No insn of the callee brings the resource to its frame, and nothing tells at run time
+ * whether that frame holds it: the entry has no origin from now on.
+ */
+void bpf_cancel_record_move(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx)
+{
+	int x = cancel_ref_origin(env, &st->refs[idx]);
+
+	if (x >= 0)
+		cancel_add_release(env, x);
+	st->refs[idx].origin = -1;
+}
+
+/*
+ * No insn of the frame that is to release refs[@idx] of @st brings it there: the kernel holds
+ * the reference for an argument of the program. Whatever makes another frame the owner of an
+ * entry without bpf_cancel_record_return() or bpf_cancel_record_move() has to tell before it
+ * does. Nothing tells at run time whether a frame holds such a resource. The entry has no
+ * origin from now on.
  */
 void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx)
 {
@@ -2439,9 +2469,9 @@ static const char *cancel_shape_text(u8 reason)
 	case CANCEL_RELEASE:
 		return "nothing that a pad may call there releases a reference of the frame";
 	case CANCEL_MULTI:
-		return "the frame holds a resource on some paths only, and may hold two that one insn brought, like two that a subprog returns with";
+		return "the frame holds a resource on some paths only, and may hold two that one insn brought or that one call takes away";
 	case CANCEL_INEXACT:
-		return "the frame holds a resource on some paths only, and no insn of the frame tells when: it was given to a callee, or a release leaves it on some paths";
+		return "the frame holds a resource on some paths only, and no insn of the frame tells when: its caller gave it to the frame, or a call that takes it away leaves it on some paths";
 	case CANCEL_PLACES:
 		return "the frame holds a resource on some paths only, in more than one place or behind locks that differ";
 	case CANCEL_STACK:
@@ -2756,8 +2786,9 @@ static int cancel_assign_pad(struct bpf_verifier_env *env, struct cancel_site *s
  * - No frame holds two resources of the class at a time: the flag cannot say which. The lock
  *   and the IRQ flags of bpf_res_spin_lock_irqsave() are one, see bpf_cancel_record_origin().
  * - The frame that holds a resource gives it up itself, at a call of a helper or of a
- *   kfunc, and no visit of that call leaves a resource of the class with the frame, see
- *   bpf_cancel_record_release(). What the visits of one call take away is one class.
+ *   kfunc, or at the call of a subprog that the resource moves into, and no visit of that
+ *   call leaves a resource of the class with the frame, see bpf_cancel_record_release() and
+ *   bpf_cancel_record_move(). What the visits of one call take away is one class.
  * - The frame has room for the flag.
  * At a site the class of an entry with a condition is in no other entry: its flag would
  * release two places.
@@ -2774,6 +2805,37 @@ static u8 cancel_class_reason(const struct cancel_origin *r)
 	if (r->inexact)
 		return CANCEL_INEXACT;
 	return r->no_room ? CANCEL_STACK : CANCEL_OK;
+}
+
+/*
+ * A visit of the call of a subprog at @rel->insn_idx moves a resource of @rel->origin into
+ * the callee, see bpf_cancel_record_move(), and the flag of its class is cleared in front of
+ * the call in every run. Does a visit keep a resource of the class over that call? The
+ * record of the call has what the frame holds behind the move in each visit, every entry
+ * with the class of its origins, and a state that never got to the call holds what the state
+ * that stands for it holds, of the same classes, see bpf_cancel_alias_refs(). A record that
+ * declined in the main pass lacks visits: the class may be among what they keep.
+ */
+static bool cancel_move_keeps(struct bpf_verifier_env *env, const struct cancel_release *rel)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[rel->insn_idx];
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_site *site;
+	const struct cancel_entry *e;
+	u32 i, r;
+
+	if (!bpf_pseudo_call(insn) && !bpf_is_callx(insn))
+		return false;
+	site = cancel_find_site(env, rel->insn_idx, BPF_CANCEL_SITE_CALL);
+	if (!site || site->decline)
+		return true;
+	r = cancel_class(c, rel->origin);
+	for (i = 0; i < site->held.nr; i++) {
+		e = &site->held.entries[i];
+		if (e->origin && cancel_class(c, e->origin - 1) == r)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -2802,6 +2864,12 @@ static void cancel_find_flag_classes(struct bpf_verifier_env *env)
 			else
 				cancel_union(c, rel->origin, other->origin);
 		}
+	}
+	/* no class changes from here on */
+	for (i = 0; i < c->nr_releases; i++) {
+		rel = &c->releases[i];
+		if (rel->origin != CANCEL_NO_ORIGIN && cancel_move_keeps(env, rel))
+			c->origins[rel->origin].inexact = true;
 	}
 	for (i = 0; i < c->nr_origins; i++) {
 		o = &c->origins[i];
@@ -3406,8 +3474,9 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
  * comes first, which only a cancellation takes.
  *
  * The flag is cleared right in front of the call, behind what jumps to the call and behind
- * its may_goto: the frame holds the resource until the call is made, and the call gets to no
- * pad before it returns.
+ * its may_goto: the frame holds the resource until the call is made. The call of a helper or
+ * of a kfunc gets to no pad before it returns. The call of a subprog that the resource moves
+ * into may get to the pad of the call, with the flag clear: the callee holds the resource.
  */
 int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env)
 {
@@ -3429,6 +3498,10 @@ int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env)
 		if (r && r->used && r->flag) {
 			buf[0] = BPF_ST_MEM(BPF_B, BPF_REG_FP, r->flag, 0);
 			buf[1] = env->prog->insnsi[i];
+			/* the call of a subprog names its callee by the distance */
+			err = bpf_adj_moved_insn(&buf[1], 1);
+			if (err)
+				return err;
 			insn = bpf_patch_list_add(env, i, buf, 2);
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
