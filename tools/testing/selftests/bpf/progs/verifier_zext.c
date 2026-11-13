@@ -361,7 +361,6 @@ __naked void arena_ptr(void)
 SEC("socket")
 __success
 __xlated("probe r0 = atomic_cmpxchg((u32 *)(r1 +0), r0, r2)")
-__xlated("unwind_goto pc+")
 __xlated("w0 = w0")
 __naked void zext_arena_cmpxchg32(void)
 {

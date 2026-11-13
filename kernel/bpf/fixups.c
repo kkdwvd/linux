@@ -292,6 +292,8 @@ static void patch_list_adj_aux(struct bpf_prog *prog, struct bpf_insn_patch *p,
 		if (i >= p->target && !memcmp(&patch[i], orig, sizeof(*orig))) {
 			slot[i].non_stack_access = last->non_stack_access;
 			last->non_stack_access = false;
+			slot[i].fault_unwinds = last->fault_unwinds;
+			last->fault_unwinds = false;
 		} else if (bpf_is_mem_insn(&patch[i])) {
 			slot[i].non_stack_access = true;
 		}
@@ -484,6 +486,10 @@ static void patch_list_remap_subprogs(struct bpf_verifier_env *env,
 	/* NOTE: fake 'exit' subprog should be updated as well. */
 	for (i = 0; i <= env->subprog_cnt; i++) {
 		info[i].start = bpf_patch_image_remap(img, img->new_off, info[i].start);
+		/* the program gets there like by a jump */
+		if (info[i].fault_pad)
+			info[i].fault_pad = bpf_patch_image_remap(img, img->new_tgt,
+								  info[i].fault_pad);
 		if (img->new_linfo)
 			info[i].linfo_idx =
 				img->new_linfo[min(info[i].linfo_idx, img->nr_linfo)];
@@ -704,14 +710,22 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 	int last = env->subprog_info[s + 1].start - 1, cnt = 0, i, n, pad, len;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_insn *buf = *pads, *insn;
-	struct bpf_pad_plan *plan;
+	struct bpf_pad_plan *plan, *shared = NULL;
 
 	for (i = env->subprog_info[s].start; i <= last; i++) {
 		if (aux[i].loop_guard && !unvisited_plan(env, i, BPF_SITE_GUARD))
 			return -ENOMEM;
-		/* nothing is held there: the same */
-		if (aux[i].fault_empty && !unvisited_plan(env, i, BPF_SITE_FAULT))
-			return -ENOMEM;
+		/*
+		 * Nothing is held there: the same. There are many such accesses. They get no insn,
+		 * a bit in the entry that they have in the exception table tells, and the pad of
+		 * the first one serves all of the function, see bpf_arena_fault().
+		 */
+		aux[i].fault_unwinds = aux[i].fault_empty && !aux[i].fault_skips;
+		if (aux[i].fault_unwinds && !shared) {
+			shared = unvisited_plan(env, i, BPF_SITE_FAULT);
+			if (!shared)
+				return -ENOMEM;
+		}
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 			if (!plan_has_pad(env, i, plan))
 				continue;
@@ -748,7 +762,7 @@ static const struct bpf_pad_plan *unwind_goto_plan(struct bpf_verifier_env *env,
 	const struct bpf_pad_plan *plan;
 
 	plan = bpf_pad_plan(aux, BPF_SITE_CALL) ?: bpf_pad_plan(aux, BPF_SITE_FAULT);
-	return plan && bpf_site_is_used(env, i, plan) ? plan : NULL;
+	return plan && bpf_site_is_used(env, i, plan) && !aux->fault_unwinds ? plan : NULL;
 }
 
 /*
@@ -921,11 +935,16 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	aux = env->insn_aux_data;
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++)
-			for (plan = aux[i].pad_plans; plan; plan = plan->next)
-				if (plan_has_pad(env, i, plan))
-					emit_pad(env, s, plan, new,
-						 &aux[sub[1].start - added[s] + plan->pad]);
+		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++) {
+			for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+				if (!plan_has_pad(env, i, plan))
+					continue;
+				cnt = sub[1].start - added[s] + plan->pad;
+				emit_pad(env, s, plan, new, &aux[cnt]);
+				if (plan->kind == BPF_SITE_FAULT && aux[i].fault_unwinds)
+					sub->fault_pad = cnt;
+			}
+		}
 	}
 	err = insert_slot_stores(env, new, added);
 	err = err ?: insert_unwind_gotos(env, added);
@@ -2173,6 +2192,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->jited_len = func[0]->jited_len;
 	prog->aux->extable = func[0]->aux->extable;
 	prog->aux->num_exentries = func[0]->aux->num_exentries;
+	prog->aux->fault_pad = func[0]->aux->fault_pad;
 	prog->aux->func = func;
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;

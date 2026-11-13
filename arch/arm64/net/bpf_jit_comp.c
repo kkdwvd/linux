@@ -1552,11 +1552,11 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+--------+-------------+-----------+-----------+----------+
- * |   31-27   | 26-23  |      22     |     21    |   20-16   |   15-0   |
- * |           |        |             |           |           |          |
- * | FIXUP_REG | Unused | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
- * +-----------+--------+-------------+-----------+-----------+----------+
+ * +-----------+--------+---------+-------------+-----------+-----------+----------+
+ * |   31-27   | 26-24  |    23   |      22     |     21    |   20-16   |   15-0   |
+ * |           |        |         |             |           |           |          |
+ * | FIXUP_REG | Unused | UNWINDS | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
+ * +-----------+--------+---------+-------------+-----------+-----------+----------+
  *
  * - OFFSET (16 bits): Offset used to compute address for Load/Store instruction.
  * - ARENA_REG (5 bits): Register that is used to calculate the address for load/store when
@@ -1565,6 +1565,8 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  * - ARENA_WRITE (1 bit): This bit is set when the faulting instruction wrote to the arena region.
  *                        It is independent of FIXUP_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
+ * - UNWINDS (1 bit): The frame holds nothing at the insn: the handler goes to the landing pad of
+ *                    the function that releases nothing. No unwind_goto follows the insn.
  * - FIXUP_REG (5 bits): Destination register for the load instruction (cleared on fault) or set to
  *                       DONT_CLEAR if the instruction does not read into a register.
  */
@@ -1573,6 +1575,7 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
 #define BPF_FIXUP_ARENA_REG_MASK   GENMASK(20, 16)
 #define BPF_ARENA_ACCESS           BIT(21)
 #define BPF_ARENA_WRITE            BIT(22)
+#define BPF_ARENA_UNWINDS          BIT(23)
 #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
 #define DONT_CLEAR 5 /* Unused ARM64 register from BPF's POV */
 
@@ -1589,7 +1592,8 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		pad = bpf_arena_fault(is_write, addr, regs->pc, end);
+		pad = bpf_arena_fault(is_write, addr, regs->pc, end,
+				      ex->fixup & BPF_ARENA_UNWINDS);
 	}
 
 	/*
@@ -1604,7 +1608,8 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 }
 
 /* For accesses to BTF pointers, add an entry to the exception table */
-static int add_exception_handler(const struct bpf_insn *insn,
+static int add_exception_handler(const struct bpf_verifier_env *env,
+				 const struct bpf_insn *insn,
 				 struct jit_ctx *ctx,
 				 int dst_reg)
 {
@@ -1671,6 +1676,8 @@ static int add_exception_handler(const struct bpf_insn *insn,
 		ex->fixup |= BPF_ARENA_ACCESS;
 		if (is_write)
 			ex->fixup |= BPF_ARENA_WRITE;
+		if (bpf_insn_fault_unwinds(env, ctx->prog, insn - ctx->prog->insnsi))
+			ex->fixup |= BPF_ARENA_UNWINDS;
 		/*
 		 * insn->src_reg/dst_reg holds the address in the arena region with upper 32-bits
 		 * being zero because of a preceding addr_space_cast(r<n>, 0x0, 0x1) instruction.
@@ -2574,7 +2581,7 @@ emit_cond_jmp:
 		else
 			emit_ldst(code, dst, src, off_adj, tmp, ctx);
 
-		ret = add_exception_handler(insn, ctx, dst);
+		ret = add_exception_handler(env, insn, ctx, dst);
 		if (ret)
 			return ret;
 		break;
@@ -2611,7 +2618,7 @@ emit_cond_jmp:
 		else
 			emit_ldst(code, imm ? tmp : A64_ZR, dst, off, tmp2, ctx);
 
-		ret = add_exception_handler(insn, ctx, DONT_CLEAR);
+		ret = add_exception_handler(env, insn, ctx, DONT_CLEAR);
 		if (ret)
 			return ret;
 		break;
@@ -2635,7 +2642,7 @@ emit_cond_jmp:
 		else
 			emit_ldst(code, src, dst, off, tmp, ctx);
 
-		ret = add_exception_handler(insn, ctx, DONT_CLEAR);
+		ret = add_exception_handler(env, insn, ctx, DONT_CLEAR);
 		if (ret)
 			return ret;
 		break;
@@ -2666,7 +2673,7 @@ emit_cond_jmp:
 			 */
 			int load_reg = bpf_atomic_load_reg(insn);
 
-			ret = add_exception_handler(insn, ctx, load_reg < 0 ?
+			ret = add_exception_handler(env, insn, ctx, load_reg < 0 ?
 						    DONT_CLEAR : bpf2a64[load_reg]);
 			if (ret)
 				return ret;
@@ -2988,6 +2995,10 @@ skip_init_ctx:
 	}
 
 	prog->bpf_func = (void *)ctx.ro_image + cfi_get_offset();
+	/* offset[] counts from the image, not from bpf_func */
+	if (bpf_prog_fault_pad(env, prog))
+		prog->aux->fault_pad =
+			(unsigned long)&ctx.ro_image[ctx.offset[bpf_prog_fault_pad(env, prog)]];
 	prog->jited = 1;
 	prog->jited_len = prog_size - cfi_get_offset();
 

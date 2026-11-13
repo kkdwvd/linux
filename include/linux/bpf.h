@@ -1723,6 +1723,9 @@ void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
 bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
 				 int insn_idx);
+bool bpf_insn_fault_unwinds(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+			    int insn_idx);
+int bpf_prog_fault_pad(const struct bpf_verifier_env *env, const struct bpf_prog *prog);
 u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_node *node,
@@ -2031,6 +2034,8 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	/* the address of the landing pad that releases nothing, see bpf_arena_fault() */
+	unsigned long fault_pad;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;
@@ -3482,7 +3487,7 @@ void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
 void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
 void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
 unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long fault_ip,
-			      unsigned long end);
+			      unsigned long end, bool unwinds);
 
 static __always_inline u32
 bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
@@ -3823,7 +3828,8 @@ static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
 }
 
 static inline unsigned long bpf_arena_fault(bool write, unsigned long addr,
-					    unsigned long fault_ip, unsigned long end)
+					    unsigned long fault_ip, unsigned long end,
+					    bool unwinds)
 {
 	return end;
 }

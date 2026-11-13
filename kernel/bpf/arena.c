@@ -1456,12 +1456,13 @@ out:
 /*
  * JITed code faulted at @fault_ip, in an access to arena at @addr. The code of the BPF insn ends at
  * @end. Report it. Returns where the program goes on: at the landing pad when unwind_goto follows
- * the insn, else at @end: the access is skipped.
+ * the insn, if @unwinds at the pad of the function that releases nothing, else at @end: the access
+ * is skipped.
  */
 unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long fault_ip,
-			      unsigned long end)
+			      unsigned long end, bool unwinds)
 {
-	unsigned long pad = bpf_fault_unwind_target(end);
+	unsigned long pad = unwinds ? end : bpf_fault_unwind_target(end);
 	struct bpf_prog *prog;
 
 	/*
@@ -1472,6 +1473,8 @@ unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long faul
 	rcu_read_lock();
 	prog = bpf_prog_ksym_find(fault_ip);
 	rcu_read_unlock();
+	if (prog && unwinds)
+		pad = prog->aux->fault_pad;
 	if (prog)
 		__bpf_prog_report_arena_violation(prog, write, addr, fault_ip, pad != end);
 	return pad;

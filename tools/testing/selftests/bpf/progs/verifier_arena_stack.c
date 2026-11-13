@@ -47,7 +47,6 @@ SEC("syscall")
 __description("arena stack: load and store")
 __success __retval(12)
 __xlated("r0 = *(u64 *)(r12 -16)")
-__xlated("unwind_goto pc+")
 __xlated("r2 = *(u64 *)(r12 -8)")
 __naked void load_store(void)
 {

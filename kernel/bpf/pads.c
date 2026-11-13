@@ -169,6 +169,9 @@
  * It is the one site with another way out: without unwind_goto the handler skips the access, a load
  * reads 0. That is what a conflict means here, see skip_faults(): it does not reject the program.
  * Nor does a call that has nothing but such accesses below it, see bpf_pad_must_unwind().
+ * At most accesses the frame holds nothing. They have no unwind_goto either: a bit in the entry
+ * that an access has in the exception table sends the handler to one pad per function, 'r0 = 0'
+ * and the exit, see append_pads() in fixups.c.
  *
  * HIDDEN SLOTS are the fallback for what neither the program counter nor a place tells. Here only
  * the program knows what 'own' means:

@@ -2009,6 +2009,24 @@ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struc
 	return env->insn_aux_data[insn_idx].indirect_target;
 }
 
+/* When the access to arena at @insn_idx of @prog faults the program goes to bpf_prog_fault_pad() */
+bool bpf_insn_fault_unwinds(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+			    int insn_idx)
+{
+	if (!env)
+		return false;
+	insn_idx += prog->aux->subprog_start;
+	return env->insn_aux_data[insn_idx].fault_unwinds;
+}
+
+/* The insn of @prog at which the landing pad that releases nothing begins. 0: it has none. */
+int bpf_prog_fault_pad(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
+{
+	u32 pad = env ? env->subprog_info[prog->aux->func_idx].fault_pad : 0;
+
+	return pad ? pad - prog->aux->subprog_start : 0;
+}
+
 u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
 {
 	const struct bpf_subprog_info *sub;
