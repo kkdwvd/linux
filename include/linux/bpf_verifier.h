@@ -1105,6 +1105,8 @@ struct bpf_subprog_info {
 	bool plain_call: 1;
 	/* it is set as an async callback that may not return 0 */
 	bool async_ret_nonzero: 1;
+	/* its stack check has a pad, see bpf_cancel_entry_pad() */
+	bool cancel_entry: 1;
 	u8 code_stack_args;
 	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1602,8 +1604,16 @@ enum bpf_cancel_site_type {
 	BPF_CANCEL_SITE_CALL,
 };
 
+/* the insns at the end of a pad that leave the frame */
+#define BPF_CANCEL_PAD_EXIT_INSNS	3
+
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
 int bpf_cancel_resolve(struct bpf_verifier_env *env);
+bool bpf_cancel_has_pads(const struct bpf_verifier_env *env);
+int bpf_cancel_append_pads(struct bpf_verifier_env *env, int subprog,
+			   const struct bpf_insn *tail);
+int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int subprog, struct bpf_insn *buf);
+int bpf_cancel_insert_gotos(struct bpf_verifier_env *env);
 void bpf_cancel_reset(struct bpf_verifier_env *env);
 void bpf_cancel_free(struct bpf_verifier_env *env);
 void bpf_cancel_print_stats(struct bpf_verifier_env *env);

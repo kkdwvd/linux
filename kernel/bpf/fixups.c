@@ -618,9 +618,10 @@ static bool guard_leaves_subprog(const struct bpf_insn_aux_data *aux)
 
 /*
  * 'r0 = 0; exit' behind the last insn of the subprog, for all its guards that are near.
+ * @tail is that insn, and on return the last insn of what is queued.
  * Returns the number of insns that are going to be added.
  */
-static int append_budget_exit(struct bpf_verifier_env *env, int s)
+static int append_budget_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *tail)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
 	int last = (sub + 1)->start - 1, n = 0, i;
@@ -632,11 +633,12 @@ static int append_budget_exit(struct bpf_verifier_env *env, int s)
 	if (i > last)
 		return 0;
 
-	buf[n++] = env->prog->insnsi[last];
+	buf[n++] = *tail;
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
 	if (bpf_ret_reg_pair(env, s))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	buf[n++] = budget_exit_insn(env, sub);
+	*tail = buf[n - 1];
 	insn = bpf_patch_list_add(env, last, buf, n);
 	return IS_ERR(insn) ? PTR_ERR(insn) : n - 1;
 }
@@ -644,13 +646,14 @@ static int append_budget_exit(struct bpf_verifier_env *env, int s)
 /*
  * Add may_goto in front of the insns that the main pass marked, see
  * check_loop_guard(). It verified the edge from the insn to where may_goto goes.
+ * The pads of all sites are added here, behind their subprogs.
  */
 int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int len = env->prog->len, i, r, s, to, n, jmp, err = 0;
-	struct bpf_insn *patch, *insn;
-	int *target, *leave, *moved;
+	int len = env->prog->len, i, r, s, to, n, jmp, first, err = 0;
+	struct bpf_insn *patch, *insn, tail;
+	int *target, *leave, *moved, *pads;
 	bool indirect;
 	u16 *zero;
 	s64 off;
@@ -658,23 +661,34 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 	for (i = 0; i < len; i++)
 		if (aux[i].loop_guard)
 			break;
-	if (i == len)
+	if (i == len && !bpf_cancel_has_pads(env))
 		return 0;
 
 	/*
-	 * Where the subprog has 'r0 = 0; exit', 0 if it has none. And how far that moved
-	 * the subprog: guard_to is from the time before.
+	 * Where the subprog has 'r0 = 0; exit', 0 if it has none. How far that and the
+	 * pads of the subprogs in front moved the subprog: guard_to is from the time
+	 * before. And the insns that its pads take.
 	 */
-	leave = kvcalloc(2 * env->subprog_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
+	leave = kvcalloc(3 * env->subprog_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
 	if (!leave)
 		return -ENOMEM;
 	moved = leave + env->subprog_cnt;
+	pads = moved + env->subprog_cnt;
 	for (s = 0; s < env->subprog_cnt && !err; s++) {
-		leave[s] = append_budget_exit(env, s);
-		if (leave[s] < 0)
+		tail = env->prog->insnsi[env->subprog_info[s + 1].start - 1];
+		leave[s] = append_budget_exit(env, s, &tail);
+		if (leave[s] < 0) {
 			err = leave[s];
+			break;
+		}
+		pads[s] = bpf_cancel_append_pads(env, s, &tail);
+		if (pads[s] < 0)
+			err = pads[s];
 	}
-	/* A guard cannot jump into a patch that is in the list: 'r0 = 0' has no index yet. */
+	/*
+	 * A guard cannot jump into a patch that is in the list: 'r0 = 0' and the pads have
+	 * no index yet.
+	 */
 	err = err ?: bpf_patch_list_commit(env);
 	if (err) {
 		kvfree(leave);
@@ -684,21 +698,23 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 	len = env->prog->len;
 	for (s = 0, n = 0; s < env->subprog_cnt; s++) {
 		moved[s] = n;
-		n += leave[s];
-		if (!leave[s])
+		n += leave[s] + pads[s];
+		if (!leave[s] && !pads[s])
 			continue;
 		i = env->subprog_info[s + 1].start;
-		leave[s] = i - leave[s];
+		/* the first insn that was added. The pads are behind 'r0 = 0; exit'. */
+		first = i - leave[s] - pads[s];
+		leave[s] = leave[s] ? first : 0;
 		/*
 		 * The list gives what is known about an insn to the last insn of its patch,
 		 * but for indirect_target. Here the original insn is the first one.
 		 */
-		indirect = aux[leave[s] - 1].indirect_target;
-		swap(aux[leave[s] - 1], aux[i - 1]);
-		aux[leave[s] - 1].indirect_target = indirect;
+		indirect = aux[first - 1].indirect_target;
+		swap(aux[first - 1], aux[i - 1]);
+		aux[first - 1].indirect_target = indirect;
 		aux[i - 1].indirect_target = false;
 		/* the last insn may be dead code */
-		while (--i >= leave[s])
+		while (--i >= first)
 			aux[i].seen = 1;
 	}
 
@@ -854,6 +870,9 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  *	exit;
  * body:
  *
+ * In a subprog that can be cancelled the pad of the check is at bail, see
+ * bpf_cancel_entry_pad(): the invocation ends instead of going on in the caller.
+ *
  * It is the stack as it is: whatever is there is counted, be it the callers of the prog in the
  * kernel, another prog, a trampoline or a helper that calls a callback. An invocation in
  * another stack has nothing to do with it.
@@ -869,9 +888,11 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_insn buf[24], nop = BPF_JMP_A(0), *insn;
+	struct bpf_insn buf[24], bail[3], nop = BPF_JMP_A(0), *insn;
 	bool found = false;
-	int s, n, jmp, err;
+	int s, n, m, jmp, err;
+
+	BUILD_BUG_ON(BPF_CANCEL_PAD_EXIT_INSNS > ARRAY_SIZE(bail));
 
 	for (s = 1; s < env->subprog_cnt; s++)
 		found |= si[s].recursive;
@@ -891,15 +912,21 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
 		}
+		/* at bail: the pad of the check, or leave with 0 for the caller to go on with */
+		m = bpf_cancel_entry_pad(env, s, bail);
+		if (!m) {
+			bail[m++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+			if (bpf_ret_reg_pair(env, s))
+				bail[m++] = BPF_MOV64_IMM(BPF_REG_2, 0);
+			bail[m++] = budget_exit_insn(env, &si[s]);
+		}
 		jmp = n++;
-		n += emit_stack_check(buf + n, bpf_ret_reg_pair(env, s) ? 4 : 3);
+		n += emit_stack_check(buf + n, m + 1);
 		/* The arguments are not needed any more */
 		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_recursion);
 		buf[jmp] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, n - jmp - 1, 0);
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
-		if (bpf_ret_reg_pair(env, s))
-			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
-		buf[n++] = budget_exit_insn(env, &si[s]);
+		memcpy(buf + n, bail, m * sizeof(*bail));
+		n += m;
 		/* calls get to the check, jumps to the first insn do not */
 		err = bpf_patch_list_insert(env, si[s].start, buf, n);
 		if (err)

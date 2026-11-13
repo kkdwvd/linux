@@ -6210,7 +6210,7 @@ static void free_call_graph(struct bpf_verifier_env *env)
 /*
  * What holds for the calls of the program whatever the size of a frame is. The graph stays
  * for check_max_stack_depth(). Until then no call of a subprog and no subprog is added or
- * removed.
+ * removed: the pads that are added in between call the kernel only.
  */
 static int check_call_graph(struct bpf_verifier_env *env)
 {
@@ -24053,7 +24053,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		struct bpf_prog_aux *aux = tgt_prog->aux;
 		bool tgt_changes_pkt_data;
 		bool tgt_might_sleep;
-		bool tgt_can_unwind;
+		bool tgt_can_unwind, tgt_can_cancel;
 
 		if (bpf_prog_is_dev_bound(prog->aux) &&
 		    !bpf_prog_dev_bound_match(prog, tgt_prog)) {
@@ -24096,6 +24096,15 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		if (tgt_can_unwind && !prog_extension &&
 		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
 			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
+			return -EINVAL;
+		}
+		/* so would cancel_exit: the caller of the target goes on with what is in R0 */
+		tgt_can_cancel = subprog && (aux->func ? aux->func[subprog]->aux->can_cancel
+						       : aux->can_cancel);
+		if (tgt_can_cancel && !prog_extension &&
+		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
+			bpf_log(log, "Only fentry can attach to %s, which can be cancelled\n",
+				tname);
 			return -EINVAL;
 		}
 		/* What it takes of the stack is not counted, see bpf_insert_recursion_checks() */
@@ -25609,6 +25618,9 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = bpf_insert_loop_guards(env);
+
+	if (ret == 0)
+		ret = bpf_cancel_insert_gotos(env);
 
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
