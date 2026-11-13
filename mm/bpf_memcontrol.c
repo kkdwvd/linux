@@ -235,14 +235,34 @@ static const struct btf_kfunc_id_set bpf_memcontrol_reclaim_kfunc_set = {
 	.set            = &bpf_memcontrol_reclaim_kfuncs,
 };
 
+/* The kfunc that generated code calls to release a memory cgroup reference */
+BTF_ID_LIST(bpf_memcontrol_release_ids)
+BTF_ID(struct, mem_cgroup)
+BTF_ID(func, bpf_put_mem_cgroup)
+
 static int __init bpf_memcontrol_init(void)
 {
+	const struct btf_id_dtor_kfunc bpf_memcontrol_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= bpf_memcontrol_release_ids[0],
+			.release_btf_id	= bpf_memcontrol_release_ids[1],
+		},
+	};
 	int err;
 
 	err = register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC,
 					&bpf_memcontrol_kfunc_set);
 	if (err) {
 		pr_warn("error while registering bpf memcontrol kfuncs: %d", err);
+		return err;
+	}
+
+	err = register_btf_id_dtor_kfuncs(bpf_memcontrol_releases,
+					  ARRAY_SIZE(bpf_memcontrol_releases),
+					  THIS_MODULE);
+	if (err) {
+		pr_warn("error registering bpf memcontrol release kfuncs: %d\n", err);
 		return err;
 	}
 
