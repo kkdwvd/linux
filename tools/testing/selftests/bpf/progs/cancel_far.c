@@ -33,6 +33,12 @@ struct {
 	__uint(max_entries, 4096);
 } ringbuf SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARENA);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 1);
+} arena SEC(".maps");
+
 /* @var++ in assembly, with r1 and r2 */
 #define COUNT(var)				\
 	"r1 = %[" #var "] ll;"			\
@@ -136,6 +142,131 @@ __xlated("r0 = r7")
 __naked void call_33k(void)
 {
 	CALL_PROG(REPS_33K);
+}
+
+/*
+ * No page of the arena is there, so the load faults. The record is in r6, and the pad of the
+ * access is where the pad of a call would be.
+ */
+#define ARENA_PROG(reps)					\
+	asm volatile (						\
+		"r1 = %[arena] ll;"				\
+		RESERVE						\
+		"if r0 != 0 goto 1f;"				\
+		"r0 = 0;"					\
+		"exit;"						\
+	"1:"							\
+		"r6 = r0;"					\
+		"r7 = 0;"					\
+		"r8 = 8192;"					\
+		"r8 = addr_space_cast(r8, 0, 1);"		\
+		"r0 = *(u64 *)(r8 + 0);"			\
+		FILL(reps)					\
+		DISCARD_AND_EXIT				\
+		:						\
+		: __imm(bpf_ringbuf_reserve),			\
+		  __imm(bpf_ringbuf_discard),			\
+		  __imm_addr(arena),				\
+		  __imm_addr(ringbuf),				\
+		  __imm_addr(behind)				\
+		: __clobber_all					\
+	)
+
+SEC("tc")
+__description("cancel far: the pad of an access of arena that is more than 2048 insns away")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r0 = *(u64 *)(r8 +0)")
+__xlated("cancel_goto pc+{{(2[1-9]|[3-9][0-9])[0-9][0-9]$}}")
+__xlated("r0 = r7")
+__naked void arena_2k(void)
+{
+	ARENA_PROG(REPS_2K);
+}
+
+SEC("tc")
+__description("cancel far: the pad of an access of arena that is more than 32767 insns away")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r0 = *(u64 *)(r8 +0)")
+__xlated("cancel_goto pc+{{(3[3-9]|[4-9][0-9])[0-9][0-9][0-9]$}}")
+__xlated("r0 = r7")
+__naked void arena_33k(void)
+{
+	ARENA_PROG(REPS_33K);
+}
+
+/* The load faults, like the one of ARENA_PROG(), and the frame holds nothing */
+__naked __noinline __used
+static unsigned long faults(void)
+{
+	asm volatile (
+		"r1 = %[arena] ll;"
+		"r1 = 8192;"
+		"r1 = addr_space_cast(r1, 0, 1);"
+		"r0 = *(u64 *)(r1 + 0);"
+		"exit;"
+		:
+		: __imm_addr(arena)
+		: __clobber_all
+	);
+}
+
+/*
+ * A raw tracepoint prog with 64 bytes of stack has a private stack. On x86-64 its frame
+ * pointer is in r9, which the JIT saves around a call. The return to the pad has to restore
+ * r9 as well, so behind such a call cancel_goto is code: a return jumps over it, and the
+ * cancel_exit of the callee returns into it, where it pops r9 and jumps to the pad. A tracing
+ * prog cannot recurse, so the callee is cancelled by a load that faults.
+ */
+#define PRIV_STACK_PROG(reps)					\
+	asm volatile (						\
+		"r7 = 0;"					\
+		"*(u64 *)(r10 - 64) = r7;"			\
+		RESERVE						\
+		"if r0 != 0 goto 1f;"				\
+		"r0 = 0;"					\
+		"exit;"						\
+	"1:"							\
+		"r6 = r0;"					\
+		"call faults;"					\
+		FILL(reps)					\
+		DISCARD_AND_EXIT				\
+		:						\
+		: __imm(bpf_ringbuf_reserve),			\
+		  __imm(bpf_ringbuf_discard),			\
+		  __imm_addr(ringbuf),				\
+		  __imm_addr(behind)				\
+		: __clobber_all					\
+	)
+
+SEC("raw_tp")
+__description("cancel far: the pad of a call in a frame with a private stack")
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{(3[3-9]|[4-9][0-9])[0-9][0-9][0-9]$}}")
+__xlated("r0 = r7")
+__arch_arm64
+__arch_x86_64
+__jited("	movq	%rax, %rbx")
+__jited("	pushq	%r9")
+__jited("	callq	0x{{.*}}")
+__jited("	popq	%r9")
+__jited("	jmp	L{{[0-9]+}}")
+__jited("	popq	%r9")
+__jited("	jmp	L{{[0-9]+}}")
+__jited("L{{[0-9]+}}:	movq	%r13, %rax")
+__naked void priv_stack_33k(void)
+{
+	PRIV_STACK_PROG(REPS_33K);
 }
 
 /* r1: whether to dive first. r0 = a record or NULL: the frame returns with it. */
