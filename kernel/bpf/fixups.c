@@ -1419,7 +1419,7 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 	struct bpf_insn *zext_patch = env->insn_buf;
 	struct bpf_insn *rnd_hi32_patch = &env->insn_buf[2];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int i, patch_len, len = env->prog->len;
+	int i, err, patch_len, len = env->prog->len;
 	struct bpf_insn *insns = env->prog->insnsi;
 	bool rnd_hi32;
 
@@ -1494,6 +1494,16 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 		patch = zext_patch;
 		patch_len = 2;
 apply_patch_buffer:
+		/*
+		 * Nothing stands between an insn and its unwind_goto. On the way to the
+		 * landing pad the insn has not written the register.
+		 */
+		if (bpf_is_unwind_goto(&insns[i + 1])) {
+			err = bpf_patch_list_insert(env, i + 2, patch + 1, patch_len - 1);
+			if (err)
+				return err;
+			continue;
+		}
 		patch = bpf_patch_list_add(env, i, patch, patch_len);
 		if (IS_ERR(patch))
 			return PTR_ERR(patch);
@@ -1656,6 +1666,10 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 			    insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW)) &&
 			   env->insn_aux_data[i].ptr_type == PTR_TO_ARENA) {
 			insn->code = BPF_STX | BPF_PROBE_ATOMIC | BPF_SIZE(insn->code);
+			env->prog->aux->num_exentries++;
+			continue;
+		} else if (bpf_is_unwind_goto(insn)) {
+			/* jit_subprogs() counts again, a prog of one function doesn't get there */
 			env->prog->aux->num_exentries++;
 			continue;
 		} else if (insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW) &&
