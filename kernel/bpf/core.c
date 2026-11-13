@@ -3723,6 +3723,12 @@ bool __weak bpf_jit_supports_cancel(void)
 	return false;
 }
 
+/* cancel_goto behind an access of arena: a fault in the access goes on at the pad */
+bool __weak bpf_jit_supports_arena_cancel(void)
+{
+	return false;
+}
+
 /* uhmul and shmul */
 bool __weak bpf_jit_supports_hmul(void)
 {

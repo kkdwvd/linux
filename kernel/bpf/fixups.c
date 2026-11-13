@@ -1567,6 +1567,18 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 		patch = zext_patch;
 		patch_len = 2;
 apply_patch_buffer:
+		/*
+		 * cancel_goto stays directly behind the access of arena that it is for, see
+		 * bpf_cancel_insert_gotos(): what is added goes behind cancel_goto, and the
+		 * pad is that much further away, which its offset in imm has the room for.
+		 * Execution falls through cancel_goto to what is added, as before. A fault in
+		 * the access leaves for the pad without it.
+		 */
+		if (i + 1 < len && bpf_is_cancel_goto(&insns[i + 1])) {
+			patch[0] = insns[i + 1];
+			patch[0].imm += patch_len - 1;
+			i++;
+		}
 		patch = bpf_patch_list_add(env, i, patch, patch_len);
 		if (IS_ERR(patch))
 			return PTR_ERR(patch);
@@ -1628,6 +1640,20 @@ static int arena_member_fixup(struct bpf_verifier_env *env, int idx, struct bpf_
 		buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, insn->dst_reg, 0, 1);
 	buf[cnt++] = BPF_ALU32_IMM(BPF_SUB, insn->dst_reg, (s32)base);
 	return cnt;
+}
+
+/*
+ * The access of arena at @idx takes an entry in the extable, and one more for the pad when
+ * cancel_goto is behind it, see bpf_cancel_insert_gotos(). This is the count of a program
+ * that is one function. jit_subprogs() counts the same for each function of the others.
+ */
+static void count_arena_exentries(struct bpf_verifier_env *env, int idx)
+{
+	struct bpf_prog *prog = env->prog;
+
+	prog->aux->num_exentries++;
+	if (idx + 1 < prog->len && bpf_is_cancel_goto(&prog->insnsi[idx + 1]))
+		prog->aux->num_exentries++;
 }
 
 int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
@@ -1770,7 +1796,7 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 			    insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW)) &&
 			   env->insn_aux_data[i].ptr_type == PTR_TO_ARENA) {
 			insn->code = BPF_STX | BPF_PROBE_ATOMIC | BPF_SIZE(insn->code);
-			env->prog->aux->num_exentries++;
+			count_arena_exentries(env, i);
 			continue;
 		} else if (insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW) &&
 			   insn->imm == BPF_LOAD_ACQ &&
@@ -1849,7 +1875,7 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 			} else {
 				insn->code = BPF_CLASS(insn->code) | BPF_PROBE_MEM32 | BPF_SIZE(insn->code);
 			}
-			env->prog->aux->num_exentries++;
+			count_arena_exentries(env, i);
 			continue;
 		default:
 			/*

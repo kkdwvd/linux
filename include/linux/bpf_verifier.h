@@ -1674,6 +1674,8 @@ enum bpf_cancel_site_type {
 	BPF_CANCEL_SITE_ENTRY,
 	/* the call of a subprog */
 	BPF_CANCEL_SITE_CALL,
+	/* an access of arena, which may fault */
+	BPF_CANCEL_SITE_ARENA,
 };
 
 /* the insns at the end of a pad that leave the frame */

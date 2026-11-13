@@ -21381,11 +21381,51 @@ static int check_arena_sp_insn(struct bpf_verifier_env *env, struct bpf_insn *in
 	return err ?: save_aux_ptr_type(env, PTR_TO_ARENA, false);
 }
 
+/*
+ * Whether the insn is an access of arena in the current state, which has not gone through
+ * it yet: a load, a store or an atomic insn through r12 or through a pointer to arena.
+ */
+static bool insn_accesses_arena(struct bpf_verifier_env *env, const struct bpf_insn *insn)
+{
+	int base;
+
+	/* r12 is not in regs[], see check_arena_sp_insn() */
+	if (is_arena_sp_ldx(insn) || is_arena_sp_st(insn))
+		return true;
+
+	switch (BPF_CLASS(insn->code)) {
+	case BPF_LDX:
+		base = insn->src_reg;
+		break;
+	case BPF_STX:
+		base = bpf_atomic_is_load_acq(insn) ? insn->src_reg : insn->dst_reg;
+		break;
+	case BPF_ST:
+		base = insn->dst_reg;
+		break;
+	default:
+		return false;
+	}
+	/* an argument on the stack has no register in regs[] either */
+	return base < MAX_BPF_REG && cur_regs(env)[base].type == PTR_TO_ARENA;
+}
+
 static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 {
 	int err, i;
 	struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
 	u8 class = BPF_CLASS(insn->code);
+
+	/*
+	 * An access of arena that faults ends the invocation where the JIT can do that, see
+	 * bpf_cancel_insert_gotos(). The frame is recorded as it is in front of the insn: a
+	 * fault leaves the registers as they are.
+	 */
+	if (bpf_jit_supports_arena_cancel() && insn_accesses_arena(env, insn)) {
+		err = bpf_cancel_record(env, BPF_CANCEL_SITE_ARENA);
+		if (err)
+			return err;
+	}
 
 	if (is_arena_sp_insn(insn))
 		return check_arena_sp_insn(env, insn);
