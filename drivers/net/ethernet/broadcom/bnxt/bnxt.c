@@ -3394,6 +3394,7 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
 	struct bnxt_cp_ring_info *cpr_rx;
 	u32 raw_cons = cpr->cp_raw_cons;
+	u32 nq_cons = raw_cons;
 	struct bnxt *bp = bnapi->bp;
 	struct nqe_cn *nqcmp;
 	int work_done = 0;
@@ -3420,9 +3421,21 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL,
 					     budget);
 			cpr->cp_raw_cons = raw_cons;
-			if (napi_complete_done(napi, work_done))
+			if (napi_complete_done(napi, work_done)) {
 				BNXT_DB_NQ_ARM_P5(&cpr->cp_db,
 						  cpr->cp_raw_cons);
+			} else if (raw_cons != nq_cons) {
+				/* Busy polling or deferred interrupts: the
+				 * NQ stays unarmed, but the chip must still
+				 * learn how far it was consumed. Left at the
+				 * index of the last ARM through an unbounded
+				 * busy poll, the chip sees the NQ fill up and
+				 * loses the notifications of the CQs that are
+				 * re-armed above, which are then never polled
+				 * nor re-armed again.
+				 */
+				BNXT_DB_NQ_P5(&cpr->cp_db, raw_cons);
+			}
 			goto poll_done;
 		}
 
