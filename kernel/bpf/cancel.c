@@ -144,6 +144,14 @@ struct cancel_entry {
 	/* of a lock that was taken with IRQ flags: the offset of their slot from r10 */
 	s16 irq_off;
 	u64 arg;	/* how to release it, in the terms of the kind */
+	/*
+	 * Of a lock at a known address: a place leads to it as well, with the lock alt_arg
+	 * bytes from where its pointer points. Visits that hold such locks at different
+	 * addresses may agree on it, see cancel_merge().
+	 */
+	bool alt;
+	s16 alt_place;
+	s32 alt_arg;
 };
 
 static bool cancel_place_is_reg(int place)
@@ -251,6 +259,17 @@ static bool cancel_list_has(const struct cancel_list *list, const struct cancel_
 		if (cancel_entry_same(&list->entries[i], e))
 			return true;
 	return false;
+}
+
+static struct cancel_entry *cancel_list_find(const struct cancel_list *list,
+					     const struct cancel_entry *e)
+{
+	u32 i;
+
+	for (i = 0; i < list->nr; i++)
+		if (cancel_entry_same(&list->entries[i], e))
+			return &list->entries[i];
+	return NULL;
 }
 
 static struct cancel_site *cancel_find_site(struct bpf_verifier_env *env, u32 insn_idx,
@@ -502,10 +521,11 @@ static bool cancel_lock_addr(struct bpf_verifier_env *env, const struct bpf_refe
  * Does @reg point into what the lock of @ref is in: the map value or the object? It has the
  * id of the lock then, and the type that a lock is taken through. Its offset has to be
  * known: *@delta is from where it points to the lock. A lock without an id is found by no
- * pointer, since nothing tells pointers without an id apart.
+ * pointer, since nothing tells pointers without an id apart. Unless its map has
+ * @one_elem: every pointer into the map points into that element then.
  */
 static bool cancel_reg_at_lock(const struct bpf_reg_state *reg,
-			       const struct bpf_reference_state *ref, s32 *delta)
+			       const struct bpf_reference_state *ref, bool one_elem, s32 *delta)
 {
 	const struct btf_struct_meta *meta;
 	const struct btf_record *rec;
@@ -523,7 +543,13 @@ static bool cancel_reg_at_lock(const struct bpf_reg_state *reg,
 	} else {
 		return false;
 	}
-	if (!ref->id || reg->id != ref->id || !tnum_is_const(reg->var_off))
+	if (one_elem) {
+		if (reg->type != PTR_TO_MAP_VALUE)
+			return false;
+	} else if (!ref->id || reg->id != ref->id) {
+		return false;
+	}
+	if (!tnum_is_const(reg->var_off))
 		return false;
 	off = cancel_lock_off(rec, ref);
 	if (off < 0)
@@ -539,24 +565,24 @@ static bool cancel_reg_at_lock(const struct bpf_reg_state *reg,
  * A live place of the current frame of @st that leads to the lock of @ref, see
  * cancel_reg_at_lock(), CANCEL_NO_PLACE if it has none. R6-R9 are asked first, then the
  * slots of the stack, the lowest number first: visits that have the pointer in
- * several places agree on one.
+ * several places agree on one. @one_elem: see cancel_reg_at_lock().
  */
 static int cancel_lock_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			     enum bpf_cancel_site_type type,
-			     const struct bpf_reference_state *ref, s32 *delta)
+			     const struct bpf_reference_state *ref, bool one_elem, s32 *delta)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_stack_state *slot;
 	int i;
 
 	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
-		if (cancel_reg_at_lock(&frame->regs[i], ref, delta) &&
+		if (cancel_reg_at_lock(&frame->regs[i], ref, one_elem, delta) &&
 		    cancel_reg_is_place(env, type, i))
 			return i;
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
 		if (bpf_is_spilled_reg(slot) &&
-		    cancel_reg_at_lock(&slot->spilled_ptr, ref, delta) &&
+		    cancel_reg_at_lock(&slot->spilled_ptr, ref, one_elem, delta) &&
 		    cancel_spill_is_place(env, st, type, i))
 			return -(i + 1) * BPF_REG_SIZE;
 	}
@@ -602,8 +628,16 @@ static int cancel_collect_lock(struct bpf_verifier_env *env, const struct bpf_ve
 			return CANCEL_LOCK_PLACE;
 		e.irq_off = -(spi + 1) * BPF_REG_SIZE;
 	}
-	if (!cancel_lock_addr(env, ref, &e.arg)) {
-		e.place = cancel_lock_place(env, st, type, ref, &delta);
+	if (cancel_lock_addr(env, ref, &e.arg)) {
+		/*
+		 * One of several locks that the program chose at run time has another
+		 * address in every visit. The pointer that it was taken through says which.
+		 */
+		e.alt_place = cancel_lock_place(env, st, type, ref, true, &delta);
+		e.alt = e.alt_place != CANCEL_NO_PLACE;
+		e.alt_arg = delta;
+	} else {
+		e.place = cancel_lock_place(env, st, type, ref, false, &delta);
 		if (e.place == CANCEL_NO_PLACE)
 			return CANCEL_LOCK_PLACE;
 		e.arg = delta;
@@ -698,6 +732,49 @@ static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifie
 				      st->active_preempt_locks - frame->entry_preempt_locks);
 }
 
+/* The lock of @e by the pointer to it instead of its address, see struct cancel_entry */
+static void cancel_entry_use_alt(struct cancel_entry *e)
+{
+	e->place = e->alt_place;
+	e->arg = e->alt_arg;
+	e->alt = false;
+}
+
+/*
+ * A visit holds the lock of @v, which is at a known address, and @held has no lock at that
+ * address: the program chose one of several locks at run time, and each visit has another.
+ * By address these are entries that no pad can tell apart. The visits may still have the
+ * pointer to their lock in one place. Then the entries become one that goes by the pointer:
+ * "one of the locks is held, r7 points to it".
+ */
+static void cancel_lock_by_pointer(struct cancel_list *held, struct cancel_entry *v)
+{
+	struct cancel_entry by_ptr, other, *e;
+	u32 i;
+
+	if (!v->alt || cancel_list_has(held, v))
+		return;
+	by_ptr = *v;
+	cancel_entry_use_alt(&by_ptr);
+	/* visits before this one went by the pointer already */
+	if (cancel_list_has(held, &by_ptr)) {
+		*v = by_ptr;
+		return;
+	}
+	for (i = 0; i < held->nr; i++) {
+		e = &held->entries[i];
+		if (!e->alt)
+			continue;
+		other = *e;
+		cancel_entry_use_alt(&other);
+		if (!cancel_entry_same(&other, &by_ptr))
+			continue;
+		cancel_entry_use_alt(e);
+		*v = by_ptr;
+		return;
+	}
+}
+
 /*
  * A visit of @site found c->visit. An entry that this visit or one before it
  * is without takes a condition. So does a resource that the visits have in
@@ -706,15 +783,24 @@ static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifie
 static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 {
 	struct cancel_list *held = &site->held, *visit = &c->visit;
-	struct cancel_entry *e;
+	struct cancel_entry *e, *v;
 	bool cond = false;
 	int err;
 	u32 i;
 
+	for (i = 0; i < visit->nr; i++)
+		cancel_lock_by_pointer(held, &visit->entries[i]);
 	for (i = 0; i < held->nr; i++) {
 		e = &held->entries[i];
-		if (!cancel_list_has(visit, e))
+		v = cancel_list_find(visit, e);
+		if (!v) {
 			e->cond = true;
+			cond = true;
+			continue;
+		}
+		/* the pointer is of use only where every visit with the lock has it */
+		if (e->alt && (!v->alt || v->alt_place != e->alt_place || v->alt_arg != e->alt_arg))
+			e->alt = false;
 		cond |= e->cond;
 	}
 	for (i = 0; i < visit->nr; i++) {
