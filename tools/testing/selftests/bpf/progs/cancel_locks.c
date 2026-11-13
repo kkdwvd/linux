@@ -174,6 +174,231 @@ static unsigned long dives(void)
 	);
 }
 
+SEC("tc")
+__description("cancel: IRQ flags, saved at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int irq_save_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_local_irq_save(&flags);
+	dives();
+	bpf_local_irq_restore(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
+ * The flags that were saved last found interrupts off. The pad restores them first, or it would
+ * turn interrupts on and then off for good. It is behind the exit of the main program: two calls
+ * of bpf_local_irq_restore(), then what tells that the program was cancelled.
+ */
+SEC("tc")
+__description("cancel: IRQ flags that were saved twice, the slot of the first one above")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void irq_save_twice_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"call dives;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* The other way around: the order is that of the saves, and not of the slots */
+SEC("tc")
+__description("cancel: IRQ flags that were saved twice, the slot of the first one below")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void irq_save_twice_slots_swapped(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"call dives;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+static __noinline int saves_and_dives(void)
+{
+	unsigned long flags;
+
+	bpf_local_irq_save(&flags);
+	dives();
+	bpf_local_irq_restore(&flags);
+	behind++;
+	return 0;
+}
+
+/* Each frame restores the flags that it saved: the pad of the callee, then the pad of the caller */
+SEC("tc")
+__description("cancel: IRQ flags that a caller and its callee saved")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__stderr("ERROR: Program was cancelled")
+int irq_save_in_two_frames(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_local_irq_save(&flags);
+	saves_and_dives();
+	bpf_local_irq_restore(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
+ * What no pad releases. A cancellation gets to a site where the frame holds something that its
+ * pad has no way to release, or would release once more: the program is not loaded. The log has
+ * a line for the site, with the kind of insn, the limit, and the word of the stats for the reason.
+ */
+
+/* It returns with the flags saved, for the caller to restore them */
+static __noinline int saves_for_caller_and_dives(unsigned long *flags)
+{
+	bpf_local_irq_save(flags);
+	dives();
+	behind++;
+	return 0;
+}
+
+/*
+ * The frame that saved the flags is to restore them when it is cancelled, but the slot that they
+ * are in is in the frame of its caller: its pad has no address for them.
+ */
+SEC("tc")
+__description("cancel: IRQ flags that a callee saved to a slot of its caller are rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(lock)")
+int irq_flags_in_slot_of_caller(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	saves_for_caller_and_dives(&flags);
+	bpf_local_irq_restore(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
+static __noinline int restores_and_dives(unsigned long *flags)
+{
+	bpf_local_irq_restore(flags);
+	dives();
+	behind++;
+	return 0;
+}
+
+/*
+ * A callee that is given a pointer to the stack is verified with its callers only. The log names
+ * the call in the main program and no other insn.
+ */
+SEC("tc")
+__description("cancel: a callee that restores the IRQ flags of its caller is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(foreign)")
+int callee_restores_irq_flags(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_local_irq_save(&flags);
+	restores_and_dives(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
 /*
  * RCU read sections and preemption-disabled sections. The verifier counts them, and the pad of a
  * frame leaves the sections that the frame entered, or that a callee entered and returned in: one
