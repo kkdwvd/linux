@@ -1661,6 +1661,7 @@ enum bpf_cancel_acquire {
 };
 
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
+int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state);
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
 bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  u32 idx, int subprog);

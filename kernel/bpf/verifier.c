@@ -12164,6 +12164,7 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	struct bpf_verifier_state *state = env->cur_state;
 	u16 callee_incoming, stack_arg_cnt;
 	struct bpf_func_state *caller;
+	bool on_its_own;
 	int err;
 
 	caller = state->frame[state->curframe];
@@ -12193,12 +12194,17 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	err = move_refs_to_callee(env, state, subprog);
 	if (err)
 		return err;
-	/* every state that calls gets here, however the callee is verified */
-	err = bpf_cancel_record(env, BPF_CANCEL_SITE_CALL);
+	/*
+	 * Every state that calls gets here, however the callee is verified. The record takes
+	 * more of the caller's stack for a place if the frame of the caller is in the state
+	 * while the callee is verified: what the callee does to the stack shows there.
+	 */
+	on_its_own = func_is_on_its_own(env, state, subprog);
+	err = bpf_cancel_record_call(env, !on_its_own);
 	if (err)
 		return err;
 
-	if (func_is_on_its_own(env, state, subprog))
+	if (on_its_own)
 		return call_func_on_its_own(env, subprog, *insn_idx);
 
 	/*

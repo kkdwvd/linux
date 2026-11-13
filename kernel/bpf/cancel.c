@@ -366,6 +366,10 @@ struct bpf_cancel {
 	u32 cap_sites;
 	/* what the frame holds in the visit that is recorded */
 	struct cancel_list visit;
+	/* it is of a call, and the frame is in the state while the callee is verified */
+	bool caller_in_state;
+	/* the state as a frame that waits in a call has it, see cancel_record_callers() */
+	struct bpf_verifier_state caller;
 	struct cancel_sub *subs;
 	struct cancel_pad *pads;
 	u32 nr_pads;
@@ -391,6 +395,20 @@ struct bpf_cancel {
 	u32 nr_flags;
 };
 
+/*
+ * CANCEL_PTR: the pad calls what releases the reference with the handle in R1. arg is the
+ * BTF id of a kfunc, and from bit 32 on off of its call, see struct bpf_release_kfunc.
+ */
+
+/* flags: the handle is NULL if nothing was acquired, and the pad tests it */
+#define CANCEL_PTR_NULL		BIT(0)
+/* arg is the id of a helper */
+#define CANCEL_PTR_HELPER	BIT(1)
+/* an object that the program owns is dropped: arg is the btf_record of its type, or NULL */
+#define CANCEL_PTR_OBJ		BIT(2)
+/* and it is a per-CPU object */
+#define CANCEL_PTR_PERCPU	BIT(3)
+
 static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *e)
 {
 	struct cancel_entry *entries;
@@ -409,6 +427,16 @@ static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *
 }
 
 /*
+ * The flags of an entry of @kind that visits may differ in. A handle that may be NULL in one
+ * visit and is tested in another one is one entry: the test of the pad does no harm where the
+ * program has made it. A callee makes it for the frame that waits in its call.
+ */
+static u8 cancel_soft_flags(u8 kind)
+{
+	return kind == CANCEL_PTR ? CANCEL_PTR_NULL : 0;
+}
+
+/*
  * Entries are matched by place, not by what took the resource: "A or B is
  * held, in r8" is one entry, released in one way.
  */
@@ -422,7 +450,8 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 	 */
 	if (cancel_kind_ordered(a->kind) && (a->rank != b->rank || a->irq_off != b->irq_off))
 		return false;
-	return a->kind == b->kind && a->place == b->place && a->flags == b->flags &&
+	return a->kind == b->kind && a->place == b->place &&
+	       !((a->flags ^ b->flags) & ~cancel_soft_flags(a->kind)) &&
 	       a->arg == b->arg && a->off == b->off && a->flag == b->flag;
 }
 
@@ -544,13 +573,14 @@ static struct cancel_site *cancel_get_site(struct bpf_verifier_env *env, u32 ins
  * insns that the verifier adds take a register that is dead for scratch, see
  * bpf_insert_loop_guards(). So a place has to be live in front of the site.
  *
- * Can the pad of the site in front of env->insn_idx read register @regno? At a call the
- * cancellation comes back out of the callee, which keeps R6-R9 only.
+ * Can the pad of the site that the current frame of @st is at, in front of st->insn_idx,
+ * read register @regno? At a call the cancellation comes back out of the callee, which keeps
+ * R6-R9 only.
  */
-static bool cancel_reg_is_place(struct bpf_verifier_env *env, enum bpf_cancel_site_type type,
-				int regno)
+static bool cancel_reg_is_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+				enum bpf_cancel_site_type type, int regno)
 {
-	if (!(env->insn_aux_data[env->insn_idx].live_regs_before & BIT(regno)))
+	if (!(env->insn_aux_data[st->insn_idx].live_regs_before & BIT(regno)))
 		return false;
 	return type != BPF_CANCEL_SITE_CALL || (regno >= BPF_REG_6 && regno <= BPF_REG_9);
 }
@@ -579,8 +609,11 @@ static bool cancel_spill_is_place(struct bpf_verifier_env *env,
 	/*
 	 * A callee that is given a pointer to a stack may write to the slot, through that
 	 * pointer or through one that it finds there. Without one it reaches no frame below.
+	 * What a callee does to the slot shows where it is verified with this frame in the
+	 * state: every site that a cancellation can come back from looks at the frame again,
+	 * see cancel_record_callers().
 	 */
-	for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+	for (i = BPF_REG_1; i <= BPF_REG_5 && !env->cancel->caller_in_state; i++)
 		if (base_type(frame->regs[i].type) == PTR_TO_STACK)
 			return false;
 	bpf_for_each_spilled_stack_arg(i, frame, reg)
@@ -825,7 +858,7 @@ static void cancel_lock_place(struct bpf_verifier_env *env, const struct bpf_ver
 
 	e->alt_place = CANCEL_NO_PLACE;
 	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
-		if (cancel_reg_is_place(env, type, i))
+		if (cancel_reg_is_place(env, st, type, i))
 			cancel_lock_at(&frame->regs[i], ref, one_elem, i, e);
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
@@ -900,7 +933,7 @@ static bool cancel_lock_below(const struct bpf_verifier_state *st)
 
 	for (i = 0; i < st->acquired_refs; i++)
 		if ((st->refs[i].type & REF_TYPE_LOCK_MASK) &&
-		    !bpf_frame_owns_ref(st, st->curframe, i))
+		    st->refs[i].frameno < (int)st->curframe)
 			return true;
 	return false;
 }
@@ -1139,20 +1172,6 @@ static int cancel_collect_dynptr(struct bpf_verifier_env *env, const struct bpf_
 	return cancel_list_add(visit, &e);
 }
 
-/*
- * CANCEL_PTR: the pad calls what releases the reference with the handle in R1. arg is the
- * BTF id of a kfunc, and from bit 32 on off of its call, see struct bpf_release_kfunc.
- */
-
-/* flags: the handle is NULL if nothing was acquired, and the pad tests it */
-#define CANCEL_PTR_NULL		BIT(0)
-/* arg is the id of a helper */
-#define CANCEL_PTR_HELPER	BIT(1)
-/* an object that the program owns is dropped: arg is the btf_record of its type, or NULL */
-#define CANCEL_PTR_OBJ		BIT(2)
-/* and it is a per-CPU object */
-#define CANCEL_PTR_PERCPU	BIT(3)
-
 /* May a pad call helper @func_id: the program may, and it is a call that does not sleep */
 static bool cancel_helper_ok(struct bpf_verifier_env *env, int func_id)
 {
@@ -1254,7 +1273,8 @@ static bool cancel_obj_drop_ok(struct bpf_verifier_env *env, const struct bpf_ve
  * A pointer that may be NULL is one that the program did not test since it was acquired:
  * the verifier drops the reference where the test finds NULL. Nothing was acquired then,
  * so the pad makes the test and leaves the call out. If a callee made the test, the place
- * of the caller has the same NULL.
+ * of the caller has the same NULL, for as long as nothing else is written to it, see
+ * cancel_null_in_place().
  */
 static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			     const struct bpf_reg_state *reg, int place, int reason,
@@ -1382,7 +1402,7 @@ static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_ver
 		return CANCEL_REFS;
 
 	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
-		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, type, i))
+		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, st, type, i))
 			reason = cancel_ptr_place(env, st, &frame->regs[i], i, reason, &e);
 	for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
 		slot = bpf_stack_slot(frame, spi);
@@ -1613,6 +1633,39 @@ static void cancel_agree_on_places(struct bpf_cancel *c, struct cancel_list *hel
 }
 
 /*
+ * The current frame of @st waits in a call and is without @e, which every visit of the call
+ * held so far: a callee tested the handle and found NULL, so nothing was acquired, see
+ * cancel_ptr_handle(). The pad makes that test too, and is right for this visit if the
+ * place of @e still has the NULL: a callee may have written to a slot since. Then the
+ * entry is one that this visit is without, like any other.
+ */
+static bool cancel_null_in_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+				 const struct cancel_entry *e)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int spi = -e->place / BPF_REG_SIZE - 1;
+	const struct bpf_stack_state *slot;
+	const struct bpf_reg_state *reg;
+
+	if (e->kind != CANCEL_PTR || !(e->flags & CANCEL_PTR_NULL) || e->cond)
+		return false;
+	if (cancel_place_is_reg(e->place)) {
+		if (!cancel_reg_is_place(env, st, BPF_CANCEL_SITE_CALL, e->place))
+			return false;
+		reg = &frame->regs[e->place];
+	} else {
+		if (spi >= bpf_stack_nr_slots(frame))
+			return false;
+		slot = bpf_stack_slot(frame, spi);
+		if (bpf_spill_size(slot) != BPF_REG_SIZE ||
+		    !cancel_spill_is_place(env, st, BPF_CANCEL_SITE_CALL, spi))
+			return false;
+		reg = &slot->spilled_ptr;
+	}
+	return reg->type == SCALAR_VALUE && tnum_equals_const(reg->var_off, 0);
+}
+
+/*
  * A visit of @site found c->visit. An entry that this visit or one before it
  * is without takes a condition. So does a resource that the visits have in
  * different places and that finds no place for all of them: these are two
@@ -1620,9 +1673,14 @@ static void cancel_agree_on_places(struct bpf_cancel *c, struct cancel_list *hel
  * is found out after the main pass, see cancel_site_flags(). It goes by what
  * brought the resource, and whatever brought what the visits have in one entry
  * is one class.
+ *
+ * @waits: the visit is of a frame that waits in the call, the current one of that state, see
+ * cancel_record_callers(). NULL for the visit of a frame that gets to the site.
  */
-static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
+static int cancel_merge(struct bpf_verifier_env *env, struct cancel_site *site,
+			const struct bpf_verifier_state *waits)
 {
+	struct bpf_cancel *c = env->cancel;
 	struct cancel_list *held = &site->held, *visit = &c->visit;
 	struct cancel_entry *e, *v;
 	int err;
@@ -1634,6 +1692,13 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 	for (i = 0; i < held->nr; i++) {
 		e = &held->entries[i];
 		v = cancel_list_find(visit, e);
+		if (!v && waits && cancel_null_in_place(env, waits, e)) {
+			/* no other place is known to have the NULL in this visit */
+			e->regs = 0;
+			e->slots = 0;
+			cancel_note_place(e, e->place);
+			continue;
+		}
 		if (!v) {
 			e->cond = true;
 			continue;
@@ -1644,6 +1709,8 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 		/* and so is a place that the entry notes */
 		e->regs &= v->regs;
 		e->slots &= v->slots;
+		/* see cancel_soft_flags() */
+		e->flags |= v->flags;
 		e->stray |= v->stray;
 		if (e->origin && v->origin)
 			cancel_union(c, e->origin - 1, v->origin - 1);
@@ -1664,16 +1731,95 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 }
 
 /*
- * The current state is at a site, in front of env->insn_idx. Record what its
- * current frame holds there. The frames below wait in calls, which are sites
- * of their own.
+ * A visit of @site by a frame whose state is @st, with the frame as the current one. Record
+ * what the frame holds there. Whatever the reason, a site that declines once declines.
+ * @waits: the frame got to the site before and waits in the call, see
+ * cancel_record_callers().
  */
-int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type)
+static int cancel_record_visit(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			       struct cancel_site *site, bool waits)
 {
-	const struct bpf_verifier_state *st = env->cur_state;
-	struct cancel_site *site;
-	struct bpf_cancel *c;
+	struct bpf_cancel *c = env->cancel;
 	int reason;
+
+	if (site->decline)
+		return 0;
+	c->visit.nr = 0;
+	reason = cancel_collect(env, st, site->type, &c->visit);
+	if (reason < 0)
+		return reason;
+	if (reason) {
+		site->decline = reason;
+		return 0;
+	}
+	return cancel_merge(env, site, waits ? st : NULL);
+}
+
+/*
+ * The frames of @st below the current one wait in calls, and a cancellation that begins at
+ * the site of the current frame goes on in the pads of these calls. The record of a call is
+ * made at the call. A callee that has a pointer to the stack of a caller may have written
+ * since to a slot that the record took for the place of a handle.
+ *
+ * So each frame that waits visits its call again, as it is now: the pad has to be right for
+ * that too. A cancellation gets to the pad of a call from a site at or above the callee, and
+ * each of these makes the visit when the callee is verified with the frame in the state, see
+ * bpf_cancel_record_call(). A slot that lost the handle is no place in the visit: its entry
+ * switches to a place that all visits have, see cancel_agree_on_places(), or the call
+ * declines.
+ *
+ * The visit is made from a state that ends at the frame: what the pad of the call finds when
+ * the frames above are gone. Their entries of refs[] stay and count for nothing. Their
+ * sections are left: the frame above was entered in what is held then.
+ *
+ * A frame that holds nothing does not visit a call that no visit held anything at. One that
+ * held something does: what a callee tested and found to be NULL is an entry that this
+ * visit is without, see cancel_null_in_place(). What a callee released declines the call
+ * before that, see bpf_cancel_foreign_release().
+ */
+static int cancel_record_callers(struct bpf_verifier_env *env, const struct bpf_verifier_state *st)
+{
+	struct bpf_cancel *c = env->cancel;
+	struct bpf_verifier_state *caller = &c->caller;
+	struct cancel_site *site;
+	u32 holds = 0, i;
+	int fr, err;
+
+	BUILD_BUG_ON(MAX_CALL_FRAMES > BITS_PER_TYPE(holds));
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].frameno >= 0 && st->refs[i].frameno < st->curframe)
+			holds |= BIT(st->refs[i].frameno);
+	for (fr = st->curframe - 1; fr >= 0; fr--) {
+		/* a helper or a kfunc that calls a callback is no site */
+		site = cancel_find_site(env, st->frame[fr + 1]->callsite, BPF_CANCEL_SITE_CALL);
+		if (!site || site->decline || (!site->held.nr && !(holds & BIT(fr))))
+			continue;
+		*caller = *st;
+		caller->curframe = fr;
+		caller->insn_idx = site->insn_idx;
+		caller->active_rcu_locks = st->frame[fr + 1]->entry_rcu_locks;
+		caller->active_preempt_locks = st->frame[fr + 1]->entry_preempt_locks;
+		c->caller_in_state = true;
+		err = cancel_record_visit(env, caller, site, true);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+/*
+ * The current state is at a site, in front of env->insn_idx. Record what its current frame
+ * holds there, and what the frames below hold at their calls, see cancel_record_callers().
+ * @caller_in_state: the site is a call, and the frame is in the state while the callee is
+ * verified, see cancel_spill_is_place().
+ */
+static int cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type,
+			 bool caller_in_state)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct cancel_site *site;
+	int err;
 
 	/* the program doesn't get there */
 	if (st->speculative)
@@ -1681,30 +1827,40 @@ int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type ty
 	site = cancel_get_site(env, env->insn_idx, type);
 	if (!site)
 		return -ENOMEM;
-	if (site->decline)
-		return 0;
-
-	c = env->cancel;
-	c->visit.nr = 0;
 	/*
 	 * The stack check is in front of the first insn and only calls get to it: the
 	 * frame has taken nothing yet, whatever a state that jumps to that insn holds,
-	 * and no call moves a reference into it, see bpf_cancel_ref_moves().
+	 * and no call moves a reference into it, see bpf_cancel_ref_moves(). The frames
+	 * below are as their calls found them.
 	 */
-	reason = 0;
-	if (type != BPF_CANCEL_SITE_ENTRY) {
-		/* for cancel_spill_is_place() */
-		reason = bpf_live_stack_query_init(env, env->cur_state);
-		if (!reason)
-			reason = cancel_collect(env, st, type, &c->visit);
+	if (type == BPF_CANCEL_SITE_ENTRY) {
+		env->cancel->visit.nr = 0;
+		return site->decline ? 0 : cancel_merge(env, site, NULL);
 	}
-	if (reason < 0)
-		return reason;
-	if (reason) {
-		site->decline = reason;
-		return 0;
-	}
-	return cancel_merge(c, site);
+	/* for cancel_spill_is_place() */
+	err = bpf_live_stack_query_init(env, st);
+	if (err)
+		return err;
+	env->cancel->caller_in_state = caller_in_state;
+	err = cancel_record_visit(env, st, site, false);
+	if (err)
+		return err;
+	return cancel_record_callers(env, st);
+}
+
+int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type)
+{
+	return cancel_record(env, type, false);
+}
+
+/*
+ * The current state calls a static subprog at env->insn_idx. @caller_in_state: the callee is
+ * verified with the frames of the state below it, and not on its own, see
+ * call_func_on_its_own().
+ */
+int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state)
+{
+	return cancel_record(env, BPF_CANCEL_SITE_CALL, caller_in_state);
 }
 
 /*
@@ -1829,7 +1985,7 @@ bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifie
 
 	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
 		if (frame->regs[i].id == ref->id &&
-		    cancel_reg_is_place(env, BPF_CANCEL_SITE_CALL, i))
+		    cancel_reg_is_place(env, st, BPF_CANCEL_SITE_CALL, i))
 			return false;
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
@@ -2262,13 +2418,13 @@ static const char *cancel_shape_text(u8 reason)
 	case CANCEL_FOREIGN:
 		return "a callee releases what the frame holds";
 	case CANCEL_LOCK_PLACE:
-		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot when no stack pointer is passed)";
+		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot that the callee is seen to leave alone)";
 	case CANCEL_ITER:
 		return "the frame holds an iterator that a pad cannot destroy there";
 	case CANCEL_DYNPTR:
 		return "the frame holds a dynptr that a pad cannot release there";
 	case CANCEL_PLACE:
-		return "no register or stack slot that a pad can read has a reference of the frame as it was acquired (at a call: R6-R9, or a slot when no stack pointer is passed)";
+		return "no register or stack slot that a pad can read has a reference of the frame as it was acquired (at a call: R6-R9, or a slot that the callee is seen to leave alone)";
 	case CANCEL_RELEASE:
 		return "nothing that a pad may call there releases a reference of the frame";
 	case CANCEL_MULTI:
@@ -2522,7 +2678,8 @@ static bool cancel_same_held(const struct cancel_site *a, const struct cancel_si
 	if (a->held.nr != b->held.nr)
 		return false;
 	for (i = 0; i < a->held.nr; i++)
-		if (!cancel_entry_same(&a->held.entries[i], &b->held.entries[i]))
+		if (!cancel_entry_same(&a->held.entries[i], &b->held.entries[i]) ||
+		    a->held.entries[i].flags != b->held.entries[i].flags)
 			return false;
 	return true;
 }
