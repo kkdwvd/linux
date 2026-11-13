@@ -1366,6 +1366,137 @@ __naked void res_lock_in_one_visit(void)
 }
 
 /*
+ * bpf_res_spin_lock_irqsave() takes the lock and saves IRQ flags, and one call gives both back.
+ * The two are one resource: one flag, the byte below the slot of the IRQ flags, which is set if
+ * R0 is 0, and one entry of the pad, which unlocks and restores with one call.
+ */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock_irqsave that one of two visits of a call holds")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("call kernel-function")
+__xlated("if w0 != 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -9) = 1")
+__xlated("...")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("r2 = r10")
+__xlated("r2 += -8")
+__xlated("*(u8 *)(r10 -9) = 0")
+__xlated("call kernel-function")
+__xlated("...")
+__xlated("r1 = *(u8 *)(r10 -9)")
+__xlated("if r1 == 0x0 goto pc+5")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("r2 = r10")
+__xlated("r2 += -8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void res_lock_irqsave_in_one_visit(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 3f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 == 0 goto 1f;"
+		"r1 = %[res_a] ll;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call %[bpf_res_spin_lock_irqsave];"
+		"if r0 != 0 goto 4f;"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		"if r7 == 0 goto 2f;"
+		"r1 = %[res_a] ll;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call %[bpf_res_spin_unlock_irqrestore];"
+	"2:"
+		asm_count(behind)
+	"3:"
+		"r0 = 0;"
+		"exit;"
+	"4:"
+		asm_count(lock_err)
+		"goto 3b;"
+		:
+		: __imm(bpf_res_spin_lock_irqsave),
+		  __imm(bpf_res_spin_unlock_irqrestore),
+		  __imm_addr(zero),
+		  __imm_addr(res_a),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
+/* r1: a slot of the caller for the IRQ flags. r0 = 0 if it returns with the lock and the flags. */
+__naked __noinline __used
+static unsigned long locks_irqsave_for_caller(void)
+{
+	asm volatile (
+		"r2 = r1;"
+		"r1 = %[res_a] ll;"
+		"call %[bpf_res_spin_lock_irqsave];"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_lock_irqsave),
+		  __imm_addr(res_a)
+		: __clobber_all
+	);
+}
+
+/*
+ * Where no flag can tell, the program is not loaded. Here a callee returns with the lock and
+ * the IRQ flags: its call brought two entries to the frame, and that is not known to be one
+ * resource like the two of one bpf_res_spin_lock_irqsave() are.
+ */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock_irqsave that a callee returned with in one of two visits is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(multi)")
+__naked void res_lock_irqsave_of_callee_in_one_visit(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 == 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call locks_irqsave_for_caller;"
+		"if r0 != 0 goto 2f;"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		"if r7 == 0 goto 2f;"
+		"r1 = %[res_a] ll;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call %[bpf_res_spin_unlock_irqrestore];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_unlock_irqrestore),
+		  __imm_addr(zero),
+		  __imm_addr(res_a)
+		: __clobber_all
+	);
+}
+
+/*
  * One state saved the flags of the upper slot before those of the lower slot, the other one
  * saved the lower slot only. The lower slot is restored first in the one and second in the
  * other, which is two entries of the pad for what one call saved: its flag would restore twice.
