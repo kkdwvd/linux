@@ -504,7 +504,8 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	if (a->acquired_refs != b->acquired_refs)
 		return false;
 	for (i = 0; i < a->acquired_refs; i++) {
-		if (a->refs[i].type != b->refs[i].type)
+		if (a->refs[i].type != b->refs[i].type ||
+		    a->refs[i].frameno != b->refs[i].frameno)
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:

@@ -522,6 +522,9 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
 		    old->refs[i].type != cur->refs[i].type)
 			return false;
+		/* a state doesn't stand for one where another frame is to release it */
+		if (old->refs[i].frameno != cur->refs[i].frameno)
+			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
 			if (!check_ids(old->refs[i].parent_id, cur->refs[i].parent_id, idmap))

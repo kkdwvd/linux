@@ -348,6 +348,12 @@ struct bpf_reference_state {
 	 * is used purely to inform the user of a reference leak.
 	 */
 	int insn_idx;
+	/*
+	 * The frame that is to release it: the one that acquired it, or the caller
+	 * that a returning frame left it with. BPF_INHERITED_FRAME for what the
+	 * callers of a function verified on its own hold.
+	 */
+	int frameno;
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -589,6 +595,12 @@ struct bpf_verifier_state {
 	/* The insn that the state comes from, -1 if no instructions have been executed yet. */
 	u32 last_insn_idx;
 };
+
+/* Is refs[@idx] for frame @frame of @st to release? */
+static inline bool bpf_frame_owns_ref(const struct bpf_verifier_state *st, int frame, u32 idx)
+{
+	return st->refs[idx].frameno == frame;
+}
 
 /* Number of BPF_REG_SIZE stack slots tracked for the frame so far. */
 static inline u32 bpf_stack_nr_slots(const struct bpf_func_state *frame)
@@ -1146,6 +1158,8 @@ struct bpf_id_pair {
  */
 #define BPF_INHERITED_ID	0x20000000
 #define BPF_MAX_ID		(BPF_INHERITED_ID / 2)
+/* The owner of what is held at the call: the frames of the callers are not in the state */
+#define BPF_INHERITED_FRAME	(-1)
 
 struct bpf_idmap {
 	u32 cnt;
