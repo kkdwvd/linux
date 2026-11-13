@@ -861,64 +861,35 @@ static void push_callee_regs(struct jit_ctx *ctx)
 {
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary should save all ARM64
-	 * Callee-saved registers as the exception callback needs to recover
-	 * all ARM64 Callee-saved registers in its epilogue.
-	 */
-	if (ctx->prog->aux->exception_boundary) {
-		emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
-		ctx->fp_used = true;
-	} else {
-		find_used_callee_regs(ctx);
-		for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
-			reg1 = ctx->used_callee_reg[i];
-			reg2 = ctx->used_callee_reg[i + 1];
-			emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
-		}
-		if (i < ctx->nr_used_callee_reg) {
-			reg1 = ctx->used_callee_reg[i];
-			/* keep SP 16-byte aligned */
-			emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
-		}
+	find_used_callee_regs(ctx);
+	for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
+		reg1 = ctx->used_callee_reg[i];
+		reg2 = ctx->used_callee_reg[i + 1];
+		emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
+	}
+	if (i < ctx->nr_used_callee_reg) {
+		reg1 = ctx->used_callee_reg[i];
+		/* keep SP 16-byte aligned */
+		emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
 	}
 }
 
 /* Restore callee-saved registers */
 static void pop_callee_regs(struct jit_ctx *ctx)
 {
-	struct bpf_prog_aux *aux = ctx->prog->aux;
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary pushes R23 and R24 in addition
-	 * to BPF callee-saved registers. Exception callback uses the boundary
-	 * program's stack frame, so recover these extra registers in the above
-	 * two cases.
-	 */
-	if (aux->exception_boundary || aux->exception_cb) {
-		emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
-		emit(A64_POP(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_POP(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_POP(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_POP(A64_R(19), A64_R(20), A64_SP), ctx);
-	} else {
-		i = ctx->nr_used_callee_reg - 1;
-		if (ctx->nr_used_callee_reg % 2 != 0) {
-			reg1 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
-			i--;
-		}
-		while (i > 0) {
-			reg1 = ctx->used_callee_reg[i - 1];
-			reg2 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, reg2, A64_SP), ctx);
-			i -= 2;
-		}
+	i = ctx->nr_used_callee_reg - 1;
+	if (ctx->nr_used_callee_reg % 2 != 0) {
+		reg1 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
+		i--;
+	}
+	while (i > 0) {
+		reg1 = ctx->used_callee_reg[i - 1];
+		reg2 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, reg2, A64_SP), ctx);
+		i -= 2;
 	}
 }
 
@@ -998,45 +969,27 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	emit(A64_MOV(1, A64_R(9), A64_LR), ctx);
 	emit(A64_NOP, ctx);
 
-	if (!prog->aux->exception_cb) {
-		/* Sign lr */
-		if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
-			emit(A64_PACIASP, ctx);
+	/* Sign lr */
+	if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
+		emit(A64_PACIASP, ctx);
 
-		/* Save FP and LR registers to stay align with ARM64 AAPCS */
-		emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
-		emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+	/* Save FP and LR registers to stay align with ARM64 AAPCS */
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
 
-		prepare_bpf_tail_call_cnt(ctx);
+	prepare_bpf_tail_call_cnt(ctx);
 
-		if (!ebpf_from_cbpf && is_main_prog) {
-			cur_offset = ctx->idx - idx0;
-			if (cur_offset != PROLOGUE_OFFSET) {
-				pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
-						cur_offset, PROLOGUE_OFFSET);
-				return -1;
-			}
-			/* BTI landing pad for the tail call, done with a BR */
-			emit_bti(A64_BTI_J, ctx);
+	if (!ebpf_from_cbpf && is_main_prog) {
+		cur_offset = ctx->idx - idx0;
+		if (cur_offset != PROLOGUE_OFFSET) {
+			pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
+					cur_offset, PROLOGUE_OFFSET);
+			return -1;
 		}
-		push_callee_regs(ctx);
-	} else {
-		/*
-		 * Exception callback receives FP of Main Program as third
-		 * parameter
-		 */
-		emit(A64_MOV(1, A64_FP, A64_R(2)), ctx);
-		/*
-		 * Main Program already pushed the frame record and the
-		 * callee-saved registers. The exception callback will not push
-		 * anything and re-use the main program's stack.
-		 *
-		 * 12 registers are on the stack
-		 */
-		emit(A64_SUB_I(1, A64_SP, A64_FP, 96), ctx);
-		/* The callback may use its own BPF stack, set up fp for it. */
-		ctx->fp_used = true;
+		/* BTI landing pad for the tail call, done with a BR */
+		emit_bti(A64_BTI_J, ctx);
 	}
+	push_callee_regs(ctx);
 
 	/* Stack must be multiples of 16B */
 	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
