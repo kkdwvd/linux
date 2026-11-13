@@ -238,7 +238,7 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 	bpf_equations_pre_join(env, dst, src, leftover_loop, leftover_loop && widen);
 	for (j.fr = 0; j.fr <= dst->curframe; j.fr++)
 		join_func(&j, dst->frame[j.fr], src->frame[j.fr],
-			  env->insn_aux_data[bpf_frame_insn_idx(dst, j.fr)].live_regs_before);
+			  bpf_frame_live_regs(env, dst, j.fr));
 	bpf_equations_post_join(env, dst, src);
 	dst->max_held_cnt = max(dst->max_held_cnt, src->max_held_cnt);
 	/*

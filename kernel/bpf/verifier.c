@@ -3475,6 +3475,7 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 			bpf_find_containing_subprog(env, i)->can_unwind = true;
 			seen = true;
 		}
+		env->has_throw |= bpf_is_throw_kfunc(insn);
 		if (!bpf_is_unwind_goto(insn))
 			continue;
 		seen = true;
@@ -12250,6 +12251,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (IS_ERR(branch))
 				return PTR_ERR(branch);
 			branch->unwound = true;
+			/* the value, also out of a function that returns nothing */
+			if (env->has_throw)
+				mark_reg_unknown(env, branch->frame[branch->curframe]->regs,
+						 BPF_REG_0);
 		}
 
 		if (env->subprog_info[subprog].might_throw) {
@@ -20432,7 +20437,12 @@ static int check_global_subprog_return_code(struct bpf_verifier_env *env)
 	u32 i, nregs;
 	int err;
 
-	if (subprog_returns_void(env, subprog))
+	/*
+	 * unwind_exit leaves with the value in R0, whatever the function returns. The landing pads
+	 * of the callers read it, and to them it is a number, see check_func_call().
+	 */
+	if (subprog_returns_void(env, subprog) &&
+	    !bpf_is_unwind_exit(&env->prog->insnsi[env->insn_idx]))
 		return 0;
 
 	nregs = bpf_ret_reg_pair(env, subprog) ? 2 : 1;
@@ -20831,6 +20841,18 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 }
 
 
+/*
+ * The program starts to unwind with the value in R@regno. In a program with bpf_throw() the landing
+ * pads that the verifier emits pass the value on, and the main program returns it. Nobody
+ * looks at what an async callback returns.
+ */
+static int check_unwound_value(struct bpf_verifier_env *env, int regno, const char *reg_name)
+{
+	if (env->cur_state->frame[0]->in_async_callback_fn)
+		return 0;
+	return check_return_code(env, regno, reg_name);
+}
+
 static int process_bpf_exit_full(struct bpf_verifier_env *env,
 				 bool *do_print_state,
 				 bool exception_exit)
@@ -21188,6 +21210,11 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				env->insn_idx += insn->imm + 1;
 			return INSN_IDX_UPDATED;
 		} else if (opcode == BPF_EXIT) {
+			if (bpf_is_unwind_exit(insn) && env->has_throw) {
+				err = check_unwound_value(env, BPF_REG_0, "R0");
+				if (err)
+					return err;
+			}
 			return process_bpf_exit_full(env, do_print_state, false);
 		}
 		return check_cond_jmp_op(env, insn, &env->insn_idx);
@@ -21695,9 +21722,8 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge
 }
 
 /*
- * What @subprog returns when it is unwound, see unwind_frame(). No code of the program chooses that
- * value, so for the main program it is the one that refuses, drops or changes nothing. That is 0,
- * but:
+ * What the program returns when the verifier unwinds it, see unwind_frame(). No code of the program
+ * chooses that value, so it is the one that refuses, drops or changes nothing. That is 0, but:
  *
  *	tc					TC_ACT_SHOT, 0 is TC_ACT_OK
  *	lwt, flow dissector			BPF_DROP, 0 is BPF_OK
@@ -21705,20 +21731,19 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge
  *	lsm, the hook returns an errno		-EPERM, 0 lets the operation go on
  *	the range is [1, 1]			1, hooks that cannot refuse
  *
- * Each is a value that check_return_code() lets the program return.
+ * Each is a value that check_return_code() lets the program return: no state is checked there with
+ * it, see unwind_frame().
  * Two values can be wrong in a way that is not known at load time: a cls_bpf classifier that is not
  * in direct-action mode takes 2 for a class, a stream parser of sk_skb takes 0 for a message that
  * is not complete.
  * An extension returns into the program that it extends, with the value of that program.
- * The exception callback returns in place of the main program.
+ * A subprog is left with the same value: its callers may pass it on, see bpf_site_has_value().
  */
-int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog)
+int bpf_unwound_retval(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
 	struct bpf_retval_range range;
 
-	if (subprog && subprog != env->exception_callback_subprog)
-		return 0;
 	switch (resolve_prog_type(prog)) {
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
@@ -22025,6 +22050,8 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
  * release_frame_resources(), the value in place of the result, then unwind_exit, or exit in a frame
  * that the kernel called. What is left of @st goes where the frame returns to, through the
  * worklist like every other state. @st is taken.
+ * The value was checked where it was made, see check_unwound_value(): on the way it is joined and
+ * widened like any other number, and what comes out of a global subprog is not known.
  *
  * With a conflict there is no pad: the site is an unproven insn in @st, which ends here. The pass
  * goes on, and a pass that keeps more apart may have no such state.
@@ -22057,6 +22084,9 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			goto out;
 		if (!plan->conflict)
 			plan->conflict = frame_cannot_unwind(env, st);
+		if (!plan->conflict && bpf_site_has_value(env, kind) &&
+		    frame->regs[BPF_REG_0].type != SCALAR_VALUE)
+			plan->conflict = BPF_CONFLICT_NO_VALUE;
 		certain = site_is_certain(env, plan, insn_idx);
 		/* there is no other way out */
 		if (plan->conflict && bpf_pad_must_unwind(env, plan) && certain) {
@@ -22073,11 +22103,12 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	err = release_frame_resources(env);
 	if (err)
 		goto out;
-	bpf_mark_reg_known_scalar(&frame->regs[BPF_REG_0],
-				  bpf_unwound_retval(env, frame->subprogno));
+	if (!bpf_site_has_value(env, kind)) {
+		bpf_mark_reg_known_scalar(&frame->regs[BPF_REG_0], bpf_unwound_retval(env));
+		bpf_equations_forget_xreg(env, st, bpf_xreg(st->curframe, BPF_REG_0));
+	}
 	if (bpf_ret_reg_pair(env, frame->subprogno))
 		__mark_reg_const_zero(&frame->regs[BPF_REG_2]);
-	bpf_equations_forget_xreg(env, st, bpf_xreg(st->curframe, BPF_REG_0));
 	bpf_equations_forget_xreg(env, st, bpf_xreg(st->curframe, BPF_REG_2));
 
 	st->unwound = sub->bail_unwinds && !frame_is_top(st);
@@ -22097,7 +22128,9 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
-	if (!st->curframe && st->instance_id) {
+	if (frame_is_top(st)) {
+		err = PROCESS_BPF_EXIT;
+	} else if (!st->curframe && st->instance_id) {
 		/*
 		 * What leaves the function is compared as if it were at one exit, out of loops.
 		 * The function stays in its recursion, see loop_stack_pop().
@@ -22108,7 +22141,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			leave_loops(frame, cnt);
 			bpf_equations_clean(env, st);
 		}
-		err = exit_func_on_its_own(env, env->subprog_info[frame->subprogno].exit_idx);
+		err = exit_func_on_its_own(env, sub->exit_idx);
 	} else {
 		err = process_bpf_exit_full(env, &print_state, false);
 	}

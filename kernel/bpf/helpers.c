@@ -1250,7 +1250,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 
 	bpf_timed_may_goto_save(prog, &saved);
 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
-	/* The verifier checked that return value is zero. */
+	/* Nobody looks at the return value: 0 at exit, any number when the callback was unwound. */
 	bpf_timed_may_goto_restore(prog, &saved);
 
 	this_cpu_write(hrtimer_running, NULL);

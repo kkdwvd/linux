@@ -306,7 +306,7 @@ redo:
 			 */
 			if (r == BPF_REG_0 && i + 1 < insn_cnt &&
 			    bpf_is_sync_callback_calling_insn(&insns[i]) &&
-			    bpf_is_unwind_goto(&insns[i + 1]))
+			    (bpf_is_unwind_goto(&insns[i + 1]) || env->has_throw))
 				continue;
 			switch (c->state) {
 			case CONST_ARG_CONST: {

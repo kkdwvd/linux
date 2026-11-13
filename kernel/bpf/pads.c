@@ -11,7 +11,7 @@
  *   - a load, a store or an atomic insn in arena, when it faults
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
- * then 'r0 = 0' and unwind_exit, or exit in a frame that the kernel called.
+ * then the value in r0 and unwind_exit, or exit in a frame that the kernel called.
  *
  *	bpf_rcu_read_lock();				   call bpf_rcu_read_lock
  *	do {						1: ...
@@ -170,8 +170,21 @@
  * reads 0. That is what a conflict means here, see skip_faults(): it does not reject the program.
  * Nor does a call that has nothing but such accesses below it, see bpf_pad_must_unwind().
  * At most accesses the frame holds nothing. They have no unwind_goto either: a bit in the entry
- * that an access has in the exception table sends the handler to one pad per function, 'r0 = 0'
+ * that an access has in the exception table sends the handler to one pad per function, 'r0 = V'
  * and the exit, see append_pads() in fixups.c.
+ *
+ * THE VALUE goes from the frame where the unwinding starts to the one that ends it, in R0, and the
+ * program returns it. What the verifier unwinds has bpf_unwound_retval(). In a program without
+ * bpf_throw() each pad loads it, whatever an unwind_exit of the program left in R0. With it a pad
+ * after a call passes on what unwind_exit of the callee left in R0. Its own calls clobber R0, so
+ * the value waits in a hidden word of the frame, below the stack of the function. A pad without a
+ * call has none.
+ *
+ *						      pad: *(u64 *)(r10 - 8) = r0
+ *							   r1 = r6
+ *							   call bpf_task_release
+ *							   r0 = *(u64 *)(r10 - 8)
+ *							   unwind_exit
  *
  * HIDDEN SLOTS are the fallback for what neither the program counter nor a place tells. Here only
  * the program knows what 'own' means:
@@ -1713,6 +1726,13 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	return n;
 }
 
+/* The calls of the pad of @plan clobber the value that it has to pass on */
+static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	return bpf_site_has_value(env, plan->kind) &&
+	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT]);
+}
+
 /*
  * The insns of the landing pad of @plan, a site in @subprog, but for the last one, which leaves the
  * frame. The passes that follow the emission look up in the aux data of an insn what the main pass
@@ -1722,15 +1742,21 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
-	int class, i, n;
+	int value_off = env->subprog_info[subprog].value_off;
+	int class, i, n = 0;
 
-	n = release_ents(env, plan, PAD_TURN_RCU_ITERS, buf, aux);
+	if (plan_saves_value(env, plan))
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, value_off);
+	n += release_ents(env, plan, PAD_TURN_RCU_ITERS, &buf[n], &aux[n]);
 	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env, subprog));
+	if (plan_saves_value(env, plan))
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_FP, value_off);
+	else if (!bpf_site_has_value(env, plan->kind))
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env));
 	if (bpf_ret_reg_pair(env, subprog))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	return n;
@@ -1985,6 +2011,7 @@ static int settle_slots(struct bpf_verifier_env *env)
 	for (s = 0; s < env->subprog_cnt; s++) {
 		env->subprog_info[s].slots = 0;
 		env->subprog_info[s].hidden_words = 0;
+		env->subprog_info[s].value_off = 0;
 	}
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -2232,6 +2259,8 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NO_EXIT]		= "the function has no exit",
 		[BPF_CONFLICT_NO_PERFMON]	= "the program is loaded without CAP_PERFMON",
 		[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
+		[BPF_CONFLICT_NO_VALUE]		= "the value of unwind_exit is not a number",
+		[BPF_CONFLICT_NO_ROOM]		= "no room in the stack for the value",
 	};
 	int j;
 
@@ -2293,6 +2322,26 @@ static int skip_faults(struct bpf_verifier_env *env, int i, const struct bpf_pad
 }
 
 /*
+ * The pads of @sub keep the value over their calls in a hidden word of the frame, below the
+ * hidden slots. Nothing else writes it. Returns the reason of a conflict.
+ */
+static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
+{
+	int err;
+
+	if (sub->value_off)
+		return 0;
+	sub->hidden_words++;
+	err = bpf_hidden_slots_fit(env);
+	if (err <= 0) {
+		sub->hidden_words--;
+		return err ?: BPF_CONFLICT_NO_ROOM;
+	}
+	sub->value_off = -(int)bpf_stack_depth_with_slots(sub);
+	return 0;
+}
+
+/*
  * The main pass unwinds at more sites than the program has in the end: pass 0 takes the edge of
  * may_goto in every loop that nothing stops, and a loop that has a trip count gets no may_goto.
  * The states that left a frame there went on to the callers, and visited the plans of the calls.
@@ -2343,6 +2392,8 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			if (!plan->used)
 				continue;
 			err = settle_plan(env, plan);
+			if (!err && plan_saves_value(env, plan))
+				err = take_value_word(env, bpf_find_containing_subprog(env, i));
 			if (err < 0)
 				return err;
 			plan->conflict = err;

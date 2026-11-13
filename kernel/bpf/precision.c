@@ -177,7 +177,7 @@ u64 bpf_hash_live_types(struct bpf_verifier_env *env, const struct bpf_verifier_
 		aux = &env->insn_aux_data[bpf_frame_insn_idx(st, fr)];
 		bits = bpf_spi_to_xreg(bpf_stack_nr_slots(st->frame[fr]));
 		bitmap_zero(live, bits);
-		live[0] = aux->live_regs_before & XREG_REGS;
+		live[0] = bpf_frame_live_regs(env, st, fr) & XREG_REGS;
 		bpf_add_slots(live, aux->live_stack_before, bits);
 		bpf_add_cost(env, bitmap_weight(live, bits), BPF_COST_COPY);
 		for_each_set_bit(xregno, live, bits) {
