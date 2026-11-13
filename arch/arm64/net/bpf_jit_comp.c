@@ -1761,7 +1761,7 @@ static int build_landings(struct jit_ctx *ctx)
 		}
 		k++;
 		emit(A64_MOV(1, bpf2a64[BPF_REG_0], A64_R(0)), ctx);
-		jmp_offset = ctx->offset[i + 1 + insn->off] - ctx->idx;
+		jmp_offset = ctx->offset[i + 1 + bpf_jmp_offset(insn)] - ctx->idx;
 		check_imm26(jmp_offset);
 		emit(A64_B(jmp_offset), ctx);
 	}
@@ -2448,9 +2448,10 @@ emit_cond_jmp:
 		break;
 	/* unwind_goto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
+	case BPF_JMP32 | BPF_JCOND:
 	{
 		int ret_addr = ctx->idx - 1;
-		int target = ctx->offset[i + 1 + off];
+		int target = ctx->offset[i + 1 + bpf_jmp_offset(insn)];
 
 		/*
 		 * 'bl foo; mov x8, x0' is in front. After the call of a subprog

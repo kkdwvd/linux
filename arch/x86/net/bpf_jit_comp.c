@@ -3463,9 +3463,11 @@ populate_extable:
 
 			/* unwind_goto. The verifier expanded may_goto. */
 		case BPF_JMP | BPF_JCOND:
+		case BPF_JMP32 | BPF_JCOND:
 			if (!after_call_len) {
 				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-							 addrs[i - 1], addrs[i + insn->off]);
+							 addrs[i - 1],
+							 addrs[i + bpf_jmp_offset(insn)]);
 				if (err)
 					return err;
 				break;
@@ -3487,7 +3489,7 @@ populate_extable:
 			EMIT2(0xEB, after_call_len + 5);
 			memcpy(prog, after_call, after_call_len);
 			prog += after_call_len;
-			EMIT1_off32(0xE9, addrs[i + insn->off] -
+			EMIT1_off32(0xE9, addrs[i + bpf_jmp_offset(insn)] -
 					  (addrs[i - 1] + 2 + after_call_len + 5));
 			break;
 

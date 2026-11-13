@@ -295,9 +295,21 @@ static inline bool insn_is_mov_percpu_addr(const struct bpf_insn *insn)
 		.off   = 0,					\
 		.imm   = 1 })
 
+/* gotol, and unwind_goto that the verifier adds, have 32 bits for the offset */
+static inline bool bpf_jmp_offset_is_imm(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JA) || insn->code == (BPF_JMP32 | BPF_JCOND);
+}
+
+static inline int bpf_jmp_offset(const struct bpf_insn *insn)
+{
+	return bpf_jmp_offset_is_imm(insn) ? insn->imm : insn->off;
+}
+
 static inline bool bpf_is_unwind_goto(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_UNWIND_GOTO;
+	return (insn->code == (BPF_JMP | BPF_JCOND) || insn->code == (BPF_JMP32 | BPF_JCOND)) &&
+	       insn->src_reg == BPF_UNWIND_GOTO;
 }
 
 static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)

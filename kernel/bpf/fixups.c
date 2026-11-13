@@ -739,10 +739,13 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
  * between a call and its unwind_goto, and jumps to the insn that follows the call go past it.
  * The pads are in the program: a call that has may_goto before it would need two jumps of one
  * patch, see bpf_patch_list_jump(). @added: how many insns the pads after each subprog have.
+ *
+ * unwind_goto is no code, the jumps that take a conditional jump to a target that is too far for
+ * 16 bits would be, see patch_image_relax(). So it has 32 bits for the offset.
  */
 static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 {
-	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
+	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_patch_list *pl = &env->patch_list;
 	const struct bpf_subprog_info *sub;
@@ -1083,7 +1086,7 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	int i;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		unwinds = bpf_is_unwind_goto(insn) && aux_data[i + 1 + insn->off].seen;
+		unwinds = bpf_is_unwind_goto(insn) && aux_data[i + 1 + bpf_jmp_offset(insn)].seen;
 		calls = (bpf_pseudo_call(insn) || bpf_is_callx(insn)) && aux_data[i].seen;
 		/*
 		 * The callee never exits. Its unwind_exit needs unwind_goto all the same.
@@ -3481,9 +3484,10 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	int reg_loop_ctx = BPF_REG_8;
 	struct bpf_insn *unwind_goto = &env->prog->insnsi[position + 1];
 	bool has_unwind_goto = bpf_is_unwind_goto(unwind_goto);
+	int pad_off = bpf_jmp_offset(unwind_goto);
 	bool pad = has_unwind_goto &&
 		   bpf_subprog_unwinds(&env->subprog_info[callback_subprogno]) &&
-		   env->insn_aux_data[position + 2 + unwind_goto->off].seen;
+		   env->insn_aux_data[position + 2 + pad_off].seen;
 
 	struct bpf_insn *insn_buf = env->insn_buf;
 	struct bpf_insn *last;
@@ -3555,7 +3559,7 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	 */
 	if (pad)
 		bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - 6),
-				    position + 2 + unwind_goto->off, 0);
+				    position + 2 + pad_off, 0);
 	/* The unwind_goto after the call of bpf_loop follows no call anymore. */
 	if (has_unwind_goto)
 		*unwind_goto = BPF_JMP_A(0);

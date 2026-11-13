@@ -404,6 +404,10 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 			   insn->src_reg == BPF_UNWIND_GOTO) {
 			verbose(cbs->private_data, "(%02x) unwind_goto pc%+d",
 				insn->code, insn->off);
+		} else if (insn->code == (BPF_JMP32 | BPF_JCOND) &&
+			   insn->src_reg == BPF_UNWIND_GOTO) {
+			verbose(cbs->private_data, "(%02x) unwind_goto pc%+d",
+				insn->code, insn->imm);
 		} else if (insn->code == (BPF_JMP32 | BPF_JA)) {
 			verbose(cbs->private_data, "(%02x) gotol pc%+d",
 				insn->code, insn->imm);

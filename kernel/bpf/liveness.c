@@ -322,15 +322,6 @@ static int mark_stack_mask(struct func_instance *instance, u32 frame, u32 insn_i
 	return 0;
 }
 
-int bpf_jmp_offset(struct bpf_insn *insn)
-{
-	u8 code = insn->code;
-
-	if (code == (BPF_JMP32 | BPF_JA))
-		return insn->imm;
-	return insn->off;
-}
-
 __diag_push();
 __diag_ignore_all("-Woverride-init", "Allow field initialization overrides for opcode_info_tbl");
 

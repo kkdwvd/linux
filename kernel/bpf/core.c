@@ -396,8 +396,8 @@ static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 	    code == (BPF_JMP | BPF_TAIL_CALL) || code == (BPF_JMP | BPF_JA | BPF_X))
 		return false;
 
-	*is_imm = code == (BPF_JMP32 | BPF_JA);
-	*rel = *is_imm ? insn->imm : insn->off;
+	*is_imm = bpf_jmp_offset_is_imm(insn);
+	*rel = bpf_jmp_offset(insn);
 	return true;
 }
 

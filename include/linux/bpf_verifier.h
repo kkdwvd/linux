@@ -2454,7 +2454,6 @@ const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
 const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
-int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
