@@ -1625,11 +1625,24 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 }
 
 /* bpf_rcu_read_unlock() or bpf_preempt_enable() is done, see release_reference_state() */
-static void release_context_state(struct bpf_verifier_state *state)
+static void release_context_state(struct bpf_verifier_env *env)
 {
+	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_func_state *frame;
 	int fr;
 
+	/*
+	 * The first frame that was entered inside of the section: its caller entered it. Frame 0
+	 * of a function that is verified on its own was entered by a caller that is not here.
+	 */
+	for (fr = 0; fr <= state->curframe; fr++) {
+		frame = state->frame[fr];
+		if (frame->entry_rcu_locks > state->active_rcu_locks ||
+		    frame->entry_preempt_locks > state->active_preempt_locks) {
+			bpf_cancel_foreign_release(env, fr - 1);
+			break;
+		}
+	}
 	for (fr = 0; fr <= state->curframe; fr++) {
 		frame = state->frame[fr];
 		frame->entry_rcu_locks = min(frame->entry_rcu_locks, state->active_rcu_locks);
@@ -16240,7 +16253,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_rcu_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
 					env->cur_state->active_rcu_locks);
 		if (!in_rcu_cs(env))
@@ -16258,7 +16271,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return -EINVAL;
 		}
 		env->cur_state->active_preempt_locks--;
-		release_context_state(env->cur_state);
+		release_context_state(env);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
 					env->cur_state->active_preempt_locks);
 		if (!in_rcu_cs(env))
