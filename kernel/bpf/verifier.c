@@ -1686,6 +1686,7 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
+			bpf_cancel_foreign_release(env, state->refs[i].frameno);
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
