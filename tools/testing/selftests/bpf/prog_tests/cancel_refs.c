@@ -481,6 +481,63 @@ static void test_wakeup_sources(struct cancel_refs *skel)
 	ASSERT_TRUE(wakeup_sources_go(), "ws_lock_at_call");
 }
 
+/*
+ * The objects keep a reference to the task in a kptr. It is released when the last reference
+ * to the object is dropped, so the references to the task tell whether a pad dropped its own.
+ */
+static void test_objects(struct cancel_refs *skel)
+{
+	struct child child;
+	int users;
+
+	if (!start_child(&child))
+		return;
+	skel->bss->pid = child.pid;
+	users = task_users(skel);
+	if (!ASSERT_GT(users, 0, "task_users"))
+		goto out;
+
+	cancelled(skel, skel->progs.obj_at_call);
+	ASSERT_EQ(task_users(skel), users, "obj_at_call");
+
+	/* the map has the other reference to the object: it goes with that one */
+	cancelled(skel, skel->progs.refcounted_at_call);
+	ASSERT_EQ(task_users(skel), users + 1, "refcounted_at_call");
+	run(skel->progs.drop_stashed);
+	ASSERT_EQ(task_users(skel), users, "drop_stashed");
+
+	run(skel->progs.list_push);
+	ASSERT_EQ(task_users(skel), users + 1, "list_push");
+	cancelled(skel, skel->progs.list_node_at_call);
+	ASSERT_EQ(task_users(skel), users, "list_node_at_call");
+	/* the list is empty: the handle is NULL, and the pad drops nothing */
+	cancelled(skel, skel->progs.list_node_at_call);
+
+	/* a per-CPU object leaves nothing behind that could be found */
+	cancelled(skel, skel->progs.percpu_obj_at_call);
+out:
+	stop_child(&child);
+}
+
+static void test_several(struct cancel_refs *skel, struct ring_buffer *rb)
+{
+	struct child child;
+	int users;
+
+	if (!start_child(&child))
+		return;
+	skel->bss->pid = child.pid;
+	users = task_users(skel);
+	if (!ASSERT_GT(users, 0, "task_users"))
+		goto out;
+
+	cancelled(skel, skel->progs.several_kinds_at_call);
+	ASSERT_EQ(task_users(skel), users, "several_kinds_at_call task");
+	ringbuf_is_clean(skel, rb, "several_kinds_at_call ringbuf");
+out:
+	stop_child(&child);
+}
+
 void serial_test_cancel_refs(void)
 {
 	struct ring_buffer *rb = NULL;
@@ -531,6 +588,10 @@ void serial_test_cancel_refs(void)
 		test_sockets(skel, rb);
 	if (test__start_subtest("ringbuf"))
 		test_ringbuf(skel, rb);
+	if (test__start_subtest("objects"))
+		test_objects(skel);
+	if (test__start_subtest("several"))
+		test_several(skel, rb);
 out:
 	ring_buffer__free(rb);
 	cancel_refs__destroy(skel);

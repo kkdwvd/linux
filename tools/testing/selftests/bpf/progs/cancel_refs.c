@@ -366,8 +366,6 @@ __naked void file_dynptr_in_vma_loop(void)
 /* clang makes no BTF for a kfunc that only asm calls, and libbpf needs it to link the prog */
 void __kfunc_btf_root(void)
 {
-	bpf_iter_num_new(0, 0, 0);
-	bpf_iter_num_destroy(0);
 	bpf_iter_task_vma_new(0, 0, 0);
 	bpf_iter_task_vma_next(0);
 	bpf_iter_task_vma_destroy(0);
@@ -1257,4 +1255,246 @@ int ws_lock_at_call(void *ctx)
 	behind++;
 	bpf_wakeup_sources_read_unlock(lock);
 	return 1;
+}
+
+/*
+ * An object that the prog owns: one of bpf_obj_new() or bpf_percpu_obj_new(), a reference of
+ * bpf_refcount_acquire() to it, or a node that was popped from a list. The pad drops it the
+ * way bpf_obj_drop() does, with the fields of its type.
+ *
+ * All but the per-CPU object keep the task of the runner in a kptr, which the last reference
+ * to the object releases when it is dropped. So the runner counts the references to the task.
+ */
+
+struct holder {
+	struct task_struct __kptr *task;
+};
+
+struct counted {
+	struct bpf_refcount ref;
+	struct task_struct __kptr *task;
+};
+
+struct pcpu_val {
+	long a;
+	long b;
+};
+
+/* The node of a list is the first member of its object, */
+struct elem {
+	struct bpf_list_node node;
+	struct task_struct __kptr *task;
+};
+
+/* or it is not: then a pointer to the node points into the object */
+struct elem_tail {
+	struct task_struct __kptr *task;
+	struct bpf_list_node node;
+};
+
+struct stash_val {
+	struct counted __kptr *counted;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct stash_val);
+} stash SEC(".maps");
+
+#define private(name) SEC(".bss." #name) __hidden __attribute__((aligned(8)))
+
+private(L) struct bpf_spin_lock list_lock;
+private(L) struct bpf_list_head list_head __contains(elem, node);
+private(T) struct bpf_spin_lock tail_lock;
+private(T) struct bpf_list_head tail_head __contains(elem_tail, node);
+
+/* Put a reference to the task of the runner into @field, the kptr of an object */
+static __always_inline void hold_task(void *field)
+{
+	struct task_struct *task, *old;
+
+	task = bpf_task_from_pid(pid);
+	if (!task)
+		return;
+	old = bpf_kptr_xchg(field, task);
+	if (old)
+		bpf_task_release(old);
+}
+
+SEC("tc")
+__description("cancel refs: an object of bpf_obj_new() is dropped with what its fields hold")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int obj_at_call(struct __sk_buff *skb)
+{
+	struct holder *h;
+
+	h = bpf_obj_new(typeof(*h));
+	if (!h)
+		return TC_ACT_OK;
+	hold_task(&h->task);
+	dives();
+	behind++;
+	bpf_obj_drop(h);
+	return TC_ACT_OK;
+}
+
+/*
+ * The object has two references: one goes to the map, and the frame holds the other one when
+ * it is cancelled. The pad drops that, and the object stays until drop_stashed() runs.
+ */
+SEC("tc")
+__description("cancel refs: a reference of bpf_refcount_acquire() is dropped")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int refcounted_at_call(struct __sk_buff *skb)
+{
+	struct counted *c, *held, *old;
+	struct stash_val *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&stash, &key);
+	if (!v)
+		return TC_ACT_OK;
+	c = bpf_obj_new(typeof(*c));
+	if (!c)
+		return TC_ACT_OK;
+	hold_task(&c->task);
+	held = bpf_refcount_acquire(c);
+	old = bpf_kptr_xchg(&v->counted, c);
+	if (old)
+		bpf_obj_drop(old);
+	dives();
+	behind++;
+	bpf_obj_drop(held);
+	return TC_ACT_OK;
+}
+
+/* A per-CPU object has no fields that hold anything */
+SEC("tc")
+__description("cancel refs: an object of bpf_percpu_obj_new() is dropped")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int percpu_obj_at_call(struct __sk_buff *skb)
+{
+	struct pcpu_val __percpu_kptr *p;
+
+	p = bpf_percpu_obj_new(struct pcpu_val);
+	if (!p)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_percpu_obj_drop(p);
+	return TC_ACT_OK;
+}
+
+/*
+ * The prog tests what it popped behind the call only. The pointer to the node is the pointer
+ * to the object, so the pad tests it and drops the object.
+ */
+SEC("tc")
+__description("cancel refs: a node that was popped from a list is dropped")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int list_node_at_call(struct __sk_buff *skb)
+{
+	struct bpf_list_node *n;
+
+	bpf_spin_lock(&list_lock);
+	n = bpf_list_pop_front(&list_head);
+	bpf_spin_unlock(&list_lock);
+	dives();
+	behind++;
+	if (n)
+		bpf_obj_drop(container_of(n, struct elem, node));
+	return TC_ACT_OK;
+}
+
+/*
+ * One frame holds something of every kind. The pad discards the dynptr, destroys the
+ * iterator and releases the three references, each the way of its kind.
+ */
+SEC("tc")
+__description("cancel refs: an iterator, a dynptr, a task, a record and an object of one frame")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int several_kinds_at_call(struct __sk_buff *skb)
+{
+	struct task_struct *task;
+	struct bpf_dynptr ptr;
+	struct bpf_iter_num it;
+	struct holder *h;
+	void *rec;
+
+	bpf_iter_num_new(&it, 0, 3);
+	bpf_ringbuf_reserve_dynptr(&ringbuf, 8, 0, &ptr);
+	task = bpf_task_from_pid(pid);
+	rec = bpf_ringbuf_reserve(&ringbuf, 8, 0);
+	h = bpf_obj_new(typeof(*h));
+	if (!h)
+		goto out;
+	hold_task(&h->task);
+	dives();
+	behind++;
+	bpf_obj_drop(h);
+out:
+	if (rec)
+		bpf_ringbuf_discard(rec, 0);
+	if (task)
+		bpf_task_release(task);
+	bpf_ringbuf_discard_dynptr(&ptr, 0);
+	bpf_iter_num_destroy(&it);
+	return TC_ACT_OK;
+}
+
+/* The runner sets the lists up and clears the map with the next three */
+
+/* A node that holds the task, for list_node_at_call() to pop */
+SEC("tc")
+int list_push(struct __sk_buff *skb)
+{
+	struct elem *e;
+
+	e = bpf_obj_new(typeof(*e));
+	if (!e)
+		return TC_ACT_OK;
+	hold_task(&e->task);
+	bpf_spin_lock(&list_lock);
+	bpf_list_push_front(&list_head, &e->node);
+	bpf_spin_unlock(&list_lock);
+	return TC_ACT_OK;
+}
+
+/* Drop the reference that refcounted_at_call() left in the map */
+SEC("tc")
+int drop_stashed(struct __sk_buff *skb)
+{
+	struct stash_val *v;
+	struct counted *c;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&stash, &key);
+	if (!v)
+		return TC_ACT_OK;
+	c = bpf_kptr_xchg(&v->counted, NULL);
+	if (c)
+		bpf_obj_drop(c);
+	return TC_ACT_OK;
 }
