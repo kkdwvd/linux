@@ -3059,15 +3059,6 @@ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 	return true;
 }
 
-bool bpf_jit_supports_exceptions(void)
-{
-	/*
-	 * Exceptions require unwinding support, which is always available,
-	 * because the kernel is always built with backchain.
-	 */
-	return true;
-}
-
 void arch_bpf_stack_walk(bool (*consume_fn)(void *, u64, u64, u64),
 			 void *cookie)
 {

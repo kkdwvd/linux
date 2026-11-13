@@ -1401,7 +1401,6 @@ u64 bpf_fault_unwind_target(u64 end);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);
-bool bpf_jit_supports_exceptions(void);
 bool bpf_jit_supports_ptr_xchg(void);
 bool bpf_jit_supports_arena(void);
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena);
@@ -1418,13 +1417,11 @@ bool bpf_jit_supports_fsession(void);
  *    emit_stack_check() knows.
  *  - All may_goto of the prog share one time slice. That is the timed form, which only JITed
  *    progs get, see bpf_do_misc_fixups(). The other form counts in each frame.
- *  - A walk of the stack finds the prog when there is no room, to tell user space, see
- *    bpf_prog_report_recursion().
  */
 static inline bool bpf_prog_has_invocation_budget(const struct bpf_prog *prog)
 {
 	return (IS_ENABLED(CONFIG_X86_64) || IS_ENABLED(CONFIG_ARM64)) && prog->jit_requested &&
-	       bpf_jit_supports_timed_may_goto() && bpf_jit_supports_exceptions();
+	       bpf_jit_supports_timed_may_goto();
 }
 
 struct bpf_jit_arg_abi {

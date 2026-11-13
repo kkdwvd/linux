@@ -841,7 +841,7 @@ static void bpf_prog_kallsyms_del_subprogs(struct bpf_prog *fp)
 {
 	int i;
 
-	for (i = 0; i < fp->aux->real_func_cnt; i++)
+	for (i = 0; i < fp->aux->func_cnt; i++)
 		bpf_prog_kallsyms_del(fp->aux->func[i]);
 }
 
@@ -1635,7 +1635,7 @@ int bpf_jit_get_func_addr(const struct bpf_prog *prog,
 		if (!extra_pass)
 			addr = NULL;
 		else if (prog->aux->func &&
-			 imm >= 0 && imm < prog->aux->real_func_cnt)
+			 imm >= 0 && imm < prog->aux->func_cnt)
 			addr = (u8 *)prog->aux->func[imm]->bpf_func;
 		else
 			return -EINVAL;
@@ -3565,7 +3565,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
-	for (i = 0; i < aux->real_func_cnt; i++) {
+	for (i = 0; i < aux->func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
 		 * released along with it.
@@ -3573,7 +3573,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 		aux->func[i]->aux->poke_tab = NULL;
 		bpf_jit_free(aux->func[i]);
 	}
-	if (aux->real_func_cnt) {
+	if (aux->func_cnt) {
 		kvfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);
 	} else {
@@ -3591,7 +3591,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	 * A prog that still runs when its last reference goes needs its symbols,
 	 * by which its exception table is found.  It has ended by now.
 	 */
-	ksyms = aux->real_func_cnt || !list_empty(&aux->ksym.lnode);
+	ksyms = aux->func_cnt || !list_empty(&aux->ksym.lnode);
 	bpf_prog_kallsyms_del_all(aux->prog);
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
@@ -4019,11 +4019,6 @@ void * __weak bpf_arch_text_copy(void *dst, void *src, size_t len)
 int __weak bpf_arch_text_invalidate(void *dst, size_t len)
 {
 	return -ENOTSUPP;
-}
-
-bool __weak bpf_jit_supports_exceptions(void)
-{
-	return false;
 }
 
 bool __weak bpf_jit_supports_private_stack(void)

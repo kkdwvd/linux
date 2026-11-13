@@ -552,11 +552,6 @@ void bpf_jit_free(struct bpf_prog *fp)
 	bpf_prog_unlock_free(fp);
 }
 
-bool bpf_jit_supports_exceptions(void)
-{
-	return IS_ENABLED(CONFIG_PPC64);
-}
-
 bool bpf_jit_supports_subprog_tailcalls(void)
 {
 	return IS_ENABLED(CONFIG_PPC64);

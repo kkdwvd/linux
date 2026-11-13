@@ -23,7 +23,6 @@
 #include <linux/security.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_mem_alloc.h>
-#include <linux/kasan.h>
 #include <linux/bpf_verifier.h>
 #include <linux/uaccess.h>
 #include <linux/verification.h>
@@ -3451,56 +3450,13 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
-struct bpf_throw_ctx {
-	struct bpf_prog_aux *aux;
-	u64 sp;
-	u64 bp;
-	int cnt;
-};
-
-static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
-{
-	struct bpf_throw_ctx *ctx = cookie;
-	struct bpf_prog *prog;
-
-	/*
-	 * The RCU read lock is held to safely traverse the latch tree, but we
-	 * don't need its protection when accessing the prog, since it has an
-	 * active stack frame on the current stack trace, and won't disappear.
-	 */
-	rcu_read_lock();
-	prog = bpf_prog_ksym_find(ip);
-	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
-	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
-	ctx->aux = prog->aux;
-	ctx->sp = sp;
-	ctx->bp = bp;
-	return false;
-}
-
+/*
+ * The verifier makes a jump to a landing pad of each call, see kernel/bpf/pads.c.
+ * Programs name the function, so it is in BTF.
+ */
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	struct bpf_throw_ctx ctx = {};
-
-	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
-	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
-	WARN_ON_ONCE(!ctx.bp);
-	WARN_ON_ONCE(!ctx.cnt);
-	/*
-	 * Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
-	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
-	 * which skips compiler generated instrumentation to do the same. Some
-	 * architectures cannot recover sp while unwinding, so fall back to bp.
-	 */
-	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp + ctx.aux->stack_arg_sp_adjust, ctx.bp, 0, 0);
-	WARN(1, "A call to BPF exception callback should never return\n");
+	WARN_ON_ONCE(1);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)

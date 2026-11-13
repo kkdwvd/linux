@@ -2158,7 +2158,6 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		 */
 		func[i]->aux->func = func;
 		func[i]->aux->func_cnt = env->subprog_cnt;
-		func[i]->aux->real_func_cnt = env->subprog_cnt;
 	}
 	for (i = 0; i < env->subprog_cnt; i++) {
 		old_bpf_func = func[i]->bpf_func;
@@ -2216,7 +2215,6 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->fault_pad = func[0]->aux->fault_pad;
 	prog->aux->func = func;
 	prog->aux->func_cnt = env->subprog_cnt;
-	prog->aux->real_func_cnt = env->subprog_cnt;
 	prog->aux->exception_callback_subprog = env->exception_callback_subprog;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;

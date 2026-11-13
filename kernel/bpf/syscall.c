@@ -3217,7 +3217,7 @@ free_used_maps:
 	 * period before we can tear down JIT memory since symbols
 	 * are already exposed under kallsyms.
 	 */
-	__bpf_prog_put_noref(prog, prog->aux->real_func_cnt);
+	__bpf_prog_put_noref(prog, prog->aux->func_cnt);
 	return err;
 
 free_prog:
@@ -5045,7 +5045,7 @@ static int bpf_prog_map_addrs(const struct bpf_prog *prog, struct maple_tree *mt
 /* the id of the subprog that starts at insn 'start' */
 static u32 bpf_prog_find_func(const struct bpf_prog *prog, u32 start)
 {
-	u32 l = 0, r = prog->aux->real_func_cnt, m;
+	u32 l = 0, r = prog->aux->func_cnt, m;
 
 	while (r - l > 1) {
 		m = (l + r) / 2;

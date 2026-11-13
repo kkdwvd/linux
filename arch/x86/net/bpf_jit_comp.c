@@ -5111,15 +5111,6 @@ void bpf_jit_free(struct bpf_prog *prog)
 	bpf_prog_unlock_free(prog);
 }
 
-bool bpf_jit_supports_exceptions(void)
-{
-	/* We unwind through both kernel frames (starting from within bpf_throw
-	 * call) and BPF frames. Therefore we require ORC unwinder to be enabled
-	 * to walk kernel frames and reach BPF frames in the stack trace.
-	 */
-	return IS_ENABLED(CONFIG_UNWINDER_ORC);
-}
-
 bool bpf_jit_supports_private_stack(void)
 {
 	return true;
