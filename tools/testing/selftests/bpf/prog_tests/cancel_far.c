@@ -128,6 +128,7 @@ static void check_insns(struct bpf_program *prog, int min, int nr)
 }
 
 static const char no_room[] = "ERROR: No room in the stack for a call of a recursive function";
+static const char arena_fault[] = "ERROR: Arena READ access at unmapped address";
 
 /* The frame holds the record at the one point of @prog that has a pad more than @min insns away */
 static void test_point(struct cancel_far *skel, struct ring_buffer *rb, struct bpf_program *prog,
@@ -187,6 +188,12 @@ void test_cancel_far(void)
 		test_point(skel, rb, skel->progs.call_2k, no_room, 2048);
 		test_point(skel, rb, skel->progs.call_33k, no_room, 32767);
 	}
+	if (test__start_subtest("arena")) {
+		test_point(skel, rb, skel->progs.arena_2k, arena_fault, 2048);
+		test_point(skel, rb, skel->progs.arena_33k, arena_fault, 32767);
+	}
+	if (test__start_subtest("private stack"))
+		test_point(skel, rb, skel->progs.priv_stack_33k, arena_fault, 32767);
 	if (test__start_subtest("flag")) {
 		test_flag(skel, rb, skel->progs.flag_2k, 2048);
 		test_flag(skel, rb, skel->progs.flag_33k, 32767);
