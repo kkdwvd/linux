@@ -780,6 +780,390 @@ int no_release_kfunc(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+/* r1: a pointer to a slot of the caller. It writes to the slot and dives. */
+__naked __noinline __used
+static unsigned long fills_slot(void)
+{
+	asm volatile (
+		"r2 = 7;"
+		"*(u64 *)(r1 + 0) = r2;"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The only copy that outlives the call is in the stack, and the callee is given a pointer to
+ * the stack: to another slot. The frame is in the state while the callee is verified, and
+ * every site in there finds the slot of the task as the call left it. The pad of the call
+ * reads the slot.
+ */
+SEC("tc")
+__description("cancel refs: a task in a stack slot is released when the callee writes to another slot")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void stack_pointer_at_call(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call fills_slot;"
+		COUNT(behind)
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a pointer to a slot of the caller that has a task. It takes the task out of the slot,
+ * dives, and puts the task back.
+ */
+__naked __noinline __used
+static unsigned long hides_task(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = *(u64 *)(r6 + 0);"
+		"r1 = 0;"
+		"*(u64 *)(r6 + 0) = r1;"
+		"call dives;"
+		COUNT(behind)
+		"*(u64 *)(r6 + 0) = r7;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The slot has the task when the call is made and when it returns, but not while the callee
+ * dives: a pad of the call would release whatever the callee left there.
+ */
+SEC("?tc")
+__description("cancel refs: a task in a stack slot is rejected when the callee writes to the slot")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(place)")
+__naked void callee_writes_to_slot(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call hides_task;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/* r1: a pointer to a slot of the caller. It reads the slot, overwrites it, and dives. */
+__naked __noinline __used
+static unsigned long wipes_slot(void)
+{
+	asm volatile (
+		"r2 = *(u64 *)(r1 + 0);"
+		"r2 = 0;"
+		"*(u64 *)(r1 + 0) = r2;"
+		"call dives;"
+		COUNT(behind)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * Two slots have the task when the call is made, and the callee overwrites the one that the
+ * call picked. The call goes by the other one, which every site in the callee finds intact.
+ */
+SEC("tc")
+__description("cancel refs: a task in two stack slots is released from the one that the callee leaves")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -16)")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_writes_to_one_slot(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call wipes_slot;"
+		COUNT(behind)
+		"r1 = *(u64 *)(r10 - 16);"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * dives() doesn't read r1 and is verified on its own, without the frame of its caller in the
+ * state. Then a stack pointer in an argument register is taken for a way to the slot.
+ */
+SEC("?tc")
+__description("cancel refs: a task in a stack slot is rejected when a callee that is verified on its own may get a stack pointer")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(place)")
+__naked void stack_pointer_at_call_on_its_own(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call dives;"
+		COUNT(behind)
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* r1: a task or NULL, which the caller holds and did not test. It tests it and dives. */
+__naked __noinline __used
+static unsigned long tests_task(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"if r1 == 0 goto 1f;"
+		"r6 = 1;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The callee makes the test for NULL that the caller did not make. Where it finds a task the
+ * caller holds it as before. Where it finds NULL the caller holds nothing, and r6 has the
+ * NULL: the pad of the call tests r6, as the visit of the call itself asks for, and needs no
+ * flag.
+ */
+SEC("tc")
+__description("cancel refs: a task that the callee tests for NULL is released if there is one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("exit")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_tests_task(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"r6 = r0;"
+		"r1 = r0;"
+		"call tests_task;"
+		COUNT(behind)
+		RELEASE_TASK(r6)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* The same with the task in a stack slot, which has the NULL where the callee finds one */
+SEC("tc")
+__description("cancel refs: a task in a stack slot that the callee tests for NULL is released if there is one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_tests_task_spilled(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r0;"
+		"call tests_task;"
+		COUNT(behind)
+		"r6 = *(u64 *)(r10 - 8);"
+		RELEASE_TASK(r6)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: a pointer to a slot of the caller that has a task or NULL. It tests what the slot has,
+ * and where that is NULL it writes something else to the slot. It dives, and returns whether
+ * there is a task.
+ */
+__naked __noinline __used
+static unsigned long tests_and_writes(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = 1;"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1f;"
+		"r7 = 0;"
+		"r1 = 5;"
+		"*(u64 *)(r6 + 0) = r1;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"r0 = r7;"
+		"exit;"
+		:
+		: __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * Where the callee finds NULL the slot of the caller does not keep it: the test of the pad
+ * would find what the callee wrote. The caller holds the task on some paths only then, and a
+ * drop flag tells: it is set behind bpf_task_from_pid() unless that returned NULL.
+ */
+SEC("tc")
+__description("cancel refs: a task in a stack slot that the callee tests for NULL and overwrites")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -9) = 1")
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -9)")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void callee_tests_and_writes(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call tests_and_writes;"
+		COUNT(behind)
+		"if r0 == 0 goto 1f;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
 __naked __noinline __used
 static unsigned long releases_arg(void)
 {

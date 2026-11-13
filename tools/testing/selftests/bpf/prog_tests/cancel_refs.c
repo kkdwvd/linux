@@ -223,6 +223,17 @@ static void test_tasks(struct cancel_refs *skel)
 	ASSERT_EQ(task_users(skel), users, "only_copy_in_arg");
 	/* and so does the one that was given it in a stack argument */
 	test_only_copy_in_stack_arg(skel, users);
+	/* the callee has a pointer to the stack of the caller, whose pad reads a slot there */
+	cancelled(skel, skel->progs.stack_pointer_at_call);
+	ASSERT_EQ(task_users(skel), users, "stack_pointer_at_call");
+	cancelled(skel, skel->progs.callee_writes_to_one_slot);
+	ASSERT_EQ(task_users(skel), users, "callee_writes_to_one_slot");
+	cancelled(skel, skel->progs.callee_tests_task);
+	ASSERT_EQ(task_users(skel), users, "callee_tests_task");
+	cancelled(skel, skel->progs.callee_tests_task_spilled);
+	ASSERT_EQ(task_users(skel), users, "callee_tests_task_spilled");
+	cancelled(skel, skel->progs.callee_tests_and_writes);
+	ASSERT_EQ(task_users(skel), users, "callee_tests_and_writes");
 
 	/* the path that holds the task: its drop flag is set, and the pad releases the task */
 	skel->bss->zero = 0;
@@ -284,6 +295,10 @@ static void test_tasks(struct cancel_refs *skel)
 
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;
+	cancelled(skel, skel->progs.callee_tests_task);
+	cancelled(skel, skel->progs.callee_tests_task_spilled);
+	/* the slot has what the callee wrote, and the pad leaves it alone */
+	cancelled(skel, skel->progs.callee_tests_and_writes);
 	cancelled(skel, skel->progs.task_maybe_null_in_reg);
 	cancelled(skel, skel->progs.task_maybe_null_spilled);
 	cancelled(skel, skel->progs.tasks_in_regs_and_slots);
