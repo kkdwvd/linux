@@ -87,6 +87,31 @@ struct {
 	__type(value, struct spin_elem);
 } spin_locks SEC(".maps");
 
+struct res_elem {
+	long pad;
+	struct bpf_res_spin_lock lock;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, int);
+	__type(value, struct res_elem);
+} res_locks SEC(".maps");
+
+/* What the asm below adds to a pointer to an element */
+_Static_assert(__builtin_offsetof(struct spin_elem, lock) == 8, "the lock is not at 8");
+_Static_assert(__builtin_offsetof(struct res_elem, lock) == 8, "the lock is not at 8");
+
+/* r0 = element 1 of @map, or NULL. The key is at r10 - 4. */
+#define asm_lookup(map)				\
+	"r1 = 1;"				\
+	"*(u32 *)(r10 - 4) = r1;"		\
+	"r2 = r10;"				\
+	"r2 += -4;"				\
+	"r1 = %[" #map "] ll;"			\
+	"call %[bpf_map_lookup_elem];"
+
 /* @var++, with r1 and r2 */
 #define asm_count(var)				\
 	"r1 = %[" #var "] ll;"			\
@@ -172,6 +197,192 @@ static unsigned long dives(void)
 		  __imm_addr(behind)
 		: __clobber_all
 	);
+}
+
+/* The sites: the stack check of dives(), its call of itself, and the call in the main program */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a global variable, held at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int spin_lock_global_at_call(struct __sk_buff *ctx)
+{
+	if (enter())
+		return TC_ACT_OK;
+	bpf_spin_lock(&spin_a);
+	dives();
+	bpf_spin_unlock(&spin_a);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/* r6 points to the element across the call, and the pad adds the 8 bytes to the lock */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value, a register points to the value at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+__naked void spin_lock_in_map_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* No register keeps the pointer: the pad reads the slot that it was spilled to */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value, a stack slot points to the value at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+__naked void spin_lock_spilled_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r1 = r0;"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r1 = *(u64 *)(r10 - 16);"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* A lock that the pad left locked tells the second run so: it is not to be had */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock in a global variable, held at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_lock_global_at_call(struct __sk_buff *ctx)
+{
+	if (enter())
+		return TC_ACT_OK;
+	if (bpf_res_spin_lock(&res_a)) {
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock(&res_a);
+	behind++;
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel: bpf_res_spin_lock in a map value, a register points to the value at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+__naked void res_lock_in_map_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(res_locks)
+		"if r0 == 0 goto 1f;"
+		"r7 = r0;"
+		"r1 = r7;"
+		"r1 += 8;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 2f;"
+		"call dives;"
+		"r1 = r7;"
+		"r1 += 8;"
+		"call %[bpf_res_spin_unlock];"
+		asm_count(behind)
+		"goto 1f;"
+	"2:"
+		asm_count(lock_err)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_res_spin_lock),
+		  __imm(bpf_res_spin_unlock),
+		  __imm_addr(res_locks),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
+/* One call of the pad unlocks and restores the flags that the lock was taken with */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock_irqsave, held at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_lock_irqsave_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	if (bpf_res_spin_lock_irqsave(&res_a, &flags)) {
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock_irqrestore(&res_a, &flags);
+	behind++;
+	return TC_ACT_OK;
 }
 
 SEC("tc")
@@ -329,6 +540,187 @@ int irq_save_in_two_frames(struct __sk_buff *ctx)
 }
 
 /*
+ * bpf_spin_lock() saves the IRQ flags too, and bpf_spin_unlock() restores what it found:
+ * interrupts that bpf_local_irq_save() turned off. The pad calls the helper, then the kfunc.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock that was taken with IRQ flags saved")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("call unknown")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void spin_lock_in_irq_save_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_unlock];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_a),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The flags of the inner lock found the interrupts that the outer one turned off. In the order
+ * of the kinds the pad would unlock the outer one first.
+ */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock_irqsave that was taken under bpf_spin_lock")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_lock_irqsave_in_spin_lock_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_spin_lock(&spin_a);
+	if (bpf_res_spin_lock_irqsave(&res_a, &flags)) {
+		bpf_spin_unlock(&spin_a);
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock_irqrestore(&res_a, &flags);
+	bpf_spin_unlock(&spin_a);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
+ * Two locks of one kind, at addresses that the pad loads. Whatever else could order them, one of
+ * this program and the next takes them the other way around.
+ */
+SEC("tc")
+__description("cancel: two bpf_res_spin_lock_irqsave, the first variable first")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_locks_irqsave_ab_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags_a, flags_b;
+
+	if (enter())
+		return TC_ACT_OK;
+	if (bpf_res_spin_lock_irqsave(&res_a, &flags_a)) {
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	if (bpf_res_spin_lock_irqsave(&res_b, &flags_b)) {
+		bpf_res_spin_unlock_irqrestore(&res_a, &flags_a);
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock_irqrestore(&res_b, &flags_b);
+	bpf_res_spin_unlock_irqrestore(&res_a, &flags_a);
+	behind++;
+	return TC_ACT_OK;
+}
+
+SEC("tc")
+__description("cancel: two bpf_res_spin_lock_irqsave, the second variable first")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_locks_irqsave_ba_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags_a, flags_b;
+
+	if (enter())
+		return TC_ACT_OK;
+	if (bpf_res_spin_lock_irqsave(&res_b, &flags_b)) {
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	if (bpf_res_spin_lock_irqsave(&res_a, &flags_a)) {
+		bpf_res_spin_unlock_irqrestore(&res_b, &flags_b);
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock_irqrestore(&res_a, &flags_a);
+	bpf_res_spin_unlock_irqrestore(&res_b, &flags_b);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/* Three kinds in one pad: the lock with its flags, the lock without, the flags of the frame */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock and bpf_res_spin_lock_irqsave with IRQ flags saved")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+int res_locks_in_irq_save_at_call(struct __sk_buff *ctx)
+{
+	unsigned long flags, flags_b;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_local_irq_save(&flags);
+	if (bpf_res_spin_lock(&res_a)) {
+		bpf_local_irq_restore(&flags);
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	if (bpf_res_spin_lock_irqsave(&res_b, &flags_b)) {
+		bpf_res_spin_unlock(&res_a);
+		bpf_local_irq_restore(&flags);
+		lock_err++;
+		return TC_ACT_OK;
+	}
+	dives();
+	bpf_res_spin_unlock_irqrestore(&res_b, &flags_b);
+	bpf_res_spin_unlock(&res_a);
+	bpf_local_irq_restore(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/*
  * What no pad releases. A cancellation gets to a site where the frame holds something that its
  * pad has no way to release, or would release once more: the program is not loaded. The log has
  * a line for the site, with the kind of insn, the limit, and the word of the stats for the reason.
@@ -363,6 +755,134 @@ int irq_flags_in_slot_of_caller(struct __sk_buff *ctx)
 		return TC_ACT_OK;
 	saves_for_caller_and_dives(&flags);
 	bpf_local_irq_restore(&flags);
+	behind++;
+	return TC_ACT_OK;
+}
+
+/* r1: the element. It returns with the lock taken, and keeps no pointer to the element. */
+__naked __noinline __used
+static unsigned long locks_for_caller_and_dives(void)
+{
+	asm volatile (
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_spin_lock)
+		: __clobber_all
+	);
+}
+
+/* Only the caller has a pointer to the element, and the pad of the callee is to unlock */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value that only a caller has a pointer to is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(lock)")
+__naked void spin_lock_pointer_with_caller(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r1 = r6;"
+		"call locks_for_caller_and_dives;"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The pointer to the element is in a stack slot only, and r1 points to the stack at the call. A
+ * callee that is given such a pointer may write to the slot, so the pad of the call may not read
+ * it. dives() does nothing with r1 and is verified on its own, without the frame of its caller
+ * in the state: nothing shows there what becomes of the slot.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock in a map value whose pointer a callee may overwrite is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(lock)")
+__naked void spin_lock_spilled_stack_passed(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(spin_locks)
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r1 = r0;"
+		"r1 += 8;"
+		"call %[bpf_spin_lock];"
+		"r1 = r10;"
+		"r1 += -4;"
+		"call dives;"
+		"r1 = *(u64 *)(r10 - 16);"
+		"r1 += 8;"
+		"call %[bpf_spin_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_locks),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+static __noinline int unlocks_and_dives(void)
+{
+	bpf_spin_unlock(&spin_a);
+	dives();
+	behind++;
+	return 0;
+}
+
+/*
+ * The pad of the call in the main program would unlock once more, and the callee has nothing to
+ * tell it by: it got no pointer to the lock in an argument register. The callee is verified
+ * without its callers first: it cannot be cancelled, whoever calls it, and the log names its
+ * call of dives() for that. Then the call in the main program is found, and the log names it too.
+ */
+SEC("tc")
+__description("cancel: a callee that unlocks the bpf_spin_lock of its caller is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(foreign)")
+int callee_unlocks(struct __sk_buff *ctx)
+{
+	if (enter())
+		return TC_ACT_OK;
+	bpf_spin_lock(&spin_a);
+	unlocks_and_dives();
 	behind++;
 	return TC_ACT_OK;
 }
@@ -736,6 +1256,98 @@ __naked void rcu_counts_differ(void)
 		  __imm_addr(behind)
 		: __clobber_all
 	);
+}
+
+/*
+ * All of it together. A lock is taken inside of saved IRQ flags, and both inside of a section:
+ * the kfuncs that save the flags and enter a section are not for a program that holds a lock.
+ * The pad goes the same way back. Behind the exit of the main program it unlocks with the helper,
+ * restores the flags and leaves the section with the two kfuncs, then tells that the program was
+ * cancelled.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock inside of saved IRQ flags inside of an RCU read section")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("call unknown")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void spin_lock_in_irq_save_in_rcu_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"call %[bpf_rcu_read_lock];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_lock];"
+		"call dives;"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_unlock];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"call %[bpf_rcu_read_unlock];"
+		asm_count(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock),
+		  __imm(bpf_rcu_read_unlock),
+		  __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(spin_a),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+static __noinline int locks_and_dives(void)
+{
+	bpf_spin_lock(&spin_a);
+	dives();
+	bpf_spin_unlock(&spin_a);
+	behind++;
+	return 0;
+}
+
+/* The pad of the callee unlocks, and then the pad of the caller restores and leaves */
+SEC("tc")
+__description("cancel: bpf_spin_lock of a callee inside of IRQ flags and a section of its caller")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__stderr("ERROR: Program was cancelled")
+int spin_lock_in_irq_save_in_rcu_two_frames(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_rcu_read_lock();
+	bpf_local_irq_save(&flags);
+	locks_and_dives();
+	bpf_local_irq_restore(&flags);
+	bpf_rcu_read_unlock();
+	behind++;
+	return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";
