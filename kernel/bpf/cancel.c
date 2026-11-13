@@ -4,13 +4,14 @@
  * Cancellation of a program on pads that the verifier generates.
  *
  * When a cancellation point fires the invocation ends there. A point is may_goto
- * whose time is up, of the program or of the verifier, or the stack check of a
- * recursive subprog that finds no room. Each frame of the call chain runs a pad,
- * from the frame at the point to the frame that the kernel entered. A pad
- * releases what its frame holds and leaves the frame with cancel_exit, which
- * returns to the pad of the call in the caller: 'cancel_goto pad' behind the call
- * names it. The pad of the main program returns to the kernel. A cancellation
- * runs pads only, never the code of the program again.
+ * whose time is up, of the program or of the verifier, the stack check of a
+ * recursive subprog that finds no room, or an access of arena that faults. Each
+ * frame of the call chain runs a pad, from the frame at the point to the frame
+ * that the kernel entered. A pad releases what its frame holds and leaves the
+ * frame with cancel_exit, which returns to the pad of the call in the caller:
+ * 'cancel_goto pad' behind the call names it. The pad of the main program
+ * returns to the kernel. A cancellation runs pads only, never the code of the
+ * program again.
  *
  * A site is an insn at which a frame can be cancelled: a point, or the call of
  * a subprog, which a cancellation comes back through. The main pass records
@@ -57,8 +58,9 @@
  *
  * The main pass verifies what it always did: may_goto of the verifier leaves the
  * loop or the subprog, may_goto of the program goes where the program sends it,
- * the stack check leaves the subprog. That is what the program does at a site
- * that declines. A site with a pad doesn't get there any more.
+ * the stack check leaves the subprog, the access that faults is skipped. That is
+ * what the program does at a site that declines. A site with a pad doesn't get
+ * there any more.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -352,7 +354,7 @@ struct cancel_site {
 	bool padded;
 	/* no cancellation gets here: it has no pad and does not decline */
 	bool unused;
-	u32 pad;	/* of a guard, may_goto of the program or a call that is padded */
+	u32 pad;	/* of a guard, may_goto of the program, a call or an access that is padded */
 };
 
 /* The sites of a subprog that hold the same have one pad */
@@ -2642,7 +2644,7 @@ static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_si
 	 */
 	if (site->type == BPF_CANCEL_SITE_ENTRY)
 		return env->subprog_info[site->subprog].recursive;
-	return false;
+	return site->type == BPF_CANCEL_SITE_ARENA;
 }
 
 /* Where the callees of the call at @site begin: 0 if it calls nothing */
@@ -2773,6 +2775,8 @@ static const char *cancel_site_str(const struct cancel_site *site)
 		return "may_goto";
 	case BPF_CANCEL_SITE_ENTRY:
 		return "recursive call";
+	case BPF_CANCEL_SITE_ARENA:
+		return "arena access";
 	default:
 		return "call";
 	}
@@ -3955,6 +3959,20 @@ int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int s, struct bpf_insn *b
 }
 
 /*
+ * The site of the insn at @idx that has a pad which cancel_goto behind the insn names: a call
+ * of a subprog, or an access of arena. No insn is both.
+ */
+static struct cancel_site *cancel_goto_site(struct bpf_verifier_env *env, int idx)
+{
+	struct cancel_site *site;
+
+	site = cancel_find_site(env, idx, BPF_CANCEL_SITE_CALL);
+	if (!site)
+		site = cancel_find_site(env, idx, BPF_CANCEL_SITE_ARENA);
+	return site && site->padded ? site : NULL;
+}
+
+/*
  * 'cancel_goto pad' behind each call that a cancellation comes back through: cancel_exit of
  * the callee finds the pad by the return address of the call. unwind_goto of the program
  * stays directly behind its call. The pads and the guards are in the program.
@@ -3966,6 +3984,12 @@ int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int s, struct bpf_insn *b
  *
  * The offset of the pad has 32 bits and is in imm, like that of gotol: cancel_goto is one insn
  * however far the pad is, and a call that returns goes on with the insn that follows.
+ *
+ * The same behind each access of arena that has a pad, with the access in place of the call:
+ * a fault in the access goes on where cancel_goto says. No unwind_goto follows an access, see
+ * check_unwind_insns(). JITs look for cancel_goto directly behind the access, and the passes
+ * from here to the JIT leave it there: what they add for the access goes in front of it, or
+ * behind cancel_goto, see bpf_opt_subreg_zext_lo32_rnd_hi32().
  */
 int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
 {
@@ -3977,14 +4001,14 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
 		return 0;
 
 	for (i = 0; i < len; i++) {
-		site = cancel_find_site(env, i, BPF_CANCEL_SITE_CALL);
-		if (!site || !site->padded)
+		site = cancel_goto_site(env, i);
+		if (!site)
 			continue;
 		/*
-		 * Behind the call: a jump to the insn that follows doesn't go through
-		 * cancel_goto, and cancel_goto is no dead code when that insn is, behind a
-		 * callee that never returns. A jump out of what is appended counts from the
-		 * insn that follows.
+		 * Behind the call or the access: a jump to the insn that follows doesn't go
+		 * through cancel_goto, and cancel_goto is no dead code when that insn is,
+		 * behind a callee that never returns. A jump out of what is appended counts
+		 * from the insn that follows.
 		 */
 		at = i + bpf_is_unwind_goto(&insn[i + 1]);
 		off = cancel_pad_idx(env, site) - at - 1;

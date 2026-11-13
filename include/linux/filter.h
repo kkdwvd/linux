@@ -319,6 +319,11 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
  * they are: the pad of the frame that leaves tells in R2 what the frame released for
  * its caller, see bpf_cancel_note_args(). A call without a pad is one that the kernel
  * made. There it is exit.
+ *
+ * 'access; cancel_goto pad' names the pad of an access of arena, see
+ * bpf_is_arena_access(): a fault in the access goes on at the pad, with the registers
+ * and the stack of the frame as they were in front of the access. Without cancel_goto
+ * the access is skipped, and a load reads 0.
  */
 #define BPF_CANCEL_GOTO	2
 #define BPF_CANCEL_EXIT	2
@@ -342,6 +347,23 @@ static inline bool bpf_is_cancel_exit(const struct bpf_insn *insn)
 static inline bool bpf_jmp_offset_in_imm(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP32 | BPF_JA) || bpf_is_cancel_goto(insn);
+}
+
+/* An access of arena in the form that JITs get, see bpf_convert_ctx_accesses() */
+static inline bool bpf_is_arena_access(const struct bpf_insn *insn)
+{
+	u8 mode = BPF_MODE(insn->code);
+
+	switch (BPF_CLASS(insn->code)) {
+	case BPF_LDX:
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
+	case BPF_ST:
+		return mode == BPF_PROBE_MEM32;
+	case BPF_STX:
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC;
+	default:
+		return false;
+	}
 }
 
 /*
@@ -1426,6 +1448,7 @@ bool bpf_jit_supports_callx(void);
 bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
 bool bpf_jit_supports_cancel(void);
+bool bpf_jit_supports_arena_cancel(void);
 bool bpf_jit_supports_hmul(void);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);
