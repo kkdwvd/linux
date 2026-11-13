@@ -16,8 +16,10 @@
  * what the frame at the site holds, as a list of entries: one per resource, with
  * its kind, the place of its handle and how it is released. Many states visit
  * a site. An entry that every visit has in the same place is released as it is.
- * An entry that only some visits have takes a condition. A site at which the
- * frame holds what has no entry declines.
+ * An entry that only some visits have takes a condition: a drop flag of the
+ * frame says at run time whether the frame holds it, see "Drop flags", and the
+ * site declines where no flag can. A site at which the frame holds what has no
+ * entry declines.
  *
  * These kinds of resource are described:
  * - IRQ flags and locks: the pad restores the flags that its frame saved and
@@ -112,6 +114,8 @@ static bool cancel_kind_ordered(u8 kind)
 
 /* The most insns that a pad takes to release an entry */
 #define CANCEL_ENTRY_INSNS	8
+/* and to test the flag of an entry with a condition */
+#define CANCEL_FLAG_INSNS	2
 
 /* Why a site declines */
 enum cancel_reason {
@@ -120,7 +124,7 @@ enum cancel_reason {
 	CANCEL_REFS,
 	/* it entered more RCU or preemption sections than a pad leaves, or a pad lacks the kfunc */
 	CANCEL_SECTION,
-	/* it holds something in some visits only, or in different places */
+	/* it is in an RCU or preemption section in some visits only, or in fewer of them */
 	CANCEL_COND,
 	/* a helper or a kfunc calls the subprog, or it is the exception callback */
 	CANCEL_CALLBACK,
@@ -142,6 +146,17 @@ enum cancel_reason {
 	CANCEL_PLACE,
 	/* nothing that a pad may call there releases a reference */
 	CANCEL_RELEASE,
+	/*
+	 * The last ones are for what only some visits hold, see "Drop flags". No flag says
+	 * whether the frame holds it: frames hold two resources of its class at a time,
+	 */
+	CANCEL_MULTI,
+	/* or nothing tells at run time when a frame comes to hold one, or gives it up, */
+	CANCEL_INEXACT,
+	/* or the visits have a resource of the class in two places, */
+	CANCEL_PLACES,
+	/* or the frame has no room for the flag. */
+	CANCEL_STACK,
 	__CANCEL_REASONS,
 };
 
@@ -160,6 +175,10 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_DYNPTR]		= "dynptr",
 	[CANCEL_PLACE]		= "place",
 	[CANCEL_RELEASE]	= "release",
+	[CANCEL_MULTI]		= "multi",
+	[CANCEL_INEXACT]	= "inexact",
+	[CANCEL_PLACES]		= "places",
+	[CANCEL_STACK]		= "stack",
 };
 
 /* The place of an entry that has no handle */
@@ -182,6 +201,14 @@ struct cancel_entry {
 	u64 arg;	/* how to release it, in the terms of the kind */
 	/* of an object that the program owns: the pointer in place is that many bytes into it */
 	s32 off;
+	/*
+	 * An origin of what the visits hold there + 1, see struct cancel_origin: the visits
+	 * make their origins one class. 0 if no visit has one.
+	 */
+	u32 origin;
+	bool stray;	/* a visit holds something there that has no origin */
+	/* with a condition: the offset of the drop flag from r10, once the site gets a pad */
+	s16 flag;
 	/*
 	 * Of a lock at a known address: a place leads to it as well, with the lock alt_arg
 	 * bytes from where its pointer points. Visits that hold such locks at different
@@ -269,6 +296,13 @@ struct cancel_origin {
 	bool inexact;
 	/* a frame held two resources of the origin at a time */
 	bool multi;
+	/*
+	 * The rest is for the class, in the origin that stands for it, and found by
+	 * bpf_cancel_resolve(): inexact and multi are for the class then too.
+	 */
+	bool no_room;	/* the frame has no room for the flag */
+	bool used;	/* a pad reads the flag */
+	s16 flag;	/* its offset from r10, 0 if the class has none */
 };
 
 /*
@@ -318,6 +352,8 @@ struct bpf_cancel {
 	u32 nr_pairs;
 	u32 cap_pairs;
 	bool no_pairs;		/* not all of them are here */
+	/* the flags that are reserved, see cancel_reserve_flags() */
+	u32 nr_flags;
 };
 
 static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *e)
@@ -352,7 +388,7 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 	if (cancel_kind_ordered(a->kind) && (a->rank != b->rank || a->irq_off != b->irq_off))
 		return false;
 	return a->kind == b->kind && a->place == b->place && a->flags == b->flags &&
-	       a->arg == b->arg && a->off == b->off;
+	       a->arg == b->arg && a->off == b->off && a->flag == b->flag;
 }
 
 static bool cancel_list_has(const struct cancel_list *list, const struct cancel_entry *e)
@@ -1337,15 +1373,23 @@ static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifie
 			  enum bpf_cancel_site_type type, struct cancel_list *visit)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
+	struct cancel_entry *e;
 	int reason;
-	u32 i;
+	u32 i, nr;
 
 	for (i = 0; i < st->acquired_refs; i++) {
 		if (!bpf_frame_owns_ref(st, st->curframe, i))
 			continue;
+		nr = visit->nr;
 		reason = cancel_collect_ref(env, st, type, i, visit);
 		if (reason)
 			return reason;
+		/* the entry is for refs[i]: what brought that tells whether the frame holds it */
+		if (visit->nr > nr) {
+			e = &visit->entries[nr];
+			e->origin = cancel_ref_origin(env, &st->refs[i]) + 1;
+			e->stray = !e->origin;
+		}
 	}
 	reason = cancel_collect_section(visit, CANCEL_RCU,
 					st->active_rcu_locks - frame->entry_rcu_locks);
@@ -1401,13 +1445,15 @@ static void cancel_lock_by_pointer(struct cancel_list *held, struct cancel_entry
 /*
  * A visit of @site found c->visit. An entry that this visit or one before it
  * is without takes a condition. So does a resource that the visits have in
- * different places: these are two entries.
+ * different places: these are two entries. Whether a pad can tell if the frame
+ * holds an entry with a condition is found out after the main pass, see
+ * cancel_site_flags(). It goes by what brought the resource, and whatever
+ * brought what the visits have in one entry is one class.
  */
 static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 {
 	struct cancel_list *held = &site->held, *visit = &c->visit;
 	struct cancel_entry *e, *v;
-	bool cond = false;
 	int err;
 	u32 i;
 
@@ -1418,28 +1464,27 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 		v = cancel_list_find(visit, e);
 		if (!v) {
 			e->cond = true;
-			cond = true;
 			continue;
 		}
 		/* the pointer is of use only where every visit with the lock has it */
 		if (e->alt && (!v->alt || v->alt_place != e->alt_place || v->alt_arg != e->alt_arg))
 			e->alt = false;
-		cond |= e->cond;
+		e->stray |= v->stray;
+		if (e->origin && v->origin)
+			cancel_union(c, e->origin - 1, v->origin - 1);
+		else if (v->origin)
+			e->origin = v->origin;
 	}
 	for (i = 0; i < visit->nr; i++) {
 		e = &visit->entries[i];
 		if (cancel_list_has(held, e))
 			continue;
 		e->cond = site->visited;
-		cond |= e->cond;
 		err = cancel_list_add(held, e);
 		if (err)
 			return err;
 	}
 	site->visited = true;
-	/* nothing makes a condition yet */
-	if (cond)
-		site->decline = CANCEL_COND;
 	return 0;
 }
 
@@ -2038,7 +2083,7 @@ static const char *cancel_shape_text(u8 reason)
 	case CANCEL_SECTION:
 		return "the frame is in more RCU or preemption-disabled sections than a pad leaves";
 	case CANCEL_COND:
-		return "the frame holds a resource on some paths only, or in different places";
+		return "the paths to it are in different numbers of RCU or preemption-disabled sections";
 	case CANCEL_FOREIGN:
 		return "a callee releases what the frame holds";
 	case CANCEL_LOCK_PLACE:
@@ -2051,6 +2096,14 @@ static const char *cancel_shape_text(u8 reason)
 		return "no register or stack slot that a pad can read has a reference of the frame as it was acquired (at a call: R6-R9, or a slot when no stack pointer is passed)";
 	case CANCEL_RELEASE:
 		return "nothing that a pad may call there releases a reference of the frame";
+	case CANCEL_MULTI:
+		return "the frame holds a resource on some paths only, and may hold two that one insn brought, like a lock and its IRQ flags";
+	case CANCEL_INEXACT:
+		return "the frame holds a resource on some paths only, and no insn of the frame tells when: it was given to a callee, or a release leaves it on some paths";
+	case CANCEL_PLACES:
+		return "the frame holds a resource on some paths only, in more than one place or behind locks that differ";
+	case CANCEL_STACK:
+		return "the frame holds a resource on some paths only, and its stack has no room for a flag";
 	default:
 		return NULL;
 	}
@@ -2343,6 +2396,214 @@ static int cancel_assign_pad(struct bpf_verifier_env *env, struct cancel_site *s
 }
 
 /*
+ * Drop flags. Where the visits of a site disagree on whether the frame holds a resource, the
+ * entry has a condition, and the pad releases it only if the frame holds it in this run. A
+ * flag says so: a hidden byte of the frame that is zero when the frame begins, see
+ * bpf_reserve_zeroed_stack(). It has no handle in it. The pad finds the resource in the
+ * place of the program, as it does without a condition.
+ *
+ * A flag is for a class of origins: nothing tells which of them brought what a frame holds
+ * when the program gets to a site. It is 1 exactly while the frame holds a resource of the
+ * class. A store behind every origin sets it, under the test that tells whether the insn
+ * brought something, and a store in front of every call that takes such a resource away
+ * clears it, see bpf_cancel_insert_flag_stores(). A class has a flag only if these stores
+ * are right in every run:
+ * - Every origin is an insn of one subprog, and its visits agree on what tells that it
+ *   brought a resource, see bpf_cancel_record_acquire() and bpf_cancel_record_return().
+ * - No frame holds two resources of the class at a time: the flag cannot say which.
+ * - The frame that holds a resource gives it up itself, at a call of a helper or of a
+ *   kfunc, and no visit of that call leaves a resource of the class with the frame, see
+ *   bpf_cancel_record_release(). What the visits of one call take away is one class.
+ * - The frame has room for the flag.
+ * At a site the class of an entry with a condition is in no other entry: its flag would
+ * release two places.
+ *
+ * RCU and preemption sections have no entry in refs[], and so no origin. Visits that
+ * disagree on them decline as CANCEL_COND.
+ */
+
+/* Why the class that @r stands for has no flag, CANCEL_OK if it can have one */
+static u8 cancel_class_reason(const struct cancel_origin *r)
+{
+	if (r->multi)
+		return CANCEL_MULTI;
+	if (r->inexact)
+		return CANCEL_INEXACT;
+	return r->no_room ? CANCEL_STACK : CANCEL_OK;
+}
+
+/*
+ * The main pass is over: the classes are what they are but for the calls that take away,
+ * which are looked at first. Find for each class whether it can have a flag, see "Drop
+ * flags".
+ *
+ * A pad loads from the flag what an insn in front of it stored. Where a load may run ahead
+ * of such a store, see bypass_spec_v4, the pad would go by what the flag was before.
+ */
+static void cancel_find_flag_classes(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_release *rel, *other;
+	struct cancel_origin *o, *r;
+	u32 i, n;
+
+	for (i = 0; i < c->nr_releases; i++) {
+		rel = &c->releases[i];
+		if (rel->origin == CANCEL_NO_ORIGIN)
+			continue;
+		for (n = env->insn_aux_data[rel->insn_idx].cancel_release; n; n = other->next) {
+			other = &c->releases[n - 1];
+			if (other->origin == CANCEL_NO_ORIGIN)
+				c->origins[rel->origin].inexact = true;
+			else
+				cancel_union(c, rel->origin, other->origin);
+		}
+	}
+	for (i = 0; i < c->nr_origins; i++) {
+		o = &c->origins[i];
+		r = &c->origins[cancel_class(c, i)];
+		if (o->inexact || o->subprog != r->subprog ||
+		    o->how == BPF_CANCEL_ACQUIRE_SOMETIMES ||
+		    (o->null_ret && o->how != BPF_CANCEL_ACQUIRE_R0) ||
+		    c->no_releases || !env->bypass_spec_v4)
+			r->inexact = true;
+		if (o->multi || c->no_pairs)
+			r->multi = true;
+	}
+	for (i = 0; i < c->nr_pairs; i++) {
+		r = &c->origins[cancel_class(c, c->pairs[i].a)];
+		if (r == &c->origins[cancel_class(c, c->pairs[i].b)])
+			r->multi = true;
+	}
+}
+
+/*
+ * Can a flag tell for each entry of @site that only some visits have whether the frame
+ * holds it? Returns the reason why the site declines if not.
+ */
+static u8 cancel_site_flags(struct bpf_verifier_env *env, const struct cancel_site *site)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_entry *e, *other;
+	u32 i, j, r;
+	u8 reason;
+
+	for (i = 0; i < site->held.nr; i++) {
+		e = &site->held.entries[i];
+		if (!e->cond)
+			continue;
+		if (e->kind == CANCEL_RCU || e->kind == CANCEL_PREEMPT)
+			return CANCEL_COND;
+		if (!e->origin || e->stray)
+			return CANCEL_INEXACT;
+		r = cancel_class(c, e->origin - 1);
+		reason = cancel_class_reason(&c->origins[r]);
+		if (reason)
+			return reason;
+		for (j = 0; j < site->held.nr; j++) {
+			other = &site->held.entries[j];
+			if (j != i && other->origin && cancel_class(c, other->origin - 1) == r)
+				return CANCEL_PLACES;
+		}
+	}
+	return CANCEL_OK;
+}
+
+/* The flags that pads read: those of the sites that get a pad as things are */
+static void cancel_find_used(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_site *site;
+	const struct cancel_entry *e;
+	bool has_point;
+	u32 i, j;
+
+	for (i = 0; i < c->nr_origins; i++)
+		c->origins[i].used = false;
+	for (i = 0; i < c->nr_sites; i++) {
+		site = &c->sites[i];
+		if (site->decline || c->subs[site->subprog].why ||
+		    !cancel_gets_to(env, site, &has_point))
+			continue;
+		for (j = 0; j < site->held.nr; j++) {
+			e = &site->held.entries[j];
+			if (e->cond)
+				c->origins[cancel_class(c, e->origin - 1)].used = true;
+		}
+	}
+}
+
+/*
+ * Reserve the flags that are used and have no room yet: a byte each, in the frame of the
+ * subprog that the origins of the class are in. A subprog is asked once, for all of its
+ * flags. Returns the number of subprogs whose frames have no room, below 0 on error.
+ */
+static int cancel_reserve_flags(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	struct cancel_origin *o, *first;
+	int err, failed = 0;
+	bool jit_required;
+	u32 i, j, nr;
+	s16 off;
+
+	for (i = 0; i < c->nr_origins; i++) {
+		first = &c->origins[i];
+		if (!first->used || first->flag)
+			continue;
+		for (j = i, nr = 0; j < c->nr_origins; j++) {
+			o = &c->origins[j];
+			nr += o->used && !o->flag && o->subprog == first->subprog;
+		}
+		/*
+		 * Such stack is for a program that the interpreter never runs. One with a pad
+		 * is that, and it is no pad without its flags.
+		 */
+		jit_required = env->prog->jit_required;
+		env->prog->jit_required = 1;
+		err = bpf_reserve_zeroed_stack(env, first->subprog, nr, &off);
+		if (err && err != -ENOSPC)
+			return err;
+		if (err) {
+			env->prog->jit_required = jit_required;
+			failed++;
+		}
+		for (j = i; j < c->nr_origins; j++) {
+			o = &c->origins[j];
+			if (!o->used || o->flag || o->subprog != first->subprog)
+				continue;
+			if (err) {
+				o->used = false;
+				o->no_room = true;
+				continue;
+			}
+			o->flag = off++;
+			c->nr_flags++;
+		}
+	}
+	return failed;
+}
+
+/* @site gets a pad: its entries that only some visits have go by the flags of their classes */
+static int cancel_set_flags(struct bpf_verifier_env *env, struct cancel_site *site)
+{
+	struct bpf_cancel *c = env->cancel;
+	struct cancel_entry *e;
+	u32 i;
+
+	for (i = 0; i < site->held.nr; i++) {
+		e = &site->held.entries[i];
+		if (!e->cond)
+			continue;
+		e->flag = c->origins[cancel_class(c, e->origin - 1)].flag;
+		if (verifier_bug_if(!e->flag, env, "cancel: no flag for the site at insn %u",
+				    site->insn_idx))
+			return -EFAULT;
+	}
+	return 0;
+}
+
+/*
  * The main pass is over and no insn has moved yet. Find the subprogs that can be cancelled,
  * and what becomes of each site: it gets a pad, it declines, or no cancellation gets there.
  * The frames are as large as the program makes them, and may still take hidden slots that
@@ -2379,6 +2640,7 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 	for (s = 0; s < env->subprog_cnt; s++)
 		c->subs[s].why = cancel_sub_reason(env, s);
 	cancel_find_stuck(env);
+	cancel_find_flag_classes(env);
 	/* a site that cannot have what its pad needs declines, before the calls are looked at */
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
@@ -2390,9 +2652,32 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 				return reason;
 			site->decline = reason;
 		}
+		if (!site->decline)
+			site->decline = cancel_site_flags(env, site);
 	}
 	cancel_drop_subs(env);
 	cancel_find_raising(env);
+	/*
+	 * Only the flags of sites that get a pad take room. A site whose frame has none
+	 * declines after all, and fewer sites get a pad then: that is found once more.
+	 */
+	cancel_find_used(env);
+	err = cancel_reserve_flags(env);
+	if (err < 0)
+		return err;
+	if (err) {
+		for (i = 0; i < c->nr_sites; i++) {
+			site = &c->sites[i];
+			if (!site->decline && !c->subs[site->subprog].why)
+				site->decline = cancel_site_flags(env, site);
+		}
+		for (s = 0; s < env->subprog_cnt; s++)
+			c->subs[s].has_point = c->subs[s].raises = false;
+		cancel_drop_subs(env);
+		cancel_find_raising(env);
+		cancel_find_used(env);
+	}
+	err = 0;
 
 	for (i = 0; i < c->nr_sites && !err; i++) {
 		site = &c->sites[i];
@@ -2407,7 +2692,7 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 		if (!has_point || (!site->decline && !raises))
 			site->unused = true;
 		else if (!site->decline)
-			err = cancel_assign_pad(env, site);
+			err = cancel_set_flags(env, site) ?: cancel_assign_pad(env, site);
 		else
 			reject |= cancel_reject(env, site, of_subprog);
 	}
@@ -2617,15 +2902,23 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, struct bpf_insn
 static int cancel_emit_pad(struct bpf_verifier_env *env, const struct cancel_site *site,
 			   struct bpf_insn *buf)
 {
-	int n = 0, cnt, place;
+	int n = 0, cnt, skip, place;
+	const struct cancel_entry *e;
 	u32 i;
 
 	for (i = 0; i < site->held.nr; i++) {
 		place = site->held.entries[i].place;
-		cnt = cancel_emit_entry(env, &site->held.entries[i], place, buf + n);
+		/* the flag of an entry that only some visits have tells whether it is there */
+		e = &site->held.entries[i];
+		skip = e->flag ? CANCEL_FLAG_INSNS : 0;
+		cnt = cancel_emit_entry(env, e, place, buf + n + skip);
 		if (cnt < 0)
 			return cnt;
-		n += cnt;
+		if (skip) {
+			buf[n] = BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_FP, e->flag);
+			buf[n + 1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, cnt);
+		}
+		n += skip + cnt;
 	}
 	return n + cancel_emit_exit(env, site->subprog, buf + n);
 }
@@ -2651,7 +2944,7 @@ int bpf_cancel_append_pads(struct bpf_verifier_env *env, int s, const struct bpf
 		return 0;
 	for (p = c->subs[s].pads; p; p = pad->next) {
 		pad = &c->pads[p - 1];
-		need += c->sites[pad->site].held.nr * CANCEL_ENTRY_INSNS;
+		need += c->sites[pad->site].held.nr * (CANCEL_ENTRY_INSNS + CANCEL_FLAG_INSNS);
 		need += BPF_CANCEL_PAD_EXIT_INSNS;
 	}
 	if (need > c->cap_insns) {
@@ -2755,6 +3048,77 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * Keep the flags that pads read, see "Drop flags". The pads, the guards and cancel_goto are
+ * in the program, and an insn that the main pass noted is found by what is known about it.
+ *
+ *	call acquire			*(u8 *)(r10 + flag) = 0
+ *	if r0 == 0 goto +1		call release
+ *	*(u8 *)(r10 + flag) = 1
+ *	insn
+ *
+ * The flag is set in front of the insn that follows the call, and of may_goto that is
+ * there: a jump to that insn brought nothing. Behind the call of a subprog cancel_goto
+ * comes first, which only a cancellation takes.
+ *
+ * The flag is cleared right in front of the call, behind what jumps to the call and behind
+ * its may_goto: the frame holds the resource until the call is made, and the call gets to no
+ * pad before it returns.
+ */
+int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	const struct cancel_origin *o, *r;
+	const struct cancel_site *site;
+	struct bpf_insn buf[2], *insn;
+	int i, n, at, err;
+	u32 x;
+
+	if (!c || !c->nr_flags)
+		return 0;
+
+	for (i = 0; i < env->prog->len; i++) {
+		/* what its visits take away is of one class by now, or of classes without a flag */
+		x = env->insn_aux_data[i].cancel_release;
+		x = x ? c->releases[x - 1].origin : CANCEL_NO_ORIGIN;
+		r = x != CANCEL_NO_ORIGIN ? &c->origins[cancel_class(c, x)] : NULL;
+		if (r && r->used && r->flag) {
+			buf[0] = BPF_ST_MEM(BPF_B, BPF_REG_FP, r->flag, 0);
+			buf[1] = env->prog->insnsi[i];
+			insn = bpf_patch_list_add(env, i, buf, 2);
+			if (IS_ERR(insn))
+				return PTR_ERR(insn);
+		}
+
+		x = env->insn_aux_data[i].cancel_origin;
+		if (!x)
+			continue;
+		o = &c->origins[x - 1];
+		r = &c->origins[cancel_class(c, x - 1)];
+		if (!r->used || !r->flag)
+			continue;
+		n = 0;
+		if (o->how == BPF_CANCEL_ACQUIRE_R0)
+			buf[n++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
+		else if (o->how == BPF_CANCEL_ACQUIRE_R0_ZERO)
+			/* the kfunc returns an int */
+			buf[n++] = BPF_JMP32_IMM(BPF_JNE, BPF_REG_0, 0, 1);
+		buf[n++] = BPF_ST_MEM(BPF_B, BPF_REG_FP, r->flag, 1);
+		insn = &env->prog->insnsi[i];
+		at = i + 1;
+		if (bpf_pseudo_call(insn) || bpf_is_callx(insn)) {
+			at += bpf_is_unwind_goto(insn + 1);
+			site = cancel_find_site(env, i, BPF_CANCEL_SITE_CALL);
+			if (site && site->padded)
+				at++;
+		}
+		err = bpf_patch_list_insert(env, at, buf, n);
+		if (err)
+			return err;
+	}
+	return bpf_patch_list_commit(env);
+}
+
 /* The main pass starts over: the states of the round that is dropped never run */
 void bpf_cancel_reset(struct bpf_verifier_env *env)
 {
@@ -2777,6 +3141,7 @@ void bpf_cancel_reset(struct bpf_verifier_env *env)
 	c->no_releases = false;
 	c->nr_pairs = 0;
 	c->no_pairs = false;
+	c->nr_flags = 0;
 }
 
 void bpf_cancel_free(struct bpf_verifier_env *env)

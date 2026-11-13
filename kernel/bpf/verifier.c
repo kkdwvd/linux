@@ -12142,9 +12142,13 @@ static int move_refs_to_callee(struct bpf_verifier_env *env, struct bpf_verifier
 	err = bpf_live_stack_query_init(env, state);
 	if (err)
 		return err;
-	for (i = 0; i < state->acquired_refs; i++)
-		if (bpf_cancel_ref_moves(env, state, i, subprog))
-			state->refs[i].frameno = state->curframe + 1;
+	for (i = 0; i < state->acquired_refs; i++) {
+		if (!bpf_cancel_ref_moves(env, state, i, subprog))
+			continue;
+		/* no insn of the callee brings it there: it has no drop flag from here on */
+		bpf_cancel_ref_moved(env, state, i);
+		state->refs[i].frameno = state->curframe + 1;
+	}
 	return 0;
 }
 
@@ -25888,6 +25892,9 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = bpf_cancel_insert_gotos(env);
+
+	if (ret == 0)
+		ret = bpf_cancel_insert_flag_stores(env);
 
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
