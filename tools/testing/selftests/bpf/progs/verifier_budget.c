@@ -15,7 +15,6 @@
  * helper has no pad to come back to. What the program does there when it is out of budget:
  * - it unwinds, when unwind_goto follows every call of the subprog and the subprog
  *   holds nothing of its own. The pads of the callers are verified.
- * - the main prog and an async callback end
  * - otherwise it leaves the loop, or returns 0 from the subprog
  * The main pass verifies these ways out in every program. The tests that take them at run
  * time do it in a callback of bpf_loop(), see RUN_IN_CALLBACK().
@@ -258,11 +257,12 @@ static unsigned long spins_caught(void)
 	);
 }
 
+/* Without a pad may_goto leaves the loop, and the prog returns the 7 of spins() */
 SEC("socket")
-__description("budget: a loop in a subprog is left when there is no unwind_goto")
+__description("budget: a loop in a subprog ends the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void loop_in_subprog(void)
 {
 	asm volatile (
@@ -272,11 +272,24 @@ __naked void loop_in_subprog(void)
 	);
 }
 
+CALLBACK(calls_spins, spins, 0)
+
 SEC("socket")
-__description("budget: a loop in a subprog unwinds when there is unwind_goto")
+__description("budget: in a callback, a loop in a subprog is left when there is no unwind_goto")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(7)
+__naked void loop_in_subprog_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(calls_spins));
+}
+
+/* A cancellation runs the pads of the verifier, not the ones that unwind_goto names */
+SEC("socket")
+__description("budget: a loop in a subprog ends the prog when there is unwind_goto")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
 __naked void loop_in_subprog_caught(void)
 {
 	asm volatile (
@@ -289,6 +302,33 @@ __naked void loop_in_subprog_caught(void)
 		: __imm_unwind_goto(1)
 		: __clobber_all
 	);
+}
+
+__naked __noinline __used
+static unsigned long catches_spins(void)
+{
+	asm volatile (
+		"call spins_caught;"
+		unwind_goto(1)
+		"goto 1f;"
+		"r0 = 42;"
+	"1:"
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_unwind_goto(1),
+		  __imm_addr(result)
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: in a callback, a loop in a subprog unwinds when there is unwind_goto")
+__arch_x86_64
+__arch_arm64
+__success __retval(42)
+__naked void loop_in_subprog_caught_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(catches_spins));
 }
 
 __naked __noinline __used
@@ -332,7 +372,7 @@ __naked void pad_forgets(void)
 	);
 }
 
-/* There is no pad for what the subprog took itself */
+/* The program has no pad for what the subprog took itself */
 __naked __noinline __used
 static unsigned long spins_locked(void)
 {
@@ -352,11 +392,12 @@ static unsigned long spins_locked(void)
 	);
 }
 
+/* The pad of the verifier leaves the RCU read section */
 SEC("socket")
-__description("budget: a loop in a subprog that holds something is left")
+__description("budget: a loop in a subprog that holds something ends the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void loop_in_subprog_locked(void)
 {
 	asm volatile (
@@ -369,6 +410,33 @@ __naked void loop_in_subprog_locked(void)
 		: __imm_unwind_goto(1)
 		: __clobber_all
 	);
+}
+
+__naked __noinline __used
+static unsigned long catches_spins_locked(void)
+{
+	asm volatile (
+		"call spins_locked;"
+		unwind_goto(1)
+		"goto 1f;"
+		"r0 = 42;"
+	"1:"
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_unwind_goto(1),
+		  __imm_addr(result)
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: in a callback, a loop in a subprog that holds something is left")
+__arch_x86_64
+__arch_arm64
+__success __retval(7)
+__naked void loop_in_subprog_locked_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(catches_spins_locked));
 }
 
 /* r1: how deep to go. Returns the sum of 1 .. r1 */
@@ -875,8 +943,18 @@ int recursion_sleeps_in_rcu_callback(void *ctx)
 
 /*
  * may_goto of the program stops the loop that it leaves. This one goes to itself
- * when it is out of budget. The loop spins until may_goto that is added ends the prog.
+ * when it is out of budget, so the loop gets may_goto of the verifier too. Either of them
+ * ends the prog when the time is up. In a callback may_goto of the program jumps, and it is
+ * may_goto that is added which leaves the loop.
  */
+#define MAY_GOTO_STAYS_IN_LOOP				\
+		"r6 = %[one] ll;"			\
+	"1:"						\
+		".8byte %[may_goto_self];"		\
+		"r1 = *(u64 *)(r6 + 0);"		\
+		"if r1 != 0 goto 1b;"			\
+		"r0 = 1;"
+
 SEC("socket")
 __description("budget: may_goto that doesn't leave the loop")
 __arch_x86_64
@@ -885,18 +963,37 @@ __success __retval(0)
 __naked void may_goto_stays_in_loop(void)
 {
 	asm volatile (
-		"r6 = %[one] ll;"
-	"1:"
-		".8byte %[may_goto_self];"
-		"r1 = *(u64 *)(r6 + 0);"
-		"if r1 != 0 goto 1b;"
-		"r0 = 1;"
+		MAY_GOTO_STAYS_IN_LOOP
 		"exit;"
 		:
 		: __imm_addr(one),
 		  __imm_insn(may_goto_self, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, -1, 0))
 		: __clobber_all
 	);
+}
+
+__naked __noinline __used
+static unsigned long may_goto_stays_in_loop_of_callback(void)
+{
+	asm volatile (
+		MAY_GOTO_STAYS_IN_LOOP
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_addr(one),
+		  __imm_addr(result),
+		  __imm_insn(may_goto_self, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, -1, 0))
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: in a callback, may_goto that doesn't leave the loop")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__naked void may_goto_stays_in_loop_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(may_goto_stays_in_loop_of_callback));
 }
 
 /* The jump to itself has to go through may_goto that is added in front of it */
@@ -949,32 +1046,36 @@ __naked void loop_with_two_entries(void)
 
 /*
  * bpf_iter_num_next() stops the loop that the program leaves when there is nothing left.
- * This one goes on. The iterator is held, so the loop is left when it is out of budget.
+ * This one goes on, so it gets may_goto. The iterator is held when the loop is out of budget.
  */
+#define LOOP_AFTER_ITER_IS_DRAINED			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"r2 = 0;"				\
+		"r3 = 10;"				\
+		"call %[bpf_iter_num_new];"		\
+		"r6 = %[one] ll;"			\
+	"1:"						\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"call %[bpf_iter_num_next];"		\
+		"r1 = *(u64 *)(r6 + 0);"		\
+		"if r1 != 0 goto 1b;"			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"call %[bpf_iter_num_destroy];"		\
+		"r0 = 1;"
+
+/* The pad of the verifier destroys the iterator */
 SEC("socket")
-__description("budget: a loop that goes on when its iterator is drained")
+__description("budget: a loop that goes on when its iterator is drained ends the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(1)
+__success __retval(0)
 __naked void loop_after_iter_is_drained(void)
 {
 	asm volatile (
-		"r1 = r10;"
-		"r1 += -8;"
-		"r2 = 0;"
-		"r3 = 10;"
-		"call %[bpf_iter_num_new];"
-		"r6 = %[one] ll;"
-	"1:"
-		"r1 = r10;"
-		"r1 += -8;"
-		"call %[bpf_iter_num_next];"
-		"r1 = *(u64 *)(r6 + 0);"
-		"if r1 != 0 goto 1b;"
-		"r1 = r10;"
-		"r1 += -8;"
-		"call %[bpf_iter_num_destroy];"
-		"r0 = 1;"
+		LOOP_AFTER_ITER_IS_DRAINED
 		"exit;"
 		:
 		: __imm_addr(one),
@@ -983,6 +1084,33 @@ __naked void loop_after_iter_is_drained(void)
 		  __imm(bpf_iter_num_destroy)
 		: __clobber_all
 	);
+}
+
+/* The loop is left, and the code behind it destroys the iterator */
+__naked __noinline __used
+static unsigned long loops_after_iter_is_drained(void)
+{
+	asm volatile (
+		LOOP_AFTER_ITER_IS_DRAINED
+		CALLBACK_RETURNS_R0
+		:
+		: __imm_addr(one),
+		  __imm_addr(result),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy)
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: in a callback, a loop that goes on when its iterator is drained is left")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__naked void loop_after_iter_is_drained_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(loops_after_iter_is_drained));
 }
 
 /*
@@ -1152,7 +1280,8 @@ __naked void nest_of_17_loops(void)
 /*
  * The loops below spin and have no jump that every trip goes through, so may_goto is at the head.
  * It goes to the code behind the loop, past what the loop makes for that code, with the registers
- * and the stack as they are at the head.
+ * and the stack as they are at the head. That is what the main pass verifies, and what runs
+ * in a callback. Everywhere else may_goto ends the prog.
  *
  * r6 is 5 on every edge of the program that gets behind the loop. At the head it's 7.
  */
@@ -1176,10 +1305,10 @@ static unsigned long spins_and_makes(void)
 }
 
 SEC("socket")
-__description("budget: may_goto at the head of a loop keeps a register that the loop sets")
+__description("budget: may_goto at the head of a loop ends the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(7)
+__success __retval(0)
 __naked void guard_at_head_keeps_reg(void)
 {
 	asm volatile (
@@ -1187,6 +1316,18 @@ __naked void guard_at_head_keeps_reg(void)
 		"exit;"
 		::: __clobber_all
 	);
+}
+
+CALLBACK(calls_spins_and_makes, spins_and_makes, 0)
+
+SEC("socket")
+__description("budget: in a callback, may_goto at the head of a loop keeps a register that the loop sets")
+__arch_x86_64
+__arch_arm64
+__success __retval(7)
+__naked void guard_at_head_keeps_reg_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(calls_spins_and_makes));
 }
 
 /* Only the loop sets r6: there is no way from the head to the code behind the loop */
@@ -1220,6 +1361,19 @@ __naked void guard_at_head_unset_reg(void)
 		"exit;"
 		::: __clobber_all
 	);
+}
+
+/* may_goto leaves the subprog with 0 */
+CALLBACK(calls_spins_and_makes_unset, spins_and_makes_unset, 100)
+
+SEC("socket")
+__description("budget: in a callback, may_goto at the head of a loop, a register that only the loop sets")
+__arch_x86_64
+__arch_arm64
+__success __retval(100)
+__naked void guard_at_head_unset_reg_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(calls_spins_and_makes_unset));
 }
 
 SEC("socket")
@@ -1302,19 +1456,18 @@ static unsigned long spins_with_half_of_reg(void)
 	);
 }
 
+/* The code that reads all of r7 runs in a callback only */
+CALLBACK(calls_spins_with_half_of_reg, spins_with_half_of_reg, 100)
+
 SEC("socket")
 __description("budget: may_goto at the head of a loop, one half of a register is live there")
 __arch_x86_64
 __arch_arm64
 __flag(BPF_F_TEST_RND_HI32)
-__success __retval(0)
+__success __retval(100)
 __naked void guard_at_head_half_of_reg(void)
 {
-	asm volatile (
-		"call spins_with_half_of_reg;"
-		"exit;"
-		::: __clobber_all
-	);
+	asm volatile (RUN_IN_CALLBACK(calls_spins_with_half_of_reg));
 }
 
 /*
@@ -1829,12 +1982,11 @@ static unsigned long spins_all_regs_live(void)
 	);
 }
 
-/* The time is up: the loop is left with r1 = 1 and all the other registers as they are */
 SEC("socket")
 __description("budget: may_goto where all registers are live, out of budget")
 __arch_x86_64
 __arch_arm64
-__success __retval(38)
+__success __retval(0)
 __naked void guard_all_regs_live_spins(void)
 {
 	asm volatile (
@@ -1842,6 +1994,19 @@ __naked void guard_all_regs_live_spins(void)
 		"exit;"
 		::: __clobber_all
 	);
+}
+
+/* The time is up: the loop is left with r1 = 1 and all the other registers as they are */
+CALLBACK(calls_spins_all_regs_live, spins_all_regs_live, 0)
+
+SEC("socket")
+__description("budget: in a callback, may_goto where all registers are live, out of budget")
+__arch_x86_64
+__arch_arm64
+__success __retval(38)
+__naked void guard_all_regs_live_spins_in_callback(void)
+{
+	asm volatile (RUN_IN_CALLBACK(calls_spins_all_regs_live));
 }
 
 /*
