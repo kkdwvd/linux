@@ -1224,10 +1224,26 @@ static const struct btf_kfunc_id_set wakeup_source_kfunc_set = {
 	.set   = &wakeup_source_kfunc_ids,
 };
 
+/* The kfunc that generated code calls to release the lock of the wakeup sources */
+BTF_ID_LIST(wakeup_source_release_ids)
+BTF_ID(struct, bpf_ws_lock)
+BTF_ID(func, bpf_wakeup_sources_read_unlock)
+
 static void __init wakeup_sources_bpf_init(void)
 {
+	const struct btf_id_dtor_kfunc wakeup_source_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= wakeup_source_release_ids[0],
+			.release_btf_id	= wakeup_source_release_ids[1],
+		},
+	};
+
 	if (register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &wakeup_source_kfunc_set))
 		pm_pr_dbg("Wakeup: failed to register BTF kfuncs\n");
+	if (register_btf_id_dtor_kfuncs(wakeup_source_releases,
+					ARRAY_SIZE(wakeup_source_releases), NULL))
+		pm_pr_dbg("Wakeup: failed to register BTF release kfuncs\n");
 }
 #else
 static inline void wakeup_sources_bpf_init(void) {}
