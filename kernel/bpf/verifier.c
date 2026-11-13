@@ -3381,7 +3381,7 @@ static int record_callx_edge(struct bpf_verifier_env *env, int caller, int calle
  * Return the first subprog with the number >= 'from' that 'caller' calls
  * via callx, or -1 when there is none.
  */
-static int next_callx_callee(struct bpf_verifier_env *env, int caller, int from)
+int bpf_next_callx_callee(struct bpf_verifier_env *env, int caller, int from)
 {
 	u32 cnt = env->subprog_cnt;
 	unsigned long bit, end = (caller + 1) * cnt;
@@ -3496,7 +3496,7 @@ static int sort_subprogs_topo(struct bpf_verifier_env *env)
 					/* find a callee that is not explored yet */
 					callee = -1;
 					do {
-						callee = next_callx_callee(env, cur, callee + 1);
+						callee = bpf_next_callx_callee(env, cur, callee + 1);
 					} while (callee >= 0 && color[callee] == 2);
 					if (callee < 0)
 						continue;
@@ -5539,6 +5539,7 @@ struct bpf_call_graph {
 	unsigned long *in_recursion; /* recursive subprogs and what they get to */
 	unsigned long *tail_calls; /* subprogs that have a tail call */
 	unsigned long *arena_sp; /* subprogs that count on r12 of the caller */
+	enum priv_stack_mode priv_stack_mode; /* where the frames of the program may go */
 };
 
 static unsigned long *subprog_calls(struct bpf_call_graph *cg, int s)
@@ -5596,7 +5597,8 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 			__set_bit(j, subprog_calls(cg, s));
 		}
 		/* the callees of callx and the callbacks of helpers, see record_callx_edge() */
-		for (j = next_callx_callee(env, s, 0); j >= 0; j = next_callx_callee(env, s, j + 1))
+		for (j = bpf_next_callx_callee(env, s, 0); j >= 0;
+		     j = bpf_next_callx_callee(env, s, j + 1))
 			__set_bit(j, subprog_calls(cg, s));
 	}
 	memcpy(cg->reach, cg->calls, cnt * words * sizeof(long));
@@ -6166,12 +6168,56 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	return err;
 }
 
-static int check_max_stack_depth(struct bpf_verifier_env *env)
+/* Which frames go to the private stack. A frame that grows may move there, none comes back. */
+static void set_priv_stack_modes(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	int s;
+
+	for_each_set_bit(s, cg->live, cg->cnt) {
+		/*
+		 * All async_cb subprogs use normal kernel stack. If a particular
+		 * subprog appears in both main prog and async_cb subtree, that
+		 * subprog will use normal kernel stack to avoid potential nesting.
+		 * The private stack has room for one frame of a subprog.
+		 * x86-64 uses R9 for both private stack frame pointer and arg6.
+		 */
+		if (cg->priv_stack_mode != PRIV_STACK_ADAPTIVE || test_bit(s, cg->in_async_cb) ||
+		    si[s].recursive || (IS_ENABLED(CONFIG_X86_64) && si[s].stack_arg_cnt)) {
+			si[s].priv_stack_mode = NO_PRIV_STACK;
+			continue;
+		}
+		/*
+		 * Request private stack support only if the subprog stack
+		 * depth is no less than BPF_PRIV_STACK_MIN_SIZE. This is to
+		 * avoid jit penalty if the stack usage is small.
+		 */
+		if (round_up_stack_depth(env, si[s].stack_depth) >= BPF_PRIV_STACK_MIN_SIZE) {
+			si[s].priv_stack_mode = PRIV_STACK_ADAPTIVE;
+			env->prog->aux->jits_use_priv_stack = true;
+		}
+	}
+}
+
+static void free_call_graph(struct bpf_verifier_env *env)
+{
+	if (env->call_graph)
+		kvfree(env->call_graph->calls);
+	kfree(env->call_graph);
+	env->call_graph = NULL;
+}
+
+/*
+ * What holds for the calls of the program whatever the size of a frame is. The graph stays
+ * for check_max_stack_depth(). Until then no call of a subprog and no subprog is added or
+ * removed.
+ */
+static int check_call_graph(struct bpf_verifier_env *env)
 {
 	enum priv_stack_mode priv_stack_mode = PRIV_STACK_UNKNOWN;
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_call_graph cg = {};
-	int s, ret;
+	struct bpf_call_graph *cg;
+	int ret;
 
 	for (int i = 0; i < env->subprog_cnt; i++) {
 		if (si[i].has_tail_call) {
@@ -6192,42 +6238,32 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	if (priv_stack_mode == PRIV_STACK_UNKNOWN)
 		priv_stack_mode = bpf_enable_priv_stack(env->prog);
 
-	ret = build_call_graph(env, &cg);
-	ret = ret ?: check_exception_cb(env, &cg);
-	ret = ret ?: check_recursion(env, &cg);
-	ret = ret ?: check_callbacks(env, &cg);
-	ret = ret ?: check_tail_calls(env, &cg);
-	if (ret)
-		goto out;
-	mark_arena_stack_entries(env, &cg);
+	cg = kzalloc_obj(*cg, GFP_KERNEL_ACCOUNT);
+	if (!cg)
+		return -ENOMEM;
+	env->call_graph = cg;
+	cg->priv_stack_mode = priv_stack_mode;
 
-	for_each_set_bit(s, cg.live, cg.cnt) {
-		/*
-		 * All async_cb subprogs use normal kernel stack. If a particular
-		 * subprog appears in both main prog and async_cb subtree, that
-		 * subprog will use normal kernel stack to avoid potential nesting.
-		 * The private stack has room for one frame of a subprog.
-		 * x86-64 uses R9 for both private stack frame pointer and arg6.
-		 */
-		if (priv_stack_mode != PRIV_STACK_ADAPTIVE || test_bit(s, cg.in_async_cb) ||
-		    si[s].recursive || (IS_ENABLED(CONFIG_X86_64) && si[s].stack_arg_cnt)) {
-			si[s].priv_stack_mode = NO_PRIV_STACK;
-			continue;
-		}
-		/*
-		 * Request private stack support only if the subprog stack
-		 * depth is no less than BPF_PRIV_STACK_MIN_SIZE. This is to
-		 * avoid jit penalty if the stack usage is small.
-		 */
-		if (round_up_stack_depth(env, si[s].stack_depth) >= BPF_PRIV_STACK_MIN_SIZE) {
-			si[s].priv_stack_mode = PRIV_STACK_ADAPTIVE;
-			env->prog->aux->jits_use_priv_stack = true;
-		}
+	ret = build_call_graph(env, cg);
+	ret = ret ?: check_exception_cb(env, cg);
+	ret = ret ?: check_recursion(env, cg);
+	ret = ret ?: check_callbacks(env, cg);
+	ret = ret ?: check_tail_calls(env, cg);
+	if (ret) {
+		free_call_graph(env);
+		return ret;
 	}
+	mark_arena_stack_entries(env, cg);
+	return 0;
+}
 
-	ret = check_call_depth(env, &cg);
-out:
-	kvfree(cg.calls);
+static int check_max_stack_depth(struct bpf_verifier_env *env)
+{
+	int ret;
+
+	set_priv_stack_modes(env, env->call_graph);
+	ret = check_call_depth(env, env->call_graph);
+	free_call_graph(env);
 	return ret;
 }
 
@@ -11528,6 +11564,9 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 		err = set_callee_state_cb(env, caller, callee, insn_idx);
 		if (err)
 			return err;
+		/* it returns 0 to the kernel when it is cancelled, see bpf_cancel_resolve() */
+		if (callee->callback_ret_range.minval > 0 || callee->callback_ret_range.maxval < 0)
+			env->subprog_info[subprog].async_ret_nonzero = true;
 
 		return 0;
 	}
@@ -23503,6 +23542,7 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 				env->subprog_info[i].insns_total,
 				env->subprog_info[i].stack_depth);
 		}
+		bpf_cancel_print_stats(env);
 	}
 	/* user space parses this line. There is no limit and there are no read marks. */
 	verbose(env, "processed %d insns (limit 0) max_states_per_insn %d "
@@ -25554,15 +25594,21 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
 		ret = bpf_prog_offload_finalize(env);
 
-	if (ret == 0)
-		ret = bpf_insert_loop_guards(env);
-
 skip_full_check:
 	/* might decrease stack depth, keep it before passes that
 	 * allocate additional slots.
 	 */
 	if (ret == 0)
 		ret = bpf_remove_fastcall_spills_fills(env);
+
+	if (ret == 0)
+		ret = check_call_graph(env);
+
+	if (ret == 0)
+		ret = bpf_cancel_resolve(env);
+
+	if (ret == 0)
+		ret = bpf_insert_loop_guards(env);
 
 	if (ret == 0)
 		ret = check_max_stack_depth(env);
@@ -25698,6 +25744,7 @@ err_prep:
 	release_btfs(env);
 err_free_env:
 	bpf_free_subprog_jts(env);
+	free_call_graph(env);
 	if (env->insn_aux_data)
 		bpf_clear_insn_aux_data(env, 0, env->insn_aux_data_len);
 	vfree(env->insn_aux_data);

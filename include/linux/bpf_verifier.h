@@ -1103,6 +1103,8 @@ struct bpf_subprog_info {
 	bool bail_unwinds: 1;
 	/* some call of it is not followed by unwind_goto */
 	bool plain_call: 1;
+	/* it is set as an async callback that may not return 0 */
+	bool async_ret_nonzero: 1;
 	u8 code_stack_args;
 	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1150,6 +1152,7 @@ struct bpf_idmap {
 
 struct bpf_liveness;
 struct scev;
+struct bpf_call_graph;
 
 struct bpf_fd_array {
 	union {
@@ -1319,6 +1322,8 @@ struct bpf_verifier_env {
 	u32 max_stack_depth;
 	/* stack budget of the program, see bpf_prog_stack_limit() */
 	u32 stack_limit;
+	/* who calls whom, from check_call_graph() until check_max_stack_depth() is done */
+	struct bpf_call_graph *call_graph;
 	/* total verification time */
 	u64 verification_time;
 	/* maximum number of verifier states kept in 'branching' instructions */
@@ -1587,6 +1592,7 @@ bool bpf_edge_leaves_loop(struct bpf_verifier_env *env, int h, int n, int t);
 int bpf_find_latches(struct bpf_verifier_env *env, bool flags);
 bool bpf_jump_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
+int bpf_next_callx_callee(struct bpf_verifier_env *env, int caller, int from);
 
 /* cancel.c */
 enum bpf_cancel_site_type {
@@ -1597,8 +1603,10 @@ enum bpf_cancel_site_type {
 };
 
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
+int bpf_cancel_resolve(struct bpf_verifier_env *env);
 void bpf_cancel_reset(struct bpf_verifier_env *env);
 void bpf_cancel_free(struct bpf_verifier_env *env);
+void bpf_cancel_print_stats(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);
