@@ -574,6 +574,7 @@ struct bpf_pad_plan {
 	bool failed;			/* a state made the conflict an error of the pass */
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 sections_differ;		/* bit per class: not the same number on all visits */
+	u8 no_place;			/* the conflict unless hidden slots have all pointers */
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */

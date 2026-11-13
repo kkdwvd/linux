@@ -239,6 +239,10 @@
  * A function has slots for a GROUP of classes, see enum bpf_pad_group and settle_slots(). All its
  * pads release that group through the slots alone. All else stays as it is: a program that needs no
  * slot has no store and no byte of stack for them. A site with another way out never asks for them.
+ * A pointer that no place has at a site is in its slot as well: the compiler keeps nothing over a
+ * call of a function that never returns. An iterator and a dynptr are references like a pointer to
+ * the main pass. One that no place has may stand for an object that the program has overwritten, so
+ * that is for functions in which no insn acquires such an object, see acquires_stack_obj().
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -1280,6 +1284,12 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			if (held_ent(plan, i))
 				continue;
 			err = ref_ent(env, &new, st, insn_idx, ref);
+			/* no entry: a hidden slot may have it, see plan_needs_slots() */
+			if (ref->type == REF_TYPE_PTR &&
+			    (err == BPF_CONFLICT_NO_PLACE || err == BPF_CONFLICT_CALLER_SAVED)) {
+				plan->no_place = err;
+				continue;
+			}
 			if (err)
 				return err;
 			ent = match_ent(plan, &new, !pass);
@@ -1822,6 +1832,7 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 
 	if (!err && plan->sections_differ)
 		err = BPF_CONFLICT_SECTIONS_DIFFER;
+	err = err ?: plan->no_place;
 	for (i = 0; !err && i < plan->nr_ents; i++)
 		err = settle_ent(env, plan, &plan->ents[i]);
 	for (class = 0; !err && class < BPF_PAD_NR_SECTIONS; class++) {
@@ -1870,17 +1881,39 @@ void bpf_pads_must_unwind(struct bpf_verifier_env *env)
 }
 
 /*
- * The groups of which @plan has something that its pad cannot tell whether it is held. Slots are
- * stores on the normal path: none where there is another way out, and none for a site that the
- * program does not have.
+ * Does an insn of @sub acquire an iterator or a dynptr? If none does, a reference of its frame that
+ * no place has is a pointer in every run, and the slot of the call that returned it has it. What
+ * comes to the frame in another way is noted in 'no_slots'.
  */
-static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+static bool acquires_stack_obj(struct bpf_verifier_env *env, const struct bpf_subprog_info *sub)
+{
+	const struct bpf_pad_note *note;
+	int i;
+
+	for (i = sub->start; i < sub[1].start; i++) {
+		note = env->insn_aux_data[i].pad_note;
+		if (note && note->acquires && note->ent.class > BPF_PAD_REF)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The groups of which @plan has something that its pad cannot tell whether it is held, or where.
+ * Slots are stores on the normal path: none where there is another way out, and none for a site
+ * that the program does not have.
+ * @all_ptrs: no insn of the function acquires an iterator or a dynptr.
+ */
+static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			   bool all_ptrs)
 {
 	u8 groups = plan->sections_differ;
 	int i, err;
 
 	if (!plan->used || plan->conflict || !bpf_pad_must_unwind(env, plan))
 		return 0;
+	if (plan->no_place && all_ptrs)
+		groups |= BIT(BPF_PAD_GROUP_REFS);
 	for (i = 0; i < plan->nr_ents; i++) {
 		err = settle_ent(env, plan, &plan->ents[i]);
 		if (err == BPF_CONFLICT_NOT_ALWAYS_HELD || err == BPF_CONFLICT_CALLER_SAVED)
@@ -1916,9 +1949,10 @@ static bool plan_has_room(const struct bpf_pad_plan *plan, int group, int slots)
  * calls @notes and in no other way. A slot is an entry that is tested. For the order of a pad, see
  * enum pad_turn, the slots of sections go before all entries, those of references after
  * them, those of locks and irq flags after all entries.
+ * @all_ptrs: the slots have all that the frame holds of references.
  */
 static int plan_take_slots(struct bpf_pad_plan *plan, int group, struct bpf_pad_note **notes,
-			   int nr)
+			   int nr, bool all_ptrs)
 {
 	struct bpf_pad_ent new, *ent;
 	int i, k, pos = 0;
@@ -1931,6 +1965,8 @@ static int plan_take_slots(struct bpf_pad_plan *plan, int group, struct bpf_pad_
 		plan->sections[group] = 0;
 		plan->sections_differ &= ~BIT(group);
 	}
+	if (all_ptrs)
+		plan->no_place = 0;
 	if (group == BPF_PAD_GROUP_LOCKS)
 		pos = plan->nr_ents;
 	while (group == BPF_PAD_GROUP_REFS && pos < plan->nr_ents &&
@@ -1965,6 +2001,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_pad_note *note, *notes[BPF_PAD_MAX_ENTS];
+	bool all_ptrs = group == BPF_PAD_GROUP_REFS && !acquires_stack_obj(env, sub);
 	int i, err, nr = 0, slots = 0, words = 0;
 	struct bpf_pad_plan *plan;
 
@@ -1999,7 +2036,8 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 			/* it has another way out */
 			if (plan_has_slots(plan) && !plan_has_room(plan, group, slots))
 				plan->conflict = BPF_CONFLICT_SLOTS_FULL;
-			err = plan_has_slots(plan) ? plan_take_slots(plan, group, notes, nr) : 0;
+			err = plan_has_slots(plan) ?
+			      plan_take_slots(plan, group, notes, nr, all_ptrs) : 0;
 			if (err)
 				return err;
 		}
@@ -2019,6 +2057,7 @@ static int settle_slots(struct bpf_verifier_env *env)
 	struct bpf_subprog_info *sub;
 	struct bpf_pad_plan *plan;
 	int i, s, err;
+	bool all_ptrs;
 	u8 need;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
@@ -2028,13 +2067,14 @@ static int settle_slots(struct bpf_verifier_env *env)
 	}
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
+		all_ptrs = !acquires_stack_obj(env, sub);
 		do {
 			if (bpf_must_abort())
 				return -EINTR;
 			need = 0;
 			for (i = sub->start; i < sub[1].start; i++)
 				for (plan = aux[i].pad_plans; plan; plan = plan->next)
-					need |= plan_needs_slots(env, plan);
+					need |= plan_needs_slots(env, plan, all_ptrs);
 			need &= ~sub->no_slots;
 			err = need ? subprog_take_slots(env, s, __ffs(need)) : 0;
 			if (err < 0)
