@@ -1717,6 +1717,474 @@ __naked void flag_of_second_frame(void)
 	);
 }
 
+/* r1: a task, which the frame releases. r2: whether to dive first. */
+__naked __noinline __used
+static unsigned long puts_task(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"if r2 == 0 goto 1f;"
+		"call dives;"
+	"1:"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame gives the task that one path holds to a callee, which takes it over, see
+ * only_copy_in_arg(). The call that moves the task takes it away from the frame like a call
+ * that releases it: the flag is cleared in front of it. The runner cancels the prog in front
+ * of that call, with the task and without it, and behind it, in the callee: the pad of
+ * puts_task() releases the task then, and the pad of its call here has nothing to release.
+ */
+SEC("tc")
+__description("cancel refs: a task that one path holds and gives to a callee is released once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("r2 = 1")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void held_on_one_path_given_away(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 4f;"
+		"r6 = r0;"
+		"r7 = 1;"
+		"goto 2f;"
+	"1:"
+		"call %[bpf_get_current_task_btf];"
+		"r6 = r0;"
+	"2:"
+		"r1 = %[late] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 3f;"
+		"call dives;"
+		COUNT(behind)
+	"3:"
+		"if r7 == 0 goto 4f;"
+		"r1 = r6;"
+		"r2 = 1;"
+		"call puts_task;"
+		COUNT(behind)
+	"4:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(late),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * One path gives the task to puts_task(), which releases it and returns, and puts the task that
+ * runs the prog where the handle was. The other path keeps the task. Both get to the call of
+ * dives(): the pad releases r6 on the path that kept the task, and finds the flag clear on the
+ * one that gave it away, since the store in front of the call of puts_task() ran.
+ */
+__naked __noinline __used
+static unsigned long gives_or_keeps(void)
+{
+	asm volatile (
+		"call %[bpf_get_current_task_btf];"
+		"r8 = r0;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 2f;"
+		"r6 = r0;"
+		"r7 = 1;"
+		"r1 = %[give] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"r1 = r6;"
+		"r6 = r8;"
+		"r7 = 0;"
+		"r2 = 0;"
+		"call puts_task;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"if r7 == 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(pid),
+		  __imm_addr(give),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The flag is one of a subprog here, and the call that moves the task goes back: the main
+ * program calls puts_task() first, which puts its code in front of that of gives_or_keeps().
+ */
+SEC("tc")
+__description("cancel refs: a task that one path gave to a callee is not released behind that call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("r8 = r0")
+__xlated("...")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r2 = 0")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call pc-{{[0-9]+}}")
+__xlated("call pc-{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void given_away_on_one_path(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"r2 = 0;"
+		"call puts_task;"
+		"call gives_or_keeps;"
+		COUNT(behind)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* r1: a task, which the frame releases, or NULL */
+__naked __noinline __used
+static unsigned long puts_task_or_null(void)
+{
+	asm volatile (
+		"if r1 == 0 goto 1f;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/*
+ * Both paths get to the call that moves the task here. One of them has NULL where the other
+ * one has the handle, and holds nothing: it moves nothing and keeps nothing, and the store in
+ * front of the call clears a flag that is clear.
+ */
+SEC("tc")
+__description("cancel refs: a task or NULL that a callee is given has a flag")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("r6 = r0")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void null_or_task_given_away(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		TASK_FROM_PID
+		"r6 = r0;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"r1 = r6;"
+		"call puts_task_or_null;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* r1: a task. r2: whether the frame is to release it. */
+__naked __noinline __used
+static unsigned long puts_task_if(void)
+{
+	asm volatile (
+		"if r2 == 0 goto 1f;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/*
+ * Where no flag can tell, the prog is not loaded. A flag that is cleared in front of a call has
+ * to be clear behind that call on every path. Here one path to the call of puts_task_if() gives
+ * the task away, and the other one keeps it in r6 and passes the task that runs the prog.
+ */
+SEC("?tc")
+__description("cancel refs: a task that one path gives to a callee and another keeps over the call is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(inexact)")
+__naked void given_away_or_kept(void)
+{
+	asm volatile (
+		"call %[bpf_get_current_task_btf];"
+		"r8 = r0;"
+		"r6 = r8;"
+		"r7 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 4f;"
+		"r6 = r0;"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		"if r7 == 0 goto 4f;"
+		"r1 = %[give] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"r1 = r6;"
+		"r6 = r8;"
+		"r7 = 0;"
+		"r2 = 1;"
+		"goto 3f;"
+	"2:"
+		"r1 = r8;"
+		"r2 = 0;"
+	"3:"
+		"call puts_task_if;"
+		"if r7 == 0 goto 4f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"4:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(give)
+		: __clobber_all
+	);
+}
+
+/* r1, r2: two tasks, which the frame releases */
+__naked __noinline __used
+static unsigned long puts_two_tasks(void)
+{
+	asm volatile (
+		"r6 = r2;"
+		"call %[bpf_task_release];"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/*
+ * One store in front of a call clears one flag, so what one call moves is one class. The frame
+ * here holds two tasks of that class at a time, and one flag cannot say which.
+ */
+SEC("?tc")
+__description("cancel refs: two tasks that one path holds and gives to a callee in one call are rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(multi)")
+__naked void two_given_away_in_one_call(void)
+{
+	asm volatile (
+		"r8 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 2f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"r6 = r0;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r7 = r0;"
+		"r8 = 1;"
+		"goto 2f;"
+	"1:"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"goto 3f;"
+	"2:"
+		"call dives;"
+		"if r8 == 0 goto 3f;"
+		"r1 = r6;"
+		"r2 = r7;"
+		"call puts_two_tasks;"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/* r1: a task, which the frame releases: in front of its call of dives() or behind it */
+__naked __noinline __used
+static unsigned long puts_task_early_or_late(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		"if r7 != 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/*
+ * No insn of the callee brought the task that a call moved into its frame, so nothing sets a
+ * flag for it there. The callee here holds the task on one of two paths to its call of dives().
+ */
+SEC("?tc")
+__description("cancel refs: a task that a callee was given and holds on one path is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(inexact)")
+__naked void given_task_held_on_one_path(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"call puts_task_early_or_late;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
 /* The runner looks at what the progs above held through the next three */
 
 int task_rcu_users;
