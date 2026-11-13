@@ -196,6 +196,34 @@ static void test_only_copy_in_stack_arg(struct cancel_refs *skel, int users)
 	ASSERT_EQ(task_users(skel), users, "only_copy_in_stack_arg");
 }
 
+/*
+ * @name keeps a copy of a task that a callee may release, and passes the task in a stack
+ * argument. It is cancelled in front of the release and behind it, and returns both ways.
+ * The prog is there when the compiler has stack arguments.
+ */
+static void test_stack_arg_released(struct cancel_refs *skel, const char *name, int users)
+{
+	struct bpf_program *prog;
+
+	prog = bpf_object__find_program_by_name(skel->obj, name);
+	if (!prog)
+		return;
+	skel->bss->give = 1;
+	skel->bss->late = 0;
+	cancelled(skel, prog);
+	ASSERT_EQ(task_users(skel), users, what(prog, "in front of the release"));
+	skel->bss->late = 1;
+	cancelled(skel, prog);
+	ASSERT_EQ(task_users(skel), users, what(prog, "behind the release"));
+	skel->bss->late = 2;
+	ASSERT_EQ(run(prog), TC_ACT_OK, what(prog, "returns"));
+	ASSERT_EQ(task_users(skel), users, what(prog, "released by the callee"));
+	skel->bss->give = 0;
+	ASSERT_EQ(run(prog), TC_ACT_OK, what(prog, "returns"));
+	ASSERT_EQ(task_users(skel), users, what(prog, "released by the caller"));
+	skel->bss->late = 0;
+}
+
 static void test_tasks(struct cancel_refs *skel)
 {
 	struct child child;
@@ -334,10 +362,63 @@ static void test_tasks(struct cancel_refs *skel)
 	ASSERT_EQ(task_users(skel), users, "null_or_task_given_away with NULL");
 	skel->bss->zero = 0;
 
+	/*
+	 * The callee may release the task that its caller keeps a copy of. The prog is cancelled
+	 * in the callee in front of the release: the pad of the call releases the task.
+	 */
+	skel->bss->give = 1;
+	cancelled(skel, skel->progs.callee_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_may_release in front of the release");
+	/* and behind the release: the pad of the callee tells, and the task is left alone */
+	skel->bss->late = 1;
+	cancelled(skel, skel->progs.callee_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_may_release behind the release");
+	/* nothing tells where the callee returns: the prog releases the task there, or doesn't */
+	skel->bss->late = 2;
+	ASSERT_EQ(run(skel->progs.callee_may_release), TC_ACT_OK, "callee_may_release returns");
+	ASSERT_EQ(task_users(skel), users, "callee_may_release released by the callee");
+	skel->bss->give = 0;
+	ASSERT_EQ(run(skel->progs.callee_may_release), TC_ACT_OK, "callee_may_release returns");
+	ASSERT_EQ(task_users(skel), users, "callee_may_release released by the caller");
+
+	/*
+	 * The task goes through two calls. The prog is cancelled in the frame that released it,
+	 * and the two pads below pass on what that one tells,
+	 */
+	skel->bss->give = 1;
+	skel->bss->late = 0;
+	cancelled(skel, skel->progs.callee_of_callee_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_of_callee_may_release in the last frame");
+	/* and in the frame between, when the one that released has returned */
+	skel->bss->late = 1;
+	cancelled(skel, skel->progs.callee_of_callee_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_of_callee_may_release in the frame between");
+	skel->bss->give = 0;
+	ASSERT_EQ(run(skel->progs.callee_of_callee_may_release), TC_ACT_OK,
+		  "callee_of_callee_may_release returns");
+	ASSERT_EQ(task_users(skel), users, "callee_of_callee_may_release released by the caller");
+	skel->bss->late = 0;
+	/* the callee gets the task in a stack argument, and tells by that */
+	test_stack_arg_released(skel, "callee_may_release_stack_arg", users);
+	/* and the frame between passes it on in a register */
+	test_stack_arg_released(skel, "stack_arg_goes_on", users);
+	/* the callee that releases the task never returns, and is verified without its caller */
+	cancelled(skel, skel->progs.callee_releases_and_throws);
+	ASSERT_EQ(task_users(skel), users, "callee_releases_and_throws");
+	/* the callee tests the task for NULL as well: it finds one and leaves it to its caller, */
+	cancelled(skel, skel->progs.callee_tests_and_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_tests_and_may_release with the task");
+	/* or releases it */
+	skel->bss->give = 1;
+	cancelled(skel, skel->progs.callee_tests_and_may_release);
+	ASSERT_EQ(task_users(skel), users, "callee_tests_and_may_release released");
+	skel->bss->give = 0;
+
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;
 	cancelled(skel, skel->progs.callee_tests_task);
 	cancelled(skel, skel->progs.callee_tests_task_spilled);
+	cancelled(skel, skel->progs.callee_tests_and_may_release);
 	/* the slot has what the callee wrote, and the pad leaves it alone */
 	cancelled(skel, skel->progs.callee_tests_and_writes);
 	cancelled(skel, skel->progs.task_maybe_null_in_reg);
