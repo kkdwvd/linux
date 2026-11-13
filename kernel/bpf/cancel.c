@@ -4,13 +4,13 @@
  * Cancellation of a program on pads that the verifier generates.
  *
  * When a cancellation point fires the invocation ends there. A point is may_goto
- * of the verifier whose time is up, or the stack check of a recursive subprog
- * that finds no room. Each frame of the call chain runs a pad, from the frame at
- * the point to the frame that the kernel entered. A pad releases what its frame
- * holds and leaves the frame with cancel_exit, which returns to the pad of the
- * call in the caller: 'cancel_goto pad' behind the call names it. The pad of the
- * main program returns to the kernel. A cancellation runs pads only, never the
- * code of the program again.
+ * whose time is up, of the program or of the verifier, or the stack check of a
+ * recursive subprog that finds no room. Each frame of the call chain runs a pad,
+ * from the frame at the point to the frame that the kernel entered. A pad
+ * releases what its frame holds and leaves the frame with cancel_exit, which
+ * returns to the pad of the call in the caller: 'cancel_goto pad' behind the call
+ * names it. The pad of the main program returns to the kernel. A cancellation
+ * runs pads only, never the code of the program again.
  *
  * A site is an insn at which a frame can be cancelled: a point, or the call of
  * a subprog, which a cancellation comes back through. The main pass records
@@ -55,9 +55,10 @@
  * cancelled, and with them the sites that get a pad. The pads go behind the last
  * insn of their subprog, see bpf_insert_loop_guards().
  *
- * The main pass verifies what it always did: may_goto leaves the loop or the
- * subprog, the stack check leaves the subprog. That is what the program does
- * at a site that declines. A site with a pad doesn't get there any more.
+ * The main pass verifies what it always did: may_goto of the verifier leaves the
+ * loop or the subprog, may_goto of the program goes where the program sends it,
+ * the stack check leaves the subprog. That is what the program does at a site
+ * that declines. A site with a pad doesn't get there any more.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -351,7 +352,7 @@ struct cancel_site {
 	bool padded;
 	/* no cancellation gets here: it has no pad and does not decline */
 	bool unused;
-	u32 pad;	/* of a guard or a call that is padded */
+	u32 pad;	/* of a guard, may_goto of the program or a call that is padded */
 };
 
 /* The sites of a subprog that hold the same have one pad */
@@ -2633,6 +2634,8 @@ static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_si
 	/* every place for may_goto is recorded, and its loop may have got none */
 	if (site->type == BPF_CANCEL_SITE_GUARD)
 		return env->insn_aux_data[site->insn_idx].loop_guard;
+	if (site->type == BPF_CANCEL_SITE_MAY_GOTO)
+		return true;
 	/*
 	 * The main pass records the stack check of every subprog that may be on a cycle.
 	 * check_recursion() has found the ones that are, and only they get the check.
@@ -2766,6 +2769,8 @@ static const char *cancel_site_str(const struct cancel_site *site)
 	switch (site->type) {
 	case BPF_CANCEL_SITE_GUARD:
 		return "loop";
+	case BPF_CANCEL_SITE_MAY_GOTO:
+		return "may_goto";
 	case BPF_CANCEL_SITE_ENTRY:
 		return "recursive call";
 	default:
@@ -3987,6 +3992,46 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
 		err = bpf_patch_list_append(env, at, &cg, 1);
 		if (err)
 			return err;
+		env->prog->jit_required = 1;
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
+ * may_goto of the program that has a pad goes there, in place of where the program sends it:
+ * when the time slice is over the invocation ends, and the program doesn't leave the loop to
+ * go on. The main pass verified the branch of the program. Nothing takes it any more. The
+ * pads are in the program, and bpf_do_misc_fixups() has yet to expand the insn.
+ *
+ * Only may_goto that shares the time slice of the invocation has a pad, see
+ * cancel_sub_reason(). The other form counts in its frame: a count that runs out is how
+ * the program bounds its loop, and no reason to end the invocation.
+ */
+int bpf_cancel_retarget_may_gotos(struct bpf_verifier_env *env)
+{
+	struct bpf_patch_list *pl = &env->patch_list;
+	struct cancel_site *site;
+	struct bpf_insn *insn;
+	int i;
+
+	if (!cancel_has_pads(env))
+		return 0;
+
+	for (i = 0; i < env->prog->len; i++) {
+		site = cancel_find_site(env, i, BPF_CANCEL_SITE_MAY_GOTO);
+		if (!site || !site->padded)
+			continue;
+		if (bpf_must_abort())
+			return -EINTR;
+		/*
+		 * One insn for one, but queued: the list finds the offset, and makes
+		 * 'may_goto +1; goto +1; gotol pad' of it when the pad is far.
+		 */
+		insn = __bpf_patch_list_add(pl, env->prog, i, &env->prog->insnsi[i], 1);
+		if (IS_ERR(insn))
+			return PTR_ERR(insn);
+		bpf_patch_list_jump(pl, insn, cancel_pad_idx(env, site), 0);
+		/* the timed form is for JITs, see bpf_do_misc_fixups() */
 		env->prog->jit_required = 1;
 	}
 	return bpf_patch_list_commit(env);
