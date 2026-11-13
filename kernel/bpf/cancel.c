@@ -2001,6 +2001,57 @@ bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifie
 	return !cancel_ref_of_stack_obj(st, ref->id);
 }
 
+/*
+ * The current frame of @st calls static subprog @subprog and keeps what did not move, see
+ * bpf_cancel_ref_moves(). The callee may release that all the same:
+ *
+ *	p = bpf_task_acquire(t);
+ *	if (try_consume(p))	// releases p on some paths
+ *		return 0;
+ *	bpf_task_release(p);
+ *
+ * A frame that releases for its owner is to tell which resource that was.
+ *
+ * Each entry of refs[] notes the argument here: the first one that has its handle, see
+ * cancel_arg_of(). The argument is the name of the resource for the callee, whoever calls it,
+ * and for the record of this call. It is made of what is compared in front of the call, the
+ * ids of live registers and of stack arguments, and compared itself from here on, see
+ * refsafe(): it is the same in every state that this one stands for.
+ *
+ * An argument names one resource. A lock in an object that the program owns has the id of the
+ * reference to the object: neither has a name then. What has no id is in no argument: a lock
+ * at a known address. Neither are IRQ flags, an iterator or a dynptr, which are found by
+ * their address in a stack.
+ *
+ * The note lasts as long as the frame of the callee, see prepare_func_exit(). A function that
+ * is verified on its own has it for its frame 0, see call_func_on_its_own(). Nothing is noted
+ * in a program that cannot have pads: its states are compared as they were.
+ */
+void bpf_cancel_note_args(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int subprog)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int above = st->curframe + 1;
+	struct bpf_reference_state *ref;
+	u32 seen = 0, twice = 0;
+	u32 i;
+
+	if (!cancel_prog_may_have_pads(env))
+		return;
+	for (i = 0; i < st->acquired_refs; i++) {
+		ref = &st->refs[i];
+		ref->args[above] = 0;
+		/* what moved is the callee's own */
+		if (!ref->id || ref->frameno == above)
+			continue;
+		ref->args[above] = cancel_arg_of(env, frame, subprog, ref->id);
+		twice |= seen & BIT(ref->args[above]);
+		seen |= BIT(ref->args[above]);
+	}
+	for (i = 0; i < st->acquired_refs; i++)
+		if (twice & BIT(st->refs[i].args[above]))
+			st->refs[i].args[above] = 0;
+}
+
 /* The origin that the insn at @insn_idx is, a new one if it is none yet. Below 0 on error. */
 static int cancel_get_origin(struct bpf_verifier_env *env, int insn_idx)
 {
