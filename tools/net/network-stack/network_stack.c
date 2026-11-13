@@ -110,6 +110,7 @@ struct cpuset {
 static struct {
 	const char *dev;
 	const char *cpus;
+	const char *irqs;
 	const char *thread_cgroup;
 	const char *tx;
 	__u64 hold_us, spin_us, nap_us, rest_us;
@@ -393,6 +394,26 @@ static void family_cb(struct nlattr *nla, int len)
 			nl_family = *(__u16 *)((char *)nla + NLA_HDRLEN);
 }
 
+/* Whether @irq is in --irqs, a comma-separated list of interrupt numbers. */
+static bool irq_listed(int irq)
+{
+	const char *p = opt.irqs;
+
+	while (*p) {
+		char *end;
+		long v = strtol(p, &end, 10);
+
+		if (end == p)
+			die("bad interrupt list %s", opt.irqs);
+		if (v == irq)
+			return true;
+		p = *end == ',' ? end + 1 : end;
+		if (*end && *end != ',')
+			die("bad interrupt list %s", opt.irqs);
+	}
+	return false;
+}
+
 static void napi_cb(struct nlattr *nla, int len)
 {
 	struct napi *n = &napis[nr_napis];
@@ -417,6 +438,8 @@ static void napi_cb(struct nlattr *nla, int len)
 		die("NAPI %u is in threaded mode; switch the device's threaded mode off first", n->id);
 	/* A NAPI without an interrupt of its own cannot be steered to a pool CPU. */
 	if (!n->id || n->irq < 0)
+		return;
+	if (opt.irqs && !irq_listed(n->irq))
 		return;
 	nr_napis++;
 }
@@ -458,7 +481,8 @@ static void read_napis(void)
 		die("NAPI dump of %s: %s", opt.dev, strerror(-ret));
 	close(fd);
 	if (!nr_napis)
-		die("%s has no NAPI with an interrupt", opt.dev);
+		die("%s has no NAPI with an interrupt%s%s", opt.dev,
+		    opt.irqs ? " in " : "", opt.irqs ? opt.irqs : "");
 }
 
 /* Where each NAPI's interrupt arrives now, which names the NAPI's LLC. */
@@ -1423,6 +1447,7 @@ static void usage(void)
 "\n"
 "Placement:\n"
 "  --cpus LIST            pool CPUs (default: the cores IFNAME's IRQs are on, with SMT siblings)\n"
+"  --irqs LIST            only the NAPIs with these interrupts; the rest stay with softirq\n"
 "  --cpuset PATH          cgroup to keep off the active pool CPUs; may be repeated\n"
 "  --thread-cgroup PATH   cgroup to run the threads in\n"
 "  --napis-per-thread N   NAPIs per thread at start (default: 2 with --static, else\n"
@@ -1468,12 +1493,13 @@ enum {
 	OPT_MIN_THREADS, OPT_STATIC, OPT_TICK_MS, OPT_HI, OPT_TARGET, OPT_LO, OPT_GAP_US,
 	OPT_SHRINK_TICKS, OPT_IRQ, OPT_HOLD_US, OPT_SPIN_US, OPT_NAP_US, OPT_INTERVAL_MS,
 	OPT_DURATION, OPT_VERBOSE, OPT_TX, OPT_TX_WAIT_US, OPT_TX_SHARE, OPT_SOFTIRQ_PPS,
-	OPT_REFRESH_US,
+	OPT_REFRESH_US, OPT_IRQS,
 };
 
 static const struct option longopts[] = {
 	{ "dev", required_argument, NULL, OPT_DEV },
 	{ "cpus", required_argument, NULL, OPT_CPUS },
+	{ "irqs", required_argument, NULL, OPT_IRQS },
 	{ "cpuset", required_argument, NULL, OPT_CPUSET },
 	{ "thread-cgroup", required_argument, NULL, OPT_THREAD_CGROUP },
 	{ "napis-per-thread", required_argument, NULL, OPT_NAPIS_PER_THREAD },
@@ -1538,6 +1564,7 @@ int main(int argc, char **argv)
 		case OPT_SPIN_US: opt.spin_us = strtoull(optarg, NULL, 0); break;
 		case OPT_NAP_US: opt.nap_us = strtoull(optarg, NULL, 0); break;
 		case OPT_REFRESH_US: opt.refresh_us = strtoull(optarg, NULL, 0); break;
+		case OPT_IRQS: opt.irqs = optarg; break;
 		case OPT_SOFTIRQ_PPS: opt.softirq_pps = strtoull(optarg, NULL, 0); break;
 		case OPT_INTERVAL_MS: opt.interval_ms = strtoull(optarg, NULL, 0); break;
 		case OPT_DURATION: opt.duration_s = strtoull(optarg, NULL, 0); break;
