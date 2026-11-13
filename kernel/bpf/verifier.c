@@ -21623,8 +21623,6 @@ static bool frame_holds_resources(const struct bpf_verifier_state *st)
  * the callers hold, or the program is rejected. Where a caller has none the verifier emits it.
  *
  * False when it cannot:
- * - This frame acquired something itself, and there is no landing pad for that: the verifier
- *   emits none for references.
  * - The subprog cannot leave with unwind_exit, see bail_unwinds.
  * - A helper that calls a callback doesn't expect it to unwind.
  * Then the program goes on along a path that it has, like after may_goto of
@@ -21638,7 +21636,6 @@ static bool frame_can_unwind(struct bpf_verifier_env *env, const struct bpf_veri
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
-	int i;
 
 	/* see unwind_frame() */
 	if (sub->exit_idx == U32_MAX)
@@ -21646,9 +21643,6 @@ static bool frame_can_unwind(struct bpf_verifier_env *env, const struct bpf_veri
 	/* a landing pad has no barrier: only a loader with CAP_PERFMON gets one */
 	if (!bpf_may_unwind(env))
 		return false;
-	for (i = frame->entry_refs; i < st->acquired_refs; i++)
-		if (st->refs[i].type == REF_TYPE_PTR)
-			return false;
 	if (frame->in_callback_fn)
 		return false;
 	return frame_is_top(st) || sub->bail_unwinds || or_exit;

@@ -809,13 +809,13 @@ __naked void loop_with_two_entries(void)
 
 /*
  * bpf_iter_num_next() stops the loop that the program leaves when there is nothing left.
- * This one goes on. The iterator is held, so the loop is left when it is out of budget.
+ * This one goes on. When it is out of budget the landing pad destroys the iterator.
  */
 SEC("socket")
 __description("budget: a loop that goes on when its iterator is drained")
 __arch_x86_64
 __arch_arm64
-__success __retval(1)
+__success __retval(0)
 __naked void loop_after_iter_is_drained(void)
 {
 	asm volatile (

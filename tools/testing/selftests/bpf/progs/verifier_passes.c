@@ -1083,7 +1083,11 @@ int calls_hold_other_things(struct __sk_buff *skb)
 	return val;
 }
 
-/* a recursive function is verified on its own, also with an argument that can be NULL */
+/*
+ * a recursive function is verified on its own, also with an argument that can be NULL. When its
+ * check of the stack fails it is unwound, and the landing pad of the caller drops the object: it
+ * returns only with a pointer that it has tested.
+ */
 static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 {
 	if (!p)
@@ -1097,7 +1101,9 @@ static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 SEC("tc")
 __description("calls: the function tests a reference of the caller for NULL")
 __arch_x86_64
-__failure __msg("conflict: the frame cannot unwind") __not_msg("verifier bug")
+__load_if_JITed()
+__success __log_level(2) __not_msg("verifier bug")
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0")
 int callee_tests_null(struct __sk_buff *skb)
 {
 	struct pair *n = bpf_obj_new(typeof(*n)), *copy;

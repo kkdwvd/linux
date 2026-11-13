@@ -3686,22 +3686,6 @@ LINKED(natural_loop_is_secondary_entry, MAP_OOB,
 	"if r7 < 10 goto o_%=;")
 
 /*
- * No exit of the inner loop dominates its backedges: may_goto is added before its header. The prog
- * holds a reference, so may_goto goes to the exit of the outer loop: an edge that the verifier
- * adds. Every iteration of the outer loop restores r3. At the header of the inner one it is r7.
- */
-LINKED(added_edge, OUTSIDE,
-	"r1 = %[ringbuf] ll; r2 = 8; r3 = 0; call %[bpf_ringbuf_reserve]; if r0 == 0 goto out_%=;"
-	"*(u64 *)(r10 - 16) = r0; r3 = r8;"
-	"o_%=: r2 = r3; r3 = r7;"
-	"i_%=: r1 = *(u8 *)(r6 + 0); if r1 == 1 goto a_%=; if r1 == 2 goto b_%=; goto i_%=;"
-	"a_%=: goto i_%=;"
-	"b_%=: r3 = r2; r1 = *(u8 *)(r6 + 1); if r1 == 3 goto o_%=;"
-	"r4 = r6; if r8 > 63 goto r_%=; r4 += r3;"
-	"r_%=: *(u64 *)(r10 - 24) = r4; r1 = *(u64 *)(r10 - 16); r2 = 0;"
-	"call %[bpf_ringbuf_discard]; r1 = *(u64 *)(r10 - 24);")
-
-/*
  * r7 = ctx->data;
  * r8 = r7
  * for (r6 = 0; r6 < 10 && random() != 42; r7++, r6++);
