@@ -360,6 +360,111 @@ __naked void res_lock_in_map_at_call(void)
 	);
 }
 
+/*
+ * One of two locks in global variables, which the program chose at run time: each visit of
+ * the call has a lock at another address, and both have the pointer to it in r7. The pad
+ * unlocks through r7.
+ */
+SEC("tc")
+__description("cancel: one of two bpf_res_spin_locks in global variables, a register points to it at a call")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__stderr("ERROR: Program was cancelled")
+__xlated("exit")
+__xlated("r1 = r7")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void res_lock_one_of_two_at_call(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = %[res_a] ll;"
+		"if r6 == 0 goto 3f;"
+		"r7 = %[res_b] ll;"
+	"3:"
+		"r1 = r7;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 2f;"
+		"call dives;"
+		"r1 = r7;"
+		"call %[bpf_res_spin_unlock];"
+		asm_count(behind)
+		"goto 1f;"
+	"2:"
+		asm_count(lock_err)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_lock),
+		  __imm(bpf_res_spin_unlock),
+		  __imm_addr(zero),
+		  __imm_addr(res_a),
+		  __imm_addr(res_b),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
+/*
+ * The same, but the pointer is gone at the call, and the program tells by r6 which lock to
+ * unlock. One insn took either lock, so one drop flag would stand for two addresses.
+ */
+SEC("tc")
+__description("cancel: one of two bpf_res_spin_locks in global variables without a pointer at a call is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(places)")
+__naked void res_lock_one_of_two_no_pointer(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r1 = %[res_a] ll;"
+		"if r6 == 0 goto 3f;"
+		"r1 = %[res_b] ll;"
+	"3:"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 2f;"
+		"call dives;"
+		"r1 = %[res_a] ll;"
+		"if r6 == 0 goto 4f;"
+		"r1 = %[res_b] ll;"
+	"4:"
+		"call %[bpf_res_spin_unlock];"
+		asm_count(behind)
+		"goto 1f;"
+	"2:"
+		asm_count(lock_err)
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_lock),
+		  __imm(bpf_res_spin_unlock),
+		  __imm_addr(zero),
+		  __imm_addr(res_a),
+		  __imm_addr(res_b),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
 /* One call of the pad unlocks and restores the flags that the lock was taken with */
 SEC("tc")
 __description("cancel: bpf_res_spin_lock_irqsave, held at a call")
