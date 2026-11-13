@@ -91,6 +91,36 @@ int basic_alloc1(void *ctx)
 	return 0;
 }
 
+/*
+ * An access to a page that the arena does not have ends the prog: it is unwound, and returns
+ * -ECANCELED like a prog of its type that ran out of time. If the access were skipped the prog
+ * would go on and return 7, which is what it does where the JIT cannot unwind: the progs that
+ * fault are for the JITs that can.
+ */
+SEC("syscall")
+__arch_x86_64 __arch_arm64
+__success __retval(-ECANCELED)
+__skip_without_arena
+int basic_alloc1_uaf(void *ctx)
+{
+	volatile int __arena *page1, *page2;
+
+	page1 = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
+	if (!page1)
+		return 1;
+	*page1 = 1;
+	page2 = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
+	if (!page2)
+		return 2;
+	*page2 = 2;
+	bpf_arena_free_pages(&arena, (void __arena *)page2, 1);
+	if (*page1 != 1)
+		return 6;
+	if (*page2 != 0) /* use-after-free ends the prog */
+		return 8;
+	return 7;
+}
+
 SEC("syscall")
 __success __retval(0)
 int free_scalar_below_arena(void *ctx)
@@ -168,6 +198,49 @@ int basic_alloc2(void *ctx)
 	bpf_arena_free_pages(&arena, (void __arena *)page1, 2);
 	return 0;
 }
+
+/*
+ * The two pages of the arena, page1 and page2, the page behind them, page3, and the one in front,
+ * page4. @access is to a page that is not there, or not any more after @free: it ends the prog,
+ * which returns @unwound, the value of an unwound prog of its type. If the access were skipped the
+ * prog would return 7.
+ */
+#define ALLOC2_FAULT(name, sec, unwound, free, access)				\
+SEC(sec)									\
+__arch_x86_64 __arch_arm64							\
+__success __retval(unwound)							\
+__skip_without_arena								\
+int name(void *ctx)								\
+{										\
+	volatile char __arena *page1, *page2, *page3, *page4;			\
+										\
+	page1 = bpf_arena_alloc_pages(&arena, NULL, 2, NUMA_NO_NODE, 0);	\
+	if (!page1)								\
+		return 1;							\
+	page2 = page1 + __PAGE_SIZE;						\
+	page3 = page1 + __PAGE_SIZE * 2;					\
+	page4 = page1 - __PAGE_SIZE;						\
+	*page1 = 1;								\
+	*page2 = 2;								\
+	if (free)								\
+		bpf_arena_free_pages(&arena, (void __arena *)page1, 2);		\
+	access;									\
+	barrier_var(page3);							\
+	barrier_var(page4);							\
+	return 7;								\
+}
+
+ALLOC2_FAULT(basic_alloc2_store_behind, "syscall", -ECANCELED, 0, *page3 = 3)
+ALLOC2_FAULT(basic_alloc2_store_in_front, "syscall", -ECANCELED, 0, *page4 = 4)
+ALLOC2_FAULT(basic_alloc2_load_behind, "syscall", -ECANCELED, 0, if (*page3) return 3)
+ALLOC2_FAULT(basic_alloc2_load_in_front, "syscall", -ECANCELED, 0, if (*page4) return 4)
+ALLOC2_FAULT(basic_alloc2_uaf_first, "syscall", -ECANCELED, 1, if (*page1) return 5)
+ALLOC2_FAULT(basic_alloc2_uaf_second, "syscall", -ECANCELED, 1, if (*page2) return 6)
+/* without sleeping the pages are freed later: only what was never there is sure to fault */
+ALLOC2_FAULT(basic_alloc2_nosleep_store_behind, "socket", 0, 0, *page3 = 3)
+ALLOC2_FAULT(basic_alloc2_nosleep_store_in_front, "socket", 0, 0, *page4 = 4)
+ALLOC2_FAULT(basic_alloc2_nosleep_load_behind, "socket", 0, 0, if (*page3) return 3)
+ALLOC2_FAULT(basic_alloc2_nosleep_load_in_front, "socket", 0, 0, if (*page4) return 4)
 
 struct bpf_arena___l {
         struct bpf_map map;

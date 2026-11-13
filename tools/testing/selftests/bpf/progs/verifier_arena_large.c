@@ -3,6 +3,7 @@
 
 #define BPF_NO_KFUNC_PROTOTYPES
 #include <vmlinux.h>
+#include <errno.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "bpf_misc.h"
@@ -78,6 +79,93 @@ int big_alloc1(void *ctx)
 		return 13;
 	return 0;
 }
+
+/*
+ * The first page of the arena, page1, and the one in front of the guard region at its end, page2.
+ * @access is to a page that is not there, or not any more after @free: it ends the prog, which
+ * is unwound and returns -ECANCELED. If the access were skipped the prog would return 7, which is
+ * what it does where the JIT cannot unwind: these progs are for the JITs that can.
+ */
+#define BIG_ALLOC1_FAULT(name, free, access)					\
+SEC("syscall")									\
+__arch_x86_64 __arch_arm64							\
+__success __retval(-ECANCELED)							\
+__skip_without_arena								\
+int name(void *ctx)								\
+{										\
+	volatile char __arena *page1, *page2;					\
+										\
+	page1 = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);	\
+	if (!page1)								\
+		return 1;							\
+	*page1 = 1;								\
+	page2 = bpf_arena_alloc_pages(&arena,					\
+				      (void __arena *)(ARENA_SIZE - 2 * PAGE_SIZE), \
+				      1, NUMA_NO_NODE, 0);			\
+	if (!page2)								\
+		return 2;							\
+	*page2 = 2;								\
+	if (free)								\
+		bpf_arena_free_pages(&arena, (void __arena *)page1, 1);		\
+	if (access)								\
+		return 3;							\
+	return 7;								\
+}
+
+BIG_ALLOC1_FAULT(big_alloc1_uaf, 1, *page1)
+BIG_ALLOC1_FAULT(big_alloc1_behind_first, 0, *(page1 + PAGE_SIZE))
+BIG_ALLOC1_FAULT(big_alloc1_in_front_of_last, 0, *(page2 - PAGE_SIZE))
+
+/*
+ * The page in front of the first one. The address has 32 bits in the arena: if the compiler
+ * subtracts from the pointer, the access wraps to the last page, which is there, see big_alloc1().
+ * Only the offset of the insn takes it below the arena, into the guard region: so the insn is
+ * written here. r2 = addr_space_cast(r2, 0x0, 0x1), which the assembler of GCC doesn't know.
+ */
+SEC("syscall")
+__arch_x86_64 __arch_arm64
+__success __retval(-ECANCELED)
+__naked void big_alloc1_in_front_of_first(void)
+{
+	asm volatile (
+		"r1 = %[arena] ll;"
+		"r2 = 0;"
+		".8byte 0x1000122bf;"
+		"r0 = *(u8 *)(r2 - 4096);"
+		"r0 = 7;"
+		"exit;"
+		:: __imm_addr(arena)
+		: __clobber_all);
+}
+
+/*
+ * Try to access a reserved page. Behavior should be identical with accessing unallocated pages:
+ * the access ends the prog, which returns -ECANCELED. If it were skipped the prog would return 7.
+ */
+#define ACCESS_RESERVED(name, nr, access)					\
+SEC("syscall")									\
+__arch_x86_64 __arch_arm64							\
+__success __retval(-ECANCELED)							\
+__skip_without_arena								\
+int name(void *ctx)								\
+{										\
+	volatile char __arena *page;						\
+	char __arena *base;							\
+	const size_t len = 4;							\
+										\
+	/* Get a separate region of the arena. */				\
+	base = arena_base(&arena) + 16384 * PAGE_SIZE;				\
+	if (bpf_arena_reserve_pages(&arena, base, len))				\
+		return 1;							\
+	page = (volatile char __arena *)(base + nr * PAGE_SIZE);		\
+	access;									\
+	return 7;								\
+}
+
+/* Try to dirty reserved memory. */
+ACCESS_RESERVED(access_reserved_store, 0, *page = 0x5a)
+ACCESS_RESERVED(access_reserved_load, 0, if (*page) return 2)
+ACCESS_RESERVED(access_reserved_load_last, 3, if (*page) return 3)
 
 /* Try to allocate a region overlapping with a reservation. */
 SEC("syscall")
