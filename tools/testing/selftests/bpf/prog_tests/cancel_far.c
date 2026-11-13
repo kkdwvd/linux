@@ -137,6 +137,28 @@ static void test_point(struct cancel_far *skel, struct ring_buffer *rb, struct b
 	check_insns(prog, min, 1);
 }
 
+static void test_flag(struct cancel_far *skel, struct ring_buffer *rb, struct bpf_program *prog,
+		      int min)
+{
+	/*
+	 * gets_record() returns with a record. The store behind its call sets the flag, and
+	 * the pad of the call of dives() finds it set and discards the record.
+	 */
+	skel->bss->zero = 0;
+	skel->bss->dive = 0;
+	cancelled(skel, rb, prog, no_room);
+	/* gets_record() dives before it has a record: the pad of its call releases nothing */
+	skel->bss->dive = 1;
+	cancelled(skel, rb, prog, no_room);
+	skel->bss->dive = 0;
+	/* the path that has 0 in the place of the record: the pad finds the flag clear */
+	skel->bss->zero = 1;
+	cancelled(skel, rb, prog, no_room);
+	skel->bss->zero = 0;
+	/* the calls of gets_record() and of dives() */
+	check_insns(prog, min, 2);
+}
+
 void test_cancel_far(void)
 {
 	struct ring_buffer *rb = NULL;
@@ -164,6 +186,10 @@ void test_cancel_far(void)
 	if (test__start_subtest("call")) {
 		test_point(skel, rb, skel->progs.call_2k, no_room, 2048);
 		test_point(skel, rb, skel->progs.call_33k, no_room, 32767);
+	}
+	if (test__start_subtest("flag")) {
+		test_flag(skel, rb, skel->progs.flag_2k, 2048);
+		test_flag(skel, rb, skel->progs.flag_33k, 32767);
 	}
 out:
 	ring_buffer__free(rb);

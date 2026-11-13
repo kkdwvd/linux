@@ -27,6 +27,13 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* The verifier doesn't know what is in there */
+unsigned long zero;
+unsigned long one = 1;
+/* Which way a prog takes that reads them: the runner says, like with zero */
+unsigned long late;
+unsigned long give;
+
 /* The frames of a recursion that began, and how many times the code behind a call ran */
 unsigned long frames;
 unsigned long behind;
@@ -894,6 +901,255 @@ __naked void only_copy_in_stack_arg(void)
 }
 
 #endif
+
+/*
+ * One path gets to the call with the task in r6. The other one has a task there that is not
+ * the frame's to release: the one that runs the prog. Only the run of the prog knows which it
+ * is, so the frame gets a drop flag: a hidden byte of its stack that is 1 while the frame holds
+ * the task. It is set behind bpf_task_from_pid() unless that returned NULL and cleared in front
+ * of bpf_task_release(), and the pad releases r6 if it is set.
+ */
+SEC("tc")
+__description("cancel refs: a task that only one path to the call holds is released on that path")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void held_on_one_path(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"r6 = r0;"
+		"r7 = 1;"
+		"goto 2f;"
+	"1:"
+		"call %[bpf_get_current_task_btf];"
+		"r6 = r0;"
+	"2:"
+		"call dives;"
+		COUNT(behind)
+		"if r7 == 0 goto 3f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* r1: whether to dive first. r0 = the task with the pid or NULL: the frame returns with it. */
+__naked __noinline __used
+static unsigned long gets_task(void)
+{
+	asm volatile (
+		"if r1 == 0 goto 1f;"
+		"call dives;"
+	"1:"
+		TASK_FROM_PID
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * What a callee returns with is the caller's, and the call of the callee brought it there: the
+ * flag is set behind that call if R0 is not NULL. gets_task() may dive, so its call has a pad,
+ * and the store is behind cancel_goto, which a return does not take.
+ */
+SEC("tc")
+__description("cancel refs: a task that a callee returned with on one path is released on that path")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void returned_on_one_path(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		/* 0 once more, for all that the verifier knows gets_task() may dive */
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"call gets_task;"
+		"if r0 == 0 goto 3f;"
+		"r6 = r0;"
+		"r7 = 1;"
+		"goto 2f;"
+	"1:"
+		"call %[bpf_get_current_task_btf];"
+		"r6 = r0;"
+	"2:"
+		"call dives;"
+		COUNT(behind)
+		"if r7 == 0 goto 3f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: whether to take the task with the pid, r2: whether to dive. r0 = the task, which the frame
+ * returns with, or NULL. Its call of dives() is a site that it gets to with the task in r6 or
+ * with a task there that is not its own, so the frame has a drop flag.
+ */
+__naked __noinline __used
+static unsigned long takes_or_dives(void)
+{
+	asm volatile (
+		"r7 = r1;"
+		"r8 = r2;"
+		"call %[bpf_get_current_task_btf];"
+		"r6 = r0;"
+		"if r7 == 0 goto 1f;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"r6 = r0;"
+	"1:"
+		"if r8 == 0 goto 2f;"
+		"call dives;"
+	"2:"
+		"if r7 == 0 goto 3f;"
+		"r0 = r6;"
+		"exit;"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_get_current_task_btf),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * A flag is clear when its frame begins. The first frame of takes_or_dives() takes the task and
+ * returns with it: nothing clears its flag. The second frame is where the first one was. It takes
+ * nothing and dives, and its pad is to find the flag clear.
+ */
+SEC("tc")
+__description("cancel refs: the drop flag of a frame is clear when the frame begins")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("r7 = r1")
+__xlated("...")
+__xlated("call kernel-function")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r0 = r6")
+__xlated("exit")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void flag_of_second_frame(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"r2 = %[zero] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"call takes_or_dives;"
+		"if r0 == 0 goto 2f;"
+		"r9 = r0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"r2 = %[one] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"call takes_or_dives;"
+		COUNT(behind)
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r1 = r9;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(zero),
+		  __imm_addr(one),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
 
 /* The runner looks at what the progs above held through the next three */
 
