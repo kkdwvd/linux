@@ -1083,7 +1083,7 @@ SEC("socket")
 __description("budget: a subprog is in a section on some paths")
 __arch_x86_64
 __arch_arm64
-__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__success __retval(42)
 __naked void unwinds_then_cannot(void)
 {
 	asm volatile (

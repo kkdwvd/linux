@@ -769,9 +769,66 @@ static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 }
 
 /*
+ * Add the stores that keep the hidden slots up to date, see kernel/bpf/pads.c. @buf has room for
+ * BPF_PAD_MAX_SLOT_INSNS. @added: how many insns the pads after each subprog have. Only they read
+ * the slots.
+ * What goes before a call is patched in with the call: jumps to the call go through it. The
+ * guard of the call is there already and stays in front: the frame is not left between a store and
+ * its call. What follows a call is appended behind it: jumps to the next insn go past it, as they
+ * go past the call. unwind_goto that the verifier adds comes later and goes between the call and
+ * the store.
+ * The stores at the entry are inserted before the first insn: calls get there, jumps back
+ * to that insn do not. They stand after the insn that takes the frame in the stack in arena, which
+ * bpf_insert_recursion_checks() expects to be the first one.
+ */
+static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf, const int *added)
+{
+	const struct bpf_pad_note *notes[BPF_PAD_MAX_ENTS];
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_subprog_info *sub;
+	const struct bpf_insn *insn, *last;
+	int i, s, n, nr, call, entry, err;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (!sub->slots || !added[s])
+			continue;
+		nr = bpf_pad_slot_notes(env, s, notes);
+		if (nr < 0)
+			return nr;
+		entry = sub->start + is_arena_sp_adj(&env->prog->insnsi[sub->start]);
+		for (i = sub->start; i < sub[1].start; i++) {
+			insn = &env->prog->insnsi[i];
+			/* the patches are queued in the order of the insns */
+			n = 0;
+			if (i == entry && i > sub->start)
+				n = bpf_pad_entry_insns(notes, nr, buf);
+			/* nothing stands between a call and unwind_goto of the program */
+			call = i - 1 - (i > sub->start && bpf_is_unwind_goto(insn - 1));
+			if (call >= (int)sub->start && !bpf_is_unwind_goto(insn))
+				n += bpf_pad_insns_after(sub, aux[call].pad_note, &buf[n]);
+			err = n ? bpf_patch_list_append(env, i - 1, buf, n) : 0;
+			if (err)
+				return err;
+			n = bpf_pad_insns_before(sub, notes, nr, aux[i].pad_note, buf);
+			buf[n] = *insn;
+			last = n ? bpf_patch_list_add(env, i, buf, n + 1) : NULL;
+			if (IS_ERR(last))
+				return PTR_ERR(last);
+			n = i == entry && i == sub->start ? bpf_pad_entry_insns(notes, nr, buf) : 0;
+			err = n ? bpf_patch_list_insert(env, i, buf, n) : 0;
+			if (err)
+				return err;
+		}
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
- * marked, see check_loop_guard(), unwind_goto after calls, and the landing pads. What a pad does it
- * did to the states that left the frame at the site, see unwind_frame().
+ * marked, see check_loop_guard(), unwind_goto after calls, the landing pads, and the stores to the
+ * hidden slots that the pads read. What a pad does it did to the states that left the frame at the
+ * site, see unwind_frame().
  *
  *	may_goto pad
  *	insn
@@ -797,7 +854,8 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 
 	/* how many insns the pads after the subprog have */
 	added = kvzalloc_objs(int, env->subprog_cnt, BPF_VERIFIER_GFP);
-	new = kvzalloc_objs(*new, BPF_PAD_MAX_INSNS + 1, BPF_VERIFIER_GFP);
+	new = kvzalloc_objs(*new, max(BPF_PAD_MAX_INSNS + 1, BPF_PAD_MAX_SLOT_INSNS),
+			    BPF_VERIFIER_GFP);
 	pad_aux = kvzalloc_objs(*pad_aux, BPF_PAD_MAX_INSNS + 1, BPF_VERIFIER_GFP);
 	if (!added || !new || !pad_aux) {
 		err = -ENOMEM;
@@ -849,7 +907,8 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 					emit_pad(env, s, plan, new,
 						 &aux[sub[1].start - added[s] + plan->pad]);
 	}
-	err = insert_unwind_gotos(env, added);
+	err = insert_slot_stores(env, new, added);
+	err = err ?: insert_unwind_gotos(env, added);
 out:
 	kvfree(added);
 	kvfree(new);

@@ -1842,10 +1842,10 @@ __naked void spilled_iv_is_no_guess(void)
 
 /*
  * With @bound 7 no execution disables preemption. The joined state does, and then the landing
- * pad of may_goto of the loop at 3 has two numbers of sections to leave: a conflict. A pass
- * that keeps r6 apart has none.
+ * pad of may_goto of the loop at 3 has two numbers of sections to leave: it takes them from
+ * hidden slots. A pass that keeps r6 apart has one number.
  * With @bound 8 an execution with r6 == 8 disables preemption, once for each trip of the loop
- * at 2, so the conflict is real.
+ * at 2, and never enables it: the error is real.
  */
 #define GUARD_OF_THE_JOIN(bound)					\
 	asm volatile (							\
@@ -1891,7 +1891,7 @@ __naked void guess_takes_target_of_join(void)
 SEC("tc")
 __description("failing_path: a real state is in a section at may_goto")
 __failure
-__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable-ed region")
 __not_msg("this path has a guess")
 __naked void guess_takes_real_target(void)
 {
@@ -1900,8 +1900,9 @@ __naked void guess_takes_real_target(void)
 
 SEC("tc")
 __description("failing_path: level 2 has the path-sensitive run and the next pass")
-__failure __log_level(2) __msg("path-sensitive run after pass 0") __msg("pass 1")
-__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__failure __log_level(2) __msg("path-sensitive run after pass 0")
+__msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable-ed region")
+__msg("pass 1")
 __naked void guess_in_level_2(void)
 {
 	GUARD_OF_THE_JOIN(8);

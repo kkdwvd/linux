@@ -6241,6 +6241,63 @@ out:
 	return ret;
 }
 
+/*
+ * What check_max_stack_depth() says ahead of time, @with_slots: with the hidden slots of the
+ * subprogs in their frames. It writes no log, and what it finds out about the subprogs is dropped.
+ */
+static int try_max_stack_depth(struct bpf_verifier_env *env, bool with_slots)
+{
+	size_t size = (env->subprog_cnt + 1) * sizeof(env->subprog_info[0]);
+	bool priv_stack = env->prog->aux->jits_use_priv_stack;
+	u32 max_depth = env->max_stack_depth, log_level = env->log.level;
+	u32 max_arena_depth = env->max_arena_stack_depth;
+	struct bpf_subprog_info *sub, *saved;
+	int s, err;
+
+	saved = kvmemdup(env->subprog_info, size, BPF_VERIFIER_GFP);
+	if (!saved)
+		return -ENOMEM;
+	for (s = 0; with_slots && s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (!sub->hidden_words)
+			continue;
+		sub->stack_depth = bpf_stack_depth_with_slots(sub);
+		/* or check_max_stack_depth() takes the spills of bpf_fastcall off the stack */
+		sub->keep_fastcall_stack = true;
+	}
+	env->log.level = 0;
+	err = check_max_stack_depth(env);
+	env->log.level = log_level;
+	memcpy(env->subprog_info, saved, size);
+	env->max_stack_depth = max_depth;
+	env->max_arena_stack_depth = max_arena_depth;
+	env->prog->aux->jits_use_priv_stack = priv_stack;
+	kvfree(saved);
+	return err;
+}
+
+/*
+ * Is there room in the stack for the hidden slots of the subprogs, see bpf_pads_settle()? No room
+ * is a conflict, so check_max_stack_depth() is asked ahead of time: in the end what it says is the
+ * verdict, see check_after_pass().
+ * It checks more than the depth of the stack: recursion, callbacks, tail calls. An error that it
+ * has without the slots as well is none of theirs, and a conflict for lack of room would hide it:
+ * there is room then, and check_after_pass() says what is wrong.
+ * Returns 1 if there is room, 0 if there is none.
+ */
+int bpf_hidden_slots_fit(struct bpf_verifier_env *env)
+{
+	int err = try_max_stack_depth(env, true);
+
+	if (!err)
+		return 1;
+	if (err != -ENOMEM)
+		err = try_max_stack_depth(env, false);
+	if (err == -ENOMEM)
+		return err;
+	return !!err;
+}
+
 static int __check_buffer_access(struct bpf_verifier_env *env,
 				 const char *buf_info,
 				 const struct bpf_reg_state *reg,
@@ -24132,9 +24189,12 @@ static int check_pass(struct bpf_verifier_env *env, struct bpf_snapshot *initial
 		bpf_pads_note_causes(env);
 	if (ret || pass_needs_restart(env))
 		return ret;
-	/* a state that never gets to a site makes no conflict there */
+	/*
+	 * A state that never gets to a site makes no conflict there. Hidden slots add to the
+	 * stack of a function: the plans are settled before the stack is checked.
+	 */
 	mark_used_sites(env, initial);
-	ret = check_after_pass(env) ?: bpf_pads_settle(env);
+	ret = bpf_pads_settle(env) ?: check_after_pass(env);
 	if (ret) {
 		bpf_find_unproven_after_pass(env);
 		bpf_pads_note_causes(env);

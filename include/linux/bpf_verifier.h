@@ -501,6 +501,11 @@ enum bpf_pad_conflict {
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
 #define BPF_PAD_MAX_CANDS	6
+/*
+ * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
+ * five to compare and clear, four to find a free one. And the call.
+ */
+#define BPF_PAD_MAX_SLOT_INSNS	(BPF_PAD_MAX_ENTS * 9 + 1)
 
 /* Where a place is */
 enum bpf_place_loc {
@@ -555,6 +560,7 @@ struct bpf_pad_plan {
 	bool used;			/* the program leaves the frame there, see bpf_pads_mark_used() */
 	bool failed;			/* a state made the conflict an error of the pass */
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
+	u8 sections_differ;		/* bit per class: not the same number on all visits */
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
@@ -597,6 +603,8 @@ struct bpf_pad_note {
 	u8 src;			/* the register that goes to the slot */
 	u8 held;		/* the most that the frame holds of the group when it gets there */
 	struct bpf_pad_ent ent;	/* what a slot of the call is to a plan, but for the offset */
+	u8 nr_slots;		/* see subprog_take_slots() */
+	s16 off;		/* the first one, from R10. The others are below it. */
 	/* The call releases a resource that the frame acquired. */
 	bool releases;
 	u8 group;		/* enum bpf_pad_group */
@@ -1419,6 +1427,10 @@ struct bpf_subprog_info {
 	bool below_conflict: 1;
 	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
 	u8 no_slots: 4;
+	/* it has them for these. Each bpf_pads_settle() decides anew. */
+	u8 slots: 4;
+	/* they take that many words of 8 bytes below its stack */
+	u8 hidden_words;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -1434,6 +1446,12 @@ struct bpf_subprog_info {
 static inline bool bpf_subprog_unwinds(const struct bpf_subprog_info *sub)
 {
 	return sub->can_unwind || (sub->recursive && sub->bail_unwinds);
+}
+
+/* How far the stack of @sub goes with its hidden slots */
+static inline u32 bpf_stack_depth_with_slots(const struct bpf_subprog_info *sub)
+{
+	return round_up(sub->stack_depth, BPF_REG_SIZE) + sub->hidden_words * BPF_REG_SIZE;
 }
 
 static inline u16 bpf_in_stack_arg_cnt(const struct bpf_subprog_info *sub)
@@ -2125,6 +2143,13 @@ int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
 void bpf_pads_note_causes(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
+int bpf_hidden_slots_fit(struct bpf_verifier_env *env);
+int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad_note **notes);
+int bpf_pad_entry_insns(const struct bpf_pad_note **notes, int nr, struct bpf_insn *buf);
+int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
+int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
+			struct bpf_insn *buf);
 void bpf_pads_log(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_state *dst_state,

@@ -128,7 +128,7 @@
  *   - All visits hold it: the program counter tells.
  *   - A candidate is 0 on all visits that don't: the pad tests it. That is how the program itself
  *     tells, a pointer that is NULL as long as there is nothing to release.
- *   - Otherwise there is a conflict.
+ *   - Otherwise the function gets hidden slots, see below, or there is a conflict.
  * A pointer that the program has not compared with NULL yet when it gets to the site is tested too.
  *
  *	t = NULL;					   r6 = 0
@@ -147,6 +147,53 @@
  * A pad has one order, see enum pad_turn, among equals that of refs[], the youngest first. Locks
  * and irq flags have to be released that way, and a dynptr ahead of the pointer that it was made
  * from. States that acquired them in different orders can be a conflict.
+ *
+ * HIDDEN SLOTS are the fallback for what neither the program counter nor a place tells. Here only
+ * the program knows what 'own' means:
+ *
+ *	if (x)						   *(u64 *)(r10 - 8) = 0
+ *		t = bpf_task_from_pid(a);		   *(u64 *)(r10 - 16) = 0
+ *	else						   ...
+ *		t = bpf_task_from_pid(b);		   call bpf_task_from_pid
+ *	own = !!t;					   *(u64 *)(r10 - 8) = r0
+ *	if (!t)						   ...
+ *		t = bpf_get_current_task_btf();		   call bpf_task_from_pid
+ *	v = wait(t);					   *(u64 *)(r10 - 16) = r0
+ *	if (own)					   ...
+ *		bpf_task_release(t);			   call wait
+ *							   unwind_goto pad
+ *							   ...
+ *							   ax = *(u64 *)(r10 - 8)
+ *							   if ax != r1 goto 1f
+ *							   *(u64 *)(r10 - 8) = 0
+ *							   goto 2f
+ *							1: ax = *(u64 *)(r10 - 16)
+ *							   if ax != r1 goto 2f
+ *							   *(u64 *)(r10 - 16) = 0
+ *							2: call bpf_task_release
+ *							   ...
+ *						      pad: r1 = *(u64 *)(r10 - 16)
+ *							   if r1 == 0 goto 3f
+ *							   call bpf_task_release
+ *							3: r1 = *(u64 *)(r10 - 8)
+ *							   if r1 == 0 goto 4f
+ *							   call bpf_task_release
+ *							4: r0 = 0
+ *							   exit
+ *
+ * Each call that acquires has a slot of its own, below the stack of the function, where no access
+ * of the program gets. The slots of a frame that are not 0 are, one to one, what the frame holds:
+ *   entry       all slots are 0
+ *   acquire     the slot takes what the release takes: R0, the address of a lock or of an object
+ *   release     the slot that has the handle is cleared. It is found at run time.
+ *   pad         'if (slot) release(slot)' over the slots, the same at all sites of the function
+ * The stores follow from the insn and from what the main pass notes where it processes the insn,
+ * see bpf_pad_note_acquire() and what follows it, never from the states at a site: a state that was
+ * pruned or joined on the way does not get there, and which insn acquired a reference is not
+ * compared when that is done. What no store can follow is noted as well, see 'no_slots'.
+ * A function has slots for a GROUP of classes, see enum bpf_pad_group and settle_slots(). All its
+ * pads release that group through the slots alone. All else stays as it is: a program that needs no
+ * slot has no store and no byte of stack for them.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -1237,7 +1284,7 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
  * of the site serve @st too. A visit at which the frame holds nothing is a visit like any other.
  *
  * Sections: the pad leaves as many as the frame has entered. That is a number of calls in the
- * code of the pad, so it has to be the same on all visits.
+ * code of the pad, so it has to be the same on all visits, or the function gets hidden slots.
  *
  * Returns the plan. It tells whether there is a conflict.
  */
@@ -1263,7 +1310,7 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 		if (nr > BPF_PAD_MAX_SECTIONS)
 			plan->conflict = BPF_CONFLICT_TOO_MUCH;
 		else if (plan->visited && plan->sections[class] != nr)
-			plan->conflict = BPF_CONFLICT_SECTIONS_DIFFER;
+			plan->sections_differ |= BIT(class);
 		plan->sections[class] = nr;
 	}
 	plan->visited = true;
@@ -1705,6 +1752,8 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	struct bpf_insn release;
 	int i, class, err = plan->conflict;
 
+	if (!err && plan->sections_differ)
+		err = BPF_CONFLICT_SECTIONS_DIFFER;
 	for (i = 0; !err && i < plan->nr_ents; i++)
 		err = settle_ent(env, plan, &plan->ents[i]);
 	for (class = 0; !err && class < BPF_PAD_NR_SECTIONS; class++) {
@@ -1713,6 +1762,321 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 			err = get_release(env, &release);
 	}
 	return err;
+}
+
+/*
+ * The groups of which @plan has something that its pad cannot tell whether it is held. None for a
+ * site that the program does not have.
+ */
+static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	u8 groups = plan->sections_differ;
+	int i, err;
+
+	if (!plan->used || plan->conflict)
+		return 0;
+	for (i = 0; i < plan->nr_ents; i++) {
+		err = settle_ent(env, plan, &plan->ents[i]);
+		if (err == BPF_CONFLICT_NOT_ALWAYS_HELD || err == BPF_CONFLICT_CALLER_SAVED)
+			groups |= BIT(class_group(plan->ents[i].class));
+	}
+	return groups;
+}
+
+/* The slot of bpf_res_spin_lock_irqsave() has a word for the second argument of the release */
+static int slot_words(const struct bpf_pad_note *note)
+{
+	return note->ent.class == BPF_PAD_RES_LOCK_IRQ ? 2 : 1;
+}
+
+/* Does the pad of @plan run in a frame that has set up its hidden slots? */
+static bool plan_has_slots(const struct bpf_pad_plan *plan)
+{
+	return plan->kind != BPF_SITE_RECURSION && !plan->conflict;
+}
+
+/*
+ * The pad of @plan releases what the frame holds of @group through the hidden slots of the @nr
+ * calls @notes and in no other way. A slot is an entry that is tested. For the order of a pad, see
+ * enum pad_turn, the slots of sections go before all entries, those of references after
+ * them, those of locks and irq flags after all entries.
+ */
+static int plan_take_slots(struct bpf_pad_plan *plan, int group, struct bpf_pad_note **notes,
+			   int nr)
+{
+	struct bpf_pad_ent new, *ent;
+	int i, k, pos = 0;
+
+	for (i = 0, k = 0; i < plan->nr_ents; i++)
+		if (class_group(plan->ents[i].class) != group)
+			plan->ents[k++] = plan->ents[i];
+	plan->nr_ents = k;
+	if (group < BPF_PAD_NR_SECTIONS) {
+		plan->sections[group] = 0;
+		plan->sections_differ &= ~BIT(group);
+	}
+	if (group == BPF_PAD_GROUP_LOCKS)
+		pos = plan->nr_ents;
+	while (group == BPF_PAD_GROUP_REFS && pos < plan->nr_ents &&
+	       plan->ents[pos].class < BPF_PAD_NR_SECTIONS)
+		pos++;
+	for (i = 0; i < nr; i++) {
+		for (k = 0; k < notes[i]->nr_slots; k++) {
+			new = notes[i]->ent;
+			new.cand[0][0].at = notes[i]->off - k * BPF_REG_SIZE;
+			if (slot_words(notes[i]) == 2)
+				new.cand[1][0].at = notes[i]->off - BPF_REG_SIZE;
+			ent = add_ent(plan, &new, pos++);
+			if (!ent)
+				return -ENOMEM;
+			ent->always = false;
+			ent->cand[0][0].null = true;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Give subprog @s hidden slots for all that it acquires of @group, below its stack: every access of
+ * the program to the frame, also one of a callee through a pointer, has raised stack_depth.
+ * A call that is on no cycle runs once per frame: one slot. Any other has one more than the frame
+ * holds of the group when it gets there, so that one is free.
+ * Returns 0 if that cannot be: a release that the program cannot call, no room in a pad or in the
+ * stack.
+ */
+static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
+{
+	struct bpf_subprog_info *sub = &env->subprog_info[s];
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_pad_note *note, *notes[BPF_PAD_MAX_ENTS];
+	int i, j, err, left, nr = 0, slots = 0, words = 0;
+	struct bpf_pad_plan *plan;
+
+	for (i = sub->start; i < sub[1].start; i++) {
+		note = aux[i].pad_note;
+		if (!note || !note->acquires || class_group(note->ent.class) != group)
+			continue;
+		err = nr < BPF_PAD_MAX_ENTS ? get_release(env, &note->ent.release) : 1;
+		if (err)
+			return min(err, 0);
+		notes[nr++] = note;
+		note->nr_slots = bpf_loop_at_index(env, i) < 0 ? 1 : 1 + note->held;
+		note->off = -(int)bpf_stack_depth_with_slots(sub) - (words + 1) * BPF_REG_SIZE;
+		slots += note->nr_slots;
+		words += note->nr_slots * slot_words(note);
+	}
+	if (!nr)
+		return 0;
+	for (i = sub->start; i < sub[1].start; i++) {
+		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			for (j = 0, left = 0; j < plan->nr_ents; j++)
+				left += class_group(plan->ents[j].class) != group;
+			if (plan->used && plan_has_slots(plan) &&
+			    left + slots > BPF_PAD_MAX_ENTS)
+				return 0;
+		}
+	}
+	sub->hidden_words += words;
+	err = bpf_hidden_slots_fit(env);
+	if (err <= 0) {
+		sub->hidden_words -= words;
+		return err;
+	}
+	for (i = sub->start; i < sub[1].start; i++) {
+		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			err = plan_has_slots(plan) ? plan_take_slots(plan, group, notes, nr) : 0;
+			if (err)
+				return err;
+		}
+	}
+	sub->slots |= BIT(group);
+	return 1;
+}
+
+/*
+ * Hidden slots are the fallback: a subprog gets them for a group of which one of its plans has
+ * something that the pad cannot tell otherwise. A slot takes the first call of a pad from an entry
+ * that is in R0-R5, so look again. If the subprog cannot have them its plans stay as they are.
+ */
+static int settle_slots(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_subprog_info *sub;
+	struct bpf_pad_plan *plan;
+	int i, s, err;
+	u8 need;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		env->subprog_info[s].slots = 0;
+		env->subprog_info[s].hidden_words = 0;
+	}
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		do {
+			if (bpf_must_abort())
+				return -EINTR;
+			need = 0;
+			for (i = sub->start; i < sub[1].start; i++)
+				for (plan = aux[i].pad_plans; plan; plan = plan->next)
+					need |= plan_needs_slots(env, plan);
+			need &= ~sub->no_slots;
+			err = need ? subprog_take_slots(env, s, __ffs(need)) : 0;
+			if (err < 0)
+				return err;
+			if (need && !err)
+				sub->no_slots |= BIT(__ffs(need));
+		} while (need);
+	}
+	return 0;
+}
+
+static bool note_has_slots(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note)
+{
+	return note && note->acquires && (sub->slots & BIT(class_group(note->ent.class)));
+}
+
+/*
+ * The calls of subprog @s that have hidden slots go to @notes, which has room for BPF_PAD_MAX_ENTS.
+ * A slot is an entry of each plan of the subprog, so all groups together have no more slots than
+ * that, see plan_has_room(), and the insns of the stores are sized for as many, see
+ * BPF_PAD_MAX_SLOT_INSNS. Nothing else keeps the calls that few: check it where they are written.
+ * Returns how many there are.
+ */
+int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad_note **notes)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	const struct bpf_pad_note *note;
+	int i, nr = 0, slots = 0;
+
+	for (i = sub->start; i < sub[1].start; i++) {
+		note = env->insn_aux_data[i].pad_note;
+		if (!note_has_slots(sub, note))
+			continue;
+		slots += note->nr_slots;
+		if (verifier_bug_if(slots > BPF_PAD_MAX_ENTS, env,
+				    "func#%d has %d hidden slots, a landing pad has %d entries",
+				    s, slots, BPF_PAD_MAX_ENTS))
+			return -EFAULT;
+		notes[nr++] = note;
+	}
+	return nr;
+}
+
+/*
+ * The entry of a function: all words of its hidden slots are 0. The frame holds nothing of its own,
+ * and a pad reads all slots, also at a site that is before the calls that fill them.
+ */
+int bpf_pad_entry_insns(const struct bpf_pad_note **notes, int nr, struct bpf_insn *buf)
+{
+	int i, k, n = 0;
+
+	for (i = 0; i < nr; i++)
+		for (k = 0; k < notes[i]->nr_slots * slot_words(notes[i]); k++)
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, notes[i]->off - k * BPF_REG_SIZE,
+					      0);
+	return n;
+}
+
+/*
+ * The call of @note acquires: a slot takes what the release takes, unconditionally. 0 in R0 means
+ * that nothing was acquired, and 0 in a slot means the same. A section has no handle: 1.
+ * If the call has several slots the first one that is 0 is filled. The frame holds no more than
+ * 'held' of the group, so there is one.
+ */
+static int set_insns(const struct bpf_pad_note *note, struct bpf_insn *buf)
+{
+	int k, n = 0, nr = note->nr_slots, off = note->off;
+
+	for (k = 0; k < nr; k++, off -= BPF_REG_SIZE) {
+		if (nr > 1) {
+			buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, off);
+			buf[n++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, k == nr - 1 ? 1 : 2);
+		}
+		if (note->ent.class < BPF_PAD_NR_SECTIONS)
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, off, 1);
+		else
+			buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, note->src, off);
+		if (k < nr - 1)
+			buf[n++] = BPF_JMP_A((nr - 1 - k) * 4 - 1);
+	}
+	/* the irq flags, the next argument: the pad reads the word if the slot is not 0 */
+	if (slot_words(note) == 2)
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, note->src + 1, off);
+	return n;
+}
+
+/*
+ * The call of @rel releases: the slot of the group that has the handle is cleared, whichever call
+ * filled it in this run. The first match ends the search: two references to one object are the
+ * same handle in two slots, and one of them is released. No match: the call was given NULL.
+ * Sections are all alike: the first slot that is not 0.
+ */
+static int clear_insns(const struct bpf_pad_note **notes, int nr, const struct bpf_pad_note *rel,
+		       struct bpf_insn *buf)
+{
+	int i, k, n = 0, off, delta, reg;
+
+	for (i = 0; i < nr; i++) {
+		if (class_group(notes[i]->ent.class) != rel->group)
+			continue;
+		delta = rel->delta - notes[i]->ent.cand[0][0].delta;
+		/*
+		 * The delta is made of constants that the program chose, the offsets of a node in
+		 * its object. It is added in R0, which a call is about to clobber: there the JIT
+		 * blinds it like any other constant of the program. An insn on AX is not blinded.
+		 */
+		reg = delta ? BPF_REG_0 : BPF_REG_AX;
+		for (k = 0; k < notes[i]->nr_slots; k++) {
+			off = notes[i]->off - k * BPF_REG_SIZE;
+			buf[n++] = BPF_LDX_MEM(BPF_DW, reg, BPF_REG_FP, off);
+			if (delta)
+				buf[n++] = BPF_ALU64_IMM(BPF_ADD, reg, delta);
+			if (rel->group < BPF_PAD_NR_SECTIONS)
+				buf[n++] = BPF_JMP_IMM(BPF_JEQ, reg, 0, 2);
+			else
+				buf[n++] = BPF_JMP_REG(BPF_JNE, reg, rel->reg, 2);
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, off, 0);
+			buf[n++] = BPF_JMP_A(0);
+		}
+	}
+	/* nothing follows the last slot */
+	buf[--n - 2].off = 1;
+	for (i = 0; i < n; i++)
+		if (buf[i].code == (BPF_JMP | BPF_JA))
+			buf[i].off = n - i - 1;
+	return n;
+}
+
+/* The insns that go before the call of @note in @sub. @notes: the @nr calls with slots. */
+int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf)
+{
+	int n = 0;
+
+	if (note && note->releases && (sub->slots & BIT(note->group)))
+		n = clear_insns(notes, nr, note, buf);
+	/* an address that the call takes. The resource is held when the call returns. */
+	if (note_has_slots(sub, note) && note->ent.class != BPF_PAD_REF)
+		n += set_insns(note, &buf[n]);
+	return n;
+}
+
+/* The insns that go after the call of @note, which is in @sub */
+int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
+			struct bpf_insn *buf)
+{
+	int n = 0;
+
+	if (!note_has_slots(sub, note))
+		return 0;
+	if (note->ent.class == BPF_PAD_REF)
+		return set_insns(note, buf);
+	/* the lock was not taken. The upper half of an int is not defined. */
+	if (note->ent.class == BPF_PAD_RES_LOCK || note->ent.class == BPF_PAD_RES_LOCK_IRQ) {
+		buf[n++] = BPF_JMP32_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
+		buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, note->off, 0);
+	}
+	return n;
 }
 
 /*
@@ -1736,6 +2100,8 @@ bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan)
 static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *ent)
 {
 	static const char * const class[] = {
+		[BPF_PAD_RCU]			= "rcu",
+		[BPF_PAD_PREEMPT]		= "preempt",
 		[BPF_PAD_IRQ]			= "irq",
 		[BPF_PAD_RES_LOCK]		= "res_lock",
 		[BPF_PAD_RES_LOCK_IRQ]		= "res_lock_irq",
@@ -1834,10 +2200,11 @@ void bpf_pads_mark_used(struct bpf_verifier_env *env)
  */
 int bpf_pads_settle(struct bpf_verifier_env *env)
 {
+	struct bpf_subprog_info *sub;
 	struct bpf_pad_plan *plan;
-	int i, err;
+	int i, s, err;
 
-	/* the entries take the places that suit all visits, see visit_refs() */
+	/* hidden slots take their places among entries that have theirs */
 	for (i = 0; i < env->prog->len; i++) {
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
 			err = order_ents(env, plan);
@@ -1845,6 +2212,9 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 				return err;
 		}
 	}
+	err = settle_slots(env);
+	if (err)
+		return err;
 	for (i = 0; i < env->prog->len; i++) {
 		if (env->insn_aux_data[i].pad_plans && bpf_must_abort())
 			return -EINTR;
@@ -1860,6 +2230,15 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 				return -EINVAL;
 			}
 		}
+	}
+	/* The main pass is over: the program has no access to its stack that is not known. */
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (!sub->hidden_words)
+			continue;
+		sub->stack_depth = bpf_stack_depth_with_slots(sub);
+		/* check_max_stack_depth() would put the stack of the callees there */
+		sub->keep_fastcall_stack = true;
 	}
 	return 0;
 }
