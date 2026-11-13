@@ -537,12 +537,28 @@ static const struct btf_kfunc_id_set nf_conntrack_kfunc_set = {
 	.set   = &nf_ct_kfunc_set,
 };
 
+/* The kfunc that generated code calls to release a reference to a struct nf_conn.
+ * A struct nf_conn___init has none: only bpf_ct_insert_entry() takes it.
+ */
+BTF_ID_LIST(nf_ct_release_ids)
+BTF_ID(struct, nf_conn)
+BTF_ID(func, bpf_ct_release)
+
 int register_nf_conntrack_bpf(void)
 {
+	const struct btf_id_dtor_kfunc nf_ct_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= nf_ct_release_ids[0],
+			.release_btf_id	= nf_ct_release_ids[1],
+		},
+	};
 	int ret;
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &nf_conntrack_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &nf_conntrack_kfunc_set);
+	ret = ret ?: register_btf_id_dtor_kfuncs(nf_ct_releases, ARRAY_SIZE(nf_ct_releases),
+						 THIS_MODULE);
 	if (!ret) {
 		mutex_lock(&nf_conn_btf_access_lock);
 		nfct_btf_struct_access = _nf_conntrack_btf_struct_access;
