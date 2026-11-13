@@ -240,6 +240,19 @@ struct cancel_sub {
 	u32 pads;	/* its first pad + 1 */
 };
 
+/*
+ * The origin of a reference to an object is the call that acquired it: refs[] has the insn.
+ * Nothing compares these insns when a state is found to be within another one, or when two
+ * states are joined. So the origin in a state is one of several calls that may have acquired
+ * the reference when the program gets there: the one of the state, and those of the states
+ * that it stands for. Such origins are one class, see bpf_cancel_alias_refs(). What is to
+ * be known about a reference by its origin has to hold for the class.
+ */
+struct cancel_origin {
+	u32 insn_idx;	/* the call, in the program as the main pass has it */
+	u32 up;		/* towards the origin that stands for the class, which has itself here */
+};
+
 struct bpf_cancel {
 	struct cancel_site *sites;
 	u32 nr_sites;
@@ -253,6 +266,10 @@ struct bpf_cancel {
 	/* the pads of one subprog, see bpf_cancel_append_pads() */
 	struct bpf_insn *insns;
 	u32 cap_insns;
+	/* the calls that acquire references to objects, see bpf_cancel_record_origin() */
+	struct cancel_origin *origins;
+	u32 nr_origins;
+	u32 cap_origins;
 };
 
 static int cancel_list_add(struct cancel_list *list, const struct cancel_entry *e)
@@ -1528,6 +1545,95 @@ bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifie
 	return !cancel_ref_of_stack_obj(st, ref->id);
 }
 
+/*
+ * The insn at @insn_idx acquires a reference to an object, and is its origin. All such
+ * references come from acquire_reference(), which makes the origin first.
+ */
+int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	struct bpf_cancel *c = env->cancel;
+	struct cancel_origin *o;
+	u32 cap;
+
+	if (aux->cancel_origin)
+		return 0;
+	if (!c) {
+		c = kzalloc_obj(*c, GFP_KERNEL_ACCOUNT);
+		if (!c)
+			return -ENOMEM;
+		env->cancel = c;
+	}
+	if (c->nr_origins == c->cap_origins) {
+		cap = max(2 * c->cap_origins, 16U);
+		o = kvrealloc(c->origins, cap * sizeof(*o), GFP_KERNEL_ACCOUNT);
+		if (!o)
+			return -ENOMEM;
+		c->origins = o;
+		c->cap_origins = cap;
+	}
+	o = &c->origins[c->nr_origins];
+	memset(o, 0, sizeof(*o));
+	o->insn_idx = insn_idx;
+	o->up = c->nr_origins;
+	aux->cancel_origin = ++c->nr_origins;
+	return 0;
+}
+
+/* The origin of @ref, a reference to an object. It has one, see bpf_cancel_record_origin(). */
+static int cancel_ref_origin(struct bpf_verifier_env *env, const struct bpf_reference_state *ref)
+{
+	u32 o = env->insn_aux_data[ref->insn_idx].cancel_origin;
+
+	if (verifier_bug_if(!o, env, "cancel: the reference of insn %d has no origin",
+			    ref->insn_idx))
+		return -EFAULT;
+	return o - 1;
+}
+
+/* The origin that stands for the class of origin @o */
+static u32 cancel_class(struct bpf_cancel *c, u32 o)
+{
+	struct cancel_origin *origins = c->origins;
+
+	while (origins[o].up != o) {
+		origins[o].up = origins[origins[o].up].up;
+		o = origins[o].up;
+	}
+	return o;
+}
+
+/*
+ * @a stands for @b from now on: @b is within it, or it is the join of the two. They hold the
+ * same references, and the origins of the two that are in the same entry of refs[] become
+ * one class. This only takes notes: whether a state stands for another one does not depend
+ * on the origins.
+ *
+ * What the callers of a function that is verified on its own hold is left out. The state at
+ * the entry of the function is shared by calls from anywhere, each with what its caller
+ * holds, and the function is not the owner of that. Every call gets its own entries back
+ * when the function returns, see bpf_flow_return().
+ */
+void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
+			   const struct bpf_verifier_state *b)
+{
+	struct bpf_cancel *c = env->cancel;
+	int x, y;
+	u32 i;
+
+	for (i = 0; i < a->acquired_refs; i++) {
+		if (a->refs[i].type != REF_TYPE_PTR || a->refs[i].insn_idx == b->refs[i].insn_idx ||
+		    a->refs[i].frameno == BPF_INHERITED_FRAME)
+			continue;
+		x = cancel_ref_origin(env, &a->refs[i]);
+		y = cancel_ref_origin(env, &b->refs[i]);
+		if (x < 0 || y < 0)
+			continue;
+		x = cancel_class(c, x);
+		c->origins[x].up = cancel_class(c, y);
+	}
+}
+
 /* A point is where a cancellation begins. A call passes it on. */
 static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_site *site)
 {
@@ -2345,6 +2451,9 @@ void bpf_cancel_reset(struct bpf_verifier_env *env)
 		kfree(c->sites[i].held.entries);
 	}
 	c->nr_sites = 0;
+	for (i = 0; i < c->nr_origins; i++)
+		env->insn_aux_data[c->origins[i].insn_idx].cancel_origin = 0;
+	c->nr_origins = 0;
 }
 
 void bpf_cancel_free(struct bpf_verifier_env *env)
@@ -2361,6 +2470,7 @@ void bpf_cancel_free(struct bpf_verifier_env *env)
 	kvfree(c->subs);
 	kvfree(c->pads);
 	kvfree(c->insns);
+	kvfree(c->origins);
 	kfree(c);
 	env->cancel = NULL;
 }

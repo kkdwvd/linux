@@ -621,5 +621,9 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 		}
 	}
 
-	return join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
+	err = join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
+	/* @dst has the references of @a and stands for @b too, see bpf_cancel_alias_refs() */
+	if (!err)
+		bpf_cancel_alias_refs(env, a, b);
+	return err;
 }

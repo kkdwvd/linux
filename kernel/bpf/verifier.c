@@ -1558,6 +1558,12 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id)
 {
 	struct bpf_reference_state *s;
+	int err;
+
+	/* the insn is the origin of the reference, see bpf_cancel_alias_refs() */
+	err = bpf_cancel_record_origin(env, insn_idx);
+	if (err)
+		return err;
 
 	s = acquire_reference_state(env, insn_idx);
 	if (!s)

@@ -960,6 +960,8 @@ struct bpf_insn_aux_data {
 	s32 guard_to;
 	/* the first cancel site at this instruction + 1, see bpf_cancel_record() */
 	u32 cancel_site;
+	/* the origin of the references that this call acquires + 1, see bpf_cancel_record_origin() */
+	u32 cancel_origin;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 };
@@ -1640,6 +1642,9 @@ int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type ty
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
 bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  u32 idx, int subprog);
+int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx);
+void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
+			   const struct bpf_verifier_state *b);
 int bpf_cancel_resolve(struct bpf_verifier_env *env);
 bool bpf_cancel_has_pads(const struct bpf_verifier_env *env);
 int bpf_cancel_append_pads(struct bpf_verifier_env *env, int subprog,

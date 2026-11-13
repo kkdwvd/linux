@@ -696,5 +696,7 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			return false;
 	}
 
+	/* @old may come to stand for @cur, with references that other insns acquired */
+	bpf_cancel_alias_refs(env, old, cur);
 	return true;
 }
