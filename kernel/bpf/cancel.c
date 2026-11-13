@@ -175,6 +175,8 @@ struct cancel_entry {
 	s16 irq_off;
 	u8 flags;	/* of the kind, they go with arg */
 	u64 arg;	/* how to release it, in the terms of the kind */
+	/* of an object that the program owns: the pointer in place is that many bytes into it */
+	s32 off;
 	/*
 	 * Of a lock at a known address: a place leads to it as well, with the lock alt_arg
 	 * bytes from where its pointer points. Visits that hold such locks at different
@@ -280,7 +282,7 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 	if (cancel_kind_ordered(a->kind) && (a->rank != b->rank || a->irq_off != b->irq_off))
 		return false;
 	return a->kind == b->kind && a->place == b->place && a->flags == b->flags &&
-	       a->arg == b->arg;
+	       a->arg == b->arg && a->off == b->off;
 }
 
 static bool cancel_list_has(const struct cancel_list *list, const struct cancel_entry *e)
@@ -1034,6 +1036,11 @@ static bool cancel_obj_drop_ok(struct bpf_verifier_env *env, const struct bpf_ve
  * What a helper like bpf_tcp_sock() made of a reference has the id as well, and is a
  * handle only where the program may release through it.
  *
+ * A pointer into an object that the program owns is as good as the one to its start: it has
+ * the type of the object and says how far into it it points, and the pad takes that off.
+ * bpf_list_pop_front() and bpf_rbtree_remove() return such a pointer, to the node in the
+ * object, and it is all that the frame has until the program has made the other one of it.
+ *
  * A pointer that may be NULL is one that the program did not test since it was acquired:
  * the verifier drops the reference where the test finds NULL. Nothing was acquired then,
  * so the pad makes the test and leaves the call out. If a callee made the test, the place
@@ -1048,15 +1055,22 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 	struct bpf_release_kfunc rel;
 	int helper = 0;
 	u8 how = 0;
+	s64 off;
 
-	if (!tnum_equals_const(reg->var_off, 0))
+	if (!tnum_is_const(reg->var_off))
+		return reason;
+	off = reg->var_off.value;
+	if (off && (base_type(reg->type) != PTR_TO_BTF_ID || !(flags & MEM_ALLOC)))
+		return reason;
+	/* the pad takes it off with an immediate */
+	if (off != (s32)off || off == S32_MIN)
 		return reason;
 
 	switch (base_type(reg->type)) {
 	case PTR_TO_BTF_ID:
 		/*
 		 * An object that the program allocated, took out of a map, or removed from a
-		 * list or a tree: the pointer to its start, not the one to the node in it.
+		 * list or a tree.
 		 */
 		if (flags & MEM_ALLOC) {
 			if (flags & ~(MEM_ALLOC | MEM_PERCPU))
@@ -1065,6 +1079,7 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 				return CANCEL_RELEASE;
 			how = CANCEL_PTR_OBJ | (flags & MEM_PERCPU ? CANCEL_PTR_PERCPU : 0);
 			e->arg = (unsigned long)rec;
+			e->off = off;
 			break;
 		}
 		/* a kernel object: referenced is as good as trusted for a release kfunc */
@@ -1735,7 +1750,9 @@ static int cancel_entry_cmp(const void *a, const void *b)
 		return x->place < y->place ? -1 : 1;
 	if (x->flags != y->flags)
 		return x->flags < y->flags ? -1 : 1;
-	return x->arg < y->arg ? -1 : x->arg > y->arg;
+	if (x->arg != y->arg)
+		return x->arg < y->arg ? -1 : 1;
+	return x->off < y->off ? -1 : x->off > y->off;
 }
 
 static bool cancel_same_held(const struct cancel_site *a, const struct cancel_site *b)
@@ -1943,7 +1960,10 @@ static int cancel_emit_iter(const struct cancel_entry *e, int place, struct bpf_
 	return n;
 }
 
-/* Release the reference whose handle is in @place, unless there is none: CANCEL_PTR_NULL */
+/*
+ * Release the reference whose handle is in @place, unless there is none: CANCEL_PTR_NULL. A
+ * pointer that is e->off bytes into its object is NULL when there is no object, too.
+ */
 static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_insn *buf)
 {
 	int n = 0, test = -1;
@@ -1954,6 +1974,8 @@ static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_i
 		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, place);
 	if (e->flags & CANCEL_PTR_NULL)
 		test = n++;
+	if (e->off)
+		buf[n++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, -e->off);
 
 	if (e->flags & CANCEL_PTR_OBJ) {
 		struct bpf_insn rec[2] = { BPF_LD_IMM64(BPF_REG_2, e->arg) };
