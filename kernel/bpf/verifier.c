@@ -11929,6 +11929,10 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 			entry.refs[i].parent_id = inherited_id(state, entry.refs[i].parent_id);
 		/* its owner is not in the state, and calls from any depth share the state */
 		entry.refs[i].frameno = BPF_INHERITED_FRAME;
+		/* the function is frame 0 there, and no frame is added here */
+		memset(entry.refs[i].args, 0, sizeof(entry.refs[i].args));
+		entry.refs[i].args[0] = state->refs[i].args[state->curframe + 1];
+		state->refs[i].args[state->curframe + 1] = 0;
 		/*
 		 * What the call moved is for the function to release, see move_refs_to_callee().
 		 * The call waits as it got to the insn, with the caller as the owner: that is what
@@ -12196,6 +12200,8 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	err = move_refs_to_callee(env, state, subprog);
 	if (err)
 		return err;
+	/* what does not move may be released by the callee for the frame that keeps it */
+	bpf_cancel_note_args(env, state, subprog);
 	/*
 	 * Every state that calls gets here, however the callee is verified. The record takes
 	 * more of the caller's stack for a place if the frame of the caller is in the state
@@ -12972,9 +12978,12 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 				       callee->frameno, 0, r0);
 	if (err)
 		return err;
-	for (i = 0; i < state->acquired_refs; i++)
+	for (i = 0; i < state->acquired_refs; i++) {
 		if (bpf_frame_owns_ref(state, callee->frameno, i))
 			state->refs[i].frameno = caller->frameno;
+		/* see bpf_cancel_note_args() */
+		state->refs[i].args[callee->frameno] = 0;
+	}
 
 	/* for callbacks like bpf_loop or bpf_for_each_map_elem go back to callsite,
 	 * there function call logic would reschedule callback visit.

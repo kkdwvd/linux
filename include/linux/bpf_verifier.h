@@ -328,6 +328,10 @@ struct bpf_stack_state {
 	u8 slot_type[BPF_REG_SIZE];
 };
 
+#define MAX_CALL_FRAMES 32
+/* What the interpreter has stack for. A longer chain of calls requires the JIT. */
+#define MAX_CALL_FRAMES_INTERP 16
+
 struct bpf_reference_state {
 	/* Each reference object has a type. Ensure REF_TYPE_PTR is zero to
 	 * default to pointer reference on zero initialization of a state.
@@ -363,6 +367,16 @@ struct bpf_reference_state {
 	 * callers of a function verified on its own hold.
 	 */
 	int frameno;
+	/*
+	 * How it got to the frames above the owner: args[fr] is the argument
+	 * that the call which frame fr was entered by had its handle in: 1-5
+	 * for R1-R5, from 6 on a stack argument, 0 if it had none, see
+	 * bpf_cancel_note_args(). In frame 0 of a function that is verified on
+	 * its own: for what the callers hold.
+	 * One more than there are frames: the last frame may call a function
+	 * that is verified on its own.
+	 */
+	u8 args[MAX_CALL_FRAMES + 1];
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -559,10 +573,6 @@ struct bpf_func_state {
 	struct bpf_reg_state *stack_arg_regs; /* Outgoing on-stack arguments */
 	struct loop_stack_entry *loop_stack;
 };
-
-#define MAX_CALL_FRAMES 32
-/* What the interpreter has stack for. A longer chain of calls requires the JIT. */
-#define MAX_CALL_FRAMES_INTERP 16
 
 /* Maximum number of bpf_reg_state objects that can exist at once */
 #define MAX_STACK_ARG_SLOTS (MAX_BPF_STATIC_FUNC_ARGS - MAX_BPF_FUNC_REG_ARGS)
@@ -1665,6 +1675,8 @@ int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state);
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
 bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			  u32 idx, int subprog);
+void bpf_cancel_note_args(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			  int subprog);
 int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx);
 void bpf_cancel_record_acquire(struct bpf_verifier_env *env, enum bpf_cancel_acquire how);
 int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
