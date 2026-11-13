@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include <linux/pkt_cls.h>
+#include "cgroup_helpers.h"
 #include "cancel_refs.skel.h"
+
+#define CGROUP	"/cancel_refs"
 
 static char stream[64 * 1024];
 
@@ -132,6 +135,123 @@ static void test_dynptrs(struct cancel_refs *skel, struct ring_buffer *rb)
 	ASSERT_EQ(mm_users_now, mm_users, "file_dynptr_in_vma_loop mm");
 }
 
+struct child {
+	pid_t pid;
+	int wfd;
+};
+
+/* A task for the progs to take. It sleeps until the runner closes the pipe. */
+static bool start_child(struct child *child)
+{
+	int fds[2];
+	char c;
+
+	if (!ASSERT_OK(pipe(fds), "pipe"))
+		return false;
+	child->pid = fork();
+	if (child->pid == 0) {
+		close(fds[1]);
+		if (read(fds[0], &c, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	close(fds[0]);
+	child->wfd = fds[1];
+	if (!ASSERT_GT(child->pid, 0, "fork")) {
+		close(fds[1]);
+		return false;
+	}
+	return true;
+}
+
+static void stop_child(struct child *child)
+{
+	close(child->wfd);
+	waitpid(child->pid, NULL, 0);
+}
+
+/* The references to the task that the progs take, as probe_task() counts them */
+static int task_users(struct cancel_refs *skel)
+{
+	skel->bss->task_rcu_users = -1;
+	run(skel->progs.probe_task);
+	return skel->bss->task_rcu_users;
+}
+
+static void test_tasks(struct cancel_refs *skel)
+{
+	struct child child;
+	int users;
+
+	if (!start_child(&child))
+		return;
+	skel->bss->pid = child.pid;
+	users = task_users(skel);
+	if (!ASSERT_GT(users, 0, "task_users"))
+		goto out;
+
+	cancelled(skel, skel->progs.task_at_call);
+	ASSERT_EQ(task_users(skel), users, "task_at_call");
+	cancelled(skel, skel->progs.tasks_in_two_frames);
+	ASSERT_EQ(task_users(skel), users, "tasks_in_two_frames");
+	cancelled(skel, skel->progs.task_maybe_null_in_reg);
+	ASSERT_EQ(task_users(skel), users, "task_maybe_null_in_reg");
+	cancelled(skel, skel->progs.task_maybe_null_spilled);
+	ASSERT_EQ(task_users(skel), users, "task_maybe_null_spilled");
+	cancelled(skel, skel->progs.tasks_in_regs_and_slots);
+	ASSERT_EQ(task_users(skel), users, "tasks_in_regs_and_slots");
+
+	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
+	skel->bss->pid = -1;
+	cancelled(skel, skel->progs.task_maybe_null_in_reg);
+	cancelled(skel, skel->progs.task_maybe_null_spilled);
+	cancelled(skel, skel->progs.tasks_in_regs_and_slots);
+out:
+	stop_child(&child);
+}
+
+/*
+ * A cgroup that was removed is released when the last reference to it is gone, and never if
+ * a pad left one behind.
+ */
+static void test_cgroup(struct cancel_refs *skel)
+{
+	struct bpf_link *link;
+	int fd, i;
+
+	if (!ASSERT_OK(setup_cgroup_environment(), "setup_cgroup_environment"))
+		return;
+	fd = create_and_get_cgroup(CGROUP);
+	if (!ASSERT_GE(fd, 0, "create_and_get_cgroup"))
+		goto out;
+	close(fd);
+	skel->bss->cgid = get_cgroup_id(CGROUP);
+	skel->bss->cgroup_released = 0;
+	link = bpf_program__attach(skel->progs.on_cgroup_release);
+	if (!ASSERT_OK_PTR(link, "attach")) {
+		remove_cgroup(CGROUP);
+		goto out;
+	}
+
+	cancelled(skel, skel->progs.cgroup_at_call);
+	remove_cgroup(CGROUP);
+	for (i = 0; i < 1000 && !skel->bss->cgroup_released; i++)
+		usleep(10000);
+	ASSERT_EQ(skel->bss->cgroup_released, 1, "cgroup_at_call");
+	bpf_link__destroy(link);
+out:
+	cleanup_cgroup_environment();
+}
+
+static void test_cpumask(struct cancel_refs *skel)
+{
+	cancelled(skel, skel->progs.cpumask_at_call);
+	/* the map has a reference, which the probe takes. The one of the prog is gone. */
+	skel->bss->cpumask_usage = -1;
+	ASSERT_EQ(run(skel->progs.probe_cpumask), 0, "probe_cpumask");
+	ASSERT_EQ(skel->bss->cpumask_usage, 1, "cpumask_at_call");
+}
+
 void serial_test_cancel_refs(void)
 {
 	struct ring_buffer *rb = NULL;
@@ -160,6 +280,12 @@ void serial_test_cancel_refs(void)
 		test_iters(skel);
 	if (test__start_subtest("dynptrs"))
 		test_dynptrs(skel, rb);
+	if (test__start_subtest("tasks"))
+		test_tasks(skel);
+	if (test__start_subtest("cgroup"))
+		test_cgroup(skel);
+	if (test__start_subtest("cpumask"))
+		test_cpumask(skel);
 out:
 	ring_buffer__free(rb);
 	cancel_refs__destroy(skel);

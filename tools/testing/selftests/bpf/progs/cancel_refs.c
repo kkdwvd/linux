@@ -454,7 +454,373 @@ int ringbuf_submit(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+/*
+ * A reference to a kernel object. Its handle is the pointer that the kfunc returned, in a
+ * register or in a stack slot of the frame, and the pad makes the call that the prog makes to
+ * release it: bpf_task_release(), bpf_cgroup_release() or bpf_cpumask_release().
+ */
+
 /* What the progs take: the task with this pid, another task, and the cgroup with this id */
 int pid;
 int pid2;
 __u64 cgid;
+
+SEC("tc")
+__description("cancel refs: the task of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int task_at_call(struct __sk_buff *skb)
+{
+	struct task_struct *task;
+
+	task = bpf_task_from_pid(pid);
+	if (!task)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_task_release(task);
+	return TC_ACT_OK;
+}
+
+static __noinline int holds_copy(struct task_struct *task)
+{
+	struct task_struct *copy;
+
+	copy = bpf_task_acquire(task);
+	if (!copy)
+		return 0;
+	dives();
+	behind++;
+	bpf_task_release(copy);
+	return 1;
+}
+
+/*
+ * Each frame releases what it took: the pad of holds_copy() the copy, and the pad of the call
+ * of holds_copy() here the task.
+ */
+SEC("tc")
+__description("cancel refs: two frames that wait in calls release a task each")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+int tasks_in_two_frames(struct __sk_buff *skb)
+{
+	struct task_struct *task;
+
+	task = bpf_task_from_pid(pid);
+	if (!task)
+		return TC_ACT_OK;
+	holds_copy(task);
+	behind++;
+	bpf_task_release(task);
+	return TC_ACT_OK;
+}
+
+/* r0 = bpf_task_from_pid(@var) in assembly */
+#define TASK_FROM(var)				\
+	"r1 = %[" #var "] ll;"			\
+	"r1 = *(u32 *)(r1 + 0);"		\
+	"call %[bpf_task_from_pid];"
+
+#define TASK_FROM_PID	TASK_FROM(pid)
+
+/* bpf_task_release() of the task in @reg unless that is NULL, with r1 */
+#define RELEASE_TASK(reg)			\
+	"if " #reg " == 0 goto 9f;"		\
+	"r1 = " #reg ";"			\
+	"call %[bpf_task_release];"		\
+"9:"
+
+/*
+ * The prog did not test the task since bpf_task_from_pid() returned it: there may be none.
+ * The pad makes the test and leaves the call out for NULL.
+ */
+SEC("tc")
+__description("cancel refs: a task in r6 that may be NULL is tested and released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void task_maybe_null_in_reg(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"r6 = r0;"
+		"call dives;"
+		COUNT(behind)
+		RELEASE_TASK(r6)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/* The only copy that outlives the call is in the stack. The prog loads it to r2, the pad to r1. */
+SEC("tc")
+__description("cancel refs: a task in a stack slot that may be NULL is tested and released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void task_maybe_null_spilled(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"*(u64 *)(r10 - 8) = r0;"
+		"call dives;"
+		COUNT(behind)
+		"r2 = *(u64 *)(r10 - 8);"
+		RELEASE_TASK(r2)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * Six references of one frame, in every register that a call keeps and in two stack slots.
+ * The pad releases them place by place, the stack first.
+ */
+SEC("tc")
+__description("cancel refs: tasks in r6-r9 and in stack slots are all released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("r1 = *(u64 *)(r10 -16)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = r7")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = r8")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = r9")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void tasks_in_regs_and_slots(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"r6 = r0;"
+		TASK_FROM_PID
+		"r7 = r0;"
+		TASK_FROM_PID
+		"r8 = r0;"
+		TASK_FROM_PID
+		"r9 = r0;"
+		TASK_FROM_PID
+		"*(u64 *)(r10 - 8) = r0;"
+		TASK_FROM_PID
+		"*(u64 *)(r10 - 16) = r0;"
+		"call dives;"
+		COUNT(behind)
+		RELEASE_TASK(r6)
+		RELEASE_TASK(r7)
+		RELEASE_TASK(r8)
+		RELEASE_TASK(r9)
+		"r2 = *(u64 *)(r10 - 8);"
+		RELEASE_TASK(r2)
+		"r2 = *(u64 *)(r10 - 16);"
+		RELEASE_TASK(r2)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("cancel refs: the cgroup of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int cgroup_at_call(struct __sk_buff *skb)
+{
+	struct cgroup *cgrp, *held;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return TC_ACT_OK;
+	held = bpf_cgroup_acquire(cgrp);
+	bpf_cgroup_release(cgrp);
+	if (!held)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	bpf_cgroup_release(held);
+	return TC_ACT_OK;
+}
+
+struct cpumask_val {
+	struct bpf_cpumask __kptr *mask;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct cpumask_val);
+} cpumasks SEC(".maps");
+
+/*
+ * The map has a second reference to the cpumask when the prog is cancelled, for the runner to
+ * count what is left, see probe_cpumask().
+ */
+SEC("syscall")
+__description("cancel refs: the cpumask of a frame that waits in a call is released")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int cpumask_at_call(void *ctx)
+{
+	struct bpf_cpumask *mask, *old;
+	struct cpumask_val *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&cpumasks, &key);
+	if (!v)
+		return 1;
+	mask = bpf_cpumask_create();
+	if (!mask)
+		return 1;
+	old = bpf_kptr_xchg(&v->mask, bpf_cpumask_acquire(mask));
+	if (old)
+		bpf_cpumask_release(old);
+	dives();
+	behind++;
+	bpf_cpumask_release(mask);
+	return 1;
+}
+
+/*
+ * A prog is not loaded when a cancellation gets to a site whose pad could not release what the
+ * frame holds, or would release it twice. The log has a line for the site, with the limit.
+ *
+ * A conntrack entry that was allocated and not inserted yet is a nf_conn___init. The only
+ * kfunc that takes the reference is bpf_ct_insert_entry(), which returns another one: the type
+ * names no kfunc that generated code may call to release it.
+ */
+SEC("?tc")
+__description("cancel refs: a reference to a type without a release kfunc is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(release)")
+int no_release_kfunc(struct __sk_buff *skb)
+{
+	struct bpf_ct_opts opts = { .netns_id = BPF_F_CURRENT_NETNS, .l4proto = IPPROTO_UDP };
+	struct bpf_sock_tuple tuple = {};
+	struct nf_conn___init *init;
+	struct nf_conn *ct;
+
+	init = bpf_skb_ct_alloc(skb, &tuple, sizeof(tuple.ipv4), &opts, sizeof(opts));
+	if (!init)
+		return TC_ACT_OK;
+	dives();
+	behind++;
+	ct = bpf_ct_insert_entry(init);
+	if (ct)
+		bpf_ct_release(ct);
+	return TC_ACT_OK;
+}
+
+/* The runner looks at what the progs above held through the next three */
+
+int task_rcu_users;
+
+/* The references to the task that the progs take, this one among them */
+SEC("tc")
+int probe_task(struct __sk_buff *skb)
+{
+	struct task_struct *task;
+
+	task = bpf_task_from_pid(pid);
+	if (!task)
+		return TC_ACT_OK;
+	task_rcu_users = task->rcu_users.refs.counter;
+	bpf_task_release(task);
+	return TC_ACT_OK;
+}
+
+int cgroup_released;
+
+/* The cgroup that cgroup_at_call() took is released, some time after it was removed */
+SEC("tp_btf/cgroup_release")
+int BPF_PROG(on_cgroup_release, struct cgroup *cgrp, const char *path)
+{
+	if (cgrp->kn->id == cgid)
+		cgroup_released = 1;
+	return 0;
+}
+
+int cpumask_usage;
+
+/* The references to the cpumask that cpumask_at_call() left in the map, this one among them */
+SEC("syscall")
+int probe_cpumask(void *ctx)
+{
+	struct bpf_cpumask *mask;
+	struct cpumask_val *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&cpumasks, &key);
+	if (!v)
+		return 1;
+	mask = bpf_kptr_xchg(&v->mask, NULL);
+	if (!mask)
+		return 1;
+	cpumask_usage = mask->usage.refs.counter;
+	bpf_cpumask_release(mask);
+	return 0;
+}
