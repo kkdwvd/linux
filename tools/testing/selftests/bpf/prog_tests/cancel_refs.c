@@ -256,6 +256,61 @@ static void test_cpumask(struct cancel_refs *skel)
 	ASSERT_EQ(skel->bss->cpumask_usage, 1, "cpumask_at_call");
 }
 
+/* The references to the socket that the progs look up, as probe_sock() counts them */
+static int sock_users(struct cancel_refs *skel)
+{
+	skel->bss->sock_refcnt = -1;
+	run(skel->progs.probe_sock);
+	return skel->bss->sock_refcnt;
+}
+
+static void test_sockets(struct cancel_refs *skel, struct ring_buffer *rb)
+{
+	int srv, cli = -1, acc = -1, users;
+
+	/*
+	 * A lookup takes no reference to a socket that listens. It takes one to the socket of
+	 * a connection: the one that accept() returns, which gets what the client sends.
+	 */
+	srv = start_server(AF_INET, SOCK_STREAM, "127.0.0.1", 0, 0);
+	if (!ASSERT_OK_FD(srv, "start_server"))
+		return;
+	cli = connect_to_fd(srv, 0);
+	if (!ASSERT_OK_FD(cli, "connect_to_fd"))
+		goto out;
+	acc = accept(srv, NULL, NULL);
+	if (!ASSERT_OK_FD(acc, "accept"))
+		goto out;
+	skel->bss->tuple_saddr = htonl(INADDR_LOOPBACK);
+	skel->bss->tuple_daddr = htonl(INADDR_LOOPBACK);
+	skel->bss->tuple_sport = get_socket_local_port(cli);
+	skel->bss->tuple_dport = get_socket_local_port(srv);
+	users = sock_users(skel);
+	if (!ASSERT_GT(users, 0, "sock_users"))
+		goto out;
+
+	cancelled(skel, skel->progs.sock_at_call);
+	ASSERT_EQ(sock_users(skel), users, "sock_at_call");
+	cancelled(skel, skel->progs.skc_at_call);
+	ASSERT_EQ(sock_users(skel), users, "skc_at_call");
+
+	/* Nothing has port 0: the handle is NULL, and the pad calls nothing with it. */
+	skel->bss->tuple_dport = 0;
+	cancelled(skel, skel->progs.sock_at_call);
+out:
+	if (acc >= 0)
+		close(acc);
+	if (cli >= 0)
+		close(cli);
+	close(srv);
+}
+
+static void test_ringbuf(struct cancel_refs *skel, struct ring_buffer *rb)
+{
+	cancelled(skel, skel->progs.ringbuf_at_call);
+	ringbuf_is_clean(skel, rb, "ringbuf_at_call");
+}
+
 /* The references to the object of the test kfuncs, as probe_test_ref() counts them */
 static int test_ref_users(struct cancel_refs *skel)
 {
@@ -472,6 +527,10 @@ void serial_test_cancel_refs(void)
 		test_net(skel);
 	if (test__start_subtest("wakeup sources"))
 		test_wakeup_sources(skel);
+	if (test__start_subtest("sockets"))
+		test_sockets(skel, rb);
+	if (test__start_subtest("ringbuf"))
+		test_ringbuf(skel, rb);
 out:
 	ring_buffer__free(rb);
 	cancel_refs__destroy(skel);
