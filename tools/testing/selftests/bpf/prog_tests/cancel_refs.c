@@ -199,7 +199,7 @@ static void test_only_copy_in_stack_arg(struct cancel_refs *skel, int users)
 static void test_tasks(struct cancel_refs *skel)
 {
 	struct child child;
-	int users;
+	int users, self;
 
 	if (!start_child(&child))
 		return;
@@ -223,6 +223,36 @@ static void test_tasks(struct cancel_refs *skel)
 	ASSERT_EQ(task_users(skel), users, "only_copy_in_arg");
 	/* and so does the one that was given it in a stack argument */
 	test_only_copy_in_stack_arg(skel, users);
+
+	/* the path that holds the task: its drop flag is set, and the pad releases the task */
+	skel->bss->zero = 0;
+	cancelled(skel, skel->progs.held_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "held_on_one_path");
+	/*
+	 * The other path has the task that runs the prog in the place of the handle, and
+	 * holds nothing: the pad finds the flag clear and leaves that task alone.
+	 */
+	skel->bss->pid = sys_gettid();
+	self = task_users(skel);
+	skel->bss->zero = 1;
+	cancelled(skel, skel->progs.held_on_one_path);
+	ASSERT_EQ(task_users(skel), self, "held_on_one_path without the task");
+	cancelled(skel, skel->progs.returned_on_one_path);
+	ASSERT_EQ(task_users(skel), self, "returned_on_one_path without the task");
+	skel->bss->zero = 0;
+
+	/* the callee returns with the task, and the path that calls it holds the task */
+	skel->bss->pid = child.pid;
+	cancelled(skel, skel->progs.returned_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "returned_on_one_path");
+	/*
+	 * The frame that is cancelled has the task that runs the prog where its handle would
+	 * be, and its flag is where the frame before it left one set.
+	 */
+	cancelled(skel, skel->progs.flag_of_second_frame);
+	ASSERT_EQ(task_users(skel), users, "flag_of_second_frame");
+	skel->bss->pid = sys_gettid();
+	ASSERT_EQ(task_users(skel), self, "flag_of_second_frame: the task that runs it");
 
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;

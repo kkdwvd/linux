@@ -20,6 +20,10 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* The verifier doesn't know what is in there */
+unsigned long zero;
+unsigned long dive;
+
 /* The frames of a recursion that began, and how many times the code behind a point ran */
 unsigned long frames;
 unsigned long behind;
@@ -132,6 +136,94 @@ __xlated("r0 = r7")
 __naked void call_33k(void)
 {
 	CALL_PROG(REPS_33K);
+}
+
+/* r1: whether to dive first. r0 = a record or NULL: the frame returns with it. */
+__naked __noinline __used
+static unsigned long gets_record(void)
+{
+	asm volatile (
+		"if r1 == 0 goto 1f;"
+		"call dives;"
+	"1:"
+		RESERVE
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_reserve),
+		  __imm_addr(ringbuf)
+		: __clobber_all
+	);
+}
+
+/*
+ * One of the two paths to the call of dives() holds a record: the one that gets_record() returned
+ * with. The frame has a drop flag for it, which is set behind the call of gets_record(): behind
+ * its cancel_goto, where only a call that returns gets to. Both calls have their pads behind the
+ * exit. The pad of the first one runs when gets_record() dives, and releases nothing.
+ */
+#define FLAG_PROG(reps)						\
+	asm volatile (						\
+		"r7 = 0;"					\
+		"r1 = %[zero] ll;"				\
+		"r1 = *(u64 *)(r1 + 0);"			\
+		"if r1 != 0 goto 2f;"				\
+		"r1 = %[dive] ll;"				\
+		"r1 = *(u64 *)(r1 + 0);"			\
+		"call gets_record;"				\
+		"if r0 != 0 goto 1f;"				\
+		"r0 = 0;"					\
+		"exit;"						\
+	"1:"							\
+		"r6 = r0;"					\
+		"r7 = 1;"					\
+		"goto 3f;"					\
+	"2:"							\
+		"r6 = 0;"					\
+	"3:"							\
+		"call dives;"					\
+		FILL(reps)					\
+		COUNT(behind)					\
+		"if r7 == 0 goto 4f;"				\
+		"r1 = r6;"					\
+		"r2 = 0;"					\
+		"call %[bpf_ringbuf_discard];"			\
+	"4:"							\
+		"r0 = 0;"					\
+		"exit;"						\
+		:						\
+		: __imm(bpf_ringbuf_discard),			\
+		  __imm_addr(zero),				\
+		  __imm_addr(dive),				\
+		  __imm_addr(behind)				\
+		: __clobber_all					\
+	)
+
+SEC("tc")
+__description("cancel far: a drop flag behind a call whose pad is more than 2048 insns away")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{(2[1-9]|[3-9][0-9])[0-9][0-9]$}}")
+__naked void flag_2k(void)
+{
+	FLAG_PROG(REPS_2K);
+}
+
+SEC("tc")
+__description("cancel far: a drop flag behind a call whose pad is more than 32767 insns away")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 5 padded 5 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{(3[3-9]|[4-9][0-9])[0-9][0-9][0-9]$}}")
+__naked void flag_33k(void)
+{
+	FLAG_PROG(REPS_33K);
 }
 
 /* The ring buffer takes a record and hands it to the consumer */

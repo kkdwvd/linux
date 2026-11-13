@@ -1025,6 +1025,277 @@ int callee_restores_irq_flags(struct __sk_buff *ctx)
 }
 
 /*
+ * What only some of the states that get to a site hold. Only the run of the program knows which
+ * of them it is in, so the frame gets a drop flag for such a lock or such IRQ flags: a hidden
+ * byte of its stack that is 1 while the frame holds them. The verifier sets it behind the call
+ * that takes them and clears it in front of the call that gives them back, and the pad releases
+ * them under a test of the flag. The runner takes both ways to the site.
+ *
+ * Two states get to the call with the same flags in the same slots. One saved the upper slot
+ * first, the other one the lower slot. These are four entries, each with the flag of the call
+ * that saved it: the pad has the two that were saved second first, and restores the two that
+ * this run saved, in its order.
+ */
+SEC("tc")
+__description("cancel: IRQ flags that two visits of a call saved in another order")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -{{[0-9]+}})")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("r1 = *(u8 *)(r10 -{{[0-9]+}})")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("r1 = *(u8 *)(r10 -{{[0-9]+}})")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("r1 = *(u8 *)(r10 -{{[0-9]+}})")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void irq_save_orders_differ(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 5f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 != 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"goto 2f;"
+	"1:"
+		"r7 = 1;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"2:"
+		"call dives;"
+		"if r7 != 0 goto 3f;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"goto 4f;"
+	"3:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+	"4:"
+		asm_count(behind)
+	"5:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * One of the two states that get to the call holds the lock. The flag is the byte at fp-1: set
+ * behind bpf_spin_lock(), cleared in front of bpf_spin_unlock(), and tested by the pad, which
+ * is behind the exit of the main program.
+ */
+SEC("tc")
+__description("cancel: bpf_spin_lock that one of two visits of a call holds")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("r7 = 1")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("call unknown")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+{{[0-9]+}}")
+__xlated("if r7 == 0x0 goto pc+4")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call unknown")
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("call unknown")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void spin_lock_in_one_visit(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 3f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 == 0 goto 1f;"
+		"r7 = 1;"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_lock];"
+	"1:"
+		"call dives;"
+		"if r7 == 0 goto 2f;"
+		"r1 = %[spin_a] ll;"
+		"call %[bpf_spin_unlock];"
+	"2:"
+		asm_count(behind)
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm_addr(zero),
+		  __imm_addr(spin_a),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * bpf_res_spin_lock() may fail, and R0 tells: the flag is set behind the call if R0 is 0, and
+ * a lock that was not to be had leaves it clear.
+ */
+SEC("tc")
+__description("cancel: bpf_res_spin_lock that one of two visits of a call holds")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(TC_ACT_SHOT) __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("call kernel-function")
+__xlated("if w0 != 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -1) = 1")
+__xlated("...")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("*(u8 *)(r10 -1) = 0")
+__xlated("call kernel-function")
+__xlated("...")
+__xlated("r1 = *(u8 *)(r10 -1)")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = 0x{{[0-9a-f]+}}")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void res_lock_in_one_visit(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 3f;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 == 0 goto 1f;"
+		"r1 = %[res_a] ll;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 4f;"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		"if r7 == 0 goto 2f;"
+		"r1 = %[res_a] ll;"
+		"call %[bpf_res_spin_unlock];"
+	"2:"
+		asm_count(behind)
+	"3:"
+		"r0 = 0;"
+		"exit;"
+	"4:"
+		asm_count(lock_err)
+		"goto 3b;"
+		:
+		: __imm(bpf_res_spin_lock),
+		  __imm(bpf_res_spin_unlock),
+		  __imm_addr(zero),
+		  __imm_addr(res_a),
+		  __imm_addr(behind),
+		  __imm_addr(lock_err)
+		: __clobber_all
+	);
+}
+
+/*
+ * One state saved the flags of the upper slot before those of the lower slot, the other one
+ * saved the lower slot only. The lower slot is restored first in the one and second in the
+ * other, which is two entries of the pad for what one call saved: its flag would restore twice.
+ */
+SEC("tc")
+__description("cancel: IRQ flags that one of two visits of a call saved under one more are rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(places)")
+__naked void irq_save_under_one_more(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"r7 = 0;"
+		"if r6 == 0 goto 1f;"
+		"r7 = 1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"1:"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_save];"
+		"call dives;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_local_irq_restore];"
+		"if r7 == 0 goto 2f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/*
  * RCU read sections and preemption-disabled sections. The verifier counts them, and the pad of a
  * frame leaves the sections that the frame entered, or that a callee entered and returned in: one
  * call for each section, behind what unlocks and restores, and four of a kind at most.
