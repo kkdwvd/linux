@@ -199,7 +199,7 @@ __naked void call_through(void)
 	: __clobber_all);
 }
 
-unsigned long first_r12, last_r12;
+unsigned long first_r12, last_r12, result;
 
 /* 1024 bytes in the stack in arena, nothing in the kernel stack */
 static __naked __noinline __used long goes_down(void)
@@ -218,11 +218,36 @@ static __naked __noinline __used long goes_down(void)
 	: __clobber_all);
 }
 
-/* The check of a recursion looks at the kernel stack. It fails before 32K of arena are used. */
+/*
+ * The check of a recursion looks at the kernel stack. When it fails the program is cancelled:
+ * every frame gives its part of the stack in arena back in its pad, and a syscall program
+ * returns 0.
+ */
 SEC("syscall")
-__description("arena stack: recursion ends in the stack")
-__success __retval(1)
+__description("arena stack: recursion ends the program")
+__success __retval(0)
 __naked void recursion(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+	".8byte %[mov];"	/* r1 = r12 */
+	"r2 = %[first_r12] ll;"
+	"*(u64 *)(r2 + 0) = r1;"
+	"call goes_down;"
+	"r0 = 1;"
+	"exit;"
+	:
+	: __imm_addr(first_r12),
+	  __imm_insn(adj, ADJ(32)),
+	  __imm_insn(mov, MOV(BPF_REG_1))
+	: __clobber_all);
+}
+
+/*
+ * A callback that a helper calls is not cancelled: the call that finds no room in the kernel
+ * stack returns, and so do all the others. The check fails before 32K of arena are used.
+ */
+static __naked __noinline __used long goes_down_cb(void)
 {
 	asm volatile (
 	".8byte %[adj];"
@@ -239,12 +264,36 @@ __naked void recursion(void)
 	"if r1 < 8192 goto +2;"
 	"if r1 > 32736 goto +1;"
 	"r0 = 1;"
+	"r2 = %[result] ll;"
+	"*(u64 *)(r2 + 0) = r0;"
+	"r0 = 0;"
 	"exit;"
 	:
 	: __imm_addr(first_r12),
 	  __imm_addr(last_r12),
+	  __imm_addr(result),
 	  __imm_insn(adj, ADJ(32)),
 	  __imm_insn(mov, MOV(BPF_REG_1))
+	: __clobber_all);
+}
+
+SEC("syscall")
+__description("arena stack: recursion in a callback ends in the stack")
+__success __retval(1)
+__naked void recursion_in_callback(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"r2 = goes_down_cb ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"r1 = %[result] ll;"
+	"r0 = *(u64 *)(r1 + 0);"
+	"exit;"
+	:
+	: __imm_addr(result),
+	  __imm(bpf_loop)
 	: __clobber_all);
 }
 
