@@ -11996,6 +11996,22 @@ static u32 returned_id(u32 id)
 }
 
 /*
+ * The function found a pointer to be NULL whose reference @caller holds, and @caller, which waits
+ * at the call, does not know, see ref_of_caller()
+ */
+static bool found_null_of_caller(const struct bpf_verifier_state *caller,
+				 const struct bpf_verifier_state *exit)
+{
+	u32 i;
+
+	for (i = 0; i < caller->acquired_refs; i++)
+		if (exit->refs[i].type == REF_TYPE_PTR && exit->refs[i].found_null &&
+		    !caller->refs[i].found_null)
+			return true;
+	return false;
+}
+
+/*
  * @caller waits at the call at @call_idx. @exit is the state at the exit of the
  * function. Make @caller the state after the call.
  */
@@ -12006,6 +12022,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	const struct bpf_func_state *callee = exit->frame[0];
 	u32 i, nregs, nheld = caller->acquired_refs;
 	struct bpf_reg_state *reg;
+	bool found_null;
 	int err;
 
 	caller->speculative |= exit->speculative;
@@ -12014,15 +12031,20 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	 * the function released a lock and acquired it again. Else verify the function in the
 	 * instance of the caller. The caller has non-owning references only under a lock, which
 	 * is one of what it holds.
+	 * A function that returns after it found a reference of the caller to be NULL is the
+	 * same to the caller: nothing is held on that path.
 	 */
+	found_null = callee->entry_refs == nheld && !exit->unwound &&
+		     found_null_of_caller(caller, exit);
 	if (callee->entry_refs < nheld || (exit->invalidated_non_owning && nheld) ||
 	    callee->entry_rcu_locks < caller->active_rcu_locks ||
-	    callee->entry_preempt_locks < caller->active_preempt_locks) {
+	    callee->entry_preempt_locks < caller->active_preempt_locks || found_null) {
 		if (exit->speculative)
 			return -EACCES;
 		if (env->log.level & BPF_LOG_LEVEL2)
-			verbose(env, "func#%d releases what its caller holds at insn %d\n",
-				callee->subprogno, call_idx);
+			verbose(env, "func#%d %s what its caller holds at insn %d\n",
+				callee->subprogno, found_null ? "finds NULL" : "releases",
+				call_idx);
 		env->subprog_info[callee->subprogno].releases_inherited = true;
 		return BPF_EXIT_NEEDS_CALLER;
 	}
@@ -13040,6 +13062,9 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type != REF_TYPE_PTR)
+			continue;
+		/* found NULL on this path, see ref_of_caller(): a throw leaks nothing */
+		if (exception_exit && state->refs[i].found_null)
 			continue;
 		/* Allow struct_ops programs to return a referenced kptr back to
 		 * kernel. Type checks are performed later in check_return_code.
@@ -19406,6 +19431,35 @@ static void mark_ptr_or_null_reg(struct bpf_func_state *state,
 	}
 }
 
+/*
+ * A function that is verified on its own has what its caller holds in the first of refs[], and
+ * no register of the caller. When it finds such a pointer to be NULL, nothing is held on this
+ * path. The caller answers for the reference all the same: in its state the pointer can be NULL,
+ * and it tests the pointer before it uses or releases it, as a landing pad of its frame does. So
+ * the reference stays in refs[], and the entry notes what was found, which keeps the state apart
+ * from those that have not found it, see same_refs(). After the test no register of the function
+ * has the pointer, so the function cannot release it.
+ * Where the function returns, the caller may rely on what was found: the call is verified once
+ * more in the frames of the caller, see bpf_flow_return(), as it is when the function releases
+ * the reference. Where the function is unwound, the caller is unwound in turn, and its landing
+ * pad tests the pointer: nothing is lost on its own, and there a recursion has an end.
+ * The mark does not come out of the function on that way. So a landing pad that the program has
+ * behind the call, for unwind_exit of the function, starts with the reference held and with a
+ * pointer that can be NULL, also on the path on which the function found it to be NULL: it has to
+ * test the pointer itself before it leaves, or it is refused for a reference that is not
+ * released.
+ * Returns the entry of the reference @id if the caller of frame 0 holds it.
+ */
+static struct bpf_reference_state *ref_of_caller(struct bpf_verifier_state *st, u32 id)
+{
+	u32 i;
+
+	for (i = 0; i < st->frame[0]->entry_refs; i++)
+		if (st->refs[i].type == REF_TYPE_PTR && st->refs[i].id == id)
+			return &st->refs[i];
+	return NULL;
+}
+
 /* The logic is similar to find_good_pkt_pointers(), both could eventually
  * be folded together at some point.
  */
@@ -19414,14 +19468,20 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
 {
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *regs = state->regs, *reg;
+	struct bpf_reference_state *ref;
 	u32 id = regs[regno].id;
 
-	if (is_null && find_reference_state(vstate, id))
-		/* regs[regno] is in the " == NULL" branch.
-		 * No one could have freed the reference state before
-		 * doing the NULL check.
-		 */
-		WARN_ON_ONCE(__release_reference_nomark(vstate, id));
+	if (is_null && find_reference_state(vstate, id)) {
+		ref = ref_of_caller(vstate, id);
+		if (ref)
+			ref->found_null = true;
+		else
+			/* regs[regno] is in the " == NULL" branch.
+			 * No one could have freed the reference state before
+			 * doing the NULL check.
+			 */
+			WARN_ON_ONCE(__release_reference_nomark(vstate, id));
+	}
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
 		mark_ptr_or_null_reg(state, reg, id, is_null);

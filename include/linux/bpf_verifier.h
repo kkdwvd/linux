@@ -389,10 +389,17 @@ struct bpf_reference_state {
 	 */
 	int origin;
 	union {
-		/* For REF_TYPE_PTR */
+		/* For REF_TYPE_PTR. Compared and hashed, see same_refs(): no holes. */
 		struct {
 			int parent_id;
-			u32 ctx_arg;	/* it came with that __ref argument, the first is 1 */
+			u16 ctx_arg;	/* it came with that __ref argument, the first is 1 */
+			/*
+			 * A function that is verified on its own found the pointer to be NULL,
+			 * and its caller holds the reference, see ref_of_caller(). The mark
+			 * stays in the function when that is unwound: a pad of the caller
+			 * sees the reference held.
+			 */
+			u16 found_null;
 		};
 		/* Use to keep track of the source object of a lock, to ensure
 		 * it matches on unlock.
