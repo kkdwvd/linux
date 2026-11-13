@@ -513,6 +513,18 @@ static void test_objects(struct cancel_refs *skel)
 	/* the list is empty: the handle is NULL, and the pad drops nothing */
 	cancelled(skel, skel->progs.list_node_at_call);
 
+	/* the pad has the pointer to the node and drops the object that the node is in */
+	run(skel->progs.tail_push);
+	ASSERT_EQ(task_users(skel), users + 1, "tail_push");
+	cancelled(skel, skel->progs.list_node_not_first);
+	ASSERT_EQ(task_users(skel), users, "list_node_not_first");
+	cancelled(skel, skel->progs.list_node_not_first);
+	run(skel->progs.tail_push);
+	ASSERT_EQ(task_users(skel), users + 1, "tail_push");
+	cancelled(skel, skel->progs.list_node_spilled);
+	ASSERT_EQ(task_users(skel), users, "list_node_spilled");
+	cancelled(skel, skel->progs.list_node_spilled);
+
 	/* a per-CPU object leaves nothing behind that could be found */
 	cancelled(skel, skel->progs.percpu_obj_at_call);
 out:

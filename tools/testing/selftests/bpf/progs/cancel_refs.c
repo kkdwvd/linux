@@ -1425,6 +1425,116 @@ int list_node_at_call(struct __sk_buff *skb)
 }
 
 /*
+ * The frame has the pointer to the node, 8 bytes into the object, and no pointer to the
+ * object until the prog has made one behind the call. The pad makes it: it tests the pointer
+ * to the node, takes the 8 bytes off and drops the object.
+ */
+SEC("tc")
+__description("cancel refs: a node that is not the first member is dropped with its object")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+int list_node_not_first(struct __sk_buff *skb)
+{
+	struct bpf_list_node *n;
+
+	bpf_spin_lock(&tail_lock);
+	n = bpf_list_pop_front(&tail_head);
+	bpf_spin_unlock(&tail_lock);
+	dives();
+	behind++;
+	if (n)
+		bpf_obj_drop(container_of(n, struct elem_tail, node));
+	return TC_ACT_OK;
+}
+
+/* The same with the pointer to the node in a stack slot, where the insns of the pad show */
+SEC("tc")
+__description("cancel refs: a node in a stack slot is dropped with the object that it is in")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+5")
+__xlated("r1 += -8")
+__xlated("r2 = 0x{{.*}}")
+__xlated("r3 = 0")
+__xlated("call unknown")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void list_node_spilled(void)
+{
+	asm volatile (
+		"r1 = %[tail_lock] ll;"
+		"call %[bpf_spin_lock];"
+		"r1 = %[tail_head] ll;"
+		"call %[bpf_list_pop_front];"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = %[tail_lock] ll;"
+		"call %[bpf_spin_unlock];"
+		"call dives;"
+		COUNT(behind)
+		"r1 = *(u64 *)(r10 - 8);"
+		"if r1 == 0 goto 1f;"
+		"r1 += -8;"
+		"call %[bpf_obj_drop];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_spin_lock),
+		  __imm(bpf_spin_unlock),
+		  __imm(bpf_list_pop_front),
+		  __imm(bpf_obj_drop),
+		  __imm_addr(tail_lock),
+		  __imm_addr(tail_head),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * Only an object that the prog owns is found through a pointer into it. A kernel object is
+ * released by a kfunc that takes the pointer which was acquired, and the frame has no such
+ * pointer at the call.
+ */
+SEC("?tc")
+__description("cancel refs: a pointer into a task is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("the program cannot be cancelled at this call:")
+__msg("(place)")
+__naked void pointer_into_task(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r6 += 8;"
+		"call dives;"
+		"r6 += -8;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+/*
  * One frame holds something of every kind. The pad discards the dynptr, destroys the
  * iterator and releases the three references, each the way of its kind.
  */
@@ -1479,6 +1589,22 @@ int list_push(struct __sk_buff *skb)
 	bpf_spin_lock(&list_lock);
 	bpf_list_push_front(&list_head, &e->node);
 	bpf_spin_unlock(&list_lock);
+	return TC_ACT_OK;
+}
+
+/* and one for list_node_not_first() and list_node_spilled() */
+SEC("tc")
+int tail_push(struct __sk_buff *skb)
+{
+	struct elem_tail *e;
+
+	e = bpf_obj_new(typeof(*e));
+	if (!e)
+		return TC_ACT_OK;
+	hold_task(&e->task);
+	bpf_spin_lock(&tail_lock);
+	bpf_list_push_front(&tail_head, &e->node);
+	bpf_spin_unlock(&tail_lock);
 	return TC_ACT_OK;
 }
 
