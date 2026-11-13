@@ -29,8 +29,9 @@
  *   the reader of the file.
  * - RCU read sections and preemption-disabled sections: the pad leaves the ones
  *   that its frame entered.
- * - references to kernel objects whose handle the frame has in a register or in
- *   a stack slot, where a kfunc releases them, see cancel_collect_ptr().
+ * - references whose handle the frame has in a register or in a stack slot,
+ *   where a kfunc or a helper releases them: a kernel object, a socket, a
+ *   ringbuf record, see cancel_collect_ptr().
  * A frame that holds anything else of its own declines. So does the frame that
  * waits in a call when a callee releases what the frame holds: its pad would
  * release that again.
@@ -932,6 +933,22 @@ static int cancel_collect_dynptr(struct bpf_verifier_env *env, const struct bpf_
 
 /* flags: the handle is NULL if nothing was acquired, and the pad tests it */
 #define CANCEL_PTR_NULL		BIT(0)
+/* arg is the id of a helper */
+#define CANCEL_PTR_HELPER	BIT(1)
+
+/* May a pad call helper @func_id: the program may, and it is a call that does not sleep */
+static bool cancel_helper_ok(struct bpf_verifier_env *env, int func_id)
+{
+	const struct bpf_func_proto *fn;
+
+	if (bpf_get_helper_proto(env, func_id, &fn))
+		return false;
+	if (fn->gpl_only && !env->prog->gpl_compatible)
+		return false;
+	if (fn->allowed && !fn->allowed(env->prog))
+		return false;
+	return !fn->might_sleep;
+}
 
 /*
  * Is reference @id the one of an iterator or of a dynptr, in the stack of whichever frame?
@@ -990,22 +1007,54 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 {
 	u32 flags = type_flag(reg->type) & ~PTR_MAYBE_NULL;
 	struct bpf_release_kfunc rel;
+	int helper = 0;
 
 	if (!tnum_equals_const(reg->var_off, 0))
 		return reason;
-	/* a kernel object: referenced is as good as trusted for the argument of a release kfunc */
-	if (base_type(reg->type) != PTR_TO_BTF_ID || (flags & ~PTR_TRUSTED))
+
+	switch (base_type(reg->type)) {
+	case PTR_TO_BTF_ID:
+		/* a kernel object: referenced is as good as trusted for a release kfunc */
+		if (flags & ~PTR_TRUSTED)
+			return CANCEL_REFS;
+		/* the kfunc takes a pointer to this very type, as a release kfunc has to */
+		if (bpf_find_release_kfunc(env, reg->btf, reg->btf_id, false, &rel))
+			return CANCEL_RELEASE;
+		if (cancel_lock_below(st) && !(rel.flags & KF_SPINLOCK_SAFE))
+			return CANCEL_RELEASE;
+		e->arg = rel.func_id | (u64)rel.offset << 32;
+		break;
+	case PTR_TO_SOCKET:
+	case PTR_TO_SOCK_COMMON:
+	case PTR_TO_TCP_SOCK:
+		/*
+		 * A socket that a lookup returned, or what bpf_sk_fullsock() and bpf_tcp_sock()
+		 * made of it: bpf_sk_release() takes these too, and it is one address.
+		 */
+		if (flags)
+			return CANCEL_REFS;
+		helper = BPF_FUNC_sk_release;
+		break;
+	case PTR_TO_MEM:
+		/* a record of bpf_ringbuf_reserve(), which the program did not get to submit */
+		if (flags != MEM_RINGBUF)
+			return CANCEL_REFS;
+		helper = BPF_FUNC_ringbuf_discard;
+		break;
+	default:
 		return CANCEL_REFS;
-	/* the kfunc takes a pointer to this very type, which is all that a release kfunc accepts */
-	if (bpf_find_release_kfunc(env, reg->btf, reg->btf_id, false, &rel))
-		return CANCEL_RELEASE;
-	if (cancel_lock_below(st) && !(rel.flags & KF_SPINLOCK_SAFE))
-		return CANCEL_RELEASE;
+	}
+	if (helper) {
+		/* under a lock the program calls no helper that releases */
+		if (cancel_lock_below(st) || !cancel_helper_ok(env, helper))
+			return CANCEL_RELEASE;
+		e->arg = helper;
+	}
 
 	e->kind = CANCEL_PTR;
 	e->place = place;
-	e->flags = type_may_be_null(reg->type) ? CANCEL_PTR_NULL : 0;
-	e->arg = rel.func_id | (u64)rel.offset << 32;
+	e->flags = (type_may_be_null(reg->type) ? CANCEL_PTR_NULL : 0) |
+		   (helper ? CANCEL_PTR_HELPER : 0);
 	return 0;
 }
 
@@ -1610,6 +1659,9 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 			return 0;
 		return cancel_add_kfunc(env, cancel_dynptr_file_discard_id[0], 0, CANCEL_DYNPTR);
 	case CANCEL_PTR:
+		/* cancel_ptr_handle() made sure of the helper */
+		if (e->flags & CANCEL_PTR_HELPER)
+			return 0;
 		return cancel_add_kfunc(env, (u32)e->arg, e->arg >> 32, CANCEL_RELEASE);
 	default:
 		return 0;
@@ -1841,15 +1893,27 @@ static int cancel_emit_iter(const struct cancel_entry *e, int place, struct bpf_
 /* Release the reference whose handle is in @place, unless there is none: CANCEL_PTR_NULL */
 static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_insn *buf)
 {
-	int n = 0;
+	int n = 0, test = -1;
 
 	if (cancel_place_is_reg(place))
 		buf[n++] = BPF_MOV64_REG(BPF_REG_1, place);
 	else
 		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, place);
 	if (e->flags & CANCEL_PTR_NULL)
-		buf[n++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 1);
-	buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
+		test = n++;
+
+	if (!(e->flags & CANCEL_PTR_HELPER)) {
+		buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
+	} else {
+		/* bpf_ringbuf_discard(record, 0) */
+		if (e->arg == BPF_FUNC_ringbuf_discard)
+			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
+		buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, e->arg);
+	}
+
+	/* over the call and what sets up its other arguments */
+	if (test >= 0)
+		buf[test] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, n - test - 1);
 	return n;
 }
 
