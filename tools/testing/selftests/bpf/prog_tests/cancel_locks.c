@@ -44,6 +44,7 @@ static const struct test tests[] = {
 	{ "spin_lock_spilled_at_call" },
 	{ "res_lock_global_at_call" },
 	{ "res_lock_in_map_at_call" },
+	{ "res_lock_one_of_two_at_call", .two_ways = true },
 	{ "res_lock_irqsave_at_call" },
 	{ "irq_save_at_call" },
 	{ "irq_save_twice_at_call" },
@@ -88,9 +89,10 @@ static int run_twice(struct bpf_program *prog)
 
 /*
  * The prog gets an object of its own, like in the test loader: one that does not load, or that
- * leaves a lock locked, is not in the way of the others.
+ * leaves a lock locked, is not in the way of the others. @zero: what the variable of that name
+ * is to have, which the verifier knows nothing of.
  */
-static void run_test(const struct test *t)
+static void run_test(const struct test *t, unsigned long zero)
 {
 	struct bpf_program *prog, *other;
 	int ret, cancelled;
@@ -106,6 +108,7 @@ static void run_test(const struct test *t)
 		bpf_program__set_autoload(other, other == prog);
 	if (!ASSERT_OK(cancel_locks__load(skel), "cancel_locks__load"))
 		goto out;
+	skel->bss->zero = zero;
 
 	/* the cancel value of the type, which no prog returns at its end */
 	cancelled = bpf_program__type(prog) == BPF_PROG_TYPE_SYSCALL ? 0 : TC_ACT_SHOT;
@@ -150,6 +153,8 @@ void serial_test_cancel_locks(void)
 	for (i = 0; i < ARRAY_SIZE(tests); i++) {
 		if (!test__start_subtest(tests[i].prog))
 			continue;
-		run_test(&tests[i]);
+		run_test(&tests[i], 0);
+		if (tests[i].two_ways)
+			run_test(&tests[i], 1);
 	}
 }
