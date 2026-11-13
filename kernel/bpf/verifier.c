@@ -5764,20 +5764,11 @@ static int check_recursion(struct bpf_verifier_env *env, struct bpf_call_graph *
 static int check_callbacks(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
-	struct bpf_insn *insn = env->prog->insnsi;
-	int i, s;
+	int s;
 
 	for_each_marked_subprog(cg, s, CG_IN_CB) {
 		if (si[s].has_ld_abs) {
 			verbose(env, "cannot use BPF_LD_[ABS|IND] within callback\n");
-			return -EINVAL;
-		}
-		for (i = si[s].start; i < si[s + 1].start; i++) {
-			if (!bpf_is_throw_kfunc(insn + i) || !env->insn_aux_data[i].seen)
-				continue;
-			verbose(env,
-				"bpf_throw kfunc (insn %d) cannot be called from callback subprog %d\n",
-				i, s);
 			return -EINVAL;
 		}
 	}

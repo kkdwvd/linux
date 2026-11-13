@@ -35,12 +35,12 @@ extern void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it) __ksym;
  *	constraints on the program's return value (as with R0 on exit).
  *	Otherwise, the return value of the marked exception callback will be
  *	subjected to the same checks.
+ *	A throw in an async callback ends that callback alone. A throw in the
+ *	exception callback ends the program with 'cookie', checked like R0.
  *
  *	Each frame releases the resources that it holds (locks, references,
  *	etc.) on the way, in a landing pad that the verifier emits. If it
  *	cannot tell what a frame holds there is a verification error.
- *
- *	Note that callbacks *cannot* call this helper.
  * Returns
  *	Never.
  * Throws
