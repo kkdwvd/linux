@@ -31,7 +31,8 @@
  *   that its frame entered.
  * - references whose handle the frame has in a register or in a stack slot,
  *   where a kfunc or a helper releases them: a kernel object, a socket, a
- *   ringbuf record, see cancel_collect_ptr().
+ *   ringbuf record, an object that the program owns, see
+ *   cancel_collect_ptr().
  * A frame that holds anything else of its own declines. So does the frame that
  * waits in a call when a callee releases what the frame holds: its pad would
  * release that again.
@@ -935,6 +936,10 @@ static int cancel_collect_dynptr(struct bpf_verifier_env *env, const struct bpf_
 #define CANCEL_PTR_NULL		BIT(0)
 /* arg is the id of a helper */
 #define CANCEL_PTR_HELPER	BIT(1)
+/* an object that the program owns is dropped: arg is the btf_record of its type, or NULL */
+#define CANCEL_PTR_OBJ		BIT(2)
+/* and it is a per-CPU object */
+#define CANCEL_PTR_PERCPU	BIT(3)
 
 /* May a pad call helper @func_id: the program may, and it is a call that does not sleep */
 static bool cancel_helper_ok(struct bpf_verifier_env *env, int func_id)
@@ -984,6 +989,39 @@ static bool cancel_ref_of_stack_obj(const struct bpf_verifier_state *st, u32 id)
 	return false;
 }
 
+/* The kfuncs that drop an object which the program owns, the per-CPU one last */
+BTF_ID_LIST(cancel_obj_drop_ids)
+BTF_ID(func, bpf_obj_drop)
+BTF_ID(func, bpf_percpu_obj_drop)
+
+/*
+ * May a pad drop the object in @reg, which the program owns, like bpf_obj_drop() does or,
+ * for a @percpu one, bpf_percpu_obj_drop()? It does not call the kfunc, see
+ * cancel_emit_ptr(), but it does no more than the program may do there by calling it.
+ * *@rec is for the fields that go with the object.
+ */
+static bool cancel_obj_drop_ok(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			       const struct bpf_reg_state *reg, bool percpu,
+			       const struct btf_record **rec)
+{
+	const struct btf_struct_meta *meta = btf_find_struct_meta(reg->btf, reg->btf_id);
+	struct btf *vmlinux = bpf_get_btf_vmlinux();
+
+	*rec = meta ? meta->record : NULL;
+	/* bpf_kptr_xchg() gets an object out of a map for a program that has no such kfunc */
+	if (IS_ERR_OR_NULL(vmlinux) || !env->prog->gpl_compatible ||
+	    !btf_kfunc_is_allowed(vmlinux, cancel_obj_drop_ids[percpu], env->prog))
+		return false;
+	/* neither kfunc is called under a lock */
+	if (cancel_lock_below(st))
+		return false;
+	/* a per-CPU object has no fields, see bpf_fixup_kfunc_call() */
+	if (percpu)
+		return !meta;
+	/* the fields that check_kfunc_call() lets no tracing program destroy */
+	return !bpf_nmi_unsafe_prog(env) || !btf_record_has_nmi_unsafe_fields(*rec);
+}
+
 /*
  * @reg is in @place, which a pad can read, and has the id of a reference that the current
  * frame of @st is to release. Can the pad release the reference out of it? Returns 0 with
@@ -1006,14 +1044,29 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 			     struct cancel_entry *e)
 {
 	u32 flags = type_flag(reg->type) & ~PTR_MAYBE_NULL;
+	const struct btf_record *rec;
 	struct bpf_release_kfunc rel;
 	int helper = 0;
+	u8 how = 0;
 
 	if (!tnum_equals_const(reg->var_off, 0))
 		return reason;
 
 	switch (base_type(reg->type)) {
 	case PTR_TO_BTF_ID:
+		/*
+		 * An object that the program allocated, took out of a map, or removed from a
+		 * list or a tree: the pointer to its start, not the one to the node in it.
+		 */
+		if (flags & MEM_ALLOC) {
+			if (flags & ~(MEM_ALLOC | MEM_PERCPU))
+				return CANCEL_REFS;
+			if (!cancel_obj_drop_ok(env, st, reg, flags & MEM_PERCPU, &rec))
+				return CANCEL_RELEASE;
+			how = CANCEL_PTR_OBJ | (flags & MEM_PERCPU ? CANCEL_PTR_PERCPU : 0);
+			e->arg = (unsigned long)rec;
+			break;
+		}
 		/* a kernel object: referenced is as good as trusted for a release kfunc */
 		if (flags & ~PTR_TRUSTED)
 			return CANCEL_REFS;
@@ -1048,13 +1101,13 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 		/* under a lock the program calls no helper that releases */
 		if (cancel_lock_below(st) || !cancel_helper_ok(env, helper))
 			return CANCEL_RELEASE;
+		how = CANCEL_PTR_HELPER;
 		e->arg = helper;
 	}
 
 	e->kind = CANCEL_PTR;
 	e->place = place;
-	e->flags = (type_may_be_null(reg->type) ? CANCEL_PTR_NULL : 0) |
-		   (helper ? CANCEL_PTR_HELPER : 0);
+	e->flags = (type_may_be_null(reg->type) ? CANCEL_PTR_NULL : 0) | how;
 	return 0;
 }
 
@@ -1659,8 +1712,8 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 			return 0;
 		return cancel_add_kfunc(env, cancel_dynptr_file_discard_id[0], 0, CANCEL_DYNPTR);
 	case CANCEL_PTR:
-		/* cancel_ptr_handle() made sure of the helper */
-		if (e->flags & CANCEL_PTR_HELPER)
+		/* cancel_ptr_handle() made sure of the helper. The drop is no call of a kfunc. */
+		if (e->flags & (CANCEL_PTR_HELPER | CANCEL_PTR_OBJ))
 			return 0;
 		return cancel_add_kfunc(env, (u32)e->arg, e->arg >> 32, CANCEL_RELEASE);
 	default:
@@ -1902,13 +1955,24 @@ static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_i
 	if (e->flags & CANCEL_PTR_NULL)
 		test = n++;
 
-	if (!(e->flags & CANCEL_PTR_HELPER)) {
-		buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
-	} else {
+	if (e->flags & CANCEL_PTR_OBJ) {
+		struct bpf_insn rec[2] = { BPF_LD_IMM64(BPF_REG_2, e->arg) };
+
+		/*
+		 * What bpf_obj_drop() and bpf_percpu_obj_drop() come to. The fixup of their
+		 * call takes the type from the aux data of the insn, and a pad has none.
+		 */
+		buf[n++] = rec[0];
+		buf[n++] = rec[1];
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_3, !!(e->flags & CANCEL_PTR_PERCPU));
+		buf[n++] = BPF_EMIT_KERNEL_CALL(__bpf_obj_drop_impl);
+	} else if (e->flags & CANCEL_PTR_HELPER) {
 		/* bpf_ringbuf_discard(record, 0) */
 		if (e->arg == BPF_FUNC_ringbuf_discard)
 			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 		buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, e->arg);
+	} else {
+		buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
 	}
 
 	/* over the call and what sets up its other arguments */

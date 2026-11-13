@@ -16169,11 +16169,24 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+/*
+ * A tracing program may run in NMI context, where the destructors of some
+ * fields cannot run: bpf_obj_drop() is refused there on a type that has them.
+ */
+bool bpf_nmi_unsafe_prog(struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
-	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
 	struct bpf_reg_state *regs = cur_regs(env);
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
@@ -16291,10 +16304,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
-	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && (is_tracing_prog_type(prog_type) ||
-	     /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
-	     (prog_type == BPF_PROG_TYPE_TRACING && env->prog->expected_attach_type != BPF_TRACE_ITER
-	      && !env->prog->sleepable))) {
+	     is_bpf_percpu_obj_drop_kfunc(meta.func_id)) && bpf_nmi_unsafe_prog(env)) {
 		struct btf_struct_meta *struct_meta;
 
 		struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);

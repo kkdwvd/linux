@@ -2250,6 +2250,7 @@ struct bpf_release_kfunc {
 
 int bpf_find_release_kfunc(struct bpf_verifier_env *env, struct btf *btf, u32 btf_id,
 			   bool sleepable, struct bpf_release_kfunc *rel);
+bool bpf_nmi_unsafe_prog(struct bpf_verifier_env *env);
 
 /* Functions exported from verifier.c, used by trampoline.c */
 int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 btf_id,
