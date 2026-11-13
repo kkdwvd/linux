@@ -773,6 +773,128 @@ int no_release_kfunc(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+__naked __noinline __used
+static unsigned long releases_arg(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"call dives;"
+		COUNT(behind)
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame hands its only copy to the callee in r1, which a call does not keep. The task is
+ * the callee's from the call on: the pad of the call here releases nothing, and the pad of the
+ * call of dives() in releases_arg() releases the task from r6, where the callee has it.
+ */
+SEC("tc")
+__description("cancel refs: a task that only an argument register has is released by the callee")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("cancel_goto pc+2")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("...")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void only_copy_in_arg(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"call releases_arg;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+#if defined(__BPF_FEATURE_STACK_ARGUMENT)
+
+/* The sixth argument, which is on the stack: a task that the caller gave away */
+__naked __noinline __used
+static unsigned long releases_stack_arg(void)
+{
+	asm volatile (
+		"r6 = *(u64 *)(r11 + 8);"
+		"call dives;"
+		COUNT(behind)
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The only copy is in a stack argument. The task moves like the one in r1 above: the pad of
+ * the call of dives() in the callee releases it from r6, where the callee loaded it to.
+ */
+SEC("tc")
+__description("cancel refs: a task that only a stack argument has is released by the callee")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("r6 = *(u64 *)(r11 +8)")
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("r2 = 0")
+__xlated("r0 = 0")
+__xlated("cancel_exit")
+__naked void only_copy_in_stack_arg(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r11 - 8) = r0;"
+		"call releases_stack_arg;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm_addr(pid)
+		: __clobber_all
+	);
+}
+
+#endif
+
 /* The runner looks at what the progs above held through the next three */
 
 int task_rcu_users;
