@@ -202,6 +202,14 @@ struct cancel_entry {
 	/* of an object that the program owns: the pointer in place is that many bytes into it */
 	s32 off;
 	/*
+	 * Of a handle that is a pointer: the places of the frame that have it like place does,
+	 * as far as there are bits for them: registers, and the first slots of the stack. In an
+	 * entry of a site: the ones that every visit has which holds the entry. Visits that
+	 * picked different places agree on one of these, see cancel_agree_on_places().
+	 */
+	u16 regs;
+	u64 slots;
+	/*
 	 * An origin of what the visits hold there + 1, see struct cancel_origin: the visits
 	 * make their origins one class. 0 if no visit has one.
 	 */
@@ -222,6 +230,33 @@ struct cancel_entry {
 static bool cancel_place_is_reg(int place)
 {
 	return place >= BPF_REG_0 && place < BPF_REG_FP;
+}
+
+/* @place has the handle of @e too, see regs and slots in struct cancel_entry */
+static void cancel_note_place(struct cancel_entry *e, int place)
+{
+	int spi = -place / BPF_REG_SIZE - 1;
+
+	if (cancel_place_is_reg(place))
+		e->regs |= BIT(place);
+	else if (spi < BITS_PER_TYPE(e->slots))
+		e->slots |= BIT_ULL(spi);
+}
+
+/*
+ * A place that @a and @b both have their handles in, CANCEL_NO_PLACE if they have none. The
+ * first one in the order in which a visit picks its place, see cancel_collect_ptr().
+ */
+static int cancel_common_place(const struct cancel_entry *a, const struct cancel_entry *b)
+{
+	u16 regs = a->regs & b->regs;
+	u64 slots = a->slots & b->slots;
+
+	if (regs >> BPF_REG_6)
+		return BPF_REG_6 + __ffs(regs >> BPF_REG_6);
+	if (slots)
+		return -(int)(__ffs64(slots) + 1) * BPF_REG_SIZE;
+	return CANCEL_NO_PLACE;
 }
 
 struct cancel_list {
@@ -389,6 +424,15 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 		return false;
 	return a->kind == b->kind && a->place == b->place && a->flags == b->flags &&
 	       a->arg == b->arg && a->off == b->off && a->flag == b->flag;
+}
+
+/* Are @a and @b the same but for the place: is what they hold released in one way? */
+static bool cancel_entry_alike(const struct cancel_entry *a, const struct cancel_entry *b)
+{
+	struct cancel_entry at = *b;
+
+	at.place = a->place;
+	return cancel_entry_same(a, &at);
 }
 
 static bool cancel_list_has(const struct cancel_list *list, const struct cancel_entry *e)
@@ -733,32 +777,62 @@ static bool cancel_reg_at_lock(const struct bpf_reg_state *reg,
 	return true;
 }
 
+/* The lock of @e by the pointer to it: alt_place and alt_arg of struct cancel_entry */
+static void cancel_entry_use_alt(struct cancel_entry *e)
+{
+	e->place = e->alt_place;
+	e->arg = e->alt_arg;
+	e->alt = false;
+}
+
 /*
- * A live place of the current frame of @st that leads to the lock of @ref, see
- * cancel_reg_at_lock(), CANCEL_NO_PLACE if it has none. R6-R9 are asked first, then the
- * slots of the stack, the lowest number first: visits that have the pointer in
- * several places agree on one. @one_elem: see cancel_reg_at_lock().
+ * @reg is in @place, which a pad can read. Does it lead to the lock of @ref, see
+ * cancel_reg_at_lock()? The first place that does is alt_place of @e, with the lock alt_arg
+ * bytes from where it points. @e notes every place that points as far from the lock as that
+ * one. Not for a lock at a known address, @one_elem: its entry goes by the address or by the
+ * one place.
  */
-static int cancel_lock_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
-			     enum bpf_cancel_site_type type,
-			     const struct bpf_reference_state *ref, bool one_elem, s32 *delta)
+static void cancel_lock_at(const struct bpf_reg_state *reg, const struct bpf_reference_state *ref,
+			   bool one_elem, int place, struct cancel_entry *e)
+{
+	s32 delta;
+
+	if (!cancel_reg_at_lock(reg, ref, one_elem, &delta))
+		return;
+	if (e->alt_place == CANCEL_NO_PLACE) {
+		e->alt_place = place;
+		e->alt_arg = delta;
+	}
+	if (!one_elem && delta == e->alt_arg)
+		cancel_note_place(e, place);
+}
+
+/*
+ * The live places of the current frame of @st that lead to the lock of @ref, into alt_place
+ * and alt_arg of @e: CANCEL_NO_PLACE if it has none. R6-R9 are asked first, then the slots
+ * of the stack, the lowest number first: visits that have the pointer in several
+ * places pick the same one where they can, and note the others, see
+ * cancel_agree_on_places(). @one_elem: see cancel_reg_at_lock().
+ */
+static void cancel_lock_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			      enum bpf_cancel_site_type type,
+			      const struct bpf_reference_state *ref, bool one_elem,
+			      struct cancel_entry *e)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_stack_state *slot;
 	int i;
 
+	e->alt_place = CANCEL_NO_PLACE;
 	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
-		if (cancel_reg_at_lock(&frame->regs[i], ref, one_elem, delta) &&
-		    cancel_reg_is_place(env, type, i))
-			return i;
+		if (cancel_reg_is_place(env, type, i))
+			cancel_lock_at(&frame->regs[i], ref, one_elem, i, e);
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
-		if (bpf_is_spilled_reg(slot) &&
-		    cancel_reg_at_lock(&slot->spilled_ptr, ref, one_elem, delta) &&
-		    cancel_spill_is_place(env, st, type, i))
-			return -(i + 1) * BPF_REG_SIZE;
+		if (bpf_is_spilled_reg(slot) && cancel_spill_is_place(env, st, type, i))
+			cancel_lock_at(&slot->spilled_ptr, ref, one_elem,
+				       -(i + 1) * BPF_REG_SIZE, e);
 	}
-	return CANCEL_NO_PLACE;
 }
 
 /*
@@ -773,7 +847,6 @@ static int cancel_collect_lock(struct bpf_verifier_env *env, const struct bpf_ve
 {
 	const struct bpf_reference_state *ref = &st->refs[idx];
 	struct cancel_entry e = { .place = CANCEL_NO_PLACE };
-	s32 delta = 0;
 	u32 rank;
 	int spi;
 
@@ -805,14 +878,13 @@ static int cancel_collect_lock(struct bpf_verifier_env *env, const struct bpf_ve
 		 * One of several locks that the program chose at run time has another
 		 * address in every visit. The pointer that it was taken through says which.
 		 */
-		e.alt_place = cancel_lock_place(env, st, type, ref, true, &delta);
+		cancel_lock_place(env, st, type, ref, true, &e);
 		e.alt = e.alt_place != CANCEL_NO_PLACE;
-		e.alt_arg = delta;
 	} else {
-		e.place = cancel_lock_place(env, st, type, ref, false, &delta);
-		if (e.place == CANCEL_NO_PLACE)
+		cancel_lock_place(env, st, type, ref, false, &e);
+		if (e.alt_place == CANCEL_NO_PLACE)
 			return CANCEL_LOCK_PLACE;
-		e.arg = delta;
+		cancel_entry_use_alt(&e);
 	}
 	return cancel_list_add(visit, &e);
 }
@@ -1265,13 +1337,37 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 }
 
 /*
+ * @reg is in @place and has the id of a reference, see cancel_ptr_handle(). @reason is 0 if
+ * a place before this one has the handle and is the place of @e: this one is noted if it
+ * has the handle in the same way.
+ */
+static int cancel_ptr_place(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			    const struct bpf_reg_state *reg, int place, int reason,
+			    struct cancel_entry *e)
+{
+	struct cancel_entry other = {};
+
+	if (reason) {
+		reason = cancel_ptr_handle(env, st, reg, place, reason, e);
+		if (!reason)
+			cancel_note_place(e, place);
+		return reason;
+	}
+	if (!cancel_ptr_handle(env, st, reg, place, CANCEL_PLACE, &other) &&
+	    cancel_entry_alike(e, &other))
+		cancel_note_place(e, place);
+	return 0;
+}
+
+/*
  * refs[@idx] of @st is a reference to an object, and the pad releases it like the program
  * does: by a call with the handle. Find the handle in a place of the current frame. It has
  * the id of the reference there, which a state that stands for another one has in the same
  * places as that one: ids are compared along with the types, in what is live.
  *
- * Where more than one place has the handle the visits of a site have to pick the same one:
- * R6-R9 come first, then the stack, the lowest number first.
+ * Where more than one place has the handle the visits of a site pick the same one where they
+ * can: R6-R9 come first, then the stack, the lowest number first. The entry
+ * notes the other places, for the visits that cannot, see cancel_agree_on_places().
  */
 static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			      enum bpf_cancel_site_type type, u32 idx, struct cancel_list *visit)
@@ -1285,15 +1381,15 @@ static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_ver
 	if (ref->type != REF_TYPE_PTR || cancel_ref_of_stack_obj(st, ref->id))
 		return CANCEL_REFS;
 
-	for (i = BPF_REG_6; i <= BPF_REG_9 && reason; i++)
+	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
 		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, type, i))
-			reason = cancel_ptr_handle(env, st, &frame->regs[i], i, reason, &e);
-	for (spi = 0; spi < bpf_stack_nr_slots(frame) && reason; spi++) {
+			reason = cancel_ptr_place(env, st, &frame->regs[i], i, reason, &e);
+	for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
 		slot = bpf_stack_slot(frame, spi);
 		if (bpf_is_spilled_reg(slot) && slot->spilled_ptr.id == ref->id &&
 		    cancel_spill_is_place(env, st, type, spi))
-			reason = cancel_ptr_handle(env, st, &slot->spilled_ptr,
-						   -(spi + 1) * BPF_REG_SIZE, reason, &e);
+			reason = cancel_ptr_place(env, st, &slot->spilled_ptr,
+						  -(spi + 1) * BPF_REG_SIZE, reason, &e);
 	}
 	return reason ?: cancel_list_add(visit, &e);
 }
@@ -1399,14 +1495,6 @@ static int cancel_collect(struct bpf_verifier_env *env, const struct bpf_verifie
 				      st->active_preempt_locks - frame->entry_preempt_locks);
 }
 
-/* The lock of @e by the pointer to it instead of its address, see struct cancel_entry */
-static void cancel_entry_use_alt(struct cancel_entry *e)
-{
-	e->place = e->alt_place;
-	e->arg = e->alt_arg;
-	e->alt = false;
-}
-
 /*
  * A visit holds the lock of @v, which is at a known address, and @held has no lock at that
  * address: the program chose one of several locks at run time, and each visit has another.
@@ -1443,12 +1531,95 @@ static void cancel_lock_by_pointer(struct cancel_list *held, struct cancel_entry
 }
 
 /*
+ * An entry of @held that is released like @v and holds what an origin of the class of @v
+ * brought. With @same_place the one that has its handle in the place of @v, else one that
+ * has it in a place where @v has its handle too. NULL if there is none, or if nothing tells
+ * what brought the resource of @v.
+ */
+static struct cancel_entry *cancel_partner(struct bpf_cancel *c, const struct cancel_list *held,
+					   const struct cancel_entry *v, bool same_place)
+{
+	struct cancel_entry *e;
+	u32 i, r;
+
+	if (!v->origin)
+		return NULL;
+	r = cancel_class(c, v->origin - 1);
+	for (i = 0; i < held->nr; i++) {
+		e = &held->entries[i];
+		if (!e->origin || e->stray || cancel_class(c, e->origin - 1) != r ||
+		    !cancel_entry_alike(e, v))
+			continue;
+		if (same_place ? e->place == v->place :
+				 cancel_common_place(e, v) != CANCEL_NO_PLACE)
+			return e;
+	}
+	return NULL;
+}
+
+/*
+ * A visit picks one place for each handle, and visits that have a handle in several places
+ * may pick different ones: one has it in r6 and in a slot, another one in the slot only. By
+ * these places the entries are two, each held on some paths only, and no flag tells them
+ * apart. But an entry notes all the places that have its handle, and the two can go by one
+ * that both have: the slot.
+ *
+ * Only entries of one class of origins are made one like this: the same insns brought what
+ * they hold. A common place alone does not tell. The second visit may hold another resource
+ * in r6: if that became one entry with the resource of the first visit, the slot would be a
+ * second entry for a resource that the first visit holds as well. What nothing is known to
+ * have brought stays in the place that its visit picked.
+ */
+static void cancel_agree_on_places(struct bpf_cancel *c, struct cancel_list *held,
+				   struct cancel_list *visit)
+{
+	struct cancel_entry *e, *v, at;
+	int place;
+	u32 i;
+
+	/*
+	 * The entries that stay where they are come first: of the places that they leave to
+	 * their partners none has the handle of another entry of the visit.
+	 */
+	for (i = 0; i < visit->nr; i++) {
+		v = &visit->entries[i];
+		e = cancel_partner(c, held, v, true);
+		if (!e)
+			continue;
+		e->regs &= v->regs;
+		e->slots &= v->slots;
+	}
+	for (i = 0; i < visit->nr; i++) {
+		v = &visit->entries[i];
+		if (cancel_partner(c, held, v, true))
+			continue;
+		e = cancel_partner(c, held, v, false);
+		if (!e)
+			continue;
+		place = cancel_common_place(e, v);
+		/* an entry that is there already holds something else: no two are the same */
+		at = *e;
+		at.place = place;
+		if (e->place != place && cancel_list_has(held, &at))
+			continue;
+		at = *v;
+		at.place = place;
+		if (v->place != place && cancel_list_has(visit, &at))
+			continue;
+		e->place = v->place = place;
+		e->regs &= v->regs;
+		e->slots &= v->slots;
+	}
+}
+
+/*
  * A visit of @site found c->visit. An entry that this visit or one before it
  * is without takes a condition. So does a resource that the visits have in
- * different places: these are two entries. Whether a pad can tell if the frame
- * holds an entry with a condition is found out after the main pass, see
- * cancel_site_flags(). It goes by what brought the resource, and whatever
- * brought what the visits have in one entry is one class.
+ * different places and that finds no place for all of them: these are two
+ * entries. Whether a pad can tell if the frame holds an entry with a condition
+ * is found out after the main pass, see cancel_site_flags(). It goes by what
+ * brought the resource, and whatever brought what the visits have in one entry
+ * is one class.
  */
 static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 {
@@ -1459,6 +1630,7 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 
 	for (i = 0; i < visit->nr; i++)
 		cancel_lock_by_pointer(held, &visit->entries[i]);
+	cancel_agree_on_places(c, held, visit);
 	for (i = 0; i < held->nr; i++) {
 		e = &held->entries[i];
 		v = cancel_list_find(visit, e);
@@ -1469,6 +1641,9 @@ static int cancel_merge(struct bpf_cancel *c, struct cancel_site *site)
 		/* the pointer is of use only where every visit with the lock has it */
 		if (e->alt && (!v->alt || v->alt_place != e->alt_place || v->alt_arg != e->alt_arg))
 			e->alt = false;
+		/* and so is a place that the entry notes */
+		e->regs &= v->regs;
+		e->slots &= v->slots;
 		e->stray |= v->stray;
 		if (e->origin && v->origin)
 			cancel_union(c, e->origin - 1, v->origin - 1);
