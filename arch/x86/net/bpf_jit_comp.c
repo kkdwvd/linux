@@ -1864,11 +1864,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+--------+-----------+---------+----------+
- * | 31        | 30          | 29-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+--------+-----------+---------+----------+
+ * +-----------+-------------+--------------+----------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29           | 28       | 27-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |              |          |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | ARENA_CANCEL | R0_IN_AX | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+--------------+----------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far past the faulting insn to resume. That is its own length
  *                      for a single-insn access, but the distance to the end of the whole
@@ -1884,6 +1884,12 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                        It is independent of DST_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
  * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
+ * - ARENA_CANCEL (1 bit): cancel_goto is behind the access. A fault does not resume INSN_LEN
+ *                         past the faulting insn but at the pad that cancel_goto names, with
+ *                         no register cleared. The pad is in an entry of its own, which is
+ *                         found by the address that INSN_LEN gives, see ARENA_CANCEL_EXKEY.
+ * - R0_IN_AX (1 bit): Set with ARENA_CANCEL when the sequence that the insn is part of keeps R0
+ *                     in BPF_REG_AX and uses RAX for itself. The pad gets R0 back.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1901,9 +1907,22 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_IN_AX	BIT(28)
+#define FIXUP_ARENA_CANCEL	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
 #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
+
+/*
+ * 'access; cancel_goto pad': the pad of an access of arena is in an extable entry
+ *   { .insn = resume - 1, .fixup = pad - resume }
+ * where resume is the address at which a fault in the access goes on when there is no
+ * cancel_goto: the end of the access, or of the faulting part of its sequence. The insn
+ * that ends there has 2 bytes at least, so no insn starts at resume - 1 and no fault hits
+ * the entry. It is not the entry of a call either, see add_ret_exentry(): those are inside
+ * the call insn.
+ */
+#define ARENA_CANCEL_EXKEY	1
 
 bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 {
@@ -1911,6 +1930,7 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 	u32 insn_len = FIELD_GET(FIXUP_INSN_LEN_MASK, x->fixup);
 	bool is_arena = !!(x->fixup & FIXUP_ARENA_ACCESS);
 	bool is_write = !!(x->fixup & FIXUP_ARENA_WRITE);
+	const struct exception_table_entry *pad;
 	unsigned long addr;
 	s16 off;
 	u32 arena_reg;
@@ -1920,6 +1940,21 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
 		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
+	}
+
+	if (x->fixup & FIXUP_ARENA_CANCEL) {
+		pad = search_bpf_extables(regs->ip + insn_len - ARENA_CANCEL_EXKEY);
+		/*
+		 * The frame is cancelled. Its pad reads the registers that were live in front
+		 * of the access: no insn of the access has changed one of the program by now,
+		 * but for RAX in a sequence that keeps R0 in BPF_REG_AX.
+		 */
+		if (!WARN_ON_ONCE(!pad)) {
+			if (x->fixup & FIXUP_ARENA_R0_IN_AX)
+				regs->ax = regs->r10;
+			regs->ip += insn_len + (long)pad->fixup;
+			return true;
+		}
 	}
 
 	/* jump over the faulting access, or the sequence it is part of, and clear dest register */
@@ -1934,11 +1969,13 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
  * Record an arena access that may fault. @fault_ip is the address of the
  * faulting insn in the RO image, @resume_off how far past it execution has to
  * resume: for a multi-insn lowering that is the end of the whole sequence, not
- * the end of the one insn.
+ * the end of the one insn. @cancel is FIXUP_ARENA_CANCEL, with FIXUP_ARENA_R0_IN_AX
+ * where that holds, when cancel_goto is behind the access, and 0 otherwise.
  */
 static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image,
 			      int *excnt, u8 *fault_ip, u32 resume_off,
-			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off)
+			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off,
+			      u32 cancel)
 {
 	struct exception_table_entry *ex;
 	s64 delta;
@@ -1961,7 +1998,7 @@ static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image
 	ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, resume_off) |
 		    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
 		    FIELD_PREP(FIXUP_REG_MASK, fixup_reg) |
-		    FIXUP_ARENA_ACCESS;
+		    FIXUP_ARENA_ACCESS | cancel;
 	if (is_write)
 		ex->fixup |= FIXUP_ARENA_WRITE;
 
@@ -2407,6 +2444,25 @@ static bool call_has_cancel_goto(const struct bpf_insn *call, int cnt)
 		cnt--;
 	}
 	return cnt && bpf_is_cancel_goto(call + 1);
+}
+
+/* 'access; cancel_goto': whether cancel_goto follows @insn, which has @cnt insns behind it */
+static bool arena_has_cancel_goto(const struct bpf_insn *insn, int cnt)
+{
+	return cnt && bpf_is_cancel_goto(insn + 1);
+}
+
+/*
+ * The entry of the pad of an access of arena, see ARENA_CANCEL_EXKEY. A fault in the
+ * access would go on at @resume. @pad is where the cancel_goto behind the access points.
+ * The entries of the faulting insns of the access are in front of this one in the table,
+ * and they have the lower addresses.
+ */
+static int add_arena_pad_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
+				 int resume, int pad)
+{
+	return add_ret_exentry(prog, image, rw_image, excnt, resume, pad, ARENA_CANCEL_EXKEY,
+			       false);
 }
 
 /*
@@ -3078,7 +3134,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 			}
 populate_extable:
 			{
-				u32 arena_reg, fixup_reg;
+				u32 arena_reg, fixup_reg, cancel = 0;
 				bool is_write;
 
 				/*
@@ -3115,12 +3171,22 @@ populate_extable:
 					is_write = true;
 				}
 
+				/* one insn: a fault leaves the registers as they are */
+				if (arena_has_cancel_goto(insn, insn_cnt - i))
+					cancel = FIXUP_ARENA_CANCEL;
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
 							 prog - start_of_ldx, fixup_reg,
-							 arena_reg, is_write, insn->off);
+							 arena_reg, is_write, insn->off, cancel);
 				if (err)
 					return err;
+				if (cancel) {
+					err = add_arena_pad_exentry(bpf_prog, image, rw_image,
+								    &excnt, proglen + (prog - temp),
+								    addrs[i + 1 + insn[1].imm]);
+					if (err)
+						return err;
+				}
 			}
 			break;
 
@@ -3325,6 +3391,7 @@ populate_extable:
 			if (is_atomic_fetch_op(insn)) {
 				u32 real_src_reg = src_reg, real_dst_reg = dst_reg;
 				u8 *fault[2], *resume;
+				u32 cancel = 0;
 				int j;
 
 				/* Will need RAX as a CMPXCHG operand so save R0 */
@@ -3344,7 +3411,15 @@ populate_extable:
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
 				 * since the BPF insn is a read-modify-write.
+				 *
+				 * With cancel_goto behind the insn both go to its pad. The
+				 * load and a CMPXCHG that lost have changed RAX by then, and
+				 * R0 is in BPF_REG_AX. The other registers of the program
+				 * are as they were: the old value is moved to src_reg behind
+				 * the loop only.
 				 */
+				if (arena_has_cancel_goto(insn, insn_cnt - i))
+					cancel = FIXUP_ARENA_CANCEL | FIXUP_ARENA_R0_IN_AX;
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
 								 &excnt,
@@ -3353,7 +3428,15 @@ populate_extable:
 								 resume - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 true, insn->off);
+								 true, insn->off, cancel);
+					if (err)
+						return err;
+				}
+				/* both faults resume at one address: they share the entry */
+				if (cancel) {
+					err = add_arena_pad_exentry(bpf_prog, image, rw_image,
+								    &excnt, proglen + (resume - temp),
+								    addrs[i + 1 + insn[1].imm]);
 					if (err)
 						return err;
 				}
@@ -3482,6 +3565,9 @@ populate_extable:
 			if (bpf_is_cancel_goto(insn)) {
 				/* the offset of its pad has 32 bits and is in imm */
 				target = i + insn->imm;
+				/* access; cancel_goto: the access has added the entry */
+				if (i > 1 && bpf_is_arena_access(insn - 1))
+					break;
 				/* call; [unwind_goto;] cancel_goto */
 				after_unwind = i > 1 && bpf_is_unwind_goto(insn - 1);
 				if (i < 2 + after_unwind ||
@@ -5062,6 +5148,11 @@ bool bpf_jit_supports_unwind(void)
 }
 
 bool bpf_jit_supports_cancel(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_arena_cancel(void)
 {
 	return true;
 }
