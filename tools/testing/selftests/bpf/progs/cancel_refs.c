@@ -967,6 +967,188 @@ __naked void held_on_one_path(void)
 	);
 }
 
+/*
+ * Both paths to the call hold the task, and both have it in the slot. One of them has it in r6
+ * as well, which a visit picks first, and the other one has no handle there. They agree on the
+ * slot: one entry that both hold, and the pad needs no flag for it.
+ */
+SEC("tc")
+__description("cancel refs: a task in r6 and a slot on one path, in the slot on the other one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void two_places_on_one_path(void)
+{
+	asm volatile (
+		TASK_FROM_PID
+		"if r0 == 0 goto 2f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r6 = r0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"r6 = r10;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		/* r6 is live at the call */
+		"r7 = r6;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * One path has the task in r6 and in the slot. The other one has it in the slot and another
+ * task in r6, which only that path holds. r6 is a place of both tasks, but the entries go by
+ * what brought them: the first task is in the slot on both paths, and the other task is in r6
+ * on one path, with a drop flag. Were the two tasks in r6 one entry, the slot would be a
+ * second entry for a task that the first path holds too, and that path would release it twice.
+ */
+SEC("tc")
+__description("cancel refs: a task in r6 and a slot on one path, another task in r6 on the other one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("if r0 == 0x0 goto pc+1")
+__xlated("*(u8 *)(r10 -9) = 1")
+__xlated("...")
+__xlated("r1 = r6")
+__xlated("*(u8 *)(r10 -9) = 0")
+__xlated("call kernel-function")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__xlated("r1 = *(u8 *)(r10 -9)")
+__xlated("if r1 == 0x0 goto pc+2")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void two_places_and_another_task(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r6 = r0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		TASK_FROM(pid2)
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r7 = 1;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"if r7 == 0 goto 2f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"2:"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(pid2),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
+/*
+ * The same with the code of the path that takes the second task behind the rest: the verifier
+ * gets to the call with that path first. The second task is not tested here, so the pad tests
+ * it. The entries come out as above.
+ */
+SEC("tc")
+__description("cancel refs: another task in r6 on one path, the task in r6 and a slot on the other one")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 3 padded 3 declined")
+__xlated("goto pc-{{[0-9]+}}")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__xlated("r1 = *(u8 *)(r10 -9)")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("call unknown")
+__xlated("r0 = 2")
+__xlated("exit")
+__naked void another_task_and_two_places(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		TASK_FROM_PID
+		"if r0 == 0 goto 3f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r6 = r0;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 4f;"
+		"r8 = 0;"
+	"1:"
+		"call dives;"
+		COUNT(behind)
+		"if r7 == 0 goto 2f;"
+		RELEASE_TASK(r6)
+	"2:"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"3:"
+		"r0 = 0;"
+		"exit;"
+	"4:"
+		TASK_FROM(pid2)
+		"r6 = r0;"
+		"r7 = 1;"
+		"goto 1b;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(pid),
+		  __imm_addr(pid2),
+		  __imm_addr(zero),
+		  __imm_addr(behind)
+		: __clobber_all
+	);
+}
+
 /* r1: whether to dive first. r0 = the task with the pid or NULL: the frame returns with it. */
 __naked __noinline __used
 static unsigned long gets_task(void)

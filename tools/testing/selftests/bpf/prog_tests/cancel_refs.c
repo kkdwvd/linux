@@ -254,6 +254,34 @@ static void test_tasks(struct cancel_refs *skel)
 	skel->bss->pid = sys_gettid();
 	ASSERT_EQ(task_users(skel), self, "flag_of_second_frame: the task that runs it");
 
+	/* the pad releases the task from the slot, whether r6 has it as well or not */
+	skel->bss->pid = child.pid;
+	cancelled(skel, skel->progs.two_places_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "two_places_on_one_path: in r6 too");
+	skel->bss->zero = 1;
+	cancelled(skel, skel->progs.two_places_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "two_places_on_one_path: in the slot only");
+	skel->bss->zero = 0;
+
+	/*
+	 * The path that holds one task has it in r6 and in the slot, and releases it once.
+	 * The other path holds the task that runs the prog as well, in r6: each of the two
+	 * is released once.
+	 */
+	skel->bss->pid2 = sys_gettid();
+	cancelled(skel, skel->progs.two_places_and_another_task);
+	ASSERT_EQ(task_users(skel), users, "two_places_and_another_task: one task");
+	cancelled(skel, skel->progs.another_task_and_two_places);
+	ASSERT_EQ(task_users(skel), users, "another_task_and_two_places: one task");
+	skel->bss->zero = 1;
+	cancelled(skel, skel->progs.two_places_and_another_task);
+	ASSERT_EQ(task_users(skel), users, "two_places_and_another_task: the first task");
+	cancelled(skel, skel->progs.another_task_and_two_places);
+	ASSERT_EQ(task_users(skel), users, "another_task_and_two_places: the first task");
+	skel->bss->zero = 0;
+	skel->bss->pid = sys_gettid();
+	ASSERT_EQ(task_users(skel), self, "two_places_and_another_task: the other task");
+
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;
 	cancelled(skel, skel->progs.task_maybe_null_in_reg);
