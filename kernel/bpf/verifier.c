@@ -11147,9 +11147,16 @@ static int __release_reference_nomark(struct bpf_verifier_state *state, int id)
 
 static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
-	int err;
+	struct bpf_verifier_state *state = env->cur_state;
+	int i, err;
 
-	err = __release_reference_nomark(env->cur_state, id);
+	for (i = 0; i < state->acquired_refs; i++) {
+		if (state->refs[i].type != REF_TYPE_PTR || state->refs[i].id != id)
+			continue;
+		bpf_cancel_foreign_release(env, state->refs[i].frameno);
+		break;
+	}
+	err = __release_reference_nomark(state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
 	return err;

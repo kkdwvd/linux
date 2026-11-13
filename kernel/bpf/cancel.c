@@ -19,14 +19,17 @@
  * An entry that only some visits have takes a condition. A site at which the
  * frame holds what has no entry declines.
  *
- * A pad restores the IRQ flags that its frame saved and unlocks the locks that
- * it took, the ones that were taken last first. A lock is found at an address
- * that is known, or through a live pointer of the frame to what the lock is in.
- * Then it leaves the RCU read sections and the preemption-disabled sections
- * that its frame entered. No other kind of resource is described yet: a frame
- * that holds anything else of its own declines. So does the frame that waits in
- * a call when a callee releases what the frame holds: its pad would release that
- * again.
+ * These kinds of resource are described:
+ * - IRQ flags and locks: the pad restores the flags that its frame saved and
+ *   unlocks the locks that it took, the ones that were taken last first. A lock
+ *   is found at an address that is known, or through a live pointer of the
+ *   frame to what the lock is in.
+ * - open-coded iterators: the pad calls bpf_iter_<type>_destroy().
+ * - RCU read sections and preemption-disabled sections: the pad leaves the ones
+ *   that its frame entered.
+ * A frame that holds anything else of its own declines. So does the frame that
+ * waits in a call when a callee releases what the frame holds: its pad would
+ * release that again.
  *
  * After the main pass bpf_cancel_resolve() finds the subprogs that can be
  * cancelled, and with them the sites that get a pad. The pads go behind the last
@@ -64,6 +67,8 @@ enum cancel_kind {
 	CANCEL_RES_LOCK,
 	/* or bpf_res_spin_unlock_irqrestore(), which restores the IRQ flags of the lock too */
 	CANCEL_RES_LOCK_IRQ,
+	/* an open-coded iterator in the stack of the frame, see cancel_collect_iter() */
+	CANCEL_KIND_ITER,
 	/*
 	 * The sections that the frame entered, see cancel_collect_section(). These two are
 	 * the last ones. Which of them is left first makes no difference: either kind nests by
@@ -111,6 +116,8 @@ enum cancel_reason {
 	CANCEL_FOREIGN,
 	/* it holds a lock or IRQ flags that a pad has no way to */
 	CANCEL_LOCK_PLACE,
+	/* it holds an iterator that its pad cannot find or may not destroy */
+	CANCEL_ITER,
 	__CANCEL_REASONS,
 };
 
@@ -125,6 +132,7 @@ static const char * const cancel_reason_str[__CANCEL_REASONS] = {
 	[CANCEL_NO_JIT]		= "jit",
 	[CANCEL_FOREIGN]	= "foreign",
 	[CANCEL_LOCK_PLACE]	= "lock",
+	[CANCEL_ITER]		= "iter",
 };
 
 /* The place of an entry that has no handle */
@@ -646,6 +654,158 @@ static int cancel_collect_lock(struct bpf_verifier_env *env, const struct bpf_ve
 }
 
 /*
+ * Is a lock held that the pad of the current frame of @st leaves alone? The pad releases the
+ * locks of its frame in front of everything else. The frames below keep theirs until their
+ * pads run.
+ */
+static bool cancel_lock_below(const struct bpf_verifier_state *st)
+{
+	u32 i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if ((st->refs[i].type & REF_TYPE_LOCK_MASK) &&
+		    !bpf_frame_owns_ref(st, st->curframe, i))
+			return true;
+	return false;
+}
+
+/*
+ * May a pad of the current frame of @st call kfunc @func_id of @btf with the address of an
+ * object of the frame in R1? It is the call that the program makes to release the object, so
+ * the program has to be allowed to make it, see bpf_fetch_kfunc_arg_meta(). @flags are what
+ * the kfunc is registered with to be the one that releases. Every flag more asks for what a
+ * pad may be without: a context that may sleep, an RCU section, which the locks of the frame
+ * may have been, a capability, an argument that the verifier fills in. All but
+ * KF_SPINLOCK_SAFE, which a lock that is still held asks for, see do_check_insn().
+ */
+static bool cancel_kfunc_ok(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			    const struct btf *btf, u32 func_id, u32 flags)
+{
+	u32 *kf_flags = btf_kfunc_flags(btf, func_id, env->prog);
+
+	if (!kf_flags || !btf_kfunc_is_allowed(btf, func_id, env->prog))
+		return false;
+	if ((*kf_flags & ~KF_SPINLOCK_SAFE) != flags)
+		return false;
+	return (*kf_flags & KF_SPINLOCK_SAFE) || !cancel_lock_below(st);
+}
+
+/* The slot of @frame that the iterator of refs[] entry @id begins in, -1 if it has none */
+static int cancel_find_iter(const struct bpf_func_state *frame, u32 id)
+{
+	const struct bpf_stack_state *slot;
+	u32 spi;
+
+	for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
+		slot = bpf_stack_slot(frame, spi);
+		if (slot->slot_type[BPF_REG_SIZE - 1] == STACK_ITER && slot->spilled_ptr.id == id)
+			return spi;
+	}
+	return -1;
+}
+
+/*
+ * The kfunc that destroys an iterator of type @btf_id of @btf, as its BTF id in @btf, below 0
+ * if a pad of the current frame of @st may not call it. It is bpf_iter_<type>_destroy() of
+ * the BTF that has the kfunc which made the iterator: process_iter_arg() takes no other, and
+ * btf_check_iter_kfuncs() saw to the name and to the iterator being the only argument.
+ */
+static int cancel_iter_destroy(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			       struct btf *btf, u32 btf_id)
+{
+	const struct btf_type *t = btf_type_by_id(btf, btf_id);
+	char name[128];
+	s32 func_id;
+	int len;
+
+	len = snprintf(name, sizeof(name), "%s_destroy", btf_name_by_offset(btf, t->name_off));
+	if (len < 0 || len >= sizeof(name))
+		return -ENAMETOOLONG;
+	func_id = btf_find_by_name_kind(btf, name, BTF_KIND_FUNC);
+	if (func_id < 0)
+		return func_id;
+	if (!cancel_kfunc_ok(env, st, btf, func_id, KF_ITER_DESTROY))
+		return -EACCES;
+	/* the name is made of that of the type, and two types may have one name */
+	t = btf_type_by_id(btf, btf_type_by_id(btf, func_id)->type);
+	if (btf_check_iter_arg(btf, t, 0) != btf_id)
+		return -EINVAL;
+	return func_id;
+}
+
+/*
+ * An open-coded iterator. refs[@idx] is the reference that bpf_iter_<type>_new() took, and
+ * the slot that the iterator begins in has its id. The pad calls bpf_iter_<type>_destroy()
+ * with the address of the iterator, which is what the program does for an iterator that is
+ * active and for one that is drained.
+ *
+ * The entry is made of what the STACK_ITER slots say, and stacksafe() compares all of that,
+ * in slots that are dead too. A program can write to the slots. Nothing destroys the
+ * iterator then, and the program is rejected for the reference that is left.
+ */
+static int cancel_collect_iter(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			       u32 idx, struct cancel_list *visit)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_reference_state *ref = &st->refs[idx];
+	struct cancel_entry e = { .kind = CANCEL_KIND_ITER };
+	const struct bpf_stack_state *slot;
+	const struct bpf_reg_state *it, *reg;
+	const struct bpf_insn *insn;
+	int spi, nr_slots, func_id, i;
+	u32 fr;
+
+	if (ref->type != REF_TYPE_PTR)
+		return CANCEL_REFS;
+	spi = cancel_find_iter(frame, ref->id);
+	if (spi < 0) {
+		/* a callee made it in the stack of a frame below: this pad has no address for it */
+		for (fr = 0; fr < st->curframe; fr++)
+			if (cancel_find_iter(st->frame[fr], ref->id) >= 0)
+				return CANCEL_ITER;
+		return CANCEL_REFS;
+	}
+	it = &bpf_stack_slot(frame, spi)->spilled_ptr;
+
+	/* what bpf_iter_<type>_destroy() asks of the slots, see is_iter_reg_valid_init() */
+	nr_slots = btf_type_by_id(it->iter.btf, it->iter.btf_id)->size / BPF_REG_SIZE;
+	if (spi + 1 < nr_slots)
+		return CANCEL_ITER;
+	for (i = 0; i < nr_slots; i++) {
+		slot = bpf_stack_slot(frame, spi - i);
+		reg = &slot->spilled_ptr;
+		if (slot->slot_type[BPF_REG_SIZE - 1] != STACK_ITER || (i && reg->id) ||
+		    reg->iter.btf != it->iter.btf || reg->iter.btf_id != it->iter.btf_id ||
+		    (reg->type & PTR_UNTRUSTED))
+			return CANCEL_ITER;
+	}
+	/*
+	 * PTR_UNTRUSTED above: the RCU section that the iterator was made in is over. MEM_RCU:
+	 * it lasts, but it may be a lock or an IRQ flag of the frame, see in_rcu_cs(), and the
+	 * pad has released these when it destroys the iterator. An RCU or a preemption section
+	 * is left behind that, and a program that doesn't sleep is in one throughout.
+	 */
+	if ((it->type & MEM_RCU) && st->in_sleepable && !st->active_rcu_locks &&
+	    !st->active_preempt_locks)
+		return CANCEL_ITER;
+
+	func_id = cancel_iter_destroy(env, st, it->iter.btf, it->iter.btf_id);
+	if (func_id < 0)
+		return CANCEL_ITER;
+	/*
+	 * A call names the BTF of a module by an index into fd_array. The call that made the
+	 * iterator has one for the BTF of its kfunc, which is the BTF of the iterator.
+	 */
+	insn = &env->prog->insnsi[ref->insn_idx];
+	if (!bpf_pseudo_kfunc_call(insn) || !insn->off != !btf_is_module(it->iter.btf))
+		return CANCEL_ITER;
+
+	e.place = -(spi + 1) * BPF_REG_SIZE;
+	e.arg = (u64)(u16)insn->off << 32 | (u32)func_id;
+	return cancel_list_add(visit, &e);
+}
+
+/*
  * refs[@idx] of @st is for the current frame to release. Each kind that has entries in
  * refs[] is asked in turn. It adds an entry to @visit and returns 0, or returns CANCEL_REFS
  * for what is not of its kind, or the reason why the site declines.
@@ -663,6 +823,8 @@ static int cancel_collect_ref(struct bpf_verifier_env *env, const struct bpf_ver
 		reason = cancel_collect_irq(st, idx, visit);
 	if (reason == CANCEL_REFS)
 		reason = cancel_collect_lock(env, st, type, idx, visit);
+	if (reason == CANCEL_REFS)
+		reason = cancel_collect_iter(env, st, idx, visit);
 	return reason;
 }
 
@@ -990,6 +1152,8 @@ static const char *cancel_shape_text(u8 reason)
 		return "a callee releases what the frame holds";
 	case CANCEL_LOCK_PLACE:
 		return "no register or stack slot that a pad can read leads to a lock or IRQ flags of the frame (at a call: R6-R9, or a slot when no stack pointer is passed)";
+	case CANCEL_ITER:
+		return "the frame holds an iterator that a pad cannot destroy there";
 	default:
 		return NULL;
 	}
@@ -1190,6 +1354,8 @@ static int cancel_prepare_entry(struct bpf_verifier_env *env, const struct cance
 	case CANCEL_RCU:
 	case CANCEL_PREEMPT:
 		return cancel_add_kfunc(env, cancel_section_kfunc(e->kind), 0, CANCEL_SECTION);
+	case CANCEL_KIND_ITER:
+		return cancel_add_kfunc(env, (u32)e->arg, e->arg >> 32, CANCEL_ITER);
 	default:
 		return 0;
 	}
@@ -1404,6 +1570,17 @@ static int cancel_emit_unlock(const struct cancel_entry *e, int place, struct bp
 	return n;
 }
 
+/* bpf_iter_<type>_destroy(r10 + @place), see cancel_collect_iter() for e->arg */
+static int cancel_emit_iter(const struct cancel_entry *e, int place, struct bpf_insn *buf)
+{
+	int n = 0;
+
+	buf[n++] = BPF_MOV64_REG(BPF_REG_1, BPF_REG_FP);
+	buf[n++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, place);
+	buf[n++] = BPF_CALL_KFUNC(e->arg >> 32, (u32)e->arg);
+	return n;
+}
+
 /*
  * The insns that release @e, into @buf: CANCEL_ENTRY_INSNS at most. Returns how many. The
  * handle is in @place: R6-R9 or a stack slot, whatever e->place says. The insns may clobber
@@ -1422,6 +1599,8 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 	case CANCEL_RCU:
 	case CANCEL_PREEMPT:
 		return cancel_emit_section(e, buf);
+	case CANCEL_KIND_ITER:
+		return cancel_emit_iter(e, place, buf);
 	default:
 		verifier_bug(env, "cancel: no pad releases kind %d", e->kind);
 		return -EFAULT;
