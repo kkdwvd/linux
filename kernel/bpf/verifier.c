@@ -1197,7 +1197,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	id = acquire_irq_state(env, insn_idx);
 	if (id < 0)
 		return id;
-	bpf_cancel_record_acquire(env, BPF_CANCEL_ACQUIRE_ALWAYS);
+	/* bpf_res_spin_lock_irqsave() saves the flags if it takes the lock, see process_spin_lock() */
+	bpf_cancel_record_acquire(env, kfunc_class == IRQ_LOCK_KFUNC ? BPF_CANCEL_ACQUIRE_R0_ZERO :
+								       BPF_CANCEL_ACQUIRE_ALWAYS);
 
 	slot = bpf_stack_slot(state, spi);
 	st = &slot->spilled_ptr;

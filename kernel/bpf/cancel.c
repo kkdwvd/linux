@@ -2101,12 +2101,23 @@ static int cancel_add_pairs(struct bpf_verifier_env *env, const struct bpf_verif
 int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx)
 {
 	const struct bpf_verifier_state *st = env->cur_state;
+	u32 nr = st->acquired_refs;
 	int x;
 
 	x = cancel_get_origin(env, insn_idx);
 	if (x < 0)
 		return x;
-	return cancel_add_pairs(env, st, st->curframe, x, -1, st->acquired_refs);
+	/*
+	 * bpf_res_spin_lock_irqsave() adds two entries, the lock and then the IRQ flags, and
+	 * they are one resource: one call brings the two and one call takes them away, see
+	 * cancel_lock_irq_slot(), and a pad has one entry for them. A lock of that kind is the
+	 * last entry only while its call has yet to add the flags: they are held together with
+	 * what the lock is, and the two don't count as two of one origin.
+	 */
+	if (nr && st->refs[nr - 1].type == REF_TYPE_RES_LOCK_IRQ &&
+	    st->refs[nr - 1].insn_idx == insn_idx)
+		return 0;
+	return cancel_add_pairs(env, st, st->curframe, x, -1, nr);
 }
 
 /* Visits of an origin have to agree on what tells that it brought a resource */
@@ -2428,7 +2439,7 @@ static const char *cancel_shape_text(u8 reason)
 	case CANCEL_RELEASE:
 		return "nothing that a pad may call there releases a reference of the frame";
 	case CANCEL_MULTI:
-		return "the frame holds a resource on some paths only, and may hold two that one insn brought, like a lock and its IRQ flags";
+		return "the frame holds a resource on some paths only, and may hold two that one insn brought, like two that a subprog returns with";
 	case CANCEL_INEXACT:
 		return "the frame holds a resource on some paths only, and no insn of the frame tells when: it was given to a callee, or a release leaves it on some paths";
 	case CANCEL_PLACES:
@@ -2742,7 +2753,8 @@ static int cancel_assign_pad(struct bpf_verifier_env *env, struct cancel_site *s
  * are right in every run:
  * - Every origin is an insn of one subprog, and its visits agree on what tells that it
  *   brought a resource, see bpf_cancel_record_acquire() and bpf_cancel_record_return().
- * - No frame holds two resources of the class at a time: the flag cannot say which.
+ * - No frame holds two resources of the class at a time: the flag cannot say which. The lock
+ *   and the IRQ flags of bpf_res_spin_lock_irqsave() are one, see bpf_cancel_record_origin().
  * - The frame that holds a resource gives it up itself, at a call of a helper or of a
  *   kfunc, and no visit of that call leaves a resource of the class with the frame, see
  *   bpf_cancel_record_release(). What the visits of one call take away is one class.
