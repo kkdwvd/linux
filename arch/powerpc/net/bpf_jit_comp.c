@@ -272,8 +272,6 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 		cgctx.user_vm_start = bpf_arena_get_user_vm_start(fp->aux->arena);
 	}
 	cgctx.is_subprog = bpf_is_subprog(fp);
-	cgctx.exception_boundary = fp->aux->exception_boundary;
-	cgctx.exception_cb = fp->aux->exception_cb;
 	cgctx.priv_sp = priv_stack_ptr;
 	cgctx.priv_stack_size = 0;
 	if (priv_stack_ptr) {
