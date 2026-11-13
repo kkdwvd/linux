@@ -10,6 +10,8 @@
 /* Only defined by the non-UAPI linux/filter.h, which this file cannot use. */
 #define BPF_PROBE_ATOMIC 0xe0
 #define BPF_ATOMIC_LOCAL 0x1000
+#define BPF_CANCEL_GOTO 2
+#define BPF_CANCEL_EXIT 2
 
 #define __BPF_FUNC_STR_FN(x) [BPF_FUNC_ ## x] = __stringify(bpf_ ## x)
 static const char * const func_id_str[] = {
@@ -404,12 +406,17 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 			   insn->src_reg == BPF_UNWIND_GOTO) {
 			verbose(cbs->private_data, "(%02x) unwind_goto pc%+d",
 				insn->code, insn->off);
+		} else if (insn->code == (BPF_JMP | BPF_JCOND) &&
+			   insn->src_reg == BPF_CANCEL_GOTO) {
+			verbose(cbs->private_data, "(%02x) cancel_goto pc%+d",
+				insn->code, insn->imm);
 		} else if (insn->code == (BPF_JMP32 | BPF_JA)) {
 			verbose(cbs->private_data, "(%02x) gotol pc%+d",
 				insn->code, insn->imm);
 		} else if (insn->code == (BPF_JMP | BPF_EXIT)) {
 			verbose(cbs->private_data, "(%02x) %s", insn->code,
-				insn->src_reg == BPF_UNWIND_EXIT ? "unwind_exit" : "exit");
+				insn->src_reg == BPF_UNWIND_EXIT ? "unwind_exit" :
+				insn->src_reg == BPF_CANCEL_EXIT ? "cancel_exit" : "exit");
 		} else if (BPF_SRC(insn->code) == BPF_X) {
 			verbose(cbs->private_data,
 				"(%02x) if %c%d %s %c%d goto pc%+d",

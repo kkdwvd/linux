@@ -565,7 +565,7 @@ static int bpf_adj_moved_insn(struct bpf_insn *insn, u32 delta)
 			return 0;
 	} else if ((class == BPF_JMP || class == BPF_JMP32) &&
 		   op != BPF_CALL && op != BPF_EXIT) {
-		if (insn->code != (BPF_JMP32 | BPF_JA)) {
+		if (!bpf_jmp_offset_in_imm(insn)) {
 			off = insn->off;
 			off_min = S16_MIN;
 			is_imm = false;
@@ -959,18 +959,22 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	struct bpf_insn trap = BPF_JMP_IMM(BPF_JA, 0, 0, -1);
 	struct bpf_insn *insn = env->prog->insnsi;
 	const int insn_cnt = env->prog->len;
-	int i;
+	int i, off;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		if (!bpf_insn_is_cond_jump(insn->code))
 			continue;
 
-		if (bpf_is_unwind_goto(insn) && aux_data[i + 1 + insn->off].seen) {
+		/* the pad of cancel_goto is in imm, and is no dead code: bpf_insert_loop_guards() */
+		off = bpf_is_cancel_goto(insn) ? insn->imm : insn->off;
+		if ((bpf_is_unwind_goto(insn) || bpf_is_cancel_goto(insn)) &&
+		    aux_data[i + 1 + off].seen) {
 			/*
 			 * The callee never exits. Its unwind_exit needs
 			 * unwind_goto all the same, and the cpu predicts that it
 			 * returns to what follows. Don't let the removal of dead
-			 * code put something else there.
+			 * code put something else there. cancel_exit and
+			 * cancel_goto are no different.
 			 */
 			if (!aux_data[i + 1].seen) {
 				memcpy(insn + 1, &trap, sizeof(trap));
@@ -1982,7 +1986,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 			if (BPF_CLASS(insn->code) == BPF_STX &&
 			     BPF_MODE(insn->code) == BPF_PROBE_ATOMIC)
 				num_exentries++;
-			if (bpf_is_unwind_goto(insn))
+			if (bpf_is_unwind_goto(insn) || bpf_is_cancel_goto(insn))
 				num_exentries++;
 		}
 		func[i]->aux->num_exentries = num_exentries;
@@ -1991,6 +1995,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->changes_pkt_data = env->subprog_info[i].changes_pkt_data;
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
+		func[i]->aux->can_cancel = env->subprog_info[i].can_cancel;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
 		func[i]->aux->token = prog->aux->token;
 		if (!i)

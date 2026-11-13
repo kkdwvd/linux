@@ -306,6 +306,43 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
 }
 
 /*
+ * src_reg of BPF_JMP | BPF_JCOND and of BPF_JMP | BPF_EXIT that only the verifier
+ * inserts. check_jmp_fields() rejects a program that is loaded with them.
+ *
+ * 'call foo; cancel_goto pad' names the pad of the call: what the verifier generated
+ * for this frame to do when foo is cancelled. The unwind_goto of the call may be
+ * between the two. cancel_goto is not a jump. JITs emit no code for it, nothing jumps
+ * to it and execution falls through it. The pads are behind the last insn of their
+ * subprog, however long that is: the offset of the pad has 32 bits and is in imm,
+ * like that of gotol, and off is 0.
+ * cancel_exit returns to the pad of the call that it returns from, with R0 as it is.
+ * A call without a pad is one that the kernel made. There it is exit.
+ */
+#define BPF_CANCEL_GOTO	2
+#define BPF_CANCEL_EXIT	2
+static_assert(BPF_CANCEL_GOTO > BPF_UNWIND_GOTO);
+static_assert(BPF_CANCEL_EXIT > BPF_UNWIND_EXIT);
+
+static inline bool bpf_is_cancel_goto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_CANCEL_GOTO;
+}
+
+static inline bool bpf_is_cancel_exit(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_CANCEL_EXIT;
+}
+
+/*
+ * Whether the offset of the target of @insn, a jump or cancel_goto, is in imm and has
+ * 32 bits. The others have 16 bits, in off.
+ */
+static inline bool bpf_jmp_offset_in_imm(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JA) || bpf_is_cancel_goto(insn);
+}
+
+/*
  * The caller of the main prog doesn't tell unwind_exit from exit. An extension
  * is different: its caller is the caller of the subprog that it replaced.
  * An exception callback returns from the frame of the main prog. After freplace
@@ -1386,6 +1423,7 @@ bool bpf_jit_supports_kfunc_call(void);
 bool bpf_jit_supports_callx(void);
 bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
+bool bpf_jit_supports_cancel(void);
 bool bpf_jit_supports_hmul(void);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);

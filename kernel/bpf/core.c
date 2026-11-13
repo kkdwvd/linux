@@ -377,7 +377,8 @@ static int patch_list_reserve_insns(struct bpf_patch_list *pl, u32 cnt)
 /*
  * Extract the pc-relative operand of a jump, a subprog call or a ld_imm64 of a
  * subprog. gotox and a tail call pass for a jump to the next insn: nothing
- * reads their 'off'.
+ * reads their 'off'. cancel_goto passes for a jump as well: its pad moves like
+ * the target of one, and the operand is in 'imm' like that of gotol.
  */
 static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 {
@@ -392,7 +393,7 @@ static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 	    BPF_OP(code) == BPF_CALL || BPF_OP(code) == BPF_EXIT)
 		return false;
 
-	*is_imm = code == (BPF_JMP32 | BPF_JA);
+	*is_imm = bpf_jmp_offset_in_imm(insn);
 	*rel = *is_imm ? insn->imm : insn->off;
 	return true;
 }
@@ -3712,6 +3713,12 @@ bool __weak bpf_jit_supports_kfunc_ret_reg_pair(void)
 
 /* unwind_goto and unwind_exit */
 bool __weak bpf_jit_supports_unwind(void)
+{
+	return false;
+}
+
+/* cancel_goto and cancel_exit */
+bool __weak bpf_jit_supports_cancel(void)
 {
 	return false;
 }

@@ -1055,6 +1055,7 @@ struct bpf_subprog_info {
 	bool has_tail_call: 1;
 	bool might_throw: 1;
 	bool can_unwind: 1; /* has unwind_exit */
+	bool can_cancel: 1; /* has cancel_exit: generated pads */
 	bool recursive: 1; /* on a cycle of the call graph */
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
 	bool addr_taken: 1; /* callx calls nothing else */

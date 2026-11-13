@@ -1944,6 +1944,7 @@ struct bpf_prog_aux {
 	bool has_prologue;
 	bool might_sleep;
 	bool can_unwind;
+	bool can_cancel;
 	/* frames of recursive subprogs can be on the stack when it is called */
 	bool in_recursion;
 	bool kprobe_write_ctx;
