@@ -369,7 +369,8 @@ struct bpf_reference_state {
 	 */
 	int insn_idx;
 	/*
-	 * The frame that is to release it: the one that acquired it, or the caller
+	 * The frame that is to release it: the one that acquired it, the callee
+	 * that a call moved it into, see bpf_cancel_ref_moves(), or the caller
 	 * that a returning frame left it with. BPF_INHERITED_FRAME for what the
 	 * callers of a function verified on its own hold.
 	 */
@@ -547,7 +548,8 @@ struct bpf_func_state {
 	/*
 	 * How much of what was held when the frame was entered is held ever since. For
 	 * references that is the first entry_refs of refs[]. What is released and taken again
-	 * doesn't count. More than that is for this frame to release.
+	 * doesn't count. More than that is for this frame to release, and of the first ones
+	 * what the call moved into the frame, see bpf_reference_state.frameno.
 	 */
 	u32 entry_refs;
 	u32 entry_rcu_locks;
@@ -1711,6 +1713,8 @@ enum bpf_cancel_site_type {
 
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner);
+bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			  u32 idx, int subprog);
 int bpf_cancel_resolve(struct bpf_verifier_env *env);
 int bpf_cancel_build_pads(struct bpf_verifier_env *env, int subprog,
 			  const struct bpf_insn **insns);
