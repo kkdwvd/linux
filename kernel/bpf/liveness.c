@@ -418,9 +418,6 @@ static inline bool update_insn(struct bpf_verifier_env *env, struct func_instanc
 	u32 s, w;
 
 	succ = bpf_insn_successors(env, insn_idx);
-	if (succ->cnt == 0)
-		return false;
-
 	/* All instructions of one frame array share the same mask width */
 	for (s = 0; s < succ->cnt; ++s) {
 		unsigned long *succ_live;
@@ -1873,6 +1870,13 @@ static int record_call_access(struct bpf_verifier_env *env,
 	struct bpf_call_summary cs;
 	int r, err, callee, arg_slot_cnt = 5;
 
+	/*
+	 * bpf_throw() never returns: the landing pad reads whichever stack slots of
+	 * the frame hold resources at the call, so none is dead there.
+	 */
+	if (bpf_is_throw_kfunc(insn))
+		return mark_stack_read_all(env, instance, instance->depth, insn_idx, true);
+
 	if (bpf_pseudo_call(insn)) {
 		/*
 		 * analyze_subprog() handles static callees. For global callees,
@@ -2821,6 +2825,14 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 */
 			if (bpf_is_sync_callback_calling_insn(insn) && bpf_is_unwind_goto(insn + 1))
 				use |= r0;
+			/*
+			 * bpf_throw() never returns: the landing pad reads whichever
+			 * registers hold resources at the call. R2-R5 are left out:
+			 * live there they would be arguments of each function from
+			 * whose entry a throw is reached.
+			 */
+			if (bpf_is_throw_kfunc(insn))
+				use |= r0 | mask_widen(GENMASK(BPF_REG_9, BPF_REG_6));
 			break;
 		default:
 			def = 0;
