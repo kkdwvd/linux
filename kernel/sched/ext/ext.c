@@ -12148,6 +12148,15 @@ static const struct btf_kfunc_id_set scx_kfunc_set_any = {
 };
 
 /*
+ * The kfunc that generated code calls to release a cpumask reference. A
+ * reference to an idle cpumask is released by it as well: like
+ * scx_bpf_put_idle_cpumask(), it does nothing.
+ */
+BTF_ID_LIST(scx_cpumask_release_ids)
+BTF_ID(struct, cpumask)
+BTF_ID(func, scx_bpf_put_cpumask)
+
+/*
  * Kfuncs that tracing programs can't call. A tracing program can run in any
  * kernel context, including with an rq lock held. scx_locked_rq() only tracks
  * rq locks held across SCX callbacks and returns NULL there.
@@ -12352,6 +12361,13 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 
 static int __init scx_init(void)
 {
+	const struct btf_id_dtor_kfunc scx_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= scx_cpumask_release_ids[0],
+			.release_btf_id	= scx_cpumask_release_ids[1],
+		},
+	};
 	int ret;
 
 	/*
@@ -12458,6 +12474,12 @@ static int __init scx_init(void)
 	    (ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
 					     &scx_kfunc_set_any))) {
 		pr_err("sched_ext: Failed to register kfunc sets (%d)\n", ret);
+		return ret;
+	}
+
+	ret = register_btf_id_dtor_kfuncs(scx_releases, ARRAY_SIZE(scx_releases), THIS_MODULE);
+	if (ret) {
+		pr_err("sched_ext: Failed to register release kfuncs (%d)\n", ret);
 		return ret;
 	}
 
