@@ -3825,6 +3825,16 @@ u64 __weak bpf_unwind_target(u64 ret_addr)
 }
 
 /*
+ * Where a fault in the code of an insn that ends at @end goes: the landing pad that unwind_goto
+ * after the insn names, or @end, which skips the insn. The JITs that go to a pad at a fault have
+ * the real one.
+ */
+u64 __weak bpf_fault_unwind_target(u64 end)
+{
+	return end;
+}
+
+/*
  * How this arch places a by-value kfunc argument, or NULL for one that has
  * not opted in and so only takes an argument of a single eightbyte, which
  * every convention places in slot order.

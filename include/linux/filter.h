@@ -1403,6 +1403,7 @@ bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
 bool bpf_jit_supports_hmul(void);
 u64 bpf_unwind_target(u64 ret_addr);
+u64 bpf_fault_unwind_target(u64 end);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);

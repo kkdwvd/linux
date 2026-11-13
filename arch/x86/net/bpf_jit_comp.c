@@ -1792,14 +1792,12 @@ static int emit_atomic_ld_st_index(u8 **pprog, u32 atomic_op, u32 size,
  * in @dst_reg and @src_reg.
  *
  * Both the load and the CMPXCHG can fault when accessing the arena, so their
- * addresses are handed back in @fault[0] and @fault[1]. A fault has to resume
- * at @resume, which is past the loop and past the move that delivers the old
- * value, but before R0 is restored. Both are NULL for the non-arena case,
- * which needs no fixup.
+ * addresses are handed back in @fault[0] and @fault[1]. It is NULL for the
+ * non-arena case, which needs no fixup. ex_handler_bpf() leaves the whole
+ * sequence and restores R0 itself, see FIXUP_ARENA_R0_IN_AX.
  */
 static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
-				 u32 src_reg, int index_reg,
-				 u8 **fault, u8 **resume)
+				 u32 src_reg, int index_reg, u8 **fault)
 {
 	bool is64 = BPF_SIZE(insn->code) == BPF_DW;
 	u8 *branch_target, *prog = *pprog;
@@ -1842,9 +1840,6 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 	/* Return the pre-modification value */
 	emit_mov_reg(&prog, is64, src_reg, BPF_REG_0);
 
-	if (resume)
-		*resume = prog;
-
 	/* Restore R0 after clobbering RAX */
 	emit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);
 
@@ -1859,18 +1854,18 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+--------+-----------+---------+----------+
- * | 31        | 30          | 29-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+--------+-----------+---------+----------+
+ * +-----------+-------------+----------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29       | 28-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |          |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | R0_IN_AX | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+----------+--------+-----------+---------+----------+
  *
- * - INSN_LEN (8 bits): How far past the faulting insn to resume. That is its own length
- *                      for a single-insn access, but the distance to the end of the whole
- *                      sequence where one BPF insn became several, as for the CMPXCHG loop
- *                      of a fetching AND/OR/XOR. A sequence long enough to overflow this
- *                      field would first have to exceed BPF_MAX_INSN_SIZE, which do_jit()
- *                      rejects with -EFAULT before the image is used.
+ * - INSN_LEN (8 bits): How far the end of the code of the BPF insn is from the faulting insn.
+ *                      That is its own length for a single-insn access, but the distance to
+ *                      the end of the whole sequence where one BPF insn became several, as for
+ *                      the CMPXCHG loop of a fetching AND/OR/XOR. A sequence long enough to
+ *                      overflow this field would first have to exceed BPF_MAX_INSN_SIZE, which
+ *                      do_jit() rejects with -EFAULT before the image is used.
  * - DST_REG  (8 bits): Offset of dst_reg from reg2pt_regs[] (max offset = 112 (fits in 8 bits)).
  *                      This is set to DONT_CLEAR if the insn does not read into a register.
  * - ARENA_REG (8 bits): Offset of the register that is used to calculate the
@@ -1879,6 +1874,9 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                        It is independent of DST_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
  * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
+ * - R0_IN_AX (1 bit): R0 is in BPF_REG_AX while the faulting insn runs: the CMPXCHG loop of a
+ *                     fetching AND/OR/XOR keeps it there while RAX serves the CMPXCHG. The
+ *                     handler puts it back, since it leaves the sequence.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1896,6 +1894,7 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_IN_AX	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
 #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
@@ -1906,6 +1905,7 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 	u32 insn_len = FIELD_GET(FIXUP_INSN_LEN_MASK, x->fixup);
 	bool is_arena = !!(x->fixup & FIXUP_ARENA_ACCESS);
 	bool is_write = !!(x->fixup & FIXUP_ARENA_WRITE);
+	unsigned long end = regs->ip + insn_len, pad = end;
 	unsigned long addr;
 	s16 off;
 	u32 arena_reg;
@@ -1914,13 +1914,18 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		arena_reg = FIELD_GET(FIXUP_ARENA_REG_MASK, x->fixup);
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
+		pad = bpf_arena_fault(is_write, addr, regs->ip, end);
 	}
 
-	/* jump over the faulting access, or the sequence it is part of, and clear dest register */
-	if (reg != DONT_CLEAR)
+	/*
+	 * No landing pad: jump over the faulting access, or the sequence it is part of, and clear
+	 * dest register. The landing pad gets the registers as they were before the access.
+	 */
+	if (pad == end && reg != DONT_CLEAR)
 		*(unsigned long *)((void *)regs + reg) = 0;
-	regs->ip += insn_len;
+	if (x->fixup & FIXUP_ARENA_R0_IN_AX)
+		regs->ax = regs->r10;
+	regs->ip = pad;
 
 	return true;
 }
@@ -1929,11 +1934,11 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
  * Record an arena access that may fault. @fault_ip is the address of the
  * faulting insn in the RO image, @resume_off how far past it execution has to
  * resume: for a multi-insn lowering that is the end of the whole sequence, not
- * the end of the one insn.
+ * the end of the one insn. @flags are the FIXUP_ARENA_* bits of the entry.
  */
 static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image,
 			      int *excnt, u8 *fault_ip, u32 resume_off,
-			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off)
+			      u32 fixup_reg, u32 arena_reg, u32 flags, s16 off)
 {
 	struct exception_table_entry *ex;
 	s64 delta;
@@ -1956,9 +1961,7 @@ static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image
 	ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, resume_off) |
 		    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
 		    FIELD_PREP(FIXUP_REG_MASK, fixup_reg) |
-		    FIXUP_ARENA_ACCESS;
-	if (is_write)
-		ex->fixup |= FIXUP_ARENA_WRITE;
+		    FIXUP_ARENA_ACCESS | flags;
 
 	return 0;
 }
@@ -2322,6 +2325,8 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
  * replaces the return address of its frame with bpf_unwind_target() of it.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
+ * After an access to arena ret_addr is the end of its code, and a fault in it
+ * goes to bpf_fault_unwind_target() of that, see ex_handler_bpf().
  */
 static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
 			      int ret_addr, int target)
@@ -2382,6 +2387,18 @@ u64 bpf_unwind_target(u64 ret_addr)
 	scoped_guard(rcu)
 		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
 	return ret_addr;
+}
+
+/*
+ * The same for the end of the code of an access to arena that faulted, see
+ * ex_handler_bpf(). No entry is no lost unwind_exit there: no unwind_goto
+ * follows the access, and it is skipped.
+ */
+u64 bpf_fault_unwind_target(u64 end)
+{
+	const struct exception_table_entry *e = search_bpf_extables(end - 1);
+
+	return e ? end + e->fixup : end;
 }
 
 /*
@@ -3095,8 +3112,9 @@ populate_extable:
 
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
-							 prog - start_of_ldx, fixup_reg,
-							 arena_reg, is_write, insn->off);
+							 prog - start_of_ldx, fixup_reg, arena_reg,
+							 is_write ? FIXUP_ARENA_WRITE : 0,
+							 insn->off);
 				if (err)
 					return err;
 			}
@@ -3273,8 +3291,7 @@ populate_extable:
 			}
 			if (is_atomic_fetch) {
 				err = emit_atomic_fetch_rmw(&prog, insn, real_dst_reg,
-							    real_src_reg, -1,
-							    NULL, NULL);
+							    real_src_reg, -1, NULL);
 				if (err)
 					return err;
 				break;
@@ -3302,7 +3319,7 @@ populate_extable:
 		case BPF_STX | BPF_PROBE_ATOMIC | BPF_DW:
 			if (is_atomic_fetch_op(insn)) {
 				u32 real_src_reg = src_reg, real_dst_reg = dst_reg;
-				u8 *fault[2], *resume;
+				u8 *fault[2];
 				int j;
 
 				/* Will need RAX as a CMPXCHG operand so save R0 */
@@ -3313,25 +3330,26 @@ populate_extable:
 					real_dst_reg = BPF_REG_AX;
 
 				err = emit_atomic_fetch_rmw(&prog, insn, real_dst_reg,
-							    real_src_reg, X86_REG_R12,
-							    fault, &resume);
+							    real_src_reg, X86_REG_R12, fault);
 				if (err)
 					return err;
 
 				/*
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
-				 * since the BPF insn is a read-modify-write.
+				 * since the BPF insn is a read-modify-write, and both
+				 * say that R0 is in BPF_REG_AX while RAX serves the CMPXCHG.
 				 */
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
 								 &excnt,
 								 image + proglen +
 									 (fault[j] - temp),
-								 resume - fault[j],
+								 prog - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 true, insn->off);
+								 FIXUP_ARENA_WRITE |
+								 FIXUP_ARENA_R0_IN_AX, insn->off);
 					if (err)
 						return err;
 				}
@@ -3464,6 +3482,9 @@ populate_extable:
 			/* unwind_goto. The verifier expanded may_goto. */
 		case BPF_JMP | BPF_JCOND:
 		case BPF_JMP32 | BPF_JCOND:
+			/* an access to arena is in front: no call, nothing to redo */
+			if (BPF_CLASS(insn[-1].code) != BPF_JMP)
+				after_call_len = 0;
 			if (!after_call_len) {
 				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
 							 addrs[i - 1],

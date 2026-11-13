@@ -3481,7 +3481,8 @@ void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
 		     enum bpf_dynptr_type type, u32 offset, u32 size);
 void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
 void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
-void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip);
+unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long fault_ip,
+			      unsigned long end);
 
 static __always_inline u32
 bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
@@ -3821,9 +3822,10 @@ static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
 {
 }
 
-static inline void bpf_prog_report_arena_violation(bool write, unsigned long addr,
-						   unsigned long fault_ip)
+static inline unsigned long bpf_arena_fault(bool write, unsigned long addr,
+					    unsigned long fault_ip, unsigned long end)
 {
+	return end;
 }
 #endif /* CONFIG_BPF_SYSCALL */
 

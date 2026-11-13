@@ -1389,7 +1389,8 @@ static int __init kfunc_init(void)
 late_initcall(kfunc_init);
 
 static void __bpf_prog_report_arena_violation(struct bpf_prog *prog, bool write,
-					      unsigned long addr, unsigned long fault_ip)
+					      unsigned long addr, unsigned long fault_ip,
+					      bool unwound)
 {
 	struct bpf_stream_stage ss;
 	u64 user_vm_start;
@@ -1401,8 +1402,9 @@ static void __bpf_prog_report_arena_violation(struct bpf_prog *prog, bool write,
 	addr += clear_lo32(user_vm_start);
 
 	bpf_stream_stage(ss, prog, BPF_STDERR, ({
-		bpf_stream_printk(ss, "ERROR: Arena %s access at unmapped address 0x%lx\n",
-				  write ? "WRITE" : "READ", addr);
+		bpf_stream_printk(ss, "ERROR: Arena %s access at unmapped address 0x%lx%s\n",
+				  write ? "WRITE" : "READ", addr,
+				  unwound ? ". The program is unwound" : "");
 		bpf_stream_dump_stack(ss);
 	}));
 }
@@ -1440,7 +1442,7 @@ bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned lon
 
 	if (prog && prog->aux->arena == arena)
 		__bpf_prog_report_arena_violation(prog, is_write,
-						  page_addr - kbase, fault_ip);
+						  page_addr - kbase, fault_ip, false);
 	else if (__ratelimit(&rs))
 		printk_deferred(KERN_ERR "BPF arena %u: %s fault at offset 0x%lx, IP %pS\n",
 				arena->map.id, is_write ? "WRITE" : "READ",
@@ -1451,8 +1453,15 @@ out:
 	return handled;
 }
 
-void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
+/*
+ * JITed code faulted at @fault_ip, in an access to arena at @addr. The code of the BPF insn ends at
+ * @end. Report it. Returns where the program goes on: at the landing pad when unwind_goto follows
+ * the insn, else at @end: the access is skipped.
+ */
+unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long fault_ip,
+			      unsigned long end)
 {
+	unsigned long pad = bpf_fault_unwind_target(end);
 	struct bpf_prog *prog;
 
 	/*
@@ -1463,7 +1472,7 @@ void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned lo
 	rcu_read_lock();
 	prog = bpf_prog_ksym_find(fault_ip);
 	rcu_read_unlock();
-	if (!prog)
-		return;
-	__bpf_prog_report_arena_violation(prog, write, addr, fault_ip);
+	if (prog)
+		__bpf_prog_report_arena_violation(prog, write, addr, fault_ip, pad != end);
+	return pad;
 }

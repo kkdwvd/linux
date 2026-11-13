@@ -1588,7 +1588,7 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
-		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+		bpf_arena_fault(is_write, addr, regs->pc, regs->pc + AARCH64_INSN_SIZE);
 	}
 
 	if (dst_reg != DONT_CLEAR)
