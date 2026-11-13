@@ -714,20 +714,29 @@ static void emit_indirect_jump(u8 **pprog, int bpf_reg, u8 *ip)
 	*pprog = prog;
 }
 
-static void __emit_indirect_call(u8 **pprog, int reg, bool ereg)
+static void __emit_indirect_call(u8 **pprog, int reg, bool ereg, bool rex)
 {
 	u8 *prog = *pprog;
 
 	if (ereg)
 		EMIT1(0x41);
+	else if (rex)
+		EMIT1(0x40);
 
 	EMIT2(0xFF, 0xD0 + reg);
 
 	*pprog = prog;
 }
 
-/* call *bpf_reg */
-static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
+/*
+ * call *bpf_reg
+ *
+ * @rex: make the call insn 3 bytes at least. 'call *%rax' has 2, and the extable
+ * entry of the cancel_goto behind it would be at its first byte, see
+ * add_ret_exentry(). A rex prefix without bits takes a byte and does nothing else.
+ * A call of a thunk has 5 bytes.
+ */
+static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip, bool rex)
 {
 	u8 *prog = *pprog;
 	int reg = reg2hex[bpf_reg];
@@ -739,7 +748,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		err = emit_call(&prog, its_static_thunk(reg + 8*ereg), ip);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
 		EMIT_LFENCE();
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE)) {
 		OPTIMIZER_HIDE_VAR(reg);
 		if (cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
@@ -747,7 +756,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		else
 			err = emit_call(&prog, &__x86_indirect_thunk_array[reg + 8*ereg], ip);
 	} else {
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	}
 
 	*pprog = prog;
@@ -2318,11 +2327,24 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
  * replaces the return address of its frame with bpf_unwind_target() of it.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
+ *
+ * cancel_goto is the same for cancel_exit and bpf_cancel_target(), with the entry
+ * at ret_addr - 2: unwind_goto of the same call has the byte behind it. No insn
+ * starts there either, since a call that cancel_goto follows has 3 bytes at least,
+ * see emit_indirect_call().
  */
-static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
-			      int ret_addr, int target)
+#define UNWIND_EXKEY	1
+#define CANCEL_EXKEY	2
+
+/*
+ * @after_unwind: the entry of unwind_goto of the same call was added last. The table
+ * is searched by bisection and this entry has the lower address, so it takes that
+ * place and the other one moves up.
+ */
+static int add_ret_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
+			   int ret_addr, int target, int key, bool after_unwind)
 {
-	struct exception_table_entry *ex;
+	struct exception_table_entry *ex, *rw;
 	s64 delta;
 
 	if (!prog->aux->extable)
@@ -2332,22 +2354,29 @@ static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, in
 		return -EFAULT;
 	}
 	ex = &prog->aux->extable[(*excnt)++];
-	delta = image + ret_addr - 1 - (u8 *)&ex->insn;
+	/* switch ex to rw buffer for writes */
+	rw = (void *)rw_image + ((void *)ex - (void *)image);
+	if (after_unwind) {
+		/* insn is relative to the entry */
+		*rw = rw[-1];
+		rw->insn -= sizeof(*rw);
+		ex--;
+		rw--;
+	}
+	delta = image + ret_addr - key - (u8 *)&ex->insn;
 	if (!is_simm32(delta)) {
 		pr_err("extable->insn doesn't fit into 32-bit\n");
 		return -EFAULT;
 	}
-	/* switch ex to rw buffer for writes */
-	ex = (void *)rw_image + ((void *)ex - (void *)image);
-	ex->insn = delta;
-	ex->fixup = target - ret_addr;
-	ex->data = EX_TYPE_BPF;
+	rw->insn = delta;
+	rw->fixup = target - ret_addr;
+	rw->data = EX_TYPE_BPF;
 	return 0;
 }
 
 static u64 bpf_unwind_target(u64 ret_addr)
 {
-	const struct exception_table_entry *e = search_bpf_extables(ret_addr - 1);
+	const struct exception_table_entry *e = search_bpf_extables(ret_addr - UNWIND_EXKEY);
 
 	/*
 	 * The verifier made sure that unwind_goto follows a call in a prog. When
@@ -2356,11 +2385,35 @@ static u64 bpf_unwind_target(u64 ret_addr)
 	return e ? ret_addr + e->fixup : ret_addr;
 }
 
+static u64 bpf_cancel_target(u64 ret_addr)
+{
+	const struct exception_table_entry *e = search_bpf_extables(ret_addr - CANCEL_EXKEY);
+
+	/*
+	 * The verifier made sure that cancel_goto follows every call of a subprog
+	 * that has cancel_exit. When the kernel called it, it's exit.
+	 */
+	return e ? ret_addr + e->fixup : ret_addr;
+}
+
 /*
- * unwind_exit: fix the return address of this frame. r0 and r2 are returned.
- * So is BPF_REG_ARENA_SP, when it's used.
+ * 'call; [unwind_goto;] cancel_goto': whether cancel_goto follows @call, which has
+ * @cnt insns behind it.
  */
-static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
+static bool call_has_cancel_goto(const struct bpf_insn *call, int cnt)
+{
+	if (cnt && bpf_is_unwind_goto(call + 1)) {
+		call++;
+		cnt--;
+	}
+	return cnt && bpf_is_cancel_goto(call + 1);
+}
+
+/*
+ * unwind_exit, cancel_exit: replace the return address of this frame with @target
+ * of it. r0 and r2 are returned. So is BPF_REG_ARENA_SP, when it's used.
+ */
+static int emit_fix_ret_addr(u8 **pprog, u8 *ip, bool arena_sp, void *target)
 {
 	u8 *prog = *pprog, *start = prog;
 
@@ -2368,7 +2421,7 @@ static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
 	if (arena_sp)
 		push_r9(&prog);
 	EMIT4(0x48, 0x8B, 0x7D, 0x08);		/* mov rdi, [rbp + 8] */
-	if (emit_rsb_call(&prog, bpf_unwind_target, ip + (prog - start)))
+	if (emit_rsb_call(&prog, target, ip + (prog - start)))
 		return -EINVAL;
 	EMIT4(0x48, 0x89, 0x45, 0x08);		/* mov [rbp + 8], rax */
 	if (arena_sp)
@@ -3410,17 +3463,41 @@ populate_extable:
 				push_r9(&prog);
 				ip += 2;
 			}
-			if (emit_indirect_call(&prog, insn->dst_reg, ip))
+			if (emit_indirect_call(&prog, insn->dst_reg, ip,
+					       call_has_cancel_goto(insn, insn_cnt - i)))
 				return -EINVAL;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
 			break;
 
-			/* unwind_goto. The verifier expanded may_goto. */
-		case BPF_JMP | BPF_JCOND:
+			/* unwind_goto, cancel_goto. The verifier expanded may_goto. */
+		case BPF_JMP | BPF_JCOND: {
+			/* what the call returns to: 'pop r9' when the stack is private */
+			int ret_addr = addrs[i - 1] - (priv_frame_ptr ? 2 : 0);
+			/* where unwind_goto points */
+			int target = i + insn->off;
+			int key = UNWIND_EXKEY;
+			bool after_unwind = false;
+
+			if (bpf_is_cancel_goto(insn)) {
+				/* the offset of its pad has 32 bits and is in imm */
+				target = i + insn->imm;
+				/* call; [unwind_goto;] cancel_goto */
+				after_unwind = i > 1 && bpf_is_unwind_goto(insn - 1);
+				if (i < 2 + after_unwind ||
+				    !(bpf_pseudo_call(insn - 1 - after_unwind) ||
+				      bpf_is_callx(insn - 1 - after_unwind))) {
+					pr_err("bpf_jit: cancel_goto doesn't follow a call\n");
+					return -EFAULT;
+				}
+				key = CANCEL_EXKEY;
+				/* the 9 bytes of unwind_goto below are in between */
+				if (after_unwind && priv_frame_ptr)
+					ret_addr -= 9;
+			}
 			if (!priv_frame_ptr) {
-				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-							 addrs[i - 1], addrs[i + insn->off]);
+				err = add_ret_exentry(bpf_prog, image, rw_image, &excnt, ret_addr,
+						      addrs[target], key, after_unwind);
 				if (err)
 					return err;
 				break;
@@ -3434,15 +3511,18 @@ populate_extable:
 			 *   pop r9      <- unwind_exit returns here
 			 *   jmp pad
 			 * 1:
+			 * The same for cancel_goto and cancel_exit. When the call has
+			 * both, the three insns of cancel_goto are at 1.
 			 */
-			err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-						 addrs[i - 1] - 2, addrs[i - 1] + 2);
+			err = add_ret_exentry(bpf_prog, image, rw_image, &excnt, ret_addr,
+					      addrs[i - 1] + 2, key, after_unwind);
 			if (err)
 				return err;
 			EMIT2(0xEB, 7);
 			pop_r9(&prog);
-			EMIT1_off32(0xE9, addrs[i + insn->off] - (addrs[i - 1] + 9));
+			EMIT1_off32(0xE9, addrs[target] - (addrs[i - 1] + 9));
 			break;
+		}
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
@@ -3713,7 +3793,11 @@ emit_jmp:
 
 		case BPF_JMP | BPF_EXIT:
 			if (src_reg == BPF_UNWIND_EXIT && bpf_prog_can_unwind(bpf_prog) &&
-			    emit_unwind_ret_addr(&prog, ip, arena_sp))
+			    emit_fix_ret_addr(&prog, ip, arena_sp, bpf_unwind_target))
+				return -EINVAL;
+			/* in subprogs only: the verifier ends the pad of a main prog with exit */
+			if (src_reg == BPF_CANCEL_EXIT &&
+			    emit_fix_ret_addr(&prog, ip, arena_sp, bpf_cancel_target))
 				return -EINVAL;
 			if (seen_exit) {
 				jmp_offset = ctx->cleanup_addr - addrs[i] + moved;
@@ -4973,6 +5057,11 @@ bool bpf_jit_supports_kfunc_ret_reg_pair(void)
 }
 
 bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_cancel(void)
 {
 	return true;
 }
