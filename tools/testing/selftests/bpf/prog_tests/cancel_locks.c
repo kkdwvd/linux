@@ -18,7 +18,9 @@ struct at_entry {
  *
  * The two runs of a tc prog are one BPF_PROG_TEST_RUN, with nothing but the loop of
  * bpf_test_run() between them, so the second run begins in what the pads of the first left
- * behind: a preempt count or an RCU nesting that is one too high.
+ * behind: interrupts that are off, a preempt count or an RCU nesting that is one too high.
+ * With lockdep the kernel warns of interrupts that are off as soon as the first run returns,
+ * in local_bh_enable(), and turns them on there. That warning is all that tells then.
  *
  * A syscall prog is not repeated, so its second run is entered from user space again. The RCU
  * nesting of the task is still what the first run left, where the kernel counts it. The preempt
@@ -34,6 +36,10 @@ struct test {
 };
 
 static const struct test tests[] = {
+	{ "irq_save_at_call" },
+	{ "irq_save_twice_at_call" },
+	{ "irq_save_twice_slots_swapped" },
+	{ "irq_save_in_two_frames" },
 	{ "rcu_at_call" },
 	{ "preempt_at_call" },
 	{ "sections_max_at_call" },
@@ -100,6 +106,7 @@ static void run_test(const struct test *t)
 	ASSERT_EQ(skel->bss->behind, 0, "behind");
 
 	/* the second run was entered in what the first one was entered in */
+	ASSERT_EQ(skel->bss->found[1].irq, skel->bss->found[0].irq, "interrupts");
 	ASSERT_EQ(skel->bss->found[1].preempt, skel->bss->found[0].preempt, "preempt count");
 	ASSERT_EQ(skel->bss->found[1].rcu, skel->bss->found[0].rcu, "RCU nesting");
 out:
