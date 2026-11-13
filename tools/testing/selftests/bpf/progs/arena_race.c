@@ -42,12 +42,17 @@ int deferred_free;
 int worker_armed;
 int worker_exited;
 
+/*
+ * A prog whose time is up in the loop may be cancelled there, and nothing behind the loop runs
+ * then. So timed_out is set in front of it.
+ */
 static __always_inline void wait_for_release(void)
 {
+	timed_out = 1;
 	while (!*(volatile int *)&release && can_loop)
 		;
-	if (!*(volatile int *)&release)
-		timed_out = 1;
+	if (*(volatile int *)&release)
+		timed_out = 0;
 }
 
 SEC("syscall")

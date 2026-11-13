@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 #include <sched.h>
+#include <linux/pkt_cls.h>
 #include <test_progs.h>
 #include <network_helpers.h>
 #include "timed_may_goto.skel.h"
@@ -68,7 +69,8 @@ static void test_freplace(struct timed_may_goto_user *skel)
 {
 	struct timed_may_goto_ext *ext;
 
-	ASSERT_EQ(run_tc(skel->progs.freplace_target), 1, "not replaced");
+	/* the time is up in replaced_global(), which ends the prog */
+	ASSERT_EQ(run_tc(skel->progs.freplace_target), TC_ACT_SHOT, "not replaced");
 
 	ext = timed_may_goto_ext__open();
 	if (!ASSERT_OK_PTR(ext, "ext_open"))
@@ -79,10 +81,11 @@ static void test_freplace(struct timed_may_goto_user *skel)
 	if (!ASSERT_OK(timed_may_goto_ext__load(ext), "ext_load") ||
 	    !ASSERT_OK(timed_may_goto_ext__attach(ext), "ext_attach"))
 		goto out;
+	/* an extension is not cancelled: each of its calls goes on when its time is up */
 	ASSERT_EQ(run_tc(skel->progs.freplace_target), TRIES, "replaced");
 out:
 	timed_may_goto_ext__destroy(ext);
-	ASSERT_EQ(run_tc(skel->progs.freplace_target), 1, "not replaced");
+	ASSERT_EQ(run_tc(skel->progs.freplace_target), TC_ACT_SHOT, "not replaced");
 }
 
 /* What a prog leaves behind when its time is up doesn't matter for the next one on the cpu. */
@@ -95,6 +98,11 @@ static void test_tail_call_and_throw(struct timed_may_goto_user *skel)
 		return;
 
 	ASSERT_EQ(run_tc(skel->progs.normal_prog), 1, "normal_prog");
+	ASSERT_EQ(run_tc(skel->progs.normal_prog), 1, "normal_prog");
+
+	/* nor does what a prog leaves behind when it is cancelled */
+	ASSERT_EQ(run_tc(skel->progs.cancelled_prog), TC_ACT_SHOT, "cancelled_prog");
+	ASSERT_EQ(run_tc(skel->progs.cancelled_prog), TC_ACT_SHOT, "cancelled_prog");
 	ASSERT_EQ(run_tc(skel->progs.normal_prog), 1, "normal_prog");
 
 	ASSERT_EQ(run_tc(skel->progs.tail_call_in_subprog), 1, "tail_call_in_subprog");
