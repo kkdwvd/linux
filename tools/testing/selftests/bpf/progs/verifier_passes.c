@@ -1544,7 +1544,7 @@ __naked void ctx_moves(void)
 
 /*
  * The verifier can't tell that the loop ends. It adds may_goto, which unwinds the function: no
- * path continues with r7 = 0. Where a subprog cannot unwind may_goto leaves the loop.
+ * path continues with r7 = 0.
  */
 SEC("tc")
 __description("failing_path: no path continues where may_goto ends an infinite loop")

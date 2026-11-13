@@ -932,9 +932,6 @@ int bpf_compute_deps(struct bpf_verifier_env *env, unsigned long *masks,
 					bitmap_or(in, in, mask_at(env, masks, s, t), bits);
 					held |= test_bit(t, prec->held_insns);
 				}
-				t = bpf_head_guard_target(env, idx);
-				if (t >= 0)
-					bitmap_or(in, in, mask_at(env, masks, s, t), bits);
 				changed |= compute_insn_deps(env, masks, ret, s, idx,
 							     test_bit(idx, seed_insns), in, held);
 				if (idx == prec->loop_carried_at) {

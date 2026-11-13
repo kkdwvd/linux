@@ -422,7 +422,6 @@ static inline bool update_insn(struct bpf_verifier_env *env, struct func_instanc
 	unsigned long *may_read, *must_write, *live_before;
 	struct frame_masks *fm = instance->frames[frame];
 	u32 rel = relative_idx(instance, insn_idx);
-	int t = bpf_head_guard_target(env, insn_idx);
 	struct bpf_iarray *succ;
 	bool changed = false;
 	u32 s, w;
@@ -450,8 +449,6 @@ static inline bool update_insn(struct bpf_verifier_env *env, struct func_instanc
 	for (w = 0; w < fm->words; w++) {
 		unsigned long new_before = (new_after[w] & ~must_write[w]) | may_read[w];
 
-		if (t >= 0)
-			new_before |= rel_mask(fm, relative_idx(instance, t), before)[w];
 		if (new_before != live_before[w]) {
 			live_before[w] = new_before;
 			changed = true;
@@ -2188,12 +2185,6 @@ redo:
 		memcpy(at_out, at_in[i], sizeof(at_out));
 		memcpy(at_stack_out, &at_stack_in[(size_t)i * nslots], nslots * sizeof(*at_stack_out));
 
-		ti = bpf_head_guard_target(env, idx) - start;
-		if (ti >= 0 && arg_track_join_all(env, idx, start + ti, at_in[ti],
-						  &at_stack_in[(size_t)ti * nslots],
-						  at_out, at_stack_out, nslots))
-			__set_bit(ti, changed);
-
 		arg_track_xfer(env, insn, idx, at_out, at_stack_out, nslots,
 			       at_stack_arg_entry, instance, callsites);
 		arg_track_log(env, insn, idx, at_in[i], &at_stack_in[(size_t)i * nslots], at_out,
@@ -2946,7 +2937,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			u32 new_out = 0;
 			u32 new_in = 0;
 			u32 use;
-			int t;
 
 			succ = bpf_insn_successors(env, insn_idx);
 			for (int s = 0; s < succ->cnt; ++s)
@@ -2963,10 +2953,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			if (bpf_is_callx(&insns[insn_idx]))
 				use |= callx_use;
 			new_in = (new_out & ~live->def) | use;
-			/* may_goto that is added at the head of a loop goes there */
-			t = bpf_head_guard_target(env, insn_idx);
-			if (t >= 0)
-				new_in |= state[t].in;
 			if (new_out != live->out || new_in != live->in) {
 				live->in = new_in;
 				live->out = new_out;

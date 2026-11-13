@@ -756,27 +756,31 @@ none of these holds                    the verifier adds ``may_goto``
 =====================================  =========================================
 
 *may_goto* is a jump that is taken when the program has looped too long. The
-verifier puts it before a jump that leaves the loop, or at the header. It
-checks the new edge like any other edge::
+verifier puts it before a jump that leaves the loop, or at the header. The new
+edge has one target, a *landing pad* that the verifier emits after the last
+insn of the function::
 
   do {                          do {
           p = lookup();                 p = lookup();
-  } while (!p);                         may_goto leave;
+  } while (!p);                         may_goto pad;
   use(p);                       } while (!p);
                                 use(p);
                                 ...
-                                leave: return 0;
+                                pad: release what the function holds
+                                     return, or unwind
 
-Where does the edge go? The verifier takes the first line that is possible:
+The pad releases what the function acquired since its entry. Then:
 
-- In the main function: ``return 0``, if nothing has to be released and 0 is a
-  valid result.
-- In another function: *unwind*, if nothing has to be released and each call has
-  an ``unwind_goto`` after it. The function leaves with ``unwind_exit``, and
-  ``unwind_goto`` jumps to the code of the caller that cleans up.
-- The exit of the loop. The code there has to be safe. From a header the edge
-  leaves the outer loops too. If the code there reads a register that is not
-  set, the function returns 0.
+- The main function returns the value of ``bpf_unwound_retval()``: 0 where 0
+  refuses or changes nothing.
+- Another function *unwinds*. It leaves with ``unwind_exit``, and the
+  ``unwind_goto`` after its call jumps to the pad of the caller. The verifier
+  adds ``unwind_goto`` where the program has none.
+
+No insn stands for a pad in a pass. The state on the edge leaves its function
+at the ``may_goto``, see ``unwind_frame()``. One pad has to serve all states
+that get there. If none does, or if the function cannot unwind, that is a
+*conflict*: an error of the pass, like an unproven insn.
 
 A loop without an exit is an error.
 
@@ -911,7 +915,7 @@ recursion           the start of the function     a check at run time
 ==================  ============================  ==============================
 
 A recursive function starts with ``may_goto`` and a test of the free stack. If
-there is no room, it returns 0 or unwinds. The verifier checks that edge too.
+there is no room, it unwinds. The verifier checks that edge too.
 A recursion in frames is not joined. It has to end in ``MAX_CALL_FRAMES``.
 
 An async callback, for example of a timer, runs later. It starts as a new state
@@ -1071,7 +1075,7 @@ The run has the same checks as a pass, and other rules:
   insn.
 - If only the jump on the iv depends on the xregs that moved in a trip, and all
   other live xregs are the same, the path skips trips.
-- If a loop does not end, the path continues where ``may_goto`` leaves it.
+- If a loop does not end, the path leaves the function at its ``may_goto``.
 
 The path can end only at an unproven insn of the last pass. This includes an
 insn that was unproven because of another one. An error at any other insn drops
@@ -1082,7 +1086,7 @@ is something new: after ADD_DEPS, after a partition helped, after the budget
 grew, and before the final reject. It does not start again when there is a
 failing path.
 
-Three guesses of the run can make a path that the program cannot take. If such
+Two guesses of the run can make a path that the program cannot take. If such
 a path cuts the budget, a valid program can be rejected. So a path of such a
 run, a *path with a guess*, goes to the log, but the budget is not cut. If a
 pass has a real error, the log has that error.
@@ -1123,19 +1127,6 @@ also for a ring index. The same function finds it::
 
 The next runs keep this answer. So it is also a guess if the run made a guess
 before it.
-
-The third guess is the target of ``may_goto``. All states have the same one::
-
-  large = x > 7;
-  while (...) {
-          if (large && x <= 7) lock();        only a join gets here
-          do { p = lookup(); } while (!p);    gets may_goto
-          *p
-  }
-
-With no lock the target is ``return 0``. The joined state gets to ``lock()``, so
-the pass selects the code after the loop. A path with no lock goes there too,
-and ``*p`` fails.
 
 The run accepts nothing: it drops states and skips trips. It is not the verdict
 either: a path has ranges too, and it can fail at an insn that a pass proves.
@@ -1276,12 +1267,17 @@ A barrier has to stop each edge that leads to the insn::
 
   fall-through, jump, call, return     barrier before the insn
   exit of a callback --> helper        barrier at the exit
-  may_goto --> r0 = 0; exit            barrier before r0 = 0
   call --> recursion in frames         barrier at the call
   return --> dead code                 goto -1 replaces the code
 
 A speculative state is joined only with speculative states, and it subsumes
 only speculative states.
+
+A landing pad has no barrier, and no speculative state is verified on the way
+to one. So a program gets landing pads, and can have ``unwind_exit`` and
+``unwind_goto``, only with ``CAP_PERFMON``. Without it no function can unwind:
+a loop that needs ``may_goto`` of the verifier and a recursion are conflicts,
+and ``may_goto`` of the program jumps.
 
 Some mechanisms depend on a capability. The last line is there because the cpu
 can go past the jump that a proof needs:
@@ -1292,7 +1288,7 @@ can go past the jump that a proof needs:
                                    full `Limits`_
 ``CAP_PERFMON``                    trip count, reads of stack that is not
                                    written, pointers as numbers, access to BTF
-                                   objects, arena
+                                   objects, arena, landing pads
 ``CAP_PERFMON`` or no mitigations  equations of pointers, equations that a join
                                    makes from constants, the end of infeasible
                                    states, skipped first trips, stack access
@@ -1459,6 +1455,9 @@ Common errors
 ``loop at insn 2 never exits``
   The loop has no edge that leaves it.
 
+``landing pad of may_goto at 7: conflict: the number of sections differs``
+  No landing pad serves all states that leave the function there.
+
 ``BPF program is too complex``, ``the limit on cost or memory ended pass 6``
   The load is over a limit. If a pass had an error before, the log has that
   error, or a path with a guess. That path can be false.
@@ -1471,6 +1470,8 @@ barrier             the ``nospec`` insn, it stops speculative execution
 basic block         a run of insns without a jump into it or out of it
 budget              a limit on the cost of one step
 checked             the bytes of a packet that are known to be before its end
+conflict            no landing pad serves all states that leave a function at
+                    an insn, or the function cannot unwind
 control_deps        xregs whose value flows to a jump that can skip an unproven
                     insn
 correlated          two branches: one tests a result that the other one stored
@@ -1502,6 +1503,9 @@ iv                  induction variable: each trip adds a constant to it
 join                two states become one that has the values of both
 join point          an insn where states can meet
 join_key            what has no join: states with two join_keys never meet
+landing pad         code that the verifier emits after a function: it releases
+                    what the function holds, then the function returns or
+                    unwinds
 leftover            all trips that are not peeled
 live                read later, before it is written
 may_goto            a jump that is taken when the program has looped too long

@@ -10,7 +10,7 @@
  *   - a call of a helper whose callback comes back that way
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
- * then 'r0 = 0' and unwind_exit, or exit in a frame that cannot unwind.
+ * then 'r0 = 0' and unwind_exit, or exit in a frame that the kernel called.
  *
  *	bpf_rcu_read_lock();				   call bpf_rcu_read_lock
  *	do {						1: ...
@@ -1495,7 +1495,10 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
 		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
 		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
-		[BPF_CONFLICT_CANNOT_UNWIND]	= "the frame cannot unwind",
+		[BPF_CONFLICT_CANNOT_UNWIND]	=
+			"the JIT or the helper that calls the function cannot unwind it",
+		[BPF_CONFLICT_NO_EXIT]		= "the function has no exit",
+		[BPF_CONFLICT_NO_PERFMON]	= "the program is loaded without CAP_PERFMON",
 		[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
 	};
 	int j;
@@ -1517,9 +1520,29 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 }
 
 /*
+ * The main pass unwinds at more sites than the program has in the end: pass 0 takes the edge of
+ * may_goto in every loop that nothing stops, and a loop that has a trip count gets no may_goto.
+ * The states that left a frame there went on to the callers, and visited the plans of the calls.
+ * Note the sites at which the program does leave a frame. The caller has dropped the guards and
+ * marked the subprogs that unwind, see bpf_mark_subprogs_that_unwind(): the emission asks the
+ * same, and what it is going to use is among what is marked here. Only these plans are settled.
+ * What a state found at any other site, a conflict or a need for hidden slots, does not count.
+ */
+void bpf_pads_mark_used(struct bpf_verifier_env *env)
+{
+	struct bpf_pad_plan *plan;
+	int i;
+
+	for (i = 0; i < env->prog->len; i++)
+		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
+			plan->used = bpf_site_is_used(env, i, plan);
+}
+
+/*
  * A pass that counts is over: all states have visited the plans. A state whose visit made a
- * conflict was unproven at the site, see unwind_frame(). A conflict that shows only now is an
- * error of the pass as well, and its site is an unproven insn for the next one, see
+ * conflict ended at the site, see unwind_frame(): as an unproven insn if the program has the site
+ * for sure. A conflict that shows only now, at a site that the program has, is an error of the
+ * pass as well, and its site is an unproven insn for the next one, see
  * bpf_find_unproven_after_pass().
  */
 int bpf_pads_settle(struct bpf_verifier_env *env)
@@ -1539,6 +1562,8 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 		if (env->insn_aux_data[i].pad_plans && bpf_must_abort())
 			return -EINTR;
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
+			if (!plan->used)
+				continue;
 			err = settle_plan(env, plan);
 			if (err < 0)
 				return err;
@@ -1558,12 +1583,12 @@ bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux)
 	const struct bpf_pad_plan *plan;
 
 	for (plan = aux->pad_plans; plan; plan = plan->next)
-		if (plan->conflict)
+		if (plan->used && plan->conflict)
 			return true;
 	return false;
 }
 
-/* The plans of the program */
+/* The plans of the sites that the program has */
 void bpf_pads_log(struct bpf_verifier_env *env)
 {
 	const struct bpf_pad_plan *plan;
@@ -1573,5 +1598,6 @@ void bpf_pads_log(struct bpf_verifier_env *env)
 		return;
 	for (i = 0; i < env->prog->len; i++)
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
-			print_plan(env, i, plan);
+			if (plan->used)
+				print_plan(env, i, plan);
 }

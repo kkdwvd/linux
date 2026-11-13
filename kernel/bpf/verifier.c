@@ -6112,7 +6112,7 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
 				      (cg.marks[s] & CALLED));
-		si[s].did_unwind = si[s].can_unwind;
+		si[s].did_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
 	}
 
 	for (s = 0; s < cnt; s++) {
@@ -16857,7 +16857,6 @@ static void sanitize_mark_insn_seen(struct bpf_verifier_env *env)
  * edges have their own barrier, and a speculative state does not take them:
  *
  *	exit of a callback --> call of the helper	barrier at the exit
- *	may_goto --> r0 = 0; exit			see emit_unwind_exit()
  *	return --> dead code				see bpf_opt_hard_wire_dead_code_branches()
  */
 static void need_nospec(struct bpf_verifier_env *env, u32 idx)
@@ -21410,7 +21409,8 @@ static int failing_path_trip(struct bpf_verifier_env *env, struct loop_stack_ent
 			loop->infinite = true;
 			/* the next runs keep it */
 			loop->infinite_is_guess = env->run_has_guess;
-			return bpf_flow_needs_guard(env, loop);
+			bpf_flow_needs_guard(env, loop);
+			return 0;
 		} else if (err && !bpf_values_grew_in_deps(env, old, cur)) {
 			return 1;
 		}
@@ -21644,44 +21644,23 @@ static bool frame_holds_resources(const struct bpf_verifier_state *st)
  * better not to go on. The way to stop is to unwind: 'r0 = 0; unwind_exit'. The landing
  * pads that the callers have in the program are code like any other. They release what
  * the callers hold, or the program is rejected. Where a caller has none the verifier emits it.
- *
- * False when it cannot:
- * - The subprog cannot leave with unwind_exit, see bail_unwinds.
- * - A helper that has no pad for its callback doesn't expect it to unwind.
- * Then the program goes on along a path that it has, like after may_goto of
- * its own. It releases what it holds there.
- *
- * @or_exit: there is no such path. 'r0 = 0; exit' has to do where the subprog
- * cannot unwind, and the caller goes on with 0 in place of the result.
+ * There is no other way out. Returns why the frame cannot unwind, 0 if it can.
  */
-static bool frame_can_unwind(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
-			     bool or_exit)
+static enum bpf_pad_conflict frame_cannot_unwind(struct bpf_verifier_env *env,
+						 const struct bpf_verifier_state *st)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
 
 	/* see unwind_frame() */
 	if (sub->exit_idx == U32_MAX)
-		return false;
+		return BPF_CONFLICT_NO_EXIT;
 	/* a landing pad has no barrier: only a loader with CAP_PERFMON gets one */
 	if (!bpf_may_unwind(env))
-		return false;
-	if (frame->in_callback_fn && !sub->bail_unwinds)
-		return false;
-	return frame_is_top(st) || sub->bail_unwinds || or_exit;
-}
-
-/* May_goto at the head of a loop skips the body. Does it go to code that reads what is not set? */
-static bool guard_reads_unset_reg(struct bpf_verifier_env *env,
-				  const struct bpf_insn_aux_data *aux)
-{
-	u16 live = env->insn_aux_data[aux->guard_to].live_regs_before;
-	int r;
-
-	for (r = BPF_REG_0; r < BPF_REG_FP; r++)
-		if ((live & BIT(r)) && cur_regs(env)[r].type == NOT_INIT)
-			return true;
-	return false;
+		return BPF_CONFLICT_NO_PERFMON;
+	if (!frame_is_top(st) && !sub->bail_unwinds)
+		return BPF_CONFLICT_CANNOT_UNWIND;
+	return BPF_NO_CONFLICT;
 }
 
 /* This insn is a site of @kind: the current frame may be left here, see unwind_frame() */
@@ -21700,8 +21679,8 @@ static int push_unwind_edge(struct bpf_verifier_env *env, enum bpf_site_kind kin
 
 /*
  * A loop has no trip count, and nothing stops it at run time. It gets may_goto
- * before this insn. When may_goto is out of budget, the program goes to its
- * target with the registers and the stack that it has here.
+ * before this insn. When may_goto is out of budget the frame is left here, with
+ * the registers and the stack as they are, see unwind_frame().
  * Every state that goes through the loop does that, see bpf_flow_needs_guard().
  */
 static int check_loop_guard(struct bpf_verifier_env *env)
@@ -21731,55 +21710,16 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 		return -EINVAL;
 	}
 
-	/*
-	 * A guard has one way out, and only that one is verified.
-	 *
-	 * Leave the subprog, if that is possible every time the program gets here:
-	 *	do { p = lookup(); } while (!p); *p
-	 * The code after the loop relies on the result of the jump that leaves it.
-	 *
-	 * Otherwise leave the loop:
-	 *	lock(); do { ... } while (...); unlock();
-	 * The code after the loop releases what is held.
-	 *
-	 * The program has no edge from the header of a loop to the exit of the loop:
-	 *	for (;;) { c = *s++; if (!c) return 0; if (c == '*') return 1; }
-	 * The loop is left to 'exit', and only its body sets r0. Then leave the subprog. Use
-	 * a plain exit if it cannot unwind, like check_recursion_guard().
-	 *
-	 * All states that get here take the same way, or the pass starts again.
-	 * A speculative state does not select the way.
-	 */
-	if (env->cur_state->speculative)
-		goto out;
-	if (aux->guard_at_header && !aux->guard_unset_reg && guard_reads_unset_reg(env, aux)) {
-		aux->guard_unset_reg = true;
-		env->guards_late |= aux->guard_no_unwind && aux->loop_guard;
-		aux->guard_no_unwind = false;
-	}
-	if (!aux->guard_no_unwind &&
-	    !frame_can_unwind(env, env->cur_state, aux->guard_unset_reg)) {
-		env->guards_late |= aux->loop_guard;
-		aux->guard_no_unwind = true;
-	}
-	/* another state selected the target, possibly a state that only a join makes */
-	env->run_has_guess |= aux->guard_no_unwind &&
-			      frame_can_unwind(env, env->cur_state, aux->guard_unset_reg);
-out:
 	aux->loop_guard = true;
-	aux->guard_unwinds = !aux->guard_no_unwind;
-	if (aux->guard_no_unwind)
-		err = PTR_ERR_OR_ZERO(push_stack(env, aux->guard_to, env->insn_idx, false));
-	else
-		err = push_unwind_edge(env, BPF_SITE_GUARD);
+	err = push_unwind_edge(env, BPF_SITE_GUARD);
 	/* more peeled trips can show that the edge is dead */
 	if (!err && env->head)
 		env->head->st.suspect_loops |= loop->suspect_bit;
 	/*
-	 * The state on that edge leaves the subprog. So far it left the loop, and the code that
-	 * follows the loop had the suspect of its errors from there.
+	 * The state on that edge leaves the subprog. Before subprogs were unwound it left the
+	 * loop, and the code that follows the loop had the suspect of its errors from there.
 	 */
-	if (!err && env->head && !aux->guard_no_unwind && !frame_is_top(env->cur_state))
+	if (!err && env->head && !frame_is_top(env->cur_state))
 		env->cur_state->suspect_loops |= loop->suspect_bit;
 	return err;
 }
@@ -21848,17 +21788,45 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 }
 
 /*
+ * Does the program have the site of @plan at @insn_idx for sure? Pass 0 takes the edge of may_goto
+ * in every loop that nothing stops, a later pass in every loop that had no trip count before, and
+ * a loop that turns out to have a trip count gets no may_goto, see bpf_flow_drop_guards() and
+ * bpf_flow_guard_is_guess(). A call is a site only if a callee is left at one.
+ * bpf_pads_settle() knows them all. Until then a conflict at a site that may go is no error.
+ */
+static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			    int insn_idx)
+{
+	int s;
+
+	switch (plan->kind) {
+	case BPF_SITE_GUARD:
+		return !bpf_flow_guard_is_guess(env, insn_idx);
+	case BPF_SITE_CALL:
+		bpf_pad_for_each_callee(plan, s)
+			if (env->subprog_info[s].unwinds_for_sure)
+				return true;
+		return false;
+	default:
+		return true;
+	}
+}
+
+/*
  * The current frame of @st is left at @insn_idx, a site of @kind. The program has no code for
  * that: the verifier emits a landing pad after the main pass, see kernel/bpf/pads.c. No insn
  * stands for it in the main pass. @st visits the plan of the site, which notes what the pad has to
  * do. Then what the pad does to a state is done to @st: the releases, see
- * release_frame_resources(), the value in place of the result, then unwind_exit if the subprog can
- * do that, exit otherwise. What is left of @st goes where the frame returns to, through the
+ * release_frame_resources(), the value in place of the result, then unwind_exit, or exit in a frame
+ * that the kernel called. What is left of @st goes where the frame returns to, through the
  * worklist like every other state. @st is taken.
  *
  * With a conflict there is no pad: the site is an unproven insn in @st, which ends here. The pass
  * goes on, and a pass that keeps more apart may have no such state.
- * A frame that cannot unwind and waits in a call that comes back with unwind_exit is a conflict.
+ * A frame that cannot unwind is a conflict.
+ * Nor is it one at a site that the program may not have in the end, see site_is_certain(): @st is
+ * dropped, the plan keeps the conflict, and bpf_pads_settle() makes it an error of the pass if the
+ * site is still there.
  */
 static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx,
 			enum bpf_site_kind kind)
@@ -21868,29 +21836,28 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	struct bpf_verifier_state *cur = env->cur_state;
 	int cur_idx = env->insn_idx, err;
 	struct bpf_pad_plan *plan;
-	bool print_state;
+	bool print_state, certain;
 	u32 cnt;
 
 	env->cur_state = st;
 	env->insn_idx = insn_idx;
 	/* its suspects are those of a conflict that only bpf_pads_settle() finds */
 	env->insn_aux_data[insn_idx].suspect_loops |= st->suspect_loops;
-	/* there is no other way out of a call */
-	if (kind == BPF_SITE_CALL && !frame_can_unwind(env, st, false)) {
-		plan = bpf_pad_plan_get(env, insn_idx, kind) ?: ERR_PTR(-ENOMEM);
-		if (!IS_ERR(plan))
-			plan->conflict = BPF_CONFLICT_CANNOT_UNWIND;
-	} else {
-		plan = bpf_pad_visit(env, st, insn_idx, kind);
-	}
+	plan = bpf_pad_visit(env, st, insn_idx, kind);
 	err = PTR_ERR_OR_ZERO(plan);
 	if (err)
 		goto out;
-	if (plan->conflict) {
+	/* there is no other way out */
+	if (!plan->conflict)
+		plan->conflict = frame_cannot_unwind(env, st);
+	certain = site_is_certain(env, plan, insn_idx);
+	if (plan->conflict && certain) {
 		bpf_pad_log(env, insn_idx, plan);
 		err = -EINVAL;
 		goto unproven;
 	}
+	if (plan->conflict)
+		goto out;
 
 	err = release_frame_resources(env);
 	if (err)
@@ -21914,6 +21881,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		env->pads_late = true;
 	}
 	sub->did_unwind |= st->unwound;
+	sub->unwinds_for_sure |= st->unwound && certain;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
@@ -21983,8 +21951,7 @@ static int flow_drain(struct bpf_verifier_env *env)
 /*
  * A subprog on a cycle of the call graph checks the stack at run time, see
  * bpf_insert_recursion_checks(). When there is no room, or the time slice is over, it leaves
- * at once with 0 in place of the result: it unwinds if it can, see bail_unwinds, otherwise
- * it returns and callers have to be fine with that.
+ * at once: it unwinds.
  */
 static int check_recursion_guard(struct bpf_verifier_env *env)
 {
@@ -24067,6 +24034,23 @@ static void settle_late_unwinds(struct bpf_verifier_env *env, const struct bpf_s
 	env->pads_late = late;
 }
 
+/*
+ * The pass has no error so far. Which sites does the program have, as the emission is going to
+ * see it? A loop that has a trip count after all has no may_goto, and a subprog that is left
+ * nowhere else does not unwind, nor do its calls. The marks of the subprogs are for the emission
+ * to make: they go back to what they were.
+ */
+static void mark_used_sites(struct bpf_verifier_env *env, const struct bpf_snapshot *initial)
+{
+	int s;
+
+	bpf_flow_drop_guards(env);
+	bpf_mark_subprogs_that_unwind(env);
+	bpf_pads_mark_used(env);
+	for (s = 0; s < env->subprog_cnt; s++)
+		env->subprog_info[s].can_unwind = initial->subprogs[s].can_unwind;
+}
+
 /* Returns the first error */
 static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initial)
 {
@@ -24103,6 +24087,7 @@ static int check_pass(struct bpf_verifier_env *env, struct bpf_snapshot *initial
 	if (ret || pass_needs_restart(env))
 		return ret;
 	/* a state that never gets to a site makes no conflict there */
+	mark_used_sites(env, initial);
 	ret = check_after_pass(env) ?: bpf_pads_settle(env);
 	if (ret)
 		bpf_find_unproven_after_pass(env);
@@ -26389,14 +26374,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
-	/*
-	 * It took the constants to remove dead branches and find the loops. Now it's known
-	 * which edges the verifier may add, see bpf_head_guard_target(). What follows
-	 * believes the constants.
-	 */
 	ret = bpf_flow_place_guards(env);
-	if (ret > 0)
-		ret = bpf_compute_const_regs(env);
 	if (ret < 0)
 		goto skip_full_check;
 

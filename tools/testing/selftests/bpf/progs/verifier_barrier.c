@@ -129,69 +129,20 @@ __naked void exit_of_callback(void)
 	"exit;");
 }
 
+/*
+ * The loop gets may_goto, which goes to a landing pad. A pad has no barrier, so a prog that is
+ * loaded without CAP_PERFMON gets none: nothing ends its loop.
+ */
 SEC("tc")
-__description("barrier: on the way out of a loop that is out of budget")
-__success SPECULATES __success_unpriv
-__naked void unwind_exit(void)
+__description("a loop that needs may_goto of the verifier needs CAP_PERFMON")
+__success SPECULATES __failure_unpriv
+__msg_unpriv("landing pad of may_goto at 4: conflict: the program is loaded without CAP_PERFMON")
+__naked void guard_needs_perfmon(void)
 {
 	ASM(START
 "1:	r1 = *(u64 *)(r6 + 8);"
 	"if r1 != 0 goto 1b;"
 	"r0 = 1;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: before may_goto")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r1 = *(u64 *)(r6 +8)")
-__xlated_unpriv("nospec")
-__xlated_unpriv("...")
-__xlated_unpriv("if r1 > 0x7 goto")
-#endif
-__naked void in_front_of_guard(void)
-{
-	ASM(START
-"1:	r1 = r6;"
-	NEVER("2f")
-	"r1 = *(u64 *)(r6 + 8);"
-"2:	if r1 > 7 goto 1b;"
-	"r0 = 0;"
-	"exit;");
-}
-
-static __naked __noinline __used int recurse(void)
-{
-	ASM(START
-	"r8 = r1;"
-	"if r8 == 0 goto 2f;"
-	"r9 = r7;"
-	"r9 &= 1;"
-	"if r9 == 0 goto 1f;"
-	"call bpf_rcu_read_lock;"
-"1:	r1 = r8;"
-	"r1 += -1;"
-	"call recurse;"
-	"if r9 == 0 goto 2f;"
-	"call bpf_rcu_read_unlock;"
-"2:	r0 = 0;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: a speculative state holds more in a recursion")
-__failure __msg("loop at insn 12 acquires more than it releases")
-SPECULATES __success_unpriv __not_msg_unpriv("acquires more than it releases")
-__naked void recursion(void)
-{
-	ASM(START
-	"call bpf_rcu_read_lock;"
-	NEVER("1f")
-	"call bpf_rcu_read_unlock;"
-"1:	r1 = 1;"
-	"call recurse;"
-	"r0 = 0;"
 	"exit;");
 }
 
@@ -217,17 +168,14 @@ static __naked __noinline __used int recurse_in_frames(void)
  * fails the prog is in the section that it entered. When a deeper one does the pad of the function
  * has left the only section there is. A pad is a fixed number of calls, and no store of the prog
  * can count what its callee leaves: a hidden slot follows the insns of its own frame.
- * Without CAP_PERFMON the check returns 0 as before.
+ * Without CAP_PERFMON there is no pad, and no way out of a recursion that is too deep.
  */
 SEC("tc")
-__description("barrier: at the call of a recursion in the frames of the callers")
+__description("a recursion needs CAP_PERFMON")
 __failure __msg("landing pad of call at 2: conflict: the number of sections differs")
-SPECULATES __success_unpriv __not_msg_unpriv("conflict")
-#ifdef SPEC_V1
-__xlated_unpriv("r1 += -1")
-__xlated_unpriv("nospec")
-__xlated_unpriv("call pc-")
-#endif
+SPECULATES
+__failure_unpriv
+__msg_unpriv("landing pad of recursion check at 6: conflict: the program is loaded without CAP_PERFMON")
 __naked void recursion_in_frames(void)
 {
 	ASM("call bpf_rcu_read_lock;"

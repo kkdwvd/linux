@@ -486,6 +486,8 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_NO_PLACE,
 	BPF_CONFLICT_ORDER_DIFFERS,
 	BPF_CONFLICT_CANNOT_UNWIND,
+	BPF_CONFLICT_NO_EXIT,
+	BPF_CONFLICT_NO_PERFMON,
 	BPF_CONFLICT_CALLER_SAVED,
 };
 
@@ -550,6 +552,7 @@ struct bpf_pad_plan {
 	u8 kind;			/* enum bpf_site_kind */
 	u8 conflict;			/* enum bpf_pad_conflict */
 	bool visited;
+	bool used;			/* the program leaves the frame there, see bpf_pads_mark_used() */
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
@@ -1017,8 +1020,6 @@ struct bpf_loop {
 	bool rt_bounded;
 	/* insns in the loop, nested loops included */
 	u32 nr_insns;
-	/* not rt_bounded: there are places for may_goto, see guard_to in bpf_insn_aux_data */
-	bool has_guards;
 
 	/* What one pass gives to the next pass */
 	struct_group_tagged(bpf_loop_precision, precision,
@@ -1120,7 +1121,6 @@ struct bpf_insn_aux_data {
 	u64 cast_arena:1; /* addr_space_cast of an address in arena */
 	u64 cast_mov:1; /* addr_space_cast of a pointer that is not in arena, it's a move */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
-	u64 guard_unwinds:1; /* it leaves the subprog */
 	u64 speculative_first:1; /* a speculative state came to it first */
 	u64 call_recorded:1; /* see record_call_fixup() */
 	u64 pessimized:1; /* see bpf_partition_for_pessimized() */
@@ -1147,8 +1147,6 @@ struct bpf_insn_aux_data {
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
-	u32 guard_no_unwind:1; /* it cannot unwind from here, at least sometimes */
-	u32 guard_unset_reg:1; /* where it goes a register is read that is not set here */
 	u32 non_speculative_first:1; /* speculative states end here, their fixups did not fit */
 	u32 acquires:1; /* a reference or a lock */
 	u32 releases:1;
@@ -1156,7 +1154,6 @@ struct bpf_insn_aux_data {
 	/* below flags are initialized once */
 	u32 bb_end:1; /* last instruction of a basic block */
 	u32 guard_place:1; /* it is the place for may_goto if the loop needs one */
-	u32 guard_at_header:1; /* there is no better place than the header of the loop */
 	/* true if instruction is a call to a helper function that
 	 * accepts callback function as a parameter.
 	 */
@@ -1210,8 +1207,6 @@ struct bpf_insn_aux_data {
 	 * stop, -1 if none was found. It doesn't stop the loops around that one either.
 	 */
 	s32 not_stopped;
-	/* where may_goto in front of this instruction goes */
-	s32 guard_to;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 	/* the call of a callback, or the first insn of a recursive function */
@@ -1377,6 +1372,8 @@ struct bpf_subprog_info {
 	 * it, see mark_unwind_above(). For a global subprog one pass gives it to the next pass.
 	 */
 	bool did_unwind: 1;
+	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
+	bool unwinds_for_sure: 1;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -2028,7 +2025,7 @@ void bpf_flow_put_header_state(struct loop_stack_entry *entry);
 int bpf_flow_deliver(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 		     int insn_idx, int prev_insn_idx, bool again);
 int bpf_flow_next(struct bpf_verifier_env *env, int *prev_insn_idx, u64 *log_pos, u64 *diag_pos);
-int bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop);
+void bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop);
 int bpf_flow_call(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		  struct bpf_verifier_state *entry, int subprog, int call_idx);
 int bpf_flow_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int exit_idx);
@@ -2036,6 +2033,7 @@ void bpf_flow_next_is_no_bound(struct bpf_verifier_env *env, int insn_idx, int h
 bool bpf_flow_loops_lost_bound(struct bpf_verifier_env *env);
 void bpf_flow_new_pass(struct bpf_verifier_env *env);
 void bpf_flow_drop_guards(struct bpf_verifier_env *env);
+bool bpf_flow_guard_is_guess(struct bpf_verifier_env *env, int idx);
 int bpf_flow_place_guards(struct bpf_verifier_env *env);
 /* verifier.c, for flow.c */
 int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge_loop,
@@ -2048,6 +2046,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		    const struct bpf_verifier_state *exit, int call_idx);
 int bpf_insert_sites(struct bpf_verifier_env *env);
 void bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env);
+bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan);
 bool bpf_insn_is_iter_next(struct bpf_verifier_env *env, struct bpf_insn *insn);
 bool bpf_insn_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
@@ -2067,6 +2066,7 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
+void bpf_pads_mark_used(struct bpf_verifier_env *env);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(const struct bpf_insn_aux_data *aux);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
@@ -2377,27 +2377,6 @@ const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
-/*
- * Where the program goes from may_goto and from the checks that the verifier adds:
- * - May_goto before a jump goes where the jump goes, with the registers and the stack
- *   as they are before the jump. bpf_insn_successors() has that edge.
- * - A subprog that is out of budget is left at once, see unwind_frame(). No insn of it follows.
- * - May_goto before the header of a loop goes to where the loops around it are left: from
- *   @idx to what is returned here, -1 if there is none. No such edge. The registers and the
- *   stack are what they are before @idx.
- *
- * The main pass looks at the states that go there. What is computed from the graph before
- * the main pass has to take these edges into account where the main pass relies on it:
- * - Against the direction of the edges, liveness: what is live at the target is live at @idx.
- * - In the direction of the edges, bpf_compute_const_regs() and compute_subprog_args(): what
- *   holds on all edges of the graph to the target doesn't hold on this one.
- */
-static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int idx)
-{
-	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
-
-	return aux->guard_at_header ? aux->guard_to : -1;
-}
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
 int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
 bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);

@@ -7,10 +7,10 @@
 /*
  * The verifier adds may_goto to a loop that it cannot count and a check of
  * the stack to a recursive subprog. What the program does when it is out of budget:
- * - it unwinds, frame by frame, up to the main prog or an async callback, which end. The landing
- *   pads that the callers have in the program are verified. Where a caller has none the verifier
- *   adds unwind_goto after the call. What a frame holds takes a landing pad, which it emits.
- * - a frame for which there is no landing pad yet leaves the loop
+ * it unwinds, frame by frame, up to the main prog or an async callback, which end. The landing
+ * pads that the callers have in the program are verified. Where a caller has none the verifier
+ * adds unwind_goto after the call. What a frame holds takes a landing pad, which it emits.
+ * If no landing pad will do the program is rejected.
  *
  * It takes unwinding, per-cpu insns and timed may_goto in JIT. Some of the progs never end
  * on their own.
@@ -924,9 +924,7 @@ __naked void insn_of_dropped_round(void)
 
 /*
  * The loop at 3: spins. It has no jump that every trip goes through, so may_goto is at its head.
- * The first way out of it, from 2: to 1:, is the back edge of the loop at 1:, which
- * has no may_goto of its own: bpf_iter_num_next() stops it. From the head of 3: to 1: there is
- * no bpf_iter_num_next().
+ * The loop at 1: around it has no may_goto of its own: bpf_iter_num_next() stops it.
  */
 SEC("socket")
 __description("budget: may_goto at the head of a loop leaves the loops around it too")
