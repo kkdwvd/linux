@@ -299,7 +299,7 @@ __jited("add	t2, a0, s7")
 __jited("lh	s4, 0x18(t2)")
 __jited("add	t2, a0, s7")
 __jited("lb	s4, 0x20(t2)")
-__naked void arena_ldsx_disasm(void *ctx)
+__naked void arena_ldsx_disasm(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -325,24 +325,53 @@ __naked void arena_ldsx_disasm(void *ctx)
 	);
 }
 
-SEC("syscall")
-__description("Arena LDSX Exception")
-__success __retval(0)
-__arch_x86_64
-__arch_arm64
-__arch_riscv64
-__naked void arena_ldsx_exception(void *ctx)
+/*
+ * The store faults and is skipped, the load faults and yields 0. That is what a callback of a
+ * helper does: a program that can be cancelled ends at the store.
+ */
+__naked __noinline __used
+static void arena_ldsx_exception_cb(void)
 {
 	asm volatile (
+	"r6 = r2;"
 	"r1 = %[arena] ll;"
 	"r0 = 0xdeadbeef;"
 	"r0 = addr_space_cast(r0, 0, 1);"
 	"r1 = 0x3fe;"
 	"*(u64 *)(r0 + 0) = r1;"
 	"r0 = *(s8 *)(r0 + 0);"
+	"*(u64 *)(r6 + 0) = r0;"
+	"r0 = 0;"
 	"exit;"
 	:
 	:  __imm_addr(arena)
+	:  __clobber_all
+	);
+}
+
+/* 100 and what the load left in r0. 0 is what a program that was cancelled returns. */
+SEC("syscall")
+__description("Arena LDSX Exception")
+__success __retval(100)
+__arch_x86_64
+__arch_arm64
+__arch_riscv64
+__naked void arena_ldsx_exception(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"*(u64 *)(r10 - 8) = r1;"
+	"r2 = %[arena_ldsx_exception_cb] ll;"
+	"r3 = r10;"
+	"r3 += -8;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"r0 = *(u64 *)(r10 - 8);"
+	"r0 += 100;"
+	"exit;"
+	:
+	:  __imm_addr(arena_ldsx_exception_cb),
+	   __imm(bpf_loop)
 	:  __clobber_all
 	);
 }
@@ -353,7 +382,7 @@ __success __retval(-1)
 __arch_x86_64
 __arch_arm64
 __arch_riscv64
-__naked void arena_ldsx_s8(void *ctx)
+__naked void arena_ldsx_s8(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -385,7 +414,7 @@ __success __retval(-1)
 __arch_x86_64
 __arch_arm64
 __arch_riscv64
-__naked void arena_ldsx_s16(void *ctx)
+__naked void arena_ldsx_s16(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -417,7 +446,7 @@ __success __retval(-1)
 __arch_x86_64
 __arch_arm64
 __arch_riscv64
-__naked void arena_ldsx_s32(void *ctx)
+__naked void arena_ldsx_s32(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"

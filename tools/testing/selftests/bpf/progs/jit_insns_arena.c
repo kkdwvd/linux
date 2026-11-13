@@ -153,12 +153,16 @@ int cast_to_user(void *ctx)
  * Every form of the arena address computation: offsets the add, the sub, the
  * shifted add and a move take, the end of the second 4K page, the narrow sizes
  * and immediate stores, each checked through r2 at the same address.
+ *
+ * The last load is behind the two pages and faults. A program that can be
+ * cancelled ends there, with r9 unseen. In a callback of a helper the load
+ * yields 0 and the checks are looked at: *ctx is 0 if all are well.
  */
-SEC("syscall")
-__success __retval(0)
-__naked void arena_offsets(void)
+__naked __noinline __used
+static void arena_offsets_cb(void)
 {
 	asm volatile ("					\
+	*(u64 *)(r10 - 8) = r2;				\
 	r1 = %[arena] ll;				\
 	r2 = 0;						\
 	r3 = 2;						\
@@ -336,9 +340,35 @@ __naked void arena_offsets(void)
 	r0 = 0;						\
 	if r9 == 0 goto 9f;				\
 	r0 = 1;						\
-9:	exit;						\
+9:	r1 = *(u64 *)(r10 - 8);				\
+	*(u64 *)(r1 + 0) = r0;				\
+	r0 = 0;						\
+	exit;						\
 "	:
 	: __imm_addr(arena)
+	: __clobber_all);
+}
+
+/* 100 and what the callback left. 0 is what a program that was cancelled returns. */
+SEC("syscall")
+__success __retval(100)
+__naked void arena_offsets(void)
+{
+	asm volatile ("					\
+	r1 = 2;						\
+	*(u64 *)(r10 - 8) = r1;				\
+	r1 = 1;						\
+	r2 = %[arena_offsets_cb] ll;			\
+	r3 = r10;					\
+	r3 += -8;					\
+	r4 = 0;						\
+	call %[bpf_loop];				\
+	r0 = *(u64 *)(r10 - 8);				\
+	r0 += 100;					\
+	exit;						\
+"	:
+	: __imm_addr(arena_offsets_cb),
+	  __imm(bpf_loop)
 	: __clobber_all);
 }
 

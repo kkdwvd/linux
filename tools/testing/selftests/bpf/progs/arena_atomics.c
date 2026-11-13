@@ -272,20 +272,24 @@ __u64 __arena_global uaf_r1_after_dst_r0;
 __u64 __arena_global uaf_r0_before_dst_r0;
 __u64 __arena_global uaf_r0_after_dst_r0;
 __u64 __arena_global uaf_r0_after_src_r0;
-/* What reading the faulted address again gives, see the end of uaf() */
+/* What reading the faulted address again gives, see the end of uaf_cb() */
 __u64 __arena_global uaf_reread;
 
-SEC("syscall")
-int uaf(const void *ctx)
-{
-	if (pid != (bpf_get_current_pid_tgid() >> 32))
-		return 0;
 /*
  * __BPF_FEATURE_ADDR_SPACE_CAST is required by the asm below, which spells
  * addr_space_cast textually. That and the mnemonic both arrived in LLVM 19.
  */
 #if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
 	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
+#define UAF_TESTS
+
+/*
+ * Every atomic below faults, is skipped, and the program goes on to the next one. That is
+ * what a callback of a helper does: it is never cancelled. A program that can be cancelled
+ * ends at the first of them.
+ */
+static int uaf_cb(__u64 i, void *ctx)
+{
 	__u32 __arena *page32;
 	__u64 __arena *page64;
 	void __arena *page;
@@ -417,8 +421,19 @@ int uaf(const void *ctx)
 	: : [page]"r"(page64),
 	    __imm_addr(uaf_reread)
 	: "r1", "r2", "r3", "memory");
+
+	return 0;
+}
 #endif
 
+SEC("syscall")
+int uaf(const void *ctx)
+{
+	if (pid != (bpf_get_current_pid_tgid() >> 32))
+		return 0;
+#ifdef UAF_TESTS
+	bpf_loop(1, uaf_cb, NULL, 0);
+#endif
 	return 0;
 }
 

@@ -82,6 +82,8 @@ __xlated("w12 += 16")
 __xlated("*(u64 *)(r12 -8) = 10")
 __xlated("...")
 __xlated("call pc+")
+/* the pad of the call: a fault in subprog() cancels the prog */
+__xlated("cancel_goto pc+")
 /* give the stack back, then the epilogue */
 __xlated("w12 += -16")
 __xlated("if w12 & 0x10 goto pc+5")

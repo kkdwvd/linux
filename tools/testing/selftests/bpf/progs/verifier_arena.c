@@ -25,6 +25,32 @@ struct {
 	__ulong(map_extra, ARENA_VM_START); /* start of mmap() region */
 } arena SEC(".maps");
 
+/*
+ * An access of arena that faults cancels the program: it ends there, and returns 0 like a test
+ * that passed. A callback that a helper calls cannot be cancelled, and neither can what it
+ * calls. There a store that faults is skipped, a load yields 0, and the program goes on.
+ *
+ * The tests that look at what such an access leaves run their checks in a callback of
+ * bpf_loop(): fn##_in_callback() returns PASSED if fn() returned 0, and what fn() returned
+ * otherwise.
+ */
+#define PASSED 100
+
+#define IN_CALLBACK(fn)								\
+static int fn##_cb(__u64 i, int *ret)						\
+{										\
+	*ret = fn();								\
+	return 0;								\
+}										\
+										\
+static __always_inline int fn##_in_callback(void)				\
+{										\
+	int ret = -1;								\
+										\
+	bpf_loop(1, fn##_cb, &ret, 0);						\
+	return ret ?: PASSED;							\
+}
+
 SEC("socket")
 __success __retval(0)
 __skip_without_arena
@@ -55,10 +81,7 @@ int basic_alloc1_nosleep(void *ctx)
 	return 0;
 }
 
-SEC("syscall")
-__success __retval(0)
-__skip_without_arena
-int basic_alloc1(void *ctx)
+static __always_inline int basic_alloc1_checks(void)
 {
 	volatile int __arena *page1, *page2, *no_page, *page3;
 
@@ -93,6 +116,16 @@ int basic_alloc1(void *ctx)
 	return 0;
 }
 
+IN_CALLBACK(basic_alloc1_checks)
+
+SEC("syscall")
+__success __retval(PASSED)
+__skip_without_arena
+int basic_alloc1(void *ctx)
+{
+	return basic_alloc1_checks_in_callback();
+}
+
 SEC("syscall")
 __success __retval(0)
 int free_scalar_below_arena(void *ctx)
@@ -121,10 +154,7 @@ int free_scalar_below_arena(void *ctx)
 	return 0;
 }
 
-SEC("socket")
-__success __retval(0)
-__skip_without_arena
-int basic_alloc2_nosleep(void *ctx)
+static __always_inline int basic_alloc2_nosleep_checks(void)
 {
 	volatile char __arena *page1, *page2, *page3, *page4;
 
@@ -158,10 +188,17 @@ int basic_alloc2_nosleep(void *ctx)
 	return 0;
 }
 
-SEC("syscall")
-__success __retval(0)
+IN_CALLBACK(basic_alloc2_nosleep_checks)
+
+SEC("socket")
+__success __retval(PASSED)
 __skip_without_arena
-int basic_alloc2(void *ctx)
+int basic_alloc2_nosleep(void *ctx)
+{
+	return basic_alloc2_nosleep_checks_in_callback();
+}
+
+static __always_inline int basic_alloc2_checks(void)
 {
 	volatile char __arena *page1, *page2, *page3, *page4;
 
@@ -193,6 +230,16 @@ int basic_alloc2(void *ctx)
 	if (*page4 != 0)
 		return 8;
 	return 0;
+}
+
+IN_CALLBACK(basic_alloc2_checks)
+
+SEC("syscall")
+__success __retval(PASSED)
+__skip_without_arena
+int basic_alloc2(void *ctx)
+{
+	return basic_alloc2_checks_in_callback();
 }
 
 struct bpf_arena___l {

@@ -43,11 +43,14 @@ struct {
 /* gotox reg */
 #define GOTOX(reg)	BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, reg, 0, 0, 0)
 
+/* cancel_goto names the pad of each access: a fault cancels the program */
 SEC("syscall")
 __description("arena stack: load and store")
 __success __retval(12)
 __xlated("r0 = *(u64 *)(r12 -16)")
+__xlated("cancel_goto pc+{{[0-9]+}}")
 __xlated("r2 = *(u64 *)(r12 -8)")
+__xlated("cancel_goto pc+{{[0-9]+}}")
 __naked void load_store(void)
 {
 	asm volatile (
