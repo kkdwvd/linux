@@ -11921,6 +11921,11 @@ static int check_static_func_call(struct bpf_verifier_env *env, int subprog,
 	if (err)
 		return err;
 
+	/* every state that calls gets here, however the callee is verified */
+	err = bpf_cancel_record(env, BPF_CANCEL_SITE_CALL);
+	if (err)
+		return err;
+
 	if (func_is_on_its_own(env, state, subprog))
 		return call_func_on_its_own(env, subprog, *insn_idx);
 
@@ -12000,6 +12005,11 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				subprog, sub_name);
 			return err;
 		}
+
+		/* the call of a static function is recorded in check_static_func_call() */
+		err = bpf_cancel_record(env, BPF_CANCEL_SITE_CALL);
+		if (err)
+			return err;
 
 		if (env->log.level & BPF_LOG_LEVEL)
 			verbose(env, "Func#%d ('%s') is global and assumed valid.\n",
@@ -21820,9 +21830,13 @@ static int flow_drain(struct bpf_verifier_env *env)
 static int check_recursion_guard(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[cur_func(env)->subprogno];
+	int err;
 
 	if (!sub->recursive || env->insn_idx != sub->start)
 		return 0;
+	err = bpf_cancel_record(env, BPF_CANCEL_SITE_ENTRY);
+	if (err)
+		return err;
 	return push_budget_exit(env);
 }
 
@@ -23417,6 +23431,8 @@ static int do_check_all(struct bpf_verifier_env *env)
 
 	for (;;) {
 		bpf_flow_new_round(env);
+		/* what the frames held in a round that is dropped doesn't count either */
+		bpf_cancel_reset(env);
 		ret = do_check_main(env);
 		ret = ret ?: do_check_subprogs(env);
 		if (!round_is_dropped(env))
@@ -25691,6 +25707,7 @@ err_free_env:
 	kvfree(env->walk_insns);
 	bpf_flow_free(env);
 	bpf_join_free(env);
+	bpf_cancel_free(env);
 	bpf_stack_liveness_free(env);
 	kvfree(env->cfg.postorder_nums);
 	kvfree(env->cfg.insn_postorder);

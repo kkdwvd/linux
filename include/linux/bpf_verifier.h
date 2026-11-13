@@ -944,6 +944,8 @@ struct bpf_insn_aux_data {
 	s32 not_stopped;
 	/* where may_goto in front of this instruction goes */
 	s32 guard_to;
+	/* the first cancel site at this instruction + 1, see bpf_cancel_record() */
+	u32 cancel_site;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 };
@@ -1369,6 +1371,7 @@ struct bpf_verifier_env {
 	struct scev *scev;
 	struct bpf_flow *flow;
 	struct bpf_join_state *join;
+	struct bpf_cancel *cancel;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1584,6 +1587,18 @@ bool bpf_edge_leaves_loop(struct bpf_verifier_env *env, int h, int n, int t);
 int bpf_find_latches(struct bpf_verifier_env *env, bool flags);
 bool bpf_jump_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
+
+/* cancel.c */
+enum bpf_cancel_site_type {
+	/* the stack check of a recursive subprog, see check_recursion_guard() */
+	BPF_CANCEL_SITE_ENTRY,
+	/* the call of a subprog */
+	BPF_CANCEL_SITE_CALL,
+};
+
+int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
+void bpf_cancel_reset(struct bpf_verifier_env *env);
+void bpf_cancel_free(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);
