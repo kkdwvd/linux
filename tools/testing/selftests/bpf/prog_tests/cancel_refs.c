@@ -292,6 +292,47 @@ static void test_tasks(struct cancel_refs *skel)
 	skel->bss->zero = 0;
 	skel->bss->pid = sys_gettid();
 	ASSERT_EQ(task_users(skel), self, "two_places_and_another_task: the other task");
+	/*
+	 * The frame gives the task to a callee, and the call that moves it clears the flag. The
+	 * prog is cancelled in front of that call, with the task and without it,
+	 */
+	skel->bss->pid = child.pid;
+	cancelled(skel, skel->progs.held_on_one_path_given_away);
+	ASSERT_EQ(task_users(skel), users, "held_on_one_path_given_away");
+	skel->bss->pid = sys_gettid();
+	skel->bss->zero = 1;
+	cancelled(skel, skel->progs.held_on_one_path_given_away);
+	ASSERT_EQ(task_users(skel), self, "held_on_one_path_given_away without the task");
+	skel->bss->zero = 0;
+	/* and in the callee, behind the move: the pad of the callee releases the task, once */
+	skel->bss->pid = child.pid;
+	skel->bss->late = 1;
+	cancelled(skel, skel->progs.held_on_one_path_given_away);
+	ASSERT_EQ(task_users(skel), users, "held_on_one_path_given_away in the callee");
+	skel->bss->late = 0;
+
+	/*
+	 * The callee releases the task and returns, and the frame is cancelled behind that. It
+	 * has the task that runs the prog where the handle was, and its flag is clear.
+	 */
+	skel->bss->give = 1;
+	cancelled(skel, skel->progs.given_away_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "given_away_on_one_path");
+	skel->bss->pid = sys_gettid();
+	ASSERT_EQ(task_users(skel), self, "given_away_on_one_path: the task that runs it");
+	/* the path that keeps the task holds it there */
+	skel->bss->pid = child.pid;
+	skel->bss->give = 0;
+	cancelled(skel, skel->progs.given_away_on_one_path);
+	ASSERT_EQ(task_users(skel), users, "given_away_on_one_path with the task");
+
+	/* both paths get to the call that moves the task, one of them with NULL and nothing held */
+	cancelled(skel, skel->progs.null_or_task_given_away);
+	ASSERT_EQ(task_users(skel), users, "null_or_task_given_away");
+	skel->bss->zero = 1;
+	cancelled(skel, skel->progs.null_or_task_given_away);
+	ASSERT_EQ(task_users(skel), users, "null_or_task_given_away with NULL");
+	skel->bss->zero = 0;
 
 	/* No task has this pid: the handles are NULL, and the pads call nothing with them. */
 	skel->bss->pid = -1;
