@@ -4117,6 +4117,18 @@ u64 bpf_prog_report_recursion(void)
 	return 0;
 }
 
+/*
+ * Called by the landing pad that ends an invocation, when the frames have released what they held.
+ * What the value of an unwound operator means is up to the struct_ops. This is the context of the
+ * program, with the locks of the caller of the operator: see what ->unwound() may do.
+ * Only programs of a struct_ops that has the callback call it, see bpf_pad_insns().
+ */
+u64 bpf_prog_report_unwound(struct bpf_prog_aux *aux)
+{
+	aux->st_ops->unwound(aux->prog);
+	return 0;
+}
+
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
 {
 	u64 time = ktime_get_mono_fast_ns();

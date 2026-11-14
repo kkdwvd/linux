@@ -587,14 +587,14 @@ enum bpf_stuck_by {
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
  * per argument of a release two to load it, per entry a test, the calls, two to save the value,
- * two to bring the value back, one for R2 of kexit. emit_pad() has the insn that leaves on top
- * of that, or the call of the exception callback.
+ * three to tell the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has
+ * the insn that leaves on top of that, or the call of the exception callback.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
-				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 5)
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
 #define BPF_PAD_MAX_CANDS	6
 /* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
 #define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS

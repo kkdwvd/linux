@@ -2463,6 +2463,9 @@ static void __bpf_prog_put_rcu(struct rcu_head *rcu)
 {
 	struct bpf_prog_aux *aux = container_of(rcu, struct bpf_prog_aux, rcu);
 
+	/* An invocation that went on until now may have called ->unwound() of the struct_ops */
+	if (aux->prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+		module_put(aux->mod);
 	btf_put(aux->btf);
 	kvfree(aux->jited_linfo);
 	kvfree(aux->linfo);
@@ -2490,7 +2493,9 @@ static void __bpf_prog_put_rcu_tasks(struct rcu_head *rcu)
 
 static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
 {
-	module_put(prog->aux->mod);
+	/* A struct_ops prog keeps its module over the grace period, see __bpf_prog_put_rcu() */
+	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
+		module_put(prog->aux->mod);
 	bpf_free_kfunc_tab(prog->aux->kfunc_tab);
 	kfree(prog->aux->ctx_arg_info);
 	if (prog->aux->attach_btf)

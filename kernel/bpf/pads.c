@@ -2198,6 +2198,31 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 }
 
 /*
+ * The kernel called @subprog, and its pads end the invocation with exit: the main program, whose
+ * unwind_exit is exit to the JITs as well, see bpf_prog_can_unwind(), and an async callback that
+ * cannot leave unwound, see unwind_exit_insn(). They tell a struct_ops that wants to know, see
+ * bpf_prog_report_unwound().
+ * An async callback that can leave unwound has callers in the program, or is expected to. It has
+ * one pad for all its frames, which ends in kexit, or in unwind_exit for what the program unwinds,
+ * and cannot tell who called. Such a pad tells nobody.
+ * A pad that ends the invocation tells whatever its site is: also the pad of a call without
+ * unwind_goto to which unwind_exit of a callee came back, which is an unwind of the program's own.
+ * That tells about more than the kernel has stopped, and it misses nothing that the kernel has: such
+ * a pad of the main program calls the exception callback, which the kernel can unwind in turn, and
+ * the pads of that callback tell nobody.
+ * The exception callback is called by a pad of the main program, which has told already.
+ */
+static bool pad_reports(const struct bpf_verifier_env *env, int subprog)
+{
+	const struct bpf_struct_ops *st_ops = env->prog->aux->st_ops;
+	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+
+	if (!st_ops || !st_ops->unwound || sub->is_exception_cb)
+		return false;
+	return !subprog || (sub->is_async_cb && !sub->bail_unwinds);
+}
+
+/*
  * The landing pad of a site of @kind in @subprog passes R2 on with R0, see bpf_pad_passes_on(): in
  * a subprog that returns two registers. Not out of a global subprog, which passes nothing on: its
  * callers take what comes out for numbers, also where the callee of this frame returns one
@@ -2214,7 +2239,8 @@ static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_
 {
 	return (bpf_site_has_value(env, subprog, plan->kind) ||
 		bpf_pad_passes_on(env, subprog, plan->kind)) &&
-	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT]);
+	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT] ||
+		pad_reports(env, subprog));
 }
 
 
@@ -2227,6 +2253,7 @@ static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
+	struct bpf_insn ld_aux[2] = { BPF_LD_IMM64(BPF_REG_1, (long)env->prog->aux) };
 	int value_off = env->subprog_info[subprog].value_off;
 	int src = bpf_site_value_reg(plan->kind), dst = BPF_REG_0;
 	bool passes_on = bpf_pad_passes_on(env, subprog, plan->kind);
@@ -2248,6 +2275,11 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
+	if (pad_reports(env, subprog)) {
+		buf[n++] = ld_aux[0];
+		buf[n++] = ld_aux[1];
+		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_unwound);
+	}
 	if (bpf_site_is_forced(plan->kind) && env->has_throw) {
 		/* what the unwinding of the frame began with: no pad on its way writes the word */
 		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);

@@ -25584,6 +25584,15 @@ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 
 	prog->aux->st_ops = st_ops;
 	prog->aux->attach_st_ops_member_off = member_off;
+	/*
+	 * The prog keeps the module of its struct_ops for as long as it lives, as a prog keeps
+	 * the module whose kfuncs it calls. So st_ops is there wherever the prog is: an async
+	 * callback of it can run when no struct_ops map holds the module any more.
+	 */
+	if (env->attach_btf_mod) {
+		__module_get(env->attach_btf_mod);
+		prog->aux->mod = env->attach_btf_mod;
+	}
 
 	prog->aux->attach_func_proto = func_proto;
 	prog->aux->attach_func_name = mname;
