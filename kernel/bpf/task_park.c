@@ -5,6 +5,7 @@
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/cpuhotplug.h>
+#include <linux/filter.h>
 #include <linux/hrtimer.h>
 #include <linux/irq_work.h>
 #include <linux/rcupdate_trace.h>
@@ -178,6 +179,7 @@ __bpf_kfunc_start_defs();
  * bpf_task_park - Sleep until bpf_task_wake() is called for the current task
  * @timeout_ns: relative timeout, or U64_MAX for none
  * @flags: must be 0
+ * @aux: the calling program, set by the verifier
  *
  * Returns at once if a wake is pending from a bpf_task_wake() that found the
  * task running. Otherwise sleeps interruptibly until a wake, the timeout or
@@ -191,14 +193,16 @@ __bpf_kfunc_start_defs();
  *
  * Every call past the argument check leaves the read section the program
  * runs under and lets the task migrate until it returns, whether it sleeps or
- * not, so the program may go on on another CPU after any of them.
+ * not, so the program may go on on another CPU after any of them. For the
+ * time slice that bounds the program's loops, such a call ends one invocation
+ * and begins the next: the slice starts over when the call returns.
  *
  * Return: 0 when a wake was consumed or the sleep ended for no recorded
  * reason, -ETIMEDOUT when the timeout passed, -EINTR when a signal is
  * pending, whether it was found before the sleep or ended it, even if the
  * timeout passed meanwhile, -EINVAL when @flags is not 0.
  */
-__bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags)
+__bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags, struct bpf_prog_aux *aux)
 {
 	ktime_t expires = min_t(u64, timeout_ns, KTIME_MAX);
 	int ret;
@@ -262,6 +266,8 @@ __bpf_kfunc int bpf_task_park(u64 timeout_ns, u64 flags)
 
 	rcu_read_lock_trace();
 	migrate_disable();
+	/* For the time slice of may_goto, an invocation begins here. */
+	bpf_timed_may_goto_rearm(aux);
 
 	/*
 	 * Consume the wake. xchg() is fully ordered, so the condition loads
