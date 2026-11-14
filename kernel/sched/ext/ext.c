@@ -7743,6 +7743,16 @@ static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 	if (!atomic_try_cmpxchg(&sch->exit_kind, &none, kind))
 		return false;
 
+	/*
+	 * After an error the state of the BPF scheduler cannot be trusted. An
+	 * operator may wait for a lock that an unwound one left behind, under
+	 * the rq lock, until its time slice is over, and the disable path calls
+	 * operators for each task. Turn them off, as scx_root_disable() does at
+	 * its end. ops.exit() is not covered by has_op.
+	 */
+	if (kind >= SCX_EXIT_ERROR)
+		bitmap_zero(sch->has_op, SCX_OPI_END);
+
 	if (kind == SCX_EXIT_PARENT) {
 		/* an ancestor is already sweeping the subtree */
 		WRITE_ONCE(sch->aborting, true);

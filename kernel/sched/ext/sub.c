@@ -216,7 +216,11 @@ void scx_ops_cid_sched_updated_enable(struct scx_sched *sch)
 
 	lockdep_assert_held(&scx_enable_mutex);
 
-	if (!SCX_HAS_OP(sch, sub_cid_sched_updated) || scx_nr_ops_cid_sched_updated++)
+	if (!SCX_HAS_OP(sch, sub_cid_sched_updated))
+		return;
+	/* has_op goes when @sch fails, see scx_claim_exit(): what was counted has to stay */
+	sch->cid_sched_updated_counted = true;
+	if (scx_nr_ops_cid_sched_updated++)
 		return;
 
 	static_branch_enable(&__scx_ops_cid_sched_updated_enabled);
@@ -241,7 +245,9 @@ void scx_ops_cid_sched_updated_enable(struct scx_sched *sch)
  * so that no sched is notified of @sch once it is gone. The last sched with the
  * op turns the key off first and clears every rq, so while the key is off every
  * rq->scx.sched is NULL. A sched whose enable failed before its has_op fill was
- * never counted, so has_op gates the decrement.
+ * never counted, and one that failed later has lost has_op, see
+ * scx_claim_exit(). So the sched itself says whether it was counted, and that
+ * gates the decrement.
  */
 void scx_ops_cid_sched_updated_disable(struct scx_sched *sch)
 {
@@ -250,7 +256,8 @@ void scx_ops_cid_sched_updated_disable(struct scx_sched *sch)
 
 	lockdep_assert_held(&scx_enable_mutex);
 
-	last = SCX_HAS_OP(sch, sub_cid_sched_updated) && !--scx_nr_ops_cid_sched_updated;
+	last = sch->cid_sched_updated_counted && !--scx_nr_ops_cid_sched_updated;
+	sch->cid_sched_updated_counted = false;
 	if (last)
 		static_branch_disable(&__scx_ops_cid_sched_updated_enabled);
 
