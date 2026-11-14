@@ -9414,6 +9414,58 @@ static int bpf_scx_validate(void *kdata)
 	return 0;
 }
 
+/*
+ * @prog was unwound, and scx_prog_sched() has no scheduler for it.
+ * A program that is in no struct_ops map, or in more than one, has no scheduler
+ * of its own, and below a root that takes sub-schedulers it can be an operator
+ * of any of them. The failure is the root's then, whose exit ends them all.
+ * A program whose map is gone, or has no scheduler, or one that is gone, is
+ * taken for an async callback that has outlived its scheduler, and nobody is
+ * told: the root may be another scheduler by now.
+ */
+static void scx_unknown_prog_unwound(const struct bpf_prog *prog)
+{
+	struct scx_sched *root;
+
+	if (bpf_prog_get_assoc_struct_ops(prog->aux) || bpf_prog_assoc_struct_ops_gone(prog->aux))
+		return;
+	root = rcu_dereference(scx_root);
+	if (!root || READ_ONCE(root->dead))
+		return;
+	scx_error(root, "program %s (ops.%s, id %u) was unwound and its scheduler is not known, see its stderr stream",
+		  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+}
+
+/*
+ * @prog, an operator of a scheduler or an async callback of one, was unwound.
+ * The operator returns 0 without having computed it, which would be taken for a
+ * CPU or for success, so this is as fatal to the scheduler as scx_bpf_error().
+ * The rq lock of the operator's caller may be held here. scx_error() only
+ * claims the exit and leaves the disabling to irq_work and the helper kthread.
+ */
+static void bpf_scx_unwound(const struct bpf_prog *prog)
+{
+	struct scx_sched *sch;
+
+	guard(rcu)();
+
+	sch = scx_prog_sched(prog->aux);
+	if (unlikely(!sch)) {
+		scx_unknown_prog_unwound(prog);
+		return;
+	}
+	/*
+	 * A root that takes no sub-schedulers is what scx_prog_sched() has for
+	 * every program without a map, also for one whose map is gone. That one
+	 * has outlived its scheduler, see scx_unknown_prog_unwound(): @sch is
+	 * another scheduler, and is not told.
+	 */
+	if (bpf_prog_assoc_struct_ops_gone(prog->aux))
+		return;
+	scx_error(sch, "program %s (ops.%s, id %u) was unwound, see its stderr stream",
+		  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+}
+
 static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
 static void sched_ext_ops__enqueue(struct task_struct *p, u64 enq_flags) {}
 static void sched_ext_ops__dequeue(struct task_struct *p, u64 enq_flags) {}
@@ -9507,6 +9559,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.unwound = bpf_scx_unwound,
 	.name = "sched_ext_ops",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops
@@ -9584,6 +9637,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops_cid = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.unwound = bpf_scx_unwound,
 	.name = "sched_ext_ops_cid",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops_cid
