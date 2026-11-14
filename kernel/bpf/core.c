@@ -4025,6 +4025,26 @@ void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_ma
 		*cur = *saved;
 }
 
+/*
+ * bpf_task_park() is to the time slice what the end of an invocation is. The prog leaves its read
+ * section and lets go of the cpu, and whoever runs the prog there next sets count and timestamp
+ * anew. So does the prog itself when the kfunc returns, on the cpu that it is on by then: an
+ * invocation begins, and count and timestamp are for the time since. What it left on the cpu
+ * that it was on stays there, as after an exit.
+ * The caller has disabled migration again.
+ */
+void bpf_timed_may_goto_rearm(const struct bpf_prog_aux *aux)
+{
+	struct bpf_timed_may_goto *cur;
+
+	if (!aux->timed_may_goto)
+		return;
+	cur = this_cpu_ptr(aux->timed_may_goto);
+	cur->count = BPF_MAX_TIMED_LOOPS;
+	cur->timestamp = 0;
+	cur->owner = NULL;
+}
+
 /* for configs without MMU or 32-bit */
 __weak const struct bpf_map_ops arena_map_ops;
 __weak u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena)
