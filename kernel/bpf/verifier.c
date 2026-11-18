@@ -25713,6 +25713,9 @@ skip_full_check:
 		ret = bpf_cancel_retarget_may_gotos(env);
 
 	if (ret == 0)
+		ret = bpf_cancel_replace_throws(env);
+
+	if (ret == 0)
 		ret = bpf_cancel_insert_flag_stores(env);
 
 	if (ret == 0)

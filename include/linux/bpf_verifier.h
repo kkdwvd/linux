@@ -1798,6 +1798,7 @@ u32 bpf_cancel_guard_pad(struct bpf_verifier_env *env, int insn_idx);
 int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int subprog, struct bpf_insn *buf);
 int bpf_cancel_insert_gotos(struct bpf_verifier_env *env);
 int bpf_cancel_retarget_may_gotos(struct bpf_verifier_env *env);
+int bpf_cancel_replace_throws(struct bpf_verifier_env *env);
 int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env);
 void bpf_cancel_reset(struct bpf_verifier_env *env);
 void bpf_cancel_free(struct bpf_verifier_env *env);

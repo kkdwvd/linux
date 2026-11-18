@@ -13,6 +13,10 @@
  * returns to the kernel. A cancellation runs pads only, never the code of the
  * program again.
  *
+ * A call of bpf_throw() leaves through the same pads, see "Throws": the frames
+ * release what they hold, and the pad of the main program calls the exception
+ * callback with the cookie and returns what that returns.
+ *
  * A site is an insn at which a frame can be cancelled: a point, or the call of
  * a subprog, which a cancellation comes back through. The main pass records
  * what the frame at the site holds, as a list of entries: one per resource, with
@@ -132,6 +136,8 @@ static bool cancel_kind_ordered(u8 kind)
 #define CANCEL_TOLD_INSNS	2
 /* and to tell its caller what the callee told about one argument, see cancel_emit_exit() */
 #define CANCEL_FWD_INSNS	3
+/* and to keep the cookie of bpf_throw() and tell a throw from a cancellation, see "Throws" */
+#define CANCEL_THROW_INSNS	10
 
 /*
  * The arguments of a call of a static subprog have numbers: 1-5 are R1-R5, and the stack
@@ -139,6 +145,9 @@ static bool cancel_kind_ordered(u8 kind)
  */
 #define CANCEL_MAX_ARG		MAX_BPF_STATIC_FUNC_ARGS
 #define CANCEL_ARGS		GENMASK(CANCEL_MAX_ARG, 1)
+/* Beside the arguments in R2 at cancel_exit: the frames leave for bpf_throw(), see "Throws" */
+#define CANCEL_THROWN		BIT(31)
+static_assert(!(CANCEL_ARGS & CANCEL_THROWN));
 
 /*
  * What a frame leaves for. A cancellation ends the invocation with the cancel value of the
@@ -234,6 +243,8 @@ enum cancel_untold {
 	CANCEL_NOT_FORWARDED,
 	/* CANCEL_STACK: the frame has no room to keep what the callee tells */
 	CANCEL_NO_MASK,
+	/* CANCEL_STACK: nor to keep the cookie of bpf_throw() while its pad releases */
+	CANCEL_NO_COOKIE,
 };
 
 /* The place of an entry that has no handle */
@@ -367,6 +378,8 @@ struct cancel_site {
 	bool unused;
 	/* with a pad: the bits of enum cancel_cause that get to it */
 	u8 causes;
+	/* the frame has no room for what the pad has to keep, see cancel_reserve_words() */
+	bool no_room;
 	u32 pad;	/* of a guard, may_goto of the program, a call or an access that is padded */
 };
 
@@ -395,6 +408,9 @@ struct cancel_sub {
 	/* the word that the pads of its calls keep the mask of the callee in: the offset from r10 */
 	s16 mask;
 	bool no_mask;	/* its frame has no room for the word */
+	/* the slot that its pads keep the cookie of bpf_throw() in while they release */
+	s16 cookie;
+	bool no_cookie;	/* its frame has no room for the slot */
 };
 
 /*
@@ -488,7 +504,7 @@ struct bpf_cancel {
 	bool no_pairs;		/* not all of them are here */
 	/* the flags that are reserved, see cancel_reserve_flags() */
 	u32 nr_flags;
-	/* a site is a call of bpf_throw() */
+	/* a site is a call of bpf_throw(), see "Throws" */
 	bool throws;
 };
 
@@ -2135,7 +2151,7 @@ static bool cancel_prog_may_have_pads(const struct bpf_verifier_env *env)
 }
 
 /*
- * Do the frames of the program leave through pads when it calls bpf_throw()?
+ * Do the frames of the program leave through pads when it calls bpf_throw(), see "Throws"?
  * Then every call of bpf_throw() is a site, nothing discards a frame, and the program is not
  * loaded when a throw gets to a frame that cannot leave.
  */
@@ -2894,6 +2910,8 @@ static bool cancel_reject(struct bpf_verifier_env *env, const struct cancel_site
 		text = "a callee releases what a caller of the frame holds, and the frame did not get it in an argument";
 	else if (reason == CANCEL_STACK && site->untold == CANCEL_NO_MASK)
 		text = "a callee tells what it released for the frame, and the stack of the frame has no room to keep that";
+	else if (reason == CANCEL_STACK && site->untold == CANCEL_NO_COOKIE)
+		text = "the pad keeps the cookie of bpf_throw() while it releases, and the stack of the frame has no room for it";
 	verbose(env, "insn %d: %s at this %s: %s (%s)\n", site->insn_idx,
 		throw ? "no throw can leave the frame" : "the program cannot be cancelled",
 		cancel_site_str(site), text, cancel_reason_str[reason]);
@@ -3139,12 +3157,17 @@ static u32 cancel_entry_told(const struct cancel_site *site, const struct cancel
 	return BIT(e->passed) & site->told;
 }
 
-/* Is one pad right for both: do they hold the same, and tell and get told the same? */
+/*
+ * Is one pad right for both: do they hold the same, and tell and get told the same? And does
+ * the same get to them: the cookie of a throw is in R1 at bpf_throw() and in R0 at a call.
+ */
 static bool cancel_same_held(const struct cancel_site *a, const struct cancel_site *b)
 {
 	u32 i;
 
-	if (a->held.nr != b->held.nr || a->gave != b->gave || a->told != b->told)
+	if (a->held.nr != b->held.nr || a->gave != b->gave || a->told != b->told ||
+	    a->causes != b->causes ||
+	    (a->type == BPF_CANCEL_SITE_THROW) != (b->type == BPF_CANCEL_SITE_THROW))
 		return false;
 	for (i = 0; i < a->held.nr; i++)
 		if (!cancel_entry_same(&a->held.entries[i], &b->held.entries[i]) ||
@@ -3451,36 +3474,117 @@ static u8 cancel_site_told(struct bpf_verifier_env *env, struct cancel_site *sit
 }
 
 /*
+ * Throws. A call of bpf_throw() is a point like the others, and its frames leave through the
+ * pads that a cancellation takes, see bpf_cancel_covers_throw(). What differs is the end: the
+ * pad of the main program calls the exception callback with the cookie of bpf_throw() and
+ * returns what that returns, or returns the cookie when the program has no callback. So a
+ * throw takes two things along, in the registers that cancel_exit keeps: the cookie in R0,
+ * and CANCEL_THROWN in R2, beside the arguments that a callee tells about.
+ *
+ * A pad knows from the points behind it what may get to it, see cancel_site_causes(): only
+ * cancellations, and it does what it did. Only throws, and it sets CANCEL_THROWN itself.
+ * Either, and it goes by what the callee left in R2. A release is a call, which keeps
+ * neither R0 nor R2. A pad that releases keeps the cookie in a hidden slot of its frame, and
+ * what the callee left in R2 in the word that the mask of the callee goes to, see
+ * cancel_reserve_words().
+ *
+ * A throw has nothing to fall back on: nothing discards frames where pads cover it. The
+ * program is not loaded when a throw gets to a site that declines, or to a frame that no
+ * throw can leave, see cancel_reject().
+ */
+enum cancel_thrown {
+	CANCEL_THROWN_NEVER,
+	CANCEL_THROWN_MAYBE,
+	CANCEL_THROWN_ALWAYS,
+};
+
+/* Do the frames leave for bpf_throw() when a pad runs that @causes get to? */
+static enum cancel_thrown cancel_thrown(u8 causes)
+{
+	if (!(causes & BIT(CANCEL_CAUSE_THROW)))
+		return CANCEL_THROWN_NEVER;
+	return causes & BIT(CANCEL_CAUSE_CANCEL) ? CANCEL_THROWN_MAYBE : CANCEL_THROWN_ALWAYS;
+}
+
+/* Does the pad of @site keep what the callee left in R2, in the word of its frame? */
+static bool cancel_keeps_mask(const struct cancel_site *site, u8 causes)
+{
+	return site->told || (site->held.nr && cancel_thrown(causes) == CANCEL_THROWN_MAYBE);
+}
+
+/* Does it keep the cookie of bpf_throw(), in the slot of its frame? */
+static bool cancel_keeps_cookie(const struct cancel_site *site, u8 causes)
+{
+	return site->held.nr && cancel_thrown(causes) != CANCEL_THROWN_NEVER;
+}
+
+/* @size hidden bytes of subprog @s for its pads: @off is 0 when the frame has no room */
+static int cancel_reserve_word(struct bpf_verifier_env *env, int s, u32 size, s16 *off)
+{
+	bool jit_required;
+	int err;
+
+	/* see cancel_reserve_flags() */
+	jit_required = env->prog->jit_required;
+	env->prog->jit_required = 1;
+	err = bpf_reserve_zeroed_stack(env, s, size, off);
+	if (err == -ENOSPC) {
+		env->prog->jit_required = jit_required;
+		*off = 0;
+		return 0;
+	}
+	return err;
+}
+
+/*
  * The pad of a call that goes by the mask of its callee keeps the mask in a hidden word of
  * its frame: R2 does not last beyond the first release. One word serves all such pads of a
  * subprog, and only the sites that get a pad as things are take room, like for the flags.
- * Returns the number of subprogs whose frames have no room, below 0 on error.
+ * The same word keeps CANCEL_THROWN, and a slot of the frame the cookie of bpf_throw(), see
+ * "Throws". Returns the number of sites whose frames have no room, below 0 on error.
  */
-static int cancel_reserve_masks(struct bpf_verifier_env *env)
+static int cancel_reserve_words(struct bpf_verifier_env *env)
 {
 	struct bpf_cancel *c = env->cancel;
-	const struct cancel_site *site;
+	struct cancel_site *site;
 	struct cancel_sub *sub;
 	int err, failed = 0;
-	bool jit_required;
+	u8 causes;
 	u32 i;
 
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
 		sub = &c->subs[site->subprog];
-		if (!site->told || sub->mask || sub->no_mask || !cancel_site_causes(env, site))
+		causes = cancel_site_causes(env, site);
+		if (!causes)
 			continue;
-		/* see cancel_reserve_flags() */
-		jit_required = env->prog->jit_required;
-		env->prog->jit_required = 1;
-		err = bpf_reserve_zeroed_stack(env, site->subprog, sizeof(u32), &sub->mask);
-		if (err && err != -ENOSPC)
-			return err;
-		if (err) {
-			env->prog->jit_required = jit_required;
-			sub->no_mask = true;
-			failed++;
+		if (cancel_keeps_mask(site, causes)) {
+			if (!sub->mask && !sub->no_mask) {
+				err = cancel_reserve_word(env, site->subprog, sizeof(u32),
+							  &sub->mask);
+				if (err)
+					return err;
+				sub->no_mask = !sub->mask;
+			}
+			if (sub->no_mask) {
+				site->untold = CANCEL_NO_MASK;
+				site->no_room = true;
+			}
 		}
+		if (cancel_keeps_cookie(site, causes)) {
+			if (!sub->cookie && !sub->no_cookie) {
+				err = cancel_reserve_word(env, site->subprog, sizeof(u64),
+							  &sub->cookie);
+				if (err)
+					return err;
+				sub->no_cookie = !sub->cookie;
+			}
+			if (sub->no_cookie) {
+				site->untold = CANCEL_NO_COOKIE;
+				site->no_room = true;
+			}
+		}
+		failed += site->no_room;
 	}
 	return failed;
 }
@@ -3548,8 +3652,12 @@ static int cancel_set_flags(struct bpf_verifier_env *env, struct cancel_site *si
 	u32 i;
 
 	site->mask = c->subs[site->subprog].mask;
-	if (verifier_bug_if(site->told && !site->mask, env,
+	if (verifier_bug_if(cancel_keeps_mask(site, site->causes) && !site->mask, env,
 			    "cancel: no mask for the call at insn %u", site->insn_idx))
+		return -EFAULT;
+	if (verifier_bug_if(cancel_keeps_cookie(site, site->causes) &&
+			    !c->subs[site->subprog].cookie, env,
+			    "cancel: no slot for the cookie at insn %u", site->insn_idx))
 		return -EFAULT;
 	for (i = 0; i < site->held.nr; i++) {
 		e = &site->held.entries[i];
@@ -3627,15 +3735,15 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 	}
 	cancel_find_leaving(env);
 	/*
-	 * Only the flags of sites that get a pad take room, and the masks of their callees.
-	 * A site whose frame has none declines after all, and fewer sites get a pad then:
-	 * that is found once more.
+	 * Only the flags of sites that get a pad take room, and what their pads keep while
+	 * they release. A site whose frame has none declines after all, and fewer sites get a
+	 * pad then: that is found once more.
 	 */
 	cancel_find_used(env);
 	err = cancel_reserve_flags(env);
 	if (err < 0)
 		return err;
-	reason = cancel_reserve_masks(env);
+	reason = cancel_reserve_words(env);
 	if (reason < 0)
 		return reason;
 	if (err || reason) {
@@ -3644,6 +3752,8 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 			if (site->decline || cancel_sub_stays(env, site->subprog))
 				continue;
 			site->decline = cancel_site_told(env, site);
+			if (!site->decline && site->no_room)
+				site->decline = CANCEL_STACK;
 			if (!site->decline)
 				site->decline = cancel_site_flags(env, site);
 		}
@@ -3857,10 +3967,66 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
 }
 
 /*
+ * The end of the pad of a frame that the kernel entered: the main program or an async
+ * callback, and nothing else does, see cancel_sub_reason(). All frames are done. After a
+ * cancellation the pad tells that the program was cancelled and returns its cancel value to
+ * the kernel, like any exit.
+ *
+ * After a throw the pad of the main program calls the exception callback with the cookie
+ * and returns what that returns, or returns the cookie when the program has none. The
+ * callback is a function that the pad calls: bpf_cancel_build_pads() makes the call point to
+ * it. Where either gets to the pad, CANCEL_THROWN tells, see "Throws".
+ *
+ *	w2 = *(u32 *)(r10 + mask)
+ *	if w2 & CANCEL_THROWN goto throw
+ *	call bpf_prog_report_cancel
+ *	r0 = the cancel value
+ *	exit
+ * throw:
+ *	r1 = *(u64 *)(r10 + cookie)
+ *	call the exception callback
+ *	exit
+ */
+static int cancel_emit_top(struct bpf_verifier_env *env, int s, const struct cancel_site *site,
+			   struct bpf_insn *buf)
+{
+	enum cancel_thrown thrown = site ? cancel_thrown(site->causes) : CANCEL_THROWN_NEVER;
+	int cb = env->exception_callback_subprog, reg = cb ? BPF_REG_1 : BPF_REG_0;
+	int n = 0, jmp = 0;
+	s32 val = 0;
+
+	if (thrown == CANCEL_THROWN_MAYBE) {
+		/* a pad that made no call has in R2 what the callee left there */
+		if (cancel_keeps_mask(site, site->causes))
+			buf[n++] = BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_FP, site->mask);
+		jmp = n++;
+	}
+	if (thrown != CANCEL_THROWN_ALWAYS) {
+		/* it didn't refuse in cancel_sub_reason() */
+		if (!s)
+			bpf_prog_cancel_retval(env, &val);
+		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_cancel);
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, val);
+		buf[n++] = BPF_EXIT_INSN();
+	}
+	if (thrown == CANCEL_THROWN_NEVER)
+		return n;
+	if (thrown == CANCEL_THROWN_MAYBE)
+		buf[jmp] = BPF_JMP32_IMM(BPF_JSET, BPF_REG_2, CANCEL_THROWN, n - jmp - 1);
+	/* the cookie is in R0, see cancel_emit_pad(), unless the pad made a call */
+	if (cancel_keeps_cookie(site, site->causes))
+		buf[n++] = BPF_LDX_MEM(BPF_DW, reg, BPF_REG_FP, env->cancel->subs[s].cookie);
+	else if (cb)
+		buf[n++] = BPF_MOV64_REG(BPF_REG_1, BPF_REG_0);
+	if (cb)
+		buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+	buf[n++] = BPF_EXIT_INSN();
+	return n;
+}
+
+/*
  * Leave the frame of subprog @s. cancel_exit returns to the pad of the call that the frame
- * was called by. The kernel entered the main program or an async callback, and nothing else
- * does, see cancel_sub_reason(): all frames are done. The pad tells that the program was
- * cancelled and returns to the kernel like any exit.
+ * was called by. A frame that the kernel entered has none, see cancel_emit_top().
  *
  * The pad of a subprog that a call entered tells the pad of that call in R2 which arguments
  * of the frame are released, see bpf_cancel_note_args(). Every such pad does, so that a pad
@@ -3877,28 +4043,42 @@ static int cancel_emit_entry(struct bpf_verifier_env *env, const struct cancel_e
  *	r2 |= BIT(the argument of the frame)
  *	r0 = 0
  *	cancel_exit
+ *
+ * A throw leaves with CANCEL_THROWN in R2 and the cookie in R0, see "Throws". The pad sets
+ * the bit when only throws get to it. When cancellations do too it passes on what its callee
+ * left: from the word of the frame, or from R2 itself when the pad made no call.
+ *
+ *	r2 = gave			w2 &= CANCEL_THROWN
+ *	...			or	w2 |= gave
+ *	w1 &= CANCEL_THROWN
+ *	r2 |= r1
+ *	r0 = *(u64 *)(r10 + cookie)
+ *	cancel_exit
  */
 static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct cancel_site *site,
 			    struct bpf_insn *buf)
 {
+	enum cancel_thrown thrown = site ? cancel_thrown(site->causes) : CANCEL_THROWN_NEVER;
+	bool word = site && cancel_keeps_mask(site, site->causes);
 	u32 fwd = 0;
-	s32 val = 0;
 	int n = 0, r;
 
-	if (cancel_sub_is_top(env, s)) {
-		/* it didn't refuse in cancel_sub_reason() */
-		if (!s)
-			bpf_prog_cancel_retval(env, &val);
-		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_cancel);
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, val);
-		buf[n++] = BPF_EXIT_INSN();
-		return n;
-	}
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_2, site ? site->gave : 0);
+	if (cancel_sub_is_top(env, s))
+		return cancel_emit_top(env, s, site, buf);
+
 	for (r = 1; site && r <= CANCEL_MAX_ARG; r++)
 		if ((site->told & BIT(r)) && site->fwd[r])
 			fwd |= BIT(r);
-	if (fwd)
+	if (thrown == CANCEL_THROWN_MAYBE && !word) {
+		buf[n++] = BPF_ALU32_IMM(BPF_AND, BPF_REG_2, CANCEL_THROWN);
+		if (site->gave)
+			buf[n++] = BPF_ALU32_IMM(BPF_OR, BPF_REG_2, site->gave);
+	} else {
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, site ? site->gave : 0);
+		if (thrown == CANCEL_THROWN_ALWAYS)
+			buf[n++] = BPF_ALU32_IMM(BPF_OR, BPF_REG_2, CANCEL_THROWN);
+	}
+	if (fwd || (thrown == CANCEL_THROWN_MAYBE && word))
 		buf[n++] = BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_FP, site->mask);
 	for (r = 1; r <= CANCEL_MAX_ARG; r++) {
 		if (!(fwd & BIT(r)))
@@ -3907,7 +4087,14 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct ca
 		buf[n++] = BPF_JMP_A(1);
 		buf[n++] = BPF_ALU64_IMM(BPF_OR, BPF_REG_2, BIT(site->fwd[r]));
 	}
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+	if (thrown == CANCEL_THROWN_MAYBE && word) {
+		buf[n++] = BPF_ALU32_IMM(BPF_AND, BPF_REG_1, CANCEL_THROWN);
+		buf[n++] = BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_1);
+	}
+	if (thrown == CANCEL_THROWN_NEVER)
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+	else if (cancel_keeps_cookie(site, site->causes))
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_FP, env->cancel->subs[s].cookie);
 	buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_CANCEL_EXIT, 0, 0);
 	env->subprog_info[s].can_cancel = true;
 	env->prog->jit_required = 1;
@@ -3931,19 +4118,31 @@ static int cancel_emit_exit(struct bpf_verifier_env *env, int s, const struct ca
  *	if r1 == 0 goto next
  *	release
  * next:
+ *
+ * A pad that a throw gets to has the cookie in R0, or in R1 at bpf_throw() itself, see
+ * "Throws". It leaves with the cookie in R0, and keeps it in the slot of the frame over its
+ * releases:
+ *
+ *	*(u64 *)(r10 + cookie) = r0
  */
 static int cancel_emit_pad(struct bpf_verifier_env *env, const struct cancel_site *site,
 			   struct bpf_insn *buf)
 {
 	int n = 0, cnt, skip, told, place, reg = BPF_REG_6;
+	bool throw = site->type == BPF_CANCEL_SITE_THROW;
 	const struct cancel_entry *e;
 	/* where the handle in R0-R5 goes */
 	u8 to[BPF_REG_6] = {};
 	u16 busy = 0;
 	u32 i;
 
-	if (site->told)
+	if (cancel_keeps_mask(site, site->causes))
 		buf[n++] = BPF_STX_MEM(BPF_W, BPF_REG_FP, BPF_REG_2, site->mask);
+	if (cancel_keeps_cookie(site, site->causes))
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, throw ? BPF_REG_1 : BPF_REG_0,
+				       env->cancel->subs[site->subprog].cookie);
+	else if (throw)
+		buf[n++] = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);
 	for (i = 0; i < site->held.nr; i++) {
 		place = site->held.entries[i].place;
 		if (cancel_place_is_reg(place) && place >= BPF_REG_6)
@@ -4007,7 +4206,7 @@ int bpf_cancel_build_pads(struct bpf_verifier_env *env, int s, const struct bpf_
 		pad = &c->pads[p - 1];
 		need += c->sites[pad->site].held.nr *
 			(CANCEL_ENTRY_INSNS + CANCEL_FLAG_INSNS + CANCEL_TOLD_INSNS);
-		need += CANCEL_MOVE_INSNS + BPF_CANCEL_PAD_EXIT_INSNS;
+		need += CANCEL_MOVE_INSNS + BPF_CANCEL_PAD_EXIT_INSNS + CANCEL_THROW_INSNS;
 		/* the store of the mask, its load and what is told on, see cancel_emit_exit() */
 		need += 2 + CANCEL_MAX_ARG * CANCEL_FWD_INSNS;
 	}
@@ -4035,6 +4234,15 @@ int bpf_cancel_build_pads(struct bpf_verifier_env *env, int s, const struct bpf_
 		pad = &c->pads[p - 1];
 		pad->back = n - pad->back;
 	}
+	/*
+	 * The pad of the main program calls the exception callback, see cancel_emit_top().
+	 * The pads go behind the last insn of the subprog, and a call out of what is appended
+	 * there counts from the insn that follows.
+	 */
+	for (p = 0; p < n; p++)
+		if (bpf_pseudo_call(&c->insns[p]))
+			c->insns[p].imm = env->subprog_info[env->exception_callback_subprog].start -
+					  env->subprog_info[s + 1].start + n - p - 1;
 	*insns = c->insns;
 	return n;
 }
@@ -4169,6 +4377,46 @@ int bpf_cancel_retarget_may_gotos(struct bpf_verifier_env *env)
 			return PTR_ERR(insn);
 		bpf_patch_list_jump(pl, insn, cancel_pad_idx(env, site), 0);
 		/* the timed form is for JITs, see bpf_do_misc_fixups() */
+		env->prog->jit_required = 1;
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
+ * A call of bpf_throw() goes to the pad of its site, with the cookie in R1 as the program
+ * passed it, see cancel_emit_pad(). The kfunc is not called: the frames leave through
+ * their pads, and nothing discards them. The pads are in the program.
+ */
+int bpf_cancel_replace_throws(struct bpf_verifier_env *env)
+{
+	struct bpf_patch_list *pl = &env->patch_list;
+	struct bpf_insn ja = BPF_JMP_A(0), *insn;
+	struct cancel_site *site;
+	int i;
+
+	if (!env->seen_exception || !bpf_cancel_covers_throw(env))
+		return 0;
+
+	for (i = 0; i < env->prog->len; i++) {
+		/* what no state got to is dead code, and stays the call that it is */
+		if (!bpf_is_throw_kfunc(&env->prog->insnsi[i]) || !env->insn_aux_data[i].seen)
+			continue;
+		/*
+		 * Every state that throws is recorded, and its throw has a pad or the program
+		 * is not loaded, see bpf_cancel_resolve(). A call that stayed would return
+		 * to a program that was verified without that.
+		 */
+		site = env->cancel ? cancel_find_site(env, i, BPF_CANCEL_SITE_THROW) : NULL;
+		if (verifier_bug_if(!site || !site->padded, env,
+				    "cancel: bpf_throw() at insn %d has no pad", i))
+			return -EFAULT;
+		if (bpf_must_abort())
+			return -EINTR;
+		/* queued for its offset, like may_goto in bpf_cancel_retarget_may_gotos() */
+		insn = __bpf_patch_list_add(pl, env->prog, i, &ja, 1);
+		if (IS_ERR(insn))
+			return PTR_ERR(insn);
+		bpf_patch_list_jump(pl, insn, cancel_pad_idx(env, site), 0);
 		env->prog->jit_required = 1;
 	}
 	return bpf_patch_list_commit(env);
