@@ -720,6 +720,7 @@ enum sec_type {
 	SEC_RODATA,
 	SEC_ST_OPS,
 	SEC_PERCPU,
+	SEC_ARENA,
 };
 
 struct elf_sec_desc {
@@ -3186,8 +3187,9 @@ static int bpf_object__init_user_btf_map(struct bpf_object *obj,
 
 static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map)
 {
-	Elf_Data *data = obj->efile.arena_data, *bss = obj->efile.arena_bss;
-	size_t data_sz = data ? data->d_size : 0;
+	/* all sections of __arena variables, see bpf_object__layout_data() */
+	Elf_Data *bss = obj->efile.arena_bss;
+	size_t data_sz = obj->efile.arena_data ? obj->efile.secs[obj->efile.arena_data_shndx].map_sz : 0;
 
 	if (bss) {
 		obj->arena_bss_off = roundup(data_sz, obj->efile.arena_bss_align);
@@ -3196,8 +3198,8 @@ static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map)
 	obj->arena_data = calloc(1, data_sz);
 	if (!obj->arena_data)
 		return -ENOMEM;
-	if (data)
-		memcpy(obj->arena_data, data->d_buf, data->d_size);
+	if (obj->efile.arena_data)
+		bpf_object__fill_map_data(obj, obj->efile.arena_data_shndx, obj->arena_data);
 	obj->arena_data_sz = data_sz;
 
 	/* make bpf_map__init_value() work for ARENA maps */
@@ -4401,7 +4403,8 @@ static const char *comdat_data_base(const struct bpf_object *obj, int sec_idx,
  * each section. The maps are then those of the linked object, the sections
  * of a name that several groups have are one map like they are one section
  * after linking, and inline variables and templates don't use up the maps
- * that a program may use.
+ * that a program may use. The sections of __arena variables, which groups
+ * have too, are laid out in arena data in the same way.
  */
 static void bpf_object__layout_data(struct bpf_object *obj)
 {
@@ -4412,7 +4415,7 @@ static void bpf_object__layout_data(struct bpf_object *obj)
 
 	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
 		sec_desc = &obj->efile.secs[sec_idx];
-		if (!bpf_object__shndx_is_data(obj, sec_idx))
+		if (!bpf_object__shndx_is_data(obj, sec_idx) && sec_desc->sec_type != SEC_ARENA)
 			continue;
 
 		name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
@@ -4622,8 +4625,17 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 				sec_desc->data = data;
 				obj->efile.has_st_ops = true;
 			} else if (strcmp(name, ARENA_SEC) == 0) {
-				obj->efile.arena_data = data;
-				obj->efile.arena_data_shndx = idx;
+				/*
+				 * COMDAT groups have one each, which are laid
+				 * out after the first, see bpf_object__layout_data()
+				 */
+				sec_desc->sec_type = SEC_ARENA;
+				sec_desc->shdr = sh;
+				sec_desc->data = data;
+				if (!obj->efile.arena_data) {
+					obj->efile.arena_data = data;
+					obj->efile.arena_data_shndx = idx;
+				}
 			} else if (strcmp(name, ARENA_DATA_SEC) == 0) {
 				/* the marker, see the first pass */
 			} else if (strcmp(name, JUMPTABLES_SEC) == 0) {
@@ -5330,7 +5342,8 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	sym_sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, shdr_idx));
 
 	/* arena data relocation */
-	if (shdr_idx == obj->efile.arena_data_shndx || shdr_idx == obj->efile.arena_bss_shndx) {
+	if (obj->efile.secs[shdr_idx].sec_type == SEC_ARENA ||
+	    shdr_idx == obj->efile.arena_bss_shndx) {
 		if (obj->arena_map_idx < 0) {
 			pr_warn("prog '%s': bad arena data relocation at insn %u, no arena maps defined\n",
 				prog->name, insn_idx);
@@ -5339,7 +5352,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		reloc_desc->type = RELO_DATA;
 		reloc_desc->insn_idx = insn_idx;
 		reloc_desc->map_idx = obj->arena_map_idx;
-		reloc_desc->sym_off = sym->st_value;
+		reloc_desc->sym_off = obj->efile.secs[shdr_idx].map_off + sym->st_value;
 		if (shdr_idx == obj->efile.arena_bss_shndx)
 			reloc_desc->sym_off += obj->arena_bss_off;
 
@@ -8795,7 +8808,7 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 
 	if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
 	    sym->st_shndx >= obj->efile.sec_cnt ||
-	    (sym->st_shndx != obj->efile.arena_data_shndx &&
+	    (obj->efile.secs[sym->st_shndx].sec_type != SEC_ARENA &&
 	     sym->st_shndx != obj->efile.arena_bss_shndx &&
 	     !bpf_object__shndx_is_data(obj, sym->st_shndx)) ||
 	    rel->r_offset >= scn_data->d_size ||
@@ -8816,13 +8829,12 @@ static int bpf_object__collect_data_ptr(struct bpf_object *obj, const char *relo
 	targ = &obj->efile.secs[sym->st_shndx];
 	ptrs[obj->data_ptr_cnt].targ_sec_idx = targ->map_sec_idx;
 	ptrs[obj->data_ptr_cnt].targ_off = targ->map_off + sym->st_value;
-	if (sym->st_shndx == obj->efile.arena_data_shndx ||
-	    sym->st_shndx == obj->efile.arena_bss_shndx) {
+	if (targ->sec_type == SEC_ARENA)
 		ptrs[obj->data_ptr_cnt].targ_sec_idx = -1;
-		ptrs[obj->data_ptr_cnt].targ_off = sym->st_value;
+	if (sym->st_shndx == obj->efile.arena_bss_shndx) {
+		ptrs[obj->data_ptr_cnt].targ_sec_idx = -1;
+		ptrs[obj->data_ptr_cnt].targ_off = obj->arena_bss_off + sym->st_value;
 	}
-	if (sym->st_shndx == obj->efile.arena_bss_shndx)
-		ptrs[obj->data_ptr_cnt].targ_off += obj->arena_bss_off;
 	ptrs[obj->data_ptr_cnt].sym_name = strdup(sym_name);
 	if (!ptrs[obj->data_ptr_cnt].sym_name)
 		return -ENOMEM;
@@ -8954,22 +8966,26 @@ static int bpf_object__collect_rodata_relos(struct bpf_object *obj,
 /*
  * Collect pointers that are stored in variables in arena, like
  *   int __arena * __arena p = &var;
- * They are R_BPF_64_ABS64 relocations. The addend is stored in place.
+ * They are R_BPF_64_ABS64 relocations. The addend is stored in place. Every
+ * section of __arena variables has them, the plain one and those of COMDAT
+ * groups, at its offset in arena data, see bpf_object__layout_data().
  */
 static int bpf_object__collect_arena_relos(struct bpf_object *obj,
 					   Elf64_Shdr *shdr, Elf_Data *data)
 {
 	int i, nrels = shdr->sh_size / shdr->sh_entsize;
+	size_t sec_off = obj->efile.secs[shdr->sh_info].map_off;
 	struct arena_ptr *ptrs;
 	const char *sym_name;
 	size_t sym_idx;
 	Elf64_Sym *sym;
 	Elf64_Rel *rel;
 
-	ptrs = libbpf_reallocarray(NULL, nrels, sizeof(*ptrs));
+	ptrs = libbpf_reallocarray(obj->arena_ptrs, obj->arena_ptr_cnt + nrels, sizeof(*ptrs));
 	if (!ptrs)
 		return -ENOMEM;
 	obj->arena_ptrs = ptrs;
+	ptrs += obj->arena_ptr_cnt;
 
 	for (i = 0; i < nrels; i++, ptrs++) {
 		rel = elf_rel_by_idx(data, i);
@@ -8987,7 +9003,8 @@ static int bpf_object__collect_arena_relos(struct bpf_object *obj,
 		}
 
 		if (ELF64_R_TYPE(rel->r_info) != R_BPF_64_ABS64 ||
-		    (sym->st_shndx != obj->efile.arena_data_shndx &&
+		    sym->st_shndx >= obj->efile.sec_cnt ||
+		    (obj->efile.secs[sym->st_shndx].sec_type != SEC_ARENA &&
 		     sym->st_shndx != obj->efile.arena_bss_shndx)) {
 			sym_name = elf_sym_str(obj, sym->st_name) ?: "<?>";
 			pr_warn("sec '%s': pointer to '%s' at offset %zu: it's not in arena\n",
@@ -8995,10 +9012,10 @@ static int bpf_object__collect_arena_relos(struct bpf_object *obj,
 			return -LIBBPF_ERRNO__RELOC;
 		}
 
-		ptrs->off = rel->r_offset;
-		ptrs->targ_off = sym->st_value;
+		ptrs->off = sec_off + rel->r_offset;
+		ptrs->targ_off = obj->efile.secs[sym->st_shndx].map_off + sym->st_value;
 		if (sym->st_shndx == obj->efile.arena_bss_shndx)
-			ptrs->targ_off += obj->arena_bss_off;
+			ptrs->targ_off = obj->arena_bss_off + sym->st_value;
 		obj->arena_ptr_cnt++;
 	}
 	return 0;
@@ -9046,7 +9063,7 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 			err = bpf_object__collect_st_ops_relos(obj, shdr, data);
 		else if (idx == obj->efile.btf_maps_shndx)
 			err = bpf_object__collect_map_relos(obj, shdr, data);
-		else if (idx == obj->efile.arena_data_shndx)
+		else if (obj->efile.secs[idx].sec_type == SEC_ARENA)
 			err = bpf_object__collect_arena_relos(obj, shdr, data);
 		else
 			err = bpf_object__collect_prog_relos(obj, shdr, data);
