@@ -122,10 +122,13 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 {
 	int ret, insn_sz;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
+	}
 
 	return visit_callee ? push_insn(t, t + insns[t].imm + 1, BRANCH, env) : 0;
 }
@@ -876,7 +879,7 @@ static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
 			if (verifier_bug_if(callee < 0, env, "no callee of insn %d", t))
 				return -EFAULT;
 			if (!env->subprog_info[callee].might_return) {
-				if (!bpf_is_unwind_goto(&insns[t + 1]))
+				if (bpf_call_ends_subprog(env, t) || !bpf_is_unwind_goto(&insns[t + 1]))
 					continue;
 				/* what comes back to the call goes to its landing pad */
 				pad = t + 1 + bpf_jmp_offset(&insns[t + 1]) + 1;

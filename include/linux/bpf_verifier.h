@@ -2604,6 +2604,8 @@ int bpf_flow_start_leftover(struct bpf_verifier_env *env);
 int bpf_flow_edge_unproven(struct bpf_verifier_env *env, struct bpf_verifier_state *st, u32 idx,
 			   int err);
 #define BPF_EXIT_NEEDS_CALLER	1	/* verify the call in the frames of the caller */
+int bpf_unwound_at_final_call(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			      int call_idx);
 int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		    const struct bpf_verifier_state *exit, int call_idx);
 int bpf_insert_sites(struct bpf_verifier_env *env);
@@ -3051,6 +3053,16 @@ u32 bpf_vlog_alignment(u32 pos);
 const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
+
+/*
+ * A call that does not return may be the last insn of its subprog, see
+ * check_subprogs(). The insn after it belongs to the next subprog.
+ */
+static inline bool bpf_call_ends_subprog(struct bpf_verifier_env *env, int idx)
+{
+	return env->prog->insnsi[idx].code == (BPF_JMP | BPF_CALL) &&
+	       (bpf_find_containing_subprog(env, idx) + 1)->start == idx + 1;
+}
 
 /*
  * The insn has a hidden exit: a tail call that is taken and LD_ABS or LD_IND that fails to load

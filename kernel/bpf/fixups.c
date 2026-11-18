@@ -1867,7 +1867,8 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 			callee = bpf_find_subprog(env, i + insn->imm + 1);
 			traps = callee >= 0 && !env->subprog_info[callee].might_return;
 		}
-		if ((unwinds || traps) && !aux_data[i + 1].seen) {
+		/* a call that does not return may end the program, see check_final_calls() */
+		if ((unwinds || traps) && i + 1 < insn_cnt && !aux_data[i + 1].seen) {
 			memcpy(insn + 1, &trap, sizeof(trap));
 			aux_data[i + 1].zext_dst = false;
 			aux_data[i + 1].seen = env->check_cnt;

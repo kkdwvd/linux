@@ -1413,7 +1413,10 @@ static int flow_apply_exit(struct bpf_verifier_env *env, struct flow_state *w,
 
 	err = bpf_copy_verifier_state(env, &st, &w->st) ?:
 	      bpf_flow_return(env, &st, &x->st, call_idx);
-	if (!err)
+	/* no insn follows a call that ends its subprog */
+	if (!err && bpf_call_ends_subprog(env, call_idx))
+		err = bpf_unwound_at_final_call(env, &st, call_idx);
+	else if (!err)
 		err = bpf_flow_deliver(env, &st, call_idx + 1, call_idx, false);
 	else if (err < 0 && st.speculative)
 		err = min(bpf_flow_edge_unproven(env, &st, call_idx + 1, err), 0);

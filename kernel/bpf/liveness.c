@@ -381,7 +381,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (opcode_info->can_fallthrough)
+	if (opcode_info->can_fallthrough && !bpf_call_ends_subprog(env, idx))
 		succ->items[succ->cnt++] = idx + insn_sz;
 
 	if (opcode_info->can_jump)
@@ -566,9 +566,13 @@ static bool stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 half
 		/* Get callsite from verifier state, not from instance callchain */
 		callsite = q->callsites[i];
 
-		alive = callee_stack_access_at_callsite(env, callsite)
-			? is_live_before(instance, callsite, rel, half_spi, kind)
-			: is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		if (callee_stack_access_at_callsite(env, callsite))
+			alive = is_live_before(instance, callsite, rel, half_spi, kind);
+		else if (callsite + 1 < instance->subprog_start + instance->insn_cnt)
+			alive = is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		else
+			/* the call ends the subprog: its landing pad is planned at it */
+			alive = is_live_before(instance, callsite, rel, half_spi, kind);
 		if (alive)
 			return true;
 	}
@@ -1871,11 +1875,25 @@ static bool behind_call_without_return(struct bpf_verifier_env *env, int idx)
 	const struct bpf_insn *insns = env->prog->insnsi;
 	int callee;
 
-	if (!idx || !bpf_pseudo_call(&insns[idx - 1]) || bpf_is_unwind_goto(&insns[idx]) ||
-	    bpf_is_jump_target(env, idx))
+	/* behind a call that ends its subprog is the next subprog, see reads_like_pad() */
+	if (!idx || !bpf_pseudo_call(&insns[idx - 1]) || bpf_call_ends_subprog(env, idx - 1) ||
+	    bpf_is_unwind_goto(&insns[idx]) || bpf_is_jump_target(env, idx))
 		return false;
 	callee = bpf_find_subprog(env, idx + insns[idx - 1].imm);
 	return callee >= 0 && !env->subprog_info[callee].might_return;
+}
+
+/*
+ * Does the insn at @idx read what a landing pad of the verifier may read, R6-R9 and the stack of
+ * the frame? The insn behind a call that never returns does, see behind_call_without_return().
+ * So does a call that ends its subprog, see check_final_calls(): what comes back to it is unwound
+ * at the call itself, see bpf_unwound_at_final_call(), and the places of its landing pad are
+ * judged there.
+ */
+static bool reads_like_pad(struct bpf_verifier_env *env, int idx)
+{
+	return behind_call_without_return(env, idx) ||
+	       (bpf_pseudo_call(&env->prog->insnsi[idx]) && bpf_call_ends_subprog(env, idx));
 }
 
 /* Record stack access for a given 'at' state of helper/kfunc/global subprog 'insn' */
@@ -2232,7 +2250,7 @@ redo:
 			goto err_free;
 
 		/* the landing pad reads whichever stack slots hold resources there */
-		if (behind_call_without_return(env, idx)) {
+		if (reads_like_pad(env, idx)) {
 			err = mark_stack_read_all(env, instance, instance->depth, idx, true);
 			if (err)
 				goto err_free;
@@ -2869,7 +2887,7 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 	}
 
 	/* the landing pad reads whichever registers hold resources there */
-	if (behind_call_without_return(env, insn - env->prog->insnsi))
+	if (reads_like_pad(env, insn - env->prog->insnsi))
 		use |= mask_widen(GENMASK(BPF_REG_9, BPF_REG_6));
 
 	info->def = def;
