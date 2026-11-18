@@ -1559,8 +1559,8 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	struct bpf_insn trap = BPF_JMP_IMM(BPF_JA, 0, 0, -1);
 	struct bpf_insn *insn = env->prog->insnsi;
 	const int insn_cnt = env->prog->len;
-	bool unwinds, calls;
-	int i;
+	bool unwinds, calls, traps;
+	int i, callee;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		unwinds = bpf_is_pad_goto(insn) && aux_data[i + 1 + bpf_jmp_offset(insn)].seen;
@@ -1570,8 +1570,16 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 		 * its kexit needs kgoto.
 		 * The cpu predicts that it returns to what follows, or speculates to an exit.
 		 * Don't let the removal of dead code put something else there.
+		 * Behind a call of a subprog that does not return, see bpf_compute_might_return(),
+		 * the trap stands whoever loads the program: what the pass did not go on to must
+		 * not be where a return from that call gets to, should one ever get there.
 		 */
-		if ((unwinds || (calls && !env->bypass_spec_v1)) && !aux_data[i + 1].seen) {
+		traps = calls && !env->bypass_spec_v1;
+		if (calls && !traps && bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, i + insn->imm + 1);
+			traps = callee >= 0 && !env->subprog_info[callee].might_return;
+		}
+		if ((unwinds || traps) && !aux_data[i + 1].seen) {
 			memcpy(insn + 1, &trap, sizeof(trap));
 			aux_data[i + 1].zext_dst = false;
 			aux_data[i + 1].seen = env->check_cnt;

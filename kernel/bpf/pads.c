@@ -4138,10 +4138,7 @@ static bool insn_returns(const struct bpf_insn *insn)
 {
 	if (insn->code == (BPF_JMP | BPF_EXIT))
 		return !bpf_is_unwind_exit(insn);
-	if (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call)
-		return true;
-	return BPF_CLASS(insn->code) == BPF_LD &&
-	       (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND);
+	return bpf_insn_has_hidden_exit(insn);
 }
 
 /*

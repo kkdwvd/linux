@@ -12571,6 +12571,14 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 						 BPF_REG_0);
 		}
 
+		/*
+		 * The callee does not return, see bpf_compute_might_return(): what comes back to
+		 * the call comes back unwound, as above, and the insn behind the call is not where
+		 * the program goes.
+		 */
+		if (!env->subprog_info[subprog].might_return)
+			return PROCESS_BPF_EXIT;
+
 		/* continue with next insn after call */
 		return 0;
 	}
@@ -15652,6 +15660,12 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 	       insn->imm == special_kfunc_list[KF_bpf_throw];
 }
 
+bool bpf_is_trap_kfunc(struct bpf_insn *insn)
+{
+	return bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
+	       insn->imm == special_kfunc_list[KF___bpf_trap];
+}
+
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
@@ -16510,7 +16524,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "failed to mark s32 range for retval in forked state for lock\n");
 			return err;
 		}
-	} else if (!insn->off && insn->imm == special_kfunc_list[KF___bpf_trap]) {
+	} else if (bpf_is_trap_kfunc(insn)) {
 		verbose(env, "unexpected __bpf_trap() due to uninitialized variable?\n");
 		return -EFAULT;
 	}
@@ -27351,6 +27365,11 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		goto skip_full_check;
 
 	ret = sort_subprogs_topo(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	/* walks the subprogs in their topological order, callees first */
+	ret = bpf_compute_might_return(env);
 	if (ret < 0)
 		goto skip_full_check;
 

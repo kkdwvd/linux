@@ -1609,6 +1609,11 @@ struct bpf_subprog_info {
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
 	bool addr_taken: 1; /* callx calls nothing else */
 	bool via_callx: 1; /* callx calls it */
+	/*
+	 * A path from its first insn gets to an exit, see bpf_compute_might_return(). A subprog
+	 * that only unwinds has none.
+	 */
+	bool might_return: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
@@ -2916,6 +2921,18 @@ u32 bpf_vlog_alignment(u32 pos);
 const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
+
+/*
+ * The insn has a hidden exit: a tail call that is taken and LD_ABS or LD_IND that fails to load
+ * leave the subprog like an exit insn.
+ */
+static inline bool bpf_insn_has_hidden_exit(const struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
+	       (BPF_CLASS(insn->code) == BPF_LD &&
+		(BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND));
+}
+
 const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
@@ -2953,11 +2970,13 @@ u32 btf_func_arg_align(const struct btf *btf, const struct btf_type *t);
 
 int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
+bool bpf_is_trap_kfunc(struct bpf_insn *insn);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
 int bpf_check_cfg(struct bpf_verifier_env *env);
 void bpf_free_subprog_jts(struct bpf_verifier_env *env);
 int bpf_compute_postorder(struct bpf_verifier_env *env);
+int bpf_compute_might_return(struct bpf_verifier_env *env);
 
 struct bpf_map_desc {
 	struct bpf_map *ptr;
