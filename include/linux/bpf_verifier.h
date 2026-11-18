@@ -1210,6 +1210,8 @@ struct bpf_subprog_info {
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
+	/* [WIP] only data, e.g. arena data, may have its address, see addr_taken */
+	bool addr_in_data: 1;
 	/* [WIP] has callx of a number */
 	bool scalar_callx: 1;
 	u8 arg_slot_cnt:4;
