@@ -27,6 +27,7 @@
 #include <network_helpers.h>
 #include "../test_kmods/bpf_testmod.h"
 #include "xdp_tcp.skel.h"
+#include "xdp_tcp_cancel.skel.h"
 #include "xdp_tcp_hooks.skel.h"
 #include "xdp_tcp_xsk.h"
 #include "xsk.h"
@@ -2211,6 +2212,115 @@ out:
 	teardown(&c);
 }
 
+/* Run @prog on @frame as received on the device, live when it takes the frame */
+static int cancel_run(struct ctx *c, struct bpf_program *prog, void *frame, int len, bool live)
+{
+	struct xdp_md ctx_in = { .data_end = len, .ingress_ifindex = c->ifindex };
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		    .data_in = frame,
+		    .data_size_in = len,
+		    .ctx_in = &ctx_in,
+		    .ctx_size_in = sizeof(ctx_in),
+		    .flags = live ? BPF_F_TEST_XDP_LIVE_FRAMES : 0,
+		    .repeat = 1);
+
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &opts),
+		       bpf_program__name(prog)))
+		return -1;
+	return opts.retval;
+}
+
+/* Whether @prog wrote @what to its stderr stream */
+static bool stream_has(struct bpf_program *prog, const char *what)
+{
+	LIBBPF_OPTS(bpf_prog_stream_read_opts, ropts);
+	static char stream[16 * 1024];
+	int len = 0, n;
+
+	do {
+		n = bpf_prog_stream_read(bpf_program__fd(prog), BPF_STREAM_STDERR, stream + len,
+					 sizeof(stream) - 1 - len, &ropts);
+		if (n > 0)
+			len += n;
+	} while (n > 0 && len < sizeof(stream) - 1);
+	stream[len] = 0;
+	return strstr(stream, what);
+}
+
+/* The references to the connection, as the probe counts them, its own among them */
+static int cancel_sock_refs(struct ctx *c, struct xdp_tcp_cancel *skel, void *frame, int len)
+{
+	skel->bss->sock_refcnt = -1;
+	cancel_run(c, skel->progs.probe_sock, frame, len, false);
+	return skel->bss->sock_refcnt;
+}
+
+/*
+ * A program that is cancelled while it holds the connection, and the frame it
+ * took if @steal, has them released by the pad of the call that is cancelled,
+ * and one that throws with them by the pad of bpf_throw(): the release kfuncs
+ * get the handles the program held, the connection has as many references as
+ * before, and it goes on. The program only looked the segment up, so the peer
+ * sends it again, and the echo answers.
+ */
+static void test_cancel(bool steal, bool throws)
+{
+	struct xdp_tcp_cancel *skel = NULL;
+	struct bpf_program *prog;
+	__u8 frame[FRAME_MAX];
+	int len, refs, ret;
+	struct ctx c;
+
+#if !defined(__x86_64__) && !defined(__aarch64__)
+	test__skip();
+	return;
+#endif
+	if (setup(&c, AF_INET))
+		return;
+	if (connect_peer(&c, 0))
+		goto out;
+	skel = xdp_tcp_cancel__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "xdp_tcp_cancel__open_and_load"))
+		goto out;
+	if (!ASSERT_OK(xdp_tcp_cancel__attach(skel), "xdp_tcp_cancel__attach"))
+		goto out;
+	prog = skel->progs.xdp_tcp_cancel;
+	len = peer_build_raw(&c.peer, frame, TH_ACK | TH_PSH, c.peer.snd_nxt, c.peer.rcv_nxt,
+			     "hello", 5, 0);
+	if (!ASSERT_GT(len, 0, "peer_build_raw"))
+		goto out;
+	refs = cancel_sock_refs(&c, skel, frame, len);
+	if (!ASSERT_GT(refs, 0, "references"))
+		goto out;
+
+	skel->bss->steal = steal;
+	skel->bss->throws = throws;
+	ret = cancel_run(&c, prog, frame, len, steal);
+	/* a live run returns no verdict */
+	if (!steal)
+		ASSERT_EQ(ret, throws ? XDP_DROP : XDP_ABORTED, "retval");
+	ASSERT_EQ(skel->bss->behind, 0, "behind");
+	if (throws) {
+		ASSERT_EQ(skel->bss->callbacks, 1, "exception callback");
+		ASSERT_EQ(skel->bss->thrown_cookie, 7, "cookie");
+	} else {
+		ASSERT_GT(skel->bss->frames, 0, "recursion");
+		ASSERT_TRUE(stream_has(prog, "ERROR: Program was cancelled"), "stream");
+		ASSERT_EQ(skel->bss->callbacks, 0, "no exception callback");
+	}
+	ASSERT_NEQ(skel->bss->held_sk, 0, "held socket");
+	ASSERT_EQ(skel->bss->released_sk, 1, "socket released");
+	if (steal) {
+		ASSERT_NEQ(skel->bss->held_frame, 0, "held frame");
+		ASSERT_EQ(skel->bss->released_frame, 1, "frame released");
+	}
+	ASSERT_EQ(cancel_sock_refs(&c, skel, frame, len), refs, "references after");
+	request_echoed(&c, "hello");
+out:
+	xdp_tcp_cancel__destroy(skel);
+	teardown(&c);
+}
+
 void test_xdp_tcp(void)
 {
 	static const int orders[][3] = {
@@ -2314,4 +2424,12 @@ void test_xdp_tcp(void)
 		test_retransmit();
 	if (test__start_subtest("large_reply"))
 		test_large_reply();
+	if (test__start_subtest("cancel_sock"))
+		test_cancel(false, false);
+	if (test__start_subtest("cancel_frame"))
+		test_cancel(true, false);
+	if (test__start_subtest("throw_sock"))
+		test_cancel(false, true);
+	if (test__start_subtest("throw_frame"))
+		test_cancel(true, true);
 }
