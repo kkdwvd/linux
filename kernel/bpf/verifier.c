@@ -3565,11 +3565,14 @@ out:
 	return err;
 }
 
+static bool subprog_verified_alone(struct bpf_verifier_env *env, int subprog);
+
 /*
  * The callers of a global subprog are verified ahead of it, see unwind_frame(). A global subprog
  * that has may_goto of the program in it, or in what it calls, is left there when the time is up,
  * see check_may_goto_site(). Its callers expect that from the first pass on, as they do where there
- * is an arena, see mark_recursive_subprogs(): that saves a run of the pass.
+ * is an arena, see mark_recursive_subprogs(): that saves a run of the pass. The same for [WIP] a
+ * callee of callx of a number, see subprog_verified_alone().
  */
 static int expect_may_goto_unwinds(struct bpf_verifier_env *env)
 {
@@ -3606,7 +3609,7 @@ static int expect_may_goto_unwinds(struct bpf_verifier_env *env)
 		}
 	} while (changed);
 	for_each_set_bit(s, soft, cnt)
-		si[s].did_kunwind |= si[s].bail_unwinds && bpf_subprog_is_global(env, s);
+		si[s].did_kunwind |= si[s].bail_unwinds && subprog_verified_alone(env, s);
 	bitmap_free(soft);
 	return err;
 }
@@ -6346,12 +6349,13 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 		si[s].must_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
 		si[s].must_kunwind = si[s].kunwinds_for_sure = false;
 		/*
-		 * The callers of a global subprog are verified ahead of it, see unwind_frame().
+		 * The callers of a global subprog are verified ahead of it, see unwind_frame(), and
+		 * so are those of [WIP] a callee of callx of a number, see subprog_verified_alone().
 		 * Where there is an arena expect the kernel to unwind it, that saves a pass.
 		 */
 		si[s].did_unwind = si[s].can_unwind;
 		si[s].did_kunwind = env->prog->aux->arena && si[s].bail_unwinds &&
-				    bpf_subprog_is_global(env, s);
+				    subprog_verified_alone(env, s);
 	}
 
 	for (s = 0; s < cnt; s++) {
@@ -12708,6 +12712,162 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 }
 
 /*
+ * [WIP] Functions that callx of a number may call: static functions whose
+ * address ld_imm64 takes, other than callbacks. Each of them is verified on
+ * its own with unknown scalar arguments, see do_check_common().
+ */
+static bool is_scalar_callx_callee(struct bpf_verifier_env *env, int subprog)
+{
+	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+
+	return sub->addr_taken && !sub->is_cb && !sub->is_async_cb && !sub->is_exception_cb &&
+	       !bpf_subprog_is_global(env, subprog);
+}
+
+/*
+ * The subprog is verified on its own after the functions that call it, which
+ * see no state come out of it: a global subprog, and [WIP] a callee of callx
+ * of a number, see check_scalar_callx(). What one pass finds about how it
+ * unwinds is what the next pass gives its callers, see settle_late_unwinds().
+ * Before the main pass a callback is not known as one yet: every static
+ * function whose address is taken counts, which is what callx of a number may
+ * call anyway. A prog without callx has no caller that asks.
+ */
+static bool subprog_verified_alone(struct bpf_verifier_env *env, int subprog)
+{
+	return bpf_subprog_is_global(env, subprog) ||
+	       (env->scalar_callx && env->has_callx && is_scalar_callx_callee(env, subprog));
+}
+
+/*
+ * [WIP] callx dst_reg, where dst_reg is a number. A stopgap until there are
+ * verified pointers to functions.
+ *
+ * The C++ runtime keeps the destructor of a thrown object in the header of
+ * the exception in arena and calls it when the last handler ends. The address
+ * of the function is a number when it's loaded from there. Nothing checks
+ * that the number is the address of a function of the program, or what the
+ * arguments are. The callee isn't verified in the context of the caller.
+ *
+ * Instead the call is treated like a call of a global function that can be
+ * any of the functions whose address ld_imm64 takes. Each of them is verified
+ * on its own with unknown scalar arguments in the context of the call. The
+ * caller gets R1-R5 clobbered and R0 unknown. Its stack and references are
+ * left alone. The summaries of the callees are merged: the call might sleep,
+ * throw, change packet data or unwind if any of them might. The stack depth
+ * is accounted after the main pass as if the caller called each of them.
+ */
+static int check_scalar_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			      int *insn_idx)
+{
+	bool might_sleep = false, changes_pkt = false, unwinds;
+	struct bpf_func_state *caller = cur_func(env);
+	struct bpf_verifier_state *branch;
+	struct bpf_reg_state *reg;
+	struct bpf_subprog_info *sub;
+	enum bpf_func_context ctx;
+	int i, k, cnt = 0, err;
+
+	reg = reg_state(env, insn->dst_reg);
+	if (tnum_is_const(reg->var_off)) {
+		verbose(env, "R%d is %lld, not the address of a function\n", insn->dst_reg,
+			(s64)reg->var_off.value);
+		return -EACCES;
+	}
+
+	/* ld_imm64 doesn't take the address of a global function */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		sub = &env->subprog_info[i];
+		if (!sub->addr_taken || bpf_subprog_is_global(env, i))
+			continue;
+		might_sleep |= sub->might_sleep;
+		changes_pkt |= sub->changes_pkt_data;
+		cnt++;
+	}
+	if (!cnt) {
+		verbose(env, "R%d is a number, and no function has its address taken\n",
+			insn->dst_reg);
+		return -EACCES;
+	}
+
+	if (env->cur_state->active_locks) {
+		verbose(env, "callx of a number is not allowed while holding a lock\n");
+		return -EINVAL;
+	}
+
+	if (might_sleep && !in_sleepable_context(env)) {
+		verbose(env, "callx of a number may call a sleepable function in %s\n",
+			non_sleepable_context_description(env));
+		return -EINVAL;
+	}
+
+	err = require_callx_jit(env);
+	if (err)
+		return err;
+
+	if (in_sleepable_context(env))
+		ctx = BPF_FUNC_CTX_SLEEPABLE;
+	else if (has_rcu_read_lock(env))
+		ctx = BPF_FUNC_CTX_NON_SLEEPABLE;
+	else
+		ctx = BPF_FUNC_CTX_NO_RCU_LOCK;
+	/*
+	 * The edges of the call graph for what follows the pass, and for the callers that a
+	 * callee that unwinds unwinds in turn, see mark_unwind_above(). A frame that cannot
+	 * unwind makes its callees stuck, see stuck_frame_calls().
+	 */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		if (!env->subprog_info[i].addr_taken || bpf_subprog_is_global(env, i))
+			continue;
+		subprog_aux(env, i)->called[ctx] = true;
+		err = record_callx_edge(env, caller->subprogno, i);
+		if (err)
+			return err;
+		stuck_frame_calls(env, i);
+	}
+	env->subprog_info[caller->subprogno].scalar_callx = true;
+
+	if (changes_pkt)
+		clear_all_pkt_pointers(env);
+	clear_caller_saved_regs(env, caller->regs);
+	invalidate_outgoing_stack_args(env, caller);
+	bpf_diag_mod_begin(env, &caller->regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	mark_reg_unknown(env, caller->regs, BPF_REG_0);
+	bpf_diag_mod_end(env);
+
+	/*
+	 * No state comes out of a callee, which is verified on its own, see unwind_frame(). The
+	 * callx comes back in each way in which one of them is known to be left, as a call of a
+	 * global function does, see check_func_call(): to unwind_goto behind it, or to the
+	 * landing pad that the verifier adds there. What a callee unwinds with is a number in R0,
+	 * see check_global_subprog_return_code().
+	 */
+	for (k = 0; k < 2; k++) {
+		bool kernel = k;
+
+		unwinds = false;
+		for (i = 1; i < env->subprog_cnt; i++) {
+			sub = &env->subprog_info[i];
+			if (!sub->addr_taken || bpf_subprog_is_global(env, i) ||
+			    !(kernel ? sub->did_kunwind : sub->did_unwind) || !sub->bail_unwinds)
+				continue;
+			err = check_unwound_return(env, caller, *insn_idx, i, kernel);
+			if (err)
+				return err;
+			unwinds = true;
+		}
+		if (!unwinds)
+			continue;
+		branch = push_stack(env, *insn_idx + 1, *insn_idx, false);
+		if (IS_ERR(branch))
+			return PTR_ERR(branch);
+		branch->unwound = bpf_unwound_mark(kernel, false);
+		mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+	}
+	return 0;
+}
+
+/*
  * callx dst_reg: call a bpf subprog whose address is in dst_reg.
  *
  * The address of a subprog is either loaded into a register by ld_imm64 with
@@ -12825,6 +12985,8 @@ static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	reg = reg_state(env, insn->dst_reg);
+	if (reg->type == SCALAR_VALUE && env->scalar_callx)
+		return check_scalar_callx(env, insn, insn_idx);
 	if (reg->type != PTR_TO_FUNC) {
 		bpf_note_needs_ptr(env, reg);
 		verbose(env, "R%d has type %s, expected func\n", insn->dst_reg,
@@ -22853,7 +23015,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	 * when it unwinds once it is known to do that: all is done again, if it does at the end
 	 * of the pass, see settle_late_unwinds().
 	 */
-	late = st->unwound && bpf_subprog_is_global(env, frame->subprogno) &&
+	late = st->unwound && subprog_verified_alone(env, frame->subprogno) &&
 	       !(kernel ? sub->did_kunwind : sub->did_unwind);
 	if (st->unwound && kernel)
 		sub->did_kunwind = true;
@@ -24791,7 +24953,20 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 	state->last_insn_idx = -1;
 
 	regs = state->frame[state->curframe]->regs;
-	if (subprog || env->prog->type == BPF_PROG_TYPE_EXT) {
+	if (subprog && !bpf_subprog_is_global(env, subprog)) {
+		/* [WIP] a callee of callx of a number, see check_scalar_callx() */
+		if (env->log.level & BPF_LOG_LEVEL)
+			verbose(env, "Validating %s() func#%d for callx of a number...\n",
+				bpf_subprog_name(env, subprog), subprog);
+		if (bpf_in_stack_arg_cnt(sub)) {
+			verbose(env, "callx of a number cannot pass arguments on the stack to %s()\n",
+				bpf_subprog_name(env, subprog));
+			ret = -EINVAL;
+			goto out;
+		}
+		for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+			mark_reg_unknown(env, regs, i);
+	} else if (subprog || env->prog->type == BPF_PROG_TYPE_EXT) {
 		const char *sub_name = bpf_subprog_name(env, subprog);
 		struct bpf_subprog_arg_info *arg;
 		struct bpf_reg_state *reg;
@@ -24939,6 +25114,31 @@ out:
 	return ret;
 }
 
+/*
+ * [WIP] A function that has callx of a number calls one of the functions
+ * whose address is taken: check_scalar_callx() has added the edges to all of
+ * them, which go with the pass. One of them has to be no callback, which the
+ * pass has found by now.
+ */
+static int check_scalar_callx_callees(struct bpf_verifier_env *env)
+{
+	int caller, callee;
+
+	for (caller = 0; caller < env->subprog_cnt; caller++) {
+		if (!env->subprog_info[caller].scalar_callx)
+			continue;
+		for (callee = 1; callee < env->subprog_cnt; callee++)
+			if (is_scalar_callx_callee(env, callee))
+				break;
+		if (callee == env->subprog_cnt) {
+			verbose(env, "callx of a number in %s(), but only callbacks have their address taken\n",
+				bpf_subprog_name(env, caller));
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /* Lazily verify all global functions based on their BTF, if they are called
  * from main BPF program or any of subprograms transitively.
  * BPF global subprogs called from dead code are not validated.
@@ -24964,6 +25164,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 	struct bpf_prog_aux *aux = env->prog->aux;
 	struct bpf_func_info_aux *sub_aux;
 	int context, i, ret, new_cnt;
+	bool callees = false;
 
 	if (!aux->func_info)
 		return 0;
@@ -24981,7 +25182,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 again:
 	new_cnt = 0;
 	for (i = 1; i < env->subprog_cnt; i++) {
-		if (!bpf_subprog_is_global(env, i))
+		if (callees ? !is_scalar_callx_callee(env, i) : !bpf_subprog_is_global(env, i))
 			continue;
 
 		sub_aux = subprog_aux(env, i);
@@ -24995,9 +25196,9 @@ again:
 			if (ret)
 				return ret;
 			if (env->log.level & BPF_LOG_LEVEL)
-				verbose(env, "Func#%d ('%s') is safe for any args "
-					"that match its prototype\n",
-					i, bpf_subprog_name(env, i));
+				verbose(env, "Func#%d ('%s') is safe for any %s\n",
+					i, bpf_subprog_name(env, i),
+					callees ? "scalar args" : "args that match its prototype");
 
 			sub_aux->verified[context] = true;
 			new_cnt++;
@@ -25008,8 +25209,19 @@ again:
 	 * We can't loop forever as each pass verifies at least one new context,
 	 * and there are only three contexts per global subprog.
 	 */
-	if (new_cnt)
+	if (new_cnt) {
+		callees = false;
 		goto again;
+	}
+
+	/*
+	 * [WIP] Then the callees of callx of a number, once all global
+	 * functions are verified and it's known which functions are callbacks.
+	 */
+	if (!callees) {
+		callees = true;
+		goto again;
+	}
 
 	return 0;
 }
@@ -25146,7 +25358,8 @@ static int check_after_pass(struct bpf_verifier_env *env)
 	u16 outgoing;
 	int i, err;
 
-	err = check_max_stack_depth(env) ?: check_ext_takes_prologue(env);
+	err = check_scalar_callx_callees(env) ?: check_max_stack_depth(env) ?:
+	      check_ext_takes_prologue(env);
 	if (err)
 		return err;
 	for (i = 0; i < env->subprog_cnt; i++, sub++) {
@@ -25190,7 +25403,7 @@ static int settle_late_unwinds(struct bpf_verifier_env *env, const struct bpf_sn
 		/* the walk did not get to its end: what the states found stands */
 		if (err)
 			continue;
-		late |= bpf_subprog_is_global(env, s) &&
+		late |= subprog_verified_alone(env, s) &&
 			((unwinds && !initial->subprogs[s].did_unwind) ||
 			 (kunwinds && !initial->subprogs[s].did_kunwind));
 		sub->did_unwind = unwinds;
@@ -25230,7 +25443,7 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 
 	for (i = 1; i < env->subprog_cnt; i++) {
 		/* see settle_late_unwinds() */
-		if (bpf_subprog_is_global(env, i)) {
+		if (subprog_verified_alone(env, i)) {
 			initial->subprogs[i].did_unwind |= env->subprog_info[i].did_unwind;
 			initial->subprogs[i].did_kunwind |= env->subprog_info[i].did_kunwind;
 		}
@@ -27549,6 +27762,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
+	/* [WIP] nothing checks what callx of a number calls, see check_scalar_callx() */
+	env->scalar_callx = env->arena_scalar && env->bpf_capable && env->allow_ptr_leaks;
 
 	/* Prepare BTF and func_info needed to discover all subprograms. */
 	ret = bpf_prepare_btf_info(env, attr, uattr);

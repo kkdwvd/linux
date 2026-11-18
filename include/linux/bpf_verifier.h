@@ -1754,6 +1754,8 @@ struct bpf_subprog_info {
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
+	/* [WIP] has callx of a number */
+	bool scalar_callx: 1;
 	u8 arg_slot_cnt:4;
 
 	enum priv_stack_mode priv_stack_mode;
@@ -2141,6 +2143,7 @@ struct bpf_verifier_env {
 	u32 loop_entry_cnt;		/* see loop_stack_entry.entry_id */
 	);
 	bool arena_scalar;		/* load and store through a number is arena access */
+	bool scalar_callx;		/* [WIP] callx through a number is allowed */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
 	struct bpf_map **used_maps;	/* array of map's used by eBPF program */
 	struct btf_mod_pair *used_btfs;	/* array of BTF's used by BPF program */
