@@ -634,6 +634,10 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 						 t + insn[t].imm + 1));
 	for (s = 0; s < env->used_map_cnt && env->scalar_callx && !err; s++)
 		err = bpf_call_graph_add(&cg, any_func, cnt + s);
+	/* [WIP] and those that only data refers to, see mark_subprogs_addr_in_data() */
+	for (s = 1; s < cnt && !err; s++)
+		if (si[s].addr_in_data)
+			err = bpf_call_graph_add(&cg, any_func, s);
 	if (err)
 		goto out;
 	bpf_call_graph_sort(&cg, 0);
@@ -807,6 +811,16 @@ walk_cfg:
 		mark_jump_target(env, root);
 		if (insn_state[root] != EXPLORED)
 			goto walk_cfg;
+	}
+
+	/* [WIP] a function that only data refers to, see mark_subprogs_addr_in_data() */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int w = env->subprog_info[i].start;
+
+		if (!env->subprog_info[i].addr_in_data || insn_state[w])
+			continue;
+		root = w;
+		goto walk_cfg;
 	}
 
 	for (i = 0; i < insn_cnt; i++) {
