@@ -702,18 +702,17 @@ static unsigned long always_throws(void)
 }
 
 /*
- * The callee never returns and nothing behind the call reads r6, so the register is dead at
- * the call: the states that get there are not told apart by it, and it is no place for the
- * pad of the call.
+ * The callee never returns and nothing behind the call reads r6. The pad of the call does:
+ * a call of a subprog that never returns reads r6 for it, see insn_leaves_to_pads(), and the
+ * pad releases the reference. Without a callback the prog returns the cookie, 0.
  */
 SEC("tc")
-__description("cancel throw: a reference that nothing reads behind a call that throws is rejected")
+__description("cancel throw: a reference that nothing reads behind a call that throws is released")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure
-__msg("no throw can leave the frame at this call: no register or stack slot that a pad can read has a reference of the frame as it was acquired")
-__msg("(place)")
+__success __retval(0) __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
 __naked void handle_dead_at_call(void)
 {
 	asm volatile (

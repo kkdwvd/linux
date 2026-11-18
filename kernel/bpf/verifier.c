@@ -12282,6 +12282,10 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
+		/*
+		 * The callee may unwind to the pad of the unwind_goto after the
+		 * call, with what it unwinds with in R0, whatever its return type.
+		 */
 		if (env->subprog_info[subprog].can_unwind) {
 			struct bpf_verifier_state *branch;
 
@@ -12293,6 +12297,20 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (IS_ERR(branch))
 				return PTR_ERR(branch);
 			branch->unwound = true;
+			mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+		}
+
+		/*
+		 * The callee doesn't return normally on any path: it throws, or
+		 * it unwinds to the pad. There is nothing to continue with after
+		 * the call. An extension that would return instead is refused,
+		 * see bpf_check_attach_target().
+		 */
+		if (!env->subprog_info[subprog].might_return) {
+			sub_aux->called_as_noreturn = true;
+			if (env->subprog_info[subprog].might_throw && !bpf_cancel_covers_throw(env))
+				return process_bpf_exit_full(env, NULL, true);
+			return PROCESS_BPF_EXIT;
 		}
 
 		/* with pads the call is a site like any other, and its pad releases */
@@ -15429,6 +15447,12 @@ bool bpf_is_dynptr_slice_rdwr_kfunc(struct bpf_insn *insn)
 	       insn->imm == special_kfunc_list[KF_bpf_dynptr_slice_rdwr];
 }
 
+bool bpf_is_trap_kfunc(struct bpf_insn *insn)
+{
+	return bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
+	       insn->imm == special_kfunc_list[KF___bpf_trap];
+}
+
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
@@ -16336,7 +16360,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "failed to mark s32 range for retval in forked state for lock\n");
 			return err;
 		}
-	} else if (!insn->off && insn->imm == special_kfunc_list[KF___bpf_trap]) {
+	} else if (bpf_is_trap_kfunc(insn)) {
 		verbose(env, "unexpected __bpf_trap() due to uninitialized variable?\n");
 		return -EFAULT;
 	}
@@ -20813,8 +20837,14 @@ static int check_global_subprog_return_code(struct bpf_verifier_env *env)
 	u32 i, nregs;
 	int err;
 
+	/*
+	 * unwind_exit leaves what it unwinds with in R0, and the pad of the
+	 * caller reads it, whatever the subprog returns. The return registers
+	 * of a subprog that returns something are checked below either way.
+	 */
 	if (subprog_returns_void(env, subprog))
-		return 0;
+		return bpf_is_unwind_exit(&env->prog->insnsi[env->insn_idx]) ?
+		       check_global_ret_scalar_reg(env, BPF_REG_0) : 0;
 
 	nregs = bpf_ret_reg_pair(env, subprog) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
@@ -24582,6 +24612,15 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 					"Extension program can unwind, while original does not\n");
 				return -EINVAL;
 			}
+			/*
+			 * An extension returns, even through bpf_throw: its own
+			 * exception callback returns to the caller.
+			 */
+			if (aux->func_info_aux[subprog].called_as_noreturn) {
+				bpf_log(log,
+					"Extension cannot replace a function whose callers expect it not to return\n");
+				return -EINVAL;
+			}
 		}
 		if (!tgt_prog->jited) {
 			bpf_log(log, "Can attach to only JITed progs\n");
@@ -25934,6 +25973,11 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		goto skip_full_check;
 
 	ret = bpf_compute_loops(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	/* it looks at the loops and at what a recursion that is out of budget does */
+	ret = bpf_compute_might_return(env);
 	if (ret < 0)
 		goto skip_full_check;
 

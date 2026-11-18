@@ -1801,6 +1801,8 @@ struct bpf_func_info_aux {
 	bool called_with_pkt_ptrs;
 	/* what the callers of a global function are checked against */
 	struct bpf_subprog_arg_info args[MAX_BPF_FUNC_REG_ARGS];
+	/* a caller has nothing to continue with after the call */
+	bool called_as_noreturn;
 };
 
 enum bpf_jit_poke_reason {
