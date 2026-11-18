@@ -377,6 +377,11 @@ int *bpf_kfunc_ret_rcu_test_nostruct(int rdonly_buf_size) __ksym;
 extern int bpf_kfunc_multi_st_ops_test_1(struct st_ops_args *args, u32 id) __weak __ksym;
 extern int bpf_kfunc_multi_st_ops_unwound_cnt(void) __weak __ksym;
 extern int bpf_kfunc_multi_st_ops_test_1_assoc(struct st_ops_args *args) __weak __ksym;
+extern int bpf_kfunc_coro_suspend(__u32 id, void *frame) __weak __ksym;
+extern int bpf_kfunc_coro_keep(__u32 id, void *frame) __weak __ksym;
+extern int bpf_kfunc_coro_resume_kept(__u32 id) __weak __ksym;
+extern int bpf_kfunc_coro_free_kept(__u32 id) __weak __ksym;
+extern int bpf_kfunc_coro_result(__u32 id) __weak __ksym;
 #endif
 
 struct prog_test_member *bpf_kfunc_get_default_trusted_ptr_test(void) __ksym;
