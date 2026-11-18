@@ -15195,6 +15195,44 @@ bool bpf_is_throw_kfunc(struct bpf_insn *insn)
 	       insn->imm == special_kfunc_list[KF_bpf_throw];
 }
 
+/*
+ * Can R0 behind the call of a helper or of a kfunc at @insn_idx be a handle: what a pad
+ * releases a resource of its frame through, see cancel_collect_ptr() and cancel_lock_place()?
+ * That is the pointer that the call acquired, or one that it made of an acquired one, which
+ * has the id of the reference, or a pointer to the value of a map that has a lock in it.
+ *
+ * It is asked before the main pass, see compute_handle_places(): the insn has to tell,
+ * and what it does not tell counts as a handle.
+ */
+bool bpf_call_returns_handle(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	const struct bpf_func_proto *fn;
+	struct bpf_call_arg_meta meta;
+	const struct bpf_map *map;
+	int i;
+
+	if (bpf_pseudo_kfunc_call(insn))
+		return bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta) < 0 ||
+		       is_kfunc_acquire(&meta);
+	if (bpf_get_helper_proto(env, insn->imm, &fn) < 0)
+		return true;
+	if (is_acquire_function(insn->imm, NULL) || is_ptr_cast_function(insn->imm))
+		return true;
+	if (base_type(fn->ret_type) != RET_PTR_TO_MAP_VALUE)
+		return false;
+	/* a lookup acquires in a map of sockets, and any value may have a lock */
+	for (i = 0; i < MAX_BPF_FUNC_REG_ARGS; i++)
+		if (base_type(fn->arg_type[i]) == ARG_CONST_MAP_PTR)
+			break;
+	if (i == MAX_BPF_FUNC_REG_ARGS || !(aux->const_reg_map_mask & BIT(BPF_REG_1 + i)))
+		return true;
+	map = env->used_maps[aux->const_reg_vals[BPF_REG_1 + i]];
+	return is_acquire_function(insn->imm, map) ||
+	       btf_record_has_field(map->record, BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK);
+}
+
 bool bpf_is_dynptr_slice_rdwr_kfunc(struct bpf_insn *insn)
 {
 	return bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
