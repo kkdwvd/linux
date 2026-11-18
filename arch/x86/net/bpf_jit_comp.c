@@ -2430,6 +2430,9 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	/* it has to be saved around calls of helpers and kfuncs */
 	bool arena_sp_save = arena_sp && calls_clobber_arena_sp(bpf_prog);
 	s32 arena_sp_off = 0;
+	/* the code of the last call insn that follows the native call, see unwind_goto */
+	u8 after_call[16], *ret_addr;
+	int after_call_len = 0;
 	int err;
 
 	stack_depth = bpf_prog->aux->stack_depth;
@@ -3415,6 +3418,7 @@ populate_extable:
 			ip += x86_call_depth_emit_accounting(&prog, func, ip);
 			if (emit_call(&prog, func, ip))
 				return -EINVAL;
+			ret_addr = prog;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
 			if (arena_sp_args)
@@ -3429,6 +3433,10 @@ populate_extable:
 			 */
 			if (fm && fm->ret_size > 8)
 				emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_3);
+			after_call_len = prog - ret_addr;
+			if (WARN_ON_ONCE(after_call_len > sizeof(after_call)))
+				return -EFAULT;
+			memcpy(after_call, ret_addr, after_call_len);
 			break;
 		}
 
@@ -3446,13 +3454,16 @@ populate_extable:
 			}
 			if (emit_indirect_call(&prog, insn->dst_reg, ip))
 				return -EINVAL;
+			ret_addr = prog;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
+			after_call_len = prog - ret_addr;
+			memcpy(after_call, ret_addr, after_call_len);
 			break;
 
 			/* unwind_goto. The verifier expanded may_goto. */
 		case BPF_JMP | BPF_JCOND:
-			if (!priv_frame_ptr) {
+			if (!after_call_len) {
 				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
 							 addrs[i - 1], addrs[i + insn->off]);
 				if (err)
@@ -3460,8 +3471,8 @@ populate_extable:
 				break;
 			}
 			/*
-			 * 'pop r9' after the call has to be done on the way to
-			 * the pad too:
+			 * What follows the native call, like 'pop r9', has to be
+			 * done on the way to the pad too:
 			 *   call foo
 			 *   pop r9      <- exit returns here
 			 *   jmp 1f
@@ -3470,12 +3481,14 @@ populate_extable:
 			 * 1:
 			 */
 			err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-						 addrs[i - 1] - 2, addrs[i - 1] + 2);
+						 addrs[i - 1] - after_call_len, addrs[i - 1] + 2);
 			if (err)
 				return err;
-			EMIT2(0xEB, 7);
-			pop_r9(&prog);
-			EMIT1_off32(0xE9, addrs[i + insn->off] - (addrs[i - 1] + 9));
+			EMIT2(0xEB, after_call_len + 5);
+			memcpy(prog, after_call, after_call_len);
+			prog += after_call_len;
+			EMIT1_off32(0xE9, addrs[i + insn->off] -
+					  (addrs[i - 1] + 2 + after_call_len + 5));
 			break;
 
 		case BPF_JMP | BPF_TAIL_CALL:
