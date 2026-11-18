@@ -457,6 +457,9 @@ callback of the program is not called for it. The landing pad of
 ``bpf_coro_run()`` takes a JIT that unwinds programs (x86-64 and arm64): where
 there is none, a continuation that can be unwound is not loaded.
 
+The pads of a continuation release the references that it holds only in the
+frame's memory through the frame, and free the frame after them.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

@@ -8248,6 +8248,13 @@ static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
 	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
 			    reg_arg_name(env, argno)))
 		return -EFAULT;
+	/*
+	 * A landing pad of a caller that holds the frame reads its slots, see find_frame_cands():
+	 * the store changes what the caller sees, as a store to its stack does, see
+	 * check_arena_site()
+	 */
+	if (t == BPF_WRITE && ref - env->cur_state->refs < cur_func(env)->entry_refs)
+		cur_func(env)->fault_edge = false;
 
 	if (!var_off) {
 		int foff = reg->var_off.value + off;

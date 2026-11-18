@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include <linux/pkt_cls.h>
+#include <sys/wait.h>
 #include "coro_unwind.skel.h"
 
 static char stream[64 * 1024];
@@ -63,6 +64,122 @@ static void unwound(struct coro_unwind *skel, struct bpf_program *prog)
 	ASSERT_HAS_SUBSTR(read_stream(prog), RECURSION_TOO_DEEP, bpf_program__name(prog));
 }
 
+struct child {
+	pid_t pid;
+	int wfd;
+};
+
+/* A task that waits for the pipe to close, for the progs to take */
+static bool start_child(struct child *child)
+{
+	int fds[2];
+	char c;
+
+	if (!ASSERT_OK(pipe(fds), "pipe"))
+		return false;
+	child->pid = fork();
+	if (child->pid == 0) {
+		close(fds[1]);
+		if (read(fds[0], &c, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	close(fds[0]);
+	child->wfd = fds[1];
+	if (!ASSERT_GT(child->pid, 0, "fork")) {
+		close(fds[1]);
+		return false;
+	}
+	return true;
+}
+
+static void stop_child(struct child *child)
+{
+	close(child->wfd);
+	waitpid(child->pid, NULL, 0);
+}
+
+/* What became of the resume of the continuation: wait two seconds at most */
+static int cont_result(struct coro_unwind *skel)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+	int i;
+
+	for (i = 0; i < 200; i++) {
+		if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.cont_result),
+						      &opts), "cont_result"))
+			return -1;
+		if (opts.retval != -EINPROGRESS)
+			return opts.retval;
+		usleep(10000);
+	}
+	return -EINPROGRESS;
+}
+
+static int task_users(struct coro_unwind *skel)
+{
+	skel->bss->task_rcu_users = -1;
+	run(skel->progs.probe_task);
+	return skel->bss->task_rcu_users;
+}
+
+/* The task that a prog held through a coroutine frame is released */
+static void test_tasks(struct coro_unwind *skel)
+{
+	struct child child;
+	int users;
+
+	if (!start_child(&child))
+		return;
+	skel->bss->pid = child.pid;
+	users = task_users(skel);
+	if (!ASSERT_GT(users, 0, "task_users"))
+		goto out;
+
+	unwound(skel, skel->progs.task_in_frame_at_call);
+	ASSERT_EQ(task_users(skel), users, "task_in_frame_at_call");
+	unwound(skel, skel->progs.task_in_spilled_frame_at_call);
+	ASSERT_EQ(task_users(skel), users, "task_in_spilled_frame_at_call");
+	throws(skel, skel->progs.task_in_frame_at_throw, 4);
+	ASSERT_EQ(task_users(skel), users, "task_in_frame_at_throw");
+	throws(skel, skel->progs.task_in_frame_callee_throws, 5);
+	ASSERT_EQ(task_users(skel), users, "task_in_frame_callee_throws");
+	unwound(skel, skel->progs.task_in_frame_given_to_callee);
+	ASSERT_EQ(task_users(skel), users, "task_in_frame_given_to_callee");
+	unwound(skel, skel->progs.task_in_frame_taken_by_callee);
+	ASSERT_EQ(task_users(skel), users, "task_in_frame_taken_by_callee");
+	/* the second access to arena faults, which unwinds the prog too */
+	skel->bss->behind = 0;
+	ASSERT_EQ(run(skel->progs.task_out_of_frame_at_fault), TC_ACT_SHOT,
+		  "task_out_of_frame_at_fault");
+	ASSERT_EQ(skel->bss->behind, 0, "task_out_of_frame_at_fault behind");
+	ASSERT_EQ(task_users(skel), users, "task_out_of_frame_at_fault");
+
+	/*
+	 * bpf_testmod resumes the continuation after the call that suspends the coroutine. It is
+	 * unwound, the stream says why, and the landing pad of bpf_coro_run() tells bpf_testmod.
+	 */
+	skel->bss->behind = 0;
+	ASSERT_EQ(run(skel->progs.cont_task_at_call), TC_ACT_OK, "cont_task_at_call");
+	ASSERT_EQ(cont_result(skel), 1, "cont_task_at_call unwound");
+	ASSERT_EQ(skel->bss->behind, 0, "cont_task_at_call behind");
+	ASSERT_HAS_SUBSTR(read_stream(skel->progs.cont_task_at_call), RECURSION_TOO_DEEP,
+			  "cont_task_at_call stream");
+	ASSERT_EQ(task_users(skel), users, "cont_task_at_call");
+
+	/*
+	 * The same with the task two coroutine frames deep and in R7: the pad releases it from
+	 * R7, frees the frame in the slot of the first one, then the first one
+	 */
+	ASSERT_EQ(run(skel->progs.cont_task_two_deep_r7), TC_ACT_OK, "cont_task_two_deep_r7");
+	ASSERT_EQ(cont_result(skel), 1, "cont_task_two_deep_r7 unwound");
+	ASSERT_HAS_SUBSTR(read_stream(skel->progs.cont_task_two_deep_r7), RECURSION_TOO_DEEP,
+			  "cont_task_two_deep_r7 stream");
+	ASSERT_EQ(task_users(skel), users, "cont_task_two_deep_r7");
+out:
+	stop_child(&child);
+}
+
 /* Is the program with @id freed within two seconds? The kernel frees it in the background. */
 static bool prog_freed(__u32 id)
 {
@@ -106,8 +223,8 @@ void serial_test_coro_unwind(void)
 {
 	struct coro_unwind *skel;
 
-	/* The interpreter runs no pads. */
-	if (!is_jit_enabled()) {
+	/* The interpreter runs no pads, and the continuations take bpf_testmod. */
+	if (!is_jit_enabled() || !env.has_testmod) {
 		test__skip();
 		return;
 	}
@@ -118,9 +235,15 @@ void serial_test_coro_unwind(void)
 #if !defined(__x86_64__) && !defined(__aarch64__)
 	return;
 #endif
-	skel = coro_unwind__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "coro_unwind__open_and_load"))
+	skel = coro_unwind__open();
+	if (!ASSERT_OK_PTR(skel, "coro_unwind__open"))
 		return;
+	/* the progs that the verifier rejects */
+	bpf_program__set_autoload(skel->progs.cont_task_some_paths, false);
+	bpf_program__set_autoload(skel->progs.cont_task_two_deep, false);
+	bpf_program__set_autoload(skel->progs.cont_task_far, false);
+	if (!ASSERT_OK(coro_unwind__load(skel), "coro_unwind__load"))
+		goto out;
 
 	if (test__start_subtest("frames")) {
 		unwound(skel, skel->progs.frame_at_call);
@@ -128,5 +251,10 @@ void serial_test_coro_unwind(void)
 		throws(skel, skel->progs.frame_at_throw, 3);
 		unwound(skel, skel->progs.frame_maybe_null_at_call);
 	}
+	if (test__start_subtest("tasks"))
+		test_tasks(skel);
 	destroy_and_check(skel);
+	return;
+out:
+	coro_unwind__destroy(skel);
 }

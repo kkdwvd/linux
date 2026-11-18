@@ -250,7 +250,9 @@
  *
  * A pointer that a helper or a kfunc returned and that has to be released is its own handle. A copy
  * of it, a pointer to a node in the object, a socket that a helper has cast are places of one
- * entry. What releases it follows from its type, see ref_release(). An iterator
+ * entry. So is a slot of a coroutine frame that has the pointer, which the pad reads through a
+ * register or a stack slot that points to the frame, see find_frame_cands(). What releases it
+ * follows from its type, see ref_release(). An iterator
  * and a dynptr that has to be released are objects in the stack, like irq flags. If a caller has
  * the object, a pointer to it is a place.
  * The release and the place tell the entries of a plan apart, see visit_refs().
@@ -1056,14 +1058,16 @@ static int find_lock_cands(struct bpf_verifier_env *env, const struct bpf_verifi
 
 /*
  * A register of the current frame of @st, spilled or not, live or not, that has the pointer @ref:
- * it tells the type. R0-R5 come last. NULL if there is none.
+ * it tells the type. R0-R5 come last, and a slot of a coroutine frame after them, see
+ * find_frame_cands(). NULL if there is none.
  */
 static const struct bpf_reg_state *ref_reg(const struct bpf_verifier_state *st,
 					   const struct bpf_reference_state *ref)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_stack_state *slot;
-	int i;
+	const struct bpf_reg_state *reg;
+	int i, j;
 
 	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
 		slot = bpf_stack_slot(frame, i);
@@ -1073,7 +1077,93 @@ static const struct bpf_reg_state *ref_reg(const struct bpf_verifier_state *st,
 	for (i = BPF_REG_9; i >= BPF_REG_0; i--)
 		if (frame->regs[i].type != NOT_INIT && frame->regs[i].id == ref->id)
 			return &frame->regs[i];
+	for (i = 0; i < st->acquired_refs; i++)
+		bpf_for_each_ref_slot_reg(j, &st->refs[i], reg, BIT(STACK_SPILL))
+			if (reg && reg->type != SCALAR_VALUE && reg->id == ref->id)
+				return reg;
 	return NULL;
+}
+
+/*
+ * The register that @place has in the current frame of @st, for a place of the program: a
+ * register or 8 bytes of the stack. NULL for any other place.
+ */
+static const struct bpf_reg_state *place_reg(const struct bpf_verifier_state *st,
+					     const struct bpf_pad_place *place)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_stack_state *slot;
+
+	if (place->loc == BPF_PLACE_REG && place->at < BPF_REG_FP)
+		return &frame->regs[place->at];
+	if (place->loc != BPF_PLACE_SPILL)
+		return NULL;
+	slot = bpf_stack_slot(frame, -place->at / BPF_REG_SIZE - 1);
+	return bpf_spill_size(slot) == BPF_REG_SIZE ? &slot->spilled_ptr : NULL;
+}
+
+/*
+ * A reference whose handle is in a slot of a coroutine frame: the continuation of a suspended
+ * coroutine has what the frame carried across the suspension there and nowhere else, see
+ * push_coro_resume_cb() in verifier.c, and a program may keep a reference there too. The places of
+ * the current frame of @st that point into such a frame at @insn_idx, which find_cands() would take
+ * for a place, make one more place each for every slot of the frame that has the handle of @ref:
+ * the pad loads the pointer to the frame, and the handle from the slot. Such places go to @cand
+ * behind the @nr that are there.
+ *
+ * The slots of a coroutine frame are no xregs. A state has the frame with its slots, which
+ * bpf_state_subsumes() compares and bpf_states_join() joins whatever is live, and the pointers
+ * in them are a part of the join_key, see same_ref_slots(): what a state has there every state
+ * that it stands for has. A function that writes to them gets a pointer to the frame, and is
+ * verified in the frames of its callers, see func_is_on_its_own(): what it does shows in the state
+ * that comes back to a call, which the plan of the call is made from. So the slot has the handle
+ * when the pad runs, as long as the frame is not freed: a frame that the current frame holds is
+ * freed by its pad after what is read through it, see visit_refs(), and one of a caller by the pad
+ * of the caller, later.
+ * Such a slot has no NULL test: the plan notes which places are 0 for registers and stack slots
+ * only. So the pad finds out by the program counter whether it has to release what is there.
+ * Returns the new number of candidates.
+ */
+static int find_frame_cands(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			    int insn_idx, const struct bpf_reference_state *ref,
+			    struct bpf_pad_place *cand, int nr)
+{
+	struct bpf_pad_place outer[BPF_PAD_MAX_CANDS], *place;
+	const struct bpf_reference_state *frame;
+	struct bpf_reference_state fref;
+	const struct bpf_reg_state *ptr;
+	int i, j, k, n, old;
+	s64 off;
+
+	for (i = 0; i < st->acquired_refs && nr < BPF_PAD_MAX_CANDS; i++) {
+		frame = &st->refs[i];
+		if (!frame->slots)
+			continue;
+		/* the places that have a pointer into the frame, see add_ref_cand() */
+		fref = (struct bpf_reference_state){ .id = frame->id, .type = REF_TYPE_PTR };
+		n = find_cands(env, st, insn_idx, &fref, NULL, outer);
+		for (j = 0; j < n && nr < BPF_PAD_MAX_CANDS; j++) {
+			if (outer[j].maybe_null)
+				continue;
+			bpf_for_each_ref_slot_reg(k, frame, ptr, BIT(STACK_SPILL)) {
+				/* the offset of a load: the pointer may be far from the slot */
+				off = k * BPF_REG_SIZE - (s64)outer[j].delta;
+				if (!ptr || bpf_spill_size(&frame->slots[k]) != BPF_REG_SIZE ||
+				    off != (s16)off)
+					continue;
+				old = nr;
+				add_ref_cand(cand, &nr, ptr, ref, outer[j].loc, outer[j].at);
+				if (nr == old)
+					continue;
+				place = &cand[old];
+				place->in_frame = true;
+				place->frame_off = off;
+				if (nr == BPF_PAD_MAX_CANDS)
+					break;
+			}
+		}
+	}
+	return nr;
 }
 
 /*
@@ -1179,6 +1269,9 @@ static void find_nulls(const struct bpf_func_state *frame, struct bpf_pad_nulls 
  */
 static bool place_is_null(const struct bpf_pad_nulls *nulls, const struct bpf_pad_place *place)
 {
+	/* see find_frame_cands() */
+	if (place->in_frame)
+		return false;
 	if (place->loc == BPF_PLACE_SAVED)
 		return nulls->unsaved & BIT(place->at);
 	if (place->loc == BPF_PLACE_REG)
@@ -1200,7 +1293,8 @@ static int common_cands(const struct bpf_pad_ent *ent, const struct bpf_pad_ent 
 	for (i = 0; i < ent->nr_cands[arg]; i++) {
 		for (j = 0; j < new->nr_cands[arg]; j++) {
 			if (old[i].loc != place[j].loc || old[i].at != place[j].at ||
-			    old[i].delta != place[j].delta)
+			    old[i].delta != place[j].delta || old[i].in_frame != place[j].in_frame ||
+			    old[i].frame_off != place[j].frame_off)
 				continue;
 			cand[n] = old[i];
 			cand[n++].maybe_null |= place[j].maybe_null;
@@ -1297,6 +1391,7 @@ static int ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 	if (ref_release(env, ref, reg, false, &ent->release))
 		return BPF_CONFLICT_NO_RELEASE;
 	ent->nr_cands[0] = find_cands(env, st, insn_idx, ref, NULL, ent->cand[0]);
+	ent->nr_cands[0] = find_frame_cands(env, st, insn_idx, ref, ent->cand[0], ent->nr_cands[0]);
 	if (!ent->nr_cands[0] && reg >= &regs[BPF_REG_0] && reg <= &regs[BPF_REG_5])
 		return BPF_CONFLICT_CALLER_SAVED;
 	return ent_imm(env, ent, reg);
@@ -1603,6 +1698,23 @@ static int order_ents(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	return 0;
 }
 
+/*
+ * The entry of @plan that is the coroutine frame through which @place has a handle on this visit,
+ * see find_frame_cands(). NULL if the frame is not one of what the current frame of @st holds.
+ */
+static struct bpf_pad_ent *frame_ent(const struct bpf_pad_plan *plan,
+				     const struct bpf_verifier_state *st,
+				     const struct bpf_pad_place *place)
+{
+	const struct bpf_reg_state *reg = place_reg(st, place);
+	int i;
+
+	for (i = st->frame[st->curframe]->entry_refs; reg && i < st->acquired_refs; i++)
+		if (st->refs[i].slots && st->refs[i].id == reg->id)
+			return held_ent(plan, i);
+	return NULL;
+}
+
 /* refs[@child] of @st was made from the pointer refs[@parent], see invalidate_reference() */
 static bool ref_is_child(const struct bpf_verifier_state *st, int child, int parent)
 {
@@ -1707,6 +1819,18 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			    ref_is_child(st, plan->ents[j].ref, plan->ents[i].ref) &&
 			    !put_before(plan, i, j))
 				return BPF_CONFLICT_ORDER_DIFFERS;
+	/*
+	 * A handle that the pad reads through a coroutine frame is read before the frame is freed:
+	 * the frame stands before the entry, on this visit for each candidate in a frame
+	 */
+	for (i = 0; i < plan->nr_ents; i++) {
+		ent = &plan->ents[i];
+		for (j = 0; ent->ref >= 0 && j < ent->nr_cands[0]; j++) {
+			prev = ent->cand[0][j].in_frame ? frame_ent(plan, st, &ent->cand[0][j]) : NULL;
+			if (prev && prev != ent && !put_before(plan, prev - plan->ents, i))
+				return BPF_CONFLICT_ORDER_DIFFERS;
+		}
+	}
 	find_nulls(st->frame[st->curframe], &nulls);
 	for (i = 0; i < plan->nr_ents; i++) {
 		ent = &plan->ents[i];
@@ -1863,9 +1987,10 @@ static void save_cands(struct bpf_pad_ent *ent, int err)
 	int i, n = 0;
 
 	for (i = 0; !err && ent->class == BPF_PAD_REF && i < ent->nr_cands[0]; i++)
-		if (cand[i].loc == BPF_PLACE_SPILL ||
-		    (cand[i].loc == BPF_PLACE_REG && cand[i].at >= BPF_REG_6 &&
-		     cand[i].at < BPF_REG_FP))
+		if (!cand[i].in_frame &&
+		    (cand[i].loc == BPF_PLACE_SPILL ||
+		     (cand[i].loc == BPF_PLACE_REG && cand[i].at >= BPF_REG_6 &&
+		      cand[i].at < BPF_REG_FP)))
 			cand[n++] = cand[i];
 	ent->nr_cands[0] = n;
 }
@@ -2639,10 +2764,16 @@ static bool ent_is_tested(const struct bpf_pad_ent *ent)
 	return !ent->always || ent->cand[0][0].maybe_null;
 }
 
+/* The insn of load_handle() that tests the handle of @place, counted from its first one */
+static int handle_test_at(const struct bpf_pad_place *place)
+{
+	return place->loc == BPF_PLACE_SPILL && place->in_frame ? 2 : 1;
+}
+
 /*
- * R@reg = the handle that is at @place. @test: if there is 0 the entry is not held, the second insn
- * is a jump, and release_ents() knows where to. It comes first: 0 minus the delta is not 0.
- * Returns the number of insns.
+ * R@reg = the handle that is at @place. @test: if there is 0 the entry is not held, the insn at
+ * handle_test_at() is a jump, and release_ents() knows where to. It comes before the delta: 0
+ * minus the delta is not 0. Returns the number of insns.
  */
 static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
 		       struct bpf_insn_aux_data *aux, int reg, const struct bpf_pad_place *place,
@@ -2654,10 +2785,16 @@ static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
 
 	switch (place->loc) {
 	case BPF_PLACE_REG:
-		buf[n++] = BPF_MOV64_REG(reg, place->at);
+		/* the handle is in a coroutine frame that the register points to */
+		if (place->in_frame)
+			buf[n++] = BPF_LDX_MEM(BPF_DW, reg, place->at, place->frame_off);
+		else
+			buf[n++] = BPF_MOV64_REG(reg, place->at);
 		break;
 	case BPF_PLACE_SPILL:
 		buf[n++] = BPF_LDX_MEM(BPF_DW, reg, BPF_REG_FP, place->at);
+		if (place->in_frame)
+			buf[n++] = BPF_LDX_MEM(BPF_DW, reg, reg, place->frame_off);
 		break;
 	case BPF_PLACE_MAP_VALUE:
 		/* what check_and_resolve_insns() makes of such an insn. find_lock_cands() asked. */
@@ -2739,7 +2876,8 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 								       ent->obj_type);
 		buf[n++] = ent->release;
 		if (ent_is_tested(ent))
-			buf[first + 1].off = n - first - 2;
+			buf[first + handle_test_at(&ent->cand[0][0])].off =
+				n - first - handle_test_at(&ent->cand[0][0]) - 1;
 	}
 	return n;
 }
@@ -3594,7 +3732,7 @@ int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan
 		first = n;
 		n += load_handle(env, &buf[n], &aux[n], BPF_REG_0, place, place->delta);
 		if (place->delta)
-			buf[first + 1].off = 1;
+			buf[first + handle_test_at(place)].off = 1;
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, off);
 	}
 	if (!plan->untested)
@@ -3658,7 +3796,7 @@ int bpf_pad_check_saves(struct bpf_verifier_env *env, int s)
 						    i))
 					return -EFAULT;
 				if (!ent->nr_cands[0] || place->loc != BPF_PLACE_SPILL ||
-				    place->at < sub->save_off)
+				    place->in_frame || place->at < sub->save_off)
 					continue;
 				word = (place->at - sub->save_off) / BPF_REG_SIZE;
 				if (word >= sub->save_words)
@@ -3845,6 +3983,7 @@ bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan)
 
 /*
  * 'spin_lock@5(r6-8)': what insn 5 brought to the frame, the arguments of its release.
+ * 'ref@3([r6+16])': the handle is in a slot of the coroutine frame that r6 points to.
  * 'if not 0': the pad tests the first one.
  */
 static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *ent)
@@ -3866,7 +4005,8 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 	verbose(env, "%s@%d(", class[ent->class], ent->origin);
 	for (arg = 0; arg < BPF_PAD_MAX_ARGS && ent->nr_cands[arg]; arg++) {
 		place = &ent->cand[arg][0];
-		verbose(env, "%s", arg ? ", " : "");
+		/* '[r6+16]': in a slot of the coroutine frame that r6 points to */
+		verbose(env, "%s%s", arg ? ", " : "", place->in_frame ? "[" : "");
 		if (place->loc == BPF_PLACE_SPILL)
 			verbose(env, "*fp%d", place->at);
 		else if (place->loc == BPF_PLACE_MAP_VALUE)
@@ -3879,6 +4019,8 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 			verbose(env, "fp");
 		else
 			verbose(env, "r%d", place->at);
+		if (place->in_frame)
+			verbose(env, "%+d]", place->frame_off);
 		if (place->delta && place->loc != BPF_PLACE_IMM)
 			verbose(env, "%+d", -place->delta);
 	}

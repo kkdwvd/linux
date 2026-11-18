@@ -605,14 +605,15 @@ enum bpf_stuck_by {
 
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
- * per argument of a release two to load it, per entry a test, the calls, two to save the value,
- * three to tell the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has
- * the insn that leaves on top of that, or the call of the exception callback.
+ * per argument of a release two to load it, and one more for a handle in a coroutine frame, per
+ * entry a test, the calls, two to save the value, three to tell the struct_ops, two to bring the
+ * value back, one for R2 of kexit. emit_pad() has the insn that leaves on top of that, or the call
+ * of the exception callback.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
-#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 3) + \
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
 #define BPF_PAD_MAX_CANDS	6
 /* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
@@ -642,8 +643,14 @@ struct bpf_pad_place {
 	u8 loc;			/* enum bpf_place_loc */
 	bool maybe_null:1;	/* on a visit that holds the entry the pointer is not checked yet */
 	bool null:1;		/* it is 0 on all visits that don't hold the entry */
+	/*
+	 * The handle is in a slot of a coroutine frame, 'frame_off' bytes from where the pointer at
+	 * (loc, at) points to, see find_frame_cands() in pads.c. 'delta' is about the handle.
+	 */
+	bool in_frame:1;
 	s16 at;			/* number of the register | offset from R10 | index in used_maps */
 	s32 delta;		/* what is there is that much more than the handle */
+	s16 frame_off;
 };
 
 /* The registers and the stack slots of a frame that are 0 */
