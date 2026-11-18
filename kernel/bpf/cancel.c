@@ -38,7 +38,8 @@
  * - RCU read sections and preemption-disabled sections: the pad leaves the ones
  *   that its frame entered.
  * - references whose handle the frame has in a register or in a stack slot,
- *   where a kfunc or a helper releases them: a kernel object, a socket, a
+ *   or in a slot of a coroutine frame that a register or a stack slot points
+ *   to, where a kfunc or a helper releases them: a kernel object, a socket, a
  *   ringbuf record, an object that the program owns, a coroutine frame, see
  *   cancel_collect_ptr().
  * A frame that holds anything else of its own declines.
@@ -272,6 +273,12 @@ struct cancel_entry {
 	u64 arg;	/* how to release it, in the terms of the kind */
 	/* of an object that the program owns: the pointer in place is that many bytes into it */
 	s32 off;
+	/*
+	 * Of a reference whose handle is in a slot of a coroutine frame: one more than the
+	 * offset of the slot in the frame, and place has the pointer to the frame. 0 if the
+	 * handle is in place, see cancel_ptr_in_coro_frame().
+	 */
+	u16 in_frame;
 	/*
 	 * Of a handle that is a pointer: the places of the frame that have it like place does,
 	 * as far as there are bits for them: registers, and the first slots of the stack. In an
@@ -563,7 +570,7 @@ static bool cancel_entry_same(const struct cancel_entry *a, const struct cancel_
 	 */
 	if (cancel_kind_ordered(a->kind) && (a->rank != b->rank || a->irq_off != b->irq_off))
 		return false;
-	return a->kind == b->kind && a->place == b->place &&
+	return a->kind == b->kind && a->place == b->place && a->in_frame == b->in_frame &&
 	       !((a->flags ^ b->flags) & ~cancel_soft_flags(a->kind)) &&
 	       a->arg == b->arg && a->off == b->off && a->flag == b->flag;
 }
@@ -1524,6 +1531,123 @@ static int cancel_ptr_place(struct bpf_verifier_env *env, const struct bpf_verif
 	return 0;
 }
 
+/* Does @reg point to the start of the coroutine frame of reference @id? */
+static bool cancel_is_coro_frame(const struct bpf_reg_state *reg, u32 id)
+{
+	return reg->type == PTR_TO_CORO_FRAME && reg->id == id && tnum_equals_const(reg->var_off, 0);
+}
+
+/*
+ * The place that has the pointer to the coroutine frame of reference @id, in the order of
+ * cancel_collect_ptr(). CANCEL_NO_PLACE if no place that a pad can read has it.
+ */
+static int cancel_coro_frame_place(struct bpf_verifier_env *env,
+				   const struct bpf_verifier_state *st,
+				   enum bpf_cancel_site_type type, u32 id)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_stack_state *slot;
+	int i, spi;
+
+	for (i = BPF_REG_6; i <= BPF_REG_9; i++)
+		if (cancel_is_coro_frame(&frame->regs[i], id) && cancel_reg_is_place(env, st, type, i))
+			return i;
+	for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
+		slot = bpf_stack_slot(frame, spi);
+		if (bpf_is_spilled_reg(slot) && cancel_is_coro_frame(&slot->spilled_ptr, id) &&
+		    cancel_spill_is_place(env, st, type, spi))
+			return -(spi + 1) * BPF_REG_SIZE;
+	}
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++)
+		if (cancel_is_coro_frame(&frame->regs[i], id) && cancel_reg_is_place(env, st, type, i))
+			return i;
+	return CANCEL_NO_PLACE;
+}
+
+/*
+ * Can the pad of the site that the current frame of @st is at read the slots of coroutine
+ * frames? Their slots are compared whatever is live, see refsafe(), so what a state has
+ * there every state that it stands for has. At a call the callee may write to a slot through
+ * a pointer to the coroutine frame that it is given, or that it finds in a stack that it is
+ * given a pointer to. Where the callee is verified with this frame in the state, what it does
+ * shows, as for a slot of the stack, see cancel_spill_is_place().
+ *
+ * A static callee is given only the registers that it reads: the frame of a continuation
+ * calls with the pointer to its coroutine frame still in R1 more often than not.
+ */
+static bool cancel_coro_slots_are_places(struct bpf_verifier_env *env,
+					 const struct bpf_verifier_state *st,
+					 enum bpf_cancel_site_type type)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[st->insn_idx];
+	struct bpf_func_state *frame = st->frame[st->curframe];
+	u16 args = GENMASK(BPF_REG_5, BPF_REG_1);
+	const struct bpf_reg_state *reg;
+	int i, subprog;
+
+	if (type != BPF_CANCEL_SITE_CALL || env->cancel->caller_in_state)
+		return true;
+	if (bpf_pseudo_call(insn)) {
+		subprog = bpf_find_subprog(env, st->insn_idx + insn->imm + 1);
+		if (subprog >= 0)
+			args &= env->insn_aux_data[env->subprog_info[subprog].start].live_regs_before;
+	}
+	for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+		if ((args & BIT(i)) &&
+		    (base_type(frame->regs[i].type) == PTR_TO_STACK ||
+		     base_type(frame->regs[i].type) == PTR_TO_CORO_FRAME))
+			return false;
+	bpf_for_each_spilled_stack_arg(i, frame, reg)
+		if (reg && (base_type(reg->type) == PTR_TO_STACK ||
+			    base_type(reg->type) == PTR_TO_CORO_FRAME))
+			return false;
+	return true;
+}
+
+/*
+ * No place of the frame has the handle of reference @id. It may be in a slot of a coroutine
+ * frame: the continuation of a suspended coroutine has what the coroutine frame carried
+ * across the suspension there and nowhere else, see push_coro_resume_cb(), and a program may
+ * keep a reference there too. The pad reads the handle through the pointer to the coroutine
+ * frame that a place has, and releases it in front of the coroutine frame, see
+ * cancel_entry_cmp(). That frame may be held by a caller, whose pad frees it later, but not
+ * by the callee that this frame waits for, whose pad comes first.
+ *
+ * Returns 0 with @e filled in, or the reason why the site declines.
+ */
+static int cancel_ptr_in_coro_frame(struct bpf_verifier_env *env,
+				    const struct bpf_verifier_state *st,
+				    enum bpf_cancel_site_type type, u32 id, struct cancel_entry *e)
+{
+	const struct bpf_reference_state *ref;
+	const struct bpf_stack_state *slot;
+	int place, reason = CANCEL_PLACE;
+	u32 i, spi;
+
+	if (!cancel_coro_slots_are_places(env, st, type))
+		return CANCEL_PLACE;
+	for (i = 0; i < st->acquired_refs; i++) {
+		ref = &st->refs[i];
+		if (!ref->slots || ref->frameno > (int)st->curframe)
+			continue;
+		place = cancel_coro_frame_place(env, st, type, ref->id);
+		if (place == CANCEL_NO_PLACE)
+			continue;
+		for (spi = 0; spi < ref->nr_slots; spi++) {
+			slot = &ref->slots[spi];
+			if (!bpf_is_spilled_reg(slot) || slot->spilled_ptr.id != id)
+				continue;
+			reason = cancel_ptr_handle(env, st, &slot->spilled_ptr, place, reason, e);
+			if (reason)
+				continue;
+			/* no other place reads the same: e->regs and e->slots stay empty */
+			e->in_frame = spi * BPF_REG_SIZE + 1;
+			return 0;
+		}
+	}
+	return reason;
+}
+
 /*
  * refs[@idx] of @st is a reference to an object, and the pad releases it like the program
  * does: by a call with the handle. Find the handle in a place of the current frame. It has
@@ -1559,6 +1683,8 @@ static int cancel_collect_ptr(struct bpf_verifier_env *env, const struct bpf_ver
 	for (i = BPF_REG_0; i <= BPF_REG_5; i++)
 		if (frame->regs[i].id == ref->id && cancel_reg_is_place(env, st, type, i))
 			reason = cancel_ptr_place(env, st, &frame->regs[i], i, reason, &e);
+	if (reason == CANCEL_PLACE)
+		reason = cancel_ptr_in_coro_frame(env, st, type, ref->id, &e);
 	return reason ?: cancel_list_add(visit, &e);
 }
 
@@ -1798,7 +1924,7 @@ static bool cancel_null_in_place(struct bpf_verifier_env *env, const struct bpf_
 	const struct bpf_stack_state *slot;
 	const struct bpf_reg_state *reg;
 
-	if (e->kind != CANCEL_PTR || !(e->flags & CANCEL_PTR_NULL) || e->cond)
+	if (e->kind != CANCEL_PTR || !(e->flags & CANCEL_PTR_NULL) || e->cond || e->in_frame)
 		return false;
 	if (cancel_place_is_reg(e->place)) {
 		if (!cancel_reg_is_place(env, st, BPF_CANCEL_SITE_CALL, e->place))
@@ -3171,6 +3297,11 @@ static int cancel_entry_cmp(const void *a, const void *b)
 		return x->rank > y->rank ? -1 : 1;
 	if (x->kind != y->kind)
 		return x->kind < y->kind ? -1 : 1;
+	/* what is read through a coroutine frame goes before the frame, which may be freed */
+	if (!x->in_frame != !y->in_frame)
+		return x->in_frame ? -1 : 1;
+	if (x->in_frame != y->in_frame)
+		return x->in_frame < y->in_frame ? -1 : 1;
 	if (x->place != y->place)
 		return x->place < y->place ? -1 : 1;
 	if (x->flags != y->flags)
@@ -3911,10 +4042,15 @@ static int cancel_emit_ptr(const struct cancel_entry *e, int place, struct bpf_i
 {
 	int n = 0, test = -1;
 
-	if (cancel_place_is_reg(place))
+	/* a handle in a coroutine frame is read through the pointer to the frame in place */
+	if (cancel_place_is_reg(place) && e->in_frame)
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, place, e->in_frame - 1);
+	else if (cancel_place_is_reg(place))
 		buf[n++] = BPF_MOV64_REG(BPF_REG_1, place);
 	else
 		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, place);
+	if (!cancel_place_is_reg(place) && e->in_frame)
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_1, e->in_frame - 1);
 	if (e->flags & CANCEL_PTR_NULL)
 		test = n++;
 	if (e->off)
