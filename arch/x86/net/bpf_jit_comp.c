@@ -35,8 +35,6 @@ void __asan_load8(void *p);
 void __asan_store8(void *p);
 #endif
 
-static bool all_callee_regs_used[4] = {true, true, true, true};
-
 static void *trampoline_size_image;
 
 static int __init init_trampoline_size_image(void)
@@ -527,8 +525,7 @@ static void emit_prologue_tail_call(u8 **pprog, bool is_subprog)
  * while jumping to another program
  */
 static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cbpf,
-			  bool tail_call_reachable, bool is_subprog,
-			  bool is_exception_cb)
+			  bool tail_call_reachable, bool is_subprog)
 {
 	u8 *prog = *pprog;
 
@@ -551,22 +548,8 @@ static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cb
 			/* Keep the same instruction layout. */
 			emit_nops(&prog, 3);     /* nop3 */
 	}
-	/* Exception callback receives FP as third parameter */
-	if (is_exception_cb) {
-		EMIT3(0x48, 0x89, 0xF4); /* mov rsp, rsi */
-		EMIT3(0x48, 0x89, 0xD5); /* mov rbp, rdx */
-		/* The main frame must have exception_boundary as true, so we
-		 * first restore those callee-saved regs from stack, before
-		 * reusing the stack frame.
-		 */
-		pop_callee_regs(&prog, all_callee_regs_used);
-		pop_r12(&prog);
-		/* Reset the stack frame. */
-		EMIT3(0x48, 0x89, 0xEC); /* mov rsp, rbp */
-	} else {
-		EMIT1(0x55);             /* push rbp */
-		EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
-	}
+	EMIT1(0x55);             /* push rbp */
+	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
 
 	/* X86_TAIL_CALL_OFFSET is here */
 	EMIT_ENDBR();
@@ -847,14 +830,9 @@ static void emit_bpf_tail_call_indirect(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);            /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                              /* pop rax */
@@ -913,14 +891,9 @@ static void emit_bpf_tail_call_direct(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);                /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                                  /* pop rax */
@@ -2561,39 +2534,24 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
-		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb);
+		      bpf_is_subprog(bpf_prog));
 
 	bpf_prog->aux->ksym.fp_start = prog - temp;
 
-	/* Exception callback will clobber callee regs for its own use, and
-	 * restore the original callee regs from main prog's stack frame.
+	/*
+	 * A program that calls bpf_throw() saves what it uses, like any other: its
+	 * frames leave through pads and their own epilogues, and the exception
+	 * callback is a function that the pad of the main program calls.
 	 */
-	if (bpf_prog->aux->exception_boundary) {
-		/* We also need to save r12, which is not mapped to any BPF
-		 * register, as we throw after entry into the kernel, which may
-		 * overwrite r12.
-		 */
+	if (arena_vm_start)
 		push_r12(&prog);
-		push_callee_regs(&prog, all_callee_regs_used);
-	} else {
-		if (arena_vm_start)
-			push_r12(&prog);
-		push_callee_regs(&prog, callee_regs_used);
-	}
+	push_callee_regs(&prog, callee_regs_used);
 
 	/* Compute callee-saved register area size. */
-	callee_saved_size = 0;
-	if (bpf_prog->aux->exception_boundary || arena_vm_start)
-		callee_saved_size += 8; /* r12 */
-	if (bpf_prog->aux->exception_boundary) {
-		callee_saved_size += 4 * 8; /* rbx, r13, r14, r15 */
-	} else {
-		int j;
-
-		for (j = 0; j < 4; j++)
-			if (callee_regs_used[j])
-				callee_saved_size += 8;
-	}
+	callee_saved_size = arena_vm_start ? 8 : 0; /* r12 */
+	for (i = 0; i < 4; i++)
+		if (callee_regs_used[i])
+			callee_saved_size += 8;
 	/*
 	 * Base offset from rbp for translating BPF outgoing args 7+
 	 * to native offsets. BPF uses negative offsets from r11
@@ -2622,15 +2580,6 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	outgoing_rsp = out_stack_arg_cnt > 1 ? (out_stack_arg_cnt - 1) * 8 : 0;
 	if (arena_sp)
 		outgoing_rsp = out_stack_arg_cnt * 8;
-	/*
-	 * bpf_throw() sees rsp of this frame as it is at a call. The callee-saved
-	 * regs are above the outgoing args, or above r9, which is pushed around
-	 * every call when the stack is private. With BPF_REG_ARENA_SP the slot
-	 * that keeps r9 over calls is between the two.
-	 */
-	if (bpf_prog->aux->exception_boundary)
-		bpf_prog->aux->stack_arg_sp_adjust = outgoing_rsp +
-						     (priv_frame_ptr || arena_sp_save ? 8 : 0);
 	emit_sub_rsp(&prog, outgoing_rsp);
 
 	if (arena_vm_start)
@@ -3490,10 +3439,7 @@ populate_extable:
 				if (err < 0)
 					return err;
 				ip += err;
-				/*
-				 * Other kfuncs leave rsp alone. bpf_throw() is one of
-				 * them, see stack_arg_sp_adjust.
-				 */
+				/* Other kfuncs leave rsp alone. */
 				arena_sp_args = arena_sp && kfunc_has_stack_args(fm);
 				if (arena_sp_args) {
 					u8 *start = prog;
@@ -3905,14 +3851,9 @@ emit_jmp:
 			}
 			/* Deallocate outgoing args 7+ area and the slot of BPF_REG_ARENA_SP. */
 			emit_add_rsp(&prog, outgoing_rsp + (arena_sp_save ? 8 : 0));
-			if (bpf_prog->aux->exception_boundary) {
-				pop_callee_regs(&prog, all_callee_regs_used);
+			pop_callee_regs(&prog, callee_regs_used);
+			if (arena_vm_start)
 				pop_r12(&prog);
-			} else {
-				pop_callee_regs(&prog, callee_regs_used);
-				if (arena_vm_start)
-					pop_r12(&prog);
-			}
 			EMIT1(0xC9);         /* leave */
 			bpf_prog->aux->ksym.fp_end = prog - temp;
 
@@ -5158,6 +5099,11 @@ bool bpf_jit_supports_cancel(void)
 	return true;
 }
 
+bool bpf_jit_supports_cancel_throw(void)
+{
+	return true;
+}
+
 bool bpf_jit_supports_arena_cancel(void)
 {
 	return true;
@@ -5250,9 +5196,11 @@ void bpf_jit_free(struct bpf_prog *prog)
 
 bool bpf_jit_supports_exceptions(void)
 {
-	/* We unwind through both kernel frames (starting from within bpf_throw
-	 * call) and BPF frames. Therefore we require ORC unwinder to be enabled
-	 * to walk kernel frames and reach BPF frames in the stack trace.
+	/*
+	 * The frames of bpf_throw() leave through pads, see
+	 * bpf_jit_supports_cancel_throw(). What reports a program walks the stack
+	 * to find it, through kernel frames to the BPF frames: that takes the ORC
+	 * unwinder.
 	 */
 	return IS_ENABLED(CONFIG_UNWINDER_ORC);
 }
