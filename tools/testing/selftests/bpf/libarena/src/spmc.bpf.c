@@ -192,6 +192,7 @@ struct spmc __arena *spmc_create(void)
 	 * scalar and the program fails verification.
 	 */
 	struct spmc __arena *volatile spmc;
+	volatile struct spmc_arr __arena *cur;
 	int ret, i;
 
 	spmc = arena_malloc(sizeof(*spmc));
@@ -212,7 +213,8 @@ struct spmc __arena *spmc_create(void)
 		return NULL;
 	}
 
-	spmc->cur = &spmc->arr[0];
+	cur = &spmc->arr[0];
+	spmc->cur = cur;
 
 	return (struct spmc __arena *)spmc;
 }
