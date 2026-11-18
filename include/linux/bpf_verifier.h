@@ -1754,6 +1754,8 @@ enum bpf_cancel_site_type {
 	BPF_CANCEL_SITE_CALL,
 	/* an access of arena, which may fault */
 	BPF_CANCEL_SITE_ARENA,
+	/* a call of bpf_throw() */
+	BPF_CANCEL_SITE_THROW,
 };
 
 /* the insns at the end of a pad that leave the frame */
@@ -1771,6 +1773,7 @@ enum bpf_cancel_acquire {
 	BPF_CANCEL_ACQUIRE_R0_ZERO,
 };
 
+bool bpf_cancel_covers_throw(const struct bpf_verifier_env *env);
 int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
 int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state);
 void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner, int idx);

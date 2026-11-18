@@ -140,6 +140,17 @@ static bool cancel_kind_ordered(u8 kind)
 #define CANCEL_MAX_ARG		MAX_BPF_STATIC_FUNC_ARGS
 #define CANCEL_ARGS		GENMASK(CANCEL_MAX_ARG, 1)
 
+/*
+ * What a frame leaves for. A cancellation ends the invocation with the cancel value of the
+ * program. A throw ends it with what the exception callback returns for the cookie of
+ * bpf_throw(). The two differ in the frames that they can leave, see cancel_sub_reason().
+ */
+enum cancel_cause {
+	CANCEL_CAUSE_CANCEL,
+	CANCEL_CAUSE_THROW,
+	__CANCEL_CAUSES,
+};
+
 /* Why a site declines */
 enum cancel_reason {
 	CANCEL_OK,
@@ -354,6 +365,8 @@ struct cancel_site {
 	bool padded;
 	/* no cancellation gets here: it has no pad and does not decline */
 	bool unused;
+	/* with a pad: the bits of enum cancel_cause that get to it */
+	u8 causes;
 	u32 pad;	/* of a guard, may_goto of the program, a call or an access that is padded */
 };
 
@@ -367,13 +380,15 @@ struct cancel_pad {
 
 /* What bpf_cancel_resolve() finds out about a subprog */
 struct cancel_sub {
-	u8 why;		/* enum cancel_reason: why it cannot be cancelled */
+	/* enum cancel_reason: why it cannot be cancelled, and why no throw can leave it */
+	u8 why[__CANCEL_CAUSES];
 	bool called;	/* by a call in the program */
 	/* it cannot be cancelled whatever its frames hold, see cancel_find_stuck() */
 	bool stuck;
-	bool has_point;	/* a point is in it or in what it calls */
-	/* and a cancellation comes out of it: the calls of it need pads */
-	bool raises;
+	/* for each cause: a point is in it or in what it calls */
+	bool has_point[__CANCEL_CAUSES];
+	/* and comes out of it: the calls of it need pads */
+	bool raises[__CANCEL_CAUSES];
 	u32 pads;	/* its first pad + 1 */
 	/* the bits that its pads may set in the mask for its caller, see cancel_find_gives() */
 	u32 gives;
@@ -473,6 +488,8 @@ struct bpf_cancel {
 	bool no_pairs;		/* not all of them are here */
 	/* the flags that are reserved, see cancel_reserve_flags() */
 	u32 nr_flags;
+	/* a site is a call of bpf_throw() */
+	bool throws;
 };
 
 /*
@@ -2111,10 +2128,20 @@ void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner, int idx
  * for every subprog. Where there are no pads it makes no difference which frame owns a
  * reference.
  */
-static bool cancel_prog_may_have_pads(struct bpf_verifier_env *env)
+static bool cancel_prog_may_have_pads(const struct bpf_verifier_env *env)
 {
 	return bpf_prog_has_invocation_budget(env->prog) && bpf_jit_supports_cancel() &&
 	       !bpf_prog_is_offloaded(env->prog->aux) && env->bpf_capable && env->bypass_spec_v1;
+}
+
+/*
+ * Do the frames of the program leave through pads when it calls bpf_throw()?
+ * Then every call of bpf_throw() is a site, nothing discards a frame, and the program is not
+ * loaded when a throw gets to a frame that cannot leave.
+ */
+bool bpf_cancel_covers_throw(const struct bpf_verifier_env *env)
+{
+	return bpf_jit_supports_cancel_throw() && cancel_prog_may_have_pads(env);
 }
 
 /*
@@ -2630,9 +2657,14 @@ void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifi
 	}
 }
 
-/* A point is where a cancellation begins. A call passes it on. */
-static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_site *site)
+/* A point is where a cancellation or a throw begins. A call passes it on. */
+static bool cancel_is_point(struct bpf_verifier_env *env, const struct cancel_site *site,
+			    enum cancel_cause cause)
 {
+	if (site->type == BPF_CANCEL_SITE_THROW)
+		return cause == CANCEL_CAUSE_THROW;
+	if (cause != CANCEL_CAUSE_CANCEL)
+		return false;
 	/* every place for may_goto is recorded, and its loop may have got none */
 	if (site->type == BPF_CANCEL_SITE_GUARD)
 		return env->insn_aux_data[site->insn_idx].loop_guard;
@@ -2683,8 +2715,11 @@ static bool cancel_sub_is_top(struct bpf_verifier_env *env, int s)
 	return !s || env->subprog_info[s].is_async_cb;
 }
 
-/* Why subprog @s cannot be cancelled, whatever its calls are like */
-static u8 cancel_sub_reason(struct bpf_verifier_env *env, int s)
+/*
+ * Why subprog @s cannot be cancelled, whatever its calls are like, or why no throw can leave
+ * it.
+ */
+static u8 cancel_sub_reason(struct bpf_verifier_env *env, int s, enum cancel_cause cause)
 {
 	const struct bpf_subprog_info *sub = &env->subprog_info[s];
 	s32 val;
@@ -2702,10 +2737,22 @@ static u8 cancel_sub_reason(struct bpf_verifier_env *env, int s)
 		return CANCEL_NO_JIT;
 	/*
 	 * The helper or the kfunc that calls a callback has no pad: it would go on with what
-	 * the callback left. The exception callback returns from the frame of the main program.
+	 * the callback left. The exception callback is called by the pad of the main program,
+	 * or returns from the frame of the main program where bpf_throw() discards frames.
 	 */
 	if (sub->is_loop_cb || sub->is_other_cb || sub->is_exception_cb)
 		return CANCEL_CALLBACK;
+	/*
+	 * A throw ends in the pad of the main program, which calls the exception callback and
+	 * returns what that returns: also in an extension, whose caller goes on with that like
+	 * with any return of the function that is replaced. No frame that the kernel entered
+	 * otherwise has an exception callback.
+	 */
+	if (cause == CANCEL_CAUSE_THROW) {
+		if (sub->is_async_cb)
+			return CANCEL_CALLBACK;
+		return sub->cancel_foreign ? CANCEL_FOREIGN : CANCEL_OK;
+	}
 	/* the caller of an extension is the program that it extends, which has no pad for it */
 	if (!s && env->prog->type == BPF_PROG_TYPE_EXT)
 		return CANCEL_CALLER;
@@ -2777,6 +2824,8 @@ static const char *cancel_site_str(const struct cancel_site *site)
 		return "recursive call";
 	case BPF_CANCEL_SITE_ARENA:
 		return "arena access";
+	case BPF_CANCEL_SITE_THROW:
+		return "bpf_throw()";
 	default:
 		return "call";
 	}
@@ -2797,7 +2846,8 @@ static void cancel_find_stuck(struct bpf_verifier_env *env)
 	int s;
 
 	for (s = 0; s < env->subprog_cnt; s++)
-		c->subs[s].stuck = c->subs[s].why && c->subs[s].why != CANCEL_FOREIGN;
+		c->subs[s].stuck = c->subs[s].why[CANCEL_CAUSE_CANCEL] &&
+				   c->subs[s].why[CANCEL_CAUSE_CANCEL] != CANCEL_FOREIGN;
 	do {
 		changed = false;
 		for (i = 0; i < c->nr_sites; i++) {
@@ -2816,29 +2866,37 @@ static void cancel_find_stuck(struct bpf_verifier_env *env)
  * A cancellation gets to @site, in a subprog that can be cancelled, and the frame holds what
  * no pad releases there. Going on as if no point had fired would leave it to the program
  * whether an invocation that ran out of time or faulted ever ends. The program is not
- * loaded, and the log says what the limit is. @of_subprog: the reason is that of the subprog
+ * loaded, and the log says what the limit is. @of_subprog: @reason is that of the subprog
  * of the site, the site has none of its own.
+ *
+ * A throw has nothing to go on with: the program is not loaded whatever the reason is.
  */
 static bool cancel_reject(struct bpf_verifier_env *env, const struct cancel_site *site,
-			  bool of_subprog)
+			  enum cancel_cause cause, u8 reason, bool of_subprog)
 {
-	const char *text = cancel_shape_text(site->decline);
+	bool throw = cause == CANCEL_CAUSE_THROW;
+	const char *text = cancel_shape_text(reason);
 
-	if (!text || env->cancel->subs[site->subprog].stuck)
+	if (!throw && (!text || env->cancel->subs[site->subprog].stuck))
 		return false;
 	/* the function was verified on its own, see bpf_cancel_foreign_release() */
-	if (of_subprog && site->decline == CANCEL_FOREIGN)
+	if (of_subprog && reason == CANCEL_FOREIGN)
 		text = "the function of the frame releases what a caller of it holds";
-	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_GAVE_DIFFERS)
+	else if (of_subprog && reason == CANCEL_CALLBACK)
+		text = "the kernel calls the function of the frame, and has no pad for it";
+	else if (of_subprog)
+		text = "a call of the function of the frame has no pad";
+	else if (reason == CANCEL_FOREIGN && site->untold == CANCEL_GAVE_DIFFERS)
 		text = "the frame has released what a caller of it holds on some paths only";
-	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_PASSED_DIFFERS)
+	else if (reason == CANCEL_FOREIGN && site->untold == CANCEL_PASSED_DIFFERS)
 		text = "a callee releases what it gets in an argument, and the paths to the call differ in what they pass there";
-	else if (site->decline == CANCEL_FOREIGN && site->untold == CANCEL_NOT_FORWARDED)
+	else if (reason == CANCEL_FOREIGN && site->untold == CANCEL_NOT_FORWARDED)
 		text = "a callee releases what a caller of the frame holds, and the frame did not get it in an argument";
-	else if (site->decline == CANCEL_STACK && site->untold == CANCEL_NO_MASK)
+	else if (reason == CANCEL_STACK && site->untold == CANCEL_NO_MASK)
 		text = "a callee tells what it released for the frame, and the stack of the frame has no room to keep that";
-	verbose(env, "insn %d: the program cannot be cancelled at this %s: %s (%s)\n",
-		site->insn_idx, cancel_site_str(site), text, cancel_reason_str[site->decline]);
+	verbose(env, "insn %d: %s at this %s: %s (%s)\n", site->insn_idx,
+		throw ? "no throw can leave the frame" : "the program cannot be cancelled",
+		cancel_site_str(site), text, cancel_reason_str[reason]);
 	return true;
 }
 
@@ -2847,9 +2905,10 @@ static bool cancel_reject(struct bpf_verifier_env *env, const struct cancel_site
  * call has no pad it would return behind the call, to code that was verified for another R0.
  * So a subprog can be cancelled only if every call of it has a pad, in a subprog that can be
  * cancelled in turn: up to the frame that the kernel entered, the main program or an async
- * callback. What cannot be cancelled takes all that it calls with it.
+ * callback. What cannot be cancelled takes all that it calls with it. The same for a throw,
+ * up to the main program.
  */
-static void cancel_drop_subs(struct bpf_verifier_env *env)
+static void cancel_drop_subs(struct bpf_verifier_env *env, enum cancel_cause cause)
 {
 	struct bpf_cancel *c = env->cancel;
 	struct cancel_site *site;
@@ -2862,12 +2921,12 @@ static void cancel_drop_subs(struct bpf_verifier_env *env)
 		for (i = 0; i < c->nr_sites; i++) {
 			site = &c->sites[i];
 			if (site->type != BPF_CANCEL_SITE_CALL ||
-			    (!site->decline && !c->subs[site->subprog].why))
+			    (!site->decline && !c->subs[site->subprog].why[cause]))
 				continue;
 			cancel_for_each_callee(env, site, t) {
-				if (c->subs[t].why)
+				if (c->subs[t].why[cause])
 					continue;
-				c->subs[t].why = CANCEL_CALLER;
+				c->subs[t].why[cause] = CANCEL_CALLER;
 				changed = true;
 			}
 		}
@@ -2875,28 +2934,28 @@ static void cancel_drop_subs(struct bpf_verifier_env *env)
 }
 
 /*
- * Does a cancellation get to @site: it begins there, or it comes out of what the call calls.
- * @has_point: it would get there if nothing declined.
+ * Does a cancellation or a throw get to @site: it begins there, or it comes out of what the
+ * call calls. @has_point: it would get there if nothing declined.
  */
 static bool cancel_gets_to(struct bpf_verifier_env *env, const struct cancel_site *site,
-			   bool *has_point)
+			   enum cancel_cause cause, bool *has_point)
 {
 	const struct bpf_cancel *c = env->cancel;
 	bool raises;
 	int t;
 
-	*has_point = raises = cancel_is_point(env, site);
+	*has_point = raises = cancel_is_point(env, site, cause);
 	if (site->type != BPF_CANCEL_SITE_CALL)
 		return raises;
 	cancel_for_each_callee(env, site, t) {
-		*has_point |= c->subs[t].has_point;
-		raises |= c->subs[t].raises;
+		*has_point |= c->subs[t].has_point[cause];
+		raises |= c->subs[t].raises[cause];
 	}
 	return raises;
 }
 
-/* A cancellation that gets to a site with a pad comes out of the subprog of the site. */
-static void cancel_find_raising(struct bpf_verifier_env *env)
+/* What gets to a site with a pad comes out of the subprog of the site. */
+static void cancel_find_raising(struct bpf_verifier_env *env, enum cancel_cause cause)
 {
 	struct bpf_cancel *c = env->cancel;
 	bool changed, usable, has_point, raises;
@@ -2909,18 +2968,62 @@ static void cancel_find_raising(struct bpf_verifier_env *env)
 		for (i = 0; i < c->nr_sites; i++) {
 			site = &c->sites[i];
 			sub = &c->subs[site->subprog];
-			usable = !site->decline && !sub->why;
+			usable = !site->decline && !sub->why[cause];
 			/* nothing to add */
-			if (sub->has_point && (sub->raises || !usable))
+			if (sub->has_point[cause] && (sub->raises[cause] || !usable))
 				continue;
-			raises = cancel_gets_to(env, site, &has_point) && usable;
-			if ((has_point && !sub->has_point) || (raises && !sub->raises)) {
-				sub->has_point |= has_point;
-				sub->raises |= raises;
+			raises = cancel_gets_to(env, site, cause, &has_point) && usable;
+			if ((has_point && !sub->has_point[cause]) ||
+			    (raises && !sub->raises[cause])) {
+				sub->has_point[cause] |= has_point;
+				sub->raises[cause] |= raises;
 				changed = true;
 			}
 		}
 	} while (changed);
+}
+
+/* The subprogs that each cause can leave, and those that it comes out of, as things are */
+static void cancel_find_leaving(struct bpf_verifier_env *env)
+{
+	struct bpf_cancel *c = env->cancel;
+	enum cancel_cause cause;
+	int s;
+
+	for (cause = 0; cause < __CANCEL_CAUSES; cause++) {
+		for (s = 0; s < env->subprog_cnt; s++)
+			c->subs[s].has_point[cause] = c->subs[s].raises[cause] = false;
+		cancel_drop_subs(env, cause);
+		cancel_find_raising(env, cause);
+	}
+}
+
+/* Can no frame of subprog @s leave, whatever for? Then no site of it has a pad. */
+static bool cancel_sub_stays(struct bpf_verifier_env *env, int s)
+{
+	const struct bpf_cancel *c = env->cancel;
+
+	return c->subs[s].why[CANCEL_CAUSE_CANCEL] &&
+	       (c->subs[s].why[CANCEL_CAUSE_THROW] || !c->throws);
+}
+
+/*
+ * The causes that get to the pad of @site as things are, as bits: 0 if it gets no pad. A
+ * site that declines has no pad for either, and a subprog may be left for one of them only.
+ */
+static u8 cancel_site_causes(struct bpf_verifier_env *env, const struct cancel_site *site)
+{
+	const struct cancel_sub *sub = &env->cancel->subs[site->subprog];
+	enum cancel_cause cause;
+	bool has_point;
+	u8 causes = 0;
+
+	if (site->decline)
+		return 0;
+	for (cause = 0; cause < __CANCEL_CAUSES; cause++)
+		if (!sub->why[cause] && cancel_gets_to(env, site, cause, &has_point))
+			causes |= BIT(cause);
+	return causes;
 }
 
 /*
@@ -3257,15 +3360,13 @@ static void cancel_find_used(struct bpf_verifier_env *env)
 	struct bpf_cancel *c = env->cancel;
 	const struct cancel_site *site;
 	const struct cancel_entry *e;
-	bool has_point;
 	u32 i, j;
 
 	for (i = 0; i < c->nr_origins; i++)
 		c->origins[i].used = false;
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
-		if (site->decline || c->subs[site->subprog].why ||
-		    !cancel_gets_to(env, site, &has_point))
+		if (!cancel_site_causes(env, site))
 			continue;
 		for (j = 0; j < site->held.nr; j++) {
 			e = &site->held.entries[j];
@@ -3360,15 +3461,14 @@ static int cancel_reserve_masks(struct bpf_verifier_env *env)
 	struct bpf_cancel *c = env->cancel;
 	const struct cancel_site *site;
 	struct cancel_sub *sub;
-	bool has_point, jit_required;
 	int err, failed = 0;
+	bool jit_required;
 	u32 i;
 
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
 		sub = &c->subs[site->subprog];
-		if (!site->told || site->decline || sub->why || sub->mask || sub->no_mask ||
-		    !cancel_gets_to(env, site, &has_point))
+		if (!site->told || sub->mask || sub->no_mask || !cancel_site_causes(env, site))
 			continue;
 		/* see cancel_reserve_flags() */
 		jit_required = env->prog->jit_required;
@@ -3438,7 +3538,8 @@ static int cancel_reserve_flags(struct bpf_verifier_env *env)
 
 /*
  * @site gets a pad: its entries that only some visits have go by the flags of their classes,
- * and what the callee tells is kept in the word of the subprog.
+ * and what the callee tells is kept in the word of the subprog. The causes that get to the
+ * pad are in site->causes.
  */
 static int cancel_set_flags(struct bpf_verifier_env *env, struct cancel_site *site)
 {
@@ -3471,10 +3572,12 @@ static int cancel_set_flags(struct bpf_verifier_env *env, struct cancel_site *si
 int bpf_cancel_resolve(struct bpf_verifier_env *env)
 {
 	struct bpf_cancel *c = env->cancel;
+	bool has_point, raises, declines, reject = false;
+	enum cancel_cause cause;
 	struct cancel_site *site;
-	bool has_point, raises, of_subprog, reject = false;
 	struct bpf_insn *insn;
 	int s, reason, err = 0;
+	u8 own;
 	u32 i, j;
 
 	if (!c || !c->nr_sites)
@@ -3491,20 +3594,22 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 		site->callee = -1;
 		if (bpf_pseudo_call(insn))
 			site->callee = bpf_find_subprog(env, site->insn_idx + insn->imm + 1);
+		c->throws |= site->type == BPF_CANCEL_SITE_THROW;
 		if (site->type != BPF_CANCEL_SITE_CALL)
 			continue;
 		cancel_for_each_callee(env, site, s)
 			c->subs[s].called = true;
 	}
 	for (s = 0; s < env->subprog_cnt; s++)
-		c->subs[s].why = cancel_sub_reason(env, s);
+		for (cause = 0; cause < __CANCEL_CAUSES; cause++)
+			c->subs[s].why[cause] = cancel_sub_reason(env, s, cause);
 	cancel_find_stuck(env);
 	cancel_find_flag_classes(env);
 	cancel_find_gives(env);
 	/* a site that cannot have what its pad needs declines, before the calls are looked at */
 	for (i = 0; i < c->nr_sites; i++) {
 		site = &c->sites[i];
-		if (c->subs[site->subprog].why)
+		if (cancel_sub_stays(env, site->subprog))
 			continue;
 		for (j = 0; j < site->held.nr && !site->decline; j++) {
 			reason = cancel_prepare_entry(env, &site->held.entries[j]);
@@ -3520,8 +3625,7 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 		if (!site->decline)
 			site->decline = cancel_site_flags(env, site);
 	}
-	cancel_drop_subs(env);
-	cancel_find_raising(env);
+	cancel_find_leaving(env);
 	/*
 	 * Only the flags of sites that get a pad take room, and the masks of their callees.
 	 * A site whose frame has none declines after all, and fewer sites get a pad then:
@@ -3537,36 +3641,45 @@ int bpf_cancel_resolve(struct bpf_verifier_env *env)
 	if (err || reason) {
 		for (i = 0; i < c->nr_sites; i++) {
 			site = &c->sites[i];
-			if (site->decline || c->subs[site->subprog].why)
+			if (site->decline || cancel_sub_stays(env, site->subprog))
 				continue;
 			site->decline = cancel_site_told(env, site);
 			if (!site->decline)
 				site->decline = cancel_site_flags(env, site);
 		}
-		for (s = 0; s < env->subprog_cnt; s++)
-			c->subs[s].has_point = c->subs[s].raises = false;
-		cancel_drop_subs(env);
-		cancel_find_raising(env);
+		cancel_find_leaving(env);
 		cancel_find_used(env);
 	}
 	err = 0;
 
 	for (i = 0; i < c->nr_sites && !err; i++) {
 		site = &c->sites[i];
-		raises = cancel_gets_to(env, site, &has_point);
-		of_subprog = !site->decline;
-		if (!site->decline)
-			site->decline = c->subs[site->subprog].why;
-		/*
-		 * A call that declines counts when it is in the way of a point in what it calls.
-		 * A call that doesn't decline needs a pad only for what comes out of the callee.
-		 */
-		if (!has_point || (!site->decline && !raises))
-			site->unused = true;
-		else if (!site->decline)
+		own = site->decline;
+		declines = false;
+		for (cause = 0; cause < __CANCEL_CAUSES; cause++) {
+			raises = cancel_gets_to(env, site, cause, &has_point);
+			if (!has_point)
+				continue;
+			reason = own ?: c->subs[site->subprog].why[cause];
+			/* A call that doesn't decline needs a pad only for what comes out of the callee. */
+			if (!reason) {
+				if (raises)
+					site->causes |= BIT(cause);
+				continue;
+			}
+			/* A call that declines counts when it is in the way of a point in what it calls. */
+			declines = true;
+			if (!site->decline)
+				site->decline = reason;
+			reject |= cancel_reject(env, site, cause, reason, !own);
+		}
+		if (site->causes) {
+			/* the frame can leave for one of the two only */
+			site->decline = own;
 			err = cancel_set_flags(env, site) ?: cancel_assign_pad(env, site);
-		else
-			reject |= cancel_reject(env, site, of_subprog);
+		} else if (!declines) {
+			site->unused = true;
+		}
 	}
 	if (!err && reject)
 		err = -EINVAL;

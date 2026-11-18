@@ -3792,6 +3792,15 @@ bool __weak bpf_jit_supports_cancel(void)
 	return false;
 }
 
+/*
+ * bpf_throw() leaves through the pads of cancel_goto: no program is an exception
+ * boundary, and the exception callback is a function like any other.
+ */
+bool __weak bpf_jit_supports_cancel_throw(void)
+{
+	return false;
+}
+
 /* cancel_goto behind an access of arena: a fault in the access goes on at the pad */
 bool __weak bpf_jit_supports_arena_cancel(void)
 {
