@@ -5268,6 +5268,19 @@ static bool is_arena_reg(struct bpf_verifier_env *env, int regno)
 	return reg->type == PTR_TO_ARENA;
 }
 
+/*
+ * There are no address spaces in Rust, addresses of arena are plain numbers.
+ * When the program is loaded with BPF_F_ARENA_SCALAR and has an arena a load or
+ * a store through a number is an access to arena at the low 32 bits of it,
+ * like the access through PTR_TO_ARENA is. The register stays a number.
+ */
+static bool is_arena_scalar(struct bpf_verifier_env *env, int regno)
+{
+	const struct bpf_reg_state *reg = reg_state(env, regno);
+
+	return reg->type == SCALAR_VALUE && env->arena_scalar && env->prog->aux->arena;
+}
+
 static bool is_load_acq_unsafe(struct bpf_verifier_env *env, int regno,
 			       struct bpf_insn *insn)
 {
@@ -5298,7 +5311,7 @@ static bool atomic_ptr_type_ok(struct bpf_verifier_env *env, int regno,
 		return false;
 	if (is_sk_reg(env, regno))
 		return false;
-	if (is_arena_reg(env, regno))
+	if (is_arena_reg(env, regno) || is_arena_scalar(env, regno))
 		return bpf_jit_supports_insn(insn, true);
 	if (is_load_acq_unsafe(env, regno, insn))
 		return false;
@@ -7724,6 +7737,22 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type type,
 			     bool allow_trust_mismatch);
 
+/*
+ * Returns the register to check the access of the current insn with.
+ * For a number in a program with an arena that is 'arena'.
+ */
+static struct bpf_reg_state *mem_access_reg(struct bpf_verifier_env *env, int regno,
+					    struct bpf_reg_state *arena)
+{
+	if (!is_arena_scalar(env, regno))
+		return cur_regs(env) + regno;
+
+	memset(arena, 0, sizeof(*arena));
+	arena->type = PTR_TO_ARENA;
+	env->insn_aux_data[env->insn_idx].arena_scalar = true;
+	return arena;
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -7731,6 +7760,7 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	struct bpf_verifier_state *vstate = env->cur_state;
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state arena, *src_reg;
 	enum bpf_reg_type src_reg_type;
 	int err;
 
@@ -7752,16 +7782,16 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	src_reg_type = regs[insn->src_reg].type;
+	src_reg = mem_access_reg(env, insn->src_reg, &arena);
+	src_reg_type = src_reg->type;
 
 	/*
 	 * check_stack_read_fixed_off() may refine the modification's origin to
 	 * the source stack slot.
 	 */
 	bpf_diag_mod_begin(env, &regs[insn->dst_reg], NULL, BPF_DIAG_MOD_WRITE);
-	err = check_mem_access(env, env->insn_idx, regs + insn->src_reg,
-			       argno_from_reg(insn->src_reg), insn->off,
-			       BPF_SIZE(insn->code), BPF_READ, insn->dst_reg,
+	err = check_mem_access(env, env->insn_idx, src_reg, argno_from_reg(insn->src_reg),
+			       insn->off, BPF_SIZE(insn->code), BPF_READ, insn->dst_reg,
 			       strict_alignment_once, is_ldsx);
 	/*
 	 * Paths through a kernel struct pointer and through other pointers
@@ -7789,6 +7819,7 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	struct bpf_verifier_state *vstate = env->cur_state;
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state arena, *dst_reg;
 	enum bpf_reg_type dst_reg_type;
 	int err;
 
@@ -7810,12 +7841,12 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
-	dst_reg_type = regs[insn->dst_reg].type;
+	dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
+	dst_reg_type = dst_reg->type;
 
 	/* Check if (dst_reg + off) is writeable. */
-	err = check_mem_access(env, env->insn_idx, regs + insn->dst_reg,
-			       argno_from_reg(insn->dst_reg), insn->off,
-			       BPF_SIZE(insn->code), BPF_WRITE, insn->src_reg,
+	err = check_mem_access(env, env->insn_idx, dst_reg, argno_from_reg(insn->dst_reg),
+			       insn->off, BPF_SIZE(insn->code), BPF_WRITE, insn->src_reg,
 			       strict_alignment_once, false);
 	err = err ?: save_aux_ptr_type(env, dst_reg_type, false);
 
@@ -7825,7 +7856,7 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 static int check_atomic_rmw(struct bpf_verifier_env *env,
 			    struct bpf_insn *insn)
 {
-	struct bpf_reg_state *dst_reg;
+	struct bpf_reg_state arena, *dst_reg;
 	int load_reg;
 	int err;
 
@@ -7870,6 +7901,9 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 		return -EACCES;
 	}
 
+	/* load_reg may be dst_reg. Look at dst_reg before it's marked as unknown. */
+	dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
+
 	load_reg = bpf_atomic_load_reg(insn);
 	if (load_reg >= 0) {
 		/* check and record load of old value */
@@ -7877,8 +7911,6 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 		if (err)
 			return err;
 	}
-
-	dst_reg = cur_regs(env) + insn->dst_reg;
 
 	/* Check whether we can read the memory, with second call for fetch
 	 * case to simulate the register fill.
@@ -21417,7 +21449,8 @@ static int check_arena_sp_insn(struct bpf_verifier_env *env, struct bpf_insn *in
 
 /*
  * Whether the insn is an access of arena in the current state, which has not gone through
- * it yet: a load, a store or an atomic insn through r12 or through a pointer to arena.
+ * it yet: a load, a store or an atomic insn through r12, through a pointer to arena, or
+ * through a number under BPF_F_ARENA_SCALAR.
  */
 static bool insn_accesses_arena(struct bpf_verifier_env *env, const struct bpf_insn *insn)
 {
@@ -21441,7 +21474,8 @@ static bool insn_accesses_arena(struct bpf_verifier_env *env, const struct bpf_i
 		return false;
 	}
 	/* an argument on the stack has no register in regs[] either */
-	return base < MAX_BPF_REG && cur_regs(env)[base].type == PTR_TO_ARENA;
+	return base < MAX_BPF_REG &&
+	       (cur_regs(env)[base].type == PTR_TO_ARENA || is_arena_scalar(env, base));
 }
 
 static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
@@ -21488,16 +21522,17 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			return check_stack_arg_write(env, state, insn->off, NULL);
 		}
 
+		struct bpf_reg_state arena, *dst_reg;
 		enum bpf_reg_type dst_reg_type;
 
 		err = check_reg_arg(env, insn->dst_reg, SRC_OP);
 		if (err)
 			return err;
 
-		dst_reg_type = cur_regs(env)[insn->dst_reg].type;
+		dst_reg = mem_access_reg(env, insn->dst_reg, &arena);
+		dst_reg_type = dst_reg->type;
 
-		err = check_mem_access(env, env->insn_idx, cur_regs(env) + insn->dst_reg,
-				       argno_from_reg(insn->dst_reg),
+		err = check_mem_access(env, env->insn_idx, dst_reg, argno_from_reg(insn->dst_reg),
 				       insn->off, BPF_SIZE(insn->code),
 				       BPF_WRITE, -1, false, false);
 		if (err)
@@ -25780,6 +25815,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		env->strict_alignment = false;
 
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
+	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
 
 	/* Prepare BTF and func_info needed to discover all subprograms. */
 	ret = bpf_prepare_btf_info(env, attr, uattr);
