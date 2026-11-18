@@ -80,7 +80,7 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 
 		/* wait a little for signal handler */
 		for (int i = 0; i < 1000000000 && !sigusr1_received; i++) {
-			j /= i + j + 1;
+			j /= i + 1;
 			if (remote)
 				sleep(1);
 			else
