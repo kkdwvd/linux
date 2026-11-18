@@ -25,8 +25,20 @@ void bpf_rcu_read_unlock(void) noexcept __ksym;
 void bpf_preempt_disable(void) noexcept __ksym;
 void bpf_preempt_enable(void) noexcept __ksym;
 
-/* Starts an unwind. Not a kfunc: llvm lowers the call and it doesn't come back. */
+/*
+ * Starts an unwind, and doesn't come back. libunwind does it with
+ * __builtin_bpf_unwind_exit(), which leaves the frame with unwind_exit, or
+ * enters the landing pad where the call is in a try block. An llvm without
+ * the builtin lowers a call of _Unwind_RaiseException() itself: it's no kfunc.
+ */
+#if __has_builtin(__builtin_bpf_unwind_exit)
+__always_inline int _Unwind_RaiseException(void *exc)
+{
+	__builtin_bpf_unwind_exit(exc);
+}
+#else
 int _Unwind_RaiseException(void *exc);
+#endif
 
 /* All that is left of the C++ runtime. Nobody looks at the exception object. */
 static char exc_obj[16];
