@@ -12602,8 +12602,13 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (IS_ERR(branch))
 				return PTR_ERR(branch);
 			branch->unwound = bpf_unwound_mark(kernel, false);
-			/* the value, also out of a function that returns nothing */
-			if (env->has_throw)
+			/*
+			 * The value, also out of a function that returns nothing. A landing pad of
+			 * the verifier reads it only in a program with bpf_throw(). The program's
+			 * landing pad behind the call can read what unwind_exit left in any
+			 * program: a number, see check_global_subprog_return_code().
+			 */
+			if (env->has_throw || !kernel)
 				mark_reg_unknown(env, branch->frame[branch->curframe]->regs,
 						 BPF_REG_0);
 		}
