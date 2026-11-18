@@ -1450,6 +1450,7 @@ struct bpf_insn_aux_data {
 	u64 non_sleepable:1; /* helper/kfunc may be called from non-sleepable context */
 	u64 cast_arena:1; /* addr_space_cast of an address in arena */
 	u64 cast_mov:1; /* addr_space_cast of a pointer that is not in arena, it's a move */
+	u64 arena_scalar:1; /* ldx/stx/st/atomic through a number, it's an address in arena */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
 	u64 speculative_first:1; /* a speculative state came to it first */
 	u64 call_recorded:1; /* see record_call_fixup() */
@@ -2139,6 +2140,7 @@ struct bpf_verifier_env {
 	u32 max_arena_stack_depth;	/* of all call chains */
 	u32 loop_entry_cnt;		/* see loop_stack_entry.entry_id */
 	);
+	bool arena_scalar;		/* load and store through a number is arena access */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
 	struct bpf_map **used_maps;	/* array of map's used by eBPF program */
 	struct btf_mod_pair *used_btfs;	/* array of BTF's used by BPF program */
