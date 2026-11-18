@@ -18,6 +18,8 @@
 #include "verifier_arena_fault.skel.h"
 #include "verifier_arena_stack.skel.h"
 #include "verifier_arena_large.skel.h"
+#include "verifier_arena_scalar.skel.h"
+#include "verifier_arena_scalar_fault.skel.h"
 #include "verifier_arena_globals1.skel.h"
 #include "verifier_arena_globals2.skel.h"
 #include "verifier_array_access.skel.h"
@@ -243,6 +245,8 @@ void test_verifier_arena_cast(void)           { RUN(verifier_arena_cast); }
 void test_verifier_arena_fault(void)          { RUN(verifier_arena_fault); }
 void test_verifier_arena_stack(void)          { RUN_TESTS(verifier_arena_stack); }
 void test_verifier_arena_large(void)          { RUN(verifier_arena_large); }
+void test_verifier_arena_scalar(void)         { RUN(verifier_arena_scalar); }
+void test_verifier_arena_scalar_fault(void)   { RUN(verifier_arena_scalar_fault); }
 void test_verifier_arena_globals1(void)       { RUN(verifier_arena_globals1); }
 void test_verifier_arena_globals2(void)       { RUN(verifier_arena_globals2); }
 void test_verifier_barrier(void)              { RUN(verifier_barrier); }
