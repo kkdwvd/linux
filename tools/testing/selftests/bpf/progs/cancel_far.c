@@ -357,6 +357,102 @@ __naked void flag_33k(void)
 	FLAG_PROG(REPS_33K);
 }
 
+/*
+ * unwind_goto and unwind_exit as raw insns, like in verifier_unwind.c. struct bpf_insn of
+ * vmlinux.h is relocatable, and what inline asm takes for a constant is not: hence a copy of
+ * it, with BPF_JMP | BPF_JCOND and BPF_JMP | BPF_EXIT for the opcodes.
+ */
+struct raw_insn {
+	__u8 code;
+	__u8 dst_reg:4;
+	__u8 src_reg:4;
+	__s16 off;
+	__s32 imm;
+};
+
+#define unwind_goto(off) ".8byte %[insn_unwind_goto_" #off "];"
+#define unwind_exit ".8byte %[insn_unwind_exit];"
+
+#define __imm_unwind_goto(_off) \
+	__imm_insn(insn_unwind_goto_##_off, \
+		   ((struct raw_insn) { .code = 0xe5, .src_reg = BPF_UNWIND_GOTO, .off = _off }))
+#define __imm_unwind_exit \
+	__imm_insn(insn_unwind_exit, \
+		   ((struct raw_insn) { .code = 0x95, .src_reg = BPF_UNWIND_EXIT }))
+
+/* r1 == 0: unwinds with r0 = 5. Otherwise it dives until the prog is cancelled. */
+__naked __noinline __used
+static unsigned long unwinds_or_dives(void)
+{
+	asm volatile (
+		"if r1 != 0 goto 1f;"
+		"r0 = 5;"
+		unwind_exit
+	"1:"
+		"call dives;"
+		"exit;"
+		:
+		: __imm_unwind_exit
+		: __clobber_all
+	);
+}
+
+/*
+ * The call has the unwind_goto of the prog behind it, and cancel_goto behind that. The JITs
+ * look for both directly behind the call. The patches turn the 8200 divisions into 32800
+ * insns, too far for the 16 bits of unwind_goto: the jumps that get to its landing pad go
+ * behind cancel_goto, which is no code.
+ *
+ * The record is in r6. When the callee is cancelled the pad of the verifier discards it, and
+ * when the callee unwinds the landing pad of the prog does, and returns 7.
+ */
+SEC("tc")
+__description("cancel far: unwind_goto in front of cancel_goto that patches push out of range")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __log_level(4)
+__msg("cancel sites 4 padded 4 declined")
+__xlated("call pc+{{[0-9]+}}")
+__xlated("unwind_goto pc+2")
+__xlated("cancel_goto pc+{{(3[2-9]|[4-9][0-9])[0-9][0-9][0-9]$}}")
+__xlated("goto pc+1")
+__xlated("gotol pc+{{(3[2-9]|[4-9][0-9])[0-9][0-9][0-9]$}}")
+__xlated("r7 = 1")
+__naked void unwind_far(void)
+{
+	asm volatile (
+		RESERVE
+		"if r0 != 0 goto 1f;"
+		"r0 = 0;"
+		"exit;"
+	"1:"
+		"r6 = r0;"
+		"r1 = %[dive] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"r8 = r1;"
+		"call unwinds_or_dives;"
+		unwind_goto(8211)
+		"r7 = 1;"
+		".rept 8200; r7 /= r8; .endr;"
+		DISCARD_AND_EXIT
+		/* the landing pad of the prog */
+		"r1 = r6;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_reserve),
+		  __imm(bpf_ringbuf_discard),
+		  __imm_addr(ringbuf),
+		  __imm_addr(dive),
+		  __imm_addr(behind),
+		  __imm_unwind_goto(8211)
+		: __clobber_all
+	);
+}
+
 /* The ring buffer takes a record and hands it to the consumer */
 SEC("tc")
 int ringbuf_submit(struct __sk_buff *skb)

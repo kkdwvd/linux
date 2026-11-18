@@ -160,6 +160,43 @@ static void test_flag(struct cancel_far *skel, struct ring_buffer *rb, struct bp
 	check_insns(prog, min, 2);
 }
 
+/*
+ * unwind_goto of @prog got too far from its landing pad, with cancel_goto behind it: the two
+ * are still directly behind the call, and the jumps to the landing pad follow them. Both ways
+ * out of the callee work: it is cancelled, or it unwinds and the landing pad returns 7.
+ */
+static void test_unwind(struct cancel_far *skel, struct ring_buffer *rb, struct bpf_program *prog)
+{
+	struct bpf_insn *insns;
+	__u32 cnt, i;
+	int found = 0;
+
+	skel->bss->dive = 1;
+	cancelled(skel, rb, prog, no_room);
+	skel->bss->dive = 0;
+	skel->bss->behind = 0;
+	ASSERT_EQ(run(prog), 7, what(prog, "retval"));
+	ASSERT_EQ(skel->bss->behind, 0, what(prog, "behind"));
+	ASSERT_STREQ(read_stream(prog), "", what(prog, "stream"));
+	ringbuf_is_clean(skel, rb, prog);
+
+	if (!ASSERT_OK(get_xlated_program(bpf_program__fd(prog), &insns, &cnt),
+		       what(prog, "get_xlated_program")))
+		return;
+	for (i = 1; i + 2 < cnt; i++) {
+		if (insns[i].code != (BPF_JMP | BPF_JCOND) || insns[i].src_reg != BPF_CANCEL_GOTO ||
+		    insns[i - 1].code != (BPF_JMP | BPF_JCOND) || insns[i - 1].src_reg != BPF_UNWIND_GOTO)
+			continue;
+		found++;
+		ASSERT_EQ(insns[i - 1].off, 2, what(prog, "unwind_goto"));
+		ASSERT_EQ(insns[i + 1].code, BPF_JMP | BPF_JA, what(prog, "goto"));
+		ASSERT_EQ(insns[i + 2].code, BPF_JMP32 | BPF_JA, what(prog, "gotol"));
+		ASSERT_GT(insns[i + 2].imm, 32767, what(prog, "landing pad"));
+	}
+	ASSERT_EQ(found, 1, what(prog, "unwind_goto in front of cancel_goto"));
+	free(insns);
+}
+
 void test_cancel_far(void)
 {
 	struct ring_buffer *rb = NULL;
@@ -198,6 +235,8 @@ void test_cancel_far(void)
 		test_flag(skel, rb, skel->progs.flag_2k, 2048);
 		test_flag(skel, rb, skel->progs.flag_33k, 32767);
 	}
+	if (test__start_subtest("unwind"))
+		test_unwind(skel, rb, skel->progs.unwind_far);
 out:
 	ring_buffer__free(rb);
 	cancel_far__destroy(skel);
