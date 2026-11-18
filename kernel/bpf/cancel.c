@@ -4331,7 +4331,8 @@ int bpf_cancel_insert_gotos(struct bpf_verifier_env *env)
 		 * behind a callee that never returns. A jump out of what is appended counts
 		 * from the insn that follows.
 		 */
-		at = i + bpf_is_unwind_goto(&insn[i + 1]);
+		/* a call that never returns may end its subprog, see check_final_calls() */
+		at = i + (!bpf_call_ends_subprog(env, i) && bpf_is_unwind_goto(&insn[i + 1]));
 		off = cancel_pad_idx(env, site) - at - 1;
 		cg = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_CANCEL_GOTO, 0, off);
 		err = bpf_patch_list_append(env, at, &cg, 1);

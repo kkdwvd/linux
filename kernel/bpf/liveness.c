@@ -391,7 +391,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (opcode_info->can_fallthrough)
+	if (opcode_info->can_fallthrough && !bpf_call_ends_subprog(env, idx))
 		succ->items[succ->cnt++] = idx + insn_sz;
 
 	if (opcode_info->can_jump)
@@ -575,9 +575,12 @@ static bool stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 half
 		/* Get callsite from verifier state, not from instance callchain */
 		callsite = q->callsites[i];
 
-		alive = callee_stack_access_at_callsite(env, callsite)
-			? is_live_before(instance, callsite, rel, half_spi, kind)
-			: is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		if (callee_stack_access_at_callsite(env, callsite))
+			alive = is_live_before(instance, callsite, rel, half_spi, kind);
+		else if (callsite + 1 < instance->subprog_start + instance->insn_cnt)
+			alive = is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		else
+			alive = false; /* the call ends the subprog, nothing follows it */
 		if (alive)
 			return true;
 	}

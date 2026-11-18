@@ -122,10 +122,13 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 {
 	int ret, insn_sz;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
+	}
 
 	return visit_callee ? push_insn(t, t + insns[t].imm + 1, BRANCH, env) : 0;
 }
