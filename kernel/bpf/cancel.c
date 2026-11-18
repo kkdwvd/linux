@@ -39,7 +39,7 @@
  *   that its frame entered.
  * - references whose handle the frame has in a register or in a stack slot,
  *   where a kfunc or a helper releases them: a kernel object, a socket, a
- *   ringbuf record, an object that the program owns, see
+ *   ringbuf record, an object that the program owns, a coroutine frame, see
  *   cancel_collect_ptr().
  * A frame that holds anything else of its own declines.
  *
@@ -1369,6 +1369,24 @@ static bool cancel_obj_drop_ok(struct bpf_verifier_env *env, const struct bpf_ve
 	return !bpf_nmi_unsafe_prog(env) || !btf_record_has_nmi_unsafe_fields(*rec);
 }
 
+/* The kfunc that frees a coroutine frame */
+BTF_ID_LIST_SINGLE(cancel_coro_frame_free_id, func, bpf_coro_frame_free)
+
+/*
+ * May a pad free a coroutine frame like bpf_coro_frame_free() does? Programs of every type
+ * have the kfunc, but no program calls a kfunc under a lock that is not made for it.
+ */
+static bool cancel_coro_frame_free_ok(struct bpf_verifier_env *env,
+				      const struct bpf_verifier_state *st)
+{
+	struct btf *vmlinux = bpf_get_btf_vmlinux();
+
+	if (IS_ERR_OR_NULL(vmlinux) ||
+	    !btf_kfunc_is_allowed(vmlinux, cancel_coro_frame_free_id[0], env->prog))
+		return false;
+	return !cancel_lock_below(st);
+}
+
 /*
  * @reg is in @place, which a pad can read, and has the id of a reference that the current
  * frame of @st is to release. Can the pad release the reference out of it? Returns 0 with
@@ -1454,6 +1472,17 @@ static int cancel_ptr_handle(struct bpf_verifier_env *env, const struct bpf_veri
 		if (flags != MEM_RINGBUF)
 			return CANCEL_REFS;
 		helper = BPF_FUNC_ringbuf_discard;
+		break;
+	case PTR_TO_CORO_FRAME:
+		/*
+		 * A frame from bpf_coro_frame_alloc(). It is no object of a BTF type that has a
+		 * release kfunc: bpf_coro_frame_free() takes any frame.
+		 */
+		if (flags)
+			return CANCEL_REFS;
+		if (!cancel_coro_frame_free_ok(env, st))
+			return CANCEL_RELEASE;
+		e->arg = cancel_coro_frame_free_id[0];
 		break;
 	default:
 		return CANCEL_REFS;
