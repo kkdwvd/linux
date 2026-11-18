@@ -767,7 +767,7 @@ static bool compute_insn_deps(struct bpf_verifier_env *env, unsigned long *masks
 	u16 use = aux->use_regs, def = aux->def_regs, args = 0;
 	bool changed = false, stores, reads, loads, call, held_after;
 	struct taken_funcs *taken = &env->precision->taken;
-	u8 class = BPF_CLASS(insn->code), needs;
+	u8 class = BPF_CLASS(insn->code), needs, cb_ret;
 	u16 ptrs = 0;
 	int t, callee;
 
@@ -818,8 +818,14 @@ static bool compute_insn_deps(struct bpf_verifier_env *env, unsigned long *masks
 		reads = is_seed;
 		needs = ret[callee];
 	} else if (callee > 0) {
-		reads |= compute_call_deps(env, masks, ret, callee, needs & ~RET_REGS, &held,
-					   &changed);
+		/*
+		 * The callback returns to the helper. r0 after the call is the helper's, or the
+		 * one of the callback when it unwinds to the pad after the call, see
+		 * check_cb_unwind().
+		 */
+		cb_ret = bpf_is_unwind_goto(insn + 1) ? BIT(BPF_REG_0) : 0;
+		reads |= compute_call_deps(env, masks, ret, callee, needs & ~(RET_REGS & ~cb_ret),
+					   &held, &changed);
 		needs = ret[callee];
 	} else if (bpf_is_callx(insn) || aux->calls_callback) {
 		changed |= needs & ~taken->needs;

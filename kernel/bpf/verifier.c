@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
@@ -3362,6 +3363,8 @@ static int record_callx_edge(struct bpf_verifier_env *env, int caller, int calle
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
+ * The call may be of a helper or a kfunc that calls a callback: it leaves like
+ * the callback did, see check_cb_unwind().
  */
 static int check_unwind_insns(struct bpf_verifier_env *env)
 {
@@ -3387,8 +3390,10 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 		if (!bpf_is_unwind_goto(insn))
 			continue;
 		seen = true;
-		if (!i || !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1))) {
-			verbose(env, "unwind_goto at insn %d doesn't follow a call of a subprog\n",
+		if (!i || !(bpf_pseudo_call(insn - 1) || bpf_is_callx(insn - 1) ||
+			    bpf_is_sync_callback_calling_insn(insn - 1))) {
+			verbose(env,
+				"unwind_goto at insn %d doesn't follow a call of a subprog or of a helper with a callback\n",
 				i);
 			return -EINVAL;
 		}
@@ -11438,6 +11443,66 @@ static void leave_callback(struct bpf_func_state *caller)
 		leave_loops(caller, caller->loop_stack_cnt - 1);
 }
 
+/* The helper calls its callback with a pad, see bpf_call_cb(). None yet. */
+static bool helper_has_cb_pad(enum bpf_func_id func_id)
+{
+	return false;
+}
+
+/* The kfunc calls its callback with a pad. None yet. */
+static bool kfunc_has_cb_pad(u32 btf_id)
+{
+	return false;
+}
+
+static bool insn_has_cb_pad(struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && helper_has_cb_pad(insn->imm)) ||
+	       (bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm));
+}
+
+/*
+ * A sync callback is called by a helper or a kfunc, a C frame between the
+ * callback and the BPF code that called it. unwind_exit of the callback returns
+ * to the pad of its caller when there is one, and a helper or a kfunc that
+ * calls a callback has one where BPF_HAS_CB_PADS and insn_has_cb_pad(): it
+ * calls the callback with bpf_call_cb(), drops what it holds when the callback
+ * unwinds and leaves to the pad of its own caller with the r0 of the callback.
+ * So a call with such a callback that can unwind is a call of something that
+ * can unwind, and unwind_goto has to follow it.
+ *
+ * A callback has no unwind_exit and unwinds all the same when it is recursive
+ * and unwind_goto follows every call of it that mark_recursive_subprogs() saw:
+ * its check of the recursion leaves with unwind_exit then, see
+ * check_recursion_guard(). The call of a helper that got the callback from a
+ * table of functions is not one of those calls. It is known here.
+ */
+static int check_cb_unwind(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			   int insn_idx, int subprog)
+{
+	if (!bpf_subprog_unwinds(&env->subprog_info[subprog]))
+		return 0;
+	if (!bpf_is_unwind_goto(insn + 1)) {
+		if (bpf_helper_call(insn))
+			verbose(env, "no unwind_goto after the call of %s()\n",
+				func_id_name(insn->imm));
+		else
+			verbose(env, "no unwind_goto after the call of the kfunc at insn %d\n",
+				insn_idx);
+		return -EINVAL;
+	}
+	/* The helpers have pads with asm goto outputs only, see bpf_call_cb() */
+	if (!BPF_HAS_CB_PADS) {
+		verbose(env, "callback cannot unwind: the helpers have no pads\n");
+		return -ENOTSUPP;
+	}
+	if (!insn_has_cb_pad(insn)) {
+		verbose(env, "callback cannot unwind\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int insn_idx, int subprog,
 			      set_callee_state_fn set_callee_state_cb)
@@ -11447,6 +11512,15 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	int err;
 
 	caller = state->frame[state->curframe];
+	/*
+	 * The callback unwound, and the call is visited once more for the
+	 * effects of the helper, see prepare_func_exit(): no more rounds, the
+	 * helper leaves as it does when it returns.
+	 */
+	if (state->unwound) {
+		leave_callback(caller);
+		return 0;
+	}
 	err = btf_check_subprog_call(env, subprog);
 	if (err == -EFAULT)
 		return err;
@@ -11510,6 +11584,10 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 		env->subprog_info[subprog].is_loop_cb = true;
 	else
 		env->subprog_info[subprog].is_other_cb = true;
+
+	err = check_cb_unwind(env, insn, insn_idx, subprog);
+	if (err)
+		return err;
 
 	/* for callback functions enqueue entry to callback and
 	 * proceed with next instruction within current frame.
@@ -11669,10 +11747,10 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
  * A void function can leave a pointer to the stack in r0. The caller cannot read it. That holds
  * for the stack of a caller too: for stack liveness a call returns no pointer to the stack.
  */
-static void hide_returned_stack_ptrs(struct bpf_verifier_env *env, int subprog,
+static void hide_returned_stack_ptrs(struct bpf_verifier_env *env, u32 nregs,
 				     struct bpf_reg_state *regs)
 {
-	u32 i, nregs = bpf_ret_reg_pair(env, subprog) ? 2 : 1;
+	u32 i;
 
 	for (i = 0; i < nregs; i++) {
 		if (regs[ret_regs[i]].type != PTR_TO_STACK)
@@ -11690,7 +11768,8 @@ static int exit_func_on_its_own(struct bpf_verifier_env *env)
 	struct bpf_func_state *callee = state->frame[0];
 	int err;
 
-	hide_returned_stack_ptrs(env, callee->subprogno, callee->regs);
+	hide_returned_stack_ptrs(env, bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1,
+				 callee->regs);
 	state->unwound |= bpf_is_unwind_exit(&env->prog->insnsi[env->insn_idx]);
 
 	/* Invalidate callee-local dynptrs and their slices before the frame goes away. */
@@ -12447,20 +12526,30 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_func_state *caller, *callee;
 	struct bpf_reg_state *r0;
+	bool unwinds;
 	u32 i, nregs;
 	int err;
 
 	callee = state->frame[state->curframe];
 	r0 = &callee->regs[BPF_REG_0];
-	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
+	/*
+	 * A callback returns r0 alone, to the helper, and unwinds with r0 alone,
+	 * through the pad of the helper, whatever its prototype says: r2 stays the
+	 * caller's, where the revisit of the call reads the arguments.
+	 */
+	nregs = !callee->in_callback_fn && bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
 
 	caller = state->frame[state->curframe - 1];
-	if (bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx]) || state->unwound) {
-		/* the helper or the kfunc that called it doesn't expect that */
-		if (callee->in_callback_fn) {
-			verbose(env, "callback cannot unwind\n");
-			return -EINVAL;
-		}
+	unwinds = bpf_is_unwind_exit(&env->prog->insnsi[*insn_idx]) || state->unwound;
+	if (unwinds) {
+		/*
+		 * A callback returns into the helper that called it, and to the
+		 * pad of the helper when the helper has one. check_cb_unwind()
+		 * has seen to that, and to the unwind_goto after the call of
+		 * the helper, where the helper leaves to right away, with the
+		 * r0 of the callback as it is: the pad gets its state, as the
+		 * pad after a subprog call does.
+		 */
 		if (!bpf_is_unwind_goto(&env->prog->insnsi[callee->callsite + 1])) {
 			verbose(env, "unwind_exit, but no unwind_goto after the call at insn %d\n",
 				callee->callsite);
@@ -12468,7 +12557,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 		state->unwound = true;
 	}
-	if (callee->in_callback_fn) {
+	if (callee->in_callback_fn && !unwinds) {
 		/* the helper continues after the barrier of its call */
 		if (state->speculative)
 			return -EACCES;
@@ -12511,7 +12600,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			caller->regs[regno] = callee->regs[regno];
 			bpf_diag_mod_end(env);
 		}
-		hide_returned_stack_ptrs(env, callee->subprogno, caller->regs);
+		hide_returned_stack_ptrs(env, nregs, caller->regs);
 	}
 
 	/* Invalidate callee-local dynptrs and their slices before the frame goes away. */
@@ -12528,6 +12617,14 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 
 	/* for callbacks like bpf_loop or bpf_for_each_map_elem go back to callsite,
 	 * there function call logic would reschedule callback visit.
+	 */
+	/*
+	 * A callback that unwound goes back to the call too: the helper has
+	 * effects of its own to apply, such as releasing what it consumed. With
+	 * the state marked unwound it is the last round, and r0 is still what
+	 * the callback unwound with after the call, with the effects of the
+	 * helper applied to it. See push_callback_call(), check_helper_call()
+	 * and check_kfunc_call().
 	 */
 	if (callee->in_callback_fn)
 		*insn_idx = callee->callsite;
@@ -12974,7 +13071,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	const struct bpf_func_proto *fn = NULL;
 	enum bpf_return_type ret_type;
 	enum bpf_type_flag ret_flag;
-	struct bpf_reg_state *regs;
+	struct bpf_reg_state *regs, unwound_r0;
 	struct bpf_call_arg_meta meta;
 	const char *operation;
 	int insn_idx = *insn_idx_p;
@@ -13224,12 +13321,25 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 
 	/* reset caller saved regs */
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/*
+	 * The callback unwound: the helper leaves to the pad after the call
+	 * with the r0 of the callback, which prepare_func_exit() put here and
+	 * which the effects of the helper above apply to like to any register.
+	 * There is no return, and r0 isn't written.
+	 */
+	if (env->cur_state->unwound)
+		unwound_r0 = regs[BPF_REG_0];
+	else
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		bpf_mark_reg_not_init(env, &regs[caller_saved[i]]);
 		check_reg_arg(env, caller_saved[i], DST_OP_NO_MARK);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* update return register (already marked as written above) */
 	ret_type = fn->ret_type;
@@ -13416,7 +13526,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 
 	bpf_diag_mod_end(env);
-
+unwound:
 	err = check_map_func_compatibility(env, meta.map.ptr, func_id);
 	if (err)
 		return err;
@@ -15784,7 +15894,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
 	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
-	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_call_arg_meta meta;
@@ -16075,13 +16185,23 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	bpf_diag_record_caller_saved(env, regs);
-	bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	/* The callback unwound: r0 is the callback's, see check_helper_call() */
+	if (env->cur_state->unwound) {
+		unwound_r0 = regs[BPF_REG_0];
+		ret_nregs = 0;
+	} else {
+		bpf_diag_mod_begin(env, &regs[BPF_REG_0], NULL, BPF_DIAG_MOD_WRITE);
+	}
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
 		u32 regno = caller_saved[i];
 
 		bpf_mark_reg_not_init(env, &regs[regno]);
 	}
 	invalidate_outgoing_stack_args(env, cur_func(env));
+	if (env->cur_state->unwound) {
+		regs[BPF_REG_0] = unwound_r0;
+		goto unwound;
+	}
 
 	/* Check return type */
 	t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
@@ -16269,6 +16389,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+unwound:
 	if (is_kfunc_dynptr_write(&meta) ?
 	    dynptr_write_changes_pkt_data(meta.dynptr_write_type) :
 	    bpf_is_kfunc_pkt_changing(&meta))

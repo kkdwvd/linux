@@ -63,7 +63,8 @@ enum bpf_mul_variant {
 enum bpf_cond_pseudo_jmp {
 	BPF_MAY_GOTO = 0,
 	/*
-	 * Follows a call of a bpf subprog. Taken when the subprog left with
+	 * Follows a call of a bpf subprog, callx, or a call of a helper or kfunc
+	 * that calls a callback. Taken when the subprog or the callback left with
 	 * BPF_EXIT that has src_reg == BPF_UNWIND_EXIT.
 	 */
 	BPF_UNWIND_GOTO = 1,

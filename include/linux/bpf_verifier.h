@@ -1233,6 +1233,18 @@ struct bpf_subprog_info {
 	u16 max_out_stack_arg_cnt;
 };
 
+/*
+ * The subprog can leave with unwind_exit: one of its own, or the one that the check of
+ * a recursive subprog gets, see bpf_insert_recursion_checks(). Whoever calls it needs a
+ * pad. A call insn and callx are known to have one where bail_unwinds is computed. A
+ * helper that gets the subprog from a table of functions as its callback is known in the
+ * main pass only, where a subprog can still be marked recursive for no reason.
+ */
+static inline bool bpf_subprog_unwinds(const struct bpf_subprog_info *sub)
+{
+	return sub->can_unwind || (sub->recursive && sub->bail_unwinds);
+}
+
 static inline u16 bpf_in_stack_arg_cnt(const struct bpf_subprog_info *sub)
 {
 	if (sub->stack_args_from_code)
