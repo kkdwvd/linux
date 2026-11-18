@@ -41,6 +41,8 @@ extern void bpf_task_release(struct task_struct *p) __ksym;
 /* The verifier doesn't know what is in there */
 unsigned long zero;
 unsigned long dive;
+/* Which of two ways a prog takes. The runner takes both. */
+unsigned long path;
 
 /* The frames of a recursion that began, and how many times the code behind a throw ran */
 unsigned long frames;
@@ -56,7 +58,7 @@ struct held_state {
 	int irq;	/* the bit of the IRQ flags that tells whether interrupts are on */
 	int users;	/* the references to the task that runs the prog */
 	int spin;	/* the word of spin_a: not 0 while it is locked */
-	int res;	/* the same for res_a and res_b together */
+	int res;	/* the same for res_a, res_b and the lock in res_locks together */
 };
 
 /* When the prog was entered, and when the frames were gone */
@@ -68,6 +70,39 @@ struct held_state before, after;
 private(A) struct bpf_spin_lock spin_a;
 private(B) struct bpf_res_spin_lock res_a;
 private(C) struct bpf_res_spin_lock res_b;
+
+/* With two elements only a pointer to the element leads to its lock */
+struct res_elem {
+	long pad;
+	struct bpf_res_spin_lock lock;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, int);
+	__type(value, struct res_elem);
+} res_locks SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} ringbuf SEC(".maps");
+
+/* r0 = the element of @map that the progs lock */
+#define asm_lookup(map)				\
+	"r1 = 1;"				\
+	"*(u32 *)(r10 - 4) = r1;"		\
+	"r2 = r10;"				\
+	"r2 += -4;"				\
+	"r1 = %[" #map "] ll;"			\
+	"call %[bpf_map_lookup_elem];"
+
+/* r0 = a reference to the task that runs the prog, NULL if there is none to have */
+#define asm_acquire				\
+	"call %[bpf_get_current_task_btf];"	\
+	"r1 = r0;"				\
+	"call %[bpf_task_acquire];"
 
 /* The bit of the flags that bpf_local_irq_save() saves which tells whether interrupts were on */
 #if defined(bpf_target_x86)
@@ -92,6 +127,14 @@ static __always_inline __u32 lock_word(void *lock)
 	return word;
 }
 
+/* The word of the lock in an element of res_locks */
+static __always_inline __u32 elem_lock_word(int key)
+{
+	struct res_elem *elem = bpf_map_lookup_elem(&res_locks, &key);
+
+	return elem ? lock_word(&elem->lock) : 0;
+}
+
 static __always_inline void note(struct held_state *s)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -110,6 +153,7 @@ static __always_inline void note(struct held_state *s)
 	s->users = task->rcu_users.refs.counter;
 	s->spin = lock_word(&spin_a);
 	s->res = lock_word(&res_a) | lock_word(&res_b);
+	s->res |= elem_lock_word(0) | elem_lock_word(1);
 }
 
 /* Every prog calls it first. Returns 0 if the prog may go on: a lock that is held would hang it. */
@@ -710,6 +754,807 @@ __naked void without_perfmon(void)
 		"exit;"
 		:
 		: __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/*
+ * The progs below throw where nothing behind bpf_throw() reads the handle, as behind a call
+ * that a compiler knows not to return. bpf_throw() reads for the pads: the registers and the
+ * stack slots that may have a handle, and no others, see "Handles" in liveness.c. Each prog has
+ * its handle where another insn left it.
+ */
+
+/* The kfunc left it in r0, and a move in r6 */
+SEC("tc")
+__description("cancel throw: a reference in r6 that nothing reads behind bpf_throw()")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(111) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__xlated("r1 = *(u64 *)(r10 -{{[0-9]+}})")
+__xlated("call pc+")
+__exception_cb(thrown)
+__naked void handle_in_r6(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r0 = 0;"
+		"r1 = 11;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/* A spill left it in a slot */
+SEC("tc")
+__description("cancel throw: a reference in a stack slot that nothing reads behind bpf_throw()")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(112) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_in_slot(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r0 = 0;"
+		"r1 = 12;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/* A fill left it in r6, and a number took its place in the slot */
+SEC("tc")
+__description("cancel throw: a reference that was filled from the stack")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(126) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("exit")
+__xlated("*(u64 *)(r10 -{{[0-9]+}}) = r1")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_filled(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"call %[bpf_get_prandom_u32];"
+		"r6 = *(u64 *)(r10 - 8);"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = 26;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_get_prandom_u32),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/* A store through a pointer to the stack left it in a slot, which the insn does not name */
+SEC("tc")
+__description("cancel throw: a reference that was spilled through a pointer to the stack")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(113) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_through_pointer(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"*(u64 *)(r2 + 8) = r0;"
+		"r0 = 0;"
+		"r1 = 13;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+static __noinline __used struct task_struct *acquires(void)
+{
+	return bpf_task_acquire(bpf_get_current_task_btf());
+}
+
+/* A static subprog returned it */
+SEC("tc")
+__description("cancel throw: a reference that a subprog returned")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(114) __log_level(4)
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_returned(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"call acquires;"
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r0 = 0;"
+		"r1 = 14;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/* It gets a reference in r1 and the cookie in r2, and throws with the reference in r6 */
+__naked __noinline __used
+static unsigned long throws_with(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = r2;"
+		"call %[bpf_get_prandom_u32];"
+		"r1 = r7;"
+		"call %[bpf_throw];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/*
+ * The caller gave it away in an argument, see bpf_cancel_ref_moves(): it is the callee's, in
+ * a register that the callee moved its argument to.
+ */
+SEC("tc")
+__description("cancel throw: a reference that the frame got in an argument")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(115) __log_level(4)
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_given_to_callee(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"r2 = 15;"
+		"call throws_with;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire)
+		: __clobber_all
+	);
+}
+
+#ifdef CAN_USE_CALLX
+/* callx calls a subprog whose address is taken, and each of them gets what callx passes */
+SEC("tc")
+__description("cancel throw: a reference that the frame got in an argument of callx")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(127) __log_level(4)
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_given_through_callx(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"r2 = 27;"
+		"r3 = %[throws_with] ll;"
+		"callx r3;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm_addr(throws_with)
+		: __clobber_all
+	);
+}
+#endif
+
+/* It stores a reference where r1 points, and returns whether it did */
+__naked __noinline __used
+static unsigned long acquires_into(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r6 + 0) = r0;"
+		"r0 = 1;"
+	"1:"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire)
+		: __clobber_all
+	);
+}
+
+/* A callee stored it into a slot of the frame, through the pointer that it was given */
+SEC("tc")
+__description("cancel throw: a reference that a callee stored into the stack of the frame")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(116) __log_level(4)
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_stored_by_callee(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call acquires_into;"
+		"if r0 == 0 goto 1f;"
+		"r1 = 16;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/* It reads the stack of its caller through r1 and throws the cookie in r2 */
+__naked __noinline __used
+static unsigned long reads_and_throws(void)
+{
+	asm volatile (
+		"r3 = *(u64 *)(r1 + 0);"
+		"r1 = r2;"
+		"call %[bpf_throw];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_throw)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame that waits in the call has it in a slot, and nothing reads the slot behind the
+ * call, which does not return. The callee has a pointer to that stack, so its bpf_throw()
+ * reads there too: the slot that may have a handle, fp-8.
+ */
+SEC("tc")
+__description("cancel throw: a reference in a stack slot of the frame below")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(117) __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_in_slot_below(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 16) = r1;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 17;"
+		"call reads_and_throws;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire)
+		: __clobber_all
+	);
+}
+
+/*
+ * A lock in one of two elements of a map: the pad unlocks through a pointer into the element.
+ * The lookup left one in r0, and a move and an addition the pointer to the lock in r6.
+ */
+SEC("tc")
+__description("cancel throw: a lock in a map value, a register points to the lock")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(118) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("exit")
+__xlated("*(u64 *)(r10 -{{[0-9]+}}) = r1")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void lock_in_map_value(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_lookup(res_locks)
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r6 += 8;"
+		"r1 = r6;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 1f;"
+		"r1 = 18;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_res_spin_lock),
+		  __imm(bpf_throw),
+		  __imm_addr(res_locks)
+		: __clobber_all
+	);
+}
+
+/* The callback of bpf_for_each_map_elem(): it keeps the first value for its caller */
+static __noinline __used int keeps_value(struct bpf_map *map, int *key, struct res_elem *val,
+					  struct res_elem **out)
+{
+	*out = val;
+	return 1;
+}
+
+/*
+ * The helper passed the pointer to the element to its callback, which stored it into the
+ * stack of the frame, through the pointer that the helper passed on. A fill and an addition
+ * left the pointer to the lock in r6.
+ */
+SEC("tc")
+__description("cancel throw: a lock in a map value that a callback stored the pointer to")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(128) __log_level(4)
+__xlated("exit")
+__xlated("*(u64 *)(r10 -{{[0-9]+}}) = r1")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void lock_pointer_from_callback(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = %[res_locks] ll;"
+		"r2 = %[keeps_value] ll;"
+		"r3 = r10;"
+		"r3 += -8;"
+		"r4 = 0;"
+		"call %[bpf_for_each_map_elem];"
+		"r6 = *(u64 *)(r10 - 8);"
+		"if r6 == 0 goto 1f;"
+		"r6 += 8;"
+		"r1 = r6;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 1f;"
+		"r1 = 28;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_for_each_map_elem),
+		  __imm(bpf_res_spin_lock),
+		  __imm(bpf_throw),
+		  __imm_addr(res_locks),
+		  __imm_addr(keeps_value)
+		: __clobber_all
+	);
+}
+
+/*
+ * One of two locks in global variables, which the prog chose at run time: each visit of
+ * bpf_throw() holds a lock at another address, and both have the pointer to it in r6, where
+ * ld_imm64 left it. The pad unlocks through r6.
+ */
+SEC("tc")
+__description("cancel throw: one of two locks in global variables, a register points to it")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(119) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void lock_chosen_at_run_time(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r6 = %[res_a] ll;"
+		"r1 = %[path] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"r6 = %[res_b] ll;"
+	"2:"
+		"r1 = r6;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 1f;"
+		"r1 = 19;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_res_spin_lock),
+		  __imm(bpf_throw),
+		  __imm_addr(res_a),
+		  __imm_addr(res_b),
+		  __imm_addr(path)
+		: __clobber_all
+	);
+}
+
+/*
+ * The paths that meet in front of bpf_throw() have the handle in different slots, and a number
+ * in the other one. Both slots may have a handle, so both are live there: the states stay
+ * apart, and no pad is right for both. If the slots were dead the states would be one, with
+ * its handle in a place that the other path has a number in.
+ */
+SEC("tc")
+__description("cancel throw: a reference in one of two stack slots is rejected")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure
+__msg("no throw can leave the frame at this bpf_throw(): the frame holds a resource on some paths only, in more than one place")
+__msg("(places)")
+__naked void handle_in_one_of_two_slots(void)
+{
+	asm volatile (
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"*(u64 *)(r10 - 16) = r1;"
+		"r1 = %[path] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"goto 3f;"
+	"2:"
+		"*(u64 *)(r10 - 16) = r0;"
+	"3:"
+		"r0 = 0;"
+		"r1 = 20;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_throw),
+		  __imm_addr(path)
+		: __clobber_all
+	);
+}
+
+/*
+ * One path has a second copy of the handle in a slot and the other one in r6, and both have
+ * one in r7. All three places are live at bpf_throw(), the states stay apart, and their visits
+ * agree on r7, see cancel_agree_on_places().
+ */
+SEC("tc")
+__description("cancel throw: a reference in a slot or in a register, and in one more on both paths")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(121) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = r7")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void handle_in_slot_or_reg(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r7 = r0;"
+		"r6 = 0;"
+		"*(u64 *)(r10 - 8) = r6;"
+		"r1 = %[path] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"goto 3f;"
+	"2:"
+		"r6 = r0;"
+	"3:"
+		"r0 = 0;"
+		"r1 = 21;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_throw),
+		  __imm_addr(path)
+		: __clobber_all
+	);
+}
+
+/*
+ * One path holds a reference, in r6, and the other one has 0 there and holds nothing. The
+ * frame has a drop flag for the reference, and the pad releases from r6 if the flag is set.
+ */
+SEC("tc")
+__description("cancel throw: a reference that one path holds takes a drop flag")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(122) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = *(u8 *)(r10 -{{[0-9]+}})")
+__xlated("if r1 == 0x0 goto pc+")
+__xlated("r1 = r6")
+__xlated("call kernel-function")
+__exception_cb(thrown)
+__naked void held_on_one_path(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r6 = 0;"
+		"r1 = %[path] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		asm_acquire
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+	"2:"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 3f;"
+		"if r6 == 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+	"3:"
+		"r1 = 22;"
+		"call %[bpf_throw];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_task_btf),
+		  __imm(bpf_task_acquire),
+		  __imm(bpf_task_release),
+		  __imm(bpf_throw),
+		  __imm_addr(path),
+		  __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/* It throws in a round of its loop, with the iterator and a reference of the round */
+static __noinline int loops_and_throws(u64 c)
+{
+	struct task_struct *task;
+	int i;
+
+	bpf_for(i, 0, 8) {
+		task = bpf_task_acquire(bpf_get_current_task_btf());
+		if (!task)
+			break;
+		if (i == 3 && !zero)
+			bpf_throw(c);
+		bpf_task_release(task);
+	}
+	behind++;
+	return 0;
+}
+
+/*
+ * The iterator is in the stack of the callee, whose pad destroys it. An iterator is found by
+ * its address, in slots that are compared whether they are live or not: bpf_throw() reads
+ * none of them for it.
+ */
+SEC("tc")
+__description("cancel throw: an iterator and a reference of a callee, IRQ flags of its caller")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(123) __log_level(4)
+__msg("cancel sites 2 padded 2 declined")
+__exception_cb(thrown)
+int iter_in_callee(struct __sk_buff *ctx)
+{
+	unsigned long flags;
+
+	if (enter())
+		return TC_ACT_OK;
+	bpf_local_irq_save(&flags);
+	loops_and_throws(23);
+	behind++;
+	bpf_local_irq_restore(&flags);
+	return TC_ACT_OK;
+}
+
+/* A helper acquired it: a record of a ringbuf, which the pad discards */
+SEC("tc")
+__description("cancel throw: a ringbuf record in r6 that nothing reads behind bpf_throw()")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(124) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("r1 = r6")
+__xlated("r2 = 0")
+__xlated("call unknown")
+__exception_cb(thrown)
+__naked void ringbuf_record_in_r6(void)
+{
+	asm volatile (
+		"call enter;"
+		"if r0 != 0 goto 1f;"
+		"r1 = %[ringbuf] ll;"
+		"r2 = 8;"
+		"r3 = 0;"
+		"call %[bpf_ringbuf_reserve];"
+		"if r0 == 0 goto 1f;"
+		"r6 = r0;"
+		"r0 = 0;"
+		"r1 = 24;"
+		"call %[bpf_throw];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_ringbuf_reserve),
+		  __imm(bpf_throw),
+		  __imm_addr(ringbuf)
+		: __clobber_all
+	);
+}
+
+/*
+ * A helper made it of the reference: bpf_sk_fullsock() returns the socket that it was given,
+ * with the id of its reference. It is the only handle that is left when the prog throws.
+ */
+SEC("tc")
+__description("cancel throw: a socket that bpf_sk_fullsock() returned for a reference")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(0) __log_level(4)
+__msg("cancel sites 1 padded 1 declined")
+__xlated("exit")
+__xlated("*(u64 *)(r10 -{{[0-9]+}}) = r1")
+__xlated("r1 = r6")
+__xlated("call unknown")
+__naked void socket_cast_in_r6(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"*(u64 *)(r10 - 16) = r1;"
+		"r1 = r6;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"r3 = %[tuple_size];"
+		"r4 = %[netns];"
+		"r5 = 0;"
+		"call %[bpf_sk_lookup_tcp];"
+		"if r0 == 0 goto 1f;"
+		"r7 = r0;"
+		"r1 = r7;"
+		"call %[bpf_sk_fullsock];"
+		"if r0 == 0 goto 2f;"
+		"r6 = r0;"
+		"r7 = 0;"
+		"r1 = 0;"
+		"call %[bpf_throw];"
+	"2:"
+		"r1 = r7;"
+		"call %[bpf_sk_release];"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_sk_lookup_tcp),
+		  __imm(bpf_sk_fullsock),
+		  __imm(bpf_sk_release),
+		  __imm(bpf_throw),
+		  __imm_const(tuple_size, sizeof(((struct bpf_sock_tuple *)0)->ipv4)),
+		  __imm_const(netns, BPF_F_CURRENT_NETNS)
 		: __clobber_all
 	);
 }

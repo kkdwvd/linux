@@ -13,6 +13,7 @@ struct held_state {
 };
 
 #include "cancel_throw.skel.h"
+#include "cancel_throw_cost.skel.h"
 
 /* What thrown() of progs/cancel_throw.c adds to the cookie */
 #define THROWN	100
@@ -113,9 +114,35 @@ static void cancelled(struct cancel_throw *skel, struct bpf_program *prog)
 	released(skel, prog);
 }
 
+static int on_record(void *ctx, void *data, size_t size)
+{
+	(*(int *)ctx)++;
+	return 0;
+}
+
+/*
+ * The record that @prog reserved is discarded: the consumer finds nothing, and nothing that
+ * stops it. A record that was neither submitted nor discarded stays in front of it for good.
+ */
+static void discarded(struct cancel_throw *skel, struct bpf_program *prog)
+{
+	struct ring_buffer *rb;
+	int records = 0;
+
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.ringbuf), on_record, &records, NULL);
+	if (!ASSERT_OK_PTR(rb, "ring_buffer__new"))
+		return;
+	ring_buffer__consume(rb);
+	ASSERT_EQ(records, 0, what(prog, "records"));
+	ASSERT_EQ(ring__avail_data_size(ring_buffer__ring(rb, 0)), 0, what(prog, "ringbuf"));
+	ring_buffer__free(rb);
+}
+
 void test_cancel_throw(void)
 {
+	struct bpf_program *prog;
 	struct cancel_throw *skel;
+	int path;
 
 	/* The interpreter runs no pads. */
 	if (!is_jit_enabled()) {
@@ -125,6 +152,8 @@ void test_cancel_throw(void)
 
 	/* what the verifier says about the progs, and what those return that always do the same */
 	RUN_TESTS(cancel_throw);
+	/* and that what bpf_throw() keeps live for the pads leaves them few states */
+	RUN_TESTS(cancel_throw_cost);
 
 #if !defined(__x86_64__) && !defined(__aarch64__)
 	return;
@@ -136,6 +165,7 @@ void test_cancel_throw(void)
 	bpf_program__set_autoload(skel->progs.handle_gone, false);
 	bpf_program__set_autoload(skel->progs.handle_in_r2, false);
 	bpf_program__set_autoload(skel->progs.handle_dead_at_call, false);
+	bpf_program__set_autoload(skel->progs.handle_in_one_of_two_slots, false);
 	if (!ASSERT_OK(cancel_throw__load(skel), "cancel_throw__load"))
 		goto out;
 
@@ -157,6 +187,36 @@ void test_cancel_throw(void)
 		cancelled(skel, skel->progs.cancelled_or_thrown);
 		throws(skel, skel->progs.passed_on, 9);
 		cancelled(skel, skel->progs.passed_on);
+	}
+	/* nothing behind bpf_throw() reads the handle: the pad finds it where bpf_throw() reads */
+	if (test__start_subtest("places")) {
+		throws(skel, skel->progs.handle_in_r6, 11);
+		throws(skel, skel->progs.handle_in_slot, 12);
+		throws(skel, skel->progs.handle_filled, 26);
+		throws(skel, skel->progs.handle_through_pointer, 13);
+		throws(skel, skel->progs.handle_returned, 14);
+		throws(skel, skel->progs.handle_given_to_callee, 15);
+		throws(skel, skel->progs.handle_stored_by_callee, 16);
+		throws(skel, skel->progs.handle_in_slot_below, 17);
+		throws(skel, skel->progs.lock_in_map_value, 18);
+		throws(skel, skel->progs.lock_pointer_from_callback, 28);
+		/* where the compiler and the JIT have callx */
+		prog = bpf_object__find_program_by_name(skel->obj, "handle_given_through_callx");
+		if (prog)
+			throws(skel, prog, 27);
+		throws(skel, skel->progs.iter_in_callee, 23);
+		throws(skel, skel->progs.ringbuf_record_in_r6, 24);
+		discarded(skel, skel->progs.ringbuf_record_in_r6);
+	}
+	/* the states of two paths are apart at bpf_throw(), and one pad is right for both */
+	if (test__start_subtest("two paths")) {
+		for (path = 0; path < 2; path++) {
+			skel->bss->path = path;
+			throws(skel, skel->progs.lock_chosen_at_run_time, 19);
+			throws(skel, skel->progs.handle_in_slot_or_reg, 21);
+			throws(skel, skel->progs.held_on_one_path, 22);
+		}
+		skel->bss->path = 0;
 	}
 	if (test__start_subtest("no callback")) {
 		reset(skel);
