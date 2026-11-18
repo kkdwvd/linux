@@ -478,9 +478,16 @@ void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog)
 {
 	struct bpf_subprog_info *info = subprog_info(env, subprog);
 
+	info->is_exception_cb = true;
+	/*
+	 * bpf_throw() calls it from C code, on the stack of the main program whose frames
+	 * are gone: a callback that the kernel enters. Where the frames leave through pads
+	 * the pad of the main program calls it, like any function.
+	 */
+	if (bpf_cancel_covers_throw(env))
+		return;
 	info->is_cb = true;
 	info->is_async_cb = true;
-	info->is_exception_cb = true;
 }
 
 static bool subprog_is_exc_cb(struct bpf_verifier_env *env, int subprog)
@@ -5546,6 +5553,12 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 		/* the callees of callx and the callbacks of helpers */
 		for (i = si[s].callx_edge; i && !err; i = env->callx_edges[i - 1].next)
 			err = bpf_call_graph_add(cg, s, env->callx_edges[i - 1].callee);
+		/*
+		 * Where the frames of bpf_throw() leave through pads, the pad of the main
+		 * program calls the exception callback: its frames come on top of that one.
+		 */
+		if (!s && !err && env->exception_callback_subprog && bpf_cancel_covers_throw(env))
+			err = bpf_call_graph_add(cg, 0, env->exception_callback_subprog);
 	}
 	if (err)
 		return err;
@@ -5557,6 +5570,8 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 	bpf_call_graph_mark_callees(cg, CG_LIVE);
 	for_each_marked_subprog(cg, s, CG_LIVE)
 		cg->marks[s] |= (si[s].is_cb ? CG_CB | CG_IN_CB : 0) |
+				/* called by a pad it is no callback, but check_callbacks() is for it */
+				(si[s].is_exception_cb ? CG_IN_CB : 0) |
 				(si[s].is_async_cb ? CG_IN_ASYNC_CB : 0) |
 				(bpf_call_graph_recursive(cg, s) ? CG_IN_RECURSION : 0) |
 				(si[s].has_tail_call ? CG_TAIL_CALL : 0) |
@@ -5594,13 +5609,35 @@ static int find_call_insn(struct bpf_verifier_env *env, int caller, int callee)
 	return i;
 }
 
-/* The exception callback is an async callback, so only a call is an edge to it */
+/* Whether an insn of subprog @s calls subprog @callee, like the edge between them says */
+static bool insn_calls_subprog(struct bpf_verifier_env *env, int s, int callee)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	struct bpf_insn *insn = env->prog->insnsi;
+	u32 i;
+
+	for (i = si[s].callx_edge; i; i = env->callx_edges[i - 1].next)
+		if (env->callx_edges[i - 1].callee == callee)
+			return true;
+	for (i = si[s].start; i < si[s + 1].start; i++)
+		if (bpf_pseudo_call(insn + i) && env->insn_aux_data[i].seen &&
+		    i + insn[i].imm + 1 == si[callee].start)
+			return true;
+	return false;
+}
+
+/*
+ * The exception callback is an async callback, so only a call is an edge to it. Or the pad
+ * of the main program calls it, see build_call_graph(): that edge is no call of the program.
+ */
 static int check_exception_cb(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	int cb = env->exception_callback_subprog, s;
 
 	for_each_marked_subprog(cg, s, CG_LIVE) {
 		if (!cb || !subprog_calls(cg, s, cb))
+			continue;
+		if (!s && bpf_cancel_covers_throw(env) && !insn_calls_subprog(env, 0, cb))
 			continue;
 		verbose(env, "insn %d cannot call exception cb directly\n",
 			find_call_insn(env, s, cb));
@@ -12137,7 +12174,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			branch->unwound = true;
 		}
 
-		if (env->subprog_info[subprog].might_throw) {
+		/* with pads the call is a site like any other, and its pad releases */
+		if (env->subprog_info[subprog].might_throw && !bpf_cancel_covers_throw(env)) {
 			struct bpf_verifier_state *branch;
 
 			branch = push_stack(env, *insn_idx + 1, *insn_idx, false);
@@ -16356,6 +16394,18 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			err = check_return_code(env, BPF_REG_1, "R1");
 			if (err < 0)
 				return err;
+		}
+		/*
+		 * What the frame holds in front of the throw, for the pad that releases it.
+		 * The frames leave through pads or not at all: nothing discards them.
+		 */
+		if (bpf_cancel_covers_throw(env)) {
+			err = bpf_cancel_record(env, BPF_CANCEL_SITE_THROW);
+			if (err)
+				return err;
+		} else if (bpf_jit_supports_cancel_throw()) {
+			verbose(env, "bpf_throw() needs CAP_PERFMON: the frames leave through pads\n");
+			return -EACCES;
 		}
 	}
 
@@ -20973,6 +21023,13 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	if (!exception_exit && !env->cur_state->curframe && env->cur_state->flow_entry)
 		return exit_func_on_its_own(env);
 
+	/*
+	 * The pads of the frames release what they hold when the program throws, see
+	 * bpf_cancel_record(), and the program is not loaded when a pad cannot.
+	 */
+	if (exception_exit && bpf_cancel_covers_throw(env))
+		return PROCESS_BPF_EXIT;
+
 	/* We must do check_reference_leak here before
 	 * prepare_func_exit to handle the case when
 	 * state->curframe > 0, it may be a callback function,
@@ -21302,12 +21359,17 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		if (opcode == BPF_CALL) {
 			if (env->cur_state->active_locks) {
-				/* similar to static subprog calls callx is allowed under a lock */
+				/*
+				 * Similar to static subprog calls callx is allowed under a lock.
+				 * So is bpf_throw() where the pads of the frames unlock: the
+				 * kfunc is not called, see bpf_cancel_replace_throws().
+				 */
 				if (!bpf_is_callx(insn) &&
 				    ((insn->src_reg == BPF_REG_0 &&
 				      insn->imm != BPF_FUNC_spin_unlock &&
 				      insn->imm != BPF_FUNC_kptr_xchg) ||
 				     (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
+				      !(bpf_is_throw_kfunc(insn) && bpf_cancel_covers_throw(env)) &&
 				      !kfunc_spin_allowed(env, insn->imm, insn->off)))) {
 					verbose(env,
 						"function calls are not allowed while holding a lock\n");

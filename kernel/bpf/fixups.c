@@ -1089,7 +1089,9 @@ void bpf_lower_cast_mov(struct bpf_verifier_env *env)
  *  - the main program takes a stack when it starts and returns it when it exits:
  *    the stack of the cpu when it's free, without a call.
  *    See struct bpf_arena_cpu_stack. So does a callback.
- *    bpf_throw() doesn't return it: the stack stays taken until the arena is freed.
+ *    Where bpf_throw() discards the frames it doesn't return it: the stack stays taken
+ *    until the arena is freed. Where they leave through pads, the pad of the main
+ *    program exits like the program does, see bpf_cancel_covers_throw().
  *  - a function that has a frame drops it before exit.
  *  - 'rX = r12' gives the address like user space sees it, as other addresses
  *    in arena are.
@@ -2016,8 +2018,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->can_cancel = env->subprog_info[i].can_cancel;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
 		func[i]->aux->token = prog->aux->token;
+		/* no frame is discarded where the frames of bpf_throw() leave through pads */
 		if (!i)
-			func[i]->aux->exception_boundary = env->seen_exception;
+			func[i]->aux->exception_boundary = env->seen_exception &&
+							   !bpf_cancel_covers_throw(env);
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -2544,7 +2548,9 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
 
-	if (env->seen_exception && !env->exception_callback_subprog) {
+	/* the pad of the main program returns the cookie itself, see bpf_cancel_covers_throw() */
+	if (env->seen_exception && !env->exception_callback_subprog &&
+	    !bpf_cancel_covers_throw(env)) {
 		struct bpf_insn *patch = insn_buf;
 
 		*patch++ = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);

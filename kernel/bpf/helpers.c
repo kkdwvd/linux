@@ -3460,6 +3460,12 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	return false;
 }
 
+/*
+ * Discard the frames of the program and enter its exception callback in the frame of the
+ * main program. No program calls this where its frames leave through pads instead, see
+ * bpf_cancel_replace_throws(): there the callback is a function that the pad of the main
+ * program calls.
+ */
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
 	struct bpf_throw_ctx ctx = {};
