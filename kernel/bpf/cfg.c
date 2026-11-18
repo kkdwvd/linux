@@ -590,17 +590,20 @@ enum {
  *   f1: r1 = map ll  --+
  *                      +--> node of the map --> all functions in the map
  *   f2: r1 = map ll  --+
+ *
+ * [WIP] callx of a number may call any function whose address is taken, see
+ * check_scalar_callx(): one more node goes to all of them.
  */
 static int merge_callee_effects(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
 	struct bpf_insn *insn = env->prog->insnsi;
-	u32 cnt = env->subprog_cnt, n, s, t;
+	u32 cnt = env->subprog_cnt, n, s, t, any_func = cnt + env->used_map_cnt;
 	struct bpf_call_graph cg;
 	struct bpf_func_ptr *ptr;
 	int err;
 
-	err = bpf_call_graph_init(&cg, cnt + env->used_map_cnt);
+	err = bpf_call_graph_init(&cg, any_func + 1);
 	for (s = 0; s < cnt && !err; s++) {
 		cg.marks[s] = (si[s].changes_pkt_data ? CHANGES_PKT_DATA : 0) |
 			      (si[s].might_sleep ? MIGHT_SLEEP : 0) |
@@ -613,6 +616,8 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 				 insn[t].src_reg != BPF_PSEUDO_BTF_ID)
 				err = bpf_call_graph_add(&cg, s,
 							 cnt + env->insn_aux_data[t].map_index);
+			else if (env->scalar_callx && bpf_is_callx(&insn[t]))
+				err = bpf_call_graph_add(&cg, s, any_func);
 		}
 	}
 	for (s = 0; s < env->used_map_cnt; s++) {
@@ -622,6 +627,13 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 			      bpf_call_graph_add(&cg, cnt + s,
 						 bpf_find_subprog(env, ptr->xlated_off));
 	}
+	/* [WIP] any_func comes last: callers come in increasing order, see bpf_call_graph_add() */
+	for (t = 0; t < env->prog->len && env->scalar_callx && !err; t++)
+		if (bpf_pseudo_func(&insn[t]))
+			err = bpf_call_graph_add(&cg, any_func, bpf_find_subprog(env,
+						 t + insn[t].imm + 1));
+	for (s = 0; s < env->used_map_cnt && env->scalar_callx && !err; s++)
+		err = bpf_call_graph_add(&cg, any_func, cnt + s);
 	if (err)
 		goto out;
 	bpf_call_graph_sort(&cg, 0);
