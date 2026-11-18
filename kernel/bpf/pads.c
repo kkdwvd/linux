@@ -410,6 +410,9 @@ BTF_ID(func, bpf_percpu_obj_drop)
 /* It releases the dynptr of bpf_dynptr_from_file() */
 BTF_ID_LIST_SINGLE(pad_file_discard, func, bpf_dynptr_file_discard)
 
+/* It frees a coroutine frame, see kernel/bpf/coro.c */
+BTF_ID_LIST_SINGLE(pad_coro_frame_free, func, bpf_coro_frame_free)
+
 static struct bpf_insn helper_call(enum bpf_func_id func_id)
 {
 	return BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, func_id);
@@ -488,10 +491,10 @@ static bool reg_is_sock(const struct bpf_reg_state *reg)
 
 /*
  * The call that releases the pointer in @reg. Its type tells: that is all that the verifier asks of
- * the argument of a release, whichever insn acquired the pointer. An object of the program is freed.
- * A kernel object: see btf_find_release_kfunc(). If a kfunc of a module returned the pointer @off is
- * the index of its BTF in fd_array, and that BTF comes first: nf_conn is a type of vmlinux, and the
- * kfuncs for it may be in a module.
+ * the argument of a release, whichever insn acquired the pointer. An object of the program is freed,
+ * and so is a coroutine frame. A kernel object: see btf_find_release_kfunc(). If a kfunc of a
+ * module returned the pointer @off is the index of its BTF in fd_array, and that BTF comes first:
+ * nf_conn is a type of vmlinux, and the kfuncs for it may be in a module.
  */
 static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state *reg, s16 off,
 			struct bpf_insn *release)
@@ -499,6 +502,14 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
 	const struct btf *btf = reg->btf;
 	s32 id = -ENOENT;
 
+	/*
+	 * A coroutine frame of bpf_coro_frame_alloc() is no object of a BTF type: one kfunc of
+	 * vmlinux frees any frame, in any context
+	 */
+	if (base_type(reg->type) == PTR_TO_CORO_FRAME) {
+		*release = BPF_CALL_KFUNC(0, pad_coro_frame_free[0]);
+		return 0;
+	}
 	if (base_type(reg->type) != PTR_TO_BTF_ID)
 		return -ENOENT;
 	if (!btf_is_kernel(btf)) {
