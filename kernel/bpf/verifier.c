@@ -5542,6 +5542,7 @@ enum {
 	CG_ARENA_SP	= BIT(5), /* subprogs that get to r12 */
 	CG_CB		= BIT(6),
 	CG_GLOBAL	= BIT(7),
+	CG_MIGHT_THROW	= BIT(8), /* subprogs that get to bpf_throw */
 };
 
 #define for_each_marked_subprog(cg, s, mark) \
@@ -5594,9 +5595,17 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 				(bpf_call_graph_recursive(cg, s) ? CG_IN_RECURSION : 0) |
 				(si[s].has_tail_call ? CG_TAIL_CALL : 0) |
 				(si[s].uses_arena_sp ? CG_ARENA_SP : 0) |
-				(bpf_subprog_is_global(env, s) ? CG_GLOBAL : 0);
+				(bpf_subprog_is_global(env, s) ? CG_GLOBAL : 0) |
+				(si[s].might_throw ? CG_MIGHT_THROW : 0);
 	bpf_call_graph_mark_callees(cg, CG_IN_CB | CG_IN_ASYNC_CB | CG_IN_RECURSION);
-	bpf_call_graph_mark_callers(cg, CG_TAIL_CALL, 0);
+	bpf_call_graph_mark_callers(cg, CG_TAIL_CALL | CG_MIGHT_THROW, 0);
+	/*
+	 * check_cfg() merged might_throw over the calls and the loads of the
+	 * address of a function. What callx calls throws with the frame of the
+	 * subprog that does callx on the stack, which the attach checks rely on.
+	 */
+	for_each_marked_subprog(cg, s, CG_MIGHT_THROW)
+		si[s].might_throw = true;
 	return 0;
 }
 
@@ -24453,7 +24462,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 		struct bpf_prog_aux *aux = tgt_prog->aux;
 		bool tgt_changes_pkt_data;
 		bool tgt_might_sleep;
-		bool tgt_can_unwind, tgt_can_cancel;
+		bool tgt_can_unwind, tgt_can_cancel, tgt_might_throw;
 
 		if (bpf_prog_is_dev_bound(prog->aux) &&
 		    !bpf_prog_dev_bound_match(prog, tgt_prog)) {
@@ -24498,13 +24507,21 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			bpf_log(log, "Only fentry can attach to %s, which can unwind\n", tname);
 			return -EINVAL;
 		}
-		/* so would cancel_exit: the caller of the target goes on with what is in R0 */
+		/*
+		 * So would cancel_exit: the caller of the target goes on with what is in R0.
+		 * A throw leaves through the same pads where they cover it. Where bpf_throw()
+		 * discards the frames instead, it walks the stack to the frame of the main
+		 * program, which stops at the trampoline that called the subprog, see
+		 * bpf_stack_walker(), and that trampoline would never return. An fentry
+		 * trampoline has returned by the time the subprog runs.
+		 */
 		tgt_can_cancel = subprog && (aux->func ? aux->func[subprog]->aux->can_cancel
 						       : aux->can_cancel);
-		if (tgt_can_cancel && !prog_extension &&
+		tgt_might_throw = aux->func && subprog && aux->func[subprog]->aux->might_throw;
+		if ((tgt_can_cancel || tgt_might_throw) && !prog_extension &&
 		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
-			bpf_log(log, "Only fentry can attach to %s, which can be cancelled\n",
-				tname);
+			bpf_log(log, "Only fentry can attach to %s, which %s\n", tname,
+				tgt_can_cancel ? "can be cancelled" : "might throw");
 			return -EINVAL;
 		}
 		/* What it takes of the stack is not counted, see bpf_insert_recursion_checks() */

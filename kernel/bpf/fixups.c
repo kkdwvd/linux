@@ -2042,6 +2042,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
 		func[i]->aux->can_cancel = env->subprog_info[i].can_cancel;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
+		func[i]->aux->might_throw = env->subprog_info[i].might_throw;
 		func[i]->aux->token = prog->aux->token;
 		/* no frame is discarded where the frames of bpf_throw() leave through pads */
 		if (!i)
