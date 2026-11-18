@@ -28,6 +28,7 @@
 #include "../test_kmods/bpf_testmod.h"
 #include "xdp_tcp.skel.h"
 #include "xdp_tcp_hooks.skel.h"
+#include "xdp_tcp_unwind.skel.h"
 #include "xdp_tcp_xsk.h"
 #include "xsk.h"
 
@@ -2211,6 +2212,199 @@ out:
 	teardown(&c);
 }
 
+/* Run @prog on @frame as received on the device, live when it takes the frame */
+static int unwind_run(struct ctx *c, struct bpf_program *prog, void *frame, int len, bool live)
+{
+	struct xdp_md ctx_in = { .data_end = len, .ingress_ifindex = c->ifindex };
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		    .data_in = frame,
+		    .data_size_in = len,
+		    .ctx_in = &ctx_in,
+		    .ctx_size_in = sizeof(ctx_in),
+		    .flags = live ? BPF_F_TEST_XDP_LIVE_FRAMES : 0,
+		    .repeat = 1);
+
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(prog), &opts),
+		       bpf_program__name(prog)))
+		return -1;
+	return opts.retval;
+}
+
+/* Whether @prog wrote @what to its stderr stream. Reads all of it. */
+static bool stream_has(struct bpf_program *prog, const char *what)
+{
+	LIBBPF_OPTS(bpf_prog_stream_read_opts, ropts);
+	static char stream[16 * 1024];
+	int len = 0, n;
+
+	do {
+		n = bpf_prog_stream_read(bpf_program__fd(prog), BPF_STREAM_STDERR, stream + len,
+					 sizeof(stream) - 1 - len, &ropts);
+		if (n > 0)
+			len += n;
+	} while (n > 0 && len < sizeof(stream) - 1);
+	stream[len] = 0;
+	return what && strstr(stream, what);
+}
+
+/* The references to the connection, as the probe counts them, its own among them */
+static int unwind_sock_refs(struct ctx *c, struct xdp_tcp_unwind *skel, void *frame, int len)
+{
+	skel->bss->sock_refcnt = -1;
+	unwind_run(c, skel->progs.probe_sock, frame, len, false);
+	return skel->bss->sock_refcnt;
+}
+
+/*
+ * The same once the timers that hold a reference have run, which a delayed
+ * ACK does for up to 200 ms: the count has stayed put for 300 ms.
+ */
+static int unwind_settled_refs(struct ctx *c, struct xdp_tcp_unwind *skel, void *frame, int len)
+{
+	int refs = unwind_sock_refs(c, skel, frame, len), now, quiet = 0, i;
+
+	for (i = 0; i < 300 && quiet < 30; i++) {
+		usleep(10000);
+		now = unwind_sock_refs(c, skel, frame, len);
+		quiet = now == refs ? quiet + 1 : 0;
+		refs = now;
+	}
+	return refs;
+}
+
+/* Where the program is unwound, as progs/xdp_tcp_unwind.c has them */
+enum unwind_site {
+	SITE_STACK,
+	SITE_GUARD,
+	SITE_MAY_GOTO,
+	SITE_CALLEE,
+	SITE_FAULT,
+	SITE_THROW,
+	SITE_MAX,
+};
+
+static const struct {
+	const char *name;
+	const char *report;	/* what the program's stream says */
+} unwind_sites[SITE_MAX] = {
+	[SITE_STACK]	= { "stack", "No room in the stack for a call of a recursive function" },
+	[SITE_GUARD]	= { "guard", "Timeout detected for may_goto instruction" },
+	[SITE_MAY_GOTO]	= { "may_goto", "Timeout detected for may_goto instruction" },
+	[SITE_CALLEE]	= { "callee", "Timeout detected for may_goto instruction" },
+	[SITE_FAULT]	= { "fault", "Arena READ access at unmapped address" },
+	[SITE_THROW]	= { "throw", NULL },
+};
+
+/* What the program holds at the site */
+enum unwind_held {
+	HELD_SOCK,	/* the connection */
+	HELD_FRAME,	/* and the frame it took */
+	HELD_VIEW,	/* and a dynptr over the frame, which it reads on both sides */
+	HELD_MAX,
+};
+
+/*
+ * A program that the kernel unwinds at @site while it holds the connection,
+ * and what @held says, has them released by the landing pads that the
+ * verifier emits; one that throws, by the pad of bpf_throw(). The release
+ * kfuncs get the handles the program held, once, and the connection has as
+ * many references as before. The program only looked the segment up, so the
+ * peer sends it again, and the echo answers.
+ *
+ * What the program returns: the kernel's value for XDP, XDP_ABORTED, or the
+ * cookie of the throw. With @cb the exception callback gets that and returns
+ * XDP_DROP in its place. Once the program has taken the frame, neither may
+ * have the driver recycle the buffer, which is no longer the driver's: the
+ * buffer goes through the redirect of XDP_CONSUME, which drops the driver's
+ * reference, it is not returned as a buffer, and the frame goes with the
+ * last of the two references, the program's and the driver's.
+ * A live run returns no verdict, so that is what the test looks at.
+ */
+static void unwind_one(struct ctx *c, struct xdp_tcp_unwind *skel, bool cb,
+		       enum unwind_site site, enum unwind_held held)
+{
+	struct bpf_program *prog = cb ? skel->progs.xdp_tcp_unwind_cb : skel->progs.xdp_tcp_unwind;
+	struct bpf_prog_info info = {};
+	__u32 info_len = sizeof(info);
+	bool steal = held != HELD_SOCK;
+	int len, refs, ret, expected;
+	__u8 frame[FRAME_MAX];
+
+	if (!ASSERT_OK(bpf_prog_get_info_by_fd(bpf_program__fd(prog), &info, &info_len),
+		       "prog info"))
+		return;
+	len = peer_build_raw(&c->peer, frame, TH_ACK | TH_PSH, c->peer.snd_nxt, c->peer.rcv_nxt,
+			     "hello", 5, 0);
+	if (!ASSERT_GT(len, 0, "peer_build_raw"))
+		return;
+	refs = unwind_settled_refs(c, skel, frame, len);
+	if (!ASSERT_GT(refs, 0, "references"))
+		return;
+
+	memset(skel->bss, 0, sizeof(*skel->bss));
+	skel->bss->site = site;
+	skel->bss->steal = steal;
+	skel->bss->view = held == HELD_VIEW;
+	skel->bss->watched_prog = info.id;
+	stream_has(prog, NULL);
+	ret = unwind_run(c, prog, frame, len, steal);
+	skel->bss->watched_prog = 0;
+
+	expected = site == SITE_THROW ? 7 : XDP_ABORTED;
+	if (cb) {
+		ASSERT_EQ(skel->bss->callbacks, 1, "exception callback");
+		ASSERT_EQ(skel->bss->thrown_cookie, expected, "callback value");
+		expected = XDP_DROP;
+	} else {
+		ASSERT_EQ(skel->bss->callbacks, 0, "no exception callback");
+	}
+	if (!steal)
+		ASSERT_EQ(ret, expected, "retval");
+	ASSERT_EQ(skel->bss->behind, 0, "behind");
+	if (site == SITE_STACK)
+		ASSERT_GT(skel->bss->frames, 0, "recursion");
+	if (unwind_sites[site].report)
+		ASSERT_TRUE(stream_has(prog, unwind_sites[site].report), "stream");
+	ASSERT_NEQ(skel->bss->held_sk, 0, "held socket");
+	ASSERT_EQ(skel->bss->released_sk, 1, "socket released");
+	if (steal) {
+		ASSERT_NEQ(skel->bss->held_frame, 0, "held frame");
+		ASSERT_EQ(skel->bss->released_frame, 1, "frame released");
+		ASSERT_EQ(skel->bss->redirected, 1, "consumed redirect");
+		ASSERT_EQ(skel->bss->buff_returned, 0, "buffer not returned");
+		ASSERT_EQ(skel->bss->frame_puts, 2, "frame puts");
+		ASSERT_EQ(skel->bss->last_put_refs, 1, "last reference");
+	}
+	ASSERT_EQ(unwind_sock_refs(c, skel, frame, len), refs, "references after");
+	request_echoed(c, "hello");
+}
+
+static void test_unwind(bool cb, enum unwind_site site)
+{
+	struct xdp_tcp_unwind *skel = NULL;
+	enum unwind_held held;
+	struct ctx c;
+
+#if !defined(__x86_64__) && !defined(__aarch64__)
+	test__skip();
+	return;
+#endif
+	if (setup(&c, AF_INET))
+		return;
+	if (connect_peer(&c, 0))
+		goto out;
+	skel = xdp_tcp_unwind__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "xdp_tcp_unwind__open_and_load"))
+		goto out;
+	if (!ASSERT_OK(xdp_tcp_unwind__attach(skel), "xdp_tcp_unwind__attach"))
+		goto out;
+	for (held = 0; held < HELD_MAX; held++)
+		unwind_one(&c, skel, cb, site, held);
+out:
+	xdp_tcp_unwind__destroy(skel);
+	teardown(&c);
+}
+
 void test_xdp_tcp(void)
 {
 	static const int orders[][3] = {
@@ -2314,4 +2508,12 @@ void test_xdp_tcp(void)
 		test_retransmit();
 	if (test__start_subtest("large_reply"))
 		test_large_reply();
+	for (i = 0; i < SITE_MAX; i++) {
+		snprintf(name, sizeof(name), "unwind_%s", unwind_sites[i].name);
+		if (test__start_subtest(name))
+			test_unwind(false, i);
+		snprintf(name, sizeof(name), "unwind_cb_%s", unwind_sites[i].name);
+		if (test__start_subtest(name))
+			test_unwind(true, i);
+	}
 }
