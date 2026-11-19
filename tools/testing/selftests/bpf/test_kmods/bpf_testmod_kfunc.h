@@ -334,6 +334,10 @@ void bpf_kfunc_call_test_fail3(struct prog_test_fail3 *p);
 void bpf_kfunc_call_test_mem_len_fail1(void *mem, int len);
 
 void bpf_kfunc_common_test(void) __ksym;
+int bpf_kfunc_coro_frames(__u64 cookie, void *a, void *b, __u64 *rdonly_buf) __ksym;
+void bpf_kfunc_coro_frames_release(void *a, void *b) __ksym;
+int bpf_kfunc_coro_frames_stack(void *a, __u64 b, __u64 c, __u64 d, __u64 e,
+				void *f) __ksym;
 
 int bpf_kfunc_init_sock(struct init_sock_args *args) __ksym;
 void bpf_kfunc_close_sock(void) __ksym;
@@ -372,6 +376,8 @@ int *bpf_kfunc_ret_rcu_test_nostruct(int rdonly_buf_size) __ksym;
 #ifndef __KERNEL__
 extern int bpf_kfunc_multi_st_ops_test_1(struct st_ops_args *args, u32 id) __weak __ksym;
 extern int bpf_kfunc_multi_st_ops_test_1_assoc(struct st_ops_args *args) __weak __ksym;
+/* The verifier supplies the program's aux as the second argument. */
+extern void bpf_kfunc_coro_suspend_now(void *frame) __weak __ksym;
 #endif
 
 struct prog_test_member *bpf_kfunc_get_default_trusted_ptr_test(void) __ksym;

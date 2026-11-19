@@ -405,7 +405,24 @@ struct bpf_reference_state {
 		 */
 		void *ptr;
 	};
+	/*
+	 * Slot-tracked memory owned by the reference, if any. The slots follow
+	 * the bpf_stack_state conventions of the stack. They are freed with
+	 * the reference, deep copied with the verifier state, visited by
+	 * bpf_for_each_reg_in_vstate(), compared by bpf_state_subsumes() and
+	 * joined by bpf_states_join().
+	 */
+	struct bpf_stack_state *slots;
+	u32 nr_slots;
+	/* Exact byte size of the slot-tracked memory. */
+	u32 mem_size;
 };
+
+/*
+ * Slots a reference may own: as many as the stack of a program that the
+ * interpreter runs has. Every copy of a state copies them, like the stack.
+ */
+#define BPF_MAX_REF_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
 
 struct bpf_retval_range {
 	s32 minval;
@@ -540,6 +557,11 @@ struct bpf_func_state {
 	struct bpf_retval_range callback_ret_range;
 	bool in_callback_fn;
 	bool in_async_callback_fn;
+	/*
+	 * Not 0 in an async callback that is the resume or destroy function of a coroutine:
+	 * one plus the call that suspended the coroutine, see push_coro_suspend().
+	 */
+	u32 coro_suspend_site;
 	bool in_exception_callback_fn;
 	bool no_stack_arg_load;
 	/*
@@ -710,6 +732,39 @@ static inline bool bpf_stack_args_are_incoming(const struct bpf_func_state *fram
 	     iter < frame->out_stack_arg_cnt;                          \
 	     iter++, reg = bpf_get_spilled_stack_arg(iter, frame))
 
+static inline struct bpf_reg_state *bpf_get_ref_slot_reg(int slot,
+							 const struct bpf_reference_state *ref,
+							 u32 mask)
+{
+	if (slot < ref->nr_slots &&
+	    (1 << ref->slots[slot].slot_type[BPF_REG_SIZE - 1]) & mask)
+		return &ref->slots[slot].spilled_ptr;
+	return NULL;
+}
+
+/* Iterate over slots owned by 'ref', setting 'reg' to NULL or a spilled register. */
+#define bpf_for_each_ref_slot_reg(iter, ref, reg, mask)			\
+	for (iter = 0, reg = bpf_get_ref_slot_reg(iter, ref, mask);	\
+	     iter < (ref)->nr_slots;					\
+	     iter++, reg = bpf_get_ref_slot_reg(iter, ref, mask))
+
+/* Find the reference with 'id' that owns slots, if any. */
+static inline struct bpf_reference_state *bpf_find_ref_slots(const struct bpf_verifier_state *st,
+							     u32 id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id && st->refs[i].slots)
+			return &st->refs[i];
+	return NULL;
+}
+
+/*
+ * Invoke __expr over every register in __vst: frame registers, stack spills,
+ * spilled stack arguments and spills in reference-owned slots. __state is
+ * the owning frame, or the current frame for reference-owned slots.
+ */
 #define bpf_for_each_reg_in_vstate_mask(__vst, __state, __reg, __stack, __mask, __expr)   \
 	({                                                               \
 		struct bpf_verifier_state *___vstate = __vst;            \
@@ -736,6 +791,17 @@ static inline bool bpf_stack_args_are_incoming(const struct bpf_func_state *fram
 				(void)(__expr);                          \
 			}						 \
 		}                                                        \
+		__state = ___vstate->frame[___vstate->curframe];         \
+		for (___i = 0; ___i < ___vstate->acquired_refs; ___i++) { \
+			struct bpf_reference_state *___ref = &___vstate->refs[___i]; \
+			bpf_for_each_ref_slot_reg(___j, ___ref, __reg, __mask) { \
+				if (!__reg)                              \
+					continue;                        \
+				__stack = &___ref->slots[___j];          \
+				(void)(__expr);                          \
+			}                                                \
+		}                                                        \
+		__stack = NULL;                                          \
 		(void)__stack;                                           \
 	})
 
@@ -2259,6 +2325,12 @@ struct bpf_call_arg_meta {
 	enum bpf_dynptr_type dynptr_write_type;
 	/* The buffer of bpf_dynptr_slice() or bpf_dynptr_slice_rdwr() */
 	struct bpf_stack_range slice_buf;
+	struct {
+		u32 ids[MAX_BPF_FUNC_ARGS];
+		u32 cnt;
+		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
+		u32 suspend_mask;
+	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
 	 * generally to pass info about user-defined local kptr types to later
