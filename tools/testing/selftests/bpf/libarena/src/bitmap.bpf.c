@@ -135,8 +135,11 @@ void bmp_and(size_t bits, struct arena_bitmap __arena *dst, struct arena_bitmap 
 	size_t nwords = BITS_TO_LONG_LONGS(bits);
 	volatile u32 i;
 
-	for (i = zero; i < nwords && can_loop; i++)
-		dst->bits[i] = src1->bits[i] & src2->bits[i];
+	for (i = zero; i < nwords && can_loop; i++) {
+		u32 w = i;
+
+		dst->bits[w] = src1->bits[w] & src2->bits[w];
+	}
 
 	if (nwords && bits % BITS_PER_LONG_LONG)
 		dst->bits[nwords - 1] &= bmp_last_word_mask(bits);
@@ -148,8 +151,11 @@ void bmp_or(size_t bits, struct arena_bitmap __arena *dst, struct arena_bitmap _
 	size_t nwords = BITS_TO_LONG_LONGS(bits);
 	volatile u32 i;
 
-	for (i = zero; i < nwords && can_loop; i++)
-		dst->bits[i] = src1->bits[i] | src2->bits[i];
+	for (i = zero; i < nwords && can_loop; i++) {
+		u32 w = i;
+
+		dst->bits[w] = src1->bits[w] | src2->bits[w];
+	}
 
 	if (nwords && bits % BITS_PER_LONG_LONG)
 		dst->bits[nwords - 1] &= bmp_last_word_mask(bits);
@@ -177,8 +183,11 @@ void bmp_copy(size_t bits, struct arena_bitmap __arena *dst, struct arena_bitmap
 	size_t nwords = BITS_TO_LONG_LONGS(bits);
 	volatile u32 i;
 
-	for (i = zero; i < nwords && can_loop; i++)
-		dst->bits[i] = src->bits[i];
+	for (i = zero; i < nwords && can_loop; i++) {
+		u32 w = i;
+
+		dst->bits[w] = src->bits[w];
+	}
 
 	if (nwords && bits % BITS_PER_LONG_LONG)
 		dst->bits[nwords - 1] &= bmp_last_word_mask(bits);
@@ -191,9 +200,10 @@ bool bmp_subset(size_t bits, struct arena_bitmap __arena *big, struct arena_bitm
 	volatile u32 i;
 
 	for (i = zero; i < nwords && can_loop; i++) {
-		u64 mask = (i == nwords - 1) ? bmp_last_word_mask(bits) : ~0ULL;
+		u32 w = i;
+		u64 mask = (w == nwords - 1) ? bmp_last_word_mask(bits) : ~0ULL;
 
-		if (~big->bits[i] & small->bits[i] & mask)
+		if (~big->bits[w] & small->bits[w] & mask)
 			return false;
 	}
 
@@ -207,9 +217,10 @@ bool bmp_intersects(size_t bits, struct arena_bitmap __arena *arg1, struct arena
 	volatile u32 i;
 
 	for (i = zero; i < nwords && can_loop; i++) {
-		u64 mask = (i == nwords - 1) ? bmp_last_word_mask(bits) : ~0ULL;
+		u32 w = i;
+		u64 mask = (w == nwords - 1) ? bmp_last_word_mask(bits) : ~0ULL;
 
-		if (arg1->bits[i] & arg2->bits[i] & mask)
+		if (arg1->bits[w] & arg2->bits[w] & mask)
 			return true;
 	}
 

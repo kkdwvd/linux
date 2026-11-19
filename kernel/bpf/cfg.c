@@ -122,10 +122,13 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 {
 	int ret, insn_sz;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
+	}
 
 	return visit_callee ? push_insn(t, t + insns[t].imm + 1, BRANCH, env) : 0;
 }
@@ -587,17 +590,20 @@ enum {
  *   f1: r1 = map ll  --+
  *                      +--> node of the map --> all functions in the map
  *   f2: r1 = map ll  --+
+ *
+ * [WIP] callx of a number may call any function whose address is taken, see
+ * check_scalar_callx(): one more node goes to all of them.
  */
 static int merge_callee_effects(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
 	struct bpf_insn *insn = env->prog->insnsi;
-	u32 cnt = env->subprog_cnt, n, s, t;
+	u32 cnt = env->subprog_cnt, n, s, t, any_func = cnt + env->used_map_cnt;
 	struct bpf_call_graph cg;
 	struct bpf_func_ptr *ptr;
 	int err;
 
-	err = bpf_call_graph_init(&cg, cnt + env->used_map_cnt);
+	err = bpf_call_graph_init(&cg, any_func + 1);
 	for (s = 0; s < cnt && !err; s++) {
 		cg.marks[s] = (si[s].changes_pkt_data ? CHANGES_PKT_DATA : 0) |
 			      (si[s].might_sleep ? MIGHT_SLEEP : 0) |
@@ -610,6 +616,8 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 				 insn[t].src_reg != BPF_PSEUDO_BTF_ID)
 				err = bpf_call_graph_add(&cg, s,
 							 cnt + env->insn_aux_data[t].map_index);
+			else if (env->scalar_callx && bpf_is_callx(&insn[t]))
+				err = bpf_call_graph_add(&cg, s, any_func);
 		}
 	}
 	for (s = 0; s < env->used_map_cnt; s++) {
@@ -619,6 +627,17 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 			      bpf_call_graph_add(&cg, cnt + s,
 						 bpf_find_subprog(env, ptr->xlated_off));
 	}
+	/* [WIP] any_func comes last: callers come in increasing order, see bpf_call_graph_add() */
+	for (t = 0; t < env->prog->len && env->scalar_callx && !err; t++)
+		if (bpf_pseudo_func(&insn[t]))
+			err = bpf_call_graph_add(&cg, any_func, bpf_find_subprog(env,
+						 t + insn[t].imm + 1));
+	for (s = 0; s < env->used_map_cnt && env->scalar_callx && !err; s++)
+		err = bpf_call_graph_add(&cg, any_func, cnt + s);
+	/* [WIP] and those that only data refers to, see mark_subprogs_addr_in_data() */
+	for (s = 1; s < cnt && !err; s++)
+		if (si[s].addr_in_data)
+			err = bpf_call_graph_add(&cg, any_func, s);
 	if (err)
 		goto out;
 	bpf_call_graph_sort(&cg, 0);
@@ -794,6 +813,16 @@ walk_cfg:
 			goto walk_cfg;
 	}
 
+	/* [WIP] a function that only data refers to, see mark_subprogs_addr_in_data() */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int w = env->subprog_info[i].start;
+
+		if (!env->subprog_info[i].addr_in_data || insn_state[w])
+			continue;
+		root = w;
+		goto walk_cfg;
+	}
+
 	for (i = 0; i < insn_cnt; i++) {
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
@@ -829,6 +858,126 @@ err_free:
 	kvfree(insn_state);
 	kvfree(insn_stack);
 	env->cfg.insn_state = env->cfg.insn_stack = NULL;
+	return ret;
+}
+
+/*
+ * Does a path from the entry of @subprog reach an exit insn or a hidden exit,
+ * that is, might the subprog return normally? A path ends at unwind_exit,
+ * which returns to the unwind_goto after the call instead, at a call of
+ * bpf_throw, at a call of __bpf_trap, which the main pass rejects when it gets
+ * there, and at a call of a subprog that is not known to return. If that
+ * subprog can unwind, the path goes on at the pad of the unwind_goto after the
+ * call. This is not the reachability that check_cfg() sees: it keeps the edge
+ * to the next insn after such a call, so that the dead code that follows it in
+ * the middle of a subprog doesn't count as unreachable.
+ *
+ * A subprog that is out of budget, in a recursion or in a loop, may leave
+ * with 0 in place of the result as well, see push_budget_exit(). That is a
+ * return unless the subprog unwinds then.
+ */
+static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
+				unsigned long *seen, int *stack)
+{
+	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	struct bpf_insn *insns = env->prog->insnsi;
+	int top = 0, t, i, callee, pad;
+	struct bpf_iarray *succ;
+
+	if (sub->bail_insn >= 0 && !sub->bail_unwinds) {
+		if (sub->recursive)
+			return 1;
+		for (t = sub->start; t < (sub + 1)->start; t++)
+			if (env->insn_aux_data[t].loop)
+				return 1;
+	}
+
+	bitmap_clear(seen, sub->start, (sub + 1)->start - sub->start);
+	t = sub->start;
+	__set_bit(t, seen);
+	stack[top++] = t;
+	while (top) {
+		struct bpf_insn *insn;
+
+		t = stack[--top];
+		insn = &insns[t];
+		if (bpf_is_unwind_exit(insn))
+			continue;
+		if (insn->code == (BPF_JMP | BPF_EXIT) || bpf_insn_has_hidden_exit(insn))
+			return 1;
+		if (bpf_is_throw_kfunc(insn) || bpf_is_trap_kfunc(insn))
+			continue;
+		if (bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, t + insn->imm + 1);
+			if (verifier_bug_if(callee < 0, env, "no callee of insn %d", t))
+				return -EFAULT;
+			if (!env->subprog_info[callee].might_return) {
+				if (!env->subprog_info[callee].can_unwind ||
+				    bpf_call_ends_subprog(env, t) ||
+				    !bpf_is_unwind_goto(&insns[t + 1]))
+					continue;
+				/* the callee unwinds to the pad, if it leaves at all */
+				pad = t + 1 + insns[t + 1].off + 1;
+				if (!__test_and_set_bit(pad, seen))
+					stack[top++] = pad;
+				continue;
+			}
+		}
+		succ = bpf_insn_successors(env, t);
+		for (i = 0; i < succ->cnt; i++) {
+			if (__test_and_set_bit(succ->items[i], seen))
+				continue;
+			stack[top++] = succ->items[i];
+		}
+	}
+	return 0;
+}
+
+/*
+ * A subprog might return when a path from its entry leaves it. Callees come
+ * before their callers in the topological order, so one walk of every subprog
+ * is enough without recursion. A cycle of calls is walked again until nothing
+ * changes: a subprog is taken to return only once some path shows it.
+ */
+int bpf_compute_might_return(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	int *stack, i, subprog, ret = 0;
+	unsigned long *seen;
+	bool changed;
+
+	seen = bitmap_zalloc(env->prog->len, BPF_VERIFIER_GFP);
+	stack = kvmalloc_objs(*stack, env->prog->len, BPF_VERIFIER_GFP);
+	if (!seen || !stack) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < env->subprog_cnt; i++)
+		si[i].might_return = false;
+	do {
+		changed = false;
+		if (bpf_must_abort()) {
+			ret = -EINTR;
+			goto out;
+		}
+		for (i = 0; i < env->subprog_cnt; i++) {
+			subprog = env->subprog_topo_order[i];
+			if (si[subprog].might_return)
+				continue;
+			ret = subprog_might_return(env, subprog, seen, stack);
+			if (ret < 0)
+				goto out;
+			if (ret) {
+				si[subprog].might_return = true;
+				changed = true;
+			}
+		}
+	} while (changed);
+	ret = 0;
+out:
+	bitmap_free(seen);
+	kvfree(stack);
 	return ret;
 }
 

@@ -989,6 +989,7 @@ struct bpf_insn_aux_data {
 	u64 call_with_percpu_alloc_ptr:1; /* {this,per}_cpu_ptr() with prog percpu alloc */
 	u64 cast_arena:1; /* addr_space_cast of an address in arena */
 	u64 cast_mov:1; /* addr_space_cast of a pointer that is not in arena, it's a move */
+	u64 arena_scalar:1; /* ldx/stx/st/atomic through a number, it's an address in arena */
 	u64 bb_end:1; /* last instruction of a basic block */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
 	u64 guard_place:1; /* it's the place for may_goto if the loop needs one */
@@ -1183,6 +1184,11 @@ struct bpf_subprog_info {
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
 	bool addr_taken: 1; /* callx calls nothing else */
 	bool via_callx: 1; /* callx calls it */
+	/*
+	 * A path from the entry returns normally, see bpf_compute_might_return().
+	 * A subprog that only unwinds or throws does not.
+	 */
+	bool might_return: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
@@ -1204,6 +1210,10 @@ struct bpf_subprog_info {
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
+	/* [WIP] only data, e.g. arena data, may have its address, see addr_taken */
+	bool addr_in_data: 1;
+	/* [WIP] has callx of a number */
+	bool scalar_callx: 1;
 	u8 arg_slot_cnt:4;
 
 	enum priv_stack_mode priv_stack_mode;
@@ -1383,6 +1393,8 @@ struct bpf_verifier_env {
 	u32 walk_cnt;			/* see loop_stack_entry.walk_id */
 	u32 *walk_insns;		/* the insns that were looked at in each of them */
 	u32 max_arena_stack_depth;	/* of all call chains */
+	bool arena_scalar;		/* load and store through a number is arena access */
+	bool scalar_callx;		/* [WIP] callx through a number is allowed */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
 	struct bpf_map **used_maps;	/* array of map's used by eBPF program */
 	struct btf_mod_pair *used_btfs;	/* array of BTF's used by BPF program */
@@ -2084,6 +2096,28 @@ u32 bpf_vlog_alignment(u32 pos);
 const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
+
+/*
+ * A call that does not return may be the last insn of its subprog, see
+ * check_subprogs(). The insn after it belongs to the next subprog.
+ */
+static inline bool bpf_call_ends_subprog(struct bpf_verifier_env *env, int idx)
+{
+	return env->prog->insnsi[idx].code == (BPF_JMP | BPF_CALL) &&
+	       (bpf_find_containing_subprog(env, idx) + 1)->start == idx + 1;
+}
+
+/*
+ * A tail call that is taken and ld_{abs,ind} that fails to load leave the
+ * subprog as if it reached an exit insn.
+ */
+static inline bool bpf_insn_has_hidden_exit(const struct bpf_insn *insn)
+{
+	return (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
+	       (BPF_CLASS(insn->code) == BPF_LD &&
+		(BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND));
+}
+
 const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
@@ -2142,11 +2176,13 @@ int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
 bool bpf_call_returns_handle(struct bpf_verifier_env *env, int insn_idx);
 bool bpf_is_dynptr_slice_rdwr_kfunc(struct bpf_insn *insn);
+bool bpf_is_trap_kfunc(struct bpf_insn *insn);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
 int bpf_check_cfg(struct bpf_verifier_env *env);
 void bpf_free_subprog_jts(struct bpf_verifier_env *env);
 int bpf_compute_postorder(struct bpf_verifier_env *env);
+int bpf_compute_might_return(struct bpf_verifier_env *env);
 
 struct bpf_map_desc {
 	struct bpf_map *ptr;

@@ -17,6 +17,7 @@
 #include "verifier_arena_cast.skel.h"
 #include "verifier_arena_stack.skel.h"
 #include "verifier_arena_large.skel.h"
+#include "verifier_arena_scalar.skel.h"
 #include "verifier_arena_globals1.skel.h"
 #include "verifier_arena_globals2.skel.h"
 #include "verifier_array_access.skel.h"
@@ -42,6 +43,8 @@
 #include "verifier_callx_dead_cb.skel.h"
 #include "verifier_callx_many.skel.h"
 #include "verifier_callx_rodata.skel.h"
+#include "verifier_callx_scalar.skel.h"
+#include "verifier_callx_scalar_arena.skel.h"
 #include "verifier_cfg.skel.h"
 #include "verifier_cgroup_inv_retcode.skel.h"
 #include "verifier_cgroup_skb.skel.h"
@@ -109,6 +112,7 @@
 #include "verifier_mul.skel.h"
 #include "verifier_netfilter_ctx.skel.h"
 #include "verifier_netfilter_retcode.skel.h"
+#include "verifier_noreturn_call.skel.h"
 #include "verifier_bpf_fastcall.skel.h"
 #include "verifier_or_jmp32_k.skel.h"
 #include "verifier_no_limits.skel.h"
@@ -150,6 +154,7 @@
 #include "verifier_uninit.skel.h"
 #include "verifier_unpriv.skel.h"
 #include "verifier_unwind.skel.h"
+#include "verifier_unwind_cb.skel.h"
 #include "verifier_unpriv_perf.skel.h"
 #include "verifier_value_adj_spill.skel.h"
 #include "verifier_value.skel.h"
@@ -229,6 +234,7 @@ void test_verifier_arena(void)                { RUN(verifier_arena); }
 void test_verifier_arena_cast(void)           { RUN(verifier_arena_cast); }
 void test_verifier_arena_stack(void)          { RUN_TESTS(verifier_arena_stack); }
 void test_verifier_arena_large(void)          { RUN(verifier_arena_large); }
+void test_verifier_arena_scalar(void)         { RUN(verifier_arena_scalar); }
 void test_verifier_arena_globals1(void)       { RUN(verifier_arena_globals1); }
 void test_verifier_arena_globals2(void)       { RUN(verifier_arena_globals2); }
 void test_verifier_basic_stack(void)          { RUN(verifier_basic_stack); }
@@ -253,6 +259,8 @@ void test_verifier_callx(void)                { RUN_JITED(verifier_callx); }
 void test_verifier_callx_dead_cb(void)        { RUN_JITED(verifier_callx_dead_cb); }
 void test_verifier_callx_many(void)           { RUN_JITED(verifier_callx_many); }
 void test_verifier_callx_rodata(void)         { RUN_JITED(verifier_callx_rodata); }
+void test_verifier_callx_scalar(void)         { RUN_JITED(verifier_callx_scalar); }
+void test_verifier_callx_scalar_arena(void)   { RUN_JITED(verifier_callx_scalar_arena); }
 void test_verifier_cfg(void)                  { RUN(verifier_cfg); }
 void test_verifier_cgroup_inv_retcode(void)   { RUN(verifier_cgroup_inv_retcode); }
 void test_verifier_cgroup_skb(void)           { RUN(verifier_cgroup_skb); }
@@ -319,6 +327,7 @@ void test_verifier_movsx(void)                 { RUN(verifier_movsx); }
 void test_verifier_mul(void)                  { RUN(verifier_mul); }
 void test_verifier_netfilter_ctx(void)        { RUN(verifier_netfilter_ctx); }
 void test_verifier_netfilter_retcode(void)    { RUN(verifier_netfilter_retcode); }
+void test_verifier_noreturn_call(void)        { RUN(verifier_noreturn_call); }
 void test_verifier_bpf_fastcall(void)         { RUN(verifier_bpf_fastcall); }
 void test_verifier_no_limits(void)            { RUN_JITED(verifier_no_limits); }
 void test_verifier_or_jmp32_k(void)           { RUN(verifier_or_jmp32_k); }
@@ -373,6 +382,32 @@ void test_verifier_typedef(void)              { RUN(verifier_typedef); }
 void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
+/* The helpers have pads with asm goto outputs only, and the kernel says -ENOTSUPP without */
+static bool cb_pads_supported(void)
+{
+	struct verifier_unwind_cb *skel;
+	struct bpf_program *prog;
+	int err;
+
+	skel = verifier_unwind_cb__open();
+	if (!skel)
+		return true;
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, prog == skel->progs.loop_cb_unwinds);
+	err = verifier_unwind_cb__load(skel);
+	verifier_unwind_cb__destroy(skel);
+	return err != -ENOTSUPP;
+}
+
+void test_verifier_unwind_cb(void)
+{
+	if (!cb_pads_supported()) {
+		printf("%s:SKIP:the helpers have no pads\n", __func__);
+		test__skip();
+		return;
+	}
+	RUN(verifier_unwind_cb);
+}
 void test_verifier_unpriv_perf(void)          { RUN(verifier_unpriv_perf); }
 void test_verifier_value_adj_spill(void)      { RUN(verifier_value_adj_spill); }
 void test_verifier_value(void)                { RUN(verifier_value); }

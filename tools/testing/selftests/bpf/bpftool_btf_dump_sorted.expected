@@ -21,6 +21,10 @@
 #define __bpf_arena __attribute__((address_space(1))) __attribute__((btf_type_tag("arena")))
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef __ksym
 #define __ksym __attribute__((section(".ksyms")))
 #endif
@@ -34,6 +38,14 @@
 #define __bpf_fastcall __attribute__((bpf_fastcall))
 #else
 #define __bpf_fastcall
+#endif
+#endif
+
+#ifndef __bpf_noexcept
+#ifdef __cplusplus
+#define __bpf_noexcept noexcept
+#else
+#define __bpf_noexcept
 #endif
 #endif
 
@@ -81,6 +93,10 @@ struct s {
 
 /* BPF kfuncs */
 #ifndef BPF_NO_KFUNC_PROTOTYPES
+#endif
+
+#ifdef __cplusplus
+} /* extern "C" */
 #endif
 
 #endif /* __VMLINUX_H__ */

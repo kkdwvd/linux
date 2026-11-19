@@ -1801,6 +1801,8 @@ struct bpf_func_info_aux {
 	bool called_with_pkt_ptrs;
 	/* what the callers of a global function are checked against */
 	struct bpf_subprog_arg_info args[MAX_BPF_FUNC_REG_ARGS];
+	/* a caller has nothing to continue with after the call */
+	bool called_as_noreturn;
 };
 
 enum bpf_jit_poke_reason {
@@ -1944,6 +1946,8 @@ struct bpf_prog_aux {
 	bool can_cancel;
 	/* frames of recursive subprogs can be on the stack when it is called */
 	bool in_recursion;
+	/* bpf_throw may run with the frame of this subprog on the stack */
+	bool might_throw;
 	bool kprobe_write_ctx;
 	/* has insns that work with the arena base, see bpf_prog_has_arena_insns() */
 	bool uses_arena_insns;

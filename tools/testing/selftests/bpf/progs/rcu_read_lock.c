@@ -447,7 +447,7 @@ int rcu_read_lock_global_subprog(void *ctx)
 
 	bpf_rcu_read_lock();
 	if (bpf_get_prandom_u32())
-		ret += global_subprog(ret);
+		ret = global_subprog(ret);
 	bpf_rcu_read_unlock();
 	return 0;
 }
@@ -467,7 +467,7 @@ int rcu_read_lock_global_subprog_lock(void *ctx)
 {
 	volatile int ret = 0;
 
-	ret += global_subprog_lock(ret);
+	ret = global_subprog_lock(ret);
 	bpf_rcu_read_unlock();
 	return 0;
 }
@@ -488,7 +488,7 @@ int rcu_read_lock_global_subprog_unlock(void *ctx)
 	volatile int ret = 0;
 
 	bpf_rcu_read_lock();
-	ret += global_subprog_unlock(ret);
+	ret = global_subprog_unlock(ret);
 	return 0;
 }
 
@@ -523,7 +523,7 @@ int rcu_read_lock_sleepable_helper_global_subprog(void *ctx)
 	volatile int ret = 0;
 
 	bpf_rcu_read_lock();
-	ret += global_sleepable_helper_subprog(ret);
+	ret = global_sleepable_helper_subprog(ret);
 	bpf_rcu_read_unlock();
 	return 0;
 }
@@ -534,7 +534,7 @@ int rcu_read_lock_sleepable_kfunc_global_subprog(void *ctx)
 	volatile int ret = 0;
 
 	bpf_rcu_read_lock();
-	ret += global_sleepable_kfunc_subprog(ret);
+	ret = global_sleepable_kfunc_subprog(ret);
 	bpf_rcu_read_unlock();
 	return 0;
 }
@@ -545,7 +545,7 @@ int rcu_read_lock_sleepable_global_subprog_indirect(void *ctx)
 	volatile int ret = 0;
 
 	bpf_rcu_read_lock();
-	ret += global_subprog_calling_sleepable_global(ret);
+	ret = global_subprog_calling_sleepable_global(ret);
 	bpf_rcu_read_unlock();
 	return 0;
 }

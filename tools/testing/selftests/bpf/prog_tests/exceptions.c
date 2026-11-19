@@ -14,15 +14,13 @@ static char log_buf[1024 * 1024];
  * On x86-64 and arm64 the frames of bpf_throw() leave through pads, see kernel/bpf/cancel.c:
  * a subprog that throws returns into the pad of its call. A trampoline that calls the
  * subprog has no pad, so only fentry attaches to it, like to a subprog that can be cancelled.
- * Where bpf_throw() discards frames, that of the trampoline goes with them, and fexit
- * attaches.
+ * Where bpf_throw() discards frames, it walks the stack to the frame of the main program and
+ * stops at the trampoline, which would never return: only fentry attaches there too.
  */
 #if defined(__x86_64__) || defined(__aarch64__)
-#define FEXIT_THROWING_RET	-EINVAL
 #define FEXIT_THROWING_MSG	"Only fentry can attach to throwing_subprog, which can be cancelled"
 #else
-#define FEXIT_THROWING_RET	0
-#define FEXIT_THROWING_MSG	""
+#define FEXIT_THROWING_MSG	"Only fentry can attach to throwing_subprog, which might throw"
 #endif
 
 static void test_exceptions_failure(void)
@@ -101,6 +99,7 @@ static void test_exceptions_success(void)
 	RUN_SUCCESS(exception_bad_assert_range, 0);
 	RUN_SUCCESS(exception_bad_assert_range_with, 10);
 	RUN_SUCCESS(exception_throw_from_void_global, 11);
+	RUN_SUCCESS(exception_noreturn_call, 16);
 
 	if (skel->rodata->has_stack_arg) {
 		RUN_SUCCESS(exception_throw_stack_arg, 56);
@@ -214,6 +213,26 @@ static void test_exceptions_success(void)
 				goto done;
 		}), "", ({ RUN_SUCCESS(exception_ext, 128); }));
 
+	if (test__start_subtest("extension -> global func that does not return"))
+		RUN_EXT(-EINVAL, true, ({
+			prog = eskel->progs.extension;
+			bpf_program__set_autoload(prog, true);
+			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
+				       bpf_program__fd(skel->progs.exception_noreturn_call),
+				       "exception_noreturn_global"), "set_attach_target"))
+				goto done;
+		}), "Extension cannot replace a function whose callers expect it not to return", 0);
+
+	if (test__start_subtest("throwing extension -> global func that does not return"))
+		RUN_EXT(-EINVAL, true, ({
+			prog = eskel->progs.throwing_extension;
+			bpf_program__set_autoload(prog, true);
+			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
+				       bpf_program__fd(skel->progs.exception_noreturn_call),
+				       "exception_noreturn_global"), "set_attach_target"))
+				goto done;
+		}), "Extension cannot replace a function whose callers expect it not to return", 0);
+
 	if (test__start_subtest("non-throwing fentry -> non-throwing subprog"))
 		/* non-throwing fentry -> non-throwing subprog : OK */
 		RUN_EXT(0, false, ({
@@ -281,8 +300,7 @@ static void test_exceptions_success(void)
 		}), "", 0);
 
 	if (test__start_subtest("non-throwing fexit -> throwing subprog"))
-		/* non-throwing fexit -> throwing subprog : OK where frames are discarded */
-		RUN_EXT(FEXIT_THROWING_RET, FEXIT_THROWING_RET != 0, ({
+		RUN_EXT(-EINVAL, true, ({
 			prog = eskel->progs.pfexit;
 			bpf_program__set_autoload(prog, true);
 			if (!ASSERT_OK(bpf_program__set_attach_target(prog,
@@ -292,8 +310,7 @@ static void test_exceptions_success(void)
 		}), FEXIT_THROWING_MSG, 0);
 
 	if (test__start_subtest("throwing fexit -> throwing subprog"))
-		/* throwing fexit -> throwing subprog : OK where frames are discarded */
-		RUN_EXT(FEXIT_THROWING_RET, FEXIT_THROWING_RET != 0, ({
+		RUN_EXT(-EINVAL, true, ({
 			prog = eskel->progs.throwing_fexit;
 			bpf_program__set_autoload(prog, true);
 			if (!ASSERT_OK(bpf_program__set_attach_target(prog,

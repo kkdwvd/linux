@@ -164,7 +164,6 @@ void test_cancel_throw(void)
 	/* the ones that are rejected */
 	bpf_program__set_autoload(skel->progs.handle_gone, false);
 	bpf_program__set_autoload(skel->progs.handle_in_r2, false);
-	bpf_program__set_autoload(skel->progs.handle_dead_at_call, false);
 	bpf_program__set_autoload(skel->progs.handle_in_one_of_two_slots, false);
 	if (!ASSERT_OK(cancel_throw__load(skel), "cancel_throw__load"))
 		goto out;

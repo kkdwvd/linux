@@ -178,7 +178,11 @@ struct ib_wc {
 	int: 32;
 	int byte_len;
 	void *qp;
-	union {} ex;
+	union {
+#ifdef __cplusplus
+		char ___cpp[0];
+#endif
+	} ex;
 	long: 64;
 	int slid;
 	int wc_flags;
@@ -200,7 +204,11 @@ struct acpi_object_method {
 	long: 64;
 	void *node;
 	void *aml_start;
-	union {} dispatch;
+	union {
+#ifdef __cplusplus
+		char ___cpp[0];
+#endif
+	} dispatch;
 	long: 64;
 	int aml_length;
 };

@@ -391,7 +391,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (opcode_info->can_fallthrough)
+	if (opcode_info->can_fallthrough && !bpf_call_ends_subprog(env, idx))
 		succ->items[succ->cnt++] = idx + insn_sz;
 
 	if (opcode_info->can_jump)
@@ -402,9 +402,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	 * from the subprogram, which is a hidden edge to its exit. A subprogram
 	 * without an exit insn has no exit to model.
 	 */
-	if (unlikely((bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
-		     (BPF_CLASS(insn->code) == BPF_LD &&
-		      (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND)))) {
+	if (unlikely(bpf_insn_has_hidden_exit(insn))) {
 		u32 exit_idx = bpf_find_containing_subprog(env, idx)->exit_idx;
 
 		if (exit_idx != U32_MAX)
@@ -577,9 +575,12 @@ static bool stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 half
 		/* Get callsite from verifier state, not from instance callchain */
 		callsite = q->callsites[i];
 
-		alive = callee_stack_access_at_callsite(env, callsite)
-			? is_live_before(instance, callsite, rel, half_spi, kind)
-			: is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		if (callee_stack_access_at_callsite(env, callsite))
+			alive = is_live_before(instance, callsite, rel, half_spi, kind);
+		else if (callsite + 1 < instance->subprog_start + instance->insn_cnt)
+			alive = is_live_before(instance, callsite + 1, rel, half_spi, kind);
+		else
+			alive = false; /* the call ends the subprog, nothing follows it */
 		if (alive)
 			return true;
 	}
@@ -2176,11 +2177,22 @@ static void handle_indirect_calls(struct bpf_verifier_env *env, struct bpf_handl
 /*
  * Does the frame leave for good at @insn, through pads: nothing behind the insn reads what
  * the frame has, and the pads of the frames do? That is a call of bpf_throw() where the
- * frames of the program leave through pads when it throws.
+ * frames of the program leave through pads when it throws. There it is also a call of a
+ * subprog that never returns, see bpf_compute_might_return(): the throw or the cancellation
+ * that ends the callee comes back through the pad of the call.
  */
 static bool insn_leaves_to_pads(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
-	return bpf_is_throw_kfunc(insn) && bpf_cancel_covers_throw(env);
+	int callee;
+
+	if (!bpf_cancel_covers_throw(env))
+		return false;
+	if (bpf_is_throw_kfunc(insn))
+		return true;
+	if (!bpf_pseudo_call(insn))
+		return false;
+	callee = bpf_find_subprog(env, insn - env->prog->insnsi + insn->imm + 1);
+	return callee >= 0 && !env->subprog_info[callee].might_return;
 }
 
 static void free_handle_places(struct bpf_verifier_env *env)
@@ -3112,14 +3124,17 @@ static int callee_subprog(struct bpf_verifier_env *env, const struct bpf_insn *i
  * if nothing behind the insn reads them, see insn_leaves_to_pads(). Of R6-R9, and of R0, where
  * an acquisition leaves its handle. Not of R2-R5: a read of them in a static subprog makes
  * them its arguments, and those of the calls that get to it, see bpf_compute_live_registers().
- * A handle that is in one of these alone when the frame throws is in no place.
+ * A handle that is in one of these alone when the frame throws is in no place. Nor of R0 at
+ * the call of a subprog that never returns: it is the callee's when the frame leaves.
  */
 static u32 pad_use(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
-	u16 regs = BIT(BPF_REG_0) | GENMASK(BPF_REG_9, BPF_REG_6);
+	u16 regs = GENMASK(BPF_REG_9, BPF_REG_6);
 
 	if (!insn_leaves_to_pads(env, insn))
 		return 0;
+	if (bpf_is_throw_kfunc(insn))
+		regs |= BIT(BPF_REG_0);
 	return mask_widen(handle_regs(env, insn - env->prog->insnsi) & regs);
 }
 
@@ -3292,6 +3307,13 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 * what the frame holds is no dead register there.
 			 */
 			use |= pad_use(env, insn);
+			/*
+			 * When the callback unwinds, the revisit of the call passes
+			 * the r0 of the callback on to the pad after the call, see
+			 * check_helper_call(): live before the call.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && bpf_is_unwind_goto(insn + 1))
+				use |= r0;
 			break;
 		default:
 			def = 0;

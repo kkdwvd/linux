@@ -928,12 +928,13 @@ static unsigned long cb_unwinds(void)
 	);
 }
 
+/* bpf_loop() has a pad for it, so what's missing is the one after the call */
 SEC("tc")
 __description("unwind: callback unwinds")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure __msg("callback cannot unwind")
+__failure __msg("no unwind_goto after the call of bpf_loop()")
 __naked int callback_unwinds(void)
 {
 	asm volatile (
@@ -1267,6 +1268,74 @@ void __kfunc_btf_root(void)
 {
 	bpf_rcu_read_lock();
 	bpf_rcu_read_unlock();
+}
+
+/*
+ * This one only unwinds, and returns nothing. The pad of the caller reads what
+ * it unwinds with in r0 all the same.
+ */
+__naked __noinline __used
+void global_only_unwinds(void)
+{
+	asm volatile (
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+/* This one unwinds without saying with what */
+__naked __noinline __used
+void global_unwinds_uninit(void)
+{
+	asm volatile (
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+/*
+ * The callee never returns normally, so nothing follows the call but the pad,
+ * which llvm then places right after it. The path that would continue after
+ * the call isn't checked: it has no r0.
+ */
+SEC("tc")
+__description("unwind: a global subprog that only unwinds")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(15)
+__naked int calls_global_only_unwinds(void)
+{
+	asm volatile (
+		"call global_only_unwinds;"
+		unwind_goto(0)
+		"r0 += 10;"
+		"exit;"
+		:
+		: __imm_unwind_goto(0)
+		: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog unwinds with nothing in r0")
+__arch_x86_64
+__arch_arm64
+__failure __msg("R0 !read_ok")
+__naked int calls_global_unwinds_uninit(void)
+{
+	asm volatile (
+		"call global_unwinds_uninit;"
+		unwind_goto(0)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_unwind_goto(0)
+		: __clobber_all
+	);
 }
 
 char _license[] SEC("license") = "GPL";
