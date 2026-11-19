@@ -89,8 +89,17 @@
  * amount of copy-paste that kfunc authors have to include for correctness so
  * as to avoid issues such as the compiler inlining or eliding either a static
  * kfunc, or a global kfunc in an LTO build.
+ *
+ * kfuncs are called from BPF programs through BTF, never through a C
+ * declaration. __bpf_kfunc_start_defs() keeps compilers from asking for one,
+ * but sparse ignores __diag, so tell it with __visible instead. Only do so
+ * for sparse, as compilers warn about __visible on static kfuncs.
  */
+#ifdef __CHECKER__
+#define __bpf_kfunc __used __retain __noclone noinline __visible
+#else
 #define __bpf_kfunc __used __retain __noclone noinline
+#endif
 
 #define __bpf_kfunc_start_defs()					       \
 	__diag_push();							       \
