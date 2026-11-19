@@ -16,6 +16,18 @@ extern void bpf_local_irq_restore(unsigned long *) __ksym;
 
 #define private(name) SEC(".bss." #name) __hidden __attribute__((aligned(8)))
 
+/*
+ * Where bpf_throw() discards the frames of the program, what they hold would be lost: a
+ * program that throws with a lock, IRQ flags, a section or a reference held is rejected.
+ * On x86-64 and arm64 the frames leave through pads that release all that, see
+ * kernel/bpf/cancel.c, so these programs are loaded there, and cancel_throw.c runs the like
+ * of them. The tests that say so are for the JITs that discard frames, of which the test
+ * loader knows s390x. A throw in a callback is rejected everywhere, with pads before the
+ * main pass gets to complain of what the frames hold.
+ */
+#define __frames_discarded	__arch_s390x
+#define __frames_have_pads	__arch_x86_64 __arch_arm64
+
 struct foo {
 	struct bpf_rb_node node;
 };
@@ -133,6 +145,7 @@ __noinline static int subprog_lock(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("function calls are not allowed while holding a lock")
 int reject_with_lock(void *ctx)
 {
@@ -142,6 +155,7 @@ int reject_with_lock(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("function calls are not allowed while holding a lock")
 int reject_subprog_with_lock(void *ctx)
 {
@@ -149,6 +163,7 @@ int reject_subprog_with_lock(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
 int reject_with_rcu_read_lock(void *ctx)
 {
@@ -165,6 +180,7 @@ __noinline static int throwing_subprog(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
 int reject_subprog_with_rcu_read_lock(void *ctx)
 {
@@ -180,9 +196,7 @@ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
 	return true;
 }
 
-SEC("?tc")
-__failure __msg("function calls are not allowed while holding a lock")
-int reject_with_rbtree_add_throw(void *ctx)
+static __always_inline int rbtree_add_throw(void)
 {
 	struct foo *f;
 
@@ -196,6 +210,23 @@ int reject_with_rbtree_add_throw(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
+__failure __msg("function calls are not allowed while holding a lock")
+int reject_with_rbtree_add_throw(void *ctx)
+{
+	return rbtree_add_throw();
+}
+
+SEC("?tc")
+__frames_have_pads
+__failure __msg("cannot be called from callback subprog")
+int reject_with_rbtree_add_throw_pads(void *ctx)
+{
+	return rbtree_add_throw();
+}
+
+SEC("?tc")
+__frames_discarded
 __failure __msg("Unreleased reference")
 int reject_with_reference(void *ctx)
 {
@@ -216,6 +247,7 @@ __noinline int global_subprog_may_throw(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("Unreleased reference")
 int reject_global_subprog_throw_with_reference(struct __sk_buff *ctx)
 {
@@ -247,9 +279,7 @@ __noinline static int subprog_cb_ref(u32 i, void *ctx)
 	return 0;
 }
 
-SEC("?tc")
-__failure __msg("Unreleased reference")
-int reject_with_cb_reference(void *ctx)
+static __always_inline int cb_reference(void)
 {
 	struct foo *f;
 
@@ -262,6 +292,22 @@ int reject_with_cb_reference(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
+__failure __msg("Unreleased reference")
+int reject_with_cb_reference(void *ctx)
+{
+	return cb_reference();
+}
+
+SEC("?tc")
+__frames_have_pads
+__failure __msg("cannot be called from callback subprog")
+int reject_with_cb_reference_pads(void *ctx)
+{
+	return cb_reference();
+}
+
+SEC("?tc")
 __failure __msg("cannot be called from callback")
 int reject_with_cb(void *ctx)
 {
@@ -270,6 +316,7 @@ int reject_with_cb(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("Unreleased reference")
 int reject_with_subprog_reference(void *ctx)
 {
@@ -417,6 +464,7 @@ __noinline static int rcu_lock_then_throw(void)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
 int reject_subprog_rcu_lock_throw(void *ctx)
 {
@@ -425,6 +473,7 @@ int reject_subprog_rcu_lock_throw(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("bpf_throw cannot be used inside bpf_preempt_disable-ed region")
 int reject_subprog_throw_preempt_lock(void *ctx)
 {
@@ -435,6 +484,7 @@ int reject_subprog_throw_preempt_lock(void *ctx)
 }
 
 SEC("?tc")
+__frames_discarded
 __failure __msg("bpf_throw cannot be used inside bpf_local_irq_save-ed region")
 int reject_subprog_throw_irq_lock(void *ctx)
 {

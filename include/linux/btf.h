@@ -89,8 +89,17 @@
  * amount of copy-paste that kfunc authors have to include for correctness so
  * as to avoid issues such as the compiler inlining or eliding either a static
  * kfunc, or a global kfunc in an LTO build.
+ *
+ * kfuncs are called from BPF programs through BTF, never through a C
+ * declaration. __bpf_kfunc_start_defs() keeps compilers from asking for one,
+ * but sparse ignores __diag, so tell it with __visible instead. Only do so
+ * for sparse, as compilers warn about __visible on static kfuncs.
  */
+#ifdef __CHECKER__
+#define __bpf_kfunc __used __retain __noclone noinline __visible
+#else
 #define __bpf_kfunc __used __retain __noclone noinline
+#endif
 
 #define __bpf_kfunc_start_defs()					       \
 	__diag_push();							       \
@@ -141,9 +150,19 @@ struct btf_kfunc_id_set {
 	btf_kfunc_filter_t filter;
 };
 
+/*
+ * The two ways a reference to struct @btf_id is dropped. @kfunc_btf_id is the
+ * void (*)(void *) destructor that runs for a kptr of the type when the map
+ * value holding it is freed. @release_btf_id is the KF_RELEASE kfunc
+ * void (*)(struct type *) of the type, which the verifier calls in code it
+ * generates to release a reference the program holds. An entry may leave one
+ * of the two as 0: a type without a destructor cannot be stored as a referenced
+ * kptr, a type without a release kfunc is not released by generated code.
+ */
 struct btf_id_dtor_kfunc {
 	u32 btf_id;
 	u32 kfunc_btf_id;
+	u32 release_btf_id;
 };
 
 struct btf_struct_meta {
@@ -628,6 +647,7 @@ int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 			      const struct btf_kfunc_id_set *s);
 int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset);
 s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id);
+s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id);
 int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors, u32 add_cnt,
 				struct module *owner);
 struct btf_struct_meta *btf_find_struct_meta(const struct btf *btf, u32 btf_id);
@@ -719,6 +739,10 @@ static inline int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 	return 0;
 }
 static inline s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
+{
+	return -ENOENT;
+}
+static inline s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id)
 {
 	return -ENOENT;
 }

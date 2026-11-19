@@ -584,15 +584,29 @@ static const struct btf_kfunc_id_set bpf_fs_kfunc_set = {
 	.filter = bpf_fs_kfuncs_filter,
 };
 
+/* The kfunc that generated code calls to release a file reference */
+BTF_ID_LIST(bpf_file_release_ids)
+BTF_ID(struct, file)
+BTF_ID(func, bpf_put_file)
+
 static int __init bpf_fs_kfuncs_init(void)
 {
+	const struct btf_id_dtor_kfunc bpf_fs_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= bpf_file_release_ids[0],
+			.release_btf_id	= bpf_file_release_ids[1],
+		},
+	};
 	int ret;
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_LSM, &bpf_fs_kfunc_set);
-	if (ret || !IS_ENABLED(CONFIG_BINFMT_MISC_BPF))
-		return ret;
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
-					 &bpf_fs_kfunc_set);
+	if (!ret && IS_ENABLED(CONFIG_BINFMT_MISC_BPF))
+		ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
+						&bpf_fs_kfunc_set);
+	return ret ?: register_btf_id_dtor_kfuncs(bpf_fs_releases,
+						  ARRAY_SIZE(bpf_fs_releases),
+						  THIS_MODULE);
 }
 
 late_initcall(bpf_fs_kfuncs_init);

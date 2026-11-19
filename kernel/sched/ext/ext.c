@@ -9363,6 +9363,26 @@ static int bpf_scx_validate(void *kdata)
 	return 0;
 }
 
+/*
+ * The kernel cancelled @prog, an operator of a scheduler or an async callback
+ * of one. The operator returns 0 without having computed it, which would be
+ * taken for a CPU or for success, so this is as fatal to the scheduler as
+ * scx_bpf_error(). The rq lock of the operator's caller may be held here.
+ * scx_error() only claims the exit and leaves the disabling to irq_work and the
+ * helper kthread.
+ */
+static void bpf_scx_cancel(const struct bpf_prog *prog)
+{
+	struct scx_sched *sch;
+
+	guard(rcu)();
+
+	sch = scx_prog_sched(prog->aux);
+	if (likely(sch))
+		scx_error(sch, "program %s (ops.%s, id %u) was cancelled, see its stderr stream",
+			  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+}
+
 static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
 static void sched_ext_ops__enqueue(struct task_struct *p, u64 enq_flags) {}
 static void sched_ext_ops__dequeue(struct task_struct *p, u64 enq_flags) {}
@@ -9456,6 +9476,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.cancel = bpf_scx_cancel,
 	.name = "sched_ext_ops",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops
@@ -9533,6 +9554,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops_cid = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.cancel = bpf_scx_cancel,
 	.name = "sched_ext_ops_cid",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops_cid
@@ -12126,6 +12148,15 @@ static const struct btf_kfunc_id_set scx_kfunc_set_any = {
 };
 
 /*
+ * The kfunc that generated code calls to release a cpumask reference. A
+ * reference to an idle cpumask is released by it as well: like
+ * scx_bpf_put_idle_cpumask(), it does nothing.
+ */
+BTF_ID_LIST(scx_cpumask_release_ids)
+BTF_ID(struct, cpumask)
+BTF_ID(func, scx_bpf_put_cpumask)
+
+/*
  * Kfuncs that tracing programs can't call. A tracing program can run in any
  * kernel context, including with an rq lock held. scx_locked_rq() only tracks
  * rq locks held across SCX callbacks and returns NULL there.
@@ -12330,6 +12361,13 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 
 static int __init scx_init(void)
 {
+	const struct btf_id_dtor_kfunc scx_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= scx_cpumask_release_ids[0],
+			.release_btf_id	= scx_cpumask_release_ids[1],
+		},
+	};
 	int ret;
 
 	/*
@@ -12436,6 +12474,12 @@ static int __init scx_init(void)
 	    (ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
 					     &scx_kfunc_set_any))) {
 		pr_err("sched_ext: Failed to register kfunc sets (%d)\n", ret);
+		return ret;
+	}
+
+	ret = register_btf_id_dtor_kfuncs(scx_releases, ARRAY_SIZE(scx_releases), THIS_MODULE);
+	if (ret) {
+		pr_err("sched_ext: Failed to register release kfuncs (%d)\n", ret);
 		return ret;
 	}
 

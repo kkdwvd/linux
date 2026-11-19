@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_verifier.h>
 #include <linux/cfi.h>
 #include <linux/extable.h>
 #include <linux/filter.h>
@@ -854,69 +855,45 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 	ctx->nr_used_callee_reg = i;
 }
 
-/* Save callee-saved registers */
+/*
+ * Save the callee-saved registers that the function uses. A program that calls
+ * bpf_throw() saves no more than that: its frames leave through pads and their
+ * own epilogues, and the exception callback is a function that the pad of the
+ * main program calls.
+ */
 static void push_callee_regs(struct jit_ctx *ctx)
 {
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary should save all ARM64
-	 * Callee-saved registers as the exception callback needs to recover
-	 * all ARM64 Callee-saved registers in its epilogue.
-	 */
-	if (ctx->prog->aux->exception_boundary) {
-		emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
-		ctx->fp_used = true;
-	} else {
-		find_used_callee_regs(ctx);
-		for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
-			reg1 = ctx->used_callee_reg[i];
-			reg2 = ctx->used_callee_reg[i + 1];
-			emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
-		}
-		if (i < ctx->nr_used_callee_reg) {
-			reg1 = ctx->used_callee_reg[i];
-			/* keep SP 16-byte aligned */
-			emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
-		}
+	find_used_callee_regs(ctx);
+	for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
+		reg1 = ctx->used_callee_reg[i];
+		reg2 = ctx->used_callee_reg[i + 1];
+		emit(A64_PUSH(reg1, reg2, A64_SP), ctx);
+	}
+	if (i < ctx->nr_used_callee_reg) {
+		reg1 = ctx->used_callee_reg[i];
+		/* keep SP 16-byte aligned */
+		emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
 	}
 }
 
 /* Restore callee-saved registers */
 static void pop_callee_regs(struct jit_ctx *ctx)
 {
-	struct bpf_prog_aux *aux = ctx->prog->aux;
 	int reg1, reg2, i;
 
-	/*
-	 * Program acting as exception boundary pushes R23 and R24 in addition
-	 * to BPF callee-saved registers. Exception callback uses the boundary
-	 * program's stack frame, so recover these extra registers in the above
-	 * two cases.
-	 */
-	if (aux->exception_boundary || aux->exception_cb) {
-		emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
-		emit(A64_POP(A64_R(25), A64_R(26), A64_SP), ctx);
-		emit(A64_POP(A64_R(23), A64_R(24), A64_SP), ctx);
-		emit(A64_POP(A64_R(21), A64_R(22), A64_SP), ctx);
-		emit(A64_POP(A64_R(19), A64_R(20), A64_SP), ctx);
-	} else {
-		i = ctx->nr_used_callee_reg - 1;
-		if (ctx->nr_used_callee_reg % 2 != 0) {
-			reg1 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
-			i--;
-		}
-		while (i > 0) {
-			reg1 = ctx->used_callee_reg[i - 1];
-			reg2 = ctx->used_callee_reg[i];
-			emit(A64_POP(reg1, reg2, A64_SP), ctx);
-			i -= 2;
-		}
+	i = ctx->nr_used_callee_reg - 1;
+	if (ctx->nr_used_callee_reg % 2 != 0) {
+		reg1 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, A64_ZR, A64_SP), ctx);
+		i--;
+	}
+	while (i > 0) {
+		reg1 = ctx->used_callee_reg[i - 1];
+		reg2 = ctx->used_callee_reg[i];
+		emit(A64_POP(reg1, reg2, A64_SP), ctx);
+		i -= 2;
 	}
 }
 
@@ -996,45 +973,27 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	emit(A64_MOV(1, A64_R(9), A64_LR), ctx);
 	emit(A64_NOP, ctx);
 
-	if (!prog->aux->exception_cb) {
-		/* Sign lr */
-		if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
-			emit(A64_PACIASP, ctx);
+	/* Sign lr */
+	if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
+		emit(A64_PACIASP, ctx);
 
-		/* Save FP and LR registers to stay align with ARM64 AAPCS */
-		emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
-		emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+	/* Save FP and LR registers to stay align with ARM64 AAPCS */
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
 
-		prepare_bpf_tail_call_cnt(ctx);
+	prepare_bpf_tail_call_cnt(ctx);
 
-		if (!ebpf_from_cbpf && is_main_prog) {
-			cur_offset = ctx->idx - idx0;
-			if (cur_offset != PROLOGUE_OFFSET) {
-				pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
-						cur_offset, PROLOGUE_OFFSET);
-				return -1;
-			}
-			/* BTI landing pad for the tail call, done with a BR */
-			emit_bti(A64_BTI_J, ctx);
+	if (!ebpf_from_cbpf && is_main_prog) {
+		cur_offset = ctx->idx - idx0;
+		if (cur_offset != PROLOGUE_OFFSET) {
+			pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
+					cur_offset, PROLOGUE_OFFSET);
+			return -1;
 		}
-		push_callee_regs(ctx);
-	} else {
-		/*
-		 * Exception callback receives FP of Main Program as third
-		 * parameter
-		 */
-		emit(A64_MOV(1, A64_FP, A64_R(2)), ctx);
-		/*
-		 * Main Program already pushed the frame record and the
-		 * callee-saved registers. The exception callback will not push
-		 * anything and re-use the main program's stack.
-		 *
-		 * 12 registers are on the stack
-		 */
-		emit(A64_SUB_I(1, A64_SP, A64_FP, 96), ctx);
-		/* The callback may use its own BPF stack, set up fp for it. */
-		ctx->fp_used = true;
+		/* BTI landing pad for the tail call, done with a BR */
+		emit_bti(A64_BTI_J, ctx);
 	}
+	push_callee_regs(ctx);
 
 	/* Stack must be multiples of 16B */
 	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
@@ -1550,11 +1509,11 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+--------+-------------+-----------+-----------+----------+
- * |   31-27   | 26-23  |      22     |     21    |   20-16   |   15-0   |
- * |           |        |             |           |           |          |
- * | FIXUP_REG | Unused | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
- * +-----------+--------+-------------+-----------+-----------+----------+
+ * +-----------+--------+--------------+-------------+-----------+-----------+----------+
+ * |   31-27   | 26-24  |      23      |      22     |     21    |   20-16   |   15-0   |
+ * |           |        |              |             |           |           |          |
+ * | FIXUP_REG | Unused | ARENA_CANCEL | ARENA_WRITE | ARENA_ACC | ARENA_REG |  OFFSET  |
+ * +-----------+--------+--------------+-------------+-----------+-----------+----------+
  *
  * - OFFSET (16 bits): Offset used to compute address for Load/Store instruction.
  * - ARENA_REG (5 bits): Register that is used to calculate the address for load/store when
@@ -1565,14 +1524,30 @@ static void build_epilogue(struct jit_ctx *ctx, bool was_classic, bool unwind)
  *                        memory and reads the old value into a register.
  * - FIXUP_REG (5 bits): Destination register for the load instruction (cleared on fault) or set to
  *                       DONT_CLEAR if the instruction does not read into a register.
+ * - ARENA_CANCEL (1 bit): cancel_goto is behind the access. A fault does not resume behind the
+ *                         faulting instruction but at the pad that cancel_goto names, with no
+ *                         register cleared. The pad is in an entry of its own, see
+ *                         ARENA_CANCEL_EX_KEY.
  */
 
 #define BPF_FIXUP_OFFSET_MASK      GENMASK(15, 0)
 #define BPF_FIXUP_ARENA_REG_MASK   GENMASK(20, 16)
 #define BPF_ARENA_ACCESS           BIT(21)
 #define BPF_ARENA_WRITE            BIT(22)
+#define BPF_ARENA_CANCEL           BIT(23)
 #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
 #define DONT_CLEAR 5 /* Unused ARM64 register from BPF's POV */
+
+/*
+ * 'access; cancel_goto pad': the pad of an access of arena is in an extable entry
+ *   { .insn = resume - 1, .fixup = pad - resume }
+ * where resume is the address behind the instruction of the access that faults, at which
+ * a fault goes on when there is no cancel_goto. resume - 1 is inside that instruction: no
+ * instruction starts there, so no fault hits the entry, and the instruction is not a call,
+ * so it is not the entry of an unwind_goto or of the cancel_goto of a call either, see
+ * add_pad_exentry().
+ */
+#define ARENA_CANCEL_EX_KEY	1
 
 bool ex_handler_bpf(const struct exception_table_entry *ex,
 		    struct pt_regs *regs)
@@ -1582,11 +1557,25 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 	int arena_reg = FIELD_GET(BPF_FIXUP_ARENA_REG_MASK, ex->fixup);
 	bool is_arena = !!(ex->fixup & BPF_ARENA_ACCESS);
 	bool is_write = !!(ex->fixup & BPF_ARENA_WRITE);
+	const struct exception_table_entry *pad;
 	unsigned long addr;
 
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
 		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
+	}
+
+	if (ex->fixup & BPF_ARENA_CANCEL) {
+		pad = search_bpf_extables(regs->pc + AARCH64_INSN_SIZE - ARENA_CANCEL_EX_KEY);
+		/*
+		 * The frame is cancelled. Its pad reads the registers that were live in front
+		 * of the access: the instructions of the access in front of the one that
+		 * faults change the temporary registers of the JIT only.
+		 */
+		if (!WARN_ON_ONCE(!pad)) {
+			regs->pc += AARCH64_INSN_SIZE + pad->fixup;
+			return true;
+		}
 	}
 
 	if (dst_reg != DONT_CLEAR)
@@ -1680,6 +1669,10 @@ static int add_exception_handler(const struct bpf_insn *insn,
 
 		ex->fixup |=  FIELD_PREP(BPF_FIXUP_OFFSET_MASK, off) |
 			      FIELD_PREP(BPF_FIXUP_ARENA_REG_MASK, arena_reg);
+
+		/* access; cancel_goto: the entry of the pad comes next, see add_goto_exentries() */
+		if (insn + 1 < ctx->prog->insnsi + ctx->prog->len && bpf_is_cancel_goto(insn + 1))
+			ex->fixup |= BPF_ARENA_CANCEL;
 	}
 
 	ex->type = EX_TYPE_BPF;
@@ -1689,18 +1682,26 @@ static int add_exception_handler(const struct bpf_insn *insn,
 }
 
 /*
- * There is no branch for unwind_goto, only an extable entry
- *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }
- * where ret_addr is the return address of the call in front of it. unwind_exit
- * adds .fixup to its LR.
- * ret_addr - 1, because what follows the call can have an entry of its own.
- * No insn starts there, so a fault cannot hit the entry.
- * 'bl foo; mov x8, x0' is in front of unwind_goto. The pad doesn't miss the mov:
- * r0 is x8 and the epilogue of the callee copies it to x0 and leaves x8 as it is.
+ * There is no branch for unwind_goto and cancel_goto, only an extable entry
+ *   { .insn = ret_addr - 1, .fixup = pad - ret_addr }	unwind_goto
+ *   { .insn = ret_addr - 2, .fixup = pad - ret_addr }	cancel_goto
+ * where ret_addr is the return address of the call in front of them. unwind_exit
+ * adds .fixup of the first one to its LR, cancel_exit that of the second one.
+ * Both are inside the call, because what follows it can have an entry of its own.
+ * No insn starts there, so a fault cannot hit the entries.
+ * 'bl foo; mov x8, x0' is in front of unwind_goto and cancel_goto. The pad doesn't
+ * miss the mov: r0 is x8 and the epilogue of the callee copies it to x0 and leaves
+ * x8 as it is.
+ *
+ * cancel_goto behind an access of arena has an entry of the same form, see
+ * ARENA_CANCEL_EX_KEY. @ret_addr is the instruction behind the access then, where a
+ * fault would go on.
  */
-static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
+#define UNWIND_EX_KEY	1
+#define CANCEL_EX_KEY	2
+
+static int add_pad_exentry(struct jit_ctx *ctx, int ret_addr, int pad, int key)
 {
-	int ret_addr = ctx->idx - 1;
 	struct exception_table_entry *ex;
 	off_t ins_offset;
 
@@ -1713,7 +1714,7 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 		return -EINVAL;
 
 	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
-	ins_offset = (long)&ctx->ro_image[ret_addr] - 1 - (long)&ex->insn;
+	ins_offset = (long)&ctx->ro_image[ret_addr] - key - (long)&ex->insn;
 	if (WARN_ON_ONCE(ins_offset >= 0 || ins_offset < INT_MIN))
 		return -ERANGE;
 
@@ -1727,14 +1728,71 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int pad)
 	return 0;
 }
 
+/*
+ * 'call foo; [unwind_goto X;] cancel_goto P'. The table is searched by bisection,
+ * so the entry of cancel_goto has to be in front of the one of unwind_goto.
+ * unwind_goto leaves its entry to the cancel_goto behind it.
+ */
+static int add_goto_exentries(struct jit_ctx *ctx, const struct bpf_insn *insn, int i)
+{
+	const struct bpf_insn *insns = ctx->prog->insnsi, *unwind = NULL;
+	/* 'bl foo; mov x8, x0' */
+	int ret_addr = ctx->idx - 1;
+	int call = i - 1;
+	int ret, pad;
+
+	if (!bpf_is_cancel_goto(insn)) {
+		if (i + 1 < ctx->prog->len && bpf_is_cancel_goto(insn + 1))
+			return 0;
+		return add_pad_exentry(ctx, ret_addr, i + 1 + insn->off, UNWIND_EX_KEY);
+	}
+	/* the offset of the pad of cancel_goto has 32 bits and is in imm */
+	pad = i + 1 + insn->imm;
+
+	/*
+	 * 'access; cancel_goto P'. The instruction of the access that faults was emitted
+	 * last, and its entry was added last: this one is behind it in the table, and
+	 * has the higher address.
+	 */
+	if (i && bpf_is_arena_access(&insns[i - 1]))
+		return add_pad_exentry(ctx, ctx->idx, pad, ARENA_CANCEL_EX_KEY);
+
+	if (call >= 0 && bpf_is_unwind_goto(&insns[call])) {
+		unwind = &insns[call];
+		call--;
+	}
+	/* Behind anything else there is no return address to key the entry on */
+	if (call < 0 || !(bpf_pseudo_call(&insns[call]) || bpf_is_callx(&insns[call]))) {
+		pr_err_once("cancel_goto at insn %d doesn't follow a call of a subprog\n", i);
+		return -EINVAL;
+	}
+
+	ret = add_pad_exentry(ctx, ret_addr, pad, CANCEL_EX_KEY);
+	if (ret || !unwind)
+		return ret;
+	return add_pad_exentry(ctx, ret_addr, i + unwind->off, UNWIND_EX_KEY);
+}
+
 static long bpf_unwind_fixup(u64 lr)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - 1);
+	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - UNWIND_EX_KEY);
 	/*
 	 * The verifier made sure that unwind_goto follows a call in a prog. When
 	 * the kernel called an async callback, it's exit.
+	 */
+	return e ? e->fixup : 0;
+}
+
+static long bpf_cancel_fixup(u64 lr)
+{
+	const struct exception_table_entry *e;
+
+	e = search_bpf_extables(ptrauth_strip_kernel_insn_pac(lr) - CANCEL_EX_KEY);
+	/*
+	 * The verifier puts cancel_goto behind every call of a function that has
+	 * cancel_exit. No entry: the kernel called the function, and it's exit.
 	 */
 	return e ? e->fixup : 0;
 }
@@ -1743,8 +1801,10 @@ static long bpf_unwind_fixup(u64 lr)
  * unwind_exit: return to the pad. LR in the frame record is signed. Instead of
  * signing the address of the pad, let the epilogue authenticate LR as it is and
  * add the offset of the pad to it. r0 and r2 are returned.
+ * cancel_exit: the same with the pad of cancel_goto. r2 tells that pad what the
+ * frame released for its caller, see bpf_cancel_note_args().
  */
-static void emit_unwind_exit(struct jit_ctx *ctx)
+static void emit_unwind_exit(struct jit_ctx *ctx, long (*fixup)(u64 lr))
 {
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 r0 = bpf2a64[BPF_REG_0];
@@ -1752,7 +1812,7 @@ static void emit_unwind_exit(struct jit_ctx *ctx)
 
 	emit(A64_PUSH(r0, r2, A64_SP), ctx);
 	emit(A64_LDR64I(A64_R(0), A64_FP, 8), ctx);
-	emit_call((u64)bpf_unwind_fixup, ctx);
+	emit_call((u64)fixup, ctx);
 	emit(A64_MOV(1, tmp, A64_R(0)), ctx);
 	emit(A64_POP(r0, r2, A64_SP), ctx);
 	build_epilogue(ctx, false, true);
@@ -2374,16 +2434,21 @@ emit_cond_jmp:
 		if (emit_bpf_tail_call(ctx))
 			return -EFAULT;
 		break;
-	/* unwind_goto. The verifier expanded may_goto. */
+	/* unwind_goto, cancel_goto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
-		ret = add_unwind_exentry(ctx, i + 1 + off);
+		ret = add_goto_exentries(ctx, insn, i);
 		if (ret)
 			return ret;
 		break;
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
 		if (bpf_is_unwind_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
-			emit_unwind_exit(ctx);
+			emit_unwind_exit(ctx, bpf_unwind_fixup);
+			break;
+		}
+		/* bpf_prog_can_unwind(): the caller can be a prog. The kernel has no pad. */
+		if (bpf_is_cancel_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
+			emit_unwind_exit(ctx, bpf_cancel_fixup);
 			break;
 		}
 		/* Optimization: when last instruction is EXIT,
@@ -2928,6 +2993,21 @@ bool bpf_jit_supports_kfunc_ret_reg_pair(void)
 }
 
 bool bpf_jit_supports_unwind(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_cancel(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_cancel_throw(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_arena_cancel(void)
 {
 	return true;
 }
@@ -3880,10 +3960,12 @@ u64 bpf_arch_uaddress_limit(void)
 
 bool bpf_jit_supports_exceptions(void)
 {
-	/* We unwind through both kernel frames starting from within bpf_throw
-	 * call and BPF frames. Therefore we require FP unwinder to be enabled
-	 * to walk kernel frames and reach BPF frames in the stack trace.
-	 * ARM64 kernel is always compiled with CONFIG_FRAME_POINTER=y
+	/*
+	 * The frames of bpf_throw() leave through pads, see
+	 * bpf_jit_supports_cancel_throw(). What reports a program walks the stack
+	 * to find it, through kernel frames to the BPF frames: that takes the FP
+	 * unwinder, and the ARM64 kernel is always compiled with
+	 * CONFIG_FRAME_POINTER=y.
 	 */
 	return true;
 }

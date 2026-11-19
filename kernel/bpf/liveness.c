@@ -73,6 +73,7 @@ struct live_stack_query {
 };
 
 struct arg_track;
+struct bpf_handles;
 
 struct bpf_liveness {
 	DECLARE_HASHTABLE(func_instances, 8);		/* maps (depth, callsite) to func_instance */
@@ -80,6 +81,8 @@ struct bpf_liveness {
 	u32 subprog_calls;				/* analyze_subprog() invocations */
 	/* MAX_AT_TRACK_REGS for every depth: analyze_subprog() calls itself, keep its frame small */
 	struct arg_track *callee_args;
+	/* the places that may have a handle, see compute_handle_places() */
+	struct bpf_handles *handles;
 };
 
 /*
@@ -1850,15 +1853,491 @@ static int record_arg_access(struct bpf_verifier_env *env,
 	return err;
 }
 
+/*
+ * Handles.
+ *
+ * A frame that throws leaves through a pad, which releases what the frame holds, see cancel.c.
+ * The pad finds the handle of a resource in a register of its frame or in a slot of its stack:
+ * the pointer that was acquired, or a pointer to what a lock is in. Nothing behind
+ * bpf_throw() reads the handle, so the call does that for the pads, see pad_use() and
+ * mark_handle_slots(). A pad reads no place that is not live, see cancel_reg_is_place().
+ *
+ * Liveness is computed before the main pass, and only the main pass knows what a register
+ * holds. A read of every register and of every slot keeps every handle, and with it all else
+ * that the frames have: the states of the main pass are told apart by what nothing reads
+ * again, all the way to each throw. So the places that may have a handle are found here, from
+ * the insns alone. A place more than the main pass finds a handle in costs states. A place
+ * less leaves the pad without its handle, and the program is rejected.
+ *
+ * Few insns make a handle:
+ * - the call of a helper or of a kfunc that acquires, or that returns a pointer to the value
+ *   of a map with a lock in it, leaves one in R0, see bpf_call_returns_handle();
+ * - ld_imm64 of the address of such a value;
+ * - a load from the context of a struct_ops program gets the argument that is a reference.
+ * The rest copy it: a move, an addition or a subtraction, a spill to the stack and a fill from
+ * it, the call of a static subprog in its arguments and its return in R0 and R2. What is loaded
+ * from other memory than a stack is no handle: such a pointer was not acquired, and a pointer
+ * to the value of a map comes out of a call or of ld_imm64 only.
+ *
+ * So a bit for each register and for each stack slot says "may have a handle", and the bits
+ * are followed forwards through all subprogs until nothing changes. A spill and a fill through
+ * r10 name their slot. Through another pointer that may point to a stack they are a store to
+ * every slot and a load from any, of the frame or of a frame below it: a second bit for each
+ * register says that it may be such a pointer. What a frame knows of the frames around it is
+ * in struct handle_sub.
+ */
+
+/* What the registers and the stack of a frame may have in front of an insn */
+struct handle_places {
+	/* the registers that may have a handle */
+	u16 regs;
+	/* those that may point to a stack, of the frame or of one below it. r10 has no bit. */
+	u16 fps;
+	/* a slot of the frame may have a pointer to a stack */
+	bool fp_slot;
+	/* the slots of the frame that may have a handle, fp-8 is bit 0 */
+	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+};
+
+/* What a frame of a subprog knows of the frames around it */
+struct handle_sub {
+	/* of R0 and R2 when it returns: those that may have a handle, or point to a stack */
+	u16 ret_regs;
+	u16 ret_fps;
+	/* it may store a handle through a pointer to a stack, or what it calls may */
+	bool stores;
+	/* a slot of a frame below it may have a handle, or a pointer to a stack */
+	bool below;
+	bool below_fp;
+};
+
+struct bpf_handles {
+	struct handle_places *in;	/* for each insn */
+	/* the insns that are calls of a helper or a kfunc which leave a handle in R0 */
+	unsigned long *returns;
+	/* for each subprog, and one for what callx calls: any subprog whose address is taken */
+	struct handle_sub *subs;
+	/* R1-R5 at the calls with callx */
+	struct handle_places callx_args;
+	/* a load from the context may get a reference that the kernel holds for the program */
+	bool ctx_refs;
+	bool changed;
+};
+
+#define HANDLE_ARGS	GENMASK(BPF_REG_5, BPF_REG_1)
+#define HANDLE_RETS	(BIT(BPF_REG_0) | BIT(BPF_REG_2))
+#define HANDLE_SCRATCH	GENMASK(BPF_REG_5, BPF_REG_0)
+
+static void handle_or(struct bpf_handles *h, u16 *to, u16 bits)
+{
+	if (bits & ~*to) {
+		*to |= bits;
+		h->changed = true;
+	}
+}
+
+static void handle_set(struct bpf_handles *h, bool *to, bool val)
+{
+	if (val && !*to) {
+		*to = true;
+		h->changed = true;
+	}
+}
+
+/* What gets to an insn on one way is there */
+static void handle_join(struct bpf_handles *h, struct handle_places *to,
+			const struct handle_places *from)
+{
+	handle_or(h, &to->regs, from->regs);
+	handle_or(h, &to->fps, from->fps);
+	handle_set(h, &to->fp_slot, from->fp_slot);
+	if (!bitmap_subset(from->slots, to->slots, MAX_BPF_STACK_SLOTS)) {
+		bitmap_or(to->slots, to->slots, from->slots, MAX_BPF_STACK_SLOTS);
+		h->changed = true;
+	}
+}
+
+static bool handle_in_reg(const struct handle_places *p, u8 reg)
+{
+	return reg < BPF_REG_FP && (p->regs & BIT(reg));
+}
+
+static bool handle_in_stack(const struct handle_places *p)
+{
+	return !bitmap_empty(p->slots, MAX_BPF_STACK_SLOTS);
+}
+
+static bool handle_reg_is_fp(const struct handle_places *p, u8 reg)
+{
+	return reg == BPF_REG_FP || (reg < BPF_REG_FP && (p->fps & BIT(reg)));
+}
+
+static void handle_set_reg(struct handle_places *p, u8 reg, bool handle, bool fp)
+{
+	if (reg >= BPF_REG_FP)
+		return;
+	p->regs = (p->regs & ~BIT(reg)) | (handle ? BIT(reg) : 0);
+	p->fps = (p->fps & ~BIT(reg)) | (fp ? BIT(reg) : 0);
+}
+
+/* @reg gets 8 bytes that are loaded through @base: a fill, if @base points to a stack */
+static void handle_load(const struct bpf_handles *h, const struct handle_sub *sub,
+			struct handle_places *p, u8 reg, u8 base, s16 off)
+{
+	bool handle, fp = false;
+	int slot;
+
+	if (base == BPF_REG_FP) {
+		slot = fp_off_to_slot(off, MAX_BPF_STACK_SLOTS);
+		/* what is not all of one slot fills nothing: take it for any of them */
+		handle = slot >= 0 ? test_bit(slot, p->slots) : handle_in_stack(p);
+		fp = p->fp_slot;
+	} else {
+		/* what is no stack may be the context */
+		handle = h->ctx_refs;
+		/* a slot that is not known, of this frame or of one below */
+		if (handle_reg_is_fp(p, base)) {
+			handle |= handle_in_stack(p) || sub->below;
+			fp = p->fp_slot || sub->below_fp;
+		}
+	}
+	handle_set_reg(p, reg, handle, fp);
+}
+
+/* 8 bytes of @reg are stored through @base: a spill, if @base points to a stack */
+static void handle_store(struct bpf_handles *h, struct handle_sub *sub, struct handle_places *p,
+			 u8 reg, u8 base, s16 off)
+{
+	bool handle = handle_in_reg(p, reg), fp = handle_reg_is_fp(p, reg);
+	int slot;
+
+	if (base == BPF_REG_FP) {
+		slot = fp_off_to_slot(off, MAX_BPF_STACK_SLOTS);
+		if (slot < 0)
+			return;
+		__assign_bit(slot, p->slots, handle);
+		p->fp_slot |= fp;
+	} else if (handle_reg_is_fp(p, base)) {
+		/*
+		 * A slot that is not known, of this frame or of one below, which finds the
+		 * handle there when the call returns, see handle_call(). A pointer to a stack
+		 * is not stored into a frame below, see check_stack_write_fixed_off().
+		 */
+		if (handle) {
+			bitmap_fill(p->slots, MAX_BPF_STACK_SLOTS);
+			handle_set(h, &sub->stores, true);
+		}
+		p->fp_slot |= fp;
+	}
+}
+
+/*
+ * The frame of @p, of a subprog that @sub is for, makes a call. @callee is for what it calls
+ * and @entry for the first insn of that, or for all that callx calls.
+ */
+static void handle_call(struct bpf_handles *h, struct handle_sub *sub, struct handle_places *p,
+			struct handle_places *entry, struct handle_sub *callee)
+{
+	/* the callee gets its arguments, and reaches the frames below through them */
+	handle_or(h, &entry->regs, p->regs & HANDLE_ARGS);
+	handle_or(h, &entry->fps, p->fps & HANDLE_ARGS);
+	handle_set(h, &callee->below, handle_in_stack(p) || sub->below);
+	handle_set(h, &callee->below_fp, p->fp_slot || sub->below_fp);
+	/* and leaves what it returns, and what it stored in a frame below it */
+	p->regs = (p->regs & ~HANDLE_SCRATCH) | callee->ret_regs;
+	p->fps = (p->fps & ~HANDLE_SCRATCH) | callee->ret_fps;
+	if (callee->stores) {
+		bitmap_fill(p->slots, MAX_BPF_STACK_SLOTS);
+		handle_set(h, &sub->stores, true);
+	}
+}
+
+/* @p is what holds in front of the insn at @idx of subprog @s. Make it what holds behind it. */
+static void handle_step(struct bpf_verifier_env *env, struct bpf_handles *h, int s, int idx,
+			struct handle_places *p)
+{
+	struct handle_sub *sub = &h->subs[s], *callx = &h->subs[env->subprog_cnt];
+	struct bpf_insn *insn = &env->prog->insnsi[idx];
+	u8 class = BPF_CLASS(insn->code), code = BPF_OP(insn->code), mode = BPF_MODE(insn->code);
+	bool dw = BPF_SIZE(insn->code) == BPF_DW, x = BPF_SRC(insn->code) == BPF_X;
+	u8 dst = insn->dst_reg, src = insn->src_reg;
+	const struct bpf_map *map;
+	bool handle;
+	int r;
+
+	if (is_stack_arg_st(insn) || is_stack_arg_stx(insn) || is_arena_sp_adj(insn) ||
+	    is_arena_sp_st(insn)) {
+		/* an argument on the stack is not followed: the callee takes it for anything */
+	} else if (is_stack_arg_ldx(insn)) {
+		handle_set_reg(p, dst, true, true);
+	} else if (is_arena_sp_mov(insn) || is_arena_sp_ldx(insn)) {
+		handle_set_reg(p, dst, false, false);
+	} else if (class == BPF_ALU64 && code == BPF_MOV) {
+		/* the cast of a pointer that is not in arena to as(0) is a move, see cast_mov */
+		if (x && (!insn->off || (insn->off == BPF_ADDR_SPACE_CAST && insn->imm == 1)))
+			handle_set_reg(p, dst, handle_in_reg(p, src), handle_reg_is_fp(p, src));
+		else
+			handle_set_reg(p, dst, false, false);
+	} else if (class == BPF_ALU64) {
+		/* a pointer and a number make a pointer, whichever of the two the pointer is */
+		if (x)
+			handle_set_reg(p, dst, handle_in_reg(p, dst) || handle_in_reg(p, src),
+				       handle_reg_is_fp(p, dst) || handle_reg_is_fp(p, src));
+	} else if (class == BPF_ALU) {
+		handle_set_reg(p, dst, false, false);
+	} else if (class == BPF_LD && mode == BPF_IMM) {
+		handle = false;
+		if (src == BPF_PSEUDO_MAP_VALUE || src == BPF_PSEUDO_MAP_IDX_VALUE) {
+			map = env->used_maps[env->insn_aux_data[idx].map_index];
+			handle = btf_record_has_field(map->record,
+						      BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK);
+		}
+		handle_set_reg(p, dst, handle, false);
+	} else if (class == BPF_LD) {
+		/* ld_abs and ld_ind */
+		p->regs &= ~HANDLE_SCRATCH;
+		p->fps &= ~HANDLE_SCRATCH;
+	} else if (class == BPF_LDX) {
+		if (dw && mode == BPF_MEM)
+			handle_load(h, sub, p, dst, src, insn->off);
+		else
+			handle_set_reg(p, dst, false, false);
+	} else if (class == BPF_STX && (mode == BPF_MEM ||
+					(mode == BPF_ATOMIC && insn->imm == BPF_STORE_REL))) {
+		if (dw)
+			handle_store(h, sub, p, src, dst, insn->off);
+	} else if (class == BPF_STX && mode == BPF_ATOMIC) {
+		/* the register that gets what was there, as arg_track_xfer() has it */
+		r = bpf_atomic_load_reg(insn);
+		if (r >= 0 && dw)
+			handle_load(h, sub, p, r, insn->imm == BPF_LOAD_ACQ ? src : dst, insn->off);
+		else if (r >= 0)
+			handle_set_reg(p, r, false, false);
+	} else if (class == BPF_ST && mode == BPF_MEM) {
+		/* a number takes the place of what was spilled */
+		r = dst == BPF_REG_FP && dw ? fp_off_to_slot(insn->off, MAX_BPF_STACK_SLOTS) : -1;
+		if (r >= 0)
+			__clear_bit(r, p->slots);
+	} else if (bpf_is_callx(insn)) {
+		handle_call(h, sub, p, &h->callx_args, callx);
+	} else if (insn->code == (BPF_JMP | BPF_CALL)) {
+		r = bpf_pseudo_call(insn) ? bpf_find_subprog(env, idx + insn->imm + 1) : -1;
+		if (r >= 0 && !bpf_subprog_is_global(env, r)) {
+			handle_call(h, sub, p, &h->in[env->subprog_info[r].start], &h->subs[r]);
+			return;
+		}
+		/* a global subprog gets plain memory, and returns a number */
+		handle = test_bit(idx, h->returns);
+		p->regs = (p->regs & ~HANDLE_SCRATCH) | (handle ? BIT(BPF_REG_0) : 0);
+		p->fps &= ~HANDLE_SCRATCH;
+		/* the callback stores through the pointer that the helper passes on to it */
+		if (bpf_calls_callback(env, idx) && callx->stores) {
+			bitmap_fill(p->slots, MAX_BPF_STACK_SLOTS);
+			handle_set(h, &sub->stores, true);
+		}
+	} else if (insn->code == (BPF_JMP | BPF_EXIT)) {
+		/* every kind of exit: unwind_exit leaves R0 and R2 to the landing pad */
+		handle_or(h, &sub->ret_regs, p->regs & HANDLE_RETS);
+		handle_or(h, &sub->ret_fps, p->fps & HANDLE_RETS);
+	}
+}
+
+/*
+ * What is not known of the calls that the insns don't show. callx calls one of the subprogs
+ * whose address is taken, see check_func_callx_one(): each gets what any callx passes, and
+ * callx leaves what any of them does. A helper or a kfunc that takes a callback calls one
+ * of them too, with arguments of its own: these may be anything.
+ */
+static void handle_indirect_calls(struct bpf_verifier_env *env, struct bpf_handles *h,
+				  bool callbacks)
+{
+	struct handle_sub *callx = &h->subs[env->subprog_cnt], *sub;
+	struct handle_places *entry;
+	int s;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		if (!env->subprog_info[s].addr_taken)
+			continue;
+		sub = &h->subs[s];
+		entry = &h->in[env->subprog_info[s].start];
+		handle_join(h, entry, &h->callx_args);
+		handle_set(h, &sub->below, callx->below || callbacks);
+		handle_set(h, &sub->below_fp, callx->below_fp || callbacks);
+		if (callbacks) {
+			handle_or(h, &entry->regs, HANDLE_ARGS);
+			handle_or(h, &entry->fps, HANDLE_ARGS);
+		}
+		handle_or(h, &callx->ret_regs, sub->ret_regs);
+		handle_or(h, &callx->ret_fps, sub->ret_fps);
+		handle_set(h, &callx->stores, sub->stores);
+	}
+}
+
+/*
+ * Does the frame leave for good at @insn, through pads: nothing behind the insn reads what
+ * the frame has, and the pads of the frames do? That is a call of bpf_throw() where the
+ * frames of the program leave through pads when it throws.
+ */
+static bool insn_leaves_to_pads(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	return bpf_is_throw_kfunc(insn) && bpf_cancel_covers_throw(env);
+}
+
+static void free_handle_places(struct bpf_verifier_env *env)
+{
+	struct bpf_handles *h = env->liveness->handles;
+
+	if (!h)
+		return;
+	kvfree(h->in);
+	kvfree(h->returns);
+	kvfree(h->subs);
+	kvfree(h);
+	env->liveness->handles = NULL;
+}
+
+/*
+ * Find the places that may have a handle in front of each insn, see "Handles". Only for a
+ * program with an insn that reads them, see insn_leaves_to_pads(). They are for the liveness
+ * passes, which free them.
+ */
+static int compute_handle_places(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subs = env->subprog_info;
+	struct bpf_prog_aux *aux = env->prog->aux;
+	struct bpf_insn *insns = env->prog->insnsi;
+	int len = env->prog->len, cnt = env->subprog_cnt, i, j, n, s, t, idx;
+	bool callbacks = false, reads = false;
+	struct handle_places cur;
+	struct bpf_iarray *succ;
+	struct bpf_handles *h;
+
+	for (i = 0; i < len; i++) {
+		reads |= insn_leaves_to_pads(env, &insns[i]);
+		callbacks |= bpf_is_sync_callback_calling_insn(&insns[i]) ||
+			     bpf_is_async_callback_calling_insn(&insns[i]);
+	}
+	if (!reads)
+		return 0;
+
+	h = kvzalloc_obj(*h, BPF_VERIFIER_GFP);
+	if (!h)
+		return -ENOMEM;
+	env->liveness->handles = h;
+	h->in = kvzalloc_objs(*h->in, len, BPF_VERIFIER_GFP);
+	h->returns = kvcalloc(BITS_TO_LONGS(len), sizeof(*h->returns), BPF_VERIFIER_GFP);
+	h->subs = kvzalloc_objs(*h->subs, cnt + 1, BPF_VERIFIER_GFP);
+	if (!h->in || !h->returns || !h->subs)
+		return -ENOMEM;
+	for (i = 0; i < len; i++)
+		if ((bpf_helper_call(&insns[i]) || bpf_pseudo_kfunc_call(&insns[i])) &&
+		    bpf_call_returns_handle(env, i))
+			__set_bit(i, h->returns);
+	for (i = 0; env->prog->type == BPF_PROG_TYPE_STRUCT_OPS && i < aux->ctx_arg_info_size; i++)
+		h->ctx_refs |= aux->ctx_arg_info[i].refcounted;
+
+	/*
+	 * Arguments go from the callers to the callees and what is returned the other way, so
+	 * the subprogs are looked at in both orders in turn.
+	 */
+	for (n = 0, h->changed = true; h->changed; n++) {
+		if (bpf_must_abort())
+			return -EINTR;
+		h->changed = false;
+		handle_indirect_calls(env, h, callbacks);
+		for (j = 0; j < cnt; j++) {
+			/* it has callees first */
+			s = env->subprog_topo_order[n & 1 ? j : cnt - 1 - j];
+			for (i = subs[s + 1].postorder_start; i-- > subs[s].postorder_start;) {
+				idx = env->cfg.insn_postorder[i];
+				cur = h->in[idx];
+				handle_step(env, h, s, idx, &cur);
+				succ = bpf_insn_successors(env, idx);
+				iarray_for_each(t, succ)
+					handle_join(h, &h->in[t], &cur);
+				/* may_goto at the head of a loop takes what is there along */
+				t = bpf_head_guard_target(env, idx);
+				if (t >= 0)
+					handle_join(h, &h->in[t], &h->in[idx]);
+			}
+		}
+	}
+	return 0;
+}
+
+/* The registers that may have a handle in front of the insn at @idx */
+static u16 handle_regs(struct bpf_verifier_env *env, int idx)
+{
+	return env->liveness->handles->in[idx].regs;
+}
+
+/*
+ * The slots of a frame that may have a handle while the frame is at the insn at @idx: in front
+ * of it, or in a call that the insn makes, where a callee may store one through a pointer to
+ * the frame.
+ */
+static void handle_slots(struct bpf_verifier_env *env, int idx, unsigned long *slots)
+{
+	struct bpf_handles *h = env->liveness->handles;
+	struct bpf_insn *insn = &env->prog->insnsi[idx];
+	struct handle_sub *callee = NULL;
+	int s;
+
+	bitmap_copy(slots, h->in[idx].slots, MAX_BPF_STACK_SLOTS);
+	if (bpf_is_callx(insn) || bpf_calls_callback(env, idx)) {
+		callee = &h->subs[env->subprog_cnt];
+	} else if (bpf_pseudo_call(insn)) {
+		s = bpf_find_subprog(env, idx + insn->imm + 1);
+		if (s >= 0 && !bpf_subprog_is_global(env, s))
+			callee = &h->subs[s];
+	}
+	if (callee && callee->stores)
+		bitmap_fill(slots, MAX_BPF_STACK_SLOTS);
+}
+
+/*
+ * The insn at @insn_idx of @instance reads the stack for the pads, see insn_leaves_to_pads():
+ * the slots that may have a handle, in the frame that is at the insn and in the frames below
+ * it, which wait in their calls. @callsites has the call of each of them.
+ */
+static int mark_handle_slots(struct bpf_verifier_env *env, struct func_instance *instance,
+			     u32 *callsites, int insn_idx)
+{
+	u32 nr_slots = env->stack_limit / BPF_REG_SIZE, from, to, f;
+	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+	int err;
+
+	for (f = 0; f <= instance->depth; f++) {
+		handle_slots(env, f < instance->depth ? callsites[f] : insn_idx, slots);
+		for_each_set_bitrange(from, to, slots, nr_slots) {
+			err = mark_stack_read(instance, f, insn_idx, from * 2, to * 2 - 1, true);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
 /* Record stack access for a given 'at' state of helper/kfunc/global subprog 'insn' */
 static int record_call_access(struct bpf_verifier_env *env,
 			      struct func_instance *instance,
 			      struct arg_track *at,
-			      int insn_idx)
+			      int insn_idx, u32 *callsites)
 {
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_call_summary cs;
 	int r, err, callee, arg_slot_cnt = 5;
+
+	/*
+	 * bpf_throw() doesn't return, and nothing behind it reads the stack. The pads of the
+	 * frames do: a slot that may have the handle of what a frame holds is no dead slot
+	 * there.
+	 */
+	if (insn_leaves_to_pads(env, insn)) {
+		err = mark_handle_slots(env, instance, callsites, insn_idx);
+		if (err)
+			return err;
+	}
 
 	if (bpf_pseudo_call(insn)) {
 		/*
@@ -2181,7 +2660,7 @@ redo:
 			goto err_free;
 
 		if (BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_CALL) {
-			err = record_call_access(env, instance, at_in[i], idx);
+			err = record_call_access(env, instance, at_in[i], idx, callsites);
 			if (err)
 				goto err_free;
 		}
@@ -2628,6 +3107,22 @@ static int callee_subprog(struct bpf_verifier_env *env, const struct bpf_insn *i
 	return bpf_find_subprog(env, insn - env->prog->insnsi + insn->imm + 1);
 }
 
+/*
+ * The registers that the insn reads for the pad of its frame: those that may have a handle,
+ * if nothing behind the insn reads them, see insn_leaves_to_pads(). Of R6-R9, and of R0, where
+ * an acquisition leaves its handle. Not of R2-R5: a read of them in a static subprog makes
+ * them its arguments, and those of the calls that get to it, see bpf_compute_live_registers().
+ * A handle that is in one of these alone when the frame throws is in no place.
+ */
+static u32 pad_use(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	u16 regs = BIT(BPF_REG_0) | GENMASK(BPF_REG_9, BPF_REG_6);
+
+	if (!insn_leaves_to_pads(env, insn))
+		return 0;
+	return mask_widen(handle_regs(env, insn - env->prog->insnsi) & regs);
+}
+
 /* Compute info->{use,def} fields for the instruction */
 static void compute_insn_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
@@ -2791,6 +3286,12 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 */
 			if (bpf_is_callx(insn))
 				use = dst;
+			/*
+			 * bpf_throw() doesn't return, and nothing behind it reads a register.
+			 * The pad of the frame does: a register that may have the handle of
+			 * what the frame holds is no dead register there.
+			 */
+			use |= pad_use(env, insn);
 			break;
 		default:
 			def = 0;
@@ -2846,6 +3347,11 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		err = -ENOMEM;
 		goto out;
 	}
+
+	/* what bpf_throw() reads for the pads, in the registers here and in the stack below */
+	err = compute_handle_places(env);
+	if (err)
+		goto out;
 
 	for (subprog = 0; subprog < env->subprog_cnt; subprog++) {
 		start = env->subprog_info[subprog].start;
@@ -2954,6 +3460,7 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 	 */
 	err = bpf_compute_subprog_arg_access(env);
 out:
+	free_handle_places(env);
 	kvfree(order);
 	kvfree(state);
 	return err;

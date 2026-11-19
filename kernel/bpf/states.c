@@ -522,6 +522,12 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
 		    old->refs[i].type != cur->refs[i].type)
 			return false;
+		/* a state doesn't stand for one where another frame is to release it */
+		if (old->refs[i].frameno != cur->refs[i].frameno)
+			return false;
+		/* or where a frame above the owner got it in another argument */
+		if (memcmp(old->refs[i].args, cur->refs[i].args, sizeof(old->refs[i].args)))
+			return false;
 		switch (old->refs[i].type) {
 		case REF_TYPE_PTR:
 			if (!check_ids(old->refs[i].parent_id, cur->refs[i].parent_id, idmap))
@@ -625,7 +631,8 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	/* what the frame did to what its callers hold is a part of what it tells them */
 	if (old->entry_refs != cur->entry_refs ||
 	    old->entry_rcu_locks != cur->entry_rcu_locks ||
-	    old->entry_preempt_locks != cur->entry_preempt_locks)
+	    old->entry_preempt_locks != cur->entry_preempt_locks ||
+	    old->gave != cur->gave)
 		return false;
 
 	if (!check_ids(old->frame_id, cur->frame_id, &env->idmap_scratch))
@@ -696,5 +703,7 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			return false;
 	}
 
+	/* @old may come to stand for @cur, with references that other insns acquired */
+	bpf_cancel_alias_refs(env, old, cur);
 	return true;
 }

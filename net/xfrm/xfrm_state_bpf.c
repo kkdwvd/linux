@@ -127,8 +127,25 @@ static const struct btf_kfunc_id_set xfrm_state_xdp_kfunc_set = {
 	.set   = &xfrm_state_kfunc_set,
 };
 
+/* The kfunc that generated code calls to release a reference to an xfrm_state */
+BTF_ID_LIST(xfrm_state_release_ids)
+BTF_ID(struct, xfrm_state)
+BTF_ID(func, bpf_xdp_xfrm_state_release)
+
 int __init register_xfrm_state_bpf(void)
 {
-	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
-					 &xfrm_state_xdp_kfunc_set);
+	const struct btf_id_dtor_kfunc xfrm_state_releases[] = {
+		/* never stored in a map, so no destructor */
+		{
+			.btf_id		= xfrm_state_release_ids[0],
+			.release_btf_id	= xfrm_state_release_ids[1],
+		},
+	};
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+					&xfrm_state_xdp_kfunc_set);
+	return ret ?: register_btf_id_dtor_kfuncs(xfrm_state_releases,
+						  ARRAY_SIZE(xfrm_state_releases),
+						  THIS_MODULE);
 }

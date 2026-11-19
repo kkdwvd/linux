@@ -599,6 +599,8 @@
 	},
 	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 	.result = ACCEPT,
+	/* the mark is 0 and the loop has no end: the prog is cancelled, TC_ACT_SHOT */
+	.retval = 2,
 },
 {
 	"calls: using r0 returned by callee",
