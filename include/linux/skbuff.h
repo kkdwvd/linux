@@ -1028,6 +1028,7 @@ struct sk_buff {
 #endif
 #ifdef CONFIG_NET_EGRESS
 	__u8			nf_skip_egress:1;
+	__u8			skip_egress:1;
 #endif
 #ifdef CONFIG_SKB_DECRYPTED
 	__u8			decrypted:1;
@@ -5422,6 +5423,28 @@ static inline __wsum lco_csum(struct sk_buff *skb)
 static inline bool skb_is_redirected(const struct sk_buff *skb)
 {
 	return skb->redirected;
+}
+
+/*
+ * Have dev_queue_xmit() leave out the TC and netfilter egress hooks for the
+ * transmission of this packet, on every device it crosses on the way out: for
+ * a protocol path whose packets are, by design, not the hooks' to see. The
+ * bit is cleared when the packet is received by a network stack, the host's
+ * own or a veth peer's, or scrubbed for forwarding, so that a packet sent on
+ * from there meets the hooks again.
+ */
+static inline void skb_set_skip_egress(struct sk_buff *skb)
+{
+#ifdef CONFIG_NET_EGRESS
+	skb->skip_egress = 1;
+#endif
+}
+
+static inline void skb_clear_skip_egress(struct sk_buff *skb)
+{
+#ifdef CONFIG_NET_EGRESS
+	skb->skip_egress = 0;
+#endif
 }
 
 static inline void skb_set_redirected(struct sk_buff *skb, bool from_ingress)
