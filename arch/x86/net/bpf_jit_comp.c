@@ -2384,15 +2384,30 @@ static int add_ret_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *
 	return 0;
 }
 
-static u64 bpf_unwind_target(u64 ret_addr)
+/*
+ * The verifier made sure that unwind_goto follows a call in a prog. When the
+ * kernel called an async callback, it's exit. A helper that calls a callback
+ * has a pad when it wants one, see bpf_call_cb().
+ */
+u64 bpf_unwind_target(u64 ret_addr)
 {
-	const struct exception_table_entry *e = search_bpf_extables(ret_addr - UNWIND_EXKEY);
+	const struct exception_table_entry *e;
 
+	e = search_bpf_extables(ret_addr - UNWIND_EXKEY);
+	if (e)
+		return ret_addr + e->fixup;
 	/*
-	 * The verifier made sure that unwind_goto follows a call in a prog. When
-	 * the kernel called an async callback, it's exit.
+	 * The pad of a helper that called a callback with bpf_call_cb(): its
+	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
+	 * Anything else at a return address is some caller's own fixup, and
+	 * what a JIT keyed there is a fixup of the insn after the call.
 	 */
-	return e ? ret_addr + e->fixup : ret_addr;
+	e = search_kernel_exception_table(ret_addr);
+	if (!e)
+		e = search_module_extables(ret_addr);
+	if (e && (e->data & EX_DATA_TYPE_MASK) == EX_TYPE_BPF)
+		return (unsigned long)&e->fixup + e->fixup;
+	return ret_addr;
 }
 
 static u64 bpf_cancel_target(u64 ret_addr)

@@ -3292,6 +3292,13 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 * what the frame holds is no dead register there.
 			 */
 			use |= pad_use(env, insn);
+			/*
+			 * When the callback unwinds, the revisit of the call passes
+			 * the r0 of the callback on to the pad after the call, see
+			 * check_helper_call(): live before the call.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && bpf_is_unwind_goto(insn + 1))
+				use |= r0;
 			break;
 		default:
 			def = 0;

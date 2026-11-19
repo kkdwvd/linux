@@ -1451,6 +1451,7 @@ bool bpf_jit_supports_cancel(void);
 bool bpf_jit_supports_cancel_throw(void);
 bool bpf_jit_supports_arena_cancel(void);
 bool bpf_jit_supports_hmul(void);
+u64 bpf_unwind_target(u64 ret_addr);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);
