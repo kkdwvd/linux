@@ -374,7 +374,11 @@ static int patch_list_reserve_insns(struct bpf_patch_list *pl, u32 cnt)
 	return 0;
 }
 
-/* Extract the pc-relative operand of a jump, a subprog call or a ld_imm64 of a subprog. */
+/*
+ * Extract the pc-relative operand of a jump, a subprog call or a ld_imm64 of a
+ * subprog. cancel_goto passes for a jump: its pad moves like the target of one,
+ * and the operand is in 'imm' like that of gotol.
+ */
 static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 {
 	u8 code = insn->code;
@@ -389,7 +393,7 @@ static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 	    code == (BPF_JMP | BPF_TAIL_CALL) || code == (BPF_JMP | BPF_JA | BPF_X))
 		return false;
 
-	*is_imm = code == (BPF_JMP32 | BPF_JA);
+	*is_imm = bpf_jmp_offset_in_imm(insn);
 	*rel = *is_imm ? insn->imm : insn->off;
 	return true;
 }
@@ -628,10 +632,18 @@ static bool is_short_jump(const struct bpf_insn *insn)
  *
  * That moves the targets of other jumps away. One pass is enough: take each
  * jump for far that would be far with all jumps that it goes over relaxed.
+ *
+ * cancel_goto stays directly behind the unwind_goto of its call and is no code,
+ * so the two insns go behind it:
+ *
+ *   unwind_goto far   ->  unwind_goto +2
+ *   cancel_goto pad       cancel_goto pad
+ *                         goto +1
+ *                         gotol far
  */
 static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
 {
-	u32 cnt = img->new_cnt, pos, to, lo, hi, n, *map;
+	u32 cnt = img->new_cnt, pos, to, lo, hi, n, keep, *map;
 	unsigned long *far __free(kvfree) = NULL;
 	struct bpf_insn *insns = img->insns;
 
@@ -658,7 +670,13 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
 	}
 	for (pos = 0, n = 0; pos <= cnt; pos++) {
 		map[pos] = pos + n;
-		n += pos < cnt && test_bit(pos, far) ? 2 : 0;
+		if (pos == cnt || !test_bit(pos, far))
+			continue;
+		if (pos + 1 < cnt && bpf_is_cancel_goto(&insns[pos + 1])) {
+			pos++;
+			map[pos] = pos + n;
+		}
+		n += 2;
 	}
 
 	/* like kvmalloc(): the size of a prog fits into 32 bits */
@@ -673,9 +691,11 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
 		insns[to] = insns[pos];
 		if (!test_bit(pos, far))
 			continue;
-		insns[to].off = 1;
-		insns[to + 1] = BPF_JMP_A(1);
-		insns[to + 2] = BPF_JMP32_A(map[tgt[pos]] - to - 3);
+		/* cancel_goto is behind the jump */
+		keep = map[pos + 1] == to + 1;
+		insns[to].off = 1 + keep;
+		insns[to + 1 + keep] = BPF_JMP_A(1);
+		insns[to + 2 + keep] = BPF_JMP32_A(map[tgt[pos]] - to - 3 - keep);
 		tgt[pos] = NO_JUMP;
 	}
 	for (pos = 0; pos <= img->cnt; pos++) {
@@ -3766,6 +3786,27 @@ bool __weak bpf_jit_supports_unwind(void)
 	return false;
 }
 
+/* cancel_goto and cancel_exit */
+bool __weak bpf_jit_supports_cancel(void)
+{
+	return false;
+}
+
+/*
+ * bpf_throw() leaves through the pads of cancel_goto: no program is an exception
+ * boundary, and the exception callback is a function like any other.
+ */
+bool __weak bpf_jit_supports_cancel_throw(void)
+{
+	return false;
+}
+
+/* cancel_goto behind an access of arena: a fault in the access goes on at the pad */
+bool __weak bpf_jit_supports_arena_cancel(void)
+{
+	return false;
+}
+
 /* uhmul and shmul */
 bool __weak bpf_jit_supports_hmul(void)
 {
@@ -4021,6 +4062,39 @@ u64 bpf_prog_report_recursion(void)
 		bpf_stream_printk(ss, "ERROR: No room in the stack for a call of a recursive function\n");
 		bpf_stream_dump_stack(ss);
 	}));
+#endif
+	return 0;
+}
+
+/*
+ * Called by the pad of the outermost frame of a cancelled program, when the frames have released
+ * what they held. The cancellation point has told why, with the stack that was there. This tells
+ * that the program didn't go on from it.
+ */
+u64 bpf_prog_report_cancel(void)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	const struct bpf_struct_ops *st_ops;
+	struct bpf_stream_stage ss;
+	struct bpf_prog *prog;
+
+	prog = bpf_prog_find_from_stack();
+	if (!prog)
+		return 0;
+	/*
+	 * Not held back like the report of a recursion: there is one line per invocation, and the
+	 * stream is not empty when the point has just written its report.
+	 */
+	bpf_stream_stage(ss, prog, BPF_STDERR, ({
+		bpf_stream_printk(ss, "ERROR: Program was cancelled\n");
+	}));
+	/*
+	 * What the 0 of an operator means is up to the struct_ops. This is the context of the
+	 * program, with the locks of the caller of the operator: see what ->cancel() may do.
+	 */
+	st_ops = prog->aux->st_ops;
+	if (st_ops && st_ops->cancel)
+		st_ops->cancel(prog);
 #endif
 	return 0;
 }

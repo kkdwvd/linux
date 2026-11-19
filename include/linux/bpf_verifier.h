@@ -348,6 +348,10 @@ struct bpf_stack_state {
 	u8 slot_type[BPF_REG_SIZE];
 };
 
+#define MAX_CALL_FRAMES 32
+/* What the interpreter has stack for. A longer chain of calls requires the JIT. */
+#define MAX_CALL_FRAMES_INTERP 16
+
 struct bpf_reference_state {
 	/* Each reference object has a type. Ensure REF_TYPE_PTR is zero to
 	 * default to pointer reference on zero initialization of a state.
@@ -368,6 +372,31 @@ struct bpf_reference_state {
 	 * is used purely to inform the user of a reference leak.
 	 */
 	int insn_idx;
+	/*
+	 * The insn that brought it to the frame that is to release it: the call
+	 * that acquired it, or the call of the subprog that returned with it.
+	 * Below 0 if no insn of that frame did. Nothing compares it when a state
+	 * is found to be within another one or when two states are joined, see
+	 * bpf_cancel_alias_refs().
+	 */
+	int origin;
+	/*
+	 * The frame that is to release it: the one that acquired it, the callee
+	 * that a call moved it into, see bpf_cancel_ref_moves(), or the caller
+	 * that a returning frame left it with. BPF_INHERITED_FRAME for what the
+	 * callers of a function verified on its own hold.
+	 */
+	int frameno;
+	/*
+	 * How it got to the frames above the owner: args[fr] is the argument
+	 * that the call which frame fr was entered by had its handle in: 1-5
+	 * for R1-R5, from 6 on a stack argument, 0 if it had none, see
+	 * bpf_cancel_note_args(). In frame 0 of a function that is verified on
+	 * its own: for what the callers hold.
+	 * One more than there are frames: the last frame may call a function
+	 * that is verified on its own.
+	 */
+	u8 args[MAX_CALL_FRAMES + 1];
 	union {
 		/* For REF_TYPE_PTR */
 		int parent_id;
@@ -541,11 +570,19 @@ struct bpf_func_state {
 	/*
 	 * How much of what was held when the frame was entered is held ever since. For
 	 * references that is the first entry_refs of refs[]. What is released and taken again
-	 * doesn't count. More than that is for this frame to release.
+	 * doesn't count. More than that is for this frame to release, and of the first ones
+	 * what the call moved into the frame, see bpf_reference_state.frameno.
 	 */
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * The arguments that the frame was entered with the handle of a caller's resource in
+	 * which is released since, by this frame or by one above it: the bit of the number of
+	 * each, see bpf_reference_state.args. It is what the frame tells its caller when it is
+	 * cancelled, see bpf_cancel_foreign_release().
+	 */
+	u32 gave;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
@@ -565,10 +602,6 @@ struct bpf_func_state {
 	struct bpf_reg_state *stack_arg_regs; /* Outgoing on-stack arguments */
 	struct loop_stack_entry *loop_stack;
 };
-
-#define MAX_CALL_FRAMES 32
-/* What the interpreter has stack for. A longer chain of calls requires the JIT. */
-#define MAX_CALL_FRAMES_INTERP 16
 
 /* Maximum number of bpf_reg_state objects that can exist at once */
 #define MAX_STACK_ARG_SLOTS (MAX_BPF_STATIC_FUNC_ARGS - MAX_BPF_FUNC_REG_ARGS)
@@ -611,6 +644,12 @@ struct bpf_verifier_state {
 	/* The insn that the state comes from, -1 if no instructions have been executed yet. */
 	u32 last_insn_idx;
 };
+
+/* Is refs[@idx] for frame @frame of @st to release? */
+static inline bool bpf_frame_owns_ref(const struct bpf_verifier_state *st, int frame, u32 idx)
+{
+	return st->refs[idx].frameno == frame;
+}
 
 /* Number of BPF_REG_SIZE stack slots tracked for the frame so far. */
 static inline u32 bpf_stack_nr_slots(const struct bpf_func_state *frame)
@@ -1018,6 +1057,12 @@ struct bpf_insn_aux_data {
 	s32 not_stopped;
 	/* where may_goto in front of this instruction goes */
 	s32 guard_to;
+	/* the first cancel site at this instruction + 1, see bpf_cancel_record() */
+	u32 cancel_site;
+	/* the origin of what this call brings to its frame + 1, see bpf_cancel_record_origin() */
+	u32 cancel_origin;
+	/* what the visits of this call took away from its frame + 1, see bpf_cancel_record_release() */
+	u32 cancel_release;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 };
@@ -1114,7 +1159,15 @@ struct bpf_subprog_info {
 	u32 callx_edge; /* 1 + the first of its env->callx_edges, 0 if none */
 	struct bpf_iarray *jt; /* jump table shared by all gotox of this subprogram */
 	u16 stack_depth; /* max. stack depth used by this function */
+	/*
+	 * Hidden stack slots, see reserve_stack_slots(). stack_extra is what they
+	 * add to stack_depth. The zeroed_stack_size bytes from -zeroed_stack_off
+	 * up are zero when the function is entered.
+	 */
 	u16 stack_extra;
+	u16 zeroed_stack_off;
+	u16 zeroed_stack_size;
+	s16 may_goto_off; /* hidden slot that the may_goto of this function share, 0: none */
 	u16 arena_stack_depth; /* size of the frame in the stack in arena */
 	u32 insns_total;
 	u32 insns_self;
@@ -1125,6 +1178,7 @@ struct bpf_subprog_info {
 	bool has_tail_call: 1;
 	bool might_throw: 1;
 	bool can_unwind: 1; /* has unwind_exit */
+	bool can_cancel: 1; /* has cancel_exit: generated pads */
 	bool recursive: 1; /* on a cycle of the call graph */
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
 	bool addr_taken: 1; /* callx calls nothing else */
@@ -1170,6 +1224,20 @@ struct bpf_subprog_info {
 	bool bail_unwinds: 1;
 	/* some call of it is not followed by unwind_goto */
 	bool plain_call: 1;
+	/* it is set as an async callback that may not return 0 */
+	bool async_ret_nonzero: 1;
+	/* its stack check has a pad, see bpf_cancel_entry_pad() */
+	bool cancel_entry: 1;
+	/*
+	 * Verified on its own it released what a caller holds and its pads cannot tell
+	 * of: it cannot be cancelled, see bpf_cancel_foreign_release().
+	 */
+	bool cancel_foreign: 1;
+	/*
+	 * The arguments that a frame of it got a resource of a caller in which the frame or
+	 * one above it released: its pads tell by these, see bpf_func_state.gave.
+	 */
+	u32 cancel_gives;
 	u8 code_stack_args;
 	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1209,6 +1277,8 @@ struct bpf_id_pair {
  */
 #define BPF_INHERITED_ID	0x20000000
 #define BPF_MAX_ID		(BPF_INHERITED_ID / 2)
+/* The owner of what is held at the call: the frames of the callers are not in the state */
+#define BPF_INHERITED_FRAME	(-1)
 
 struct bpf_idmap {
 	u32 cnt;
@@ -1397,6 +1467,10 @@ struct bpf_verifier_env {
 	u32 max_stack_depth;
 	/* stack budget of the program, see bpf_prog_stack_limit() */
 	u32 stack_limit;
+	/* who calls whom, from check_call_graph() until check_max_stack_depth() is done */
+	struct bpf_call_graph *call_graph;
+	/* where the frames of the program may go, see set_priv_stack_modes() */
+	enum priv_stack_mode priv_stack_mode;
 	/* total verification time */
 	u64 verification_time;
 	/* maximum number of verifier states kept in 'branching' instructions */
@@ -1451,6 +1525,7 @@ struct bpf_verifier_env {
 	struct scev *scev;
 	struct bpf_flow *flow;
 	struct bpf_join_state *join;
+	struct bpf_cancel *cancel;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1667,6 +1742,68 @@ int bpf_find_latches(struct bpf_verifier_env *env, bool flags);
 bool bpf_jump_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
 
+/* cancel.c */
+enum bpf_cancel_site_type {
+	/* where the verifier adds may_goto, see check_loop_guard() */
+	BPF_CANCEL_SITE_GUARD,
+	/* may_goto of the program */
+	BPF_CANCEL_SITE_MAY_GOTO,
+	/* the stack check of a recursive subprog, see check_recursion_guard() */
+	BPF_CANCEL_SITE_ENTRY,
+	/* the call of a subprog */
+	BPF_CANCEL_SITE_CALL,
+	/* an access of arena, which may fault */
+	BPF_CANCEL_SITE_ARENA,
+	/* a call of bpf_throw() */
+	BPF_CANCEL_SITE_THROW,
+};
+
+/* the insns at the end of a pad that leave the frame */
+#define BPF_CANCEL_PAD_EXIT_INSNS	3
+
+/* What tells that a call brought a resource to its frame, see bpf_cancel_record_acquire() */
+enum bpf_cancel_acquire {
+	/* nothing does: not every visit of the call brings one */
+	BPF_CANCEL_ACQUIRE_SOMETIMES,
+	/* that it returned */
+	BPF_CANCEL_ACQUIRE_ALWAYS,
+	/* R0: the pointer that was acquired, NULL if nothing was */
+	BPF_CANCEL_ACQUIRE_R0,
+	/* R0: 0 if the lock was taken */
+	BPF_CANCEL_ACQUIRE_R0_ZERO,
+};
+
+bool bpf_cancel_covers_throw(const struct bpf_verifier_env *env);
+int bpf_cancel_record(struct bpf_verifier_env *env, enum bpf_cancel_site_type type);
+int bpf_cancel_record_call(struct bpf_verifier_env *env, bool caller_in_state);
+void bpf_cancel_foreign_release(struct bpf_verifier_env *env, int owner, int idx);
+bool bpf_cancel_ref_moves(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			  u32 idx, int subprog);
+void bpf_cancel_note_args(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			  int subprog);
+int bpf_cancel_record_origin(struct bpf_verifier_env *env, int insn_idx);
+void bpf_cancel_record_acquire(struct bpf_verifier_env *env, enum bpf_cancel_acquire how);
+int bpf_cancel_record_return(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			     int call_idx, int frame, int from, u32 first,
+			     struct bpf_reg_state *r0);
+void bpf_cancel_record_release(struct bpf_verifier_env *env, int idx);
+void bpf_cancel_record_move(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
+void bpf_cancel_ref_moved(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int idx);
+void bpf_cancel_alias_refs(struct bpf_verifier_env *env, const struct bpf_verifier_state *a,
+			   const struct bpf_verifier_state *b);
+int bpf_cancel_resolve(struct bpf_verifier_env *env);
+int bpf_cancel_build_pads(struct bpf_verifier_env *env, int subprog,
+			  const struct bpf_insn **insns);
+u32 bpf_cancel_guard_pad(struct bpf_verifier_env *env, int insn_idx);
+int bpf_cancel_entry_pad(struct bpf_verifier_env *env, int subprog, struct bpf_insn *buf);
+int bpf_cancel_insert_gotos(struct bpf_verifier_env *env);
+int bpf_cancel_retarget_may_gotos(struct bpf_verifier_env *env);
+int bpf_cancel_replace_throws(struct bpf_verifier_env *env);
+int bpf_cancel_insert_flag_stores(struct bpf_verifier_env *env);
+void bpf_cancel_reset(struct bpf_verifier_env *env);
+void bpf_cancel_free(struct bpf_verifier_env *env);
+void bpf_cancel_print_stats(struct bpf_verifier_env *env);
+
 int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);
 void bpf_free_verifier_state(struct bpf_verifier_state *state, bool free_self);
@@ -1675,6 +1812,7 @@ void bpf_mark_reg_not_init(const struct bpf_verifier_env *env,
 void bpf_mark_reg_known_scalar(struct bpf_reg_state *reg, u64 imm);
 void bpf_mark_reg_unknown(struct bpf_reg_state *reg);
 int bpf_grow_stack_state(struct bpf_verifier_env *env, struct bpf_func_state *state, int size);
+bool bpf_prog_cancel_retval(struct bpf_verifier_env *env, s32 *val);
 
 static inline int bpf_get_spi(s32 off)
 {
@@ -2002,6 +2140,7 @@ u32 btf_func_arg_align(const struct btf *btf, const struct btf_type *t);
 
 int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
+bool bpf_call_returns_handle(struct bpf_verifier_env *env, int insn_idx);
 bool bpf_is_dynptr_slice_rdwr_kfunc(struct bpf_insn *insn);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
@@ -2265,10 +2404,28 @@ static inline void bpf_free_kfunc_tab(struct bpf_kfunc_desc_tab *tab)
 /* Functions exported from verifier.c, used by fixups.c */
 void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog);
 bool bpf_allow_tail_call_in_subprogs(struct bpf_verifier_env *env);
+bool bpf_stack_depth_fits(struct bpf_verifier_env *env, int subprog, u32 depth);
 bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm);
 int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);
 int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			 struct bpf_insn *insn_buf, int insn_idx, int *cnt);
+
+/*
+ * The call that releases a reference to a kernel type, as found by
+ * bpf_find_release_kfunc(): BPF_CALL_KFUNC(offset, func_id) with the reference
+ * in R1. Like every kfunc call it needs bpf_add_kfunc_call(env, func_id, offset)
+ * before bpf_do_misc_fixups() resolves it.
+ */
+struct bpf_release_kfunc {
+	struct btf *btf;	/* BTF of the kfunc */
+	u32 func_id;		/* BTF id of the kfunc, imm of the call */
+	u16 offset;		/* off of the call: 0, or the fd_array index of a module's btf */
+	u32 flags;		/* KF_* flags of the kfunc for this program */
+};
+
+int bpf_find_release_kfunc(struct bpf_verifier_env *env, struct btf *btf, u32 btf_id,
+			   bool sleepable, struct bpf_release_kfunc *rel);
+bool bpf_nmi_unsafe_prog(struct bpf_verifier_env *env);
 
 /* Functions exported from verifier.c, used by trampoline.c */
 int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 btf_id,
@@ -2315,6 +2472,13 @@ int bpf_patch_list_append(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt);
 int bpf_patch_list_insert(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt);
+
+/*
+ * Hidden stack that is zero when the subprog is entered, see fixups.c. Only between
+ * check_call_graph() and check_max_stack_depth().
+ */
+bool bpf_zeroed_stack_fits(struct bpf_verifier_env *env, int subprog, u32 size);
+int bpf_reserve_zeroed_stack(struct bpf_verifier_env *env, int subprog, u32 size, s16 *off);
 
 int bpf_flip_opcode(u32 opcode);
 u8 bpf_rev_opcode(u8 opcode);

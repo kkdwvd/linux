@@ -35,8 +35,6 @@ void __asan_load8(void *p);
 void __asan_store8(void *p);
 #endif
 
-static bool all_callee_regs_used[4] = {true, true, true, true};
-
 static void *trampoline_size_image;
 
 static int __init init_trampoline_size_image(void)
@@ -527,8 +525,7 @@ static void emit_prologue_tail_call(u8 **pprog, bool is_subprog)
  * while jumping to another program
  */
 static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cbpf,
-			  bool tail_call_reachable, bool is_subprog,
-			  bool is_exception_cb)
+			  bool tail_call_reachable, bool is_subprog)
 {
 	u8 *prog = *pprog;
 
@@ -551,22 +548,8 @@ static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cb
 			/* Keep the same instruction layout. */
 			emit_nops(&prog, 3);     /* nop3 */
 	}
-	/* Exception callback receives FP as third parameter */
-	if (is_exception_cb) {
-		EMIT3(0x48, 0x89, 0xF4); /* mov rsp, rsi */
-		EMIT3(0x48, 0x89, 0xD5); /* mov rbp, rdx */
-		/* The main frame must have exception_boundary as true, so we
-		 * first restore those callee-saved regs from stack, before
-		 * reusing the stack frame.
-		 */
-		pop_callee_regs(&prog, all_callee_regs_used);
-		pop_r12(&prog);
-		/* Reset the stack frame. */
-		EMIT3(0x48, 0x89, 0xEC); /* mov rsp, rbp */
-	} else {
-		EMIT1(0x55);             /* push rbp */
-		EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
-	}
+	EMIT1(0x55);             /* push rbp */
+	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
 
 	/* X86_TAIL_CALL_OFFSET is here */
 	EMIT_ENDBR();
@@ -714,20 +697,29 @@ static void emit_indirect_jump(u8 **pprog, int bpf_reg, u8 *ip)
 	*pprog = prog;
 }
 
-static void __emit_indirect_call(u8 **pprog, int reg, bool ereg)
+static void __emit_indirect_call(u8 **pprog, int reg, bool ereg, bool rex)
 {
 	u8 *prog = *pprog;
 
 	if (ereg)
 		EMIT1(0x41);
+	else if (rex)
+		EMIT1(0x40);
 
 	EMIT2(0xFF, 0xD0 + reg);
 
 	*pprog = prog;
 }
 
-/* call *bpf_reg */
-static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
+/*
+ * call *bpf_reg
+ *
+ * @rex: make the call insn 3 bytes at least. 'call *%rax' has 2, and the extable
+ * entry of the cancel_goto behind it would be at its first byte, see
+ * add_ret_exentry(). A rex prefix without bits takes a byte and does nothing else.
+ * A call of a thunk has 5 bytes.
+ */
+static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip, bool rex)
 {
 	u8 *prog = *pprog;
 	int reg = reg2hex[bpf_reg];
@@ -739,7 +731,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		err = emit_call(&prog, its_static_thunk(reg + 8*ereg), ip);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
 		EMIT_LFENCE();
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE)) {
 		OPTIMIZER_HIDE_VAR(reg);
 		if (cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
@@ -747,7 +739,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		else
 			err = emit_call(&prog, &__x86_indirect_thunk_array[reg + 8*ereg], ip);
 	} else {
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	}
 
 	*pprog = prog;
@@ -838,14 +830,9 @@ static void emit_bpf_tail_call_indirect(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);            /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                              /* pop rax */
@@ -904,14 +891,9 @@ static void emit_bpf_tail_call_direct(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);                /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
-		pop_callee_regs(&prog, all_callee_regs_used);
+	pop_callee_regs(&prog, callee_regs_used);
+	if (bpf_prog_uses_arena_insns(bpf_prog))
 		pop_r12(&prog);
-	} else {
-		pop_callee_regs(&prog, callee_regs_used);
-		if (bpf_prog_uses_arena_insns(bpf_prog))
-			pop_r12(&prog);
-	}
 
 	/* Pop tail_call_cnt_ptr. */
 	EMIT1(0x58);                                  /* pop rax */
@@ -1855,11 +1837,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+--------+-----------+---------+----------+
- * | 31        | 30          | 29-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+--------+-----------+---------+----------+
+ * +-----------+-------------+--------------+----------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29           | 28       | 27-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |              |          |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | ARENA_CANCEL | R0_IN_AX | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+--------------+----------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far past the faulting insn to resume. That is its own length
  *                      for a single-insn access, but the distance to the end of the whole
@@ -1875,6 +1857,12 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                        It is independent of DST_REG, since a read-modify-write both writes to
  *                        memory and reads the old value into a register.
  * - ARENA_ACCESS (1 bit): This bit is set when the faulting instruction accessed the arena region.
+ * - ARENA_CANCEL (1 bit): cancel_goto is behind the access. A fault does not resume INSN_LEN
+ *                         past the faulting insn but at the pad that cancel_goto names, with
+ *                         no register cleared. The pad is in an entry of its own, which is
+ *                         found by the address that INSN_LEN gives, see ARENA_CANCEL_EXKEY.
+ * - R0_IN_AX (1 bit): Set with ARENA_CANCEL when the sequence that the insn is part of keeps R0
+ *                     in BPF_REG_AX and uses RAX for itself. The pad gets R0 back.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1892,9 +1880,22 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_IN_AX	BIT(28)
+#define FIXUP_ARENA_CANCEL	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
 #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
+
+/*
+ * 'access; cancel_goto pad': the pad of an access of arena is in an extable entry
+ *   { .insn = resume - 1, .fixup = pad - resume }
+ * where resume is the address at which a fault in the access goes on when there is no
+ * cancel_goto: the end of the access, or of the faulting part of its sequence. The insn
+ * that ends there has 2 bytes at least, so no insn starts at resume - 1 and no fault hits
+ * the entry. It is not the entry of a call either, see add_ret_exentry(): those are inside
+ * the call insn.
+ */
+#define ARENA_CANCEL_EXKEY	1
 
 bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 {
@@ -1902,6 +1903,7 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 	u32 insn_len = FIELD_GET(FIXUP_INSN_LEN_MASK, x->fixup);
 	bool is_arena = !!(x->fixup & FIXUP_ARENA_ACCESS);
 	bool is_write = !!(x->fixup & FIXUP_ARENA_WRITE);
+	const struct exception_table_entry *pad;
 	unsigned long addr;
 	s16 off;
 	u32 arena_reg;
@@ -1911,6 +1913,21 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
 		bpf_prog_report_arena_violation(is_write, addr, regs->ip);
+	}
+
+	if (x->fixup & FIXUP_ARENA_CANCEL) {
+		pad = search_bpf_extables(regs->ip + insn_len - ARENA_CANCEL_EXKEY);
+		/*
+		 * The frame is cancelled. Its pad reads the registers that were live in front
+		 * of the access: no insn of the access has changed one of the program by now,
+		 * but for RAX in a sequence that keeps R0 in BPF_REG_AX.
+		 */
+		if (!WARN_ON_ONCE(!pad)) {
+			if (x->fixup & FIXUP_ARENA_R0_IN_AX)
+				regs->ax = regs->r10;
+			regs->ip += insn_len + (long)pad->fixup;
+			return true;
+		}
 	}
 
 	/* jump over the faulting access, or the sequence it is part of, and clear dest register */
@@ -1925,11 +1942,13 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
  * Record an arena access that may fault. @fault_ip is the address of the
  * faulting insn in the RO image, @resume_off how far past it execution has to
  * resume: for a multi-insn lowering that is the end of the whole sequence, not
- * the end of the one insn.
+ * the end of the one insn. @cancel is FIXUP_ARENA_CANCEL, with FIXUP_ARENA_R0_IN_AX
+ * where that holds, when cancel_goto is behind the access, and 0 otherwise.
  */
 static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image,
 			      int *excnt, u8 *fault_ip, u32 resume_off,
-			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off)
+			      u32 fixup_reg, u32 arena_reg, bool is_write, s16 off,
+			      u32 cancel)
 {
 	struct exception_table_entry *ex;
 	s64 delta;
@@ -1952,7 +1971,7 @@ static int emit_arena_exentry(struct bpf_prog *bpf_prog, u8 *image, u8 *rw_image
 	ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, resume_off) |
 		    FIELD_PREP(FIXUP_ARENA_REG_MASK, arena_reg) |
 		    FIELD_PREP(FIXUP_REG_MASK, fixup_reg) |
-		    FIXUP_ARENA_ACCESS;
+		    FIXUP_ARENA_ACCESS | cancel;
 	if (is_write)
 		ex->fixup |= FIXUP_ARENA_WRITE;
 
@@ -2318,11 +2337,24 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
  * replaces the return address of its frame with bpf_unwind_target() of it.
  * ret_addr - 1, because what follows the call can have an entry of its own.
  * No insn starts there, so a fault cannot hit the entry.
+ *
+ * cancel_goto is the same for cancel_exit and bpf_cancel_target(), with the entry
+ * at ret_addr - 2: unwind_goto of the same call has the byte behind it. No insn
+ * starts there either, since a call that cancel_goto follows has 3 bytes at least,
+ * see emit_indirect_call().
  */
-static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
-			      int ret_addr, int target)
+#define UNWIND_EXKEY	1
+#define CANCEL_EXKEY	2
+
+/*
+ * @after_unwind: the entry of unwind_goto of the same call was added last. The table
+ * is searched by bisection and this entry has the lower address, so it takes that
+ * place and the other one moves up.
+ */
+static int add_ret_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
+			   int ret_addr, int target, int key, bool after_unwind)
 {
-	struct exception_table_entry *ex;
+	struct exception_table_entry *ex, *rw;
 	s64 delta;
 
 	if (!prog->aux->extable)
@@ -2332,22 +2364,29 @@ static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, in
 		return -EFAULT;
 	}
 	ex = &prog->aux->extable[(*excnt)++];
-	delta = image + ret_addr - 1 - (u8 *)&ex->insn;
+	/* switch ex to rw buffer for writes */
+	rw = (void *)rw_image + ((void *)ex - (void *)image);
+	if (after_unwind) {
+		/* insn is relative to the entry */
+		*rw = rw[-1];
+		rw->insn -= sizeof(*rw);
+		ex--;
+		rw--;
+	}
+	delta = image + ret_addr - key - (u8 *)&ex->insn;
 	if (!is_simm32(delta)) {
 		pr_err("extable->insn doesn't fit into 32-bit\n");
 		return -EFAULT;
 	}
-	/* switch ex to rw buffer for writes */
-	ex = (void *)rw_image + ((void *)ex - (void *)image);
-	ex->insn = delta;
-	ex->fixup = target - ret_addr;
-	ex->data = EX_TYPE_BPF;
+	rw->insn = delta;
+	rw->fixup = target - ret_addr;
+	rw->data = EX_TYPE_BPF;
 	return 0;
 }
 
 static u64 bpf_unwind_target(u64 ret_addr)
 {
-	const struct exception_table_entry *e = search_bpf_extables(ret_addr - 1);
+	const struct exception_table_entry *e = search_bpf_extables(ret_addr - UNWIND_EXKEY);
 
 	/*
 	 * The verifier made sure that unwind_goto follows a call in a prog. When
@@ -2356,11 +2395,54 @@ static u64 bpf_unwind_target(u64 ret_addr)
 	return e ? ret_addr + e->fixup : ret_addr;
 }
 
+static u64 bpf_cancel_target(u64 ret_addr)
+{
+	const struct exception_table_entry *e = search_bpf_extables(ret_addr - CANCEL_EXKEY);
+
+	/*
+	 * The verifier made sure that cancel_goto follows every call of a subprog
+	 * that has cancel_exit. When the kernel called it, it's exit.
+	 */
+	return e ? ret_addr + e->fixup : ret_addr;
+}
+
 /*
- * unwind_exit: fix the return address of this frame. r0 and r2 are returned.
- * So is BPF_REG_ARENA_SP, when it's used.
+ * 'call; [unwind_goto;] cancel_goto': whether cancel_goto follows @call, which has
+ * @cnt insns behind it.
  */
-static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
+static bool call_has_cancel_goto(const struct bpf_insn *call, int cnt)
+{
+	if (cnt && bpf_is_unwind_goto(call + 1)) {
+		call++;
+		cnt--;
+	}
+	return cnt && bpf_is_cancel_goto(call + 1);
+}
+
+/* 'access; cancel_goto': whether cancel_goto follows @insn, which has @cnt insns behind it */
+static bool arena_has_cancel_goto(const struct bpf_insn *insn, int cnt)
+{
+	return cnt && bpf_is_cancel_goto(insn + 1);
+}
+
+/*
+ * The entry of the pad of an access of arena, see ARENA_CANCEL_EXKEY. A fault in the
+ * access would go on at @resume. @pad is where the cancel_goto behind the access points.
+ * The entries of the faulting insns of the access are in front of this one in the table,
+ * and they have the lower addresses.
+ */
+static int add_arena_pad_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
+				 int resume, int pad)
+{
+	return add_ret_exentry(prog, image, rw_image, excnt, resume, pad, ARENA_CANCEL_EXKEY,
+			       false);
+}
+
+/*
+ * unwind_exit, cancel_exit: replace the return address of this frame with @target
+ * of it. r0 and r2 are returned. So is BPF_REG_ARENA_SP, when it's used.
+ */
+static int emit_fix_ret_addr(u8 **pprog, u8 *ip, bool arena_sp, void *target)
 {
 	u8 *prog = *pprog, *start = prog;
 
@@ -2368,7 +2450,7 @@ static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
 	if (arena_sp)
 		push_r9(&prog);
 	EMIT4(0x48, 0x8B, 0x7D, 0x08);		/* mov rdi, [rbp + 8] */
-	if (emit_rsb_call(&prog, bpf_unwind_target, ip + (prog - start)))
+	if (emit_rsb_call(&prog, target, ip + (prog - start)))
 		return -EINVAL;
 	EMIT4(0x48, 0x89, 0x45, 0x08);		/* mov [rbp + 8], rax */
 	if (arena_sp)
@@ -2452,39 +2534,24 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
-		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb);
+		      bpf_is_subprog(bpf_prog));
 
 	bpf_prog->aux->ksym.fp_start = prog - temp;
 
-	/* Exception callback will clobber callee regs for its own use, and
-	 * restore the original callee regs from main prog's stack frame.
+	/*
+	 * A program that calls bpf_throw() saves what it uses, like any other: its
+	 * frames leave through pads and their own epilogues, and the exception
+	 * callback is a function that the pad of the main program calls.
 	 */
-	if (bpf_prog->aux->exception_boundary) {
-		/* We also need to save r12, which is not mapped to any BPF
-		 * register, as we throw after entry into the kernel, which may
-		 * overwrite r12.
-		 */
+	if (arena_vm_start)
 		push_r12(&prog);
-		push_callee_regs(&prog, all_callee_regs_used);
-	} else {
-		if (arena_vm_start)
-			push_r12(&prog);
-		push_callee_regs(&prog, callee_regs_used);
-	}
+	push_callee_regs(&prog, callee_regs_used);
 
 	/* Compute callee-saved register area size. */
-	callee_saved_size = 0;
-	if (bpf_prog->aux->exception_boundary || arena_vm_start)
-		callee_saved_size += 8; /* r12 */
-	if (bpf_prog->aux->exception_boundary) {
-		callee_saved_size += 4 * 8; /* rbx, r13, r14, r15 */
-	} else {
-		int j;
-
-		for (j = 0; j < 4; j++)
-			if (callee_regs_used[j])
-				callee_saved_size += 8;
-	}
+	callee_saved_size = arena_vm_start ? 8 : 0; /* r12 */
+	for (i = 0; i < 4; i++)
+		if (callee_regs_used[i])
+			callee_saved_size += 8;
 	/*
 	 * Base offset from rbp for translating BPF outgoing args 7+
 	 * to native offsets. BPF uses negative offsets from r11
@@ -2513,15 +2580,6 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	outgoing_rsp = out_stack_arg_cnt > 1 ? (out_stack_arg_cnt - 1) * 8 : 0;
 	if (arena_sp)
 		outgoing_rsp = out_stack_arg_cnt * 8;
-	/*
-	 * bpf_throw() sees rsp of this frame as it is at a call. The callee-saved
-	 * regs are above the outgoing args, or above r9, which is pushed around
-	 * every call when the stack is private. With BPF_REG_ARENA_SP the slot
-	 * that keeps r9 over calls is between the two.
-	 */
-	if (bpf_prog->aux->exception_boundary)
-		bpf_prog->aux->stack_arg_sp_adjust = outgoing_rsp +
-						     (priv_frame_ptr || arena_sp_save ? 8 : 0);
 	emit_sub_rsp(&prog, outgoing_rsp);
 
 	if (arena_vm_start)
@@ -3025,7 +3083,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 			}
 populate_extable:
 			{
-				u32 arena_reg, fixup_reg;
+				u32 arena_reg, fixup_reg, cancel = 0;
 				bool is_write;
 
 				/*
@@ -3062,12 +3120,22 @@ populate_extable:
 					is_write = true;
 				}
 
+				/* one insn: a fault leaves the registers as they are */
+				if (arena_has_cancel_goto(insn, insn_cnt - i))
+					cancel = FIXUP_ARENA_CANCEL;
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
 							 prog - start_of_ldx, fixup_reg,
-							 arena_reg, is_write, insn->off);
+							 arena_reg, is_write, insn->off, cancel);
 				if (err)
 					return err;
+				if (cancel) {
+					err = add_arena_pad_exentry(bpf_prog, image, rw_image,
+								    &excnt, proglen + (prog - temp),
+								    addrs[i + 1 + insn[1].imm]);
+					if (err)
+						return err;
+				}
 			}
 			break;
 
@@ -3272,6 +3340,7 @@ populate_extable:
 			if (is_atomic_fetch_op(insn)) {
 				u32 real_src_reg = src_reg, real_dst_reg = dst_reg;
 				u8 *fault[2], *resume;
+				u32 cancel = 0;
 				int j;
 
 				/* Will need RAX as a CMPXCHG operand so save R0 */
@@ -3291,7 +3360,15 @@ populate_extable:
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
 				 * since the BPF insn is a read-modify-write.
+				 *
+				 * With cancel_goto behind the insn both go to its pad. The
+				 * load and a CMPXCHG that lost have changed RAX by then, and
+				 * R0 is in BPF_REG_AX. The other registers of the program
+				 * are as they were: the old value is moved to src_reg behind
+				 * the loop only.
 				 */
+				if (arena_has_cancel_goto(insn, insn_cnt - i))
+					cancel = FIXUP_ARENA_CANCEL | FIXUP_ARENA_R0_IN_AX;
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
 								 &excnt,
@@ -3300,7 +3377,15 @@ populate_extable:
 								 resume - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 true, insn->off);
+								 true, insn->off, cancel);
+					if (err)
+						return err;
+				}
+				/* both faults resume at one address: they share the entry */
+				if (cancel) {
+					err = add_arena_pad_exentry(bpf_prog, image, rw_image,
+								    &excnt, proglen + (resume - temp),
+								    addrs[i + 1 + insn[1].imm]);
 					if (err)
 						return err;
 				}
@@ -3354,10 +3439,7 @@ populate_extable:
 				if (err < 0)
 					return err;
 				ip += err;
-				/*
-				 * Other kfuncs leave rsp alone. bpf_throw() is one of
-				 * them, see stack_arg_sp_adjust.
-				 */
+				/* Other kfuncs leave rsp alone. */
 				arena_sp_args = arena_sp && kfunc_has_stack_args(fm);
 				if (arena_sp_args) {
 					u8 *start = prog;
@@ -3416,17 +3498,44 @@ populate_extable:
 				push_r9(&prog);
 				ip += 2;
 			}
-			if (emit_indirect_call(&prog, insn->dst_reg, ip))
+			if (emit_indirect_call(&prog, insn->dst_reg, ip,
+					       call_has_cancel_goto(insn, insn_cnt - i)))
 				return -EINVAL;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
 			break;
 
-			/* unwind_goto. The verifier expanded may_goto. */
-		case BPF_JMP | BPF_JCOND:
+			/* unwind_goto, cancel_goto. The verifier expanded may_goto. */
+		case BPF_JMP | BPF_JCOND: {
+			/* what the call returns to: 'pop r9' when the stack is private */
+			int ret_addr = addrs[i - 1] - (priv_frame_ptr ? 2 : 0);
+			/* where unwind_goto points */
+			int target = i + insn->off;
+			int key = UNWIND_EXKEY;
+			bool after_unwind = false;
+
+			if (bpf_is_cancel_goto(insn)) {
+				/* the offset of its pad has 32 bits and is in imm */
+				target = i + insn->imm;
+				/* access; cancel_goto: the access has added the entry */
+				if (i > 1 && bpf_is_arena_access(insn - 1))
+					break;
+				/* call; [unwind_goto;] cancel_goto */
+				after_unwind = i > 1 && bpf_is_unwind_goto(insn - 1);
+				if (i < 2 + after_unwind ||
+				    !(bpf_pseudo_call(insn - 1 - after_unwind) ||
+				      bpf_is_callx(insn - 1 - after_unwind))) {
+					pr_err("bpf_jit: cancel_goto doesn't follow a call\n");
+					return -EFAULT;
+				}
+				key = CANCEL_EXKEY;
+				/* the 9 bytes of unwind_goto below are in between */
+				if (after_unwind && priv_frame_ptr)
+					ret_addr -= 9;
+			}
 			if (!priv_frame_ptr) {
-				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-							 addrs[i - 1], addrs[i + insn->off]);
+				err = add_ret_exentry(bpf_prog, image, rw_image, &excnt, ret_addr,
+						      addrs[target], key, after_unwind);
 				if (err)
 					return err;
 				break;
@@ -3440,15 +3549,18 @@ populate_extable:
 			 *   pop r9      <- unwind_exit returns here
 			 *   jmp pad
 			 * 1:
+			 * The same for cancel_goto and cancel_exit. When the call has
+			 * both, the three insns of cancel_goto are at 1.
 			 */
-			err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-						 addrs[i - 1] - 2, addrs[i - 1] + 2);
+			err = add_ret_exentry(bpf_prog, image, rw_image, &excnt, ret_addr,
+					      addrs[i - 1] + 2, key, after_unwind);
 			if (err)
 				return err;
 			EMIT2(0xEB, 7);
 			pop_r9(&prog);
-			EMIT1_off32(0xE9, addrs[i + insn->off] - (addrs[i - 1] + 9));
+			EMIT1_off32(0xE9, addrs[target] - (addrs[i - 1] + 9));
 			break;
+		}
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
@@ -3719,7 +3831,11 @@ emit_jmp:
 
 		case BPF_JMP | BPF_EXIT:
 			if (src_reg == BPF_UNWIND_EXIT && bpf_prog_can_unwind(bpf_prog) &&
-			    emit_unwind_ret_addr(&prog, ip, arena_sp))
+			    emit_fix_ret_addr(&prog, ip, arena_sp, bpf_unwind_target))
+				return -EINVAL;
+			/* in subprogs only: the verifier ends the pad of a main prog with exit */
+			if (src_reg == BPF_CANCEL_EXIT &&
+			    emit_fix_ret_addr(&prog, ip, arena_sp, bpf_cancel_target))
 				return -EINVAL;
 			if (seen_exit) {
 				jmp_offset = ctx->cleanup_addr - addrs[i] + moved;
@@ -3735,14 +3851,9 @@ emit_jmp:
 			}
 			/* Deallocate outgoing args 7+ area and the slot of BPF_REG_ARENA_SP. */
 			emit_add_rsp(&prog, outgoing_rsp + (arena_sp_save ? 8 : 0));
-			if (bpf_prog->aux->exception_boundary) {
-				pop_callee_regs(&prog, all_callee_regs_used);
+			pop_callee_regs(&prog, callee_regs_used);
+			if (arena_vm_start)
 				pop_r12(&prog);
-			} else {
-				pop_callee_regs(&prog, callee_regs_used);
-				if (arena_vm_start)
-					pop_r12(&prog);
-			}
 			EMIT1(0xC9);         /* leave */
 			bpf_prog->aux->ksym.fp_end = prog - temp;
 
@@ -4983,6 +5094,21 @@ bool bpf_jit_supports_unwind(void)
 	return true;
 }
 
+bool bpf_jit_supports_cancel(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_cancel_throw(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_arena_cancel(void)
+{
+	return true;
+}
+
 bool bpf_jit_supports_hmul(void)
 {
 	return true;
@@ -5070,9 +5196,11 @@ void bpf_jit_free(struct bpf_prog *prog)
 
 bool bpf_jit_supports_exceptions(void)
 {
-	/* We unwind through both kernel frames (starting from within bpf_throw
-	 * call) and BPF frames. Therefore we require ORC unwinder to be enabled
-	 * to walk kernel frames and reach BPF frames in the stack trace.
+	/*
+	 * The frames of bpf_throw() leave through pads, see
+	 * bpf_jit_supports_cancel_throw(). What reports a program walks the stack
+	 * to find it, through kernel frames to the BPF frames: that takes the ORC
+	 * unwinder.
 	 */
 	return IS_ENABLED(CONFIG_UNWINDER_ORC);
 }
