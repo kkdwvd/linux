@@ -413,6 +413,7 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 			return false;
 		if (fa->in_callback_fn != fb->in_callback_fn ||
 		    fa->in_async_callback_fn != fb->in_async_callback_fn ||
+		    fa->in_kthread_fn != fb->in_kthread_fn ||
 		    /* the continuations of two suspend points stay apart */
 		    fa->coro_suspend_site != fb->coro_suspend_site ||
 		    fa->in_exception_callback_fn != fb->in_exception_callback_fn ||
@@ -499,7 +500,8 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 		return false;
 	if (a->speculative != b->speculative || a->in_sleepable != b->in_sleepable ||
 	    a->callers_unknown != b->callers_unknown ||
-	    a->unwound != b->unwound || a->changed_pkt_data != b->changed_pkt_data)
+	    a->unwound != b->unwound || a->changed_pkt_data != b->changed_pkt_data ||
+	    a->parked != b->parked)
 		return false;
 	if (a->active_locks != b->active_locks ||
 	    a->active_preempt_locks != b->active_preempt_locks ||

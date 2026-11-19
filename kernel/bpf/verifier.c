@@ -546,6 +546,7 @@ static bool is_call_rcu_kfunc(u32 btf_id);
 static bool is_callback_calling_kfunc(u32 btf_id);
 
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id);
+static bool is_bpf_kthread_create_kfunc(u32 btf_id);
 static bool is_task_work_add_kfunc(u32 func_id);
 
 static bool is_sync_callback_calling_function(enum bpf_func_id func_id)
@@ -589,9 +590,10 @@ static bool is_async_cb_sleepable(struct bpf_verifier_env *env, struct bpf_insn 
 	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 && is_call_rcu_kfunc(insn->imm))
 		return false;
 
-	/* bpf_wq and bpf_task_work callbacks are always sleepable. */
+	/* bpf_wq, bpf_task_work and bpf_kthread callbacks are always sleepable. */
 	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
-	    (is_bpf_wq_set_callback_kfunc(insn->imm) || is_task_work_add_kfunc(insn->imm)))
+	    (is_bpf_wq_set_callback_kfunc(insn->imm) || is_task_work_add_kfunc(insn->imm) ||
+	     is_bpf_kthread_create_kfunc(insn->imm)))
 		return true;
 
 	verifier_bug(env, "unhandled async callback in is_async_cb_sleepable");
@@ -1880,6 +1882,7 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->callers_unknown = src->callers_unknown;
 	dst_state->unwound = src->unwound;
 	dst_state->changed_pkt_data = src->changed_pkt_data;
+	dst_state->parked = src->parked;
 	dst_state->flow_entry = src->flow_entry;
 	dst_state->insn_idx = src->insn_idx;
 	dst_state->curframe = src->curframe;
@@ -11937,6 +11940,235 @@ static void invalidate_non_owning_refs(struct bpf_verifier_env *env)
 	}));
 }
 
+/*
+ * bpf_task_park() is confined to the main body of the program, the body of a
+ * BPF kthread, and the functions either calls directly. Any other callback
+ * runs from kernel code that holds state of its own around the call, an
+ * iteration position, a work item or timer that owns the program only through
+ * Tasks Trace RCU, an exiting task, none of it audited against a sleep that
+ * drops the program's protection. Refuse the park in any such callback frame,
+ * synchronous, asynchronous or exception. Asynchronous callbacks are verified
+ * as a state of their own with the callback as frame 0, so the walk over the
+ * frames sees them too.
+ *
+ * The body of a BPF kthread is the exception because its caller,
+ * bpf_kthread_fn(), is the whole of the thread: it brackets the callback the
+ * way the runner of a syscall program brackets the program, keeps no state
+ * across it, and the program's release stops the thread and waits for it
+ * before anything the callback uses is freed. Callbacks nested under the
+ * body are refused as anywhere else.
+ */
+static bool in_callback_frames(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	int i;
+
+	for (i = 0; i <= vstate->curframe; i++) {
+		struct bpf_func_state *frame = vstate->frame[i];
+
+		if (frame->in_kthread_fn)
+			continue;
+		if (frame->in_callback_fn || frame->in_async_callback_fn ||
+		    frame->in_exception_callback_fn)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * bpf_task_park() sleeps without the Tasks Trace RCU read section and the
+ * disabled migration that a sleepable program otherwise runs under. A dynptr
+ * or an iterator on the stack cannot simply be invalidated across such a
+ * sleep: the program must still release or destroy it, and an object that
+ * stays usable may point at memory the sleep lets go. Refuse the park while
+ * any is live, except a bpf_iter_num, whose state lives entirely on the stack
+ * and whose next and destroy touch nothing else.
+ */
+static int check_park_stack_objects(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	int i, spi;
+
+	for (i = 0; i <= vstate->curframe; i++) {
+		struct bpf_func_state *frame = vstate->frame[i];
+
+		for (spi = 0; spi < bpf_stack_nr_slots(frame); spi++) {
+			struct bpf_stack_state *slot = bpf_stack_slot(frame, spi);
+			struct bpf_reg_state *st = &slot->spilled_ptr;
+
+			switch (slot->slot_type[BPF_REG_SIZE - 1]) {
+			case STACK_DYNPTR:
+				/* Report the slot the program named, not the second half. */
+				if (!st->dynptr.first_slot)
+					continue;
+				verbose(env, "bpf_task_park() with a live dynptr at frame %d fp%d\n",
+					i, -(spi + 1) * BPF_REG_SIZE);
+				break;
+			case STACK_ITER:
+				if (!st->id)
+					continue;
+				if (st->iter.btf == btf_vmlinux &&
+				    !strcmp(iter_type_str(st->iter.btf, st->iter.btf_id), "num"))
+					continue;
+				verbose(env, "bpf_task_park() with a live %s iterator at frame %d fp%d\n",
+					iter_type_str(st->iter.btf, st->iter.btf_id), i,
+					-(spi + 1) * BPF_REG_SIZE);
+				break;
+			default:
+				continue;
+			}
+			bpf_diag_res(env, insn_idx, "live stack object across bpf_task_park()",
+				     "A dynptr or iterator on the stack may refer to memory that the sleep in bpf_task_park() lets go, and the verifier cannot invalidate it without losing the path that releases its reference.",
+				     "Release or destroy the dynptr or iterator before calling bpf_task_park(), or move the park out of the loop that uses it.");
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The acquires whose reference a program may hold across bpf_task_park().
+ *
+ * A reference the verifier tracks says only that the program owes a release.
+ * What the release pairs with differs from one acquire to the next: a count
+ * on the object, a record of a ring buffer that stays busy until it is
+ * committed, a read section the kfunc entered on the program's behalf. Only a
+ * count, or ownership of the object, keeps the object through a sleep that
+ * leaves the Tasks Trace RCU read section, and only a count is harmless to
+ * hold for a sleep of unbounded length.
+ *
+ * Nothing in the declaration of an acquire tells the kinds apart, so the park
+ * accepts the acquires listed here and refuses every other one. Each of these
+ * takes a count on a task, a cgroup or a cpumask, or hands the program an
+ * object it allocated. bpf_kptr_xchg() joins them in ref_survives_park():
+ * what a map may hold as a kptr is held by its count alone. The number
+ * iterator is here for the reference of its stack slot, which
+ * check_park_stack_objects() lets through.
+ */
+BTF_SET_START(park_safe_acquire_ids)
+BTF_ID(func, bpf_task_acquire)
+BTF_ID(func, bpf_task_from_pid)
+BTF_ID(func, bpf_task_from_vpid)
+BTF_ID(func, bpf_kthread_create)
+#ifdef CONFIG_CGROUPS
+BTF_ID(func, bpf_cgroup_acquire)
+BTF_ID(func, bpf_cgroup_ancestor)
+BTF_ID(func, bpf_cgroup_from_id)
+BTF_ID(func, bpf_task_get_cgroup1)
+#endif
+#ifdef CONFIG_BPF_JIT
+BTF_ID(func, bpf_cpumask_create)
+BTF_ID(func, bpf_cpumask_acquire)
+#endif
+BTF_ID(func, bpf_obj_new)
+BTF_ID(func, bpf_obj_new_impl)
+BTF_ID(func, bpf_percpu_obj_new)
+BTF_ID(func, bpf_percpu_obj_new_impl)
+BTF_ID(func, bpf_refcount_acquire)
+BTF_ID(func, bpf_refcount_acquire_impl)
+BTF_ID(func, bpf_list_pop_front)
+BTF_ID(func, bpf_list_pop_back)
+BTF_ID(func, bpf_list_del)
+BTF_ID(func, bpf_rbtree_remove)
+BTF_ID(func, bpf_iter_num_new)
+BTF_SET_END(park_safe_acquire_ids)
+
+/* Whether @ref may be held across a park. @name is set to what acquired it, if that is a call. */
+static bool ref_survives_park(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+			      const char **name)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[ref->insn_idx];
+	struct bpf_call_arg_meta meta;
+
+	*name = NULL;
+	if (bpf_helper_call(insn)) {
+		*name = func_id_name(insn->imm);
+		return insn->imm == BPF_FUNC_kptr_xchg;
+	}
+	if (!bpf_pseudo_kfunc_call(insn) ||
+	    bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta))
+		return false;
+	*name = meta.func_name;
+	return meta.btf == btf_vmlinux &&
+	       btf_id_set_contains(&park_safe_acquire_ids, meta.func_id);
+}
+
+/*
+ * Refuse the park while the program holds a reference that is not known to
+ * keep its object on its own, see park_safe_acquire_ids. Locks and saved IRQ
+ * states are references too, but a sleepable kfunc is refused under them
+ * before it gets here.
+ */
+static int check_park_references(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	const char *name;
+	int i;
+
+	for (i = 0; i < vstate->acquired_refs; i++) {
+		struct bpf_reference_state *ref = &vstate->refs[i];
+
+		if (ref->type != REF_TYPE_PTR || ref_survives_park(env, ref, &name))
+			continue;
+		if (name)
+			verbose(env, "bpf_task_park() with a reference from %s() acquired at insn %d\n",
+				name, ref->insn_idx);
+		else
+			verbose(env, "bpf_task_park() with a reference acquired at insn %d\n",
+				ref->insn_idx);
+		bpf_diag_res(env, insn_idx, "reference held across bpf_task_park()",
+			     "A reference may be held across the sleep in bpf_task_park() only when it is known to keep its object on its own: a task, a cgroup, a cpumask, an object the program allocated or a kptr taken out of a map. Others may stand for memory the sleep lets go, or for a section that may not be held that long.",
+			     "Release the reference before calling bpf_task_park().");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * Invalidate what the sleep in bpf_task_park() may free. Keep only pointers
+ * whose lifetime does not rest on the dropped protection: the stack and
+ * instruction metadata; the context and the maps the program references
+ * directly, which the invocation holds; the values of its array maps, which
+ * the map allocates and frees with itself, and which hold the program's
+ * global variables; arena memory, which the arena map holds and whose
+ * accesses tolerate faults; and pointers backed by a reference the program
+ * holds, each of which check_park_references() has accepted, found through
+ * their own id or the id of their parent. An inner map found through a
+ * map-in-map lookup is not kept, nor are its values: the outer map's element
+ * alone holds it, and its deletion frees it after a grace period the sleeping
+ * program no longer delays.
+ * Everything else, values of maps that free elements on delete or on their
+ * owner's teardown, RCU and trusted pointers without a reference, per-CPU
+ * and local storage pointers, is gone after the call.
+ */
+static void invalidate_regs_across_park(struct bpf_verifier_env *env)
+{
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *state;
+	struct bpf_reg_state *reg;
+
+	bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, stack, 1 << STACK_SPILL, ({
+		enum bpf_reg_type type = base_type(reg->type);
+
+		if (!is_pointer_regtype(reg->type))
+			continue;
+		if ((reg->id && find_reference_state(env->cur_state, reg->id)) ||
+		    (reg->parent_id && find_reference_state(env->cur_state, reg->parent_id)))
+			continue;
+		if ((type == CONST_PTR_TO_MAP || type == PTR_TO_MAP_VALUE) && !reg->map_uid &&
+		    (type == CONST_PTR_TO_MAP || reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY))
+			continue;
+		if (type == PTR_TO_STACK || type == PTR_TO_FUNC || type == PTR_TO_INSN ||
+		    type == PTR_TO_CTX || type == PTR_TO_ARENA)
+			continue;
+		bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_TASK_PARK);
+		mark_reg_invalid(env, reg);
+	}));
+	/* the frames of the callers are looked at when the function returns to them */
+	if (env->cur_state->flow_entry)
+		env->cur_state->parked = true;
+}
+
 static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
 {
 	struct bpf_stack_state *stack;
@@ -12433,6 +12665,9 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 	if (sub->changes_pkt_data || sub->has_tail_call || sub->has_ld_abs ||
 	    sub->is_cb || sub->is_async_cb || sub->is_exception_cb)
 		return false;
+	/* a park looks at every frame, and takes from each what the sleep may free */
+	if (sub->might_park)
+		return false;
 	if (state->speculative)
 		return false;
 	if (sub->releases_inherited &&
@@ -12647,6 +12882,15 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	 */
 	if (exit->changed_pkt_data) {
 		env->subprog_info[callee->subprogno].changes_pkt_data = true;
+		return 1;
+	}
+	/*
+	 * Likewise for a park behind such an address. It was checked against the frames
+	 * of the function only: which caller is a callback, and what the sleep takes
+	 * from each, is found out in the context of the caller.
+	 */
+	if (exit->parked) {
+		env->subprog_info[callee->subprogno].might_park = true;
 		return 1;
 	}
 
@@ -12910,6 +13154,29 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			return err;
 		}
 
+		/*
+		 * A park inside the callee is checked when the callee is verified,
+		 * but only against the callee's own frame. Apply the rules for the
+		 * frames the callee cannot see here, at the call.
+		 */
+		if (env->subprog_info[subprog].might_park) {
+			if (in_callback_frames(env)) {
+				verbose(env, "global function %s() may call bpf_task_park(), which is not allowed in a callback\n",
+					sub_name);
+				operation = bpf_diag_fmt(env, "global function %s() that may call bpf_task_park()",
+							 sub_name);
+				bpf_diag_policy(env, *insn_idx, operation, "the call is in a callback",
+						"Call the function from the main program, from the body of a BPF kthread, or from a function either calls directly, not from any other callback.");
+				return -EINVAL;
+			}
+			err = check_park_stack_objects(env, *insn_idx);
+			if (err)
+				return err;
+			err = check_park_references(env, *insn_idx);
+			if (err)
+				return err;
+		}
+
 		/* the call of a static function is recorded in check_static_func_call() */
 		err = bpf_cancel_record(env, BPF_CANCEL_SITE_CALL);
 		if (err)
@@ -12927,6 +13194,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		returns_void = subprog_returns_void(env, subprog);
 		if (env->subprog_info[subprog].changes_pkt_data)
 			clear_all_pkt_pointers(env);
+		if (env->subprog_info[subprog].might_park)
+			invalidate_regs_across_park(env);
 		if (returns_void)
 			bpf_diag_record_scrub(env, &caller->regs[BPF_REG_0], BPF_DIAG_MOD_CALLER_SAVED);
 		else
@@ -13511,6 +13780,33 @@ static int set_task_work_schedule_callback_state(struct bpf_verifier_env *env,
 
 	callee->in_async_callback_fn = true;
 	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	return 0;
+}
+
+static int set_kthread_callback_state(struct bpf_verifier_env *env,
+				      struct bpf_func_state *caller,
+				      struct bpf_func_state *callee,
+				      int insn_idx)
+{
+	/*
+	 * bpf_kthread_create(int (callback_fn)(u64 arg), u64 arg, u64 flags);
+	 * callback_fn(u64 arg);
+	 */
+	bpf_mark_reg_unknown(&callee->regs[BPF_REG_1]);
+
+	/* unused */
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_2]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_3]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_4]);
+	bpf_mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
+	callee->in_async_callback_fn = true;
+	callee->in_kthread_fn = true;
+	/*
+	 * The callback returns an int, which comes back in the low 32 bits of
+	 * R0: compare those, as for a global function.
+	 */
+	callee->callback_ret_range = retval_range(S32_MIN, S32_MAX);
+	callee->callback_ret_range.return_32bit = true;
 	return 0;
 }
 
@@ -15274,10 +15570,15 @@ enum special_kfunc_type {
 	KF_bpf_task_work_schedule_resume,
 	KF_bpf_call_rcu,
 	KF_bpf_call_rcu_tasks_trace,
+	KF_bpf_kthread_create,
+	KF_bpf_kthread_stop,
+	KF_bpf_kthread_bind,
+	KF_bpf_kthread_attach_cgroup,
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
 	KF_bpf_coro_frame_alloc,
+	KF_bpf_task_park,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -15378,6 +15679,14 @@ BTF_ID(func, bpf_task_work_schedule_signal)
 BTF_ID(func, bpf_task_work_schedule_resume)
 BTF_ID(func, bpf_call_rcu)
 BTF_ID(func, bpf_call_rcu_tasks_trace)
+BTF_ID(func, bpf_kthread_create)
+BTF_ID(func, bpf_kthread_stop)
+BTF_ID(func, bpf_kthread_bind)
+#ifdef CONFIG_CGROUPS
+BTF_ID(func, bpf_kthread_attach_cgroup)
+#else
+BTF_ID_UNUSED
+#endif
 #if defined(CONFIG_MMU) && defined(CONFIG_64BIT)
 BTF_ID(func, bpf_arena_alloc_pages)
 BTF_ID(func, bpf_arena_free_pages)
@@ -15391,6 +15700,7 @@ BTF_ID(func, bpf_session_is_return)
 BTF_ID_UNUSED
 #endif
 BTF_ID(func, bpf_coro_frame_alloc)
+BTF_ID(func, bpf_task_park)
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -15412,6 +15722,21 @@ static bool is_bpf_dynptr_clone_kfunc(const struct bpf_call_arg_meta *meta)
 static bool is_bpf_iter_css_task_new_kfunc(const struct bpf_call_arg_meta *meta)
 {
 	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_iter_css_task_new]);
+}
+
+static bool is_bpf_task_park_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_task_park];
+}
+
+/* The kfuncs that sleep or wait with migration enabled. */
+static bool is_migrating_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_task_park] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_create] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_stop] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_bind] ||
+	       btf_id == special_kfunc_list[KF_bpf_kthread_attach_cgroup];
 }
 
 static bool is_bpf_obj_new_kfunc(u32 func_id)
@@ -15529,6 +15854,11 @@ bool bpf_is_kfunc_pkt_changing(struct bpf_call_arg_meta *meta)
 {
 	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_xdp_pull_data]) ||
 	       is_kfunc_dynptr_write(meta);
+}
+
+bool bpf_is_task_park_kfunc(struct bpf_call_arg_meta *meta)
+{
+	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_task_park]);
 }
 
 static u32 kfunc_abi_slots(const struct btf_func_model *fm)
@@ -16269,6 +16599,7 @@ static bool is_sync_callback_calling_kfunc(u32 btf_id)
 static bool is_async_callback_calling_kfunc(u32 btf_id)
 {
 	return is_bpf_wq_set_callback_kfunc(btf_id) ||
+	       is_bpf_kthread_create_kfunc(btf_id) ||
 	       is_task_work_add_kfunc(btf_id) ||
 	       is_call_rcu_kfunc(btf_id);
 }
@@ -16332,6 +16663,11 @@ bool bpf_is_trap_kfunc(struct bpf_insn *insn)
 static bool is_bpf_wq_set_callback_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_wq_set_callback];
+}
+
+static bool is_bpf_kthread_create_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_kthread_create];
 }
 
 static bool is_callback_calling_kfunc(u32 btf_id)
@@ -17464,6 +17800,25 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return -EACCES;
 	}
 
+	/*
+	 * A BPF kthread is a kernel thread, and the program places it: it starts
+	 * in the root cgroup, moves to any cgroup the program names and binds to
+	 * any CPU its cpuset allows, and neither the thread nor its stack is
+	 * charged to whoever loaded the program. CAP_BPF does not stand for that.
+	 * Neither does a token, which speaks for its own user namespace only,
+	 * hence capable(). The check is made at load, as for the destructive
+	 * kfuncs: at run time the caller may be the thread itself.
+	 */
+	if (meta.btf == btf_vmlinux && bpf_is_kthread_kfunc(meta.func_id) &&
+	    !capable(CAP_SYS_ADMIN)) {
+		verbose(env, "%s requires CAP_SYS_ADMIN\n", func_name);
+		operation = bpf_diag_fmt(env, "kfunc %s", func_name);
+		bpf_diag_policy(env, insn_idx, operation,
+				"the BPF kthread kfuncs require CAP_SYS_ADMIN",
+				"Load the program with CAP_SYS_ADMIN, or avoid the kfunc.");
+		return -EPERM;
+	}
+
 	if (is_kfunc_perfmon(&meta) && !env->allow_ptr_leaks) {
 		verbose(env, "%s is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
 			func_name);
@@ -17494,6 +17849,24 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	/* Track non-sleepable context for kfuncs, same as for helpers. */
 	if (!in_sleepable_context(env))
 		insn_aux->non_sleepable = true;
+
+	/*
+	 * The kfunc may return on another CPU. What a run takes on the CPU it
+	 * starts on and gives back on the CPU it ends on does not survive that.
+	 * The stack in arena is such a thing, see bpf_arena_stack_put(). For
+	 * the same reason the program is kept out of prog arrays, where it would
+	 * also run without a reference of its own, and away from runners that
+	 * count a run per CPU. The time slice of may_goto is kept per CPU as
+	 * well, and the kfunc starts it over, see bpf_timed_may_goto_rearm().
+	 */
+	if (is_migrating_kfunc(meta.func_id)) {
+		if (env->uses_arena_sp) {
+			verbose(env, "%s() cannot be called in a program that uses R%d\n",
+				func_name, BPF_REG_ARENA_SP);
+			return -EINVAL;
+		}
+		env->prog->aux->may_migrate = true;
+	}
 
 	/* Check the arguments */
 	err = check_func_args(env, &meta, insn_idx);
@@ -17565,6 +17938,16 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (is_call_rcu_kfunc(meta.func_id)) {
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rcu_callback_state);
+		if (err) {
+			verbose(env, "kfunc %s#%d failed callback verification\n",
+				func_name, meta.func_id);
+			return err;
+		}
+	}
+
+	if (is_bpf_kthread_create_kfunc(meta.func_id)) {
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+					 set_kthread_callback_state);
 		if (err) {
 			verbose(env, "kfunc %s#%d failed callback verification\n",
 				func_name, meta.func_id);
@@ -17782,6 +18165,22 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "bpf_throw() needs CAP_PERFMON: the frames leave through pads\n");
 			return -EACCES;
 		}
+	}
+
+	if (is_bpf_task_park_kfunc(meta.func_id)) {
+		if (in_callback_frames(env)) {
+			verbose(env, "bpf_task_park() is not allowed in a callback\n");
+			bpf_diag_policy(env, insn_idx, "kfunc bpf_task_park", "the call is in a callback",
+					"Call bpf_task_park() from the main program, from the body of a BPF kthread, or from a function either calls directly, not from any other callback.");
+			return -EINVAL;
+		}
+		err = check_park_stack_objects(env, insn_idx);
+		if (err)
+			return err;
+		err = check_park_references(env, insn_idx);
+		if (err)
+			return err;
+		invalidate_regs_across_park(env);
 	}
 
 	bpf_diag_record_caller_saved(env, regs);

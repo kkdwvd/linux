@@ -563,6 +563,12 @@ struct bpf_func_state {
 	 */
 	u32 coro_suspend_site;
 	bool in_exception_callback_fn;
+	/*
+	 * The body of a BPF kthread: an async callback whose kernel caller,
+	 * bpf_kthread_fn(), keeps nothing across it that the sleep in
+	 * bpf_task_park() could invalidate, so the park is allowed in it.
+	 */
+	bool in_kthread_fn;
 	bool no_stack_arg_load;
 	/*
 	 * The helper invokes this callback under rcu_read_lock(), so the
@@ -657,6 +663,12 @@ struct bpf_verifier_state {
 	 * and their packet pointers are not in the state, see bpf_flow_return().
 	 */
 	bool changed_pkt_data;
+	/*
+	 * A function that is verified on its own parked the task. Its callers,
+	 * what the sleep takes from them and whether one of them is a callback,
+	 * are not in the state, see bpf_flow_return().
+	 */
+	bool parked;
 	/*
 	 * Not zero in a function that is verified on its own: the call that the
 	 * state at its entry came from, see bpf_flow_call().
@@ -1273,6 +1285,8 @@ struct bpf_subprog_info {
 	bool keep_fastcall_stack: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
+	/* some call reachable from this subprog may be bpf_task_park() */
+	bool might_park: 1;
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
@@ -2381,6 +2395,7 @@ static inline bool bpf_is_kfunc_sleepable(struct bpf_call_arg_meta *meta)
 }
 bool bpf_is_kfunc_pkt_changing(struct bpf_call_arg_meta *meta);
 bool bpf_is_cast_kfunc(const struct bpf_call_arg_meta *meta);
+bool bpf_is_task_park_kfunc(struct bpf_call_arg_meta *meta);
 struct bpf_iarray *bpf_iarray_realloc(struct bpf_iarray *old, size_t n_elem);
 int bpf_copy_insn_array_uniq(struct bpf_map *map, u32 start, u32 end, u32 *off);
 bool bpf_insn_is_cond_jump(u8 code);

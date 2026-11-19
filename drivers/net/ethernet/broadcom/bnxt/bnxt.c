@@ -3394,6 +3394,7 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
 	struct bnxt_cp_ring_info *cpr_rx;
 	u32 raw_cons = cpr->cp_raw_cons;
+	u32 nq_cons = raw_cons;
 	struct bnxt *bp = bnapi->bp;
 	struct nqe_cn *nqcmp;
 	int work_done = 0;
@@ -3420,9 +3421,21 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL,
 					     budget);
 			cpr->cp_raw_cons = raw_cons;
-			if (napi_complete_done(napi, work_done))
+			if (napi_complete_done(napi, work_done)) {
 				BNXT_DB_NQ_ARM_P5(&cpr->cp_db,
 						  cpr->cp_raw_cons);
+			} else if (raw_cons != nq_cons) {
+				/* Busy polling or deferred interrupts: the
+				 * NQ stays unarmed, but the chip must still
+				 * learn how far it was consumed. Left at the
+				 * index of the last ARM through an unbounded
+				 * busy poll, the chip sees the NQ fill up and
+				 * loses the notifications of the CQs that are
+				 * re-armed above, which are then never polled
+				 * nor re-armed again.
+				 */
+				BNXT_DB_NQ_P5(&cpr->cp_db, raw_cons);
+			}
 			goto poll_done;
 		}
 
@@ -14567,7 +14580,7 @@ static void bnxt_timer(struct timer_list *t)
 		}
 	}
 
-	if ((BNXT_CHIP_P5(bp)) && !bp->chip_rev && netif_carrier_ok(dev))
+	if ((bp->flags & BNXT_FLAG_CHIP_P5_PLUS) && netif_carrier_ok(dev))
 		bnxt_queue_sp_work(bp, BNXT_RING_COAL_NOW_SP_EVENT);
 
 bnxt_restart_timer:
@@ -14911,7 +14924,8 @@ static void bnxt_chk_missed_irq(struct bnxt *bp)
 		cpr = &bnapi->cp_ring;
 		for (j = 0; j < cpr->cp_ring_count; j++) {
 			struct bnxt_cp_ring_info *cpr2 = &cpr->cp_ring_arr[j];
-			u32 val[2];
+			struct bnxt_db_info *db;
+			u32 val[2] = {};
 
 			if (cpr2->has_more_work || !bnxt_has_work(bp, cpr2))
 				continue;
@@ -14925,6 +14939,23 @@ static void bnxt_chk_missed_irq(struct bnxt *bp)
 				DBG_RING_INFO_GET_REQ_RING_TYPE_L2_CMPL,
 				fw_ring_id, &val[0], &val[1]);
 			cpr->sw_stats->cmn.missed_irqs++;
+			/* Re-arm the CQ at the consumer index the driver is
+			 * at. A CQ whose notification was lost is disarmed,
+			 * and the poll re-arms only the CQs an NQE led it
+			 * to, so nothing else would ever wake this one
+			 * again. The ARMALL behind valid entries makes the
+			 * chip write the missing NQE now.
+			 */
+			db = &cpr2->cp_db;
+			bnxt_writeq(bp,
+				    db->db_key64 | DBR_TYPE_CQ_ARMALL |
+				    DB_TOGGLE(cpr2->toggle) |
+				    DB_RING_IDX(db, cpr2->cp_raw_cons),
+				    db->doorbell);
+			if (net_ratelimit())
+				netdev_warn(bp->dev,
+					    "NAPI %d CQ %d (fw ring %u): completions pending without a notification, re-armed (fw prod %u cons %u)\n",
+					    i, j, fw_ring_id, val[0], val[1]);
 		}
 	}
 }
