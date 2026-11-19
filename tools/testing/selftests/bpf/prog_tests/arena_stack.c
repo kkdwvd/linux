@@ -118,7 +118,10 @@ out:
 	sched_setaffinity(0, sizeof(old), &old);
 }
 
-/* bpf_throw() doesn't return the stack. Programs run when all stacks of the cpu are taken. */
+/*
+ * Where bpf_throw() discards the frames it doesn't return the stack, and programs run when all
+ * stacks of the cpu are taken. Where the frames leave through pads, the stack is returned.
+ */
 static void test_throw(struct arena_stack *skel)
 {
 	cpu_set_t old;
@@ -264,8 +267,8 @@ static void test_no_memory(void)
 }
 
 /*
- * bpf_throw() in a main program that has stack arguments. The exception callback restores the
- * registers of the caller.
+ * bpf_throw() in a main program that has stack arguments. The caller finds its registers as
+ * they were: the exception callback restores them, or the frame leaves through its epilogue.
  */
 static void test_throw_stack_args(void)
 {

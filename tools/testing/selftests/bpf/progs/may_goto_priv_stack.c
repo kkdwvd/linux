@@ -12,10 +12,14 @@ __u64 regs_128[7];
 /*
  * fentry prog with 64 or more bytes of stack uses private stack.
  * Loop until may_goto expires. r0-r5 should stay zero.
+ *
+ * When may_goto expires in the prog itself the prog is cancelled where the JIT supports
+ * that, and nothing behind the loop runs. A callback that a helper calls is never cancelled,
+ * so the loop is in a callback of bpf_loop(), which has its frame in the private stack too.
  */
 #define TIMED_MAY_GOTO_PRIV_STACK(size, func)				\
-SEC("fentry/" #func)							\
-__naked void priv_stack_##size(void)					\
+__naked __noinline __used						\
+static int loop_cb_##size(void)						\
 {									\
 	asm volatile (							\
 	"r6 = 0;"							\
@@ -43,6 +47,25 @@ __naked void priv_stack_##size(void)					\
 	:								\
 	: [regs]"i"(&regs_##size),					\
 	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2, 0)) \
+	: __clobber_all);						\
+}									\
+									\
+SEC("fentry/" #func)							\
+__naked void priv_stack_##size(void)					\
+{									\
+	asm volatile (							\
+	"r1 = 0;"							\
+	"*(u64 *)(r10 - " #size ") = r1;"				\
+	"r1 = 1;"							\
+	"r2 = %[loop_cb] ll;"						\
+	"r3 = 0;"							\
+	"r4 = 0;"							\
+	"call %[bpf_loop];"						\
+	"r0 = 0;"							\
+	"exit;"								\
+	:								\
+	: [loop_cb]"i"(&loop_cb_##size),				\
+	  __imm(bpf_loop)						\
 	: __clobber_all);						\
 }
 
