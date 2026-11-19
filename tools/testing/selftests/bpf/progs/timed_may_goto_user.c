@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-/* The tests of timed_may_goto.c that need help from user space. */
+/*
+ * The tests of timed_may_goto.c that need help from user space.
+ *
+ * A prog whose time is up is cancelled at its next may_goto. Most progs here go on behind that
+ * point, so they spin in a callback of bpf_loop(): a callback that a helper calls is not
+ * cancelled, and neither is what it calls.
+ */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -10,6 +16,7 @@ char _license[] SEC("license") = "GPL";
 
 #define TRIES 4
 #define CLOCK_MONOTONIC 1
+#define TC_ACT_SHOT 2
 
 int zero;
 
@@ -37,17 +44,62 @@ static __noinline int counts_to_1000(void)
 	return cnt;
 }
 
+/* fn##_in_callback(): bpf_loop() calls a callback one time, and that returns what fn() does */
+#define IN_CALLBACK(fn)								\
+static int fn##_cb(__u64 i, int *ret)						\
+{										\
+	*ret = fn();								\
+	return 0;								\
+}										\
+										\
+static __always_inline int fn##_in_callback(void)				\
+{										\
+	int ret = -1;								\
+										\
+	bpf_loop(1, fn##_cb, &ret, 0);						\
+	return ret;								\
+}
+
+/* How many of four calls spin */
+static __always_inline int calls_spins(void)
+{
+	int i, n = 0;
+
+	for (i = 0; i < TRIES; i++)
+		n += spins();
+	return n;
+}
+
+IN_CALLBACK(calls_spins)
+
+/*
+ * The time is up. Returns what a loop counts after that, which is 0, or -1 if the loop that was to
+ * use up the time ended too early. No callback of bpf_loop() runs when the time is up, so the
+ * two are in one.
+ */
+static __always_inline int spins_then_counts(void)
+{
+	return spins() ? counts_to_1000() : -1;
+}
+
+IN_CALLBACK(spins_then_counts)
+
 /* Nothing special: the loops go on, then the time is up one time. */
 SEC("tc")
 int normal_prog(void *ctx)
 {
-	int i, n = 0;
-
 	if (counts_to_1000() != 1000)
 		return 100;
-	for (i = 0; i < TRIES; i++)
-		n += spins();
-	return n;
+	return calls_spins_in_callback();
+}
+
+/* The same, but the prog makes the calls itself: the first one ends it */
+SEC("tc")
+int cancelled_prog(void *ctx)
+{
+	if (counts_to_1000() != 1000)
+		return 100;
+	return 10 + calls_spins();
 }
 
 /*
@@ -108,7 +160,7 @@ int async_after_timeout(void *ctx)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	struct elem *e, *e1;
-	int key = 0, key1 = 1;
+	int key = 0, key1 = 1, cnt;
 
 	e = bpf_map_lookup_elem(&async, &key);
 	e1 = bpf_map_lookup_elem(&async, &key1);
@@ -119,10 +171,11 @@ int async_after_timeout(void *ctx)
 		return 101;
 	if (bpf_wq_init(&e->wq, &async, 0) || bpf_wq_set_callback(&e->wq, wq_cb, 0))
 		return 102;
-	if (!spins())
+	cnt = spins_then_counts_in_callback();
+	if (cnt < 0)
 		return 103;
 	/* control: the time is up */
-	if (counts_to_1000())
+	if (cnt)
 		return 109;
 	if (bpf_timer_start(&e->timer, 0, BPF_F_TIMER_CPU_PIN))
 		return 104;
@@ -148,9 +201,16 @@ static int tick_cb(void *map, int *key, struct elem *e)
 	return 0;
 }
 
+static int spin_cb(__u64 i, void *ctx)
+{
+	spin();
+	return 0;
+}
+
 /*
  * A callback of the prog interrupts it, on the same cpu, each 20 ms. It has its own time. That
- * doesn't give more time to the prog. Return how long the loop went on, in ms.
+ * doesn't give more time to the prog. Return how long the loop went on, in ms: the loop is in a
+ * callback of bpf_loop(), so that the prog gets to tell.
  */
 SEC("syscall")
 int spin_under_timer(void *ctx)
@@ -167,8 +227,7 @@ int spin_under_timer(void *ctx)
 	    bpf_timer_start(&e->timer, 20 * 1000 * 1000, BPF_F_TIMER_CPU_PIN))
 		return 0;
 	t0 = bpf_ktime_get_ns();
-	while (can_loop)
-		;
+	bpf_loop(1, spin_cb, NULL, 0);
 	return (bpf_ktime_get_ns() - t0) / 1000000;
 }
 
@@ -205,11 +264,7 @@ int tail_callee_spun;
 SEC("tc")
 int tail_callee(struct __sk_buff *skb)
 {
-	int i;
-
-	tail_callee_spun = 0;
-	for (i = 0; i < TRIES; i++)
-		tail_callee_spun += spins();
+	tail_callee_spun = calls_spins_in_callback();
 	return 0;
 }
 
@@ -223,27 +278,27 @@ static __noinline int tail_calls(struct __sk_buff *skb)
 SEC("tc")
 int tail_call_in_subprog(struct __sk_buff *skb)
 {
-	int i, n;
+	int n;
 
 	n = tail_calls(skb);
 	if (counts_to_1000() != 1000)
 		return 101;
-	for (i = 0; i < TRIES; i++)
-		n += spins();
-	return n;
+	return n + calls_spins_in_callback();
 }
 
 SEC("tc")
 int tail_call_after_timeout(struct __sk_buff *skb)
 {
-	spins();
+	if (spins_then_counts_in_callback())
+		return 101;
 	bpf_tail_call(skb, &jmp_table, 0);
 	return 100;
 }
 
 static __noinline int throws(void)
 {
-	spin();
+	if (spins_then_counts_in_callback())
+		return 0;
 	bpf_throw(7);
 	return 0;
 }
@@ -288,6 +343,17 @@ static __noinline int spins_with_stack(void)
 	return spin() + buf[zero & 127];
 }
 
+static int calls_spins_with_stack_cb(__u64 i, int *n)
+{
+	volatile char buf[128] = {};
+	int j;
+
+	*n = buf[zero & 127];
+	for (j = 0; j < TRIES; j++)
+		*n += spins_with_stack();
+	return 0;
+}
+
 static int priv_stack_cb(__u64 i, int *spun)
 {
 	volatile char buf[128] = {};
@@ -300,10 +366,9 @@ SEC("fentry/bpf_fentry_test1")
 int BPF_PROG(priv_stack)
 {
 	volatile char buf[128] = {};
-	int i, n = buf[zero & 127], spun = 0;
+	int n = buf[zero & 127], spun = 0;
 
-	for (i = 0; i < TRIES; i++)
-		n += spins_with_stack();
+	bpf_loop(1, calls_spins_with_stack_cb, &n, zero);
 	bpf_loop(TRIES, priv_stack_cb, &spun, zero);
 	priv_stack_spun = n;
 	priv_stack_cb_spun = spun;

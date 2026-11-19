@@ -4873,7 +4873,8 @@ exit_%=:						\
  *    return 0;
  *
  * The outer loop gets may_goto in front of the jump that leaves it, the inner loop doesn't.
- * At run time it's may_goto that ends the prog.
+ * At run time it's may_goto that ends the prog: through 'r0 = 0; exit' behind the last insn,
+ * or through the pad that is there when the prog can be cancelled, which reports first.
  */
 SEC("xdp")
 __success __retval(0)
@@ -4886,6 +4887,7 @@ __xlated("if r8 < 0x3 goto pc-2")
 __xlated("goto pc-{{[0-9]+}}")
 __xlated("r0 = 0")
 __xlated("exit")
+__xlated("...")
 __xlated("r0 = 0")
 __xlated("exit")
 __naked void nested_terminating_prune(void)

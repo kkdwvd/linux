@@ -2322,7 +2322,10 @@ static void flow_shape_ctx(const struct bpf_verifier_state *st, struct flow_shap
 			   upper_32_bits((unsigned long)st->active_lock_ptr), ctx);
 	for (i = 0; i < st->acquired_refs; i++) {
 		ref = &st->refs[i];
-		ctx = jhash_1word(ref->type, ctx);
+		/* the owner doesn't follow from entry_refs: a call may move a reference */
+		ctx = jhash_2words(ref->type, ref->frameno, ctx);
+		/* nor does the argument that a frame above it got the reference in */
+		ctx = jhash(ref->args, sizeof(ref->args), ctx);
 		if (ref->type != REF_TYPE_PTR && ref->type != REF_TYPE_IRQ)
 			ctx = jhash_2words(lower_32_bits((unsigned long)ref->ptr),
 					   upper_32_bits((unsigned long)ref->ptr), ctx);
@@ -2331,7 +2334,7 @@ static void flow_shape_ctx(const struct bpf_verifier_state *st, struct flow_shap
 		frame = st->frame[fr];
 		chain = jhash_3words(frame->subprogno, frame->callsite, frame->loop_stack_cnt,
 				     chain);
-		ctx = jhash_2words(frame->entry_refs, frame->in_rcu_callback_fn, ctx);
+		ctx = jhash_3words(frame->entry_refs, frame->in_rcu_callback_fn, frame->gave, ctx);
 		ctx = jhash_2words(frame->entry_rcu_locks, frame->entry_preempt_locks, ctx);
 		for (i = 0; i < frame->loop_stack_cnt; i++) {
 			entry = &frame->loop_stack[i];

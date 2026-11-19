@@ -218,16 +218,13 @@ int stream_arena_read_fault(void *ctx)
 	return 0;
 }
 
-SEC("syscall")
-__arch_x86_64
-__arch_arm64
-__success __retval(0)
-__stderr("ERROR: Arena READ access at unmapped address 0x{{.*}}")
-__stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
-__stderr("Call trace:\n"
-"{{([a-zA-Z_][a-zA-Z0-9_]*\\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+\n"
-"|[ \t]+[^\n]+\n)*}}")
-int stream_arena_load_acquire_fault(void *ctx)
+/*
+ * The three tests below look at the register that the handler of the fault cleared. A fault
+ * in the main prog cancels it, and nothing behind the access runs. In a callback that a helper
+ * calls the access is skipped and the prog goes on, so the access is in a callback of
+ * bpf_loop(). The prog returns 1 if the register is 0: a prog that is cancelled returns 0.
+ */
+static int load_acquire_fault_cb(__u64 i, u64 *res)
 {
 	static const struct bpf_insn load_acquire_insn = {
 		.code	 = 0xc3,	/* BPF_STX | BPF_ATOMIC | BPF_W */
@@ -251,19 +248,28 @@ int stream_arena_load_acquire_fault(void *ctx)
 		  __imm_insn(load_acquire_insn, load_acquire_insn)
 		: "r0", "r1"
 	);
-	return val;
+	*res = val;
+	return 0;
 }
 
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
-__stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
+__success __retval(1)
+__stderr("ERROR: Arena READ access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
 "{{([a-zA-Z_][a-zA-Z0-9_]*\\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+\n"
 "|[ \t]+[^\n]+\n)*}}")
-int stream_arena_xchg_fault(void *ctx)
+int stream_arena_load_acquire_fault(void *ctx)
+{
+	u64 val = 1;
+
+	bpf_loop(1, load_acquire_fault_cb, &val, 0);
+	return val == 0;
+}
+
+static int xchg_fault_cb(__u64 i, u64 *res)
 {
 	static const struct bpf_insn xchg_insn = {
 		.code	 = 0xc3,	/* BPF_STX | BPF_ATOMIC | BPF_W */
@@ -281,7 +287,7 @@ int stream_arena_xchg_fault(void *ctx)
 	 * A read-modify-write carrying BPF_FETCH writes to memory, so the fault
 	 * has to be reported as a WRITE from the dst_reg address, but it also
 	 * reads the old value into src_reg, so the exception handler has to
-	 * clear src_reg. Poison it up front, the returned value must be 0.
+	 * clear src_reg. Poison it up front, the value must be 0 afterwards.
 	 */
 	asm volatile (
 		"r1 = %[user_vm_start];"
@@ -293,19 +299,28 @@ int stream_arena_xchg_fault(void *ctx)
 		  __imm_insn(xchg_insn, xchg_insn)
 		: "r1", "r2"
 	);
-	return val;
+	*res = val;
+	return 0;
 }
 
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(1)
 __stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
 "{{([a-zA-Z_][a-zA-Z0-9_]*\\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+\n"
 "|[ \t]+[^\n]+\n)*}}")
-int stream_arena_cmpxchg_fault(void *ctx)
+int stream_arena_xchg_fault(void *ctx)
+{
+	u64 val = 1;
+
+	bpf_loop(1, xchg_fault_cb, &val, 0);
+	return val == 0;
+}
+
+static int cmpxchg_fault_cb(__u64 i, u64 *res)
 {
 	static const struct bpf_insn cmpxchg_insn = {
 		.code	 = 0xc3,	/* BPF_STX | BPF_ATOMIC | BPF_W */
@@ -336,7 +351,25 @@ int stream_arena_cmpxchg_fault(void *ctx)
 		  __imm_insn(cmpxchg_insn, cmpxchg_insn)
 		: "r0", "r1", "r2"
 	);
-	return val;
+	*res = val;
+	return 0;
+}
+
+SEC("syscall")
+__arch_x86_64
+__arch_arm64
+__success __retval(1)
+__stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
+__stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
+__stderr("Call trace:\n"
+"{{([a-zA-Z_][a-zA-Z0-9_]*\\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+\n"
+"|[ \t]+[^\n]+\n)*}}")
+int stream_arena_cmpxchg_fault(void *ctx)
+{
+	u64 val = 1;
+
+	bpf_loop(1, cmpxchg_fault_cb, &val, 0);
+	return val == 0;
 }
 
 static __noinline void subprog(void)

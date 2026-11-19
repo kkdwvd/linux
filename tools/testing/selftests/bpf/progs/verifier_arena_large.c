@@ -20,10 +20,33 @@ struct {
 	__uint(max_entries, ARENA_SIZE / PAGE_SIZE);
 } arena SEC(".maps");
 
-SEC("syscall")
-__success __retval(0)
-__skip_without_arena
-int big_alloc1(void *ctx)
+/*
+ * An access of arena that faults cancels the program: it ends there, and returns 0 like a test
+ * that passed. A callback that a helper calls cannot be cancelled, and neither can what it
+ * calls. There a store that faults is skipped, a load yields 0, and the program goes on.
+ *
+ * The tests that look at what such an access leaves run their checks in a callback of
+ * bpf_loop(): fn##_in_callback() returns PASSED if fn() returned 0, and what fn() returned
+ * otherwise.
+ */
+#define PASSED 100
+
+#define IN_CALLBACK(fn)								\
+static int fn##_cb(__u64 i, int *ret)						\
+{										\
+	*ret = fn();								\
+	return 0;								\
+}										\
+										\
+static __always_inline int fn##_in_callback(void)				\
+{										\
+	int ret = -1;								\
+										\
+	bpf_loop(1, fn##_cb, &ret, 0);						\
+	return ret ?: PASSED;							\
+}
+
+static __always_inline int big_alloc1_checks(void)
 {
 	volatile char __arena *page1, *page2, *no_page, *page3;
 	u64 base;
@@ -82,11 +105,18 @@ int big_alloc1(void *ctx)
 	return 0;
 }
 
-/* Try to access a reserved page. Behavior should be identical with accessing unallocated pages. */
+IN_CALLBACK(big_alloc1_checks)
+
 SEC("syscall")
-__success __retval(0)
+__success __retval(PASSED)
 __skip_without_arena
-int access_reserved(void *ctx)
+int big_alloc1(void *ctx)
+{
+	return big_alloc1_checks_in_callback();
+}
+
+/* Try to access a reserved page. Behavior should be identical with accessing unallocated pages. */
+static __always_inline int access_reserved_checks(void)
 {
 	volatile char __arena *page;
 	char __arena *base;
@@ -118,6 +148,16 @@ int access_reserved(void *ctx)
 			return 2 + 2 * i + 1;
 	}
 	return 0;
+}
+
+IN_CALLBACK(access_reserved_checks)
+
+SEC("syscall")
+__success __retval(PASSED)
+__skip_without_arena
+int access_reserved(void *ctx)
+{
+	return access_reserved_checks_in_callback();
 }
 
 /* Try to allocate a region overlapping with a reservation. */

@@ -420,7 +420,8 @@ static bool join_func(struct bpf_join_state *js, struct bpf_func_state *fd,
 			return false;
 		if (fa->entry_refs != fb->entry_refs ||
 		    fa->entry_rcu_locks != fb->entry_rcu_locks ||
-		    fa->entry_preempt_locks != fb->entry_preempt_locks)
+		    fa->entry_preempt_locks != fb->entry_preempt_locks ||
+		    fa->gave != fb->gave)
 			return false;
 		if (!join_loop_stack(fa, fb))
 			return false;
@@ -507,7 +508,9 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	if (a->acquired_refs != b->acquired_refs)
 		return false;
 	for (i = 0; i < a->acquired_refs; i++) {
-		if (a->refs[i].type != b->refs[i].type)
+		if (a->refs[i].type != b->refs[i].type ||
+		    a->refs[i].frameno != b->refs[i].frameno ||
+		    memcmp(a->refs[i].args, b->refs[i].args, sizeof(a->refs[i].args)))
 			return false;
 		switch (a->refs[i].type) {
 		case REF_TYPE_PTR:
@@ -623,5 +626,9 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 		}
 	}
 
-	return join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
+	err = join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
+	/* @dst has the references of @a and stands for @b too, see bpf_cancel_alias_refs() */
+	if (!err)
+		bpf_cancel_alias_refs(env, a, b);
+	return err;
 }
