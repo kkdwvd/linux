@@ -57,6 +57,16 @@ objtool-args = $(vmlinux-objtool-args-y) --link
 
 vmlinux-o-ld-args-$(CONFIG_BUILTIN_MODULE_RANGES)	+= -Map=$@.map
 
+# scripts/link-vmlinux.sh links vmlinux from vmlinux.o for Clang LTO, IBT and
+# klp-build. Otherwise only modpost and checks that do not read DWARF use
+# vmlinux.o, so leave its debug sections out. Assemblers that keep a symbol for
+# every local label a relocation refers to, such as those of LoongArch and
+# RISC-V, would give it one per DWARF label, which in large configurations is
+# more than the 2^24 symbols that ELF32 relocations can index.
+ifeq ($(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_KERNEL_IBT),$(CONFIG_KLP_BUILD)),)
+vmlinux-o-ld-args-$(CONFIG_DEBUG_INFO)			+= --strip-debug
+endif
+
 quiet_cmd_ld_vmlinux.o = LD      $@
       cmd_ld_vmlinux.o = \
 	$(LD) ${KBUILD_LDFLAGS} -r -o $@ \
