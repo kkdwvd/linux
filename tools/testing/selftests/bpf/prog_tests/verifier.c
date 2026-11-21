@@ -155,6 +155,7 @@
 #include "verifier_unpriv.skel.h"
 #include "verifier_unwind.skel.h"
 #include "verifier_unwind_cb.skel.h"
+#include "verifier_unwind_cb_recursion.skel.h"
 #include "verifier_unpriv_perf.skel.h"
 #include "verifier_uprobe_write_ctx.skel.h"
 #include "verifier_value_adj_spill.skel.h"
@@ -408,6 +409,15 @@ void test_verifier_unwind_cb(void)
 		return;
 	}
 	RUN(verifier_unwind_cb);
+}
+void test_verifier_unwind_cb_recursion(void)
+{
+	if (!cb_pads_supported()) {
+		printf("%s:SKIP:the helpers have no pads\n", __func__);
+		test__skip();
+		return;
+	}
+	RUN(verifier_unwind_cb_recursion);
 }
 void test_verifier_unpriv_perf(void)          { RUN(verifier_unpriv_perf); }
 void test_verifier_uprobe_write_ctx(void)     { RUN(verifier_uprobe_write_ctx); }
