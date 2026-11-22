@@ -1571,6 +1571,7 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 		return NULL;
 	state->refs[new_ofs].insn_idx = insn_idx;
 	state->refs[new_ofs].origin = insn_idx;
+	state->refs[new_ofs].saved = 0;
 
 	return &state->refs[new_ofs];
 }
@@ -6459,10 +6460,15 @@ static int try_max_stack_depth(struct bpf_verifier_env *env, bool with_slots)
  * there is room then, and check_after_pass() says what is wrong.
  * Returns 1 if there is room, 0 if there is none.
  */
-int bpf_hidden_slots_fit(struct bpf_verifier_env *env)
+static int hidden_slots_fit(struct bpf_verifier_env *env)
 {
-	int err = try_max_stack_depth(env, true);
+	int err;
 
+	/* it walks the program and copies the subprogs */
+	err = bpf_add_cost_and_check(env, env->prog->len + env->subprog_cnt, BPF_COST_COPY);
+	if (err)
+		return err;
+	err = try_max_stack_depth(env, true);
 	if (!err)
 		return 1;
 	if (err != -ENOMEM)
@@ -6470,6 +6476,42 @@ int bpf_hidden_slots_fit(struct bpf_verifier_env *env)
 	if (err == -ENOMEM)
 		return err;
 	return !!err;
+}
+
+/*
+ * A subprog got hidden words: is there room in the stack? bpf_pads_settle() asks for one subprog
+ * after the other, and a whole check_max_stack_depth() for each is too much for a program that has
+ * many. So the answer is yes at first, and bpf_hidden_slots_settle() asks once for all of them:
+ * hidden words only add to the frames, so if all of them fit, each did when it was asked for.
+ * If they do not, the pass is done again, and from then on each subprog is asked for on its own.
+ * Returns 1 if there is room, 0 if there is none.
+ */
+int bpf_hidden_slots_fit(struct bpf_verifier_env *env)
+{
+	if (env->ask_hidden_slots)
+		return hidden_slots_fit(env);
+	env->hidden_slots_unasked = true;
+	return 1;
+}
+
+/*
+ * bpf_pads_settle() is about to rest on the hidden words that it gave out, see
+ * bpf_hidden_slots_fit(). Returns 1 if there is no room for them after all: the pass is done
+ * again.
+ */
+int bpf_hidden_slots_settle(struct bpf_verifier_env *env)
+{
+	int err;
+
+	if (!env->hidden_slots_unasked)
+		return 0;
+	env->hidden_slots_unasked = false;
+	err = hidden_slots_fit(env);
+	if (err)
+		return min(err, 0);
+	env->ask_hidden_slots = true;
+	env->slots_late = true;
+	return 1;
 }
 
 static int __check_buffer_access(struct bpf_verifier_env *env,
@@ -12324,6 +12366,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 	for (i = nheld; i < exit->acquired_refs; i++) {
 		caller->refs[i] = exit->refs[i];
 		caller->refs[i].origin = call_idx;
+		caller->refs[i].saved = 0;
 	}
 	caller->held = exit->held;
 
@@ -22751,7 +22794,7 @@ static int enter_kernel_pad(struct bpf_verifier_env *env)
 	plan = bpf_pad_enter(env, st, call_idx);
 	if (IS_ERR(plan))
 		return PTR_ERR(plan);
-	/* an error that bpf_pads_settle() raises, as for a site that is not certain */
+	/* its entry saves nothing in the run that follows, or it is an error: bpf_pads_settle() */
 	if (plan->conflict)
 		return PROCESS_BPF_EXIT;
 	/*
@@ -23296,7 +23339,7 @@ process_bpf_exit:
 static bool pass_needs_restart(struct bpf_verifier_env *env)
 {
 	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late ||
-	       env->pads_late || env->faults_late;
+	       env->pads_late || env->saves_late || env->faults_late || env->slots_late;
 }
 
 /*
@@ -24982,6 +25025,8 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 			initial->subprogs[i].stuck_insn = env->subprog_info[i].stuck_insn;
 		}
 	}
+	/* the run before changed what an entry of a landing pad saves, see bpf_pads_settle() */
+	env->saves_again = env->pass_again && env->saves_late;
 	env->pass_again = false;
 	restore_snapshot(env, initial);
 	kvfree(env->callx_edges);

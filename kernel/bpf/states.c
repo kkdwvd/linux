@@ -493,6 +493,7 @@ static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verif
 
 	for (i = 0; i < a->acquired_refs; i++)
 		if (a->refs[i].type != b->refs[i].type || a->refs[i].id != b->refs[i].id ||
+		    a->refs[i].saved != b->refs[i].saved ||
 		    memcmp(&a->refs[i].ptr, &b->refs[i].ptr, sizeof(u64)))
 			return false;
 	return true;

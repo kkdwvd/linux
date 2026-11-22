@@ -152,8 +152,10 @@
  * two ways out, and both leave with kexit and the value of the kernel:
  *   - unwind_exit of the program. The program has released what it wanted to, and the verifier
  *     releases what the frame still holds. That needs a plan like any site, with places that are
- *     good at that insn: sections, a lock at a constant address, an object in the stack of the
- *     frame, a pointer in R0.
+ *     good at that insn. No register is read there any more, so the entry of the pad copies the
+ *     pointers that the frame holds into SAVE WORDS, hidden words like K, see visit_saves(): each
+ *     is a place wherever the frame is left. What else the frame holds, a lock, irq flags, an
+ *     object in the stack, has a place of its own there or none.
  *   - A site of the frame, in the pad: a destructor loops until its time is up, faults in arena,
  *     calls what is unwound in turn. The states that leave a forced frame have a plan of their own
  *     there, BPF_SITE_FORCED, and its pad loads the value that the frame has, not the one of the
@@ -605,6 +607,7 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 		return NULL;
 	plan->kind = kind;
 	plan->nulls.regs = U16_MAX;
+	plan->nulls.unsaved = U16_MAX;
 	bitmap_fill(plan->nulls.slots, MAX_BPF_STACK_SLOTS);
 	plan->next = aux->pad_plans;
 	aux->pad_plans = plan;
@@ -984,6 +987,7 @@ static void find_nulls(const struct bpf_func_state *frame, struct bpf_pad_nulls 
 	int i, j;
 
 	memset(nulls, 0, sizeof(*nulls));
+	nulls->unsaved = ~frame->saved_mask;
 	for (i = BPF_REG_0; i < BPF_REG_FP; i++)
 		if (reg_is_null(&frame->regs[i]))
 			nulls->regs |= BIT(i);
@@ -997,9 +1001,15 @@ static void find_nulls(const struct bpf_func_state *frame, struct bpf_pad_nulls 
 	}
 }
 
-/* An address in the stack and the address of a map value are never 0 */
+/*
+ * An address in the stack and the address of a map value are never 0. A save word is 0 in a frame
+ * whose entry has put nothing there. Where it has, the word keeps the handle when the program
+ * releases what it is for: not 0, and not held.
+ */
 static bool place_is_null(const struct bpf_pad_nulls *nulls, const struct bpf_pad_place *place)
 {
+	if (place->loc == BPF_PLACE_SAVED)
+		return nulls->unsaved & BIT(place->at);
 	if (place->loc == BPF_PLACE_REG)
 		return nulls->regs & BIT(place->at);
 	return place->loc == BPF_PLACE_SPILL &&
@@ -1121,6 +1131,69 @@ static int ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 	return ent_imm(env, ent, reg);
 }
 
+/* Does the call of @ent release what save word @word of @sub is for? See visit_saves(). */
+static bool ent_is_saved_kind(const struct bpf_subprog_info *sub, int word,
+			      const struct bpf_pad_ent *ent)
+{
+	const struct bpf_pad_save *save = &sub->saves[word];
+
+	return save->set && ent->class == BPF_PAD_REF && !ent->rcu &&
+	       ent->obj_type == save->obj_type &&
+	       !memcmp(&ent->release, &save->release, sizeof(ent->release));
+}
+
+/*
+ * See ref_ent(). The entry of the landing pad has put the pointer @ref into a save word of the
+ * frame: a place that is good wherever the frame is left, whatever the program has read or
+ * overwritten since. @err: what ptr_ent() made of the registers.
+ * If no register has the pointer any more, or only one that the calls of a pad clobber, the word
+ * is the only place. What releases the pointer follows from its type, which went with the
+ * registers. So the functions keep one kind of thing in a word, see visit_saves(): that says it.
+ * A register that says something else than the word is for is a conflict: neither is believed.
+ */
+static int saved_ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
+			 const struct bpf_verifier_state *st, const struct bpf_reference_state *ref,
+			 int err)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
+	const struct bpf_pad_save *save = &sub->saves[ref->saved - 1];
+	struct bpf_pad_place *cand = ent->cand[0];
+	int i, n = ent->nr_cands[0];
+
+	if (verifier_bug_if(!save->set, env, "save word %d of func#%d has no pointer",
+			    ref->saved - 1, frame->subprogno))
+		return -EFAULT;
+	if (err == BPF_CONFLICT_NO_PLACE || err == BPF_CONFLICT_CALLER_SAVED) {
+		ent->release = save->release;
+		if (is_obj_drop(&ent->release)) {
+			if (!can_free_obj(env, &ent->release, save->obj_type))
+				return BPF_CONFLICT_NO_RELEASE;
+			ent->obj_type = save->obj_type;
+		}
+		if (takes_flags(&ent->release))
+			ent->cand[1][ent->nr_cands[1]++] =
+				(struct bpf_pad_place){ .loc = BPF_PLACE_IMM };
+	} else if (err) {
+		return err;
+	} else if (!ent_is_saved_kind(sub, ref->saved - 1, ent)) {
+		return BPF_CONFLICT_SAVES_DIFFER;
+	}
+	if (n == BPF_PAD_MAX_CANDS)
+		return 0;
+	/*
+	 * In front of R0-R5, which the calls of a pad clobber: settle_ent() takes the first place
+	 * that will do, and such a register does only for the first call of a pad.
+	 */
+	for (i = 0; i < n && !(cand[i].loc == BPF_PLACE_REG && cand[i].at < BPF_REG_6); i++)
+		;
+	memmove(&cand[i + 1], &cand[i], (n - i) * sizeof(*cand));
+	cand[i] = (struct bpf_pad_place){ .loc = BPF_PLACE_SAVED, .at = ref->saved - 1,
+					  .maybe_null = true };
+	ent->nr_cands[0]++;
+	return 0;
+}
+
 /* See ref_ent(). @ref is an iterator or a dynptr, and @slot the first one that it has. */
 static int obj_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		   const struct bpf_reference_state *ref, const struct bpf_stack_state *slot)
@@ -1163,6 +1236,9 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		err = obj_ent(env, ent, ref, obj);
 	else if (class == BPF_PAD_REF)
 		err = ptr_ent(env, ent, st, insn_idx, ref);
+	/* only a pointer has a save word, see visit_saves() */
+	if (class == BPF_PAD_REF && !obj && ref->saved)
+		err = saved_ptr_ent(env, ent, st, ref, err);
 	if (class == BPF_PAD_RES_LOCK_IRQ) {
 		/* The same insn saved irq flags, the next of refs[]: the second argument. */
 		if (verifier_bug_if(ref + 1 == st->refs + st->acquired_refs ||
@@ -1303,7 +1379,8 @@ static int order_ents(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	int i, j, k, n = plan->nr_ents, next;
 	u8 row, bit;
 
-	if (plan->ordered)
+	/* the plan of an entry is no plan of a pad: nothing is released, and there is no order */
+	if (plan->ordered || plan->kind == BPF_SITE_KENTRY)
 		return 0;
 	plan->ordered = true;
 	for (k = 0; k < n; k++) {
@@ -1440,6 +1517,7 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			ent->cand[0][j].null &= place_is_null(&nulls, &ent->cand[0][j]);
 	}
 	plan->nulls.regs &= nulls.regs;
+	plan->nulls.unsaved &= nulls.unsaved;
 	bitmap_and(plan->nulls.slots, plan->nulls.slots, nulls.slots, MAX_BPF_STACK_SLOTS);
 	return 0;
 }
@@ -1502,29 +1580,209 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	return plan;
 }
 
+/* Do the entries @a and @b release with the same call? */
+static bool same_release(const struct bpf_pad_ent *a, const struct bpf_pad_ent *b)
+{
+	return a->class == b->class && a->rcu == b->rcu && a->obj_type == b->obj_type &&
+	       !memcmp(&a->release, &b->release, sizeof(a->release));
+}
+
+/*
+ * Keep of the candidates of @ent those that the entry of a landing pad saves from: R6-R9 and
+ * stack slots of the program. None if there is no place: @err. Then the landing pad of the program
+ * has to release it, or a place has to be there where the frame is left.
+ * None either for what is no pointer, see visit_saves().
+ */
+static void save_cands(struct bpf_pad_ent *ent, int err)
+{
+	struct bpf_pad_place *cand = ent->cand[0];
+	int i, n = 0;
+
+	for (i = 0; !err && ent->class == BPF_PAD_REF && i < ent->nr_cands[0]; i++)
+		if (cand[i].loc == BPF_PLACE_SPILL ||
+		    (cand[i].loc == BPF_PLACE_REG && cand[i].at >= BPF_REG_6 &&
+		     cand[i].at < BPF_REG_FP))
+			cand[n++] = cand[i];
+	ent->nr_cands[0] = n;
+}
+
+/*
+ * What the entry of the landing pad behind the call at @call_idx saves, for the current frame of
+ * @st, which the kernel begins to unwind there.
+ *
+ * The frame holds references, locks, objects. The landing pad of the program releases what it
+ * wants to, and what is left is for the verifier, where the frame is left: at unwind_exit, or at a
+ * site in the pad. Nothing has the pointers there: the program reads a register for the last time
+ * where it releases, or never again on that way. So the entry copies each pointer that a register
+ * or a stack slot has behind the call into a SAVE WORD, hidden words of the frame like K:
+ *
+ *	t = bpf_task_from_pid(pid);		   call bpf_task_from_pid
+ *	{					   r6 = r0
+ *		Guard g;			   ...
+ *						   call wait
+ *		v = wait();			   unwind_goto pad
+ *	}					   kgoto entry
+ *	bpf_task_release(t);			   ...
+ *					      pad: call ~Guard
+ *						   gotol rest
+ *					    entry: ax = K
+ *						   if ax != 0 goto 1f
+ *						   K = 1
+ *						   r0 = r6
+ *						   *(u64 *)(r10 - 16) = r0
+ *						1: r0 = 0
+ *						   gotol pad
+ *					     rest: ax = K
+ *						   if ax == 0 goto 2f
+ *						   r1 = *(u64 *)(r10 - 16)
+ *						   if r1 == 0 goto 3f
+ *						   call bpf_task_release
+ *						3: r0 = V
+ *						   r2 = 0
+ *						   kexit
+ *						2: unwind_exit
+ *
+ * A word has a POINTER, and nothing else: a value that is the handle wherever the frame is left,
+ * whatever the pad does to the registers and to the stack. The address of an object in the stack
+ * of a caller, irq flags or an iterator, is no such value: the pad can write to the slots, and
+ * then nothing releases through the address any more. Nor is the address of a lock that only a
+ * register has. What the frame holds of those has to be released by the landing pad of the
+ * program, or has to have a place where the frame is left, like an object in the stack of the
+ * frame itself and a lock at a constant address. Otherwise the program is rejected.
+ *
+ * The words go by POSITION: word j is for the j-th of refs[] that the frame holds at the call,
+ * whatever that is. The entry of the plan says so, 'word', and from here on 'saved' of the
+ * reference does. That is the one number which the entry stores by, see bpf_pad_kentry_insns(),
+ * and which the frame is left by: the state has what is still held there, the word is a place
+ * like any other, BPF_PLACE_SAVED, and the plan of that site is made as always, see
+ * saved_ptr_ent(). No order of the entries of a plan changes it, and bpf_pad_check_saves() looks
+ * at what is emitted once more.
+ *   - A word that the entry of a frame has put nothing into is 0, 'saved_mask' of the frame has
+ *     which. So two calls that hold more and less can share what follows them: the pad tests.
+ *   - Where the pad of the program releases on one way only, the word still has the pointer on
+ *     that way. No test tells: a conflict at that site, which rejects the program.
+ *
+ * What releases a pointer follows from its type, and no register has the pointer where the frame
+ * is left: states of two calls that are the same but for that type are one state by then. So a
+ * word has ONE KIND of thing in all frames of a function, 'saves' of the subprog: the first call
+ * that saves there says which, and a call that would save another kind has a conflict.
+ *
+ * The states that get to the call may not agree: what the frame holds differs between them, in
+ * number or in kind, or they have no place in common for a pointer, or a word would get another
+ * kind of thing. That is no error. The entry of this call saves nothing then: 'ksave_off'. What
+ * its frames hold where they are left has the places that it had without save words, or none,
+ * and that rejects the program.
+ * Whether they agree is known when all of them have been here, so a run has the answer of the
+ * run before it from its start, see settle_entries(). Every state is asked, also where the entry
+ * saves nothing: a pass that keeps more apart may have states that agree, and then the entry
+ * saves again.
+ * Returns why the entry cannot save, 0 if it can.
+ */
+static int visit_saves(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
+		       const struct bpf_verifier_state *st, int call_idx)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
+	int i, j, n, err, nr = st->acquired_refs - frame->entry_refs;
+	struct bpf_pad_place cand[BPF_PAD_MAX_CANDS];
+	struct bpf_pad_ent new, *ent;
+	struct bpf_pad_save *save;
+
+	if (nr > BPF_PAD_MAX_SAVES)
+		return BPF_CONFLICT_TOO_MUCH;
+	if (plan->saves && plan->nr_ents != nr)
+		return BPF_CONFLICT_SAVES_DIFFER;
+	if (!plan->ents)
+		plan->ents = kzalloc_objs(*plan->ents, BPF_PAD_MAX_ENTS, BPF_VERIFIER_GFP);
+	if (!plan->ents)
+		return -ENOMEM;
+	for (j = 0; j < nr; j++) {
+		i = frame->entry_refs + j;
+		ent = &plan->ents[j];
+		memset(&new, 0, sizeof(new));
+		/* what is no pointer has no word, but it has a position */
+		if (st->refs[i].type == REF_TYPE_PTR) {
+			err = ref_ent(env, &new, st, call_idx + 1, &st->refs[i]);
+			if (err < 0)
+				return err;
+			save_cands(&new, err);
+		}
+		if (!plan->saves) {
+			*ent = new;
+			ent->always = true;
+		} else if (!ent->nr_cands[0] != !new.nr_cands[0]) {
+			return BPF_CONFLICT_SAVES_DIFFER;
+		} else if (new.nr_cands[0]) {
+			n = common_cands(ent, &new, 0, cand);
+			if (!n || !same_release(ent, &new))
+				return BPF_CONFLICT_SAVES_DIFFER;
+			memcpy(ent->cand[0], cand, n * sizeof(*cand));
+			ent->nr_cands[0] = n;
+		}
+		if (!ent->nr_cands[0])
+			continue;
+		ent->word = j + 1;
+		save = &sub->saves[j];
+		if (!save->set)
+			*save = (struct bpf_pad_save){ .release = ent->release,
+						       .obj_type = ent->obj_type, .set = true };
+		if (!ent_is_saved_kind(sub, j, ent))
+			return BPF_CONFLICT_SAVES_DIFFER;
+	}
+	plan->nr_ents = nr;
+	plan->saves = true;
+	return 0;
+}
+
 /*
  * The kernel unwound what the call at @call_idx called, and the current frame of @st goes on in
  * the landing pad that the program has behind the call, see enter_kernel_pad() in verifier.c. The
  * plan of the entry is no plan of a pad: the frame is not left, and nothing is released. It says
- * that the call has an entry, and what the entry has to find: in a program with bpf_throw() the
- * value of the kernel is in R0, a number, and goes to the hidden word of the frame.
- * With a conflict the state ends here, and bpf_pads_settle() rejects the program.
+ * that the call has an entry, and what the entry does when it is the first one of the frame: it
+ * keeps the value of the kernel, and the pointers that the frame holds, see visit_saves(). The
+ * references of @st and its frame are marked for what has a save word, with the number that the
+ * entry of the plan has for it. Not where the entry saves nothing, 'ksave_off': the state goes on
+ * as it is.
+ * A frame that the kernel unwinds already keeps what it has: its entry stores nothing.
+ * With a conflict the state ends here. bpf_pads_settle() has the pass done again with an entry
+ * that saves nothing, or rejects the program: in a program with bpf_throw() the value of the
+ * kernel, R0, has to be a number.
  * Returns the plan.
  */
-struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env,
-				   const struct bpf_verifier_state *st, int call_idx)
+struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				   int call_idx)
 {
-	const struct bpf_func_state *frame = st->frame[st->curframe];
+	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_pad_plan *plan;
+	int j, word, err;
 
 	plan = bpf_pad_plan_get(env, call_idx, BPF_SITE_KENTRY);
 	if (!plan)
 		return ERR_PTR(-ENOMEM);
 	plan->visited = true;
-	if (plan->conflict)
+	if (plan->conflict || bpf_frame_is_forced(frame))
 		return plan;
-	if (env->has_throw && frame->regs[BPF_REG_0].type != SCALAR_VALUE)
+	if (env->has_throw && frame->regs[BPF_REG_0].type != SCALAR_VALUE) {
 		plan->conflict = BPF_CONFLICT_NO_VALUE;
+		return plan;
+	}
+	if (!plan->no_saves) {
+		err = visit_saves(env, plan, st, call_idx);
+		if (err < 0)
+			return ERR_PTR(err);
+		plan->no_saves = err;
+	}
+	if (env->insn_aux_data[call_idx + 1].ksave_off)
+		return plan;
+	err = plan->conflict = plan->no_saves;
+	/* entry j is what refs[] has at position j until all visits are over: nothing sorts them */
+	for (j = 0; !err && j < plan->nr_ents; j++) {
+		word = plan->ents[j].word;
+		if (!word)
+			continue;
+		st->refs[frame->entry_refs + j].saved = word;
+		frame->saved_mask |= BIT(word - 1);
+	}
 	return plan;
 }
 
@@ -2490,6 +2748,8 @@ static int settle_slots(struct bpf_verifier_env *env)
 		env->subprog_info[s].value_off = 0;
 		env->subprog_info[s].no_value_word = false;
 		env->subprog_info[s].k_off = 0;
+		env->subprog_info[s].save_off = 0;
+		env->subprog_info[s].save_words = 0;
 	}
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -2573,6 +2833,24 @@ int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad
 }
 
 /*
+ * The entry of @plan, the plan of an entry, whose pointer goes to save word @word of @sub, see
+ * visit_saves(). NULL if the entry of the landing pad puts 0 there.
+ */
+static const struct bpf_pad_ent *saved_ent(const struct bpf_subprog_info *sub,
+					   const struct bpf_pad_plan *plan, int word)
+{
+	int j;
+
+	/* the function has hidden slots for pointers: every pad releases through them */
+	if (sub->slots & BIT(BPF_PAD_GROUP_REFS))
+		return NULL;
+	for (j = 0; j < plan->nr_ents; j++)
+		if (plan->ents[j].word == word + 1)
+			return &plan->ents[j];
+	return NULL;
+}
+
+/*
  * The entry of a landing pad of the program that the kernel enters, see enter_kernel_pad() in
  * verifier.c: kgoto behind the call goes here, and from here the program goes on in its pad. But for
  * the last insn, which is that jump.
@@ -2581,6 +2859,8 @@ int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad
  *	if ax != 0 goto 1f		the kernel unwinds the frame already: a call in the pad
  *	K = 1
  *	*(u64 *)(r10 - W) = r0		in a program with bpf_throw(): the value
+ *	r0 = r6				per save word of the function: the pointer, see
+ *	*(u64 *)(r10 - S) = r0		visit_saves(), or 0
  * 1:	r0 = 0
  *
  * The first entry of a frame decides: K stays 1 until the frame is left, and the value that the
@@ -2588,22 +2868,113 @@ int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad
  * pad gets 0 in R0, where unwind_exit of the program leaves what the program threw: the value of
  * the kernel is none of its business, and a pad that takes R0 for an object of the program finds
  * none.
+ * A pointer that the program has not compared with NULL yet can be 0: so is the handle then.
+ * The pointer goes through R0, which has the value no longer and is 0 behind the entry. Where the
+ * register of the program has more than the handle, the constant that is taken off is one that
+ * the program chose: an insn on R0 is blinded like any other, one on AX is not.
  * Returns the number of insns.
  */
 int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
-			 int subprog, struct bpf_insn *buf)
+			 int subprog, struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
 	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
-	int n = 0;
+	const struct bpf_pad_place *place;
+	const struct bpf_pad_ent *ent;
+	int word, off, first, n = 0;
 
 	buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, sub->k_off);
 	buf[n++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 0);
 	buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 1);
 	if (env->has_throw)
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, sub->value_off);
+	for (word = 0; word < sub->save_words; word++) {
+		off = sub->save_off + word * BPF_REG_SIZE;
+		ent = saved_ent(sub, plan, word);
+		if (!ent) {
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, off, 0);
+			continue;
+		}
+		place = &ent->cand[0][0];
+		first = n;
+		n += load_handle(env, &buf[n], &aux[n], BPF_REG_0, place, place->delta);
+		if (place->delta)
+			buf[first + 1].off = 1;
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, off);
+	}
 	buf[1].off = n - 2;
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
 	return n;
+}
+
+/*
+ * The save words of subprog @s are about to be emitted: stored by the entries of its landing pads,
+ * see bpf_pad_kentry_insns(), and read where a frame that the kernel unwinds is left. A reference
+ * has one number for both, see visit_saves(). Look at what the plans have made of it:
+ *   - An entry stores a pointer into a word that the function has, each into another one, and its
+ *     kind is the one of the word.
+ *   - A landing pad that reads a word releases that kind, and the plan of an entry has a pointer
+ *     for the word. Also one that the program does not have in the end: then every entry stores
+ *     0 there. The word is a slot of the stack in its plan, see take_kernel_words().
+ * A release of what another reference than its own left in a word must not load.
+ */
+int bpf_pad_check_saves(struct bpf_verifier_env *env, int s)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_place *place;
+	const struct bpf_pad_plan *plan;
+	const struct bpf_pad_ent *ent;
+	u16 stored = 0, words;
+	int i, j, word;
+
+	for (i = sub->start; i < sub[1].start; i++) {
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+		words = 0;
+		for (j = 0; plan && j < plan->nr_ents; j++) {
+			ent = &plan->ents[j];
+			word = ent->word - 1;
+			if (word < 0)
+				continue;
+			stored |= BIT(word);
+			if (!plan->used || plan->conflict)
+				continue;
+			if (verifier_bug_if(word >= sub->save_words || (words & BIT(word)) ||
+					    !ent->nr_cands[0] || !ent_is_saved_kind(sub, word, ent),
+					    env, "the entry at insn %d stores into save word %d",
+					    i, word))
+				return -EFAULT;
+			words |= BIT(word);
+		}
+	}
+	for (i = sub->start; i < sub[1].start; i++) {
+		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			if (!plan->used || plan->conflict || !bpf_site_is_forced(plan->kind))
+				continue;
+			for (j = 0; j < plan->nr_ents; j++) {
+				ent = &plan->ents[j];
+				/* the candidate that is emitted: a word is a stack slot by now */
+				place = &ent->cand[0][0];
+				/* load_handle() has no insn for any other form of it */
+				if (verifier_bug_if(ent->nr_cands[0] &&
+						    place->loc == BPF_PLACE_SAVED, env,
+						    "a save word of the pad of insn %d is no slot",
+						    i))
+					return -EFAULT;
+				if (!ent->nr_cands[0] || place->loc != BPF_PLACE_SPILL ||
+				    place->at < sub->save_off)
+					continue;
+				word = (place->at - sub->save_off) / BPF_REG_SIZE;
+				if (word >= sub->save_words)
+					continue;
+				if (verifier_bug_if(!(stored & BIT(word)) ||
+						    !ent_is_saved_kind(sub, word, ent), env,
+						    "the landing pad of insn %d reads save word %d",
+						    i, word))
+					return -EFAULT;
+			}
+		}
+	}
+	return 0;
 }
 
 /*
@@ -2752,6 +3123,8 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 			verbose(env, "map#%d", place->at);
 		else if (place->loc == BPF_PLACE_IMM)
 			verbose(env, "%d", place->delta);
+		else if (place->loc == BPF_PLACE_SAVED)
+			verbose(env, "saved#%d", place->at);
 		else if (place->at == BPF_REG_FP)
 			verbose(env, "fp");
 		else
@@ -2779,6 +3152,7 @@ static const char * const conflict_why[] = {
 	[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
 	[BPF_CONFLICT_NO_VALUE]		= "the value of unwind_exit is not a number",
 	[BPF_CONFLICT_NO_ROOM]		= "no room in the stack for the value",
+	[BPF_CONFLICT_SAVES_DIFFER]	= "what the frames hold at the call differs",
 };
 
 /* The plan of the site at insn @i, or why there is none */
@@ -2788,8 +3162,15 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 
 	/* no pad of the verifier: the landing pad of the program, with code in front of it */
 	if (plan->kind == BPF_SITE_KENTRY) {
-		verbose(env, "landing pad of the program behind the call at %d: the kernel enters it\n",
+		verbose(env, "landing pad of the program behind the call at %d: the kernel enters it",
 			i);
+		for (j = 0; j < plan->nr_ents; j++) {
+			if (!plan->ents[j].nr_cands[0])
+				continue;
+			verbose(env, ", saves ");
+			print_ent(env, &plan->ents[j]);
+		}
+		verbose(env, "\n");
 		return;
 	}
 	/*
@@ -2942,6 +3323,26 @@ static bool pad_can_cause(enum bpf_pad_conflict conflict)
 }
 
 /*
+ * The entries of @sub that save nothing, see visit_saves(), of the landing pads whose first insn
+ * is in @reach: what their frames still hold has the places that it has without save words.
+ */
+static void print_saves_nothing(struct bpf_verifier_env *env, const struct bpf_subprog_info *sub,
+				const unsigned long *reach)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
+	int i;
+
+	for (i = sub->start; i < sub[1].start - 1; i++) {
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+		if (plan && plan->visited && aux[i + 1].ksave_off &&
+		    test_bit(pad_of_call(env, i), reach))
+			verbose(env, "the entry of the landing pad of the call at %d saves nothing\n",
+				i);
+	}
+}
+
+/*
  * The conflict of @plan, a site at insn @i, is an error. The kernel enters a landing pad of the
  * program that only resumes or the program is rejected: where such a pad has a part in the
  * conflict the log says so, in front of the line of the conflict. It names a pad only where that
@@ -2950,7 +3351,7 @@ static bool pad_can_cause(enum bpf_pad_conflict conflict)
  *   - The frame is one that the kernel unwinds through such a pad: it has no plan where the pad
  *     ends, or at a site in pad code. A frame does not know which entry it came through: the
  *     first pad of the function that gets to the insn on the control flow graph is named, and
- *     the others that do are counted.
+ *     the others that do are counted. An entry of those that saves nothing is named too.
  *   - States got to the site out of such a pad, in a function that the pad calls. Its frame
  *     does not know the pad. If states of the normal path got there as well, the function is
  *     "also" called from the pad: the conflict may be one without the pad.
@@ -2982,6 +3383,7 @@ static void print_kpad_conflict(struct bpf_verifier_env *env, int i, const struc
 					i);
 			else
 				verbose(env, "a site in its code has no plan\n");
+			print_saves_nothing(env, sub, reach);
 		}
 		bitmap_free(reach);
 		return;
@@ -3134,19 +3536,110 @@ static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info
  */
 static int take_kernel_words(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
 {
-	int err;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_pad_place *place;
+	struct bpf_pad_plan *plan;
+	int i, j, k, err, words = 0;
 
-	sub->hidden_words++;
+	/*
+	 * As many save words as the entry that saves the most has, see bpf_pad_kentry_insns().
+	 * Also one that the program does not have in the end: the states that came through it
+	 * went on to the plans of the forced frames, which test the word that it would fill.
+	 */
+	for (i = sub->start; i < sub[1].start; i++) {
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+		for (j = 0; plan && j < BPF_PAD_MAX_SAVES; j++)
+			if (saved_ent(sub, plan, j))
+				words = max(words, j + 1);
+	}
+	sub->hidden_words += 1 + words;
 	err = bpf_hidden_slots_fit(env);
 	if (err <= 0) {
-		sub->hidden_words--;
+		sub->hidden_words -= 1 + words;
 		return err ?: 1;
 	}
-	sub->k_off = -(int)bpf_stack_depth_with_slots(sub);
-	if (!env->has_throw)
-		return 0;
-	err = take_value_word(env, sub);
-	return err < 0 ? err : !!err;
+	sub->save_words = words;
+	sub->save_off = -(int)bpf_stack_depth_with_slots(sub);
+	sub->k_off = sub->save_off + words * BPF_REG_SIZE;
+	err = env->has_throw ? take_value_word(env, sub) : 0;
+	if (err)
+		return err < 0 ? err : 1;
+	/* the pads of its forced frames read the words: they are slots of the stack like any other */
+	for (i = sub->start; i < sub[1].start; i++) {
+		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			if (!bpf_site_is_forced(plan->kind))
+				continue;
+			for (j = 0; j < plan->nr_ents; j++) {
+				for (k = 0; k < plan->ents[j].nr_cands[0]; k++) {
+					place = &plan->ents[j].cand[0][k];
+					if (place->loc != BPF_PLACE_SAVED)
+						continue;
+					place->loc = BPF_PLACE_SPILL;
+					place->at = sub->save_off + place->at * BPF_REG_SIZE;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * The entries of the landing pads that the kernel enters, ahead of every other plan. What the
+ * entry of a call saves is one answer for all states that get to the call, see visit_saves(), and
+ * a run has the answer from its start: 'ksave_off' of the call, as the run before left it. Every
+ * state was asked whether the answer still holds. Where it does not it changes here, and the pass
+ * is done again:
+ *   - The entry was to save, and the states do not agree on what the frame holds. The states that
+ *     it had marked for a save word went on to the plans of the frames that the kernel unwinds,
+ *     and the state that did not agree ended at the entry, see enter_kernel_pad() in verifier.c.
+ *     The entry saves nothing from now on. That is no error: what such a frame holds where it is
+ *     left has a plan without the save words, or the run that follows has the error.
+ *   - The entry saved nothing, and the states agree: this pass keeps apart what the pass that
+ *     had the answer did not. The entry saves again. Not in a run that is there because an
+ *     answer changed, 'saves_again': such a run only takes away.
+ * A run whose answers all hold is not done again: a program with an entry that never saves has
+ * one run per pass.
+ * So the runs that the entries ask for come to an end: behind a run in which entries save again,
+ * each further one takes saving from at least one entry and gives it back to none, which is one
+ * run per entry at most. A pass is done again for other reasons too, see pass_needs_restart() in
+ * verifier.c: a loop gets its guard late, a global subprog unwinds after all, a subprog is stuck
+ * after all. Such a run changed no answer, so the run behind it decides both ways again, and the
+ * count starts anew there. Those reruns have bounds of their own, by the loops and the subprogs
+ * of the program: what such a run found, the runs behind it know from their start.
+ * The plan of an entry that saves nothing has nothing to save from: it is what the emission
+ * reads, in the pass that is loaded, and that never looks at the bit of the last run.
+ * Any other conflict of an entry is an error like that of a plan, see bpf_pads_settle().
+ */
+static void settle_entries(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	bool level2 = env->log.level & BPF_LOG_LEVEL2;
+	struct bpf_pad_plan *plan;
+	int i;
+
+	for (i = 0; i < env->prog->len - 1; i++) {
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+		if (!plan)
+			continue;
+		if (!aux[i + 1].ksave_off) {
+			if (!plan->used || !plan->no_saves)
+				continue;
+			if (level2)
+				verbose(env, "the entry of the landing pad of the call at %d saves nothing: %s\n",
+					i, conflict_why[plan->no_saves]);
+			aux[i + 1].ksave_off = true;
+			env->saves_late = true;
+		} else if (plan->used && plan->saves && !plan->no_saves && !plan->conflict &&
+			   !env->saves_again) {
+			if (level2)
+				verbose(env, "the entry of the landing pad of the call at %d saves again\n",
+					i);
+			aux[i + 1].ksave_off = false;
+			env->saves_late = true;
+		} else {
+			plan->nr_ents = 0;
+		}
+	}
 }
 
 /*
@@ -3241,6 +3734,10 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	err = settle_slots(env);
 	if (err)
 		return err;
+	/* the run that follows is the judge of the plans: it has what each entry saves from its start */
+	settle_entries(env);
+	if (env->saves_late)
+		return 0;
 	for (i = 0; i < env->prog->len; i++) {
 		if (env->insn_aux_data[i].pad_plans && bpf_must_abort())
 			return -EINTR;
@@ -3283,8 +3780,12 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	 * only now, and each of them is one that the next pass keeps more apart for, see
 	 * bpf_find_unproven_after_pass() and bpf_pads_note_causes(). One per pass would be a pass
 	 * per conflict.
+	 * And behind the question whether the hidden words that the plans rest on fit.
 	 */
 	if (reject) {
+		err = bpf_hidden_slots_settle(env);
+		if (err)
+			return min(err, 0);
 		bpf_pad_log(env, at, reject);
 		return -EINVAL;
 	}
@@ -3293,6 +3794,9 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	err = take_kpad_words(env);
 	if (err)
 		return err;
+	err = bpf_hidden_slots_settle(env);
+	if (err)
+		return min(err, 0);
 	/* The main pass is over: the program has no access to its stack that is not known. */
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];

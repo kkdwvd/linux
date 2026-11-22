@@ -388,6 +388,13 @@ struct bpf_reference_state {
 	 * the call of the subprog that returned with it.
 	 */
 	int origin;
+	/*
+	 * The kernel is unwinding the frame, and where it entered the landing pad of the program
+	 * the pointer went to a save word of the frame, number 'saved' - 1, see bpf_pad_enter().
+	 * 0: it has none. Only a REF_TYPE_PTR that is no object in the stack has one. Compared, see
+	 * same_refs().
+	 */
+	u8 saved;
 	union {
 		/* For REF_TYPE_PTR. Compared and hashed, see same_refs(): no holes. */
 		struct {
@@ -566,6 +573,7 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_CALLER_SAVED,
 	BPF_CONFLICT_NO_VALUE,
 	BPF_CONFLICT_NO_ROOM,
+	BPF_CONFLICT_SAVES_DIFFER,
 };
 
 /* What told that a subprog is stuck, see bpf_subprog_info.stuck and bpf_pads_log() */
@@ -588,6 +596,8 @@ enum bpf_stuck_by {
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 5)
 #define BPF_PAD_MAX_CANDS	6
+/* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
+#define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS
 /*
  * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
  * five to compare and clear, four to find a free one. And the call.
@@ -600,6 +610,11 @@ enum bpf_place_loc {
 	BPF_PLACE_SPILL,	/* in 8 bytes of the stack of the frame */
 	BPF_PLACE_MAP_VALUE,	/* it is the address of the only value of a map */
 	BPF_PLACE_IMM,		/* no handle: the release takes a constant as well, 'delta' */
+	/*
+	 * In save word 'at' of a frame that the kernel unwinds, see bpf_pad_enter(). When the
+	 * function has its hidden words it is a BPF_PLACE_SPILL, see take_kernel_words().
+	 */
+	BPF_PLACE_SAVED,
 };
 
 /* A PLACE: where a landing pad finds a handle when the frame is left at the site */
@@ -614,7 +629,18 @@ struct bpf_pad_place {
 /* The registers and the stack slots of a frame that are 0 */
 struct bpf_pad_nulls {
 	u16 regs;
+	u16 unsaved;		/* save words: the entry of the frame has put no handle there */
 	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+};
+
+/*
+ * What the functions of a program keep in a save word: a pointer, and one kind of it per function
+ * and word. The kind is the call that releases it.
+ */
+struct bpf_pad_save {
+	struct bpf_insn release;
+	u32 obj_type;
+	bool set;
 };
 
 /* An ENTRY of a plan: one resource with a handle that the frame is responsible for */
@@ -626,6 +652,11 @@ struct bpf_pad_ent {
 	u8 class;		/* enum bpf_pad_class */
 	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
 	bool always;		/* all visits hold it: the program counter tells */
+	/*
+	 * BPF_SITE_KENTRY: the entry keeps the pointer in save word 'word' - 1 of the frame, and
+	 * 'saved' of the reference is the same number, see bpf_pad_enter(). 0: it keeps nothing.
+	 */
+	u8 word;
 	/*
 	 * The CANDIDATES, per argument of the release: the places that have the handle on all
 	 * visits that hold the entry. The first one is emitted.
@@ -658,8 +689,16 @@ struct bpf_pad_plan {
 	u8 no_place;			/* the conflict unless hidden slots have all pointers */
 	/* the groups that it asked hidden slots for, bits by enum bpf_pad_group: settle_slots() */
 	u8 asked_slots;
+	/*
+	 * BPF_SITE_KENTRY: why the entry cannot save what the frame holds, enum bpf_pad_conflict:
+	 * the states that got to the call do not agree. 0 if they do. Also asked where the entry
+	 * saves nothing in this run, see settle_entries().
+	 */
+	u8 no_saves;
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
+	/* BPF_SITE_KENTRY: 'ents' are what the frame holds at the call, see visit_saves() */
+	bool saves;
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
 	/*
 	 * Entry i has to stand before these entries: a visit held both, and has to release them
@@ -790,7 +829,13 @@ struct bpf_func_state {
 	 * BPF_FRAME_BELOW: the first frame of a function that is verified on its own, for a call
 	 * out of a frame that has a mark. It only keeps the function apart from its other calls.
 	 */
-	u32 forced;
+	u16 forced;
+	/*
+	 * The save words of a forced frame that the entry has put a pointer into, by number. Any
+	 * other word is 0, see bpf_pad_kentry_insns(). A pointer stays in its word when the pad
+	 * of the program releases what it is for: 'saved' of the reference says what is held.
+	 */
+	u16 saved_mask;
 	);
 	bool no_stack_arg_load;
 	/*
@@ -1355,6 +1400,13 @@ struct bpf_insn_aux_data {
 	u32 acquires:1; /* a reference or a lock */
 	u32 releases:1;
 	u32 fault_full:1; /* an access to arena: all states visit the plan, see check_arena_site() */
+	/*
+	 * unwind_goto of the program: the entry of its landing pad saves no handles, see
+	 * visit_saves(). The states that got to the call did not agree on what the frame holds,
+	 * in the run before this one. Each run asks again, and a run that finds another answer
+	 * is done again with that, see settle_entries().
+	 */
+	u32 ksave_off:1;
 
 	/* below flags are initialized once */
 	u32 bb_end:1; /* last instruction of a basic block */
@@ -1533,6 +1585,11 @@ struct bpf_subprog_info {
 	 * 0 from the entry of the function on, 1 once the kernel unwinds the frame. 0: none.
 	 */
 	s16 k_off;
+	/* its save words: the first one, the others are above it. See bpf_pad_enter(). */
+	s16 save_off;
+	u8 save_words;
+	/* what each of them has in a frame that the kernel unwinds, in this pass */
+	struct bpf_pad_save saves[BPF_PAD_MAX_SAVES];
 	u32 insns_total;
 	u32 insns_self;
 	/* offsets in range [stack_depth .. fastcall_stack_off)
@@ -1903,6 +1960,8 @@ struct bpf_verifier_env {
 	bool path_sensitive;		/* no joins, see run_path_sensitive() */
 	bool for_log;			/* the verdict is known, see do_check_all() */
 	bool pass_again;		/* the pass is done again, see pass_needs_restart() */
+	bool saves_again;		/* because an entry saves no longer, or again: settle_entries() */
+	bool ask_hidden_slots;		/* for each subprog on its own, see bpf_hidden_slots_fit() */
 	bool fallthrough_first;		/* see find_failing_path() */
 	bool run_has_guess;		/* see run_path_sensitive() */
 	u32 failing_path_budget_shift;	/* see func_failing_path_budget() */
@@ -1932,7 +1991,10 @@ struct bpf_verifier_env {
 	unsigned long cb_pads[8];
 	u8 cb_pad_cnt;
 	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
+	bool saves_late;		/* an entry saves nothing after all, or again: settle_entries() */
 	bool faults_late;		/* a site is not what it seemed: see check_arena_site() */
+	bool hidden_slots_unasked;	/* see bpf_hidden_slots_fit() */
+	bool slots_late;		/* no room for the hidden words: bpf_hidden_slots_settle() */
 	bool pad_releases;		/* see release_frame_resources() */
 	bool calls_joined;		/* see flow_may_add_instance() */
 	bool extra_values;		/* a state can have constants that no run has */
@@ -2500,8 +2562,8 @@ void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
 void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save);
 void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
-struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env,
-				   const struct bpf_verifier_state *st, int call_idx);
+struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				   int call_idx);
 struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st, int insn_idx,
 				   enum bpf_site_kind kind);
@@ -2520,11 +2582,13 @@ bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_d
 void bpf_pads_note_causes(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 int bpf_hidden_slots_fit(struct bpf_verifier_env *env);
+int bpf_hidden_slots_settle(struct bpf_verifier_env *env);
 int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad_note **notes);
 int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			int nr, struct bpf_insn *buf);
 int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
-			 int subprog, struct bpf_insn *buf);
+			 int subprog, struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
+int bpf_pad_check_saves(struct bpf_verifier_env *env, int s);
 int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
 int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,

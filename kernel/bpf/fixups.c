@@ -894,8 +894,8 @@ struct pad_unit {
 	struct bpf_pad_plan *forced;
 };
 
-/* The most insns that a unit has */
-#define PAD_UNIT_MAX_INSNS	(2 * (BPF_PAD_MAX_INSNS + 4) + 3)
+/* The most insns that a unit has, or an entry: four per save word, see bpf_pad_kentry_insns() */
+#define PAD_UNIT_MAX_INSNS	(2 * (BPF_PAD_MAX_INSNS + 4) + 3 + 4 * BPF_PAD_MAX_SAVES)
 
 /*
  * Do the two plans of @unit have the same landing pad: the same insns, and the same type of object
@@ -966,7 +966,7 @@ static int emit_unit(struct bpf_verifier_env *env, int s, enum bpf_site_kind bas
 	int n = 0, len;
 
 	if (base == BPF_SITE_KENTRY) {
-		n += bpf_pad_kentry_insns(env, unit->plan, s, buf + n);
+		n += bpf_pad_kentry_insns(env, unit->plan, s, buf + n, aux + n);
 		buf[n++] = BPF_JMP32_A(0);
 		return n;
 	}
@@ -1011,6 +1011,10 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 	bool unwinds, forced;
 
 	pads->nr = pads->cnt = 0;
+	/* the entries and what follows the landing pads of the program agree on the save words */
+	n = sub->save_words ? bpf_pad_check_saves(env, s) : 0;
+	if (n)
+		return n;
 	for (i = sub->start; i <= last; i++) {
 		if (aux[i].pad_plans && bpf_must_abort())
 			return -EINTR;
