@@ -208,6 +208,35 @@ __naked void loop_in_main_lsm(void)
 }
 
 /*
+ * 0 tells user space that the prog did what it was run for: a loader that was stopped halfway
+ * would report that all is loaded. BPF_PROG_TEST_RUN hands out -ECANCELED.
+ */
+SEC("syscall")
+__description("budget: a loop in the main prog of a syscall prog ends it with -ECANCELED")
+__arch_x86_64
+__arch_arm64
+__success __retval(-125)
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("r0 = -125")
+__xlated("exit")
+__naked void loop_in_main_syscall(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 == 0 goto 1b;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/*
  * rcu_read_lock(); do { p = lookup(); } while (!p); v = *p; rcu_read_unlock(); return v;
  * may_goto must not go where the loop goes when it's over: p may be NULL. It ends the prog, by way
  * of a landing pad that leaves the RCU section.
@@ -2367,6 +2396,46 @@ __arch_x86_64
 __arch_arm64
 __success __retval(0)
 __naked void recursion_too_deep(void)
+{
+	asm volatile (
+		"r1 = 1000;"
+		"call sum_to;"
+		"r0 = 1;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* Another start, and the frames in between pass nothing else on: a syscall prog returns -ECANCELED */
+SEC("syscall")
+__description("budget: recursion that is too deep ends a syscall prog with -ECANCELED")
+__arch_x86_64
+__arch_arm64
+__success __retval(-125)
+__naked void recursion_too_deep_syscall(void)
+{
+	asm volatile (
+		"r1 = 1000;"
+		"call sum_to;"
+		"r0 = 1;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* The exception callback gets the same value for its cookie */
+__noinline int negates(__u64 cookie)
+{
+	return -cookie;
+}
+
+SEC("syscall")
+__description("budget: the exception callback of a syscall prog gets -ECANCELED when the kernel unwinds")
+__arch_x86_64
+__arch_arm64
+__success __retval(125)
+__exception_cb(negates)
+__naked void recursion_too_deep_syscall_exception_cb(void)
 {
 	asm volatile (
 		"r1 = 1000;"
