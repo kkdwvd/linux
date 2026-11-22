@@ -1203,6 +1203,7 @@ struct bpf_insn_aux_data {
 	u64 fault_skips:1; /* when it faults it is skipped: there is no pad, or no way to unwind */
 	u64 fault_empty:1; /* in this pass a state that holds nothing went by without a visit */
 	u64 fault_unwinds:1; /* emission: when it faults the program goes to 'fault_pad' */
+	u64 unwind_goto_follows:1; /* emission: the verifier added unwind_goto after it */
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
@@ -2791,6 +2792,7 @@ int bpf_insert_arena_stack(struct bpf_verifier_env *env);
 int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env, const union bpf_attr *attr);
 int bpf_convert_ctx_accesses(struct bpf_verifier_env *env);
 int bpf_jit_subprogs(struct bpf_verifier_env *env);
+int bpf_check_unwind_gotos(struct bpf_verifier_env *env);
 int bpf_fixup_call_args(struct bpf_verifier_env *env);
 int bpf_do_misc_fixups(struct bpf_verifier_env *env);
 int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn);

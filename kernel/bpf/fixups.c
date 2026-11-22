@@ -794,6 +794,8 @@ static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 			err = bpf_patch_list_append(env, i, &unwind_goto, 1);
 			if (err)
 				return err;
+			/* for bpf_check_unwind_gotos() */
+			env->insn_aux_data[i].unwind_goto_follows = true;
 			p = &pl->patches[pl->cnt - 1];
 			bpf_patch_list_jump(pl, &pl->insns[p->start + p->len - 1],
 					    sub[1].start - added[s] + plan->pad, 0);
@@ -2278,6 +2280,54 @@ out_cleanup:
 	prog->jit_requested = 0;
 	prog->blinding_requested = 0;
 	return err;
+}
+
+/* A load from arena, a store to it, or an atomic insn there: the code of it can fault */
+static bool is_arena_access(const struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
+
+	if (class == BPF_LDX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
+	if (class == BPF_ST)
+		return mode == BPF_PROBE_MEM32;
+	return class == BPF_STX && (mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC);
+}
+
+/* The exception table can have an entry at the end of the insn: a call, an access to arena */
+static bool can_have_unwind_goto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn) || is_arena_access(insn);
+}
+
+/*
+ * unwind_goto is no code. It is an entry of the exception table, which a JIT keys at the end of
+ * the insn in front: a call, or an access to arena. No pass may put anything between the two.
+ * After a call that would be a lost unwind_exit, which bpf_unwind_target() warns about when it
+ * happens. After an access nothing would tell: a fault finds no entry, see
+ * bpf_fault_unwind_target(), and the access is skipped as if no pad had been planned for it.
+ * So look at the insns once they are final, from both sides: unwind_goto has such an insn in
+ * front, and such an insn that the verifier gave unwind_goto still has it behind. An insn that a
+ * pass has replaced by other code is no site any more: the inlined bpf_loop() has unwind_goto of
+ * its own, see inline_bpf_loop().
+ */
+int bpf_check_unwind_gotos(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn *insn = env->prog->insnsi;
+	int i, len = env->prog->len;
+
+	for (i = 0; i < len; i++, insn++) {
+		if (bpf_is_unwind_goto(insn) &&
+		    verifier_bug_if(!i || !can_have_unwind_goto(insn - 1), env,
+				    "unwind_goto at insn %d follows no call and no access to arena",
+				    i))
+			return -EFAULT;
+		if (env->insn_aux_data[i].unwind_goto_follows && can_have_unwind_goto(insn) &&
+		    verifier_bug_if(i + 1 == len || !bpf_is_unwind_goto(insn + 1), env,
+				    "insn %d has lost its unwind_goto", i))
+			return -EFAULT;
+	}
+	return 0;
 }
 
 int bpf_fixup_call_args(struct bpf_verifier_env *env)

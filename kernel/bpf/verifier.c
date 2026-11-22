@@ -26702,6 +26702,9 @@ skip_full_check:
 	}
 
 	if (ret == 0)
+		ret = bpf_check_unwind_gotos(env);
+
+	if (ret == 0)
 		ret = bpf_fixup_call_args(env);
 
 	env->verification_time = ktime_get_ns() - start_time;
