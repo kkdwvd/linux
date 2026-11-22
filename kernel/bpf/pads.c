@@ -1895,6 +1895,18 @@ void bpf_pads_must_unwind(struct bpf_verifier_env *env)
 	} while (changed);
 }
 
+static const char * const site_kind[] = {
+	[BPF_SITE_GUARD]		= "may_goto",
+	[BPF_SITE_RECURSION]		= "recursion check",
+	[BPF_SITE_CALL]			= "call",
+	[BPF_SITE_FAULT]		= "arena access",
+	[BPF_SITE_THROW]		= "bpf_throw",
+	[BPF_SITE_MAY_GOTO]		= "may_goto of the program",
+};
+
+/* The program has unwind_exit in the subprog. No site: a bit that follows those of the kinds. */
+#define LEFT_AT_UNWIND_EXIT	BIT(BPF_SITE_MAY_GOTO + 1)
+
 /*
  * At which kinds of site does the program leave each subprog? At its own, and at those of what
  * comes back to its calls. Bits by enum bpf_site_kind in 'left_at'. The main pass notes them as
@@ -1911,7 +1923,7 @@ static void sites_of_subprogs(struct bpf_verifier_env *env)
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		sub->left_at = 0;
+		sub->left_at = sub->can_unwind && s ? LEFT_AT_UNWIND_EXIT : 0;
 	}
 	do {
 		changed = false;
@@ -1940,15 +1952,43 @@ static void sites_of_subprogs(struct bpf_verifier_env *env)
 	} while (changed);
 }
 
-/* The kinds of site that the subprogs which come back to the call of @plan are left at */
+/*
+ * The kinds of site that the subprogs which come back to the call of @plan are left at. The main
+ * pass asks before sites_of_subprogs() has looked at them: unwind_exit of the program is no site
+ * that a state would have noted.
+ */
 static u8 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
 	u8 kinds = 0;
 	int s;
 
-	bpf_pad_for_each_callee(plan, s)
+	bpf_pad_for_each_callee(plan, s) {
 		kinds |= env->subprog_info[s].left_at;
+		if (env->subprog_info[s].can_unwind)
+			kinds |= LEFT_AT_UNWIND_EXIT;
+	}
 	return kinds;
+}
+
+/*
+ * Why the call of @plan at insn @i is a site: where the program leaves what it calls. It goes in
+ * front of the conflict, which ends the log.
+ */
+static void print_sites_below(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	u8 kinds;
+	int k;
+
+	if (plan->kind != BPF_SITE_CALL)
+		return;
+	kinds = sites_below(env, plan);
+	verbose(env, "what the call at %d calls is left at:", i);
+	for (k = 0; k <= BPF_SITE_MAY_GOTO; k++)
+		if (kinds & BIT(k))
+			verbose(env, " %s%s", site_kind[k], kinds >> (k + 1) ? "," : "");
+	if (kinds & LEFT_AT_UNWIND_EXIT)
+		verbose(env, " unwind_exit");
+	verbose(env, "\n");
 }
 
 /* The frame of the site of @plan cannot unwind: there is no pad to plan */
@@ -2401,14 +2441,6 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 /* The plan of the site at insn @i, or why there is none */
 static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
-	static const char * const kind[] = {
-		[BPF_SITE_GUARD]		= "may_goto",
-		[BPF_SITE_RECURSION]		= "recursion check",
-		[BPF_SITE_CALL]			= "call",
-		[BPF_SITE_FAULT]		= "arena access",
-		[BPF_SITE_THROW]		= "bpf_throw",
-		[BPF_SITE_MAY_GOTO]		= "may_goto of the program",
-	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
 		[BPF_CONFLICT_TOO_MUCH]		= "too much is held",
@@ -2430,7 +2462,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	};
 	int j;
 
-	verbose(env, "landing pad of %s at %d: ", kind[plan->kind], i);
+	verbose(env, "landing pad of %s at %d: ", site_kind[plan->kind], i);
 	for (j = plan->nr_ents - 1; !plan->conflict && j >= 0; j--)
 		print_ent(env, &plan->ents[j]);
 	if (plan->conflict)
@@ -2443,6 +2475,8 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 /* What the landing pad of the site of @plan at @insn_idx releases, or why there is none */
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan)
 {
+	if (plan->conflict)
+		print_sites_below(env, insn_idx, plan);
 	print_plan(env, insn_idx, plan);
 }
 
@@ -2577,7 +2611,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 				return err;
 			plan->conflict = err;
 			if (plan_rejects(env, plan)) {
-				print_plan(env, i, plan);
+				bpf_pad_log(env, i, plan);
 				return -EINVAL;
 			}
 			err = plan->conflict ? skip_faults(env, i, plan) : 0;
