@@ -1214,7 +1214,7 @@ struct bpf_insn_aux_data {
 	/* a subprog returned here with no pointer to release and R0 may be not 0 */
 	u64 call_brings_nothing:1;
 	/* An access to arena, see check_arena_site() */
-	u64 fault_skips:1; /* when it faults it is skipped: there is no pad, or no way to unwind */
+	u64 fault_skips:1; /* when it faults it is skipped: its subprog cannot unwind */
 	u64 fault_empty:1; /* in this pass a state that holds nothing went by without a visit */
 	u64 fault_unwinds:1; /* emission: when it faults the program goes to 'fault_pad' */
 	u64 unwind_goto_follows:1; /* emission: the verifier added unwind_goto after it */
@@ -1458,27 +1458,30 @@ struct bpf_subprog_info {
 	/*
 	 * It did so where there is no other way out: at may_goto that the verifier adds, at a
 	 * recursion check, at unwind_exit that it has, at a call of such a subprog. An access to
-	 * arena that faults has one: it is skipped. So has may_goto of the program, in a subprog
-	 * that turns out to be unable to unwind: it jumps. See bpf_pads_must_unwind().
+	 * arena and may_goto of the program have one, in a subprog that turns out to be unable to
+	 * unwind: the access is skipped, may_goto jumps. See bpf_pads_must_unwind().
 	 */
 	bool must_unwind: 1;
-	/*
-	 * A state left it that way at a site that the program has for sure, see site_is_certain(),
-	 * and that is no access to arena.
-	 */
+	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
 	bool unwinds_for_sure: 1;
 	/*
-	 * may_goto of the program, see check_may_goto_site(). In this pass a state left a frame
-	 * of it there. Or a frame of it that cannot unwind got there, or such a frame calls it,
-	 * see stuck_frame_calls(): then each may_goto of it goes where the program says, in all
-	 * frames. Every run that follows knows from its start, see check_funcs().
+	 * may_goto of the program and an access to arena, see check_may_goto_site() and
+	 * check_arena_site(). In this pass a state left a frame of it there: soft_unwinds. Or a
+	 * frame of it that cannot unwind got there, or such a frame calls it, see
+	 * stuck_frame_calls(): it is stuck. Then each may_goto of it goes where the program says
+	 * and each access that faults is skipped, in all its frames. Every run that follows
+	 * knows from its start, see check_funcs().
 	 */
-	bool may_goto_unwinds: 1;
+	bool soft_unwinds: 1;
 	bool stuck: 1;
 	/*
-	 * In this pass a frame of it whose may_goto does not stay made a call: what it called
-	 * was not told. If may_goto of the subprog stays later, the pass is done again, see
-	 * stuck_frame_calls().
+	 * 'pad_skip_gen' of the env when bpf_pad_skip_faults() walked the subprog and what came
+	 * back to the calls in and below it. While the two are equal all of that is stuck.
+	 */
+	u32 skip_gen;
+	/*
+	 * In this pass a frame of it that was not stuck made a call: what it called is not stuck
+	 * for that. If the subprog is stuck later, the pass is done again, see stuck_frame_calls().
 	 */
 	bool made_calls: 1;
 	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
@@ -1683,6 +1686,7 @@ struct bpf_verifier_env {
 	u64 pass_max_cost;		/* see bpf_undo_precision() */
 	bool aborted;			/* a thaw does not take it back */
 	bool no_mem;			/* a table cannot grow, see bpf_check_limits() */
+	u32 pad_skip_gen;		/* see 'skip_gen' of struct bpf_subprog_info */
 	/* What a pass writes. Each pass starts from the snapshot. */
 	struct_group_tagged(bpf_env_per_pass, per_pass,
 	int err;			/* the first error */
@@ -2224,6 +2228,7 @@ void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *su
 bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
 void bpf_pads_must_unwind(struct bpf_verifier_env *env);
 void bpf_pads_mark_used(struct bpf_verifier_env *env);
+int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_data *aux);
 void bpf_pads_note_causes(struct bpf_verifier_env *env);

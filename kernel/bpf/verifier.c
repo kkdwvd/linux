@@ -3411,10 +3411,10 @@ static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 	}
 	/*
 	 * It did at accesses to arena, which are skipped, and at may_goto of the program, which
-	 * jumps where the program says, see check_may_goto_site(). The pass is done again.
+	 * jumps where the program says, see check_arena_site() and check_may_goto_site(). The
+	 * pass is done again.
 	 */
-	env->faults_late |= did_unwind ||
-			    ((sub->may_goto_unwinds || sub->made_calls) && !sub->stuck);
+	env->faults_late |= did_unwind || ((sub->soft_unwinds || sub->made_calls) && !sub->stuck);
 	sub->bail_unwinds = false;
 	sub->stuck = true;
 	return 0;
@@ -21930,16 +21930,15 @@ static enum bpf_pad_conflict frame_cannot_unwind(struct bpf_verifier_env *env,
 /*
  * An insn of the program enters @subprog from the current frame: a call, callx, a helper or a
  * kfunc that has a landing pad for its callback. If the frame cannot unwind, or is a frame of a
- * subprog whose may_goto stays and that has a caller in the program, then what comes back
- * unwound to the call may have nowhere to go. So may_goto of @subprog stays too, see
- * check_may_goto_site(): from this call on, before a state gets to its may_goto and makes a
- * conflict there, or at another call of @subprog, that is none. That closes the answer over what
- * a subprog that cannot unwind calls, call by call as the pass gets to them. If a state has left
- * @subprog before, the pass is done again. The same if a frame of @subprog has made a call before:
- * what it called was not told, and the function may not be walked again, since the call of a
- * function on its own that an instance subsumes waits for the exits of that instance. A state that
- * came back unwound from there can have ended in a conflict at the call, which leaves no other
- * trace in @subprog.
+ * subprog that is stuck and has a caller in the program, then what comes back unwound to the call
+ * may have nowhere to go. So @subprog is stuck too, see check_may_goto_site() and
+ * check_arena_site(): from this call on, before a state gets to its may_goto or to its accesses
+ * and makes a conflict there that is none. That closes "stuck" over what a subprog that cannot
+ * unwind calls, call by call as the pass gets to them. If a state has left @subprog before, the
+ * pass is done again. The same if a frame of @subprog has made a call before: what it called was
+ * not told, and the function may not be walked again, since the call of a function on its own
+ * that an instance subsumes waits for the exits of that instance. A state that came back unwound
+ * from there can have ended in a conflict at the call, which leaves no other trace in @subprog.
  * @subprog still unwinds where there is no other way out. A state that does so on the way from
  * this call is an error at the call, see unwind_frame().
  */
@@ -21955,7 +21954,7 @@ static void stuck_frame_calls(struct bpf_verifier_env *env, int subprog)
 		caller->made_calls = true;
 		return;
 	}
-	env->faults_late |= sub->may_goto_unwinds || sub->made_calls ||
+	env->faults_late |= sub->soft_unwinds || sub->made_calls ||
 			    (sub->did_unwind && sub->bail_unwinds);
 	sub->stuck = true;
 }
@@ -22050,43 +22049,34 @@ static int check_may_goto_site(struct bpf_verifier_env *env)
 	    !bpf_jit_supports_timed_may_goto() || bpf_prog_is_offloaded(env->prog->aux))
 		return 0;
 	if (sub->stuck || frame_cannot_unwind(env, env->cur_state)) {
-		env->faults_late |= (sub->may_goto_unwinds || sub->made_calls) &&
-				    !sub->stuck;
+		env->faults_late |= (sub->soft_unwinds || sub->made_calls) && !sub->stuck;
 		sub->stuck = true;
 		return 0;
 	}
-	sub->may_goto_unwinds = true;
+	sub->soft_unwinds = true;
 	err = push_unwind_edge(env, BPF_SITE_MAY_GOTO);
 	return err ?: 1;
 }
 
-/* Is all that the current frame of @st holds a pointer, which is NULL where nothing is held? */
-static bool frame_holds_pointers_only(const struct bpf_verifier_state *st)
-{
-	const struct bpf_func_state *frame = st->frame[st->curframe];
-	int i;
-
-	for (i = frame->entry_refs; i < st->acquired_refs; i++)
-		if (st->refs[i].type != REF_TYPE_PTR)
-			return false;
-	return st->active_rcu_locks == frame->entry_rcu_locks &&
-	       st->active_preempt_locks == frame->entry_preempt_locks;
-}
-
 /*
  * An access through an arena pointer, @reg, faults when the page is not mapped. Then the program
- * is unwound. The site is the access itself, with the state before it takes effect, since the
- * fault precedes any write of its result.
+ * is unwound: what it was to load or to store is lost, and it is no better off than a loop that is
+ * out of time. The site is the access itself, with the state before it takes effect, since the
+ * fault precedes any write of its result. A conflict is an error, as it is at any site.
  *
- * This site has another way out, which costs nothing: the access is skipped, a load reads 0. It
- * is taken where the frame cannot unwind and where no pad serves all states: a conflict here does
- * not reject the program. There are many of them. The normal path pays nothing, the main pass little:
+ * Where the subprog cannot unwind the access is skipped when it faults, a load reads 0, as it was
+ * before the verifier unwound programs: the callback of a helper without a landing pad and what it
+ * calls, see subprog_cannot_unwind() and stuck_frame_calls(), and all but x86-64 and arm64.
+ * That is one answer for all frames of a subprog, like for its may_goto, see
+ * check_may_goto_site(). It can come when states have left a frame here: the pass is done again.
+ *
+ * There are many such accesses. The normal path pays nothing, the main pass little:
  *
  *   The frame holds nothing, in all states that get here: there is no plan and no visit.
  *
  *   It holds something: each state visits the plan, as it is. If states went by without a visit
- *   the plan does not know what is NULL where nothing is held, see visit_refs(). All is done again,
- *   and then all states visit. Unless what is held is no pointer: no test tells.
+ *   the plan does not know what they held, and what is NULL where nothing is held, see
+ *   visit_refs(). All is done again, and then all states visit.
  *
  *   A copy of the state leaves the frame, see unwind_frame(), once per stretch of insns
  *   without a call and without a store to the stack of a caller. They alone change what gets to the
@@ -22097,36 +22087,39 @@ static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_s
 	struct bpf_insn_aux_data *aux = cur_aux(env);
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = cur_func(env);
+	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
 	struct bpf_pad_plan *plan;
 	bool visits;
 
 	/* frame_cannot_unwind() does not ask the JIT about a frame that the kernel called */
-	if (reg->type != PTR_TO_ARENA || aux->fault_skips ||
-	    !bpf_jit_supports_unwind())
+	if (reg->type != PTR_TO_ARENA || !bpf_jit_supports_unwind())
 		return 0;
+	if (sub->stuck || frame_cannot_unwind(env, st)) {
+		env->faults_late |= (sub->soft_unwinds || sub->made_calls) && !sub->stuck;
+		sub->stuck = true;
+		aux->fault_skips = true;
+		return 0;
+	}
+	sub->soft_unwinds = true;
 	visits = frame_holds_resources(st) || aux->fault_full || bpf_pad_plan(aux, BPF_SITE_FAULT);
 	if (!visits) {
 		aux->fault_empty = true;
 		if (frame->fault_edge)
 			return 0;
-	}
-	if (frame_cannot_unwind(env, st)) {
-		aux->fault_skips = true;
-		return 0;
-	}
-	if (visits) {
+	} else {
 		if (aux->fault_empty && !aux->fault_full) {
-			if (!frame_holds_pointers_only(st)) {
-				aux->fault_skips = true;
-				return 0;
-			}
 			aux->fault_full = true;
 			env->faults_late = true;
 		}
 		plan = bpf_pad_visit(env, st, env->insn_idx, BPF_SITE_FAULT);
 		if (IS_ERR(plan))
 			return PTR_ERR(plan);
-		if (plan->conflict || frame->fault_edge)
+		/* an error that is none if the subprog turns out to be stuck, see do_check_all() */
+		if (plan->conflict) {
+			bpf_pad_log(env, env->insn_idx, plan);
+			return -EINVAL;
+		}
+		if (frame->fault_edge)
 			return 0;
 	}
 	frame->fault_edge = true;
@@ -22238,13 +22231,13 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
  * With a conflict there is no pad: the site is an unproven insn in @st, which ends here. The pass
  * goes on, and a pass that keeps more apart may have no such state.
  * A frame that cannot unwind is a conflict. At an access to arena check_arena_site() saw to both,
- * and at may_goto of the program check_may_goto_site() saw to it: the jump is taken there.
- * At a call that has only such accesses below it a conflict is no error: @st is dropped, and
- * bpf_pads_settle() has the accesses skipped. The same at a call in a frame that cannot unwind, if
- * what comes back to it has another way out: the callees are made unable to unwind.
- * Nor is it one at a site that the program may not have in the end, see site_is_certain(): @st is
- * dropped, the plan keeps the conflict, and bpf_pads_settle() makes it an error of the pass if the
- * site is still there.
+ * and at may_goto of the program check_may_goto_site() saw to it: the access is skipped there,
+ * the jump is taken. At a call in such a frame that is no error if what comes back to the call
+ * was left at such sites only: @st is dropped, and what came back is stuck from now on, see
+ * stuck_frame_calls() and bpf_pad_skip_faults().
+ * Nor is a conflict an error at a site that the program may not have in the end, see
+ * site_is_certain(): @st is dropped, the plan keeps the conflict, and bpf_pads_settle() makes it
+ * an error of the pass if the site is still there.
  */
 static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx,
 			enum bpf_site_kind kind)
@@ -22254,7 +22247,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	struct bpf_verifier_state *cur = env->cur_state;
 	int cur_idx = env->insn_idx, err = 0;
 	struct bpf_pad_plan *plan = NULL;
-	bool print_state, certain = false, stuck;
+	bool print_state, certain = true, stuck;
 	enum bpf_pad_conflict conflict;
 	u32 cnt;
 
@@ -22281,9 +22274,10 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		stuck = plan->conflict == BPF_CONFLICT_CANNOT_UNWIND ||
 			plan->conflict == BPF_CONFLICT_NO_EXIT;
 		/*
-		 * There is no other way out. Not for may_goto of the program and a call above it
-		 * either, but in a subprog that cannot unwind, and whether it is one may be found
-		 * later in the pass. Then this error was none, see do_check_all().
+		 * There is no other way out. Not for may_goto of the program, an access to arena
+		 * and a call above them either, but in a subprog that cannot unwind, and whether
+		 * it is one may be found later in the pass. Then this error was none, see
+		 * do_check_all().
 		 */
 		if (plan->conflict && certain && (bpf_pad_must_unwind(env, plan) || !stuck)) {
 			bpf_pad_log(env, insn_idx, plan);
@@ -22292,6 +22286,13 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			err = -EINVAL;
 			goto unproven;
 		}
+		/*
+		 * The frame of the call cannot unwind, and what came back has another way out.
+		 * stuck_frame_calls() did not see it coming: the function was left before the
+		 * call made it stuck, or the frame could unwind when it made the call.
+		 */
+		if (stuck && kind == BPF_SITE_CALL && !bpf_pad_must_unwind(env, plan))
+			err = bpf_pad_skip_faults(env, plan);
 		if (plan->conflict)
 			goto out;
 	}
@@ -22325,7 +22326,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (st->unwound)
 		bpf_pad_note_left(env, sub, plan, kind);
 	sub->must_unwind |= st->unwound && plan && bpf_pad_must_unwind(env, plan);
-	sub->unwinds_for_sure |= st->unwound && plan && certain;
+	sub->unwinds_for_sure |= st->unwound && certain;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
@@ -24512,13 +24513,13 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 		if (bpf_subprog_is_global(env, i))
 			initial->subprogs[i].did_unwind |= env->subprog_info[i].did_unwind;
 		/*
-		 * The accesses to arena in it are skipped, and the pass is done again, see
-		 * subprog_cannot_unwind() and skip_faults(). The second run has to know from its
-		 * start that the subprog cannot unwind, or it finds out late once more.
+		 * It cannot leave with unwind_exit, and the pass is done again, see
+		 * subprog_cannot_unwind(). The second run has to know from its start, or it finds
+		 * out late once more.
 		 * No other run knows: like all else about a subprog that is what one pass finds. A
 		 * pass that keeps more apart, and a path-sensitive run, may not get to the call
-		 * that has no landing pad for the subprog, or may have no conflict at its
-		 * caller. Then the subprog is left where it has to unwind, and it can.
+		 * that has no landing pad for the subprog. Then the subprog is left where it has
+		 * to unwind, and it can.
 		 */
 		if (!env->pass_again)
 			initial->subprogs[i].bail_unwinds =
@@ -24526,11 +24527,11 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 		else if (env->faults_late)
 			initial->subprogs[i].bail_unwinds &= env->subprog_info[i].bail_unwinds;
 		/*
-		 * Its may_goto jumps where the program says, see check_may_goto_site() and
-		 * stuck_frame_calls(). That is what it did before the verifier unwound programs
-		 * there, so it is safe to keep in every run that follows: a run that had to find
-		 * it again could end at an error which is none before it gets to the call that
-		 * tells.
+		 * The accesses to arena in it are skipped and its may_goto jumps where the program
+		 * says, see check_may_goto_site(), stuck_frame_calls() and bpf_pad_skip_faults().
+		 * That is what they did before the verifier unwound programs, so it is safe to
+		 * keep in every run that follows: a run that had to find it again could end at an
+		 * error which is none before it gets to the call that tells.
 		 */
 		initial->subprogs[i].stuck |= env->subprog_info[i].stuck;
 	}
@@ -24569,7 +24570,7 @@ static int check_pass(struct bpf_verifier_env *env, struct bpf_snapshot *initial
 	 */
 	mark_used_sites(env, initial);
 	ret = bpf_pads_settle(env);
-	/* accesses to arena are skipped after all, see skip_faults() */
+	/* accesses to arena are skipped after all, see bpf_pad_skip_faults() */
 	if (!ret && pass_needs_restart(env))
 		return 0;
 	ret = ret ?: check_after_pass(env);
@@ -24760,10 +24761,10 @@ static int do_check_all(struct bpf_verifier_env *env)
 		/*
 		 * The run has an error, and it found late what a run has to know from its start,
 		 * see check_arena_site(). Mostly that a subprog cannot unwind: its may_goto jumps
-		 * where the program says, and the states that left it there went where no run of
-		 * the program goes. A conflict at such a site or at a call above it was none, and
-		 * neither was what such a state ran into on its way. The run that follows knows
-		 * from its start.
+		 * where the program says, its accesses to arena are skipped, and the states that
+		 * left it there went where no run of the program goes. A conflict at such a site
+		 * or at a call above it was none, and neither was what such a state ran into on
+		 * its way. The run that follows knows from its start.
 		 */
 		if (ret && env->faults_late && !env->over_limit) {
 			/* the log has that error */

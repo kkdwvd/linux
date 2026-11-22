@@ -3,12 +3,12 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <bpf_arena_common.h>
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
-#include "arena_skipped.h"
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARENA);
@@ -276,30 +276,53 @@ __u64 __arena_global uaf_r0_after_src_r0;
 /* What reading the faulted address again gives, see the end of uaf() */
 __u64 __arena_global uaf_reread;
 
-SEC("syscall")
-int uaf(const void *ctx)
-{
-	if (pid != (bpf_get_current_pid_tgid() >> 32))
-		return 0;
 /*
  * __BPF_FEATURE_ADDR_SPACE_CAST is required by the asm below, which spells
  * addr_space_cast textually. That and the mnemonic both arrived in LLVM 19.
  */
 #if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
 	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
+/*
+ * An access to the arena that faults ends the prog where its subprog can unwind. Where it cannot
+ * the access is skipped, and the registers of an atomic insn are what they have to be: that is what
+ * this test looks at. A subprog that cannot unwind is the comparator of bpf_rbtree_add() for a node
+ * that takes a lock when it is freed. No helper may be called there.
+ */
+#define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
+#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
+
+extern void *bpf_obj_new(__u64 local_type_id__k) __ksym;
+extern void bpf_obj_drop(void *p__alloc) __ksym;
+extern long bpf_rbtree_add(struct bpf_rb_root *root, struct bpf_rb_node *node,
+			   bool (*less)(struct bpf_rb_node *, const struct bpf_rb_node *)) __ksym;
+extern struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root) __ksym;
+extern struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
+					      struct bpf_rb_node *node) __ksym;
+
+struct uaf_leaf {
+	struct bpf_rb_node node;
+};
+
+struct uaf_node {
+	struct bpf_rb_node node;
+	struct bpf_spin_lock lock;
+	struct bpf_rb_root root __contains(uaf_leaf, node);
+};
+
+private(U) struct bpf_spin_lock uaf_lock;
+private(U) struct bpf_rb_root uaf_root __contains(uaf_node, node);
+
+/* No code has a leaf: this puts it in BTF, for __contains() above */
+struct uaf_leaf *__uaf_leaf_btf_root SEC(".data.uaf_leaf");
+
+void __arena *uaf_page;
+
+static bool uaf_less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	void __arena *page = uaf_page;
 	__u32 __arena *page32;
 	__u64 __arena *page64;
-	void __arena *page;
 
-	page = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
-	bpf_arena_free_pages(&arena, page, 1);
-	uaf_recovery_fails = 26;
-	uaf_r1_after_dst_r0 = 1;
-	uaf_r0_after_dst_r0 = 1;
-	uaf_r0_after_src_r0 = 1;
-	uaf_reread = 1;
-
-	skip_faults();
 	page32 = (__u32 __arena *)page;
 	uaf_sink += __sync_fetch_and_add(page32, 1);
 	uaf_recovery_fails -= 1;
@@ -419,7 +442,49 @@ int uaf(const void *ctx)
 	: : [page]"r"(page64),
 	    __imm_addr(uaf_reread)
 	: "r1", "r2", "r3", "memory");
-	unwind_faults();
+	return false;
+}
+#endif
+
+SEC("syscall")
+int uaf(const void *ctx)
+{
+	if (pid != (bpf_get_current_pid_tgid() >> 32))
+		return 0;
+#if defined(ENABLE_ATOMICS_TESTS) && !defined(__TARGET_ARCH_arm64) && \
+	defined(__BPF_FEATURE_ADDR_SPACE_CAST)
+	struct bpf_rb_node *node;
+	struct uaf_node *n;
+	void __arena *page;
+	int i;
+
+	page = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
+	bpf_arena_free_pages(&arena, page, 1);
+	uaf_recovery_fails = 26;
+	uaf_r1_after_dst_r0 = 1;
+	uaf_r0_after_dst_r0 = 1;
+	uaf_r0_after_src_r0 = 1;
+	uaf_reread = 1;
+	uaf_page = page;
+
+	/* two nodes, so that the comparator runs, one time */
+	for (i = 0; i < 2; i++) {
+		n = bpf_obj_new(bpf_core_type_id_local(struct uaf_node));
+		if (!n)
+			return 1;
+		bpf_spin_lock(&uaf_lock);
+		bpf_rbtree_add(&uaf_root, &n->node, uaf_less);
+		bpf_spin_unlock(&uaf_lock);
+	}
+	for (i = 0; i < 2; i++) {
+		bpf_spin_lock(&uaf_lock);
+		node = bpf_rbtree_first(&uaf_root);
+		node = node ? bpf_rbtree_remove(&uaf_root, node) : NULL;
+		bpf_spin_unlock(&uaf_lock);
+		if (!node)
+			return 2;
+		bpf_obj_drop(container_of(node, struct uaf_node, node));
+	}
 #endif
 
 	return 0;

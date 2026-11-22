@@ -9,7 +9,6 @@
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
 #include <bpf_arena_common.h>
-#include "arena_skipped.h"
 
 #define private(name) SEC(".bss." #name) __hidden __attribute__((aligned(8)))
 
@@ -81,8 +80,6 @@ int basic_alloc1(void *ctx)
 	bpf_arena_free_pages(&arena, (void __arena *)page2, 1);
 	if (*page1 != 1)
 		return 6;
-	if (skipped(*page2) != 0) /* use-after-free should return 0 */
-		return 7;
 	page3 = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
 	if (!page3)
 		return 8;
@@ -127,35 +124,27 @@ __success __retval(0)
 __skip_without_arena
 int basic_alloc2_nosleep(void *ctx)
 {
-	volatile char __arena *page1, *page2, *page3, *page4;
+	volatile char __arena *page1, *page2;
 
 	page1 = bpf_arena_alloc_pages(&arena, NULL, 2, NUMA_NO_NODE, 0);
 	if (!page1)
 		return 1;
 	page2 = page1 + __PAGE_SIZE;
-	page3 = page1 + __PAGE_SIZE * 2;
-	page4 = page1 - __PAGE_SIZE;
 	*page1 = 1;
 	*page2 = 2;
-	skipped(*page3 = 3);
-	skipped(*page4 = 4);
 	if (*page1 != 1)
 		return 1;
 	if (*page2 != 2)
 		return 2;
-	if (skipped(*page3) != 0)
-		return 3;
-	if (skipped(*page4) != 0)
-		return 4;
 	bpf_arena_free_pages(&arena, (void __arena *)page1, 2);
-	if (skipped(*page1) != 0 && skipped(*page1) != 1)
+	/*
+	 * The pages may be there still: 1 and 2. If not, the prog ends here, with 0, or the
+	 * load is skipped and reads 0 where the JIT cannot unwind.
+	 */
+	if (*page1 != 0 && *page1 != 1)
 		return 5;
-	if (skipped(*page2) != 0 && skipped(*page2) != 2)
+	if (*page2 != 0 && *page2 != 2)
 		return 6;
-	if (skipped(*page3) != 0)
-		return 7;
-	if (skipped(*page4) != 0)
-		return 8;
 	return 0;
 }
 
@@ -164,35 +153,19 @@ __success __retval(0)
 __skip_without_arena
 int basic_alloc2(void *ctx)
 {
-	volatile char __arena *page1, *page2, *page3, *page4;
+	volatile char __arena *page1, *page2;
 
 	page1 = bpf_arena_alloc_pages(&arena, NULL, 2, NUMA_NO_NODE, 0);
 	if (!page1)
 		return 1;
 	page2 = page1 + __PAGE_SIZE;
-	page3 = page1 + __PAGE_SIZE * 2;
-	page4 = page1 - __PAGE_SIZE;
 	*page1 = 1;
 	*page2 = 2;
-	skipped(*page3 = 3);
-	skipped(*page4 = 4);
 	if (*page1 != 1)
 		return 1;
 	if (*page2 != 2)
 		return 2;
-	if (skipped(*page3) != 0)
-		return 3;
-	if (skipped(*page4) != 0)
-		return 4;
 	bpf_arena_free_pages(&arena, (void __arena *)page1, 2);
-	if (skipped(*page1) != 0)
-		return 5;
-	if (skipped(*page2) != 0)
-		return 6;
-	if (skipped(*page3) != 0)
-		return 7;
-	if (skipped(*page4) != 0)
-		return 8;
 	return 0;
 }
 
