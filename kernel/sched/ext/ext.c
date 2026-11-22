@@ -3454,7 +3454,8 @@ static enum scx_dsp_verdict dispatch_one(struct rq *rq, struct task_struct *prev
 		 * core. This callback complements ->cpu_release(), which is
 		 * emitted in switch_class().
 		 */
-		if (root_sch->ops.cpu_acquire)
+		/* not the operator of a scheduler that failed, see scx_fail() */
+		if (root_sch->ops.cpu_acquire && !scx_has_failed(root_sch))
 			SCX_CALL_OP(root_sch, cpu_acquire, rq, cpu, NULL);
 		rq->scx.cpu_released = false;
 	}
@@ -3753,7 +3754,8 @@ static void switch_class(struct rq *rq, struct task_struct *next)
 	 *  next time that dispatch_one() is invoked.
 	 */
 	if (!rq->scx.cpu_released) {
-		if (sch->ops.cpu_release) {
+		/* not the operator of a scheduler that failed, see scx_fail() */
+		if (sch->ops.cpu_release && !scx_has_failed(sch)) {
 			struct scx_cpu_release_args args = {
 				.reason = preempt_reason_from_class(next_class),
 				.task = next,
@@ -6124,7 +6126,8 @@ static void scx_cgroup_exit(struct scx_sched *sch)
 		tg->scx.sched = NULL;
 		if (tg->scx.flags & SCX_TG_INITED) {
 			tg->scx.flags &= ~SCX_TG_INITED;
-			if (sch->ops.cgroup_exit)
+			/* not the operator of a scheduler that failed, see scx_fail() */
+			if (sch->ops.cgroup_exit && !scx_has_failed(sch))
 				SCX_CALL_OP(sch, cgroup_exit, NULL, css->cgroup);
 		}
 	}
@@ -6156,6 +6159,9 @@ static int scx_cgroup_init(struct scx_sched *sch)
 			};
 
 			ret = SCX_CALL_OP_RET(sch, cgroup_init, NULL, css->cgroup, &args);
+			/* an operator that was unwound returns 0, see scx_has_failed() */
+			if (!ret && scx_has_failed(sch))
+				ret = -ECANCELED;
 			if (ret) {
 				scx_error(sch, "ops.cgroup_init() failed (%d)", ret);
 				return ret;
@@ -8979,6 +8985,9 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		scx_task_iter_unlock(&sti);
 
 		ret = __scx_init_task(sch, p, NULL, false);
+		/* an operator that was unwound returns 0, see scx_has_failed() */
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 
 		scx_task_iter_relock(&sti, p);
 

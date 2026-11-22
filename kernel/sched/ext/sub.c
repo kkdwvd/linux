@@ -2161,7 +2161,8 @@ dump:
 	 */
 	wake_up_all(&scx_unlink_waitq);
 
-	if (parent->ops.sub_detach && sch->sub_attached) {
+	/* not the operator of a parent that failed, see scx_fail() */
+	if (parent->ops.sub_detach && sch->sub_attached && !scx_has_failed(parent)) {
 		struct scx_sub_detach_args sub_detach_args = {
 			.ops = &sch->ops,
 			.cgroup_path = sch->cgrp_path,
@@ -2360,8 +2361,16 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 		ret = -ENODEV;
 		goto err_disable;
 	}
-	ret = SCX_CALL_OP_RET(parent, sub_attach, NULL,
-			      &sub_attach_args);
+	/*
+	 * Not the operator of a parent that failed. And one that was unwound
+	 * returns 0, which is no consent, see scx_has_failed().
+	 */
+	ret = -ECANCELED;
+	if (!scx_has_failed(parent))
+		ret = SCX_CALL_OP_RET(parent, sub_attach, NULL,
+				      &sub_attach_args);
+	if (!ret && scx_has_failed(parent))
+		ret = -ECANCELED;
 	cgroup_unlock();
 
 	if (ret) {
