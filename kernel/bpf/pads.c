@@ -2552,8 +2552,14 @@ int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad
 /*
  * The entry of a function: all words of its hidden slots are 0. The frame holds nothing of its own,
  * and a pad reads all slots, also at a site that is before the calls that fill them.
+ * And K is 0: the kernel is not unwinding the frame. Only the entry of a landing pad that the
+ * kernel enters sets it, see bpf_pad_kentry_insns(), and what tests it comes after that or after
+ * this store, in the same frame: the landing pads that the frame gets to on both ways, and what
+ * stands in for unwind_exit of the program. This is what the normal path pays for the landing
+ * pads of the program that the kernel enters: one store per call of the function.
  */
-int bpf_pad_entry_insns(const struct bpf_pad_note **notes, int nr, struct bpf_insn *buf)
+int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, struct bpf_insn *buf)
 {
 	int i, k, n = 0;
 
@@ -2561,6 +2567,42 @@ int bpf_pad_entry_insns(const struct bpf_pad_note **notes, int nr, struct bpf_in
 		for (k = 0; k < notes[i]->nr_slots * slot_words(notes[i]); k++)
 			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, notes[i]->off - k * BPF_REG_SIZE,
 					      0);
+	if (sub->k_off)
+		buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 0);
+	return n;
+}
+
+/*
+ * The entry of a landing pad of the program that the kernel enters, see enter_kernel_pad() in
+ * verifier.c: kgoto behind the call goes here, and from here the program goes on in its pad. But for
+ * the last insn, which is that jump.
+ *
+ *	ax = K
+ *	if ax != 0 goto 1f		the kernel unwinds the frame already: a call in the pad
+ *	K = 1
+ *	*(u64 *)(r10 - W) = r0		in a program with bpf_throw(): the value
+ * 1:	r0 = 0
+ *
+ * The first entry of a frame decides: K stays 1 until the frame is left, and the value that the
+ * program ends with is the one that the unwinding began with, whatever unwinds on the way. The
+ * pad gets 0 in R0, where unwind_exit of the program leaves what the program threw: the value of
+ * the kernel is none of its business, and a pad that takes R0 for an object of the program finds
+ * none.
+ * Returns the number of insns.
+ */
+int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			 int subprog, struct bpf_insn *buf)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	int n = 0;
+
+	buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, sub->k_off);
+	buf[n++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 0);
+	buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 1);
+	if (env->has_throw)
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, sub->value_off);
+	buf[1].off = n - 2;
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
 	return n;
 }
 
@@ -3088,7 +3130,7 @@ static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info
 
 /*
  * @sub gets the hidden word K, and in a program with bpf_throw() the word for the value: the entry
- * of a landing pad stores both. Returns 1 if the stack has no room.
+ * of a landing pad stores both, see bpf_pad_kentry_insns(). Returns 1 if the stack has no room.
  */
 static int take_kernel_words(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
 {

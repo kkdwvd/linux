@@ -22699,8 +22699,8 @@ static int check_unwound_arrival(struct bpf_verifier_env *env)
  * The kernel unwound what the call before this insn called, and the program has unwind_goto here
  * whose landing pad ONLY RESUMES, see bpf_find_kernel_pads(): it runs what the program wants done
  * when a frame is left, a destructor of C++ or Rust, and cannot end the unwinding. So it is not
- * passed by. kgoto behind the call goes to the ENTRY that the verifier emits, and from there to
- * the pad.
+ * passed by. kgoto behind the call goes to the ENTRY that the verifier emits, see
+ * bpf_pad_kentry_insns(), and from there to the pad.
  *
  *	call foo			call foo
  *	unwind_goto pad			unwind_goto pad

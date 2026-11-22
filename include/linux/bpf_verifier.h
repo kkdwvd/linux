@@ -2521,7 +2521,10 @@ void bpf_pads_note_causes(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 int bpf_hidden_slots_fit(struct bpf_verifier_env *env);
 int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad_note **notes);
-int bpf_pad_entry_insns(const struct bpf_pad_note **notes, int nr, struct bpf_insn *buf);
+int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, struct bpf_insn *buf);
+int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			 int subprog, struct bpf_insn *buf);
 int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
 int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
