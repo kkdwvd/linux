@@ -4142,6 +4142,129 @@ static bool insn_returns(const struct bpf_insn *insn)
 }
 
 /*
+ * The functions that have a landing pad which only resumes, 'kpad' of its unwind_goto: which of
+ * their insns can a frame run once the kernel has entered such a pad? Three kinds of code, on the
+ * control flow graph:
+ *
+ *   PAD CODE     What can be reached from the first insn of a pad that only resumes, over every
+ *                edge: 'kpad_code'. A frame that the kernel unwinds starts at such an insn, see
+ *                enter_kernel_pad() in verifier.c, and goes on over edges of the graph until it is
+ *                left. So it runs pad code and nothing else.
+ *   NORMAL PATH  What can be reached from the first insn of the function without the jump of
+ *                unwind_goto: where a frame is as long as nothing has unwound to it.
+ *   the rest     What only the jump of unwind_goto gets to and what is no pad code: the landing
+ *                pad of a typed catch, until it returns to the normal path or goes on in the
+ *                code that resumes, which it shares with the pads of the destructors. To a frame
+ *                that the kernel unwinds it is what the normal path is: such a frame is not there.
+ *
+ *	call a			normal path
+ *	unwind_goto 1f
+ *	call b
+ *	unwind_goto 2f
+ *	exit
+ * 2:	if r0 != 7 goto 3f	the rest: a typed catch
+ *	r0 = 0
+ *	exit
+ * 1:	call dtor		pad code
+ * 3:	unwind_exit
+ *
+ * A function is MIXED, 'kpads_mixed', if one of its insns is pad code and on the normal path as
+ * well: a pad that the normal path falls into or jumps to, a pad that goes back in front of its
+ * call, or to the first insn of its function, any pad of a function that has no exit. In every
+ * other function the two share no insn, and a frame gets from the normal path into pad code in
+ * two ways only: by the jump of unwind_goto, when a callee left with unwind_exit, and through the
+ * entry of a pad, when the kernel unwound the callee.
+ *
+ * The exit that stands for the return of a tail call or of LD_ABS is no edge here, as it is none
+ * where the pads are judged: it can be unwind_exit of the code that resumes, and a tail call on
+ * the normal path would make every such function mixed.
+ * Nor is the insn behind a call of a subprog that does not return, see bpf_compute_might_return():
+ * a function that only throws, static or global. The compiler puts what it likes behind such a
+ * call, a cleanup pad too, and nothing falls into that. What comes back to the call is unwound and
+ * goes where its unwind_goto says, or leaves the frame. The main pass does not go on behind such a
+ * call either, see check_func_call() for a global callee, and the code that a frame of the pass
+ * gets to must be the code that is found here.
+ * This counts on no unwind being lost at such a call, of a global callee as of a static one: a
+ * callee that can leave with unwind_exit or kexit has unwind_goto or kgoto behind each call of it,
+ * see insert_unwind_gotos() in fixups.c. A return that found neither would go on behind the call:
+ * from the normal path into pad code where a landing pad follows the call, and K is read there. So
+ * a trap stands behind such a call wherever the code behind it is dead, see
+ * bpf_opt_hard_wire_dead_code_branches().
+ */
+static int find_pad_code(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn *insns = env->prog->insnsi, *insn;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int i, p, t, s, cnt, len = env->prog->len, err = 0;
+	struct bpf_subprog_info *sub;
+	unsigned long *pad, *normal;
+	struct bpf_iarray *succ;
+	bool changed;
+
+	pad = bitmap_zalloc(len, BPF_VERIFIER_GFP);
+	normal = bitmap_zalloc(len, BPF_VERIFIER_GFP);
+	if (!pad || !normal) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (s = 0; s < env->subprog_cnt; s++)
+		if (env->subprog_info[s].has_kpads)
+			__set_bit(env->subprog_info[s].start, normal);
+	for (i = 0; i < len; i++)
+		if (aux[i].kpad)
+			__set_bit(i + 1 + bpf_jmp_offset(&insns[i]), pad);
+	/* what an insn gets to comes before it in the postorder: walk that from its end */
+	do {
+		changed = false;
+		err = bpf_add_cost_and_check(env, env->cfg.cur_postorder, BPF_COST_SCAN);
+		if (err)
+			goto out;
+		for (p = env->cfg.cur_postorder - 1; p >= 0; p--) {
+			i = env->cfg.insn_postorder[p];
+			if (!test_bit(i, pad) && !test_bit(i, normal))
+				continue;
+			insn = &insns[i];
+			s = bpf_pseudo_call(insn) ? bpf_find_subprog(env, i + 1 + insn->imm) : -1;
+			if (s >= 0 && !env->subprog_info[s].might_return) {
+				/* pad code gets to the landing pad of the call, nothing else */
+				t = i + 1 < len && bpf_is_unwind_goto(insn + 1) ?
+				    i + 2 + bpf_jmp_offset(insn + 1) : -1;
+				if (t >= 0 && test_bit(i, pad) && !__test_and_set_bit(t, pad))
+					changed = true;
+				continue;
+			}
+			succ = bpf_insn_successors(env, i);
+			cnt = insn_returns(insn) ? min(succ->cnt, 1) : succ->cnt;
+			for (t = 0; t < cnt; t++) {
+				if (test_bit(i, pad) && !__test_and_set_bit(succ->items[t], pad))
+					changed = true;
+				/* the second one of unwind_goto is its jump */
+				if (test_bit(i, normal) && !(t && bpf_is_unwind_goto(insn)) &&
+				    !__test_and_set_bit(succ->items[t], normal))
+					changed = true;
+			}
+		}
+	} while (changed);
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		for (i = sub->start; sub->has_kpads && i < sub[1].start; i++) {
+			aux[i].kpad_code = test_bit(i, pad);
+			if (sub->kpads_mixed || !test_bit(i, pad) || !test_bit(i, normal))
+				continue;
+			sub->kpads_mixed = true;
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env,
+					"insn %d of func#%d is on the normal path and in a landing pad that only resumes\n",
+					i, s);
+		}
+	}
+out:
+	bitmap_free(pad);
+	bitmap_free(normal);
+	return err;
+}
+
+/*
  * The landing pads that a program has behind its calls are code like any other: a pad can end the
  * unwinding and go on with the program, a catch clause of C++ does. What the kernel unwinds must
  * not be caught. But a pad that only cleans up, a destructor and then unwind_exit, cannot catch
@@ -4182,6 +4305,7 @@ static bool insn_returns(const struct bpf_insn *insn)
  * kernel enters each of these pads when it unwinds what the call in front of it calls, in a
  * function that can unwind, or the program is rejected: see bpf_pads_settle().
  * Dead branches are gone from the graph, see bpf_prune_dead_branches().
+ * What such pads get to is found on the same graph, see find_pad_code().
  */
 int bpf_find_kernel_pads(struct bpf_verifier_env *env)
 {
@@ -4189,7 +4313,7 @@ int bpf_find_kernel_pads(struct bpf_verifier_env *env)
 	int i, p, t, pad, cnt, len = env->prog->len, err = 0;
 	unsigned long *returns, *resumes;
 	struct bpf_iarray *succ;
-	bool changed, ret, res;
+	bool changed, ret, res, found = false;
 
 	for (i = 0; i < len && !bpf_is_unwind_goto(&insns[i]); i++)
 		;
@@ -4243,12 +4367,13 @@ int bpf_find_kernel_pads(struct bpf_verifier_env *env)
 		res = test_bit(pad, resumes);
 		env->insn_aux_data[i].kpad = !ret && res;
 		if (!ret && res)
-			bpf_find_containing_subprog(env, i)->has_kpads = true;
+			bpf_find_containing_subprog(env, i)->has_kpads = found = true;
 		if (!(env->log.level & BPF_LOG_LEVEL2))
 			continue;
 		verbose(env, "landing pad at %d of the call at %d %s\n", pad, i - 1,
 			ret ? "returns" : res ? "only resumes" : "has no unwind_exit");
 	}
+	err = found ? find_pad_code(env) : 0;
 out:
 	bitmap_free(returns);
 	bitmap_free(resumes);

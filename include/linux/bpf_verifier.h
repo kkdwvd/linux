@@ -1425,6 +1425,11 @@ struct bpf_insn_aux_data {
 	 * calls.
 	 */
 	u32 kpad:1;
+	/*
+	 * PAD CODE: an insn that such a landing pad of its function gets to. A frame that the
+	 * kernel unwinds runs nothing else, see bpf_find_kernel_pads().
+	 */
+	u32 kpad_code:1;
 	/* it can read or write the frame of a caller, in a call with a known callee */
 	u32 reads_outer:1;
 	u32 writes_outer:1;
@@ -1717,6 +1722,11 @@ struct bpf_subprog_info {
 	bool below_conflict: 1;
 	/* it has unwind_goto whose landing pad only resumes, see bpf_find_kernel_pads() */
 	bool has_kpads: 1;
+	/*
+	 * MIXED: an insn of it is pad code and on the normal path of the function as well, see
+	 * bpf_find_kernel_pads()
+	 */
+	bool kpads_mixed: 1;
 	/*
 	 * The kernel enters one of them, as the program is in the end: its frames can be forced.
 	 * See bpf_mark_subprogs_that_unwind().
