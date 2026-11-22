@@ -525,6 +525,135 @@ int private_stack_max_depth(void)
 	return 0;
 }
 
+__used __noinline static int throws_7(void)
+{
+	bpf_throw(7);
+	return 0;
+}
+
+/* kfuncs that only asm calls need BTF */
+void __kfunc_btf_root(void)
+{
+	bpf_rcu_read_lock();
+	bpf_rcu_read_unlock();
+}
+
+/*
+ * The insns of the prog use 48 bytes of stack. The landing pad of the call leaves the RCU section
+ * and keeps the value of bpf_throw() over that, in a hidden word below the stack of the prog: 56
+ * bytes, which the JIT rounds up to the 64 where a private stack begins. The prog does not get
+ * one for a word that only its landing pad uses: it keeps its frame in the stack of the kernel,
+ * and no call of it saves r9.
+ */
+SEC("raw_tp")
+__description("No private stack, a hidden word of the landing pads takes the frame to 56 bytes")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("call pc+")
+__xlated("...")
+__xlated("*(u64 *)(r10 -56) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -56)")
+__xlated("exit")
+__jited("	subq	$0x38, %rsp")
+__jited("...")
+__jited("	movq	%rdi, -0x30(%rbp)")
+__arch_arm64
+__naked void no_private_stack_hidden_word(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 48) = r1;	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
+}
+
+/*
+ * The same with a register that is spilled around a bpf_fastcall call, below the 48 bytes. The
+ * spill and the fill are removed. The hidden word stays where it was put, below the slot that is
+ * no longer used: a frame of 64 bytes, of which the insns of the prog use 48. No private stack.
+ */
+SEC("raw_tp")
+__description("No private stack, a hidden word below a bpf_fastcall spill that is removed")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("*(u64 *)(r10 -48) = r1")
+__xlated("...")
+__xlated("call pc+")
+__xlated("...")
+__xlated("*(u64 *)(r10 -64) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -64)")
+__xlated("exit")
+__jited("	subq	$0x40, %rsp")
+__jited("...")
+__jited("	movq	%rdi, -0x30(%rbp)")
+__arch_arm64
+__naked void no_private_stack_fastcall_spill(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 48) = r1;	\
+	*(u64 *)(r10 - 56) = r1;	\
+	call %[bpf_get_smp_processor_id];\
+	r1 = *(u64 *)(r10 - 56);	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_get_smp_processor_id),
+	  __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
+}
+
+/* The same with 64 bytes of its own: a private stack, and the hidden word is in it */
+SEC("raw_tp")
+__description("Private stack, the hidden word of the landing pads is in it")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("*(u64 *)(r10 -72) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -72)")
+__xlated("exit")
+__jited("	movabsq	$0x{{.*}}, %r9")
+__jited("	addq	%gs:{{.*}}, %r9")
+__jited("...")
+__jited("	movq	%rdi, -0x40(%r9)")
+__jited("...")
+__jited("	movq	%rax, -0x48(%r9)")
+__arch_arm64
+__naked void private_stack_hidden_word(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 64) = r1;	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
+}
+
 #else
 
 SEC("kprobe")
