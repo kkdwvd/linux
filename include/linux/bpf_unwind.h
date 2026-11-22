@@ -106,11 +106,16 @@
 
 /*
  * How far the two ways into the stub are from its start. unwind_exit returns behind
- * a nop: a stack walk looks up the insn in front of a return address, and for
- * the frame of the helper that has to be an insn of the stub. Without the nop it
+ * an int3: a stack walk looks up the insn in front of a return address, and for
+ * the frame of the helper that has to be an insn of the stub. Without one it
  * is the end of whatever stands in front of the stub in the section, and a
  * sample that is taken between the store of the new return address and the
- * return goes wrong above the callback. kexit returns behind clc and jnc.
+ * return goes wrong above the callback. Nothing runs the int3. It is no nop
+ * because a kprobe in front of the stub can be optimized into a jump of 5
+ * bytes, which takes in the insns behind the probe: with a nop it could end
+ * behind the way in, and unwind_exit would return into the jump. No such jump
+ * takes in an int3, see copy_optimized_instructions(), or the jnc in front of
+ * the way in of kexit. kexit returns behind clc and jnc.
  */
 #define BPF_CB_PAD_OFF	1
 #define BPF_CB_KPAD_OFF	4
@@ -125,7 +130,7 @@
  * variables hold, which the compiler does not keep across a call.
  *
  * The stub is behind the code of the section, where nothing falls into it.
- * unwind_exit returns behind the nop at 4, with the carry flag clear from there
+ * unwind_exit returns behind the int3 at 4, with the carry flag clear from there
  * on, kexit to 5, which sets it, and 'kind' is 0 or not from the flag: rcx is
  * clobbered by the call anyway. objtool gets to 4 by the table and to 5 by what
  * it takes for the other edge of the jump, which is always taken. The jump is
@@ -146,7 +151,7 @@ do {										\
 		 "	" CALL_NOSPEC "\n"					\
 		 "1:\n"								\
 		 "	.subsection 1\n"					\
-		 "4:	nop\n"							\
+		 "4:	int3\n"							\
 		 "	clc\n"							\
 		 "	.byte 0x73, 0x01\n"	/* jnc 6f */			\
 		 "5:	stc\n"							\

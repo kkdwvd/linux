@@ -10,6 +10,7 @@
 #include <linux/if_vlan.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/bpf_verifier.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
@@ -289,10 +290,10 @@ int bpf_arch_text_invalidate(void *dst, size_t len)
 }
 
 /*
- * A LANDING: where unwind_exit of a callee comes back to when the call has code
- * behind its native call, like 'pop r9'. That code, done once more, and a jump
- * to the insn that unwind_goto goes to. The landings stand behind the body of
- * the function, see do_jit().
+ * A LANDING: where unwind_exit or kexit of a callee comes back to when the call
+ * has code behind its native call, like 'pop r9'. That code, done once more,
+ * and a jump to the insn that unwind_goto or kgoto goes to. The landings stand
+ * behind the body of the function, see do_jit().
  */
 struct jit_landing {
 	u8 code[16];
@@ -312,9 +313,9 @@ struct jit_context {
 	int tail_call_indirect_label;
 
 	/*
-	 * Room for one landing per unwind_goto of the prog. Each pass fills it
-	 * again. It lives as long as addrs[]: the extra pass of a prog with
-	 * subprogs has it from the first call of bpf_int_jit_compile().
+	 * Room for one landing per unwind_goto and kgoto of the prog. Each pass
+	 * fills it again. It lives as long as addrs[]: the extra pass of a prog
+	 * with subprogs has it from the first call of bpf_int_jit_compile().
 	 */
 	struct jit_landing *landings;
 	int max_landings;
@@ -722,20 +723,28 @@ static void emit_indirect_jump(u8 **pprog, int bpf_reg, u8 *ip)
 	*pprog = prog;
 }
 
-static void __emit_indirect_call(u8 **pprog, int reg, bool ereg)
+static void __emit_indirect_call(u8 **pprog, int reg, bool ereg, bool rex)
 {
 	u8 *prog = *pprog;
 
 	if (ereg)
 		EMIT1(0x41);
+	else if (rex)
+		EMIT1(0x40);
 
 	EMIT2(0xFF, 0xD0 + reg);
 
 	*pprog = prog;
 }
 
-/* call *bpf_reg */
-static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
+/*
+ * call *bpf_reg
+ *
+ * @rex: make the call insn 3 bytes at least. 'call *%rax' has 2, and the extable entry of kgoto
+ * behind it would be at its first byte, see add_unwind_exentry(). A rex prefix without bits takes
+ * a byte and does nothing else. A call of a thunk has 5 bytes.
+ */
+static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip, bool rex)
 {
 	u8 *prog = *pprog;
 	int reg = reg2hex[bpf_reg];
@@ -747,7 +756,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		err = emit_call(&prog, its_static_thunk(reg + 8*ereg), ip);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
 		EMIT_LFENCE();
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE)) {
 		OPTIMIZER_HIDE_VAR(reg);
 		if (cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
@@ -755,7 +764,7 @@ static int emit_indirect_call(u8 **pprog, int bpf_reg, u8 *ip)
 		else
 			err = emit_call(&prog, &__x86_indirect_thunk_array[reg + 8*ereg], ip);
 	} else {
-		__emit_indirect_call(&prog, reg, ereg);
+		__emit_indirect_call(&prog, reg, ereg, rex);
 	}
 
 	*pprog = prog;
@@ -2325,11 +2334,25 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
  * No insn starts there, so a fault cannot hit the entry.
  * After an access to arena ret_addr is the end of its code, and a fault in it
  * goes to bpf_fault_unwind_target() of that, see ex_handler_bpf().
+ *
+ * kgoto is the same for kexit and bpf_kunwind_target(), with the entry at
+ * ret_addr - 2: unwind_goto of the same call has the byte behind it. No insn
+ * starts there either, since a call that kgoto follows has 3 bytes at least,
+ * see emit_indirect_call(). It never follows an access to arena, whose code can
+ * end in an insn of 2 bytes.
+ */
+#define UNWIND_EXKEY	1
+#define KUNWIND_EXKEY	2
+
+/*
+ * @after_unwind: the entry of unwind_goto of the same call was added last. The table
+ * is searched by bisection and this entry has the lower address, so it takes that
+ * place and the other one moves up.
  */
 static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, int *excnt,
-			      int ret_addr, int target)
+			      int ret_addr, int target, int key, bool after_unwind)
 {
-	struct exception_table_entry *ex;
+	struct exception_table_entry *ex, *rw;
 	s64 delta;
 
 	if (!prog->aux->extable)
@@ -2339,29 +2362,39 @@ static int add_unwind_exentry(struct bpf_prog *prog, u8 *image, u8 *rw_image, in
 		return -EFAULT;
 	}
 	ex = &prog->aux->extable[(*excnt)++];
-	delta = image + ret_addr - 1 - (u8 *)&ex->insn;
+	/* switch ex to rw buffer for writes */
+	rw = (void *)rw_image + ((void *)ex - (void *)image);
+	if (after_unwind) {
+		/* insn is relative to the entry */
+		*rw = rw[-1];
+		rw->insn -= sizeof(*rw);
+		ex--;
+		rw--;
+	}
+	delta = image + ret_addr - key - (u8 *)&ex->insn;
 	if (!is_simm32(delta)) {
 		pr_err("extable->insn doesn't fit into 32-bit\n");
 		return -EFAULT;
 	}
-	/* switch ex to rw buffer for writes */
-	ex = (void *)rw_image + ((void *)ex - (void *)image);
-	ex->insn = delta;
-	ex->fixup = target - ret_addr;
-	ex->data = EX_TYPE_BPF;
+	rw->insn = delta;
+	rw->fixup = target - ret_addr;
+	rw->data = EX_TYPE_BPF;
 	return 0;
 }
 
 /*
- * The verifier made sure that unwind_goto follows a call in a prog. When the
- * kernel called an async callback, it's exit. A helper that calls a callback
- * has a pad when it wants one, see bpf_call_cb().
+ * Where a frame that leaves with unwind_exit, @key UNWIND_EXKEY, or with kexit,
+ * @key KUNWIND_EXKEY, returns to.
+ * The verifier made sure that unwind_goto follows a call in a prog, and kgoto
+ * where the callee has kexit. When the kernel called an async callback, it's
+ * exit. A helper that calls a callback has a pad when it wants one, see
+ * bpf_call_cb().
  */
-u64 bpf_unwind_target(u64 ret_addr)
+static u64 unwind_target(u64 ret_addr, int key)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ret_addr - 1);
+	e = search_bpf_extables(ret_addr - key);
 	if (e)
 		return ret_addr + e->fixup;
 	/*
@@ -2369,23 +2402,40 @@ u64 bpf_unwind_target(u64 ret_addr)
 	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
 	 * Anything else at a return address is some caller's own fixup, and
 	 * what a JIT keyed there is a fixup of the insn after the call.
+	 * The entry has the stub of the pad. The way in for unwind_exit is
+	 * BPF_CB_PAD_OFF bytes from its start, the one for kexit
+	 * BPF_CB_KPAD_OFF bytes.
 	 */
 	e = search_kernel_exception_table(ret_addr);
 	if (!e)
 		e = search_module_extables(ret_addr);
 	if (e && (e->data & EX_DATA_TYPE_MASK) == EX_TYPE_BPF)
-		return (unsigned long)&e->fixup + e->fixup;
+		return (unsigned long)&e->fixup + e->fixup +
+		       (key == KUNWIND_EXKEY ? BPF_CB_KPAD_OFF : BPF_CB_PAD_OFF);
 	/*
 	 * No pad. That is how it ends when the kernel called an async callback
 	 * or the main prog of an extension: it's exit. A call in a prog of what
 	 * can unwind has unwind_goto behind it, which is an entry also when the
-	 * pad is the next insn. So a return address in a prog without an entry
-	 * is an unwind_exit that gets lost: the verifier sent it to a pad.
+	 * pad is the next insn, and kgoto behind a call of what has kexit. So a
+	 * return address in a prog without an entry is an unwind_exit or a
+	 * kexit that gets lost: the verifier sent it to a pad.
 	 */
 	scoped_guard(rcu)
 		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
 	return ret_addr;
 }
+
+u64 notrace bpf_unwind_target(u64 ret_addr)
+{
+	return unwind_target(ret_addr, UNWIND_EXKEY);
+}
+NOKPROBE_SYMBOL(bpf_unwind_target);
+
+u64 notrace bpf_kunwind_target(u64 ret_addr)
+{
+	return unwind_target(ret_addr, KUNWIND_EXKEY);
+}
+NOKPROBE_SYMBOL(bpf_kunwind_target);
 
 /*
  * The same for the end of the code of an access to arena that faulted, see
@@ -2394,16 +2444,26 @@ u64 bpf_unwind_target(u64 ret_addr)
  */
 u64 bpf_fault_unwind_target(u64 end)
 {
-	const struct exception_table_entry *e = search_bpf_extables(end - 1);
+	const struct exception_table_entry *e = search_bpf_extables(end - UNWIND_EXKEY);
 
 	return e ? end + e->fixup : end;
 }
 
+/* 'call; [unwind_goto;] kgoto': whether kgoto follows @call, which has @cnt insns behind it */
+static bool call_has_kgoto(const struct bpf_insn *call, int cnt)
+{
+	if (cnt && bpf_is_unwind_goto(call + 1)) {
+		call++;
+		cnt--;
+	}
+	return cnt && bpf_is_kgoto(call + 1);
+}
+
 /*
- * unwind_exit: fix the return address of this frame. r0 and r2 are returned.
- * So is BPF_REG_ARENA_SP, when it's used.
+ * unwind_exit, kexit: replace the return address of this frame with @target of
+ * it. r0 and r2 are returned. So is BPF_REG_ARENA_SP, when it's used.
  */
-static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
+static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp, void *target)
 {
 	u8 *prog = *pprog, *start = prog;
 
@@ -2411,7 +2471,7 @@ static int emit_unwind_ret_addr(u8 **pprog, u8 *ip, bool arena_sp)
 	if (arena_sp)
 		push_r9(&prog);
 	EMIT4(0x48, 0x8B, 0x7D, 0x08);		/* mov rdi, [rbp + 8] */
-	if (emit_rsb_call(&prog, bpf_unwind_target, ip + (prog - start)))
+	if (emit_rsb_call(&prog, target, ip + (prog - start)))
 		return -EINVAL;
 	EMIT4(0x48, 0x89, 0x45, 0x08);		/* mov [rbp + 8], rax */
 	if (arena_sp)
@@ -2447,7 +2507,8 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	s32 arena_sp_off = 0;
 	/* the code of the last call insn that follows the native call, see unwind_goto */
 	u8 after_call[16], *ret_addr;
-	int after_call_len = 0;
+	/* its length, and what of it is redone on the way to the pad of kgoto */
+	int after_call_len = 0, after_call_klen = 0;
 	/* the landings of this pass, and how many bytes they have so far */
 	int nr_landings = 0, tail = 0;
 	int err;
@@ -3416,6 +3477,8 @@ populate_extable:
 				emit_sub_rsp(&prog, 8);
 			if (arena_sp && call_clobbers_arena_sp(insn))
 				emit_ldx(&prog, BPF_DW, BPF_REG_ARENA_SP, BPF_REG_FP, arena_sp_off);
+			/* kexit leaves no second half: R2 is not the one of the kfunc */
+			after_call_klen = prog - ret_addr;
 			/*
 			 * A kfunc returning more than 8 bytes hands the second
 			 * half back in RDX (the native ABI's second return reg),
@@ -3443,26 +3506,38 @@ populate_extable:
 				push_r9(&prog);
 				ip += 2;
 			}
-			if (emit_indirect_call(&prog, insn->dst_reg, ip))
+			if (emit_indirect_call(&prog, insn->dst_reg, ip,
+					       call_has_kgoto(insn, insn_cnt - i)))
 				return -EINVAL;
 			ret_addr = prog;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
-			after_call_len = prog - ret_addr;
+			after_call_len = after_call_klen = prog - ret_addr;
 			memcpy(after_call, ret_addr, after_call_len);
 			break;
 
-			/* unwind_goto. The verifier expanded may_goto. */
+			/* unwind_goto, kgoto. The verifier expanded may_goto. */
 		case BPF_JMP | BPF_JCOND:
 		case BPF_JMP32 | BPF_JCOND: {
+			bool kgoto = bpf_is_kgoto(insn);
+			/* 'call; unwind_goto; kgoto', and this is the second one */
+			bool after_unwind = kgoto && i > 1 && bpf_is_unwind_goto(insn - 1);
+			int key = kgoto ? KUNWIND_EXKEY : UNWIND_EXKEY;
 			/* the insn that it goes to */
 			int to = i + bpf_jmp_offset(insn);
 			int target = addrs[to];
+			/* what is redone on the way to this pad */
+			int len = kgoto ? after_call_klen : after_call_len;
 			struct jit_landing *landing;
 
-			/* an access to arena is in front: no call, nothing to redo */
-			if (BPF_CLASS(insn[-1].code) != BPF_JMP)
-				after_call_len = 0;
+			if (BPF_CLASS(insn[-1 - after_unwind].code) != BPF_JMP) {
+				if (kgoto) {
+					pr_err("bpf_jit: kgoto follows no call\n");
+					return -EFAULT;
+				}
+				/* an access to arena is in front: no call, nothing to redo */
+				after_call_len = after_call_klen = len = 0;
+			}
 			/*
 			 * What follows the native call, like 'pop r9', has to be
 			 * done on the way to the pad too. Not in the way of what
@@ -3475,23 +3550,32 @@ populate_extable:
 			 *   ...
 			 *   pop r9      <- unwind_exit returns here
 			 *   jmp pad
+			 *   pop r9      <- kexit returns here
+			 *   jmp kpad
 			 * addrs[insn_cnt] is where the body ended in the pass before.
 			 * The entry is written when no insn moves any more.
 			 */
-			if (after_call_len) {
+			if (len) {
 				if (nr_landings >= ctx->max_landings) {
 					pr_err("bpf_jit: landings bug\n");
 					return -EFAULT;
 				}
 				landing = &ctx->landings[nr_landings++];
-				memcpy(landing->code, after_call, after_call_len);
-				landing->len = after_call_len;
+				memcpy(landing->code, after_call, len);
+				landing->len = len;
 				landing->to = to;
 				target = addrs[insn_cnt] + tail;
-				tail += after_call_len + 5;
+				tail += len + 5;
 			}
+			/*
+			 * The key is made of the return address of the call, which ends
+			 * where its first goto begins. Not where this insn begins: that is
+			 * the same place only as long as unwind_goto in front of kgoto has
+			 * no bytes.
+			 */
 			err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-						 addrs[i - 1] - after_call_len, target);
+						 addrs[i - 1 - after_unwind] - after_call_len,
+						 target, key, after_unwind);
 			if (err)
 				return err;
 			break;
@@ -3766,7 +3850,10 @@ emit_jmp:
 
 		case BPF_JMP | BPF_EXIT:
 			if (src_reg == BPF_UNWIND_EXIT && bpf_prog_can_unwind(bpf_prog) &&
-			    emit_unwind_ret_addr(&prog, ip, arena_sp))
+			    emit_unwind_ret_addr(&prog, ip, arena_sp, bpf_unwind_target))
+				return -EINVAL;
+			if (src_reg == BPF_KEXIT && bpf_prog_can_unwind(bpf_prog) &&
+			    emit_unwind_ret_addr(&prog, ip, arena_sp, bpf_kunwind_target))
 				return -EINVAL;
 			if (seen_exit) {
 				jmp_offset = ctx->cleanup_addr - addrs[i] + moved;
@@ -4914,7 +5001,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	if (!addrs)
 		goto out_addrs;
 	for (i = 0; i < prog->len; i++)
-		ctx.max_landings += bpf_is_unwind_goto(&prog->insnsi[i]);
+		ctx.max_landings += bpf_is_pad_goto(&prog->insnsi[i]);
 	if (ctx.max_landings) {
 		ctx.landings = kvmalloc_objs(*ctx.landings, ctx.max_landings);
 		if (!ctx.landings)
