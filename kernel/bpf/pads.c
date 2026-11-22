@@ -1269,12 +1269,22 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	const struct bpf_reference_state *ref;
 	struct bpf_pad_ent new, *ent, *prev;
 	struct bpf_pad_nulls nulls;
-	int i, j, arg, pass, err;
+	int i, j, arg, pass, pos, err;
 
 	/* the pad of a call runs after the call: what is live at the next insn is there */
 	insn_idx += plan->kind == BPF_SITE_CALL;
 	for (i = 0; i < plan->nr_ents; i++)
 		plan->ents[i].ref = -1;
+	/*
+	 * Each of them takes an entry of its own, also a pointer that no place has: its hidden
+	 * slot is an entry, see plan_has_room(). So more of them than a pad has entries are a
+	 * conflict, whatever the places are, and it is one of this state. A loop that acquires in
+	 * each trip and has no way out but this site has no state that fails for what leaks.
+	 */
+	for (i = st->frame[st->curframe]->entry_refs, pos = 0; i < st->acquired_refs; i++)
+		pos += !i || st->refs[i - 1].type != REF_TYPE_RES_LOCK_IRQ;
+	if (pos > BPF_PAD_MAX_ENTS)
+		return BPF_CONFLICT_TOO_MUCH;
 	for (pass = 0; pass < 2; pass++) {
 		for (i = st->frame[st->curframe]->entry_refs; i < st->acquired_refs; i++) {
 			ref = &st->refs[i];
@@ -1295,8 +1305,9 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			ent = match_ent(plan, &new, !pass);
 			if (!ent && !pass)
 				continue;
+			/* no state holds that much: the entries add up over the visits */
 			if (!ent && plan->nr_ents == BPF_PAD_MAX_ENTS)
-				return BPF_CONFLICT_TOO_MUCH;
+				return BPF_CONFLICT_PLAN_FULL;
 			/* the place of an entry is its number until order_ents() */
 			if (!ent)
 				ent = add_ent(plan, &new, plan->nr_ents);
@@ -2302,6 +2313,8 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
 		[BPF_CONFLICT_TOO_MUCH]		= "too much is held",
+		[BPF_CONFLICT_PLAN_FULL]	=
+			"the paths to the site hold more different things than a pad releases",
 		[BPF_CONFLICT_SLOTS_FULL]	=
 			"the function has more hidden slots than a pad has entries",
 		[BPF_CONFLICT_NO_RELEASE]	= "the program can call nothing that releases a resource",

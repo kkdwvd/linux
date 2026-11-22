@@ -489,7 +489,8 @@ enum bpf_pad_class {
 enum bpf_pad_conflict {
 	BPF_NO_CONFLICT,
 	BPF_CONFLICT_SECTIONS_DIFFER,
-	BPF_CONFLICT_TOO_MUCH,
+	BPF_CONFLICT_TOO_MUCH,		/* one state holds more than a pad releases */
+	BPF_CONFLICT_PLAN_FULL,		/* the states together hold more different things */
 	BPF_CONFLICT_SLOTS_FULL,	/* the hidden slots of the function are more than a pad has */
 	BPF_CONFLICT_NO_RELEASE,
 	BPF_CONFLICT_NOT_ALWAYS_HELD,
