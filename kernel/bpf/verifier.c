@@ -22385,6 +22385,9 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
 {
 	int s;
 
+	/* what a frame that the kernel unwinds already is left at says nothing new about it */
+	if (bpf_site_is_forced(plan->kind))
+		return false;
 	switch (plan->kind) {
 	case BPF_SITE_GUARD:
 		return !bpf_flow_guard_is_guess(env, insn_idx);

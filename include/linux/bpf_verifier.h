@@ -480,15 +480,36 @@ enum bpf_site_kind {
 	 * which left with kexit. Whatever unwind_goto the program has there.
 	 */
 	BPF_SITE_KCALL,
+	/*
+	 * A flag on top of a kind: the frame that is left at the site is one that the kernel
+	 * unwinds already. It is left with kexit at every kind of site, and with the value that
+	 * its unwinding began with. The states that leave such a frame have a plan of their own at
+	 * the site, next to the plan of the states that are the first to unwind there.
+	 */
+	BPF_SITE_FORCED = 0x10,
 };
+
+/* What a site is, whichever frame is left there */
+static inline enum bpf_site_kind bpf_site_base(enum bpf_site_kind kind)
+{
+	return kind & ~BPF_SITE_FORCED;
+}
+
+static inline bool bpf_site_is_forced(enum bpf_site_kind kind)
+{
+	return kind & BPF_SITE_FORCED;
+}
 
 /* The frame is left at a call, to which what it called came back unwound */
 static inline bool bpf_site_is_call(enum bpf_site_kind kind)
 {
-	return kind == BPF_SITE_CALL || kind == BPF_SITE_KCALL;
+	return bpf_site_base(kind) == BPF_SITE_CALL || bpf_site_base(kind) == BPF_SITE_KCALL;
 }
 
-/* The kernel unwinds the frame that is left at a site of @kind: the frame leaves with kexit */
+/*
+ * The kernel unwinds the frame that is left at a site of @kind: the frame leaves with kexit. Also
+ * where unwind_exit of the program comes back to a call in a frame that the kernel unwinds.
+ */
 static inline bool bpf_site_is_kernel(enum bpf_site_kind kind)
 {
 	return kind != BPF_SITE_CALL;
@@ -2370,7 +2391,8 @@ static inline bool bpf_pad_passes_on(const struct bpf_verifier_env *env, int sub
 static inline bool bpf_site_has_value(const struct bpf_verifier_env *env, int subprog,
 				      enum bpf_site_kind kind)
 {
-	if (bpf_pad_rethrows(env, subprog, kind))
+	/* a frame that the kernel unwinds already has the value in its hidden word */
+	if (bpf_site_is_forced(kind) || bpf_pad_rethrows(env, subprog, kind))
 		return false;
 	return env->has_throw && (bpf_site_is_call(kind) || kind == BPF_SITE_THROW);
 }

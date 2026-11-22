@@ -1848,7 +1848,10 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
-	if (plan_saves_value(env, plan, subprog)) {
+	if (bpf_site_is_forced(plan->kind) && env->has_throw) {
+		/* what the unwinding of the frame began with: no pad on its way writes the word */
+		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);
+	} else if (plan_saves_value(env, plan, subprog)) {
 		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);
 		if (pair)
 			buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_FP,
@@ -1939,6 +1942,9 @@ bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan
 	const struct bpf_subprog_info *sub;
 	int s;
 
+	/* the frame was being unwound when it got to the site: what began that is asked */
+	if (bpf_site_is_forced(plan->kind))
+		return false;
 	if (!bpf_site_is_call(plan->kind))
 		return plan->kind != BPF_SITE_FAULT && plan->kind != BPF_SITE_MAY_GOTO;
 	/* the callees came back to the call in the way of the plan, and that way is asked */
@@ -2009,8 +2015,8 @@ static const char * const site_kind[] = {
  */
 static u16 kinds_of_plan(const struct bpf_pad_plan *plan, u16 kinds)
 {
-	return plan->kind == BPF_SITE_KCALL ? kinds & ~LEFT_AT_UNWIND_EXIT
-					    : kinds & LEFT_AT_UNWIND_EXIT;
+	return bpf_site_base(plan->kind) == BPF_SITE_KCALL ? kinds & ~LEFT_AT_UNWIND_EXIT
+							   : kinds & LEFT_AT_UNWIND_EXIT;
 }
 
 /*
@@ -2049,7 +2055,7 @@ static int sites_of_subprogs(struct bpf_verifier_env *env)
 					if (!plan->used)
 						continue;
 					if (!bpf_site_is_call(plan->kind)) {
-						kinds |= BIT(plan->kind);
+						kinds |= BIT(bpf_site_base(plan->kind));
 						continue;
 					}
 					bpf_pad_for_each_callee(plan, c)
@@ -2171,7 +2177,7 @@ static int slot_words(const struct bpf_pad_note *note)
 /* Does the pad of @plan run in a frame that has set up its hidden slots? */
 static bool plan_has_slots(const struct bpf_pad_plan *plan)
 {
-	return plan->kind != BPF_SITE_RECURSION && !plan->conflict;
+	return bpf_site_base(plan->kind) != BPF_SITE_RECURSION && !plan->conflict;
 }
 
 /* Has @plan room for @slots entries in place of those that it has of @group? */
@@ -2553,9 +2559,13 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	};
 	int j;
 
-	/* a call has one for what the kernel unwinds, and one for unwind_exit of the program */
-	verbose(env, "landing pad of %s at %d%s: ", site_kind[plan->kind], i,
-		plan->kind == BPF_SITE_CALL ? " for unwind_exit" : "");
+	/*
+	 * A call has one for what the kernel unwinds, and one for unwind_exit of the program. And
+	 * any site one more for the frames that the kernel unwinds already.
+	 */
+	verbose(env, "landing pad of %s at %d%s%s: ", site_kind[bpf_site_base(plan->kind)], i,
+		bpf_site_base(plan->kind) == BPF_SITE_CALL ? " for unwind_exit" : "",
+		bpf_site_is_forced(plan->kind) ? " in a frame that the kernel unwinds" : "");
 	for (j = plan->nr_ents - 1; !plan->conflict && j >= 0; j--)
 		print_ent(env, &plan->ents[j]);
 	if (plan->conflict)
@@ -2580,7 +2590,7 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
 		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind)
 {
-	sub->left_at |= bpf_site_is_call(kind) ? sites_below(env, plan) : BIT(kind);
+	sub->left_at |= bpf_site_is_call(kind) ? sites_below(env, plan) : BIT(bpf_site_base(kind));
 }
 
 /* Did bpf_pad_skip_faults() walk @sub, and has no call in or below it got a new callee since? */
@@ -2730,7 +2740,8 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 				continue;
 			err = settle_plan(env, plan);
 			sub = bpf_find_containing_subprog(env, i);
-			if (!err && plan_saves_value(env, plan, sub - env->subprog_info))
+			if (!err && (plan_saves_value(env, plan, sub - env->subprog_info) ||
+				     (bpf_site_is_forced(plan->kind) && env->has_throw)))
 				err = take_value_word(env, sub);
 			if (err < 0)
 				return err;
@@ -2854,7 +2865,7 @@ static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	struct bpf_subprog_info *sub = env->subprog_info;
 	int s;
 
-	if (plan->kind != BPF_SITE_KCALL)
+	if (bpf_site_base(plan->kind) != BPF_SITE_KCALL)
 		return;
 	bpf_pad_for_each_callee(plan, s)
 		sub[s].below_conflict = true;
@@ -2900,7 +2911,8 @@ static void note_causes_below(struct bpf_verifier_env *env)
 			break;
 		for (i = sub[s].start; i < sub[s + 1].start; i++) {
 			for (below = aux[i].pad_plans; below; below = below->next) {
-				if (below->kind != BPF_SITE_KCALL || !below->visited)
+				if (bpf_site_base(below->kind) != BPF_SITE_KCALL ||
+				    !below->visited)
 					continue;
 				/*
 				 * The frame is left at this call, whatever what it calls

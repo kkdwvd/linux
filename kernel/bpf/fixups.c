@@ -664,7 +664,7 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 {
 	int s;
 
-	switch (plan->kind) {
+	switch (bpf_site_base(plan->kind)) {
 	case BPF_SITE_GUARD:
 		return env->insn_aux_data[i].loop_guard;
 	case BPF_SITE_RECURSION:
@@ -689,8 +689,9 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 		return !env->insn_aux_data[i].fault_skips;
 	case BPF_SITE_MAY_GOTO:
 		return plan->visited && !bpf_find_containing_subprog(env, i)->stuck;
+	default:
+		return false;
 	}
-	return false;
 }
 
 /*
@@ -751,7 +752,7 @@ int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
 static bool plan_has_pad(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
 	/* bpf_insert_recursion_checks() emits the pad of the check */
-	return plan->kind != BPF_SITE_RECURSION && bpf_site_is_used(env, i, plan);
+	return bpf_site_base(plan->kind) != BPF_SITE_RECURSION && bpf_site_is_used(env, i, plan);
 }
 
 /* The plan of a site of @kind at insn @i where no state got in the pass: the empty one will do */
@@ -768,19 +769,97 @@ static struct bpf_pad_plan *unvisited_plan(struct bpf_verifier_env *env, int i,
 	return plan;
 }
 
+/* The landing pads that go after a subprog: their insns, and where each pad ends */
+struct pad_buf {
+	struct bpf_insn *insns;
+	int *ends;
+	/* the hash of its insns -> a pad that can be shared, see add_pad() */
+	struct bpf_index index;
+	u64 seed;
+	int max_nr;	/* the room of 'ends' */
+	int max_cnt;	/* the room of 'insns' */
+	int nr;		/* pads */
+	int cnt;	/* insns */
+};
+
+/*
+ * Make room in @pads for @n more insns. A function can have a pad at each of its sites, so the
+ * buffer doubles. It keeps its memory from one function to the next.
+ */
+static int reserve_pad_insns(struct pad_buf *pads, int n)
+{
+	int max = max3(2 * pads->max_cnt, pads->cnt + n, 64);
+	void *mem;
+
+	if (pads->cnt + n <= pads->max_cnt)
+		return 0;
+	mem = kvrealloc(pads->insns, array_size(max, sizeof(*pads->insns)), BPF_VERIFIER_GFP);
+	if (!mem)
+		return -ENOMEM;
+	pads->insns = mem;
+	pads->max_cnt = max;
+	return 0;
+}
+
+/*
+ * @new, of @n insns, is one more pad of @pads. @share: unless they have one with the same insns.
+ * That pad is found by the hash of the insns, not by a walk over all pads of the function. The
+ * seed is random: a program cannot select pads that collide.
+ * Returns where the pad starts.
+ */
+static int add_pad(struct pad_buf *pads, const struct bpf_insn *new, int n, bool share)
+{
+	int k, start = 0;
+	void *mem;
+	u64 key = 0;
+
+	if (bpf_must_abort())
+		return -EINTR;
+	/* the first pad of a function: the index has the pads of the function before */
+	if (!pads->nr) {
+		kvfree(pads->index.slots);
+		pads->index = (struct bpf_index){};
+		pads->seed = get_random_u64();
+	}
+	if (share)
+		key = bpf_hash64(new, n * sizeof(*new), pads->seed);
+	/* pads with the same hash have keys in a row */
+	for (; share && (k = bpf_index_find(&pads->index, key)) >= 0; key++) {
+		const struct bpf_insn *pad = &pads->insns[k ? pads->ends[k - 1] : start];
+
+		if (&pads->insns[pads->ends[k]] - pad == n && !memcmp(pad, new, n * sizeof(*new)))
+			return pad - pads->insns;
+	}
+	if (pads->nr == pads->max_nr) {
+		k = max(2 * pads->max_nr, 16);
+		mem = kvrealloc(pads->ends, array_size(k, sizeof(*pads->ends)), BPF_VERIFIER_GFP);
+		if (!mem)
+			return -ENOMEM;
+		pads->ends = mem;
+		pads->max_nr = k;
+	}
+	if (reserve_pad_insns(pads, n) || (share && bpf_index_add(&pads->index, key, pads->nr)))
+		return -ENOMEM;
+	memcpy(&pads->insns[pads->cnt], new, n * sizeof(*new));
+	start = pads->cnt;
+	pads->cnt += n;
+	pads->ends[pads->nr++] = pads->cnt;
+	return start;
+}
+
 /*
  * The landing pads of the sites of subprog @s go after its last insn. Sites whose pads have the
- * same insns share one. @new and @new_aux have room for a pad. Returns the insns in @pads and
- * their number.
+ * same insns share one. @new and @new_aux have room for a pad. Returns the pads in @pads, which
+ * has the memory of the subprog before, and the number of their insns.
  */
 static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new,
-			struct bpf_insn_aux_data *new_aux, struct bpf_insn **pads)
+			struct bpf_insn_aux_data *new_aux, struct pad_buf *pads)
 {
-	int last = env->subprog_info[s + 1].start - 1, cnt = 0, i, n, pad, len;
+	int last = env->subprog_info[s + 1].start - 1, i, n, pad;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	struct bpf_insn *buf = *pads, *insn;
 	struct bpf_pad_plan *plan, *shared = NULL;
 
+	pads->nr = pads->cnt = 0;
 	for (i = env->subprog_info[s].start; i <= last; i++) {
 		if (aux[i].loop_guard && !unvisited_plan(env, i, BPF_SITE_GUARD))
 			return -ENOMEM;
@@ -803,25 +882,13 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 					    "the landing pad of insn %d was not settled", i))
 				return -EFAULT;
 			n = emit_pad(env, s, plan, new, new_aux);
-			for (pad = bpf_pad_can_be_shared(plan) ? 0 : cnt; pad < cnt; pad += len) {
-				for (len = 1; buf[pad + len - 1].code != (BPF_JMP | BPF_EXIT);
-				     len++)
-					;
-				if (len == n && !memcmp(&buf[pad], new, n * sizeof(*buf)))
-					break;
-			}
+			pad = add_pad(pads, new, n, bpf_pad_can_be_shared(plan));
+			if (pad < 0)
+				return pad;
 			plan->pad = pad;
-			if (pad < cnt)
-				continue;
-			insn = kvrealloc(buf, (cnt + n) * sizeof(*buf), BPF_VERIFIER_GFP);
-			if (!insn)
-				return -ENOMEM;
-			*pads = buf = insn;
-			memcpy(&buf[cnt], new, n * sizeof(*buf));
-			cnt += n;
 		}
 	}
-	return cnt;
+	return pads->cnt;
 }
 
 /* The plan of the site of @kind at insn @i if it has unwind_goto or kgoto after it */
@@ -1036,8 +1103,9 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 {
 	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
 	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux;
-	struct bpf_insn *pads = NULL, *new, *insn;
+	struct bpf_insn *new, *insn;
 	const struct bpf_pad_plan *plan;
+	struct pad_buf pads = {};
 	struct bpf_subprog_info *sub;
 	int i, s, cnt, err = 0;
 	int *added;
@@ -1086,7 +1154,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 					    cnt - plan->pad);
 		}
 		if (cnt)
-			err = bpf_patch_list_append(env, i - 1, pads, cnt);
+			err = bpf_patch_list_append(env, i - 1, pads.insns, cnt);
 	}
 	err = err ?: bpf_patch_list_commit(env);
 	if (err)
@@ -1104,7 +1172,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 				if (plan->kind == BPF_SITE_FAULT && aux[i].fault_unwinds)
 					sub->fault_pad = cnt;
 				/* no call is made, see check_kfunc_call() */
-				if (plan->kind == BPF_SITE_THROW)
+				if (bpf_site_base(plan->kind) == BPF_SITE_THROW)
 					env->prog->insnsi[i] = BPF_RAW_INSN(BPF_JMP32 | BPF_JA, 0, 0, 0,
 									    cnt - i - 1);
 			}
@@ -1122,7 +1190,9 @@ out:
 	kvfree(added);
 	kvfree(new);
 	kvfree(pad_aux);
-	kvfree(pads);
+	kvfree(pads.insns);
+	kvfree(pads.ends);
+	kvfree(pads.index.slots);
 	return err;
 }
 
