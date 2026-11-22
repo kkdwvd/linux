@@ -52,7 +52,9 @@
  * one it was, in 'kind', and bpf_unwind_leave() looks for the pad of the same
  * kind. The stub is out of line: the helper pays nothing for it when the
  * callback returns. Nothing else of the callback gets through the frame of a
- * helper: R2 after kexit is not what the callback left there.
+ * helper: R2 after kexit is not what the callback left there. Kernel code that
+ * does not leave with bpf_unwind_leave() after kexit ends the invocation
+ * itself, see bpf_prog_unwound_to_kernel() for what it has to do then.
  */
 
 #include <linux/bug.h>

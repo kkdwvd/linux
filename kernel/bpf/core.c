@@ -4118,15 +4118,71 @@ u64 bpf_prog_report_recursion(void)
 }
 
 /*
- * Called by the landing pad that ends an invocation, when the frames have released what they held.
- * What the value of an unwound operator means is up to the struct_ops. This is the context of the
- * program, with the locks of the caller of the operator: see what ->unwound() may do.
- * Only programs of a struct_ops that has the callback call it, see bpf_pad_insns().
+ * Called by the landing pad that ends an invocation with exit, when the frames have released what
+ * they held. What the value of an unwound operator means is up to the struct_ops. This is the
+ * context of the program, with the locks of the caller of the operator: see what ->unwound() may do.
+ * Only programs of a struct_ops that has the callback call it, see bpf_pad_insns(). A frame that
+ * the kernel called and that leaves with kexit tells in bpf_prog_unwound_to_kernel().
  */
 u64 bpf_prog_report_unwound(struct bpf_prog_aux *aux)
 {
 	aux->st_ops->unwound(aux->prog);
 	return 0;
+}
+
+/*
+ * A frame leaves with kexit, there is no landing pad at its return address, and that address is in
+ * no program: the kernel called the frame, and the invocation that it has stopped ends here.
+ * bpf_kunwind_target() of the JITs gets here, with @ip in the code that called it. That is the
+ * frame itself, an async callback: the main program has no kexit, it leaves with exit, see
+ * bpf_prog_can_unwind(). A helper that leaves through bpf_unwind_leave() has its own text there:
+ * no program, and nobody is told. Its caller is a program and has the pad.
+ *
+ * unwind_exit that finds no landing pad does not get here, see bpf_unwind_target(). It is the way
+ * out that the program has chosen, as exit is, and as unwind_exit in the text of the main program
+ * is, which is exit to the JITs: the kernel has not stopped the program, and nobody is told.
+ *
+ * So the rule for who is told is this. Every unwind by the kernel that ends an invocation is told
+ * exactly once: by the pad that ends it with exit, or here. An unwind of the program's own is told
+ * only where a landing pad that the verifier emitted ends the invocation: at a call without
+ * unwind_goto to which unwind_exit of a callee comes back, in the main program or in a callback
+ * that only the kernel calls, see pad_reports(). It is not told where unwind_exit of the program
+ * itself ends the invocation.
+ *
+ * Such a callback can leave unwound because it has callers in the program, or is expected to: the
+ * program calls it as a function as well, it calls itself, or its address waits in a register. It
+ * has one landing pad per site for all its frames, which cannot tell who called. Only here is it
+ * known that the kernel did. So the pads of such a callback do not tell the struct_ops, see
+ * pad_reports() in pads.c, and this does: one of the two, once per invocation.
+ *
+ * The frame is still on the stack and has released what it held, as where a pad tells. The context
+ * is that of the callers of async callbacks: softirq, a kernel thread, a task on its way to user
+ * space. Never NMI. ->unwound() does not sleep and takes no lock of its callers anyway, see
+ * struct bpf_struct_ops.
+ *
+ * Not told: an extension of a function of a struct_ops program, and an async callback of one. An
+ * extension has no struct_ops of its own. The one of its target is known where it is attached, and
+ * its main program leaves with exit, into the program that it extends, which goes on.
+ *
+ * Nor is a kexit told here that finds the pad of bpf_call_cb() at its return address: the helpers
+ * that have such a pad pass the unwind on with bpf_unwind_leave(), and it is told where it ends.
+ * Kernel code that calls a program with bpf_call_cb() and does not pass the unwind on ends the
+ * invocation itself, and has to tell the struct_ops itself.
+ */
+void bpf_prog_unwound_to_kernel(unsigned long ip)
+{
+	const struct bpf_struct_ops *st_ops;
+	struct bpf_prog *prog;
+
+	scoped_guard(rcu)
+		prog = bpf_prog_ksym_find(ip);
+	if (!prog)
+		return;
+	/* The frame keeps the program. The struct_ops is that of the main program. */
+	prog = prog->aux->main_prog_aux->prog;
+	st_ops = prog->aux->st_ops;
+	if (st_ops && st_ops->unwound)
+		st_ops->unwound(prog);
 }
 
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)

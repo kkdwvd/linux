@@ -1772,10 +1772,16 @@ static int build_landings(struct jit_ctx *ctx)
  * where the callee has kexit. When the kernel called an async callback, it's
  * exit. A helper that calls a callback has a pad when it wants one, see
  * bpf_call_cb().
+ * @ip: where the caller of the lookup returns to. That is the code of the frame
+ * itself when the insn of a prog asks, and the text of a helper when
+ * bpf_unwind_leave() does. A kretprobe, the function graph tracer and the
+ * trampoline of an fexit prog put an address of their own there, so the
+ * callers are notrace and on the kprobe blacklist.
  */
-static u64 unwind_target(u64 ret_addr, int key)
+static u64 unwind_target(u64 ret_addr, int key, unsigned long ip)
 {
 	const struct exception_table_entry *e;
+	bool lost;
 
 	e = search_bpf_extables(ret_addr - key);
 	if (e)
@@ -1811,19 +1817,29 @@ static u64 unwind_target(u64 ret_addr, int key)
 	 * see check_cb_pad().
 	 */
 	scoped_guard(rcu)
-		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
+		lost = bpf_prog_ksym_find(ret_addr - 1);
+	/*
+	 * The frame returns to the kernel, which called it. With kexit the
+	 * kernel has stopped the invocation, and only here is it known that
+	 * it ends: a struct_ops is told. unwind_exit is the way out that the
+	 * prog has chosen, as exit is: nobody is told, here as in the main
+	 * prog, where the insn is exit. See bpf_prog_unwound_to_kernel() for
+	 * who is told in all.
+	 */
+	if (!WARN_ON_ONCE(lost) && key == KUNWIND_EXKEY)
+		bpf_prog_unwound_to_kernel(ip);
 	return ret_addr;
 }
 
 u64 notrace bpf_unwind_target(u64 ret_addr)
 {
-	return unwind_target(ret_addr, UNWIND_EXKEY);
+	return unwind_target(ret_addr, UNWIND_EXKEY, _RET_IP_);
 }
 NOKPROBE_SYMBOL(bpf_unwind_target);
 
 u64 notrace bpf_kunwind_target(u64 ret_addr)
 {
-	return unwind_target(ret_addr, KUNWIND_EXKEY);
+	return unwind_target(ret_addr, KUNWIND_EXKEY, _RET_IP_);
 }
 NOKPROBE_SYMBOL(bpf_kunwind_target);
 
@@ -1839,21 +1855,27 @@ u64 bpf_fault_unwind_target(u64 end)
 	return e ? end + e->fixup : end;
 }
 
-/* The offset that the epilogue adds to LR once it is authenticated */
-static long bpf_unwind_fixup(u64 lr)
+/*
+ * The offset that the epilogue adds to LR once it is authenticated. The insn of
+ * the prog calls this: the address that it returns to is in the frame that is
+ * left, see unwind_target().
+ */
+static notrace long bpf_unwind_fixup(u64 lr)
 {
 	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
 
-	return bpf_unwind_target(ret_addr) - ret_addr;
+	return unwind_target(ret_addr, UNWIND_EXKEY, _RET_IP_) - ret_addr;
 }
+NOKPROBE_SYMBOL(bpf_unwind_fixup);
 
 /* The same for kexit */
-static long bpf_kunwind_fixup(u64 lr)
+static notrace long bpf_kunwind_fixup(u64 lr)
 {
 	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
 
-	return bpf_kunwind_target(ret_addr) - ret_addr;
+	return unwind_target(ret_addr, KUNWIND_EXKEY, _RET_IP_) - ret_addr;
 }
+NOKPROBE_SYMBOL(bpf_kunwind_fixup);
 
 /*
  * unwind_exit, kexit: return to the pad. LR in the frame record is signed.

@@ -2204,7 +2204,10 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
  * bpf_prog_report_unwound().
  * An async callback that can leave unwound has callers in the program, or is expected to. It has
  * one pad for all its frames, which ends in kexit, or in unwind_exit for what the program unwinds,
- * and cannot tell who called. Such a pad tells nobody.
+ * and cannot tell who called. kexit can: where the kernel called it finds no landing pad, and
+ * tells the struct_ops at run time, see bpf_prog_unwound_to_kernel(). So such a pad tells nobody,
+ * and one of the two tells, once. unwind_exit that gets to the kernel tells nobody: the program
+ * chose that way out.
  * A pad that ends the invocation tells whatever its site is: also the pad of a call without
  * unwind_goto to which unwind_exit of a callee came back, which is an unwind of the program's own.
  * That tells about more than the kernel has stopped, and it misses nothing that the kernel has: such
