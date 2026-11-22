@@ -27374,6 +27374,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	ret = bpf_find_kernel_pads(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	ret = bpf_flow_place_guards(env);
 	if (ret < 0)
 		goto skip_full_check;

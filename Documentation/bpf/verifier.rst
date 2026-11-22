@@ -780,9 +780,83 @@ The pad releases what the function acquired since its entry. Then:
 A program can unwind by itself: its ``unwind_exit`` leaves a function, and the
 ``unwind_goto`` after the call jumps to a landing pad that the program has,
 which is code like any other and may go on with the program. What the kernel
-unwinds does not get there. ``kexit`` goes to ``kgoto`` only, at every call,
-whether the program has ``unwind_goto`` there or not: a program that is stopped
-ends in the function that the kernel called, with the value of the kernel.
+unwinds cannot be caught that way. ``kexit`` goes to ``kgoto`` only, at every
+call, whether the program has ``unwind_goto`` there or not: a program that is
+stopped ends in the function that the kernel called, with the value of the
+kernel.
+
+A landing pad of the program that *only resumes* runs all the same: from its
+first insn no ``exit``, tail call or ``LD_ABS`` can be reached, and
+``unwind_exit`` can, see ``bpf_find_kernel_pads()``. That is a destructor of C++
+or drop glue of Rust. ``kgoto`` goes there through an *entry* that the verifier
+emits::
+
+  call foo                      call foo
+  unwind_goto pad               unwind_goto pad
+  ...                           kgoto entry
+  pad: call dtor                ...
+       unwind_exit              pad:   call dtor
+                                       gotol rest
+                                entry: if K == 0 { K = 1 }
+                                       r0 = 0
+                                       gotol pad
+                                rest:  if K == 0 goto +N
+                                       release what the function still holds
+                                       kexit
+                                       unwind_exit
+
+``K`` is a hidden word of the stack frame, 0 from the entry of the function on.
+The frame of a state has the same mark, *forced*, see ``enter_kernel_pad()``. A
+forced state and one of the normal path are never joined. The pad is verified
+once more for the forced state, with 0 in ``R0``; an error there rejects the
+program. A forced frame is left only with ``kexit`` and the value that its
+unwinding began with: at ``unwind_exit`` of the program, and at the sites that
+it gets to in the pad. No register is read at ``unwind_exit``, so the entry
+copies the pointers that the frame holds into hidden *save words*, see
+``visit_saves()``, and the code behind the pad releases from them what the
+state still holds. A save word has a pointer only: irq flags, an iterator or a
+dynptr in the stack of a caller and a lock that only a register has the address
+of must be released by the pad itself. Where the states that get to a call do
+not agree on what the frame holds, its entry saves nothing, and what the pad
+leaves has the places that it has without save words.
+
+The kernel enters every landing pad that only resumes and that it can get to,
+or the program does not load. The log of a program that is rejected for this
+says what could not be arranged, and names the landing pad where the verifier
+knows which one it is:
+
+- The stack of the function has no room for the hidden words, or the entry has
+  no value to keep.
+- What the frame still holds at ``unwind_exit`` of the pad has no plan, or a
+  site in the code of the pad or in a function that it calls has none. A frame
+  that the kernel unwinds gets no hidden slots of its own. What a destructor
+  releases in the pad needs neither a plan nor a slot there.
+- A pad of the verifier in a caller has no plan because of what the landing pad
+  does there: it unlocks a lock or leaves an RCU section of the caller on some
+  ways out of the function only, or writes to its irq flags. Or it releases of
+  a caller what a function on the stack needs a hidden slot for.
+
+The destructors of a frame do not run on a kernel unwind in these cases, and in
+no other. A pad behind a call that no kernel unwind comes back to skips nothing.
+
+- The pad can return, or never gets to ``unwind_exit``: a catch clause, and the
+  pad of a ``noexcept`` function, which ends in ``std::terminate()``. The
+  destructors that such a pad runs before its catch clause or before that call
+  do not run either.
+- The function cannot be unwound: the JIT cannot do it, or a helper without an
+  unwind label calls the function.
+- The frame in which the unwinding starts has no pad to enter: the frame of the
+  loop, of the access to arena, of the recursion check or of ``bpf_throw()``.
+  Its destructors do not run. Inlining decides which it is.
+- A frame above it whose call has no ``unwind_goto``, because the callee is
+  ``noexcept`` or ``nounwind`` or was inlined: its destructors do not run.
+
+A pad that the kernel enters runs to its end when the program was stopped for
+a fault in arena, for ``bpf_throw()`` or for a recursion that is too deep. When
+the time of the program was up it still is: a loop in pad code is left at its
+first ``may_goto``, of the program or of the verifier, the pad of that
+``may_goto`` releases what the function holds, and what follows the loop in the
+landing pad does not run.
 
 Where the program has no ``unwind_goto`` after a call that its ``unwind_exit``
 comes back to, the verifier adds one, and a pad that ends in ``unwind_exit``.
@@ -808,7 +882,7 @@ The callers of a global function are verified without it and take what comes
 out of it for a number, so the pad that the verifier gives it passes nothing
 on. That depends neither on what ``unwind_exit`` left nor on ``bpf_throw()``
 being somewhere in the program. A compiler that wants an object to get through
-a global function gives the call there a landing pad of its own.
+a global function gives the call there a landing pad that only resumes.
 
 No insn stands for a pad in a pass. The state on the edge leaves its function
 at the ``may_goto``, see ``unwind_frame()``. One pad has to serve all states
@@ -1518,6 +1592,8 @@ failing path        a path without joins on which the check of an unproven insn
                     fails; it is the result of a path-sensitive run
 fixpoint            the state at a header subsumes all states that come back
 fixups              what a pass notes for the rewrite of the program
+forced              a frame that the kernel unwinds through a landing pad of the
+                    program: it is left with ``kexit`` only
 fork                check an insn once for each part of the values of an operand
 gap                 a value of a join that is in neither state
 good pass           a pass without errors

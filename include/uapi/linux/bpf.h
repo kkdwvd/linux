@@ -66,6 +66,23 @@ enum bpf_cond_pseudo_jmp {
 	 * Follows a call of a bpf subprog, callx, or a call of a helper or kfunc
 	 * that calls a callback. Taken when the subprog or the callback left with
 	 * BPF_EXIT that has src_reg == BPF_UNWIND_EXIT.
+	 * When the kernel ends the program in the subprog or the callback, for a
+	 * loop that is out of time, a recursion that is too deep, a fault in arena
+	 * or bpf_throw(), the code at the target runs too if it can only
+	 * resume: no path from the target gets to BPF_EXIT without
+	 * BPF_UNWIND_EXIT, to a tail call or to BPF_LD_ABS or BPF_LD_IND, and some
+	 * path gets to BPF_EXIT with BPF_UNWIND_EXIT. R0 is 0 at the target then.
+	 * That BPF_EXIT leaves with the value of the kernel whatever is in R0, and
+	 * no BPF_UNWIND_GOTO is taken for it: the kernel goes on in the same way
+	 * with each caller.
+	 * A program can count on that code where the kernel gets to it: a program
+	 * for which the verifier cannot arrange that is rejected, and the log says
+	 * why. The kernel does not get to it in a function that cannot be unwound,
+	 * in the function in which it starts to unwind, and at a call that has no
+	 * BPF_UNWIND_GOTO. And when the time of the program is up, a loop in that
+	 * code that the kernel can stop is left at once: what follows the loop
+	 * does not run.
+	 * See Documentation/bpf/verifier.rst.
 	 */
 	BPF_UNWIND_GOTO = 1,
 };
