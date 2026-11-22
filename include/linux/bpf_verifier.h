@@ -749,6 +749,9 @@ struct bpf_pad_note {
 	s16 delta;		/* what is there is that much more than the handle */
 };
 
+/* bpf_insn_aux_data.kstub of unwind_goto that keeps its target */
+#define BPF_KSTUB_NONE	U32_MAX
+
 /* What a snapshot keeps for the landing pads of an insn, see bpf_pads_move() */
 struct bpf_pads_moved {
 	struct bpf_pad_plan *plans;
@@ -1393,6 +1396,12 @@ struct bpf_insn_aux_data {
 	u64 fault_unwinds:1; /* emission: when it faults the program goes to 'fault_pad' */
 	u64 unwind_goto_follows:1; /* emission: the verifier added unwind_goto after it */
 	u64 kgoto_follows:1; /* emission: the verifier added kgoto after it */
+	/*
+	 * unwind_goto of the program: a frame that the kernel unwinds took its jump, for
+	 * unwind_exit of what the call in front calls. That call is in pad code: what the main
+	 * pass saw of that, next to what the control flow graph says, see collect_stubs().
+	 */
+	u64 kforced:1;
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
@@ -1433,6 +1442,12 @@ struct bpf_insn_aux_data {
 	/* it can read or write the frame of a caller, in a call with a known callee */
 	u32 reads_outer:1;
 	u32 writes_outer:1;
+	/*
+	 * Emission, unwind_goto of the program: 1 + where its stub starts, counted from the first
+	 * insn behind the subprog, see collect_stubs() in fixups.c. BPF_KSTUB_NONE: it gets none,
+	 * its call is in pad code. 0: nothing was decided for it.
+	 */
+	u32 kstub;
 	/*
 	 * Per-instruction summary of stack slots in the current frame
 	 * that this instruction may write, may read, and that are live before it.

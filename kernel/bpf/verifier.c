@@ -20079,6 +20079,9 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			err = enter_kernel_pad(env);
 			if (err)
 				return err;
+		} else if (bpf_frame_is_forced(cur_func(env))) {
+			/* the call is in pad code: no stub for this insn, collect_stubs() asks */
+			cur_aux(env)->kforced = true;
 		}
 		*insn_idx += insn->off;
 		return 0;
