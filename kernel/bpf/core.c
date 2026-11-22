@@ -434,6 +434,8 @@ static int patch_insn_target(const struct bpf_patch_image *img, const struct bpf
 		tgt = p->jmp_to;
 	} else if (idx + 1 == p->jmp2) {
 		tgt = p->jmp2_to;
+	} else if (idx + 1 == p->jmp3) {
+		tgt = p->jmp3_to;
 	} else if (idx == p->self) {
 		tgt = p->off + rel + 1;
 	} else {
@@ -558,6 +560,7 @@ int __bpf_patch_list_insert(struct bpf_patch_list *pl, const struct bpf_prog *pr
 		p->self += cnt;
 		p->jmp += p->jmp ? cnt : 0;
 		p->jmp2 += p->jmp2 ? cnt : 0;
+		p->jmp3 += p->jmp3 ? cnt : 0;
 	}
 	memcpy(insn, insns, cnt * sizeof(*insns));
 	p->len += cnt;
@@ -568,7 +571,7 @@ int __bpf_patch_list_insert(struct bpf_patch_list *pl, const struct bpf_prog *pr
 /*
  * 'insn' of the last patch goes to insn 'to' of the old image, however far that is.
  * With 'back' it goes to the last insns of the patch of insn 'to - 1'.
- * A patch has two such jumps at most, and the second one has no 'back'.
+ * A patch has three such jumps at most, and only the first one has 'back'.
  */
 void bpf_patch_list_jump(struct bpf_patch_list *pl, const struct bpf_insn *insn, u32 to, u32 back)
 {
@@ -577,13 +580,18 @@ void bpf_patch_list_jump(struct bpf_patch_list *pl, const struct bpf_insn *insn,
 
 	if (p->jmp) {
 		/*
-		 * There is no room for a third one, nor for 'back' of the second one. Such a jump
+		 * There is no room for a fourth one, nor for 'back' of a later one. Such a jump
 		 * goes out of the program: bpf_patch_list_build() fails for it.
 		 */
-		if (WARN_ON_ONCE(p->jmp2 || back))
+		if (WARN_ON_ONCE(p->jmp3 || back))
 			to = U32_MAX;
-		p->jmp2 = jmp;
-		p->jmp2_to = to;
+		if (p->jmp2) {
+			p->jmp3 = jmp;
+			p->jmp3_to = to;
+		} else {
+			p->jmp2 = jmp;
+			p->jmp2_to = to;
+		}
 		return;
 	}
 	p->jmp = jmp;

@@ -5,6 +5,8 @@
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
 
+#define __exception_cb(name) __attribute__((btf_decl_tag("exception_callback:" #name)))
+
 #if defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64)
 
 struct {
@@ -218,10 +220,22 @@ static __naked __noinline __used long goes_down(void)
 	: __clobber_all);
 }
 
+/*
+ * The kernel unwinds the prog, and no code of the prog runs behind the call: what the prog returns
+ * is up to the exception callback, which runs when the frames are gone.
+ */
+__noinline int used_between_8k_and_32k(__u64 cookie)
+{
+	unsigned long used = last_r12 - first_r12;
+
+	return used >= 8192 && used <= 32736;
+}
+
 /* The check of a recursion looks at the kernel stack. It fails before 32K of arena are used. */
 SEC("syscall")
 __description("arena stack: recursion ends in the stack")
 __success __retval(1)
+__exception_cb(used_between_8k_and_32k)
 __naked void recursion(void)
 {
 	asm volatile (
@@ -230,23 +244,12 @@ __naked void recursion(void)
 	"r2 = %[first_r12] ll;"
 	"*(u64 *)(r2 + 0) = r1;"
 	"call goes_down;"
-	".8byte %[unwind_goto];"
-	"r1 = %[last_r12] ll;"
-	"r1 = *(u64 *)(r1 + 0);"
-	"r2 = %[first_r12] ll;"
-	"r2 = *(u64 *)(r2 + 0);"
-	"r1 -= r2;"
 	"r0 = 0;"
-	"if r1 < 8192 goto +2;"
-	"if r1 > 32736 goto +1;"
-	"r0 = 1;"
 	"exit;"
 	:
 	: __imm_addr(first_r12),
-	  __imm_addr(last_r12),
 	  __imm_insn(adj, ADJ(32)),
-	  __imm_insn(mov, MOV(BPF_REG_1)),
-	  __imm_insn(unwind_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0))
+	  __imm_insn(mov, MOV(BPF_REG_1))
 	: __clobber_all);
 }
 

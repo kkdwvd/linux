@@ -7,9 +7,9 @@
 /*
  * The verifier adds may_goto to a loop that it cannot count and a check of
  * the stack to a recursive subprog. What the program does when it is out of budget:
- * it unwinds, frame by frame, up to the main prog or an async callback, which end. The landing
- * pads that the callers have in the program are verified. Where a caller has none the verifier
- * adds unwind_goto after the call. What a frame holds takes a landing pad, which it emits.
+ * it unwinds, frame by frame, up to the main prog or an async callback, which end. No landing
+ * pad that a caller has in the program is on that way: the kernel unwinds with kexit, and the
+ * verifier adds kgoto after each call. What a frame holds takes a landing pad, which it emits.
  * If no landing pad will do the program is rejected.
  *
  * It takes unwinding, per-cpu insns and timed may_goto in JIT. Some of the progs never end
@@ -24,6 +24,7 @@
 #define __imm_unwind_exit \
 	__imm_insn(insn_unwind_exit, \
 		   BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0))
+#define __exception_cb(name) __attribute__((btf_decl_tag("exception_callback:" #name)))
 
 extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
@@ -187,13 +188,13 @@ static unsigned long spins_caught(void)
 }
 
 SEC("socket")
-__description("budget: a loop in a subprog unwinds, the verifier adds unwind_goto")
+__description("budget: a loop in a subprog unwinds, the verifier adds kgoto")
 __arch_x86_64
 __arch_arm64
 __success __retval(0)
 __xlated("...")
 __xlated("call pc+4")
-__xlated("unwind_goto pc+1")
+__xlated("kgoto pc+1")
 __xlated("exit")
 __xlated("r0 = 0")
 __xlated("exit")
@@ -201,7 +202,8 @@ __xlated("...")
 __xlated("r0 = 7")
 __xlated("exit")
 __xlated("r0 = 0")
-__xlated("unwind_exit")
+__xlated("r2 = 0")
+__xlated("kexit")
 __naked void loop_in_subprog(void)
 {
 	asm volatile (
@@ -211,11 +213,22 @@ __naked void loop_in_subprog(void)
 	);
 }
 
+/*
+ * unwind_goto of the prog is for unwind_exit, which the prog has. The kernel unwinds with kexit:
+ * the landing pad of the prog is not entered, and the prog returns what the kernel says, not 42.
+ * Nothing gets to that unwind_goto: it is dead code, and so is the pad.
+ */
 SEC("socket")
-__description("budget: a loop in a subprog unwinds when there is unwind_goto")
+__description("budget: a loop in a subprog unwinds past unwind_goto of the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
+__xlated("...")
+__xlated("call pc+")
+__xlated("kgoto pc+")
+__xlated("...")
+__xlated("r0 = 0")
+__xlated("exit")
 __naked void loop_in_subprog_caught(void)
 {
 	asm volatile (
@@ -245,12 +258,16 @@ static unsigned long spins_caught3(void)
 	);
 }
 
-/* Nothing in the subprog unwinds. The pad is looked at because of may_goto that is added. */
+/*
+ * Nothing in the subprog leaves with unwind_exit, and may_goto that is added does not lead to the
+ * pad of the prog, which would forget the section: the pad of the verifier leaves it. The loop
+ * ends at once here.
+ */
 SEC("socket")
-__description("budget: the pad forgets what the caller holds")
+__description("budget: the pad of the prog forgets what the caller holds, it is not entered")
 __arch_x86_64
 __arch_arm64
-__failure __msg("cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(7)
 __naked void pad_forgets(void)
 {
 	asm volatile (
@@ -292,10 +309,10 @@ static unsigned long spins_locked(void)
 }
 
 SEC("socket")
-__description("budget: a loop in a subprog leaves the section and unwinds to the pad of the prog")
+__description("budget: a loop in a subprog leaves the section and unwinds past the pad of the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
 __naked void loop_in_subprog_locked(void)
 {
 	asm volatile (
@@ -345,7 +362,7 @@ __naked void recursion(void)
 
 /* The one that is called too deep unwinds them all */
 SEC("socket")
-__description("budget: recursion that is too deep unwinds, the verifier adds unwind_goto")
+__description("budget: recursion that is too deep unwinds, the verifier adds kgoto")
 __arch_x86_64
 __arch_arm64
 __success __retval(0)
@@ -376,32 +393,30 @@ static unsigned long goes_down(void)
 	);
 }
 
+/* What the prog returns is up to the exception callback, which runs when the frames are gone */
+__noinline int lowest_is_in_the_middle(__u64 cookie)
+{
+	return ((lowest_r10 + 64) & 8191) < 256;
+}
+
 /*
  * The stack of a task is aligned to its size, 16K at least. r10 of the last frame whose body
- * runs is right above the middle.
+ * runs is right above the middle. No code of the prog runs behind the call once the kernel
+ * unwinds.
  */
 SEC("socket")
 __description("budget: recursion ends in the middle of the kernel stack")
 __arch_x86_64
 __arch_arm64
 __success __retval(1)
+__exception_cb(lowest_is_in_the_middle)
 __naked void recursion_ends_in_the_middle(void)
 {
 	asm volatile (
 		"call goes_down;"
-		unwind_goto(0)
-		"r1 = %[lowest_r10] ll;"
-		"r1 = *(u64 *)(r1 + 0);"
-		"r1 += 64;"
-		"r1 &= 8191;"
-		"r0 = 1;"
-		"if r1 < 256 goto +1;"
 		"r0 = 0;"
 		"exit;"
-		:
-		: __imm_addr(lowest_r10),
-		  __imm_unwind_goto(0)
-		: __clobber_all
+		::: __clobber_all
 	);
 }
 
@@ -475,11 +490,12 @@ __naked void recursion_caught(void)
 	);
 }
 
+/* Each frame has a landing pad of the prog, and so has the prog. The kernel unwinds past them. */
 SEC("socket")
-__description("budget: recursion that is too deep unwinds")
+__description("budget: recursion that is too deep unwinds past the pads of the prog")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
 __naked void recursion_too_deep_caught(void)
 {
 	asm volatile (
@@ -1083,7 +1099,7 @@ SEC("socket")
 __description("budget: a subprog is in a section on some paths")
 __arch_x86_64
 __arch_arm64
-__success __retval(42)
+__success __retval(0)
 __naked void unwinds_then_cannot(void)
 {
 	asm volatile (

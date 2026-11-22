@@ -302,11 +302,12 @@ redo:
 			/*
 			 * The revisit of a call with a callback that unwound
 			 * carries the r0 of the callback, see check_helper_call():
-			 * r0 is no constant of that insn.
+			 * r0 is no constant of that insn. Whatever follows the
+			 * call: a landing pad that the verifier emits passes on
+			 * what unwind_exit of the callback left as well, see
+			 * bpf_pad_passes_on().
 			 */
-			if (r == BPF_REG_0 && i + 1 < insn_cnt &&
-			    bpf_is_sync_callback_calling_insn(&insns[i]) &&
-			    (bpf_is_unwind_goto(&insns[i + 1]) || env->has_throw))
+			if (r == BPF_REG_0 && bpf_is_sync_callback_calling_insn(&insns[i]))
 				continue;
 			switch (c->state) {
 			case CONST_ARG_CONST: {

@@ -773,9 +773,42 @@ The pad releases what the function acquired since its entry. Then:
 
 - The main function returns the value of ``bpf_unwound_retval()``: 0 where 0
   refuses or changes nothing.
-- Another function *unwinds*. It leaves with ``unwind_exit``, and the
-  ``unwind_goto`` after its call jumps to the pad of the caller. The verifier
-  adds ``unwind_goto`` where the program has none.
+- Another function *unwinds*. It leaves with ``kexit``, and the ``kgoto`` after
+  its call jumps to the pad of the caller, which the verifier emits too. Only
+  the verifier emits these two insns.
+
+A program can unwind by itself: its ``unwind_exit`` leaves a function, and the
+``unwind_goto`` after the call jumps to a landing pad that the program has,
+which is code like any other and may go on with the program. What the kernel
+unwinds does not get there. ``kexit`` goes to ``kgoto`` only, at every call,
+whether the program has ``unwind_goto`` there or not: a program that is stopped
+ends in the function that the kernel called, with the value of the kernel.
+
+Where the program has no ``unwind_goto`` after a call that its ``unwind_exit``
+comes back to, the verifier adds one, and a pad that ends in ``unwind_exit``.
+What a landing pad of the program above reads depends on the functions in
+between:
+
+=====================================  =========================================
+the function in between                what gets through it
+=====================================  =========================================
+a static function                      ``R0`` as ``unwind_exit`` left it, a
+                                       pointer as well as a number, and ``R2``
+                                       if the function returns two registers
+a global function that has a landing   what that pad leaves at its
+pad of its own at the call             ``unwind_exit``: a number, or a pointer
+                                       to arena
+a global function without one          nothing: ``R0`` is the value of the
+                                       kernel, ``bpf_unwound_retval()``, and
+                                       ``R2`` is 0 if the function returns two
+                                       registers
+=====================================  =========================================
+
+The callers of a global function are verified without it and take what comes
+out of it for a number, so the pad that the verifier gives it passes nothing
+on. That depends neither on what ``unwind_exit`` left nor on ``bpf_throw()``
+being somewhere in the program. A compiler that wants an object to get through
+a global function gives the call there a landing pad of its own.
 
 No insn stands for a pad in a pass. The state on the edge leaves its function
 at the ``may_goto``, see ``unwind_frame()``. One pad has to serve all states
@@ -1538,7 +1571,8 @@ trip count          the largest trip index + 1
 trip index          how many times the program came back to the header
 unproven            an insn or a part whose check failed in a state of the pass
 unreadable          an xreg without a value: an insn that reads it is unproven
-unwind              leave a function with ``unwind_exit``
+unwind              leave a function with ``kexit``, or with ``unwind_exit``
+                    that the program has
 walk                one check of the body of a loop
 widen               move a bound that grows to a threshold
 xreg                a register, a stack slot or the trip index of a loop

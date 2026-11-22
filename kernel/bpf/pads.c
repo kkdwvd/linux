@@ -14,7 +14,7 @@
  *   - a call of bpf_throw(). No call is made: the insn becomes a jump to the pad.
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
- * then the value in r0 and unwind_exit, or exit in a frame that the kernel called.
+ * then the value in r0 and kexit, or exit in a frame that the kernel called.
  *
  *	bpf_rcu_read_lock();				   call bpf_rcu_read_lock
  *	do {						1: ...
@@ -67,8 +67,8 @@
  * fault_full, and which subprogs are stuck. bail_unwinds that is cleared late goes to the second
  * run of the same pass only, see check_funcs().
  *
- * The frames of a program are unwound one by one. The pad of a frame ends in unwind_exit, which
- * goes to unwind_goto after the call in the caller, and that goes to the pad of the caller:
+ * The frames of a program are unwound one by one. The pad of a frame ends in kexit, which goes to
+ * kgoto after the call in the caller, and that goes to the pad of the caller:
  *
  *	static int wait(void)				wait:
  *	{						1: ...
@@ -77,11 +77,12 @@
  *		} while (!p);				   ...
  *		return *p;				   exit
  *	}					      pad: r0 = 0
- *							   unwind_exit
+ *							   r2 = 0
+ *							   kexit
  *	bpf_rcu_read_lock();				prog:
  *	v = wait();					   call bpf_rcu_read_lock
  *	bpf_rcu_read_unlock();				   call wait
- *	return v;					   unwind_goto pad
+ *	return v;					   kgoto pad
  *							   ...
  *							   exit
  *						      pad: call bpf_rcu_read_unlock
@@ -89,8 +90,36 @@
  *							   exit
  *
  * With bpf_loop(n, wait, ...) in place of wait() it is the same code. The helper is a frame of the
- * kernel between the two. It has a pad of its own, see bpf_call_cb(): unwind_exit of the callback
- * goes there, the helper releases what it holds itself and goes to unwind_goto after its call.
+ * kernel between the two. It has a pad of its own, see bpf_call_cb(): kexit of the callback goes
+ * there, the helper releases what it holds itself and goes to kgoto after its call.
+ *
+ * kgoto and kexit are insns that only the verifier emits. A program unwinds too, in C++ or Rust,
+ * with insns of its own: unwind_exit leaves a frame and goes to unwind_goto after the call, where
+ * the program has a landing pad, which is code like any other. It can end the unwinding and go on.
+ * WHAT THE KERNEL UNWINDS MUST NOT BE CAUGHT: the program was stopped because it ran out of time
+ * or of stack, faulted, or called bpf_throw(). So the two never meet. kexit does not go to
+ * unwind_goto, a state that the kernel unwound is marked for it, BPF_KUNWOUND, and at a call that
+ * has unwind_goto of the program such a state goes to a pad of the verifier all the same, see
+ * check_unwound_arrival():
+ *
+ *	try {						   call wait
+ *		v = wait();				   unwind_goto catch	unwind_exit
+ *	} catch (...) {					   kgoto pad		kexit
+ *		v = 0;					   ...
+ *	}					    catch: ...
+ *							   exit
+ *						      pad: r0 = 0
+ *							   exit
+ *
+ * No landing pad of the program runs on the way, also none that only cleans up: the pad of the
+ * verifier releases what the frame holds of the kernel, and what the program keeps for itself is
+ * its own to lose.
+ * The other way around a frame that has no unwind_goto at a call can be on the way of unwind_exit
+ * of the program, BPF_SITE_CALL. The verifier gives it unwind_goto and a pad, as upstream does not:
+ * that pad ends in unwind_exit and passes on what the callee left in R0, see
+ * bpf_pad_passes_on(), to a landing pad of the program above. Not in a global subprog: its callers
+ * get a number, bpf_unwound_retval(), whatever the callee left and whether the program has
+ * bpf_throw() or not. So a call can have a pad of each kind, and a subprog can be left in both ways.
  *
  * A section has no handle: the plan has their number. Every other resource that the frame
  * acquired is an ENTRY of the plan. Its release takes a handle: the address of the lock, of
@@ -180,10 +209,10 @@
  *
  * THE VALUE goes from the frame where the unwinding starts to the one that ends it, in R0, and the
  * program returns it. What the verifier unwinds has bpf_unwound_retval(). In a program without
- * bpf_throw() each pad loads it, whatever an unwind_exit of the program left in R0. With it a pad
- * after a call passes on what unwind_exit of the callee left in R0. Its own calls clobber R0, so
- * the value waits in a hidden word of the frame, below the stack of the function. A pad without a
- * call has none.
+ * bpf_throw() each pad loads it. With it a pad after a call passes on what kexit of the callee
+ * left in R0. Its own calls clobber R0, so the value waits in a hidden word of the frame, below
+ * the stack of the function. A pad without a call has none. R2 is 0 at kexit: nothing reads it
+ * yet, and nothing of a callback gets through the frame of its helper but R0.
  * The pad of bpf_throw() starts with the argument, in R1. The pads of the main program hand the
  * value to the exception callback if there is one, and return what that returns.
  *
@@ -530,10 +559,14 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 	return plan;
 }
 
-/* @callee was left with unwind_exit and comes back to the call at @call_idx, which is a site */
-int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee)
+/*
+ * @callee was left with unwind_exit and comes back to the call at @call_idx, which is a site of
+ * @kind, BPF_SITE_CALL. Or it was left with kexit: BPF_SITE_KCALL.
+ */
+int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
+			enum bpf_site_kind kind)
 {
-	struct bpf_pad_plan *plan = bpf_pad_plan_get(env, call_idx, BPF_SITE_CALL);
+	struct bpf_pad_plan *plan = bpf_pad_plan_get(env, call_idx, kind);
 
 	if (!plan)
 		return -ENOMEM;
@@ -1282,7 +1315,7 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	int i, j, arg, pass, pos, err;
 
 	/* the pad of a call runs after the call: what is live at the next insn is there */
-	insn_idx += plan->kind == BPF_SITE_CALL;
+	insn_idx += bpf_site_is_call(plan->kind);
 	for (i = 0; i < plan->nr_ents; i++)
 		plan->ents[i].ref = -1;
 	/*
@@ -1764,12 +1797,26 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	return n;
 }
 
-/* The calls of the pad of @plan clobber the value that it has to pass on */
-static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+/*
+ * The landing pad of a site of @kind in @subprog passes R2 on with R0, see bpf_pad_passes_on(): in
+ * a subprog that returns two registers. Not out of a global subprog, which passes nothing on: its
+ * callers take what comes out for numbers, also where the callee of this frame returns one
+ * register and left R2 as it happened to be. R2 is 0 there, as it is at kexit.
+ */
+bool bpf_pad_passes_r2(struct bpf_verifier_env *env, int subprog, enum bpf_site_kind kind)
 {
-	return bpf_site_has_value(env, plan->kind) &&
+	return bpf_pad_passes_on(env, subprog, kind) && bpf_ret_reg_pair(env, subprog);
+}
+
+/* The calls of the pad of @plan, a site in @subprog, clobber the value that it has to pass on */
+static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			     int subprog)
+{
+	return (bpf_site_has_value(env, subprog, plan->kind) ||
+		bpf_pad_passes_on(env, subprog, plan->kind)) &&
 	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT]);
 }
+
 
 /*
  * The insns of the landing pad of @plan, a site in @subprog, but for the last one, which leaves the
@@ -1782,26 +1829,43 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 {
 	int value_off = env->subprog_info[subprog].value_off;
 	int src = bpf_site_value_reg(plan->kind), dst = BPF_REG_0;
+	bool passes_on = bpf_pad_passes_on(env, subprog, plan->kind);
+	bool pair = bpf_pad_passes_r2(env, subprog, plan->kind);
 	int class, i, n = 0;
 
 	/* the main program hands the value to the exception callback */
 	if (!subprog && env->exception_callback_subprog)
 		dst = BPF_REG_1;
-	if (plan_saves_value(env, plan))
+	if (plan_saves_value(env, plan, subprog)) {
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, src, value_off);
+		if (pair)
+			buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_2,
+					       value_off + BPF_REG_SIZE);
+	}
 	n += release_ents(env, plan, PAD_TURN_RCU_ITERS, &buf[n], &aux[n]);
 	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
-	if (plan_saves_value(env, plan))
+	if (plan_saves_value(env, plan, subprog)) {
 		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);
-	else if (!bpf_site_has_value(env, plan->kind))
+		if (pair)
+			buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_FP,
+					       value_off + BPF_REG_SIZE);
+	} else if (passes_on) {
+		/* no call: R0 and R2 are what unwind_exit left */
+	} else if (!bpf_site_has_value(env, subprog, plan->kind)) {
 		buf[n++] = BPF_MOV64_IMM(dst, bpf_unwound_retval(env));
-	else if (src != dst)
+	} else if (src != dst) {
 		buf[n++] = BPF_MOV64_REG(dst, src);
-	if (bpf_ret_reg_pair(env, subprog))
+	}
+	/*
+	 * kexit has 0 in R2: nothing of the frame is left for the pad of kgoto to look at. So has
+	 * every other pad of a subprog that returns two registers, unless it passes R2 on.
+	 */
+	if (bpf_pad_kexits(env, subprog, plan->kind) ||
+	    (!pair && bpf_ret_reg_pair(env, subprog)))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	return n;
 }
@@ -1872,35 +1936,58 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
  */
 bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
+	const struct bpf_subprog_info *sub;
 	int s;
 
-	if (plan->kind != BPF_SITE_CALL)
+	if (!bpf_site_is_call(plan->kind))
 		return plan->kind != BPF_SITE_FAULT && plan->kind != BPF_SITE_MAY_GOTO;
-	bpf_pad_for_each_callee(plan, s)
-		if (env->subprog_info[s].must_unwind)
+	/* the callees came back to the call in the way of the plan, and that way is asked */
+	bpf_pad_for_each_callee(plan, s) {
+		sub = &env->subprog_info[s];
+		if (bpf_site_is_kernel(plan->kind) ? sub->must_kunwind : sub->must_unwind)
 			return true;
+	}
 	return false;
 }
 
-/* What a subprog is left for may be found after its callers were unwound: look at them again */
-void bpf_pads_must_unwind(struct bpf_verifier_env *env)
+/*
+ * What a subprog is left for may be found after its callers were unwound: look at them again.
+ * The frame of a call is left in the way in which the callee came back.
+ * Callees first: callx and a cycle of calls need more rounds.
+ */
+int bpf_pads_must_unwind(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *sub;
 	const struct bpf_pad_plan *plan;
-	bool changed;
-	int i, s;
+	bool changed, must, kmust;
+	int i, k, err;
 
 	do {
 		changed = false;
-		for (s = 0; s < env->subprog_cnt; s++) {
-			sub = &env->subprog_info[s];
-			for (i = sub->start; i < sub[1].start && !sub->must_unwind; i++) {
-				plan = bpf_pad_plan(&env->insn_aux_data[i], BPF_SITE_CALL);
-				sub->must_unwind = plan && bpf_pad_must_unwind(env, plan);
-				changed |= sub->must_unwind;
+		err = bpf_add_cost_and_check(env, env->prog->len, BPF_COST_SCAN);
+		if (err)
+			return err;
+		for (k = 0; k < env->subprog_cnt; k++) {
+			sub = &env->subprog_info[env->subprog_topo_order[k]];
+			must = sub->must_unwind;
+			kmust = sub->must_kunwind;
+			for (i = sub->start; i < sub[1].start && !(must && kmust); i++) {
+				for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
+					if (!bpf_site_is_call(plan->kind) ||
+					    !bpf_pad_must_unwind(env, plan))
+						continue;
+					if (bpf_site_is_kernel(plan->kind))
+						kmust = true;
+					else
+						must = true;
+				}
 			}
+			changed |= must != sub->must_unwind || kmust != sub->must_kunwind;
+			sub->must_unwind = must;
+			sub->must_kunwind = kmust;
 		}
 	} while (changed);
+	return 0;
 }
 
 static const char * const site_kind[] = {
@@ -1910,24 +1997,36 @@ static const char * const site_kind[] = {
 	[BPF_SITE_FAULT]		= "arena access",
 	[BPF_SITE_THROW]		= "bpf_throw",
 	[BPF_SITE_MAY_GOTO]		= "may_goto of the program",
+	[BPF_SITE_KCALL]		= "call",
 };
 
-/* The program has unwind_exit in the subprog. No site: a bit that follows those of the kinds. */
-#define LEFT_AT_UNWIND_EXIT	BIT(BPF_SITE_MAY_GOTO + 1)
+/* The program has unwind_exit in the subprog. No site: the last bit, far from those of the kinds. */
+#define LEFT_AT_UNWIND_EXIT	BIT(15)
+
+/*
+ * What comes back to the call of @plan was left at sites of the @kinds of a callee: with kexit
+ * at those where the kernel unwinds, with unwind_exit where the program has it.
+ */
+static u16 kinds_of_plan(const struct bpf_pad_plan *plan, u16 kinds)
+{
+	return plan->kind == BPF_SITE_KCALL ? kinds & ~LEFT_AT_UNWIND_EXIT
+					    : kinds & LEFT_AT_UNWIND_EXIT;
+}
 
 /*
  * At which kinds of site does the program leave each subprog? At its own, and at those of what
  * comes back to its calls. Bits by enum bpf_site_kind in 'left_at'. The main pass notes them as
  * the states leave, see bpf_pad_note_left(). This is what is left of that when the pass is over.
+ * Callees first: callx and a cycle of calls need more rounds.
  */
-static void sites_of_subprogs(struct bpf_verifier_env *env)
+static int sites_of_subprogs(struct bpf_verifier_env *env)
 {
 	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	const struct bpf_pad_plan *plan;
 	struct bpf_subprog_info *sub;
+	int i, k, s, c, err;
 	bool changed;
-	int i, s, c;
-	u8 kinds;
+	u16 kinds;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -1935,8 +2034,11 @@ static void sites_of_subprogs(struct bpf_verifier_env *env)
 	}
 	do {
 		changed = false;
-		for (s = 0; s < env->subprog_cnt; s++) {
-			sub = &env->subprog_info[s];
+		err = bpf_add_cost_and_check(env, env->prog->len, BPF_COST_SCAN);
+		if (err)
+			return err;
+		for (k = 0; k < env->subprog_cnt; k++) {
+			sub = &env->subprog_info[env->subprog_topo_order[k]];
 			kinds = sub->left_at;
 			for (i = sub->start; i < sub[1].start; i++) {
 				if (aux[i].loop_guard)
@@ -1946,18 +2048,20 @@ static void sites_of_subprogs(struct bpf_verifier_env *env)
 				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 					if (!plan->used)
 						continue;
-					if (plan->kind != BPF_SITE_CALL) {
+					if (!bpf_site_is_call(plan->kind)) {
 						kinds |= BIT(plan->kind);
 						continue;
 					}
 					bpf_pad_for_each_callee(plan, c)
-						kinds |= env->subprog_info[c].left_at;
+						kinds |= kinds_of_plan(plan,
+								       env->subprog_info[c].left_at);
 				}
 			}
 			changed |= kinds != sub->left_at;
 			sub->left_at = kinds;
 		}
 	} while (changed);
+	return 0;
 }
 
 /*
@@ -1965,9 +2069,9 @@ static void sites_of_subprogs(struct bpf_verifier_env *env)
  * pass asks before sites_of_subprogs() has looked at them: unwind_exit of the program is no site
  * that a state would have noted.
  */
-static u8 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+static u16 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
-	u8 kinds = 0;
+	u16 kinds = 0;
 	int s;
 
 	bpf_pad_for_each_callee(plan, s) {
@@ -1975,7 +2079,7 @@ static u8 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *p
 		if (env->subprog_info[s].can_unwind)
 			kinds |= LEFT_AT_UNWIND_EXIT;
 	}
-	return kinds;
+	return kinds_of_plan(plan, kinds);
 }
 
 /*
@@ -1984,10 +2088,10 @@ static u8 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *p
  */
 static void print_sites_below(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
-	u8 kinds;
+	u16 kinds;
 	int k;
 
-	if (plan->kind != BPF_SITE_CALL)
+	if (!bpf_site_is_call(plan->kind))
 		return;
 	kinds = sites_below(env, plan);
 	verbose(env, "what the call at %d calls is left at:", i);
@@ -2449,7 +2553,9 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	};
 	int j;
 
-	verbose(env, "landing pad of %s at %d: ", site_kind[plan->kind], i);
+	/* a call has one for what the kernel unwinds, and one for unwind_exit of the program */
+	verbose(env, "landing pad of %s at %d%s: ", site_kind[plan->kind], i,
+		plan->kind == BPF_SITE_CALL ? " for unwind_exit" : "");
 	for (j = plan->nr_ents - 1; !plan->conflict && j >= 0; j--)
 		print_ent(env, &plan->ents[j]);
 	if (plan->conflict)
@@ -2474,7 +2580,7 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
 		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind)
 {
-	sub->left_at |= kind == BPF_SITE_CALL ? sites_below(env, plan) : BIT(kind);
+	sub->left_at |= bpf_site_is_call(kind) ? sites_below(env, plan) : BIT(kind);
 }
 
 /* Did bpf_pad_skip_faults() walk @sub, and has no call in or below it got a new callee since? */
@@ -2500,7 +2606,7 @@ int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	unsigned long *todo, *done;
 	bool walked = true;
 
-	if (verifier_bug_if(plan->kind != BPF_SITE_CALL, env,
+	if (verifier_bug_if(!bpf_site_is_call(plan->kind), env,
 			    "a site that is no call has a frame that cannot unwind"))
 		return -EFAULT;
 	/*
@@ -2533,12 +2639,11 @@ int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 		env->faults_late |= !sub->stuck;
 		/* what came back to a call below the first one is told by that one too */
 		bpf_subprog_set_stuck(sub, BPF_STUCK_CAME_BACK, insn_idx);
-		for (i = sub->start; i < sub[1].start; i++) {
-			plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
-			if (plan)
-				bpf_pad_for_each_callee(plan, c)
-					__set_bit(c, todo);
-		}
+		for (i = sub->start; i < sub[1].start; i++)
+			for (plan = aux[i].pad_plans; plan; plan = plan->next)
+				if (bpf_site_is_call(plan->kind))
+					bpf_pad_for_each_callee(plan, c)
+						__set_bit(c, todo);
 	}
 	/* a walk that got to its end has all that is below what it walked */
 	if (!err)
@@ -2551,18 +2656,20 @@ int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 
 /*
  * The pads of @sub keep the value over their calls in a hidden word of the frame, below the
- * hidden slots. Nothing else writes it. Returns the reason of a conflict.
+ * hidden slots. Nothing else writes it. A subprog whose pads pass on R2 has a second word above
+ * it, see bpf_pad_passes_r2(). Returns the reason of a conflict.
  */
 static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
 {
+	int words = 1 + bpf_pad_passes_r2(env, sub - env->subprog_info, BPF_SITE_CALL);
 	int err;
 
 	if (sub->value_off)
 		return 0;
-	sub->hidden_words++;
+	sub->hidden_words += words;
 	err = bpf_hidden_slots_fit(env);
 	if (err <= 0) {
-		sub->hidden_words--;
+		sub->hidden_words -= words;
 		return err ?: BPF_CONFLICT_NO_ROOM;
 	}
 	sub->value_off = -(int)bpf_stack_depth_with_slots(sub);
@@ -2601,8 +2708,9 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	struct bpf_pad_plan *plan;
 	int i, s, err;
 
-	bpf_pads_must_unwind(env);
-	sites_of_subprogs(env);
+	err = bpf_pads_must_unwind(env) ?: sites_of_subprogs(env);
+	if (err)
+		return err;
 	/* hidden slots take their places among entries that have theirs */
 	for (i = 0; i < env->prog->len; i++) {
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
@@ -2621,8 +2729,9 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			if (!plan->used)
 				continue;
 			err = settle_plan(env, plan);
-			if (!err && plan_saves_value(env, plan))
-				err = take_value_word(env, bpf_find_containing_subprog(env, i));
+			sub = bpf_find_containing_subprog(env, i);
+			if (!err && plan_saves_value(env, plan, sub - env->subprog_info))
+				err = take_value_word(env, sub);
 			if (err < 0)
 				return err;
 			plan->conflict = err;
@@ -2713,8 +2822,8 @@ static bool left_at_insn(const struct bpf_insn_aux_data *aux)
 }
 
 /*
- * The landing pad of the call of @plan has a conflict, and that is an error: what the call calls
- * is unwound. Where that is at may_goto that the verifier adds, it depends on the
+ * The landing pad of the call of @plan has a conflict, and that is an error: the kernel unwinds
+ * what the call calls. Where it does so at may_goto that the verifier adds, it depends on the
  * values that got to the loop: may_goto is there because a state went around without a trip
  * count. A function is verified for its calls together, and two calls of which each has a trip
  * count can make such a state between them:
@@ -2748,7 +2857,7 @@ static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	struct bpf_subprog_info *sub = env->subprog_info;
 	int s;
 
-	if (plan->kind != BPF_SITE_CALL)
+	if (plan->kind != BPF_SITE_KCALL)
 		return;
 	bpf_pad_for_each_callee(plan, s)
 		sub[s].below_conflict = true;
@@ -2794,7 +2903,7 @@ static void note_causes_below(struct bpf_verifier_env *env)
 			break;
 		for (i = sub[s].start; i < sub[s + 1].start; i++) {
 			for (below = aux[i].pad_plans; below; below = below->next) {
-				if (below->kind != BPF_SITE_CALL || !below->visited)
+				if (below->kind != BPF_SITE_KCALL || !below->visited)
 					continue;
 				/*
 				 * The frame is left at this call, whatever what it calls

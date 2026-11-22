@@ -416,7 +416,7 @@ __arch_x86_64
 __arch_arm64
 __success
 __xlated("27: call pc+10")
-__xlated("28: unwind_goto pc-15")
+__xlated("28: kgoto pc-15")
 __xlated("...")
 __xlated("37: exit")
 __xlated("38: r0 = ")
@@ -433,7 +433,8 @@ __xlated("56: if r1 != 0x0 goto pc-12")
 __xlated("57: r0 = 0")
 __xlated("58: exit")
 __xlated("59: r0 = 0")
-__xlated("60: unwind_exit")
+__xlated("60: r2 = 0")
+__xlated("61: kexit")
 __naked void patch_list_insert_in_front(void)
 {
 	INSERT_IN_FRONT;
