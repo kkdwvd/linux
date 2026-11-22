@@ -2775,6 +2775,29 @@ int loop_drops_the_pointer(void *unused)
 	return 0;
 }
 
+/*
+ * may_goto of the program is the only way out of the loop, and it ends the prog: no state gets
+ * to an exit with what leaks. A landing pad that releases what the frame holds at may_goto is
+ * needed all the same, and it has no room for one record more in each trip.
+ */
+SEC("tc")
+__description("held: a reference that is in no xreg, only may_goto ends the loop")
+__arch_x86_64 __arch_arm64
+__load_if_JITed()
+__failure
+__msg("landing pad of may_goto of the program at {{[0-9]+}}: conflict: too much is held")
+FEW_INSNS
+int loop_drops_the_pointer_for_good(void *unused)
+{
+	void *cur = NULL;
+
+	while (can_loop)
+		cur = bpf_ringbuf_reserve(&rb, 8, 0);
+	if (cur)
+		bpf_ringbuf_discard(cur, 0);
+	return 0;
+}
+
 static __noinline void acquire_on_the_way_back(long n)
 {
 	if (!n)

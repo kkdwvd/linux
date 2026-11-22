@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 #include <sched.h>
+#include <pthread.h>
 #include <test_progs.h>
 #include <network_helpers.h>
 #include "timed_may_goto.skel.h"
@@ -48,6 +49,11 @@ static void test_async(struct timed_may_goto_user *skel)
 	wait_for(&skel->bss->tw_cnt, 1000, "tw_cnt");
 	wait_for(&skel->bss->rcu_cnt, 1000, "rcu_cnt");
 	wait_for(&skel->bss->rcu_trace_cnt, 1000, "rcu_trace_cnt");
+	/* a callback that is out of time itself, 250 ms after it began to spin: it is unwound */
+	ASSERT_EQ(run_syscall(skel->progs.async_spins), 0, "async_spins");
+	wait_for(&skel->bss->wq_spins, 1, "wq_spins");
+	usleep(600 * 1000);
+	ASSERT_EQ(skel->bss->wq_went_on, 0, "wq_went_on");
 }
 
 static long now_ms(void)
@@ -177,6 +183,58 @@ out:
 	user_ring_buffer__free(rb);
 }
 
+static int run_shares_clock(struct timed_may_goto_user *skel, int spin)
+{
+	struct { int spin; } args = { spin };
+	LIBBPF_OPTS(bpf_test_run_opts, opts, .ctx_in = &args, .ctx_size_in = sizeof(args));
+
+	if (bpf_prog_test_run_opts(bpf_program__fd(skel->progs.shares_clock), &opts))
+		return -1;
+	return opts.retval;
+}
+
+/* It runs on the cpu of the victim, ahead of it, until the time of its invocation is up */
+static void *spinner(void *arg)
+{
+	struct sched_param param = { .sched_priority = 1 };
+	struct timed_may_goto_user *skel = arg;
+	int i;
+
+	for (i = 0; i < 5000 && !skel->bss->victim_started; i++)
+		usleep(1000);
+	if (sched_setscheduler(0, SCHED_FIFO, &param))
+		return (void *)-1L;
+	return (void *)(long)run_shares_clock(skel, 1);
+}
+
+/*
+ * A known hazard of the clock of may_goto, not a wanted result: an invocation is unwound for the
+ * time that another invocation of the prog used on its cpu. See shares_clock().
+ */
+static void test_another_invocation(struct timed_may_goto_user *skel)
+{
+	pthread_t thread;
+	void *ret;
+
+	/* control: alone the prog gets to its end */
+	ASSERT_EQ(run_shares_clock(skel, 0), 7, "alone");
+	ASSERT_EQ(skel->bss->victim_done, 1, "alone, done");
+	/* without preemption in the kernel nothing runs on the cpu of the victim while it spins */
+	if (!skel->bss->kernel_preempts) {
+		test__skip();
+		return;
+	}
+
+	skel->bss->victim_started = 0;
+	if (!ASSERT_OK(pthread_create(&thread, NULL, spinner, skel), "pthread_create"))
+		return;
+	ASSERT_EQ(run_shares_clock(skel, 0), -ECANCELED, "victim is unwound");
+	ASSERT_EQ(skel->bss->victim_done, 0, "victim, done");
+	ASSERT_LT(skel->bss->victim_ns, 60 * 1000 * 1000, "victim, time of its own");
+	pthread_join(thread, &ret);
+	ASSERT_EQ((long)ret, -ECANCELED, "spinner is unwound");
+}
+
 static void test_priv_stack(struct timed_may_goto_user *skel)
 {
 	LIBBPF_OPTS(bpf_test_run_opts, opts);
@@ -241,6 +299,8 @@ void serial_test_timed_may_goto(void)
 		test_user_ringbuf(skel);
 	if (test__start_subtest("priv_stack"))
 		test_priv_stack(skel);
+	if (test__start_subtest("another_invocation"))
+		test_another_invocation(skel);
 
 	sched_setaffinity(0, sizeof(old), &old);
 out:

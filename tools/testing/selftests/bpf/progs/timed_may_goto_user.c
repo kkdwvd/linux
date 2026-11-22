@@ -243,6 +243,46 @@ int spin_under_timer(void *ctx)
 }
 
 /*
+ * An async callback that uses up its own time. The kernel called its frame: it is unwound to its
+ * exit, and does not get behind its loop. The prog that starts it has returned by then: a prog
+ * that is still running on the cpu would share the count with the callback while the two take
+ * turns there.
+ */
+struct spin_elem {
+	struct bpf_wq wq;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct spin_elem);
+} async_spin SEC(".maps");
+
+int wq_spins, wq_went_on;
+
+static int wq_spin_cb(void *map, int *key, void *val)
+{
+	wq_spins = 1;
+	wq_went_on = spins() + 1;
+	return 0;
+}
+
+SEC("syscall")
+int async_spins(void *ctx)
+{
+	struct spin_elem *e;
+	int key = 0;
+
+	e = bpf_map_lookup_elem(&async_spin, &key);
+	if (!e)
+		return 100;
+	if (bpf_wq_init(&e->wq, &async_spin, 0) || bpf_wq_set_callback(&e->wq, wq_spin_cb, 0))
+		return 101;
+	return bpf_wq_start(&e->wq, 0) ? 102 : 0;
+}
+
+/*
  * Extension prog. A function that can unwind cannot be replaced: an extension ends in its main
  * prog. With a loop that may_goto stops that is replaced_global(). plain_global() cannot unwind.
  */
@@ -375,6 +415,50 @@ int drain(void *ctx)
 	int spun = 0;
 
 	return 100 + bpf_user_ringbuf_drain(&user_ringbuf, drain_cb, &spun, 0) * 10 + spun;
+}
+
+/*
+ * The count and the timestamp of may_goto are per prog and per cpu, the time is that of the wall
+ * clock, and only the callers of async callbacks keep what another invocation has there. So an
+ * invocation that is preempted shares them with the one that runs in its place: this prog, with
+ * 'spin', uses up its time while the one without waits for the cpu. That one finds the count at 0
+ * when it runs again and is unwound, with 60 ms of its own at most.
+ */
+struct shares_clock_args {
+	int spin;
+};
+
+int victim_started, victim_done;
+__u64 victim_ns;
+
+/* The victim has to be preempted while it is in the prog: that takes a kernel which does that */
+extern bool CONFIG_PREEMPT __kconfig __weak;
+extern bool CONFIG_PREEMPT_LAZY __kconfig __weak;
+extern bool CONFIG_PREEMPT_RT __kconfig __weak;
+bool kernel_preempts;
+
+SEC("syscall")
+int shares_clock(struct shares_clock_args *args)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	__u64 start = task->se.sum_exec_runtime;
+
+	kernel_preempts = CONFIG_PREEMPT || CONFIG_PREEMPT_LAZY || CONFIG_PREEMPT_RT;
+	if (args->spin) {
+		while (can_loop)
+			;
+		return 8;
+	}
+	victim_done = 0;
+	victim_started = 1;
+	/* 60 ms of this task on the cpu, whatever else runs there */
+	while (can_loop) {
+		victim_ns = task->se.sum_exec_runtime - start;
+		if (victim_ns >= 60 * 1000 * 1000)
+			break;
+	}
+	victim_done = 1;
+	return 7;
 }
 
 /*
