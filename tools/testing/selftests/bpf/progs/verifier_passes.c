@@ -3502,6 +3502,59 @@ __naked void good_pass_is_the_result(void)
 	: __clobber_all);
 }
 
+/*
+ * The same, and the good pass has a landing pad: its plans come back with it when the later pass
+ * fails. The loop is out of time with preemption off, and the pad turns it on. test_loader has no
+ * context for the prog: unwind_release runs one like it.
+ */
+SEC("syscall")
+__description("pessimized: a later pass is over the budget, the good pass has a landing pad")
+__arch_x86_64 __arch_arm64
+__success
+__log_level(6) __msg("landing pad of may_goto at {{[0-9]+}}: rcu=0 preempt=1")
+__msg("BPF program is too complex") __msg("stack depth max 128")
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("call kernel-function")
+/* -ECANCELED */
+__xlated("r0 = -125")
+__xlated("exit")
+__naked void good_pass_has_a_pad(void)
+{
+	asm volatile (
+	"r6 = r1;"
+	"*(u64 *)(r10 - 64) = 0;"
+	"call %[bpf_get_prandom_u32];"
+	"r5 = 1;"
+	"r7 = 0;"
+	".rept 14;"
+	"r0 >>= 1;"
+	"if r0 & 1 goto +1;"
+	"r7 += r5;"
+	"r5 <<= 1;"
+	".endr;"
+	"r1 = r6;"
+	"r1 += r7;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_probe_read_kernel];"
+	"r1 = 2;"
+	"r2 = frame_of_64 ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"call %[bpf_preempt_disable];"
+"1:	call %[bpf_get_prandom_u32];"
+	"if r0 != 5 goto 1b;"
+	"call %[bpf_preempt_enable];"
+	"r0 = 7;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32), __imm(bpf_probe_read_kernel), __imm(bpf_loop),
+	   __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+	: __clobber_all);
+}
+
 /* The last one has no zero */
 static const char strings[] SEC(".rodata.strings") = {
 	'a', '%', 'd', 0, [4] = 'b', 'c', 'd', '%', 'd', 0, [10] = '%', 'z', 0, [13] = 'e',
