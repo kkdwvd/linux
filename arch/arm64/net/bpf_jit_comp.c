@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/cfi.h>
 #include <linux/extable.h>
 #include <linux/filter.h>
@@ -1654,11 +1655,14 @@ static int add_exception_handler(const struct bpf_verifier_env *env,
 	return 0;
 }
 
-/* unwind_goto after the call of a helper or a kfunc, which return r0 in x0 alone */
-static bool unwind_goto_after_helper(const struct bpf_insn *insn)
+/* unwind_goto or kgoto after the call of a helper or a kfunc, which return r0 in x0 alone */
+static bool goto_after_helper(const struct bpf_insn *insn)
 {
 	const struct bpf_insn *call = insn - 1;
 
+	/* 'call; unwind_goto; kgoto' */
+	if (bpf_is_kgoto(insn) && bpf_is_unwind_goto(call))
+		call--;
 	return call->code == (BPF_JMP | BPF_CALL) && call->src_reg != BPF_PSEUDO_CALL;
 }
 
@@ -1671,8 +1675,14 @@ static bool unwind_goto_after_helper(const struct bpf_insn *insn)
  * No insn starts there, so a fault cannot hit the entry.
  * After an access to arena ret_addr is the end of its code, and a fault in it
  * goes to bpf_fault_unwind_target() of that, see ex_handler_bpf().
+ *
+ * kgoto is the same for kexit, with the entry at ret_addr - 2: unwind_goto of
+ * the same call has the byte behind it. It never follows an access to arena.
  */
-static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
+#define UNWIND_EXKEY	1
+#define KUNWIND_EXKEY	2
+
+static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target, int key)
 {
 	struct exception_table_entry *ex;
 	off_t ins_offset;
@@ -1686,7 +1696,7 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
 		return -EINVAL;
 
 	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
-	ins_offset = (long)&ctx->ro_image[ret_addr] - 1 - (long)&ex->insn;
+	ins_offset = (long)&ctx->ro_image[ret_addr] - key - (long)&ex->insn;
 	if (WARN_ON_ONCE(ins_offset >= 0 || ins_offset < INT_MIN))
 		return -ERANGE;
 
@@ -1701,10 +1711,30 @@ static int add_unwind_exentry(struct jit_ctx *ctx, int ret_addr, int target)
 }
 
 /*
+ * The entry of @insn, unwind_goto or kgoto, behind a call that returns to
+ * @ret_addr. After the call of a helper it gets a landing: *@landing is the
+ * entry that build_landings() gives the fixup.
+ */
+static int add_goto_exentry(struct jit_ctx *ctx, const struct bpf_insn *insn, int ret_addr,
+			    int *landing)
+{
+	int i = insn - ctx->prog->insnsi;
+	int target = ctx->offset[i + 1 + bpf_jmp_offset(insn)];
+
+	if (goto_after_helper(insn)) {
+		*landing = ctx->exentry_idx;
+		target = ret_addr;
+	}
+	return add_unwind_exentry(ctx, ret_addr, target,
+				  bpf_is_kgoto(insn) ? KUNWIND_EXKEY : UNWIND_EXKEY);
+}
+
+/*
  * The landings of the pads after the calls of helpers and kfuncs, past the
  * epilogue, where nothing falls into them: 'mov x8, x0; b pad' each, see the
  * unwind_goto case of build_insn(). They go in after the body, when the pads
  * are placed and the entries are in, and each fills in the fixup of its entry.
+ * A call that has unwind_goto and kgoto has two, in the order of the insns.
  */
 static int build_landings(struct jit_ctx *ctx)
 {
@@ -1715,8 +1745,9 @@ static int build_landings(struct jit_ctx *ctx)
 		const struct bpf_insn *insn = &prog->insnsi[i];
 		int ret_addr, jmp_offset;
 
-		if (!bpf_is_unwind_goto(insn) || !unwind_goto_after_helper(insn))
+		if (!bpf_is_pad_goto(insn) || !goto_after_helper(insn))
 			continue;
+		/* neither insn is code: kgoto behind unwind_goto has the same offset */
 		ret_addr = ctx->offset[i] - 1;
 		if (ctx->image) {
 			struct exception_table_entry *ex;
@@ -1735,15 +1766,18 @@ static int build_landings(struct jit_ctx *ctx)
 }
 
 /*
- * The verifier made sure that unwind_goto follows a call in a prog. When the
- * kernel called an async callback, it's exit. A helper that calls a callback
- * has a pad when it wants one, see bpf_call_cb().
+ * Where a frame that leaves with unwind_exit, @key UNWIND_EXKEY, or with kexit,
+ * @key KUNWIND_EXKEY, returns to.
+ * The verifier made sure that unwind_goto follows a call in a prog, and kgoto
+ * where the callee has kexit. When the kernel called an async callback, it's
+ * exit. A helper that calls a callback has a pad when it wants one, see
+ * bpf_call_cb().
  */
-u64 bpf_unwind_target(u64 ret_addr)
+static u64 unwind_target(u64 ret_addr, int key)
 {
 	const struct exception_table_entry *e;
 
-	e = search_bpf_extables(ret_addr - 1);
+	e = search_bpf_extables(ret_addr - key);
 	if (e)
 		return ret_addr + e->fixup;
 	/*
@@ -1751,23 +1785,40 @@ u64 bpf_unwind_target(u64 ret_addr)
 	 * entries are the EX_TYPE_BPF ones of the kernel and module tables.
 	 * Anything else at a return address is some caller's own fixup, and
 	 * what a JIT keyed there is a fixup of the insn after the call.
+	 * The entry has the stub of the pad. The way in for unwind_exit is
+	 * BPF_CB_PAD_OFF bytes from its start, the one for kexit
+	 * BPF_CB_KPAD_OFF bytes.
 	 */
 	e = search_kernel_exception_table(ret_addr);
 	if (!e)
 		e = search_module_extables(ret_addr);
 	if (e && e->type == EX_TYPE_BPF)
-		return (unsigned long)&e->fixup + e->fixup;
+		return (unsigned long)&e->fixup + e->fixup +
+		       (key == KUNWIND_EXKEY ? BPF_CB_KPAD_OFF : BPF_CB_PAD_OFF);
 	/*
 	 * No pad. That is how it ends when the kernel called an async callback
 	 * or the main prog of an extension: it's exit. A call in a prog of what
 	 * can unwind has unwind_goto behind it, which is an entry also when the
-	 * pad is the next insn. So a return address in a prog without an entry
-	 * is an unwind_exit that gets lost: the verifier sent it to a pad.
+	 * pad is the next insn, and kgoto behind a call of what has kexit. So a
+	 * return address in a prog without an entry is an unwind_exit or a
+	 * kexit that gets lost: the verifier sent it to a pad.
 	 */
 	scoped_guard(rcu)
 		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
 	return ret_addr;
 }
+
+u64 notrace bpf_unwind_target(u64 ret_addr)
+{
+	return unwind_target(ret_addr, UNWIND_EXKEY);
+}
+NOKPROBE_SYMBOL(bpf_unwind_target);
+
+u64 notrace bpf_kunwind_target(u64 ret_addr)
+{
+	return unwind_target(ret_addr, KUNWIND_EXKEY);
+}
+NOKPROBE_SYMBOL(bpf_kunwind_target);
 
 /*
  * The same for the end of the code of an access to arena that faulted, see
@@ -1776,7 +1827,7 @@ u64 bpf_unwind_target(u64 ret_addr)
  */
 u64 bpf_fault_unwind_target(u64 end)
 {
-	const struct exception_table_entry *e = search_bpf_extables(end - 1);
+	const struct exception_table_entry *e = search_bpf_extables(end - UNWIND_EXKEY);
 
 	return e ? end + e->fixup : end;
 }
@@ -1789,12 +1840,21 @@ static long bpf_unwind_fixup(u64 lr)
 	return bpf_unwind_target(ret_addr) - ret_addr;
 }
 
+/* The same for kexit */
+static long bpf_kunwind_fixup(u64 lr)
+{
+	u64 ret_addr = ptrauth_strip_kernel_insn_pac(lr);
+
+	return bpf_kunwind_target(ret_addr) - ret_addr;
+}
+
 /*
- * unwind_exit: return to the pad. LR in the frame record is signed. Instead of
- * signing the address of the pad, let the epilogue authenticate LR as it is and
- * add the offset of the pad to it. r0 and r2 are returned.
+ * unwind_exit, kexit: return to the pad. LR in the frame record is signed.
+ * Instead of signing the address of the pad, let the epilogue authenticate LR as
+ * it is and add the offset of the pad to it, which @fixup returns. r0 and r2 are
+ * returned.
  */
-static void emit_unwind_exit(struct jit_ctx *ctx)
+static void emit_unwind_exit(struct jit_ctx *ctx, long (*fixup)(u64 lr))
 {
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 r0 = bpf2a64[BPF_REG_0];
@@ -1802,7 +1862,7 @@ static void emit_unwind_exit(struct jit_ctx *ctx)
 
 	emit(A64_PUSH(r0, r2, A64_SP), ctx);
 	emit(A64_LDR64I(A64_R(0), A64_FP, 8), ctx);
-	emit_call((u64)bpf_unwind_fixup, ctx);
+	emit_call((u64)fixup, ctx);
 	emit(A64_MOV(1, tmp, A64_R(0)), ctx);
 	emit(A64_POP(r0, r2, A64_SP), ctx);
 	build_epilogue(ctx, false, true);
@@ -2424,37 +2484,58 @@ emit_cond_jmp:
 		if (emit_bpf_tail_call(ctx))
 			return -EFAULT;
 		break;
-	/* unwind_goto. The verifier expanded may_goto. */
+	/* unwind_goto, kgoto. The verifier expanded may_goto. */
 	case BPF_JMP | BPF_JCOND:
 	case BPF_JMP32 | BPF_JCOND:
 	{
+		bool kgoto = bpf_is_kgoto(insn);
+		/* 'call; unwind_goto; kgoto', and this is the second one */
+		bool after_unwind = kgoto && bpf_is_unwind_goto(insn - 1);
+		int landing[2] = { -1, -1 };
 		int ret_addr = ctx->idx - 1;
-		int target = ctx->offset[i + 1 + bpf_jmp_offset(insn)];
+		int j;
 
 		/*
-		 * 'bl foo; mov x8, x0' is in front. After the call of a subprog
+		 * The table is searched by bisection, and the entry of kgoto has the
+		 * lower address: unwind_goto leaves its entry to the kgoto behind it.
+		 */
+		if (!kgoto && i + 1 < ctx->prog->len && bpf_is_kgoto(insn + 1))
+			break;
+		if (BPF_CLASS(insn[-1 - after_unwind].code) != BPF_JMP) {
+			if (kgoto) {
+				pr_err_once("kgoto at insn %d follows no call\n", i);
+				return -EFAULT;
+			}
+			/* An access to arena is in front. The insn that faults is its last one. */
+			ret_addr = ctx->idx;
+		}
+		/*
+		 * Else 'bl foo; mov x8, x0' is in front. After the call of a subprog
 		 * the pad doesn't miss the mov: r0 is x8 in the subprog too, its
 		 * epilogue copies x8 to x0 and leaves x8 as it is. A helper that
 		 * leaves to the pad returns r0 in x0 alone, so the pad after its
 		 * call is entered through a landing past the epilogue, see
 		 * build_landings(), which fills in the fixup of the entry.
 		 */
-		if (unwind_goto_after_helper(insn)) {
-			ctx->landing_ex[ctx->landing_idx++] = ctx->exentry_idx;
-			target = ret_addr;
-		} else if (BPF_CLASS(insn[-1].code) != BPF_JMP) {
-			/* An access to arena is in front. The insn that faults is its last one. */
-			ret_addr = ctx->idx;
-		}
-		ret = add_unwind_exentry(ctx, ret_addr, target);
+		ret = add_goto_exentry(ctx, insn, ret_addr, &landing[after_unwind]);
+		if (!ret && after_unwind)
+			ret = add_goto_exentry(ctx, insn - 1, ret_addr, &landing[0]);
 		if (ret)
 			return ret;
+		/* build_landings() gets to them in the order of the insns */
+		for (j = 0; j < 2; j++)
+			if (landing[j] >= 0)
+				ctx->landing_ex[ctx->landing_idx++] = landing[j];
 		break;
 	}
 	/* function return */
 	case BPF_JMP | BPF_EXIT:
 		if (bpf_is_unwind_exit(insn) && bpf_prog_can_unwind(ctx->prog)) {
-			emit_unwind_exit(ctx);
+			emit_unwind_exit(ctx, bpf_unwind_fixup);
+			break;
+		}
+		if (bpf_is_kexit(insn) && bpf_prog_can_unwind(ctx->prog)) {
+			emit_unwind_exit(ctx, bpf_kunwind_fixup);
 			break;
 		}
 		/* Optimization: when last instruction is EXIT,
@@ -2809,8 +2890,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 		goto out_off;
 
 	for (i = 1; i < prog->len; i++)
-		if (bpf_is_unwind_goto(&prog->insnsi[i]) &&
-		    unwind_goto_after_helper(&prog->insnsi[i]))
+		if (bpf_is_pad_goto(&prog->insnsi[i]) &&
+		    goto_after_helper(&prog->insnsi[i]))
 			nr_landings++;
 	if (nr_landings) {
 		ctx.landing_ex = kvzalloc_objs(int, nr_landings);
