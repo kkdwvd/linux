@@ -1800,6 +1800,9 @@ struct bpf_verifier_env {
 	bool run_over_budget;		/* in one of its functions, see find_failing_path() */
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_needs_guard() */
+	/* the helpers and kfuncs whose landing pad for a callback was found, see check_cb_pad() */
+	unsigned long cb_pads[8];
+	u8 cb_pad_cnt;
 	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
 	bool faults_late;		/* a site is not what it seemed: see check_arena_site() */
 	bool pad_releases;		/* see release_frame_resources() */

@@ -11795,6 +11795,69 @@ static bool insn_has_cb_pad(const struct bpf_insn *insn)
 		(bpf_pseudo_kfunc_call(insn) && kfunc_has_cb_pad(insn->imm)));
 }
 
+/* kernel/extable.c has them, sorted */
+extern struct exception_table_entry __start___ex_table[];
+extern struct exception_table_entry __stop___ex_table[];
+
+/* Has the function at @addr a call with bpf_call_cb()? Its entry is keyed behind the call. */
+static bool func_has_cb_pad(unsigned long addr)
+{
+#ifdef ARCH_HAS_RELATIVE_EXTABLE
+	const struct exception_table_entry *e = __start___ex_table, *end = __stop___ex_table;
+	unsigned long size, off, key;
+	struct module *mod;
+
+	/*
+	 * A JIT that unwinds has the lookup which tells such an entry from another, see
+	 * bpf_unwind_target(). In a kernel without one no callback leaves unwound, and no entry
+	 * can be told: the lists are taken on trust.
+	 */
+	if (!bpf_jit_supports_unwind())
+		return true;
+	/* no way to tell where the function ends: the lists are taken on trust */
+	if (!kallsyms_lookup_size_offset(addr, &size, &off))
+		return true;
+	addr -= off;
+	guard(rcu)();
+	mod = __module_address(addr);
+	if (mod) {
+		e = mod->extable;
+		end = e + mod->num_exentries;
+	}
+	for (; e < end; e++) {
+		key = (unsigned long)&e->insn + e->insn;
+		/* the entry of another kind is no target: the address comes back */
+		if (key > addr && key - addr <= size && bpf_unwind_target(key) != key)
+			return true;
+	}
+#endif
+	return false;
+}
+
+/*
+ * insn_has_cb_pad() says that the helper or the kfunc at @addr has a landing pad for its callback,
+ * and the verifier lets the callback unwind for that. The lists above are kept by hand, next to
+ * the functions that call their callback with bpf_call_cb(). A function that is in a list and has
+ * no pad would not show: unwind_exit and kexit of its callback return into the text of the
+ * kernel, where no entry is how a frame that the kernel called ends, see bpf_unwind_target(). The
+ * callback would return to its helper as if nothing had happened, and nothing would warn. So look
+ * at the text, once per function and load: it has an entry of bpf_call_cb(), or that is a bug.
+ */
+static int check_cb_pad(struct bpf_verifier_env *env, unsigned long addr, const char *name)
+{
+	int i;
+
+	for (i = 0; i < env->cb_pad_cnt; i++)
+		if (env->cb_pads[i] == addr)
+			return 0;
+	if (verifier_bug_if(!func_has_cb_pad(addr), env,
+			    "%s has no landing pad for its callback", name))
+		return -EFAULT;
+	if (env->cb_pad_cnt < ARRAY_SIZE(env->cb_pads))
+		env->cb_pads[env->cb_pad_cnt++] = addr;
+	return 0;
+}
+
 /*
  * A sync callback is called by a helper or a kfunc, a C frame between the
  * callback and the BPF code that called it. unwind_exit of the callback returns
@@ -13555,6 +13618,12 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	if (err)
 		return err;
 
+	if (insn_has_cb_pad(insn)) {
+		err = check_cb_pad(env, (unsigned long)fn->func, func_id_name(func_id));
+		if (err)
+			return err;
+	}
+
 	if (meta.release_regno) {
 		struct bpf_reg_state *reg = &regs[meta.release_regno];
 		bool convert_rcu = (func_id == BPF_FUNC_kptr_xchg) && in_rcu_cs(env) &&
@@ -13581,8 +13650,12 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		}
 		break;
 	case BPF_FUNC_for_each_map_elem:
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
-					 set_map_elem_callback_state);
+		/* the helper calls the op of the map, which calls the callback: two frames */
+		err = BPF_HAS_CB_PADS ?
+		      check_cb_pad(env, (unsigned long)meta.map.ptr->ops->map_for_each_callback,
+				   "map_for_each_callback()") : 0;
+		err = err ?: push_callback_call(env, insn, insn_idx, meta.subprogno,
+						set_map_elem_callback_state);
 		break;
 	case BPF_FUNC_timer_set_callback:
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
@@ -16473,8 +16546,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (err)
 				return err;
 		}
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
-					 set_rbtree_add_callback_state);
+		err = insn_has_cb_pad(insn) ? check_cb_pad(env, desc->addr, func_name) : 0;
+		err = err ?: push_callback_call(env, insn, insn_idx, meta.subprogno,
+						set_rbtree_add_callback_state);
 		if (err) {
 			verbose(env, "kfunc %s#%d failed callback verification\n",
 				func_name, meta.func_id);

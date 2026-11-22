@@ -1802,6 +1802,13 @@ static u64 unwind_target(u64 ret_addr, int key)
 	 * pad is the next insn, and kgoto behind a call of what has kexit. So a
 	 * return address in a prog without an entry is an unwind_exit or a
 	 * kexit that gets lost: the verifier sent it to a pad.
+	 * The warning tells the first one of a boot, and no later one. And it
+	 * does not tell a return into the text of the kernel, where no entry
+	 * is how a frame that the kernel called ends: a helper that called a
+	 * callback without a pad would look the same. The verifier lets a
+	 * callback unwind only below a helper that it takes to have a pad, and
+	 * looks for the entry in the text of that helper when a prog is loaded,
+	 * see check_cb_pad().
 	 */
 	scoped_guard(rcu)
 		WARN_ON_ONCE(bpf_prog_ksym_find(ret_addr - 1));
