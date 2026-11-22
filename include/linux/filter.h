@@ -295,7 +295,24 @@ static inline bool insn_is_mov_percpu_addr(const struct bpf_insn *insn)
 		.off   = 0,					\
 		.imm   = 1 })
 
-/* gotol, and unwind_goto that the verifier adds, have 32 bits for the offset */
+/*
+ * The insns of an unwind that the kernel starts, where unwind_goto and unwind_exit are those of an
+ * unwind that the program starts: kexit leaves a frame like unwind_exit, and goes to kgoto after
+ * the call, never to unwind_goto. So no landing pad that the program has is entered when the
+ * kernel unwinds a frame, and none can end that unwind. Only the verifier emits the two, see
+ * kernel/bpf/pads.c: a program that has one is rejected, see check_jmp_fields().
+ *
+ * kgoto: BPF_JMP32 | BPF_JCOND with BPF_KGOTO in src_reg, the offset is in imm. It follows a call,
+ * or unwind_goto of a call.
+ * kexit: BPF_JMP | BPF_EXIT with BPF_KEXIT in src_reg.
+ */
+#define BPF_KGOTO	2
+#define BPF_KEXIT	2
+
+static_assert(BPF_KGOTO > BPF_UNWIND_GOTO);
+static_assert(BPF_KEXIT > BPF_UNWIND_EXIT);
+
+/* gotol, kgoto, and unwind_goto that the verifier adds, have 32 bits for the offset */
 static inline bool bpf_jmp_offset_is_imm(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP32 | BPF_JA) || insn->code == (BPF_JMP32 | BPF_JCOND);
@@ -317,7 +334,23 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
 	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_UNWIND_EXIT;
 }
 
-/* The caller of the main prog doesn't tell unwind_exit from exit */
+static inline bool bpf_is_kgoto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JCOND) && insn->src_reg == BPF_KGOTO;
+}
+
+static inline bool bpf_is_kexit(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_KEXIT;
+}
+
+/* No code, an entry of the exception table for the insn in front: unwind_goto or kgoto */
+static inline bool bpf_is_pad_goto(const struct bpf_insn *insn)
+{
+	return bpf_is_unwind_goto(insn) || bpf_is_kgoto(insn);
+}
+
+/* The caller of the main prog doesn't tell unwind_exit and kexit from exit */
 static inline bool bpf_prog_can_unwind(const struct bpf_prog *prog)
 {
 	return bpf_is_subprog(prog);
@@ -1397,6 +1430,7 @@ bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
 bool bpf_jit_supports_hmul(void);
 u64 bpf_unwind_target(u64 ret_addr);
+u64 bpf_kunwind_target(u64 ret_addr);
 u64 bpf_fault_unwind_target(u64 end);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);

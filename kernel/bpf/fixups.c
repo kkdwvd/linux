@@ -1187,10 +1187,11 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	int i;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		unwinds = bpf_is_unwind_goto(insn) && aux_data[i + 1 + bpf_jmp_offset(insn)].seen;
+		unwinds = bpf_is_pad_goto(insn) && aux_data[i + 1 + bpf_jmp_offset(insn)].seen;
 		calls = (bpf_pseudo_call(insn) || bpf_is_callx(insn)) && aux_data[i].seen;
 		/*
-		 * The callee never exits. Its unwind_exit needs unwind_goto all the same.
+		 * The callee never exits. Its unwind_exit needs unwind_goto all the same, and
+		 * its kexit needs kgoto.
 		 * The cpu predicts that it returns to what follows, or speculates to an exit.
 		 * Don't let the removal of dead code put something else there.
 		 */
@@ -1202,9 +1203,10 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 		if (unwinds || !aux_data[i].seen || !bpf_insn_is_cond_jump(insn->code))
 			continue;
 
+		/* unwind_goto of the program that kgoto follows has its offset in imm */
 		if (!aux_data[i + 1].seen)
 			ja.off = insn->off;
-		else if (!aux_data[i + 1 + insn->off].seen)
+		else if (!aux_data[i + 1 + bpf_jmp_offset(insn)].seen)
 			ja.off = 0;
 		else
 			continue;
@@ -1555,7 +1557,7 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 	struct bpf_insn *zext_patch = env->insn_buf;
 	struct bpf_insn *rnd_hi32_patch = &env->insn_buf[2];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int i, err, patch_len, len = env->prog->len;
+	int i, err, patch_len, gotos, len = env->prog->len;
 	struct bpf_insn *insns = env->prog->insnsi;
 	bool rnd_hi32;
 
@@ -1631,11 +1633,13 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 		patch_len = 2;
 apply_patch_buffer:
 		/*
-		 * Nothing stands between an insn and its unwind_goto. On the way to the
-		 * landing pad the insn has not written the register.
+		 * Nothing stands between an insn and its unwind_goto and kgoto. On the way to
+		 * the landing pad the insn has not written the register.
 		 */
-		if (bpf_is_unwind_goto(&insns[i + 1])) {
-			err = bpf_patch_list_insert(env, i + 2, patch + 1, patch_len - 1);
+		gotos = bpf_is_pad_goto(&insns[i + 1]);
+		gotos += gotos && bpf_is_pad_goto(&insns[i + 2]);
+		if (gotos) {
+			err = bpf_patch_list_insert(env, i + 1 + gotos, patch + 1, patch_len - 1);
 			if (err)
 				return err;
 			continue;
@@ -1804,7 +1808,7 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 			insn->code = BPF_STX | BPF_PROBE_ATOMIC | BPF_SIZE(insn->code);
 			env->prog->aux->num_exentries++;
 			continue;
-		} else if (bpf_is_unwind_goto(insn)) {
+		} else if (bpf_is_pad_goto(insn)) {
 			/* jit_subprogs() counts again, a prog of one function doesn't get there */
 			env->prog->aux->num_exentries++;
 			continue;
@@ -2193,7 +2197,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 			if (BPF_CLASS(insn->code) == BPF_STX &&
 			     BPF_MODE(insn->code) == BPF_PROBE_ATOMIC)
 				num_exentries++;
-			if (bpf_is_unwind_goto(insn))
+			if (bpf_is_pad_goto(insn))
 				num_exentries++;
 		}
 		func[i]->aux->num_exentries = num_exentries;
@@ -2385,10 +2389,16 @@ static bool is_arena_access(const struct bpf_insn *insn)
 	return class == BPF_STX && (mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC);
 }
 
+/* A call of any kind: what it calls returns to the insn behind it */
+static bool is_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn);
+}
+
 /* The exception table can have an entry at the end of the insn: a call, an access to arena */
 static bool can_have_unwind_goto(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn) || is_arena_access(insn);
+	return is_call(insn) || is_arena_access(insn);
 }
 
 /*
@@ -2401,6 +2411,9 @@ static bool can_have_unwind_goto(const struct bpf_insn *insn)
  * front, and such an insn that the verifier gave unwind_goto still has it behind. An insn that a
  * pass has replaced by other code is no site any more: the inlined bpf_loop() has unwind_goto of
  * its own, see inline_bpf_loop().
+ * kgoto is the same for kexit. It stands behind a call, or behind unwind_goto of a call. Not behind
+ * an access to arena: the handler of a fault looks for unwind_goto there. kexit is in no frame
+ * that the kernel calls: the main program leaves with exit.
  */
 int bpf_check_unwind_gotos(struct bpf_verifier_env *env)
 {
@@ -2412,6 +2425,16 @@ int bpf_check_unwind_gotos(struct bpf_verifier_env *env)
 		    verifier_bug_if(!i || !can_have_unwind_goto(insn - 1), env,
 				    "unwind_goto at insn %d follows no call and no access to arena",
 				    i))
+			return -EFAULT;
+		if (bpf_is_kgoto(insn) &&
+		    verifier_bug_if(!i || !(is_call(insn - 1) ||
+					    (i > 1 && bpf_is_unwind_goto(insn - 1) &&
+					     is_call(insn - 2))), env,
+				    "kgoto at insn %d follows no call", i))
+			return -EFAULT;
+		if (bpf_is_kexit(insn) &&
+		    verifier_bug_if(i < env->subprog_info[1].start, env,
+				    "kexit at insn %d of the main program", i))
 			return -EFAULT;
 		if (env->insn_aux_data[i].unwind_goto_follows && can_have_unwind_goto(insn) &&
 		    verifier_bug_if(i + 1 == len || !bpf_is_unwind_goto(insn + 1), env,

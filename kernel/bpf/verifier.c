@@ -23558,6 +23558,7 @@ static int check_jmp_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		}
 		return 0;
 	case BPF_EXIT:
+		/* kexit is for the verifier to emit, see BPF_KEXIT */
 		if (BPF_SRC(insn->code) != BPF_K || insn->imm != 0 ||
 		    insn->src_reg > BPF_UNWIND_EXIT || insn->dst_reg != BPF_REG_0 ||
 		    class == BPF_JMP32) {
@@ -23566,6 +23567,7 @@ static int check_jmp_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		}
 		return 0;
 	case BPF_JCOND:
+		/* and so are kgoto and the form of unwind_goto that has 32 bits for the offset */
 		if (insn->code != (BPF_JMP | BPF_JCOND) || insn->src_reg > BPF_UNWIND_GOTO ||
 		    insn->dst_reg || insn->imm) {
 			verbose(env, "invalid may_goto imm %d\n", insn->imm);

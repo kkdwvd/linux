@@ -3843,6 +3843,15 @@ u64 __weak bpf_unwind_target(u64 ret_addr)
 }
 
 /*
+ * Where kexit returns: to kgoto of the call when the caller has one, and where exit would
+ * otherwise. Without the real one of a JIT the verifier emits no kexit.
+ */
+u64 __weak bpf_kunwind_target(u64 ret_addr)
+{
+	return ret_addr;
+}
+
+/*
  * Where a fault in the code of an insn that ends at @end goes: the landing pad that unwind_goto
  * after the insn names, or @end, which skips the insn. The JITs that go to a pad at a fault have
  * the real one.
