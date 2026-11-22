@@ -161,7 +161,8 @@
  *     to a site in both ways a test of K picks the pad.
  * No plan for one of them is an error of the program, as it is at any site: THE KERNEL ENTERS A
  * LANDING PAD THAT ONLY RESUMES, OR THE PROGRAM IS REJECTED, see bpf_pads_settle(). No pad is
- * passed by for what the verifier cannot arrange around it.
+ * passed by for what the verifier cannot arrange around it. The same if the stack has no room
+ * for the hidden words.
  * And WHAT THE KERNEL UNWINDS CANNOT BE CAUGHT still holds: a forced frame never returns to its
  * caller, and no state of the normal path is joined with one of a forced frame.
  *
@@ -1444,6 +1445,21 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 }
 
 /*
+ * The kernel had brought @st into a landing pad of the program when it got here: a frame of it is
+ * one that the kernel unwinds, or the first frame of a function that such a frame called and that
+ * is verified on its own. See 'forced' of struct bpf_func_state.
+ */
+static bool state_is_in_kpad(const struct bpf_verifier_state *st)
+{
+	int i;
+
+	for (i = 0; i <= st->curframe && st->frame[i]; i++)
+		if (st->frame[i]->forced)
+			return true;
+	return false;
+}
+
+/*
  * The current frame of @st is about to be unwound at the site of @kind at @insn_idx. Make the plan
  * of the site serve @st too. A visit at which the frame holds nothing is a visit like any other.
  *
@@ -1463,6 +1479,11 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	plan = bpf_pad_plan_get(env, insn_idx, kind);
 	if (!plan)
 		return ERR_PTR(-ENOMEM);
+	/* how the states got to the function, for the log of a conflict: see bpf_pad_log() */
+	if (state_is_in_kpad(st))
+		plan->from_kpad = true;
+	else
+		plan->from_normal = true;
 	if (plan->conflict)
 		return plan;
 	err = visit_refs(env, plan, st, insn_idx);
@@ -1547,6 +1568,24 @@ void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group)
 
 	for (f = 0; f <= st->curframe; f++)
 		env->subprog_info[st->frame[f]->subprogno].no_slots |= BIT(group);
+}
+
+/*
+ * The current insn releases a resource of @group that a caller of its frame acquired, or leaves a
+ * section that a caller entered. If the kernel had brought the state into a landing pad of the
+ * program, that is noted too, for the log of a conflict that hidden slots would have settled, see
+ * bpf_pad_log().
+ */
+static void released_of_caller(struct bpf_verifier_env *env, enum bpf_pad_group group)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+	int f;
+
+	bpf_pad_no_slots(env, group);
+	if (!state_is_in_kpad(st))
+		return;
+	for (f = 0; f <= st->curframe; f++)
+		env->subprog_info[st->frame[f]->subprogno].no_slots_kpad |= BIT(group);
 }
 
 /*
@@ -1705,7 +1744,7 @@ void bpf_pad_note_release(struct bpf_verifier_env *env, int idx)
 	if (env->pad_releases)
 		return;
 	if (idx < frame->entry_refs) {
-		bpf_pad_no_slots(env, group);
+		released_of_caller(env, group);
 		return;
 	}
 	obj = find_obj(st, ref, &addr);
@@ -1740,7 +1779,7 @@ void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class
 	else if (frame_sections(st, class))
 		note_release(env, sub, class, 0, 0);
 	else
-		bpf_pad_no_slots(env, class_group(class));
+		released_of_caller(env, class_group(class));
 }
 
 /*
@@ -2253,6 +2292,14 @@ static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_pl
 
 	if (!plan->used || plan->conflict)
 		return 0;
+	/*
+	 * Nor for a frame that the kernel unwinds through a landing pad of the program: the
+	 * normal path pays no store for a way that only the kernel takes. Without a plan there
+	 * the program is rejected. Its pads do use the slots that the function has for another
+	 * site, see plan_take_slots().
+	 */
+	if (bpf_site_is_forced(plan->kind) || plan->kind == BPF_SITE_KENTRY)
+		return 0;
 	if (plan->no_place && all_ptrs)
 		groups |= BIT(BPF_PAD_GROUP_REFS);
 	for (i = 0; i < plan->nr_ents; i++) {
@@ -2261,6 +2308,39 @@ static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_pl
 			groups |= BIT(class_group(plan->ents[i].class));
 	}
 	return groups;
+}
+
+/*
+ * The groups that the conflict of @plan would not be one with hidden slots for: what the conflict
+ * is about, of what @plan asked for when the slots were settled, see settle_slots(), and did not
+ * get. A plan that had its conflict by then asked for nothing: a lock that no place has on a visit
+ * is not what a slot is for, see visit_refs().
+ */
+static u8 conflict_groups(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	u8 groups = 0;
+	int i;
+
+	switch (plan->conflict) {
+	case BPF_CONFLICT_SECTIONS_DIFFER:
+		groups = plan->sections_differ;
+		break;
+	case BPF_CONFLICT_NO_PLACE:
+		groups = BIT(BPF_PAD_GROUP_REFS);
+		break;
+	case BPF_CONFLICT_NOT_ALWAYS_HELD:
+	case BPF_CONFLICT_CALLER_SAVED:
+		for (i = 0; i < plan->nr_ents; i++)
+			if (settle_ent(env, plan, &plan->ents[i]) == plan->conflict)
+				groups |= BIT(class_group(plan->ents[i].class));
+		/* 'no_place' of the plan can be the same reason, see settle_plan() */
+		if (plan->no_place)
+			groups |= BIT(BPF_PAD_GROUP_REFS);
+		break;
+	default:
+		break;
+	}
+	return groups & plan->asked_slots;
 }
 
 /* The slot of bpf_res_spin_lock_irqsave() has a word for the second argument of the release */
@@ -2272,7 +2352,8 @@ static int slot_words(const struct bpf_pad_note *note)
 /* Does the pad of @plan run in a frame that has set up its hidden slots? */
 static bool plan_has_slots(const struct bpf_pad_plan *plan)
 {
-	return bpf_site_base(plan->kind) != BPF_SITE_RECURSION && !plan->conflict;
+	return bpf_site_base(plan->kind) != BPF_SITE_RECURSION &&
+	       plan->kind != BPF_SITE_KENTRY && !plan->conflict;
 }
 
 /* Has @plan room for @slots entries in place of those that it has of @group? */
@@ -2361,9 +2442,11 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	}
 	if (!nr)
 		return 0;
+	/* a plan of a frame that the kernel unwinds has a conflict instead, see below */
 	for (i = sub->start; i < sub[1].start; i++)
 		for (plan = aux[i].pad_plans; plan; plan = plan->next)
 			if (plan->used && plan_has_slots(plan) &&
+			    !bpf_site_is_forced(plan->kind) &&
 			    !plan_has_room(plan, group, slots))
 				return 0;
 	sub->hidden_words += words;
@@ -2374,7 +2457,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	}
 	for (i = sub->start; i < sub[1].start; i++) {
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
-			/* the program does not have its site */
+			/* the program does not have its site, or the kernel unwinds its frame */
 			if (plan_has_slots(plan) && !plan_has_room(plan, group, slots))
 				plan->conflict = BPF_CONFLICT_SLOTS_FULL;
 			err = plan_has_slots(plan) ?
@@ -2399,13 +2482,14 @@ static int settle_slots(struct bpf_verifier_env *env)
 	struct bpf_pad_plan *plan;
 	int i, s, err;
 	bool all_ptrs;
-	u8 need;
+	u8 need, asks;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		env->subprog_info[s].slots = 0;
 		env->subprog_info[s].hidden_words = 0;
 		env->subprog_info[s].value_off = 0;
 		env->subprog_info[s].no_value_word = false;
+		env->subprog_info[s].k_off = 0;
 	}
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -2414,9 +2498,14 @@ static int settle_slots(struct bpf_verifier_env *env)
 			if (bpf_must_abort())
 				return -EINTR;
 			need = 0;
-			for (i = sub->start; i < sub[1].start; i++)
-				for (plan = aux[i].pad_plans; plan; plan = plan->next)
-					need |= plan_needs_slots(env, plan, all_ptrs);
+			for (i = sub->start; i < sub[1].start; i++) {
+				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+					asks = plan_needs_slots(env, plan, all_ptrs);
+					/* for the log of a conflict, see conflict_groups() */
+					plan->asked_slots |= asks;
+					need |= asks;
+				}
+			}
 			need &= ~sub->no_slots;
 			err = need ? subprog_take_slots(env, s, __ffs(need)) : 0;
 			if (err < 0)
@@ -2677,12 +2766,211 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 			plan->sections[BPF_PAD_PREEMPT]);
 }
 
+/*
+ * The insns that get to insn @at over the edges of the control flow graph, @at included: a bitmap
+ * of the program. NULL if there is no memory.
+ * The walk is for the log and is not charged. So it goes back from @at over each edge of the
+ * function once: a walk over the insns until nothing changes takes a round per loop on the way.
+ */
+static unsigned long *insns_that_reach(struct bpf_verifier_env *env, int at)
+{
+	const struct bpf_subprog_info *sub = bpf_find_containing_subprog(env, at);
+	unsigned long *reach = bitmap_zalloc(env->prog->len, BPF_VERIFIER_GFP);
+	/* an edge, and 1 + the edge before it that goes to the same insn */
+	struct { u32 from, prev; } *edges = NULL, *edge;
+	/* per insn: 1 + the last edge that goes to it. And the insns to walk back from. */
+	u32 *last, *todo;
+	struct bpf_iarray *succ;
+	int i, p, t, nr = 0, top = 0;
+
+	last = kvcalloc(env->prog->len, sizeof(*last), BPF_VERIFIER_GFP);
+	todo = kvmalloc_array(env->prog->len, sizeof(*todo), BPF_VERIFIER_GFP);
+	if (!reach || !last || !todo)
+		goto err;
+	for (p = sub->postorder_start; p < sub[1].postorder_start; p++) {
+		i = env->cfg.insn_postorder[p];
+		succ = bpf_insn_successors(env, i);
+		iarray_for_each(t, succ) {
+			edge = bpf_table_next(edges, nr);
+			if (!edge)
+				goto err;
+			*edge = (typeof(*edge)){ i, last[t] };
+			last[t] = ++nr;
+		}
+	}
+	__set_bit(at, reach);
+	todo[top++] = at;
+	while (top) {
+		t = todo[--top];
+		for (p = last[t]; p; p = edges[p - 1].prev) {
+			i = edges[p - 1].from;
+			if (!__test_and_set_bit(i, reach))
+				todo[top++] = i;
+		}
+	}
+out:
+	kvfree(edges);
+	kvfree(last);
+	kvfree(todo);
+	return reach;
+err:
+	bitmap_free(reach);
+	reach = NULL;
+	goto out;
+}
+
+/* The first insn of the landing pad that the program has behind the call at @call_idx */
+static int pad_of_call(struct bpf_verifier_env *env, int call_idx)
+{
+	return call_idx + 2 + bpf_jmp_offset(&env->prog->insnsi[call_idx + 1]);
+}
+
+/*
+ * The call behind which the kernel enters the first landing pad of the program in @sub, -1 if it
+ * enters none. *@more: how many more of them @sub has. With @reach only the pads whose first insn
+ * is in that bitmap count, see insns_that_reach().
+ * A pass that is over knows the entries that the program has in the end, 'used'. Until then those
+ * that a state went through have to do.
+ */
+static int first_entered_pad(struct bpf_verifier_env *env, const struct bpf_subprog_info *sub,
+			     const unsigned long *reach, int *more)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
+	int i, used, first = -1;
+
+	for (used = 1; used >= 0 && first < 0; used--) {
+		*more = 0;
+		for (i = sub->start; sub->has_kpads && i < sub[1].start; i++) {
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+			if (!plan || !(used ? plan->used : plan->visited))
+				continue;
+			if (reach && !test_bit(pad_of_call(env, i), reach))
+				continue;
+			if (first < 0)
+				first = i;
+			else
+				(*more)++;
+		}
+	}
+	return first;
+}
+
+/*
+ * The log of an error that is one because the kernel enters landing pads of the program in @sub:
+ * the start of the line that says so, which names the first of them, of those that count, see
+ * first_entered_pad(). False if there is none.
+ */
+static bool print_entered_pad(struct bpf_verifier_env *env, const struct bpf_subprog_info *sub,
+			      const unsigned long *reach)
+{
+	int more, call = first_entered_pad(env, sub, reach, &more);
+
+	if (call < 0)
+		return false;
+	verbose(env, "the kernel would enter the landing pad at %d of the call at %d",
+		pad_of_call(env, call), call);
+	if (more)
+		verbose(env, ", and %d more of func#%d", more, (int)(sub - env->subprog_info));
+	verbose(env, ": ");
+	return true;
+}
+
+/*
+ * A conflict that a landing pad of the program can make in a frame above its own: its code
+ * releases what a caller holds, a lock or a section, on some ways out of its function only, or
+ * writes to the stack of a caller, where irq flags or an iterator are. Not a conflict that is
+ * there whatever a callee does: one state that holds too much, a release that the program cannot
+ * call, a value that is no number, a frame that cannot unwind.
+ */
+static bool pad_can_cause(enum bpf_pad_conflict conflict)
+{
+	switch (conflict) {
+	case BPF_CONFLICT_SECTIONS_DIFFER:
+	case BPF_CONFLICT_PLAN_FULL:
+	case BPF_CONFLICT_SLOTS_FULL:
+	case BPF_CONFLICT_NOT_ALWAYS_HELD:
+	case BPF_CONFLICT_NO_PLACE:
+	case BPF_CONFLICT_ORDER_DIFFERS:
+	case BPF_CONFLICT_CALLER_SAVED:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * The conflict of @plan, a site at insn @i, is an error. The kernel enters a landing pad of the
+ * program that only resumes or the program is rejected: where such a pad has a part in the
+ * conflict the log says so, in front of the line of the conflict. It names a pad only where that
+ * pad is known to have the part.
+ *   - The plan is that of an entry: it has no value to keep.
+ *   - The frame is one that the kernel unwinds through such a pad: it has no plan where the pad
+ *     ends, or at a site in pad code. A frame does not know which entry it came through: the
+ *     first pad of the function that gets to the insn on the control flow graph is named, and
+ *     the others that do are counted.
+ *   - States got to the site out of such a pad, in a function that the pad calls. Its frame
+ *     does not know the pad. If states of the normal path got there as well, the function is
+ *     "also" called from the pad: the conflict may be one without the pad.
+ *   - What came back to the call of the plan left a frame below through such a pad, which may
+ *     have taken from what the frame of the call holds, or written to its stack. Which pad it
+ *     was is not known, and a pad on the way may have done nothing of the kind: the function
+ *     that came back is named, the pad is in it or below it.
+ *   - Such a pad released what a caller holds, and no function on the stack gets hidden slots
+ *     for that, see released_of_caller(): the plan needed them for it.
+ */
+static void print_kpad_conflict(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	const struct bpf_subprog_info *sub = bpf_find_containing_subprog(env, i);
+	unsigned long *reach;
+	int s, c = -1;
+
+	if (!bpf_verifier_log_needed(&env->log))
+		return;
+	if (plan->kind == BPF_SITE_KENTRY) {
+		verbose(env, "the kernel would enter the landing pad at %d of the call at %d: its entry has no value to keep: %s\n",
+			pad_of_call(env, i), i, conflict_why[plan->conflict]);
+		return;
+	}
+	if (bpf_site_is_forced(plan->kind)) {
+		reach = insns_that_reach(env, i);
+		if (reach && print_entered_pad(env, sub, reach)) {
+			if (plan->kind == BPF_SITE_REMAINDER)
+				verbose(env, "what the pad leaves at unwind_exit at %d cannot be released\n",
+					i);
+			else
+				verbose(env, "a site in its code has no plan\n");
+		}
+		bitmap_free(reach);
+		return;
+	}
+	if (plan->from_kpad)
+		verbose(env, "func#%d is %scalled from a landing pad of the program that the kernel would enter\n",
+			(int)(sub - env->subprog_info), plan->from_normal ? "also " : "");
+	if (!pad_can_cause(plan->conflict))
+		return;
+	if (bpf_site_is_call(plan->kind) && (sites_below(env, plan) & BIT(BPF_SITE_REMAINDER)))
+		bpf_pad_for_each_callee(plan, s)
+			if (c < 0 && (env->subprog_info[s].left_at & BIT(BPF_SITE_REMAINDER)))
+				c = s;
+	if (c >= 0)
+		verbose(env, "the kernel would enter a landing pad of the program in or below func#%d: it may release or overwrite what a caller holds at the call at %d\n",
+			c, i);
+	else if (sub->no_slots_kpad & conflict_groups(env, plan))
+		verbose(env, "the kernel would enter a landing pad of the program: what its code releases of a caller may keep func#%d from getting hidden slots\n",
+			(int)(sub - env->subprog_info));
+}
+
 /* What the landing pad of the site of @plan at @insn_idx releases, or why there is none */
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan)
 {
-	if (plan->conflict)
+	if (plan->conflict) {
 		print_sites_below(env, insn_idx, plan);
-	print_plan(env, insn_idx, plan);
+		print_kpad_conflict(env, insn_idx, plan);
+	}
+	/* an entry that has a conflict is none: the line above has said why */
+	if (plan->kind != BPF_SITE_KENTRY || !plan->conflict)
+		print_plan(env, insn_idx, plan);
 }
 
 /*
@@ -2799,6 +3087,61 @@ static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info
 }
 
 /*
+ * @sub gets the hidden word K, and in a program with bpf_throw() the word for the value: the entry
+ * of a landing pad stores both. Returns 1 if the stack has no room.
+ */
+static int take_kernel_words(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
+{
+	int err;
+
+	sub->hidden_words++;
+	err = bpf_hidden_slots_fit(env);
+	if (err <= 0) {
+		sub->hidden_words--;
+		return err ?: 1;
+	}
+	sub->k_off = -(int)bpf_stack_depth_with_slots(sub);
+	if (!env->has_throw)
+		return 0;
+	err = take_value_word(env, sub);
+	return err < 0 ? err : !!err;
+}
+
+/*
+ * The functions in which the kernel enters a landing pad of the program get their hidden words,
+ * see take_kernel_words(). They come last: the stack of a function at its limit has no room for
+ * them, and they must not take the room of what a program that loads without them needs, the word
+ * for the value of a pad of the verifier. Without room the kernel cannot enter the landing pads of
+ * the function, and that is an error like any other.
+ */
+static int take_kpad_words(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_subprog_info *sub;
+	struct bpf_pad_plan *plan;
+	int i, s, err;
+	bool enters;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		enters = false;
+		for (i = sub->start; sub->has_kpads && !enters && i < sub[1].start; i++) {
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+			enters = plan && plan->used;
+		}
+		err = enters ? take_kernel_words(env, sub) : 0;
+		if (err < 0)
+			return err;
+		if (!err)
+			continue;
+		print_entered_pad(env, sub, NULL);
+		verbose(env, "no room in the stack for the hidden words of func#%d\n", s);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
  * The main pass unwinds at more sites than the program has in the end: pass 0 takes the edge of
  * may_goto in every loop that nothing stops, and a loop that has a trip count gets no may_goto.
  * The states that left a frame there went on to the callers, and visited the plans of the calls.
@@ -2828,7 +3171,7 @@ void bpf_pads_mark_used(struct bpf_verifier_env *env)
  * through the pad, unwind_exit where the pad ends, and a pad of the verifier in a caller that gets
  * what such a frame left. What the program does in its pad is its own business. What the verifier
  * adds around it has to be right, or the program does not load: no landing pad is passed by
- * because the verifier has no plan.
+ * because the verifier has no plan, see bpf_pad_log() for what the log says then.
  */
 int bpf_pads_settle(struct bpf_verifier_env *env)
 {
@@ -2866,9 +3209,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			/* the plan of an entry is no plan of a pad: its conflict is what it is */
 			if (plan->kind != BPF_SITE_KENTRY) {
 				err = settle_plan(env, plan);
-				if (!err &&
-				    (plan_saves_value(env, plan, sub - env->subprog_info) ||
-				     (bpf_site_is_forced(plan->kind) && env->has_throw)))
+				if (!err && plan_saves_value(env, plan, sub - env->subprog_info))
 					err = take_value_word(env, sub);
 				if (err < 0)
 					return err;
@@ -2905,8 +3246,13 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 		bpf_pad_log(env, at, reject);
 		return -EINVAL;
 	}
+	if (env->faults_late)
+		return 0;
+	err = take_kpad_words(env);
+	if (err)
+		return err;
 	/* The main pass is over: the program has no access to its stack that is not known. */
-	for (s = 0; !env->faults_late && s < env->subprog_cnt; s++) {
+	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
 		if (sub->hidden_words)
 			bpf_stack_take_hidden_words(sub);
@@ -3027,7 +3373,8 @@ static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan 
  *   - a conflict at a call of the normal path, in a function that the code of the pad calls as
  *     well: the numbers that the pad passes take the trip count from its loop, and may_goto is in
  *     the code for every call of the function;
- *   - hidden slots that a function does not get because of what the code of the pad releases.
+ *   - hidden slots that a function does not get because of what the code of the pad releases,
+ *     and hidden words of the function of the pad that have no room, see take_kpad_words().
  * So there is one rule: whatever the error is, every function in which the kernel entered a pad
  * is marked. The calls behind which it did are causes, and so is what makes their callees unwind,
  * see note_causes_below(). The marks say what the next pass keeps apart and nothing else: no
@@ -3288,7 +3635,9 @@ static bool insn_returns(const struct bpf_insn *insn)
  * it is that no insn which it can get to returns to its caller: it is left at unwind_exit or at a
  * site, with kexit, and nowhere else. See enter_kernel_pad() in verifier.c.
  *
- * The answer is a property of the insns, the same in every pass: 'kpad' of unwind_goto.
+ * The answer is a property of the insns, the same in every pass: 'kpad' of unwind_goto. The
+ * kernel enters each of these pads when it unwinds what the call in front of it calls, in a
+ * function that can unwind, or the program is rejected: see bpf_pads_settle().
  * Dead branches are gone from the graph, see bpf_prune_dead_branches().
  */
 int bpf_find_kernel_pads(struct bpf_verifier_env *env)

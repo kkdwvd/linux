@@ -646,9 +646,18 @@ struct bpf_pad_plan {
 	bool visited;
 	bool used;			/* the program leaves the frame there, see bpf_pads_mark_used() */
 	bool failed;			/* a state made the conflict an error of the pass */
+	/*
+	 * A state visited that the kernel had brought into a landing pad of the program, see
+	 * bpf_pad_visit(), and a state visited that it had not: the log of a conflict here says
+	 * so, see bpf_pad_log()
+	 */
+	bool from_kpad;
+	bool from_normal;
 	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
 	u8 sections_differ;		/* bit per class: not the same number on all visits */
 	u8 no_place;			/* the conflict unless hidden slots have all pointers */
+	/* the groups that it asked hidden slots for, bits by enum bpf_pad_group: settle_slots() */
+	u8 asked_slots;
 	u8 nr_ents;
 	bool ordered;			/* see order_ents() */
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
@@ -1519,6 +1528,11 @@ struct bpf_subprog_info {
 	u32 cycle; /* the first subprog of its cycle of the call graph, 0 if it is on none */
 	/* the hidden word where its landing pads keep the value over their calls. 0: none */
 	s16 value_off;
+	/*
+	 * The hidden word K of a function in which the kernel enters a landing pad of the program:
+	 * 0 from the entry of the function on, 1 once the kernel unwinds the frame. 0: none.
+	 */
+	s16 k_off;
 	u32 insns_total;
 	u32 insns_self;
 	/* offsets in range [stack_depth .. fastcall_stack_off)
@@ -1650,6 +1664,12 @@ struct bpf_subprog_info {
 	u16 left_at;
 	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
 	u8 no_slots: 4;
+	/*
+	 * Of those, the groups that it cannot have slots for because a state that the kernel had
+	 * brought into a landing pad of the program released of a caller: the log of a conflict
+	 * that the slots would have settled says so, see bpf_pad_log()
+	 */
+	u8 no_slots_kpad: 4;
 	/* it has them for these. Each bpf_pads_settle() decides anew. */
 	u8 slots: 4;
 	/* they take that many words of 8 bytes below its stack */

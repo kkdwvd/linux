@@ -22559,7 +22559,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		 * It is an error also where a landing pad of the program that the kernel entered
 		 * has a part in it: what came back to the call left a frame below through such
 		 * a pad, or the state got here out of one, in a function that the pad calls.
-		 * The kernel enters the pad or the program is rejected.
+		 * The kernel enters the pad or the program is rejected, see bpf_pad_log().
 		 */
 		if (plan->conflict && certain && (bpf_pad_must_unwind(env, plan) || !stuck)) {
 			bpf_pad_log(env, insn_idx, plan);
