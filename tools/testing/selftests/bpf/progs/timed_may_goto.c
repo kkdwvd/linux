@@ -3,8 +3,14 @@
  * There is one time slice of may_goto for an invocation of a prog: one call from the kernel into
  * the main prog, with the subprogs and sync callbacks that it reaches.
  *
- * Most tests call a function that spins until may_goto stops it, four times, each in a different
- * way. Only the first call can spin. With a time slice for each call all four do.
+ * When it is up may_goto ends the invocation: the prog is unwound, and returns what an unwound
+ * prog of its type returns. That is 2, TC_ACT_SHOT, for tc and 0 for a socket filter or a
+ * tracing prog. Most tests call a function that spins until may_goto stops it, four times, each
+ * in a different way. The first call ends the prog. With a time slice for each call the prog would
+ * go on for a second, or for ever.
+ *
+ * Where a subprog cannot unwind may_goto jumps where the program says and the prog goes on, see
+ * time_is_up(). The tests of what follows then use it.
  */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
@@ -44,36 +50,124 @@ static __noinline int counts_to_1000(void)
 	return cnt;
 }
 
+/* The prog is unwound in the first call. If it went on it would return 11, or 14. */
 SEC("tc")
 __description("timed may_goto: call")
-__success __retval(1)
+__success __retval(2)
 int call_subprog(void *ctx)
 {
-	int i, n = 0;
+	int i, n = 10;
 
 	for (i = 0; i < TRIES; i++)
 		n += spins();
 	return n;
 }
 
-SEC("tc")
-__description("timed may_goto: a call after the time is up makes no iteration")
-__success __retval(0)
-int short_loop_after_timeout(void *ctx)
+/*
+ * A subprog that cannot unwind: the comparator of bpf_rbtree_add() for a node that takes a lock
+ * when it is freed, and what the comparator calls. There may_goto jumps where the program says.
+ */
+struct item {
+	struct bpf_list_node link;
+};
+
+struct stuck_node {
+	struct bpf_rb_node rb;
+	struct bpf_spin_lock lock;
+	struct bpf_list_head items __contains(item, link);
+};
+
+#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
+private(S) struct bpf_spin_lock stuck_lock;
+private(S) struct bpf_rb_root stuck_root __contains(stuck_node, rb);
+
+/* No code has an item: this puts it in BTF, for __contains() above */
+void __item_btf_root(struct item *i)
 {
-	spins();
-	return counts_to_1000();
 }
 
+long stuck_ret;
+
+/* Add two nodes, so that @less runs one time, and take them out again. Returns 0. */
+static __always_inline int run_stuck(bool (less)(struct bpf_rb_node *a,
+						 const struct bpf_rb_node *b))
+{
+	struct bpf_rb_node *rb;
+	struct stuck_node *n;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		n = bpf_obj_new(typeof(*n));
+		if (!n)
+			return 100;
+		bpf_spin_lock(&stuck_lock);
+		bpf_rbtree_add(&stuck_root, &n->rb, less);
+		bpf_spin_unlock(&stuck_lock);
+	}
+	for (i = 0; i < 2; i++) {
+		bpf_spin_lock(&stuck_lock);
+		rb = bpf_rbtree_first(&stuck_root);
+		rb = rb ? bpf_rbtree_remove(&stuck_root, rb) : NULL;
+		bpf_spin_unlock(&stuck_lock);
+		if (!rb)
+			return 101;
+		bpf_obj_drop(container_of(rb, struct stuck_node, rb));
+	}
+	return 0;
+}
+
+/* no helpers under the lock: the loop counts its trips, a million of them take no 250 ms */
+static __always_inline int spin_stuck(void)
+{
+	long n = zero;
+
+	while (can_loop)
+		n++;
+	return n > 1000 * 1000;
+}
+
+static bool less_uses_up_time(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	stuck_ret = spin_stuck();
+	return false;
+}
+
+/*
+ * Use up the time of the invocation where the prog is not unwound for it. The prog goes on, until
+ * the next may_goto in a subprog that can unwind. Returns 0.
+ */
+static __always_inline int time_is_up(void)
+{
+	return run_stuck(less_uses_up_time) ?: !stuck_ret;
+}
+
+static bool less_counts_after_timeout(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	spin_stuck();
+	stuck_ret = counts_to_1000();
+	return false;
+}
+
+/* Both loops are in a subprog that cannot unwind */
 SEC("tc")
-__description("timed may_goto: the loop of the main prog stops when the time is up in a subprog")
-__success __retval(1)
+__description("timed may_goto: a call after the time is up makes no iteration")
+__success __retval(10)
+int short_loop_after_timeout(void *ctx)
+{
+	stuck_ret = -1;
+	return run_stuck(less_counts_after_timeout) ?: 10 + stuck_ret;
+}
+
+/* The loop of the main prog can unwind: it does, in the trip after the time was used up */
+SEC("tc")
+__description("timed may_goto: the loop of the main prog ends the prog when the time is up in a subprog that cannot unwind")
+__success __retval(2)
 int main_loop_after_timeout(void *ctx)
 {
-	int n = 0;
+	int n = 10;
 
-	while (can_loop && n < 2 * TRIES)
-		n += spins();
+	while (can_loop && n < 10 + 2 * TRIES)
+		n += time_is_up() + 1;
 	return n;
 }
 
@@ -84,10 +178,10 @@ static __noinline int passes(int i)
 
 SEC("tc")
 __description("timed may_goto: call through a function without a loop")
-__success __retval(1)
+__success __retval(2)
 int call_through(void *ctx)
 {
-	int i, n = 0;
+	int i, n = 10;
 
 	for (i = 0; i < TRIES; i++)
 		n += passes(zero);
@@ -101,10 +195,10 @@ __noinline int global_spins(void)
 
 SEC("tc")
 __description("timed may_goto: call of a global function")
-__success __retval(1)
+__success __retval(2)
 int call_global(void *ctx)
 {
-	int i, n = 0;
+	int i, n = 10;
 
 	for (i = 0; i < TRIES; i++)
 		n += global_spins();
@@ -113,11 +207,11 @@ int call_global(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: callx")
-__success __retval(1)
+__success __retval(2)
 __naked void callx_subprog(void)
 {
 	asm volatile (
-		"r6 = 0;"
+		"r6 = 10;"
 		"r7 = 0;"
 	"1:"
 		"r3 = %[spins] ll;"
@@ -139,12 +233,13 @@ static int loop_cb(__u64 i, int *spun)
 	return *spun > 2 * TRIES;
 }
 
+/* The callback is unwound, and the helper and the prog with it */
 SEC("tc")
 __description("timed may_goto: bpf_loop() inlined")
-__success __retval(1)
+__success __retval(2)
 int loop_inlined(void *ctx)
 {
-	int spun = 0;
+	int spun = 10;
 
 	bpf_loop(1 << 20, loop_cb, &spun, 0);
 	return spun;
@@ -152,10 +247,10 @@ int loop_inlined(void *ctx)
 
 SEC("tc")
 __description("timed may_goto: bpf_loop() not inlined")
-__success __retval(1)
+__success __retval(2)
 int loop_not_inlined(void *ctx)
 {
-	int spun = 0;
+	int spun = 10;
 
 	bpf_loop(1 << 20, loop_cb, &spun, zero);
 	return spun;
@@ -167,7 +262,10 @@ static int count_cb(__u64 i, int *calls)
 	return 0;
 }
 
-/* The time is up: the helper calls the callback one more time. It returns 1 in its first insns. */
+/*
+ * The time is up: the helper calls the callback one more time. It returns 1 in its first insns.
+ * The callback has no may_goto and the prog has none after the time is up: nothing is unwound.
+ */
 #define LOOP_ENDS(name, flags)							\
 SEC("tc")									\
 __description("timed may_goto: bpf_loop() " #name " ends when the time is up")	\
@@ -176,7 +274,8 @@ int loop_ends_##name(void *ctx)							\
 {										\
 	int calls = 0;								\
 										\
-	spins();								\
+	if (time_is_up())							\
+		return 100;							\
 	return bpf_loop(1000, count_cb, &calls, flags) * 10 + calls;		\
 }
 
@@ -202,15 +301,16 @@ static int outer_cb(__u64 i, struct nested *n)
 	return bpf_ktime_get_ns() - n->t0 > 1000 * 1000 * 1000;
 }
 
+/* The inner callback is unwound through both helpers */
 SEC("tc")
 __description("timed may_goto: bpf_loop() in bpf_loop() ends when the time is up")
-__success __retval(1)
+__success __retval(2)
 int loop_in_loop(void *ctx)
 {
 	struct nested n = { .t0 = bpf_ktime_get_ns() };
 
 	bpf_loop(1 << 23, outer_cb, &n, 0);
-	return n.spun && bpf_ktime_get_ns() - n.t0 < 500 * 1000 * 1000;
+	return 10 + (n.spun && bpf_ktime_get_ns() - n.t0 < 500 * 1000 * 1000);
 }
 
 static __noinline int called_cb(__u64 i, int *calls)
@@ -227,7 +327,8 @@ int loop_and_call(void *ctx)
 {
 	int calls = 0;
 
-	spins();
+	if (time_is_up())
+		return 101;
 	if (called_cb(zero, &calls))
 		return 100;
 	return bpf_loop(TRIES, called_cb, &calls, 0) * 10 + calls;
@@ -244,38 +345,39 @@ static int short_cb(__u64 i, __u64 *t0)
 
 /*
  * The main prog has no may_goto. Each call of the callback ends before it reads the clock. The
- * iterations of all calls add up.
+ * iterations of all calls add up: a call finds that the time is up, and the next one is unwound.
+ * With a time slice for each call the callback gives up after a second, and the prog returns 10.
  */
 SEC("tc")
 __description("timed may_goto: bpf_loop() the callback makes 60000 iterations")
-__success __retval(1)
+__success __retval(2)
 int loop_short_cb(void *ctx)
 {
 	__u64 t0 = bpf_ktime_get_ns();
 
 	bpf_loop(1 << 20, short_cb, &t0, 0);
-	return bpf_ktime_get_ns() - t0 < 1000 * 1000 * 1000;
+	return 10 + (bpf_ktime_get_ns() - t0 < 1000 * 1000 * 1000);
 }
 
-/* spins() uses up the time. The loop that calls it ends at its next may_goto. */
-static __noinline int loops_around_spins(void)
+/* The comparator uses up the time. The loop that got there ends the prog at its next may_goto. */
+static __noinline int loops_around_time_is_up(void)
 {
 	int n = zero;
 
 	while (can_loop && n < 20000) {
-		if (n < 2 * TRIES)
-			spins();
+		if (n < 2 * TRIES && time_is_up())
+			return 100;
 		n++;
 	}
-	return n;
+	return 10 + n;
 }
 
 SEC("tc")
-__description("timed may_goto: a loop that is on the stack ends when the time is up")
-__success __retval(1)
+__description("timed may_goto: a loop that is on the stack ends the prog when the time is up")
+__success __retval(2)
 int rest_of_batch(void *ctx)
 {
-	return loops_around_spins();
+	return loops_around_time_is_up();
 }
 
 static __noinline int one_iteration(void)
@@ -308,7 +410,8 @@ static int call_many(__u64 i, __u64 *t0)
 
 /*
  * The iterations of all calls count: the prog reads the clock in each 65535th call. The call that
- * finds out that the time is up makes its iteration.
+ * finds out that the time is up makes its iteration. No may_goto runs after it: the helpers call
+ * their callbacks one more time, which return 1 in their first insns, and the prog goes on.
  */
 SEC("tc")
 __description("timed may_goto: 65535 calls that make one iteration read the clock")
@@ -334,7 +437,7 @@ struct {						\
 MAP(array, BPF_MAP_TYPE_ARRAY, 0);
 MAP(hash, BPF_MAP_TYPE_HASH, 0);
 
-/* The first call uses up the time. The second call ends the loop of the helper. */
+/* The first call uses up the time, and is unwound through the helper */
 static int elem_cb(void *map, int *key, int *val, int *spun)
 {
 	*spun += spin();
@@ -344,10 +447,10 @@ static int elem_cb(void *map, int *key, int *val, int *spun)
 #define FOR_EACH(name)								\
 SEC("tc")									\
 __description("timed may_goto: bpf_for_each_map_elem() " #name)			\
-__success __retval(21)								\
+__success __retval(2)								\
 int for_each_##name(void *ctx)							\
 {										\
-	int i, key, spun = 0;							\
+	int i, key, spun = 100;							\
 										\
 	for (i = 0; i < TRIES; i++) {						\
 		key = i;							\
@@ -365,14 +468,15 @@ static long vma_cb(struct task_struct *task, struct vm_area_struct *vma, int *sp
 	return 0;
 }
 
+/* An unwound tracing prog returns 0 */
 SEC("raw_tp")
 __description("timed may_goto: bpf_find_vma()")
-__success __retval(1)
+__success __retval(0)
 int find_vma(void *ctx)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	__u64 addr = task->mm->arg_start;
-	int i, spun = 0;
+	int i, spun = 10;
 
 	for (i = 0; i < TRIES; i++)
 		if (bpf_find_vma(task, addr, vma_cb, &spun, 0))
@@ -385,7 +489,6 @@ struct tree_node {
 	int key;
 };
 
-#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
 private(A) struct bpf_spin_lock lock;
 private(A) struct bpf_rb_root root __contains(tree_node, rb);
 
@@ -404,9 +507,13 @@ static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 	       container_of(b, struct tree_node, rb)->key;
 }
 
+/*
+ * The comparator is unwound: the kfunc drops the node, and the pad of the prog releases the lock.
+ * The node of the first trip stays in the tree.
+ */
 SEC("tc")
 __description("timed may_goto: bpf_rbtree_add()")
-__success __retval(1)
+__success __retval(2)
 int rbtree_add(void *ctx)
 {
 	struct bpf_rb_node *rb;
@@ -435,7 +542,7 @@ int rbtree_add(void *ctx)
 	}
 	if (less_calls < TRIES - 1)
 		return 102;
-	return less_spun;
+	return 10 + less_spun;
 }
 
 /*
@@ -619,7 +726,6 @@ static long live_fall_through(void)
 
 #define CALL_AND_ADD(f)	"call " #f ";" "r6 += r0;"
 #define CALL_ALL_LIVE						\
-		"r6 = 0;"					\
 		CALL_AND_ADD(live_r0_r0)			\
 		CALL_AND_ADD(live_r0_r1)			\
 		CALL_AND_ADD(live_r0_r2)			\
@@ -645,25 +751,15 @@ __success __retval(840180)
 __naked void dead_reg(void)
 {
 	asm volatile (
-		CALL_ALL_LIVE
-		::: __clobber_all);
-}
-
-/* No iteration: 165, then 6, 6 (the may_goto jumps) and 4 (R2 isn't stored). */
-SEC("tc")
-__description("timed may_goto: may_goto takes a register that is dead, the time is up")
-__success __retval(181)
-__naked void dead_reg_time_is_up(void)
-{
-	asm volatile (
-		"call spins_on_may_goto;"
+		"r6 = 0;"
 		CALL_ALL_LIVE
 		::: __clobber_all);
 }
 
 /*
- * The subprog uses up the time of the prog and returns. With a time slice for each call the caller
- * calls it 65535 times before it reads the clock.
+ * The subprog uses up the time of the prog. Where it can unwind that ends the prog. Where it
+ * cannot it returns: with a time slice for each call its caller would call it 65535 times before
+ * it reads the clock.
  */
 __naked __noinline __used
 static unsigned long spins_on_may_goto(void)
@@ -678,11 +774,37 @@ static unsigned long spins_on_may_goto(void)
 		::: __clobber_all);
 }
 
-/* The first may_goto of the function finds that the time is up */
+/* The time is up: each may_goto of these functions jumps in its first trip */
+__naked __noinline __used
+static long all_live_time_is_up(void)
+{
+	asm volatile (
+		"call spins_on_may_goto;"
+		"r6 = r0;"
+		CALL_ALL_LIVE
+		::: __clobber_all);
+}
+
+static bool less_all_live(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	stuck_ret = all_live_time_is_up();
+	return false;
+}
+
+/*
+ * In a subprog that cannot unwind, where may_goto jumps. No iteration: 165, then 6, 6 (the
+ * may_goto jumps) and 4 (R2 isn't stored).
+ */
 SEC("tc")
-__description("timed may_goto: registers across may_goto when the time is up")
-__success __retval(46)
-__naked void regs_when_time_is_up(void)
+__description("timed may_goto: may_goto takes a register that is dead, the time is up")
+__success __retval(181)
+int dead_reg_time_is_up(void *ctx)
+{
+	return run_stuck(less_all_live) ?: stuck_ret;
+}
+
+__naked __noinline __used
+static long regs_time_is_up(void)
 {
 	asm volatile (
 		"call spins_on_may_goto;"
@@ -696,15 +818,33 @@ __naked void regs_when_time_is_up(void)
 		::: __clobber_all);
 }
 
-/* The first insn of the main prog is the target of a jump. It must not set the count again. */
+static bool less_regs(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	stuck_ret = regs_time_is_up();
+	return false;
+}
+
+/* The same: the first may_goto of the function finds that the time is up */
+SEC("tc")
+__description("timed may_goto: registers across may_goto when the time is up")
+__success __retval(46)
+int regs_when_time_is_up(void *ctx)
+{
+	return run_stuck(less_regs) ?: stuck_ret;
+}
+
+/*
+ * The first insn of the main prog is the target of a jump. It must not set the count again: the
+ * subprog makes 60000 iterations in a call and would never read the clock.
+ */
 SEC("socket")
 __description("timed may_goto: 9 insns")
-__success __retval(1)
+__success __retval(0)
 __naked void loop_calls_subprog_with_may_goto(void)
 {
 	asm volatile (
 	"1:"
-		"call spins_on_may_goto;"
+		"call loops_60000;"
 		"may_goto 2f;"
 		"goto 1b;"
 	"2:"
@@ -716,7 +856,7 @@ __naked void loop_calls_subprog_with_may_goto(void)
 /*
  * These subprogs make 60000 iterations in each call. With a read of the clock after 65535
  * iterations of a call none of them reads it, and their caller does it after
- * 65535 * 60000 * 60000 iterations.
+ * 65535 * 60000 * 60000 iterations. The prog ends unwound, a socket filter returns 0 then.
  */
 __naked __noinline __used
 static unsigned long loops_60000(void)
@@ -751,7 +891,7 @@ static unsigned long calls_60000_times(void)
 
 SEC("socket")
 __description("timed may_goto: three levels of loops that end before they read the clock")
-__success __retval(1)
+__success __retval(0)
 __naked void three_levels_of_short_loops(void)
 {
 	asm volatile (
@@ -781,41 +921,57 @@ static unsigned long loops_65534(void)
 		::: __clobber_all);
 }
 
+/*
+ * The iterations of the callee count for the prog: it reads the clock in each 65535th of them, and
+ * is unwound when the time is up. With a count for each frame only the calls would count, the
+ * time would be up after 2^32 iterations, and the prog gives up after a second: 3.
+ * It gives up at the third round that finds the second over. Each round has one read of the clock
+ * by may_goto, so the round after a stall of the guest, however long, is one that unwinds the prog.
+ */
 SEC("socket")
 __description("timed may_goto: the subprog makes 65534 iterations")
-__success __retval(1)
+__success __retval(0)
 __naked void loop_calls_subprog_with_65534_iterations(void)
 {
 	asm volatile (
 		"call %[bpf_ktime_get_ns];"
 		"r6 = r0;"
+		"r7 = 0;"
 	"1:"
 		"call loops_65534;"
+		"call %[bpf_ktime_get_ns];"
+		"r0 -= r6;"
+		"if r0 <= 1000000000 goto +2;"
+		"r7 += 1;"
+		"if r7 > 2 goto 3f;"
 		"may_goto 2f;"
 		"goto 1b;"
 	"2:"
-		"call %[bpf_ktime_get_ns];"
-		"r0 -= r6;"
-		"r1 = r0;"
 		"r0 = 1;"
-		"if r1 < 1000000000 goto +1;"
-		"r0 = 0;"
+		"exit;"
+	"3:"
+		"r0 = 3;"
 		"exit;"
 		:
 		: __imm(bpf_ktime_get_ns)
 		: __clobber_all);
 }
 
-/* The subprog returns 16 bytes in R0 and R2. may_goto must not change them. */
+/*
+ * The subprog returns 16 bytes in R0 and R2. may_goto must not change them: the loop reads the
+ * clock one time and ends.
+ */
 __naked __noinline __used
 static unsigned __int128 returns_pair_after_may_goto(void)
 {
 	asm volatile (
 		"r0 = 1;"
 		"r2 = 2;"
+		"r1 = 70000;"
 	"1:"
 		"may_goto 2f;"
-		"goto 1b;"
+		"r1 += -1;"
+		"if r1 != 0 goto 1b;"
 	"2:"
 		"exit;"
 		::: __clobber_all);
@@ -863,26 +1019,32 @@ __naked void dead_may_goto(void)
 		::: __clobber_all);
 }
 
-static __noinline int throws_after_spin(void)
+static __noinline int throws_after_time_is_up(void)
 {
-	spin();
+	if (time_is_up())
+		return 100;
 	bpf_throw(0);
 	return 0;
 }
 
 __noinline int exception_cb_loops(u64 cookie)
 {
-	return counts_to_1000();
+	return 20 + counts_to_1000();
 }
 
-/* The exception callback belongs to the invocation that throws. */
+/*
+ * The exception callback belongs to the invocation that throws. The time is up before the prog
+ * throws, in a subprog that cannot unwind, so the prog does get to bpf_throw(). The loop of the
+ * callback has no time of its own: it ends the prog in its first trip. With a new slice the
+ * callback would count to 1000 and return 1020.
+ */
 SEC("tc")
 __description("timed may_goto: bpf_throw() the exception callback has a loop")
 __exception_cb(exception_cb_loops)
-__success __retval(0)
+__success __retval(2)
 int throw_after_timeout(void *ctx)
 {
-	return throws_after_spin();
+	return throws_after_time_is_up();
 }
 
 #else

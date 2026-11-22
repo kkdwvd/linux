@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-/* The tests of timed_may_goto.c that need help from user space. */
+/*
+ * The tests of timed_may_goto.c that need help from user space. A prog whose time is up is
+ * unwound: tc returns 2, TC_ACT_SHOT, then, and a syscall prog -ECANCELED.
+ */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -37,17 +40,86 @@ static __noinline int counts_to_1000(void)
 	return cnt;
 }
 
-/* Nothing special: the loops go on, then the time is up one time. */
+/* What a short loop counts before the time is up: user space sees that it got to its end */
+int normal_cnt, tail_callee_cnt;
+
+/* Nothing special: the loops go on, then the time is up and the prog is unwound. */
 SEC("tc")
 int normal_prog(void *ctx)
 {
-	int i, n = 0;
+	int i, n = 10;
 
-	if (counts_to_1000() != 1000)
+	normal_cnt = counts_to_1000();
+	if (normal_cnt != 1000)
 		return 100;
 	for (i = 0; i < TRIES; i++)
 		n += spins();
 	return n;
+}
+
+/*
+ * A subprog that cannot unwind: the comparator of bpf_rbtree_add() for a node that takes a lock
+ * when it is freed. There may_goto jumps where the program says when the time is up, and the prog
+ * goes on, see timed_may_goto.c.
+ */
+struct item {
+	struct bpf_list_node link;
+};
+
+struct stuck_node {
+	struct bpf_rb_node rb;
+	struct bpf_spin_lock lock;
+	struct bpf_list_head items __contains(item, link);
+};
+
+#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
+private(S) struct bpf_spin_lock stuck_lock;
+private(S) struct bpf_rb_root stuck_root __contains(stuck_node, rb);
+
+/* No code has an item: this puts it in BTF, for __contains() above */
+void __item_btf_root(struct item *i)
+{
+}
+
+long stuck_spun;
+
+static bool less_uses_up_time(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	long n = zero;
+
+	/* no helpers under the lock */
+	while (can_loop)
+		n++;
+	stuck_spun = n > 1000 * 1000;
+	return false;
+}
+
+/* Use up the time of the invocation, the prog goes on. Returns 0. */
+static __always_inline int time_is_up(void)
+{
+	struct bpf_rb_node *rb;
+	struct stuck_node *n;
+	int i;
+
+	stuck_spun = 0;
+	for (i = 0; i < 2; i++) {
+		n = bpf_obj_new(typeof(*n));
+		if (!n)
+			return 100;
+		bpf_spin_lock(&stuck_lock);
+		bpf_rbtree_add(&stuck_root, &n->rb, less_uses_up_time);
+		bpf_spin_unlock(&stuck_lock);
+	}
+	for (i = 0; i < 2; i++) {
+		bpf_spin_lock(&stuck_lock);
+		rb = bpf_rbtree_first(&stuck_root);
+		rb = rb ? bpf_rbtree_remove(&stuck_root, rb) : NULL;
+		bpf_spin_unlock(&stuck_lock);
+		if (!rb)
+			return 101;
+		bpf_obj_drop(container_of(rb, struct stuck_node, rb));
+	}
+	return !stuck_spun;
 }
 
 /*
@@ -100,8 +172,9 @@ static int rcu_trace_cb(struct bpf_map *map, void *key, void *val)
 }
 
 /*
- * The time of this prog is up when it starts the callbacks. User space keeps the task on the cpu,
- * so the callbacks find what it has left. Each call of a callback is an invocation of its own.
+ * The time of this prog is up when it starts the callbacks: a comparator has used it. User space
+ * keeps the task on the cpu, so the callbacks find what it has left. Each call of a callback is an
+ * invocation of its own.
  */
 SEC("syscall")
 int async_after_timeout(void *ctx)
@@ -119,11 +192,8 @@ int async_after_timeout(void *ctx)
 		return 101;
 	if (bpf_wq_init(&e->wq, &async, 0) || bpf_wq_set_callback(&e->wq, wq_cb, 0))
 		return 102;
-	if (!spins())
+	if (time_is_up())
 		return 103;
-	/* control: the time is up */
-	if (counts_to_1000())
-		return 109;
 	if (bpf_timer_start(&e->timer, 0, BPF_F_TIMER_CPU_PIN))
 		return 104;
 	if (bpf_wq_start(&e->wq, 0))
@@ -134,7 +204,8 @@ int async_after_timeout(void *ctx)
 		return 107;
 	if (bpf_call_rcu_tasks_trace(&e1->rcu, &async, rcu_trace_cb))
 		return 108;
-	return 0;
+	/* control: the time is up, the prog is unwound here and returns -ECANCELED */
+	return 109 + counts_to_1000();
 }
 
 int ticks;
@@ -150,30 +221,30 @@ static int tick_cb(void *map, int *key, struct elem *e)
 
 /*
  * A callback of the prog interrupts it, on the same cpu, each 20 ms. It has its own time. That
- * doesn't give more time to the prog. Return how long the loop went on, in ms.
+ * doesn't give more time to the prog: it is unwound when its own time is up. User space sees how
+ * long that took.
  */
 SEC("syscall")
 int spin_under_timer(void *ctx)
 {
 	struct elem *e;
 	int key = 1;
-	__u64 t0;
 
 	e = bpf_map_lookup_elem(&async, &key);
 	if (!e)
-		return 0;
+		return 100;
 	if (bpf_timer_init(&e->timer, &async, CLOCK_MONOTONIC) ||
 	    bpf_timer_set_callback(&e->timer, tick_cb) ||
 	    bpf_timer_start(&e->timer, 20 * 1000 * 1000, BPF_F_TIMER_CPU_PIN))
-		return 0;
-	t0 = bpf_ktime_get_ns();
+		return 101;
 	while (can_loop)
 		;
-	return (bpf_ktime_get_ns() - t0) / 1000000;
+	return 102;
 }
 
 /*
- * Extension prog
+ * Extension prog. A function that can unwind cannot be replaced: an extension ends in its main
+ * prog. With a loop that may_goto stops that is replaced_global(). plain_global() cannot unwind.
  */
 __noinline int replaced_global(int i)
 {
@@ -183,10 +254,29 @@ __noinline int replaced_global(int i)
 SEC("tc")
 int freplace_target(void *ctx)
 {
-	int i, n = 0;
+	int i, n = 10;
 
 	for (i = 0; i < TRIES; i++)
 		n += replaced_global(zero);
+	return n;
+}
+
+int plain_global_calls;
+
+/* It counts its calls: the compiler must not make one call of the calls in a loop */
+__noinline int plain_global(int i)
+{
+	plain_global_calls++;
+	return i + zero;
+}
+
+SEC("tc")
+int freplace_plain_target(void *ctx)
+{
+	int i, n = 10;
+
+	for (i = 0; i < TRIES; i++)
+		n += plain_global(zero);
 	return n;
 }
 
@@ -200,17 +290,21 @@ struct {
 	__uint(value_size, sizeof(int));
 } jmp_table SEC(".maps");
 
-int tail_callee_spun;
+int tail_callee_runs;
 
+/* It has its own time: the prog that makes the tail call may have none left */
 SEC("tc")
 int tail_callee(struct __sk_buff *skb)
 {
-	int i;
+	int i, n = 10;
 
-	tail_callee_spun = 0;
+	tail_callee_runs++;
+	tail_callee_cnt = counts_to_1000();
+	if (tail_callee_cnt != 1000)
+		return 100;
 	for (i = 0; i < TRIES; i++)
-		tail_callee_spun += spins();
-	return 0;
+		n += spins();
+	return n;
 }
 
 static __noinline int tail_calls(struct __sk_buff *skb)
@@ -219,31 +313,32 @@ static __noinline int tail_calls(struct __sk_buff *skb)
 	return zero + 100;
 }
 
-/* The target of the tail call is another prog. It returns to this function. */
+/*
+ * The target of the tail call is another prog. It is unwound when its time is up, and that ends
+ * at its own exit: it returns 2 to this function, which goes on with the time that it has.
+ */
 SEC("tc")
 int tail_call_in_subprog(struct __sk_buff *skb)
 {
-	int i, n;
+	int n;
 
 	n = tail_calls(skb);
 	if (counts_to_1000() != 1000)
 		return 101;
-	for (i = 0; i < TRIES; i++)
-		n += spins();
-	return n;
+	return 10 + n;
 }
 
 SEC("tc")
 int tail_call_after_timeout(struct __sk_buff *skb)
 {
-	spins();
+	if (time_is_up())
+		return 101;
 	bpf_tail_call(skb, &jmp_table, 0);
 	return 100;
 }
 
 static __noinline int throws(void)
 {
-	spin();
 	bpf_throw(7);
 	return 0;
 }
@@ -251,6 +346,8 @@ static __noinline int throws(void)
 SEC("tc")
 int throw_after_timeout(void *ctx)
 {
+	if (time_is_up())
+		return 101;
 	return throws();
 }
 
@@ -268,18 +365,22 @@ static long drain_cb(struct bpf_dynptr *dynptr, int *spun)
 	return 0;
 }
 
+/*
+ * The callback is unwound, and the helper and the prog with it: -ECANCELED. The helper has taken
+ * the sample of that call out of the buffer. With no sample left the prog returns 100.
+ */
 SEC("syscall")
 int drain(void *ctx)
 {
 	int spun = 0;
 
-	return bpf_user_ringbuf_drain(&user_ringbuf, drain_cb, &spun, 0) * 10 + spun;
+	return 100 + bpf_user_ringbuf_drain(&user_ringbuf, drain_cb, &spun, 0) * 10 + spun;
 }
 
 /*
  * A tracing prog with large frames: they are in a private stack.
  */
-int priv_stack_spun, priv_stack_cb_spun;
+int priv_stack_runs, priv_stack_spun, priv_stack_cb_spun;
 
 static __noinline int spins_with_stack(void)
 {
@@ -302,6 +403,8 @@ int BPF_PROG(priv_stack)
 	volatile char buf[128] = {};
 	int i, n = buf[zero & 127], spun = 0;
 
+	/* the first call is unwound in each run: the frames in the private stack are left */
+	priv_stack_runs++;
 	for (i = 0; i < TRIES; i++)
 		n += spins_with_stack();
 	bpf_loop(TRIES, priv_stack_cb, &spun, zero);

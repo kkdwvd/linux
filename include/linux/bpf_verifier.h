@@ -466,6 +466,7 @@ enum bpf_site_kind {
 	BPF_SITE_CALL,		/* unwind_goto that the verifier adds after the insn, a call */
 	BPF_SITE_FAULT,		/* the same after an access to arena, for when it faults */
 	BPF_SITE_THROW,		/* the insn is a call of bpf_throw() */
+	BPF_SITE_MAY_GOTO,	/* the insn is may_goto of the program, see check_may_goto_site() */
 };
 
 /* The classes of resources that a landing pad can release */
@@ -1228,6 +1229,8 @@ struct bpf_insn_aux_data {
 	/* below flags are initialized once */
 	u32 bb_end:1; /* last instruction of a basic block */
 	u32 guard_place:1; /* it is the place for may_goto if the loop needs one */
+	/* may_goto that jumps over nothing but its like: it is removed, see bpf_opt_remove_nops() */
+	u32 may_goto_nop:1;
 	/* true if instruction is a call to a helper function that
 	 * accepts callback function as a parameter.
 	 */
@@ -1453,15 +1456,35 @@ struct bpf_subprog_info {
 	 */
 	bool did_unwind: 1;
 	/*
-	 * It did so where there is no other way out: at may_goto, at a recursion check, at
-	 * unwind_exit that it has, at a call of such a subprog. An access to arena that faults
-	 * has one: it is skipped. See bpf_pads_must_unwind().
+	 * It did so where there is no other way out: at may_goto that the verifier adds, at a
+	 * recursion check, at unwind_exit that it has, at a call of such a subprog. An access to
+	 * arena that faults has one: it is skipped. So has may_goto of the program, in a subprog
+	 * that turns out to be unable to unwind: it jumps. See bpf_pads_must_unwind().
 	 */
 	bool must_unwind: 1;
-	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
+	/*
+	 * A state left it that way at a site that the program has for sure, see site_is_certain(),
+	 * and that is no access to arena.
+	 */
 	bool unwinds_for_sure: 1;
+	/*
+	 * may_goto of the program, see check_may_goto_site(). In this pass a state left a frame
+	 * of it there. Or a frame of it that cannot unwind got there, or such a frame calls it,
+	 * see stuck_frame_calls(): then each may_goto of it goes where the program says, in all
+	 * frames. Every run that follows knows from its start, see check_funcs().
+	 */
+	bool may_goto_unwinds: 1;
+	bool stuck: 1;
+	/*
+	 * In this pass a frame of it whose may_goto does not stay made a call: what it called
+	 * was not told. If may_goto of the subprog stays later, the pass is done again, see
+	 * stuck_frame_calls().
+	 */
+	bool made_calls: 1;
 	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
 	bool below_conflict: 1;
+	/* the kinds of site that the program leaves it at, bits by enum bpf_site_kind */
+	u8 left_at;
 	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
 	u8 no_slots: 4;
 	/* it has them for these. Each bpf_pads_settle() decides anew. */
@@ -2141,6 +2164,7 @@ void bpf_flow_new_pass(struct bpf_verifier_env *env);
 void bpf_flow_drop_guards(struct bpf_verifier_env *env);
 bool bpf_flow_guard_is_guess(struct bpf_verifier_env *env, int idx);
 int bpf_flow_place_guards(struct bpf_verifier_env *env);
+void bpf_mark_may_goto_nops(struct bpf_verifier_env *env);
 /* verifier.c, for flow.c */
 int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge_loop,
 			bool *starts_leftover);
@@ -2195,6 +2219,8 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
 void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
+void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
+		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind);
 bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
 void bpf_pads_must_unwind(struct bpf_verifier_env *env);
 void bpf_pads_mark_used(struct bpf_verifier_env *env);

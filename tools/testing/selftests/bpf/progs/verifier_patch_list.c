@@ -85,7 +85,10 @@ __naked void patch_list_backward(void)
 	: __clobber_all);
 }
 
-/* The jump of may_goto leaves its own patch and crosses another one. */
+/*
+ * The jump of may_goto leaves its own patch and crosses another one, on the way to the landing pad
+ * that follows the prog.
+ */
 SEC("raw_tp")
 __description("patch list: may_goto between patched insns")
 __arch_x86_64
@@ -104,13 +107,15 @@ __xlated("11: r0 /= r1")
 __xlated("12: r2 = ")
 __xlated("14: r2 = &(void __percpu *)(r2)")
 __xlated("15: r13 = *(u64 *)(r2 +0)")
-__xlated("16: if r13 == 0x0 goto pc+9")
+__xlated("16: if r13 == 0x0 goto pc+10")
 __xlated("...")
 __xlated("22: if r1 != 0x0 goto pc+2")
 __xlated("23: w0 ^= w0")
 __xlated("24: goto pc+1")
 __xlated("25: r0 /= r1")
 __xlated("26: exit")
+__xlated("27: r0 = 0")
+__xlated("28: exit")
 __naked void patch_list_may_goto(void)
 {
 	asm volatile (
@@ -311,42 +316,38 @@ int patch_list_indirect(void)
 #endif
 
 /*
- * may_goto jumps back by 8195 insns, by 32768 once each of the 8191
- * divisions is guarded by a patch of 4 insns. That still fits the 16 bits of
- * may_goto, but not the jump it expands to, which has to become gotol. Once
- * the budget runs out, may_goto jumps back with r6 set and the program exits.
+ * When the time is up may_goto goes to the landing pad, which follows the prog: over 8191
+ * divisions, 32764 insns once each of them is guarded by a patch of 4 insns. That does not fit
+ * the 16 bits of the jump that may_goto expands to, which has to become gotol.
  */
 SEC("raw_tp")
-__description("patch list: backward may_goto expanded to gotol")
+__description("patch list: far may_goto expanded to gotol")
 __arch_x86_64
 __arch_arm64
 __success
-__xlated("12: if r6 != 0x0 goto pc-3")
+__xlated("12: r13 = *(u64 *)(r2 +0)")
+__xlated("13: if r13 == 0x0 goto pc+1")
+__xlated("14: goto pc+1")
+__xlated("15: gotol pc+32771")
 __xlated("...")
-__xlated("32783: if r13 == 0x0 goto pc+1")
-__xlated("32784: goto pc+1")
-__xlated("32785: gotol pc-32774")
+__xlated("32786: exit")
+__xlated("32787: r0 = 0")
+__xlated("32788: exit")
 __naked void patch_list_may_goto_gotol(void)
 {
 	asm volatile ("					\
 	call %[bpf_get_prandom_u32];			\
 	r1 = r0;					\
 	r6 = 0;						\
-	goto 0f;					\
-1:	r0 = 0;						\
-	exit;						\
-0:	if r6 != 0 goto 1b;				\
+	.8byte %[may_goto];				\
 	.rept 8191;					\
 	r0 /= r1;					\
 	.endr;						\
-	r2 = 0;						\
-	r6 = 1;						\
-	.8byte %[may_goto];				\
 	r0 = 0;						\
 	exit;						\
 "	:
 	: __imm(bpf_get_prandom_u32),
-	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, -8195 /* offset */, 0))
+	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 8191 /* offset */, 0))
 	: __clobber_all);
 }
 
@@ -388,17 +389,60 @@ static unsigned long patch_list_loop_at_start(void)
 	: __clobber_all);
 }
 
+#define INSERT_IN_FRONT					\
+	asm volatile (					\
+	"r1 = 3;"					\
+	"r2 = %[patch_list_loop_at_start] ll;"		\
+	"r3 = 0;"					\
+	"r4 = 0;"					\
+	"call %[bpf_loop];"				\
+	"exit;"						\
+	:						\
+	: __imm_addr(patch_list_loop_at_start),		\
+	  __imm(bpf_loop)				\
+	: __clobber_all)
+
 /*
  * The check of the may_goto count goes in front of the callback of bpf_loop().
  * The call of the inlined bpf_loop() lands on the check, the jump to the first
  * insn of the callback behind it.
- * This is the code for the JITs that support the timed may_goto.
+ * This is the code for the JITs that support the timed may_goto and unwind programs: the callback
+ * can unwind at its may_goto, so the inlined bpf_loop() has a landing pad, and the callback has
+ * one after its last insn.
  */
 SEC("raw_tp")
 __description("patch list: call of and jump to an insn with insns inserted in front")
 __arch_x86_64
-__arch_s390x
 __arch_arm64
+__success
+__xlated("27: call pc+10")
+__xlated("28: unwind_goto pc-15")
+__xlated("...")
+__xlated("37: exit")
+__xlated("38: r0 = ")
+__xlated("40: r0 = &(void __percpu *)(r0)")
+__xlated("41: r0 = *(u64 *)(r0 +0)")
+__xlated("42: if r0 != 0x0 goto pc+2")
+__xlated("43: r0 = 1")
+__xlated("44: exit")
+__xlated("45: r1 += -1")
+__xlated("...")
+__xlated("50: if r13 == 0x0 goto pc+8")
+__xlated("...")
+__xlated("56: if r1 != 0x0 goto pc-12")
+__xlated("57: r0 = 0")
+__xlated("58: exit")
+__xlated("59: r0 = 0")
+__xlated("60: unwind_exit")
+__naked void patch_list_insert_in_front(void)
+{
+	INSERT_IN_FRONT;
+}
+
+/* The JITs that do not unwind programs: the callback cannot unwind, and its may_goto jumps */
+SEC("raw_tp")
+__description("patch list: call of and jump to an insn with insns inserted in front, no pads")
+__arch_s390x
 __arch_riscv64
 __arch_loongarch
 __success
@@ -416,19 +460,9 @@ __xlated("...")
 __xlated("49: if r1 != 0x0 goto pc-12")
 __xlated("50: r0 = 0")
 __xlated("51: exit")
-__naked void patch_list_insert_in_front(void)
+__naked void patch_list_insert_in_front_no_pads(void)
 {
-	asm volatile (
-	"r1 = 3;"
-	"r2 = %[patch_list_loop_at_start] ll;"
-	"r3 = 0;"
-	"r4 = 0;"
-	"call %[bpf_loop];"
-	"exit;"
-	:
-	: __imm_addr(patch_list_loop_at_start),
-	  __imm(bpf_loop)
-	: __clobber_all);
+	INSERT_IN_FRONT;
 }
 
 __naked __noinline __used

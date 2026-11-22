@@ -982,9 +982,13 @@ static long spins_then_reads_8args(long a, long b, long c, long d, long e, long 
 	);
 }
 
+/*
+ * The callee is unwound when the time is up: it does not get to the loads of its args, which
+ * are behind the jump of may_goto, and tc drops the packet.
+ */
 SEC("tc")
-__description("stack_arg: the time of may_goto is up, then the callee reads its args")
-__success __retval(876)
+__description("stack_arg: the time of may_goto is up, the callee with args in the stack is unwound")
+__success __retval(2)
 __naked void stack_arg_may_goto_timeout_in_callee(void)
 {
 	asm volatile (

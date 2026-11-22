@@ -823,8 +823,10 @@ __naked void thresholds_over_budget(void)
 	"r0 = *(u8 *)(r1 + 0);"
 	".rept 500;"
 	"r6 = 0;"
-"3:"	MAY_GOTO(10)
+"3:"	MAY_GOTO(11)
 	"call %[bpf_get_prandom_u32];"
+	/* the way to what follows the loop: the jump of may_goto ends the prog */
+	"if r0 == 2 goto 5f;"
 	"if r0 & 1 goto 4f;"
 	"if r6 >= 60000 goto 4f;"
 	"r6 += 1;"
@@ -834,7 +836,7 @@ __naked void thresholds_over_budget(void)
 	"r1 = 0;"
 	"call long_dead_code;"
 	"goto 3b;"
-	"r6 >>= 10;"
+"5:	r6 >>= 10;"
 	"r1 = r9;"
 	"r1 += r6;"
 	"r0 = *(u8 *)(r1 + 0);"
@@ -2577,13 +2579,21 @@ int leak_made_up_in_loop(struct __sk_buff *skb)
 	return 0;
 }
 
+/*
+ * The time of may_goto that is up ends the prog, and no state takes its jump. These loops have
+ * another way out, so that what follows them is verified.
+ */
+#define OR_BREAK	if (bpf_get_prandom_u32() & 1) break
+
 SEC("tc")
 __description("held: a loop acquires and does not release")
 __failure __msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable")
 int loop_only_acquires(void *unused)
 {
-	while (can_loop)
+	while (can_loop) {
+		OR_BREAK;
 		bpf_preempt_disable();
+	}
 	return 0;
 }
 
@@ -2591,6 +2601,7 @@ int loop_only_acquires(void *unused)
 	void *prev = NULL, *cur = NULL;					\
 									\
 	while (can_loop) {						\
+		OR_BREAK;						\
 		if (prev)						\
 			bpf_ringbuf_discard(prev, 0);			\
 		prev = cur;						\
@@ -2625,8 +2636,10 @@ int loop_drops_the_pointer(void *unused)
 {
 	void *cur = NULL;
 
-	while (can_loop)
+	while (can_loop) {
+		OR_BREAK;
 		cur = bpf_ringbuf_reserve(&rb, 8, 0);
+	}
 	if (cur)
 		bpf_ringbuf_discard(cur, 0);
 	return 0;
@@ -3120,7 +3133,10 @@ __naked void peel_does_not_starve(void)
 {
 	ASM(VALUE_IN_R9
 	"r6 = 0;"
-"1:"	MAY_GOTO(2)
+	/* the way to what follows the loop: the jump of may_goto ends the prog */
+"1:	call %[bpf_get_prandom_u32];"
+	"if r0 == 0 goto +3;"
+	MAY_GOTO(2)
 	"r6 += 1;"
 	"goto 1b;"
 	"call %[bpf_get_prandom_u32];"

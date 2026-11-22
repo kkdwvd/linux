@@ -656,6 +656,8 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 		return false;
 	case BPF_SITE_FAULT:
 		return !env->insn_aux_data[i].fault_skips;
+	case BPF_SITE_MAY_GOTO:
+		return plan->visited && !bpf_find_containing_subprog(env, i)->stuck;
 	}
 	return false;
 }
@@ -819,6 +821,42 @@ static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 }
 
 /*
+ * may_goto of the program that is a site goes to its landing pad, see check_may_goto_site(). No
+ * state took its jump: the target that the program gave it may be dead code, and this insn would be
+ * taken for a jump that is never taken, see bpf_opt_hard_wire_dead_code_branches(). The loop would
+ * have nothing that stops it then. So this comes before dead code is looked for, and a pad is
+ * never dead code.
+ * The pads are in the program: may_goto that has one of the verifier before it would need two
+ * jumps of one patch, see bpf_patch_list_jump(). @added: how many insns the pads after each subprog
+ * have.
+ */
+static int retarget_may_gotos(struct bpf_verifier_env *env, const int *added)
+{
+	struct bpf_patch_list *pl = &env->patch_list;
+	const struct bpf_subprog_info *sub;
+	const struct bpf_pad_plan *plan;
+	struct bpf_insn *insn;
+	int i, s;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++) {
+			plan = bpf_pad_plan(&env->insn_aux_data[i], BPF_SITE_MAY_GOTO);
+			if (!plan || !bpf_site_is_used(env, i, plan))
+				continue;
+			if (bpf_must_abort())
+				return -EINTR;
+			/* one insn for one, but queued: the list finds the offset, however far */
+			insn = __bpf_patch_list_add(pl, env->prog, i, &env->prog->insnsi[i], 1);
+			if (IS_ERR(insn))
+				return PTR_ERR(insn);
+			bpf_patch_list_jump(pl, insn, sub[1].start - added[s] + plan->pad, 0);
+		}
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
  * Add the stores that keep the hidden slots up to date, see kernel/bpf/pads.c. @buf has room for
  * BPF_PAD_MAX_SLOT_INSNS. @added: how many insns the pads after each subprog have. Only they read
  * the slots.
@@ -877,8 +915,9 @@ static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf
 /*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
  * marked, see check_loop_guard(), unwind_goto after calls and after accesses to arena, a jump in
- * place of a call of bpf_throw(), the landing pads, and the stores to the hidden slots that the pads
- * read. What a pad does it did to the states that left the frame at the site, see unwind_frame().
+ * place of a call of bpf_throw(), the landing pads, the stores to the hidden slots that the pads
+ * read, and the pad as the target of may_goto that the program has, see check_may_goto_site().
+ * What a pad does it did to the states that left the frame at the site, see unwind_frame().
  *
  *	may_goto pad
  *	insn
@@ -974,6 +1013,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	}
 	err = insert_slot_stores(env, new, added);
 	err = err ?: insert_unwind_gotos(env, added);
+	err = err ?: retarget_may_gotos(env, added);
 out:
 	kvfree(added);
 	kvfree(new);
@@ -1242,6 +1282,42 @@ static bool insn_is_nop(struct bpf_verifier_env *env, int i, int next)
 
 	return !memcmp(&insn, &NOP, sizeof(NOP)) ||
 	       !memcmp(&insn, &MAY_GOTO_0, sizeof(MAY_GOTO_0));
+}
+
+/*
+ * addr_space_cast of a register into itself is removed if what the main pass finds there is a
+ * pointer that is not in arena, see bpf_lower_cast_mov()
+ */
+static bool cast_may_be_nop(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
+	       insn->off == BPF_ADDR_SPACE_CAST && insn->dst_reg == insn->src_reg;
+}
+
+/*
+ * may_goto that jumps over nothing, or over nothing but insns like itself, does nothing:
+ * bpf_opt_remove_nops() removes it. clang makes such insns of a loop with can_loop that it unrolls.
+ * The main pass is told now, see check_may_goto_site(): they are no sites.
+ * A cast that may be removed counts as nothing too. If it stays, so does may_goto that jumps over
+ * it, and it jumps where the program says: no site is always right, it is what the insn was before
+ * the verifier unwound programs.
+ */
+void bpf_mark_may_goto_nops(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insns = env->prog->insnsi, insn;
+	int i, next;
+
+	for (i = env->prog->len - 1, next = env->prog->len; i >= 0; i--) {
+		if (cast_may_be_nop(&insns[i]))
+			continue;
+		insn = insns[i];
+		insn.off = 0;
+		if (insns[i].off < 0 || i + 1 + insns[i].off > next ||
+		    (memcmp(&insn, &NOP, sizeof(NOP)) && memcmp(&insn, &MAY_GOTO_0, sizeof(insn))))
+			next = i;
+		else
+			env->insn_aux_data[i].may_goto_nop = bpf_is_may_goto_insn(&insn);
+	}
 }
 
 /* addr_space_cast of a pointer that is not in arena is a move, see is_cast_mov() */
@@ -3490,6 +3566,29 @@ next_insn:
 				 * The time is up, but the helper would call the function again and
 				 * again. End its loop. The verifier has seen that: the loop can end
 				 * after each call.
+				 *
+				 * This is the one place where time that is up does not end the
+				 * program, also where every frame can unwind, see
+				 * check_may_goto_site(): the helper returns the number of calls
+				 * that it made, and the program goes on with that until its next
+				 * may_goto. It gets here when no may_goto runs between the one that
+				 * found the time up, which falls through, and this entry.
+				 *
+				 * The check is no site, as may_goto of the program is one, because
+				 * what carries that one does not carry it:
+				 *  - A site is an insn of the program at which every frame of a
+				 *    subprog is left, one answer per subprog. No insn stands for
+				 *    this check in the main pass, and it is a way out of a frame
+				 *    only if a loop helper called: it would take a visit where
+				 *    such a helper enters its callback, and a kind of its own.
+				 *  - That only loop helpers call the subprog is known when the
+				 *    pass is over. 'stuck' hands "cannot unwind" to the run that
+				 *    follows. Nothing hands this on.
+				 *  - Whether the program has a timed may_goto at all is known
+				 *    here, after the landing pads were emitted.
+				 *  - Each call of such a helper would be a call that the kernel
+				 *    unwinds through, with a landing pad in its caller, in every
+				 *    program that has a may_goto anywhere.
 				 */
 				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
 							      count_off);

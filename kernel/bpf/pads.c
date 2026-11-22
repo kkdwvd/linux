@@ -5,6 +5,8 @@
  * A SITE is an insn at which the verifier lets a frame unwind although the program has no code
  * for that:
  *   - may_goto that the verifier adds
+ *   - may_goto that the program has, in a subprog that can unwind: when its time is up the program
+ *     ends, it does not go where the insn says, see check_may_goto_site() in verifier.c
  *   - the check at the entry of a recursive subprog
  *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
  *   - a call of a helper whose callback comes back that way
@@ -1855,15 +1857,17 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 }
 
 /*
- * Is the pad the only way out of the site of @plan? An access to arena that faults can be skipped.
- * So can all of them below a call, unless a subprog comes back to the call that is left elsewhere.
+ * Is the pad the only way out of the site of @plan, whatever the subprog turns out to be? An access
+ * to arena that faults can be skipped. may_goto of the program can jump where the program says, as
+ * it does in a subprog that cannot unwind. So can all of them below a call, unless a subprog comes
+ * back to the call that is left elsewhere.
  */
 bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
 	int s;
 
 	if (plan->kind != BPF_SITE_CALL)
-		return plan->kind != BPF_SITE_FAULT;
+		return plan->kind != BPF_SITE_FAULT && plan->kind != BPF_SITE_MAY_GOTO;
 	bpf_pad_for_each_callee(plan, s)
 		if (env->subprog_info[s].must_unwind)
 			return true;
@@ -1889,6 +1893,100 @@ void bpf_pads_must_unwind(struct bpf_verifier_env *env)
 			}
 		}
 	} while (changed);
+}
+
+/*
+ * At which kinds of site does the program leave each subprog? At its own, and at those of what
+ * comes back to its calls. Bits by enum bpf_site_kind in 'left_at'. The main pass notes them as
+ * the states leave, see bpf_pad_note_left(). This is what is left of that when the pass is over.
+ */
+static void sites_of_subprogs(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
+	struct bpf_subprog_info *sub;
+	bool changed;
+	int i, s, c;
+	u8 kinds;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		sub->left_at = 0;
+	}
+	do {
+		changed = false;
+		for (s = 0; s < env->subprog_cnt; s++) {
+			sub = &env->subprog_info[s];
+			kinds = sub->left_at;
+			for (i = sub->start; i < sub[1].start; i++) {
+				if (aux[i].loop_guard)
+					kinds |= BIT(BPF_SITE_GUARD);
+				if (aux[i].fault_empty && !aux[i].fault_skips)
+					kinds |= BIT(BPF_SITE_FAULT);
+				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+					if (!plan->used)
+						continue;
+					if (plan->kind != BPF_SITE_CALL) {
+						kinds |= BIT(plan->kind);
+						continue;
+					}
+					bpf_pad_for_each_callee(plan, c)
+						kinds |= env->subprog_info[c].left_at;
+				}
+			}
+			changed |= kinds != sub->left_at;
+			sub->left_at = kinds;
+		}
+	} while (changed);
+}
+
+/* The kinds of site that the subprogs which come back to the call of @plan are left at */
+static u8 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	u8 kinds = 0;
+	int s;
+
+	bpf_pad_for_each_callee(plan, s)
+		kinds |= env->subprog_info[s].left_at;
+	return kinds;
+}
+
+/* The frame of the site of @plan cannot unwind: there is no pad to plan */
+static bool plan_is_stuck(const struct bpf_pad_plan *plan)
+{
+	return plan->conflict == BPF_CONFLICT_CANNOT_UNWIND ||
+	       plan->conflict == BPF_CONFLICT_NO_EXIT;
+}
+
+/*
+ * Does the site of @plan need a pad wherever its frame can unwind? If so a conflict there is an
+ * error, and hidden slots are worth their stores. All sites do, but for:
+ *   - an access to arena, and a call that has nothing but such accesses below it: they are
+ *     skipped, see skip_faults().
+ * may_goto of the program needs one, and so does a call above it: the jump that the program
+ * has there was not verified.
+ */
+static bool site_needs_pad(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	if (bpf_pad_must_unwind(env, plan))
+		return true;
+	if (plan->kind == BPF_SITE_FAULT)
+		return false;
+	return plan->kind != BPF_SITE_CALL || (sites_below(env, plan) & BIT(BPF_SITE_MAY_GOTO));
+}
+
+/*
+ * Is the conflict of @plan an error? Not where the frame cannot unwind and the site has another way
+ * out, see bpf_pad_must_unwind(): what comes back to a call there is made unable to unwind, see
+ * skip_faults().
+ */
+static bool plan_rejects(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	if (!plan->conflict)
+		return false;
+	if (bpf_pad_must_unwind(env, plan))
+		return true;
+	return !plan_is_stuck(plan) && site_needs_pad(env, plan);
 }
 
 /*
@@ -1921,7 +2019,7 @@ static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_pl
 	u8 groups = plan->sections_differ;
 	int i, err;
 
-	if (!plan->used || plan->conflict || !bpf_pad_must_unwind(env, plan))
+	if (!plan->used || plan->conflict || !site_needs_pad(env, plan))
 		return 0;
 	if (plan->no_place && all_ptrs)
 		groups |= BIT(BPF_PAD_GROUP_REFS);
@@ -2034,7 +2132,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	for (i = sub->start; i < sub[1].start; i++)
 		for (plan = aux[i].pad_plans; plan; plan = plan->next)
 			if (plan->used && plan_has_slots(plan) &&
-			    !plan_has_room(plan, group, slots) && bpf_pad_must_unwind(env, plan))
+			    !plan_has_room(plan, group, slots) && site_needs_pad(env, plan))
 				return 0;
 	sub->hidden_words += words;
 	err = bpf_hidden_slots_fit(env);
@@ -2309,6 +2407,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_SITE_CALL]			= "call",
 		[BPF_SITE_FAULT]		= "arena access",
 		[BPF_SITE_THROW]		= "bpf_throw",
+		[BPF_SITE_MAY_GOTO]		= "may_goto of the program",
 	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
@@ -2348,11 +2447,22 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 }
 
 /*
+ * A state leaves a frame of @sub at the site of @plan, of @kind: note the kind, for the callers.
+ * bpf_pads_settle() notes them again, from the sites that the program has in the end.
+ */
+void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
+		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind)
+{
+	sub->left_at |= kind == BPF_SITE_CALL ? sites_below(env, plan) : BIT(kind);
+}
+
+/*
  * The site of @plan, at insn @i, has no pad. An access to arena: it is skipped when it faults.
  * What follows the access was verified, and less unwinds than the main pass looked at.
- * Or it is a call, and only accesses to arena unwind below it. They are skipped: what came back to
- * the call cannot unwind, nor can what came back to the calls in there. The pass is done again,
- * and they cannot from its start, see check_funcs().
+ * Or it is a call, and below it only accesses to arena and may_goto of the program unwind. The
+ * accesses are skipped and may_goto jumps where the program says: what came back to the call cannot
+ * unwind, nor can what came back to the calls in there. The pass is done again, and they cannot
+ * from its start, see check_funcs().
  */
 static int skip_faults(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
@@ -2377,6 +2487,7 @@ static int skip_faults(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		if (!sub->bail_unwinds)
 			continue;
 		sub->bail_unwinds = false;
+		sub->stuck = true;
 		for (i = sub->start; i < sub[1].start; i++) {
 			plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
 			if (plan)
@@ -2441,6 +2552,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	int i, s, err;
 
 	bpf_pads_must_unwind(env);
+	sites_of_subprogs(env);
 	/* hidden slots take their places among entries that have theirs */
 	for (i = 0; i < env->prog->len; i++) {
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
@@ -2464,7 +2576,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			if (err < 0)
 				return err;
 			plan->conflict = err;
-			if (plan->conflict && bpf_pad_must_unwind(env, plan)) {
+			if (plan_rejects(env, plan)) {
 				print_plan(env, i, plan);
 				return -EINVAL;
 			}
@@ -2494,7 +2606,7 @@ bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_d
 	const struct bpf_pad_plan *plan;
 
 	for (plan = aux->pad_plans; plan; plan = plan->next)
-		if (plan->used && plan->conflict && bpf_pad_must_unwind(env, plan))
+		if (plan->used && plan_rejects(env, plan))
 			return true;
 	return false;
 }
@@ -2518,6 +2630,17 @@ static bool jump_leaves_loop(struct bpf_verifier_env *env, int h, int n)
 		return false;
 	return !loop_is_in(env, bpf_loop_at_index(env, n + insn->off + 1), h) ||
 	       !loop_is_in(env, bpf_loop_at_index(env, n + 1), h);
+}
+
+/* The pass left a frame at the insn of @aux, may_goto of the program */
+static bool left_at_insn(const struct bpf_insn_aux_data *aux)
+{
+	const struct bpf_pad_plan *plan;
+
+	for (plan = aux->pad_plans; plan; plan = plan->next)
+		if (plan->visited && plan->kind == BPF_SITE_MAY_GOTO)
+			return true;
+	return false;
 }
 
 /*
@@ -2545,6 +2668,11 @@ static bool jump_leaves_loop(struct bpf_verifier_env *env, int h, int n)
  * loop inside the one that has may_goto, see jump_leaves_loop().
  * Only a loop of which the pass knows that it has no trip count counts, see
  * bpf_flow_guard_is_guess().
+ *
+ * may_goto of the program leaves a function as well. The dependencies of the next pass know exit,
+ * unwind_exit and bpf_throw() as the ways out of a function, and none of these stands for such an
+ * insn. Where only the calls together get to it, the jumps that can skip it are the cause: the insn
+ * is noted, and they are what controls it.
  */
 static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
@@ -2618,6 +2746,8 @@ static void note_causes_below(struct bpf_verifier_env *env)
 	for (s = 0; s < cnt; s++) {
 		guards = false;
 		for (i = sub[s].start; sub[s].below_conflict && i < sub[s + 1].start; i++) {
+			if (left_at_insn(&aux[i]))
+				bpf_note_controlled_cause(env, i);
 			if (!aux[i].loop_guard || bpf_flow_guard_is_guess(env, i))
 				continue;
 			h = bpf_loop_at_index(env, i);
@@ -2654,8 +2784,7 @@ void bpf_pads_note_causes(struct bpf_verifier_env *env)
 		env->subprog_info[s].below_conflict = false;
 	for (i = 0; i < env->prog->len; i++)
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
-			if (plan->failed || (plan->used && plan->conflict &&
-					     bpf_pad_must_unwind(env, plan)))
+			if (plan->failed || (plan->used && plan_rejects(env, plan)))
 				note_causes(env, plan);
 	note_causes_below(env);
 	/* the caller looks at the limits before it goes on. This is for a load that is to end. */

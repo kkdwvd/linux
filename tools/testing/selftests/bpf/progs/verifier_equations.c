@@ -821,12 +821,17 @@ ONE_TEST(cond_of_low_half_bad, BAD_WRITE, 8, COND_OF_LOW_HALF(-1))
 ONE_TEST(and_of_two_values, __success, 8, TWO_ANDS(7))
 ONE_TEST(and_of_two_values_bad, BAD_WRITE, 8, TWO_ANDS(255))
 
-/* The jump compares a number with itself. It gives no trip count. */
+/*
+ * The jump compares a number with itself. It gives no trip count. The loop is left when the clock
+ * says 0: the jump of may_goto ends the prog.
+ */
 ONE_TEST(jump_that_does_not_count,
 	 __failure __msg("invalid write to stack R8 off=0 size=1"), 8,
 	"r7 = 0; r8 = r10; r8 += -24; r9 = r10; r9 += -256;"
 "1:"	"r0 = 0;"
-"2:"	MAY_GOTO(2)
+"2:"	"call %[bpf_ktime_get_ns];"
+	"if r0 == 0 goto +3;"
+	MAY_GOTO(2)
 	"r9 += 1;"
 	"if r9 == r9 goto 2b;"
 	"*(u8 *)(r8 + 0) = r7;"

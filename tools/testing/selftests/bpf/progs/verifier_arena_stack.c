@@ -1032,7 +1032,11 @@ __naked void may_goto_keeps_r12(void)
 	: __clobber_all);
 }
 
-/* counts the calls and spins until the time of may_goto is up */
+/*
+ * Counts the calls, takes its time in a loop that has a trip count, and gets to one may_goto. The
+ * one that finds the time up is the last insn of its kind in the call: the callback returns, and
+ * nothing is unwound.
+ */
 static __naked __noinline __used long spin_cb(void)
 {
 	asm volatile (
@@ -1040,9 +1044,12 @@ static __naked __noinline __used long spin_cb(void)
 	"r3 = *(u64 *)(r2 + 0);"
 	"r3 += 1;"
 	"*(u64 *)(r2 + 0) = r3;"
+	"r4 = 1000;"
 "1:"
+	"r4 += -1;"
+	"if r4 != 0 goto 1b;"
 	".8byte %[may_goto];"
-	"goto 1b;"
+	"r4 = 1;"
 	"r0 = 0;"
 	"exit;"
 	:
@@ -1051,10 +1058,16 @@ static __naked __noinline __used long spin_cb(void)
 	: __clobber_all);
 }
 
+/*
+ * The call after the one that found the time up returns 1 in its first insns, before it takes a
+ * frame in the stack in arena: bpf_loop() ends, and the prog, which has no may_goto, goes on.
+ * The helper counts one call more than the callback, some calls ran, and the slot of the prog in
+ * the stack in arena is as it was: 20 + 1 + 100.
+ */
 SEC("syscall")
 __description("arena stack: bpf_loop() ends when the time of may_goto is up")
 __success __retval(121)
-/* the second call of the callback returns 1 before it takes a stack */
+/* a call of the callback when the time is up returns 1 before it takes a stack */
 __xlated("if r0 != 0x0 goto pc+2")
 __xlated("r0 = 1")
 __xlated("exit")
@@ -1075,10 +1088,12 @@ __naked void loop_ends_early(void)
 	"r3 += -8;"
 	"r4 = 0;"
 	"call %[bpf_loop];"
-	/* 2 calls, 1 of them ran */
-	"r0 *= 10;"
+	/* the last call did not run */
 	"r1 = *(u64 *)(r10 - 8);"
-	"r0 += r1;"
+	"r0 -= r1;"
+	"r0 *= 20;"
+	"if r1 == 0 goto +1;"
+	"r0 += 1;"
 	".8byte %[ldx];"	/* r1 = *(u64 *)(r12 - 8) */
 	"r0 += r1;"
 	"exit;"
