@@ -3416,7 +3416,7 @@ static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 	 */
 	env->faults_late |= did_unwind || ((sub->soft_unwinds || sub->made_calls) && !sub->stuck);
 	sub->bail_unwinds = false;
-	sub->stuck = true;
+	bpf_subprog_set_stuck(sub, BPF_STUCK_NO_PAD, env->insn_idx);
 	return 0;
 }
 
@@ -21956,7 +21956,7 @@ static void stuck_frame_calls(struct bpf_verifier_env *env, int subprog)
 	}
 	env->faults_late |= sub->soft_unwinds || sub->made_calls ||
 			    (sub->did_unwind && sub->bail_unwinds);
-	sub->stuck = true;
+	bpf_subprog_set_stuck(sub, BPF_STUCK_CALLED, env->insn_idx);
 }
 
 /* This insn is a site of @kind: the current frame may be left here, see unwind_frame() */
@@ -22050,7 +22050,7 @@ static int check_may_goto_site(struct bpf_verifier_env *env)
 		return 0;
 	if (sub->stuck || frame_cannot_unwind(env, env->cur_state)) {
 		env->faults_late |= (sub->soft_unwinds || sub->made_calls) && !sub->stuck;
-		sub->stuck = true;
+		bpf_subprog_set_stuck(sub, BPF_STUCK_AT_SITE, env->insn_idx);
 		return 0;
 	}
 	sub->soft_unwinds = true;
@@ -22096,7 +22096,7 @@ static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_s
 		return 0;
 	if (sub->stuck || frame_cannot_unwind(env, st)) {
 		env->faults_late |= (sub->soft_unwinds || sub->made_calls) && !sub->stuck;
-		sub->stuck = true;
+		bpf_subprog_set_stuck(sub, BPF_STUCK_AT_SITE, env->insn_idx);
 		aux->fault_skips = true;
 		return 0;
 	}
@@ -22292,7 +22292,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		 * call made it stuck, or the frame could unwind when it made the call.
 		 */
 		if (stuck && kind == BPF_SITE_CALL && !bpf_pad_must_unwind(env, plan))
-			err = bpf_pad_skip_faults(env, plan);
+			err = bpf_pad_skip_faults(env, plan, insn_idx);
 		if (plan->conflict)
 			goto out;
 	}
@@ -24533,7 +24533,11 @@ static int check_funcs(struct bpf_verifier_env *env, struct bpf_snapshot *initia
 		 * keep in every run that follows: a run that had to find it again could end at an
 		 * error which is none before it gets to the call that tells.
 		 */
-		initial->subprogs[i].stuck |= env->subprog_info[i].stuck;
+		if (env->subprog_info[i].stuck && !initial->subprogs[i].stuck) {
+			initial->subprogs[i].stuck = true;
+			initial->subprogs[i].stuck_by = env->subprog_info[i].stuck_by;
+			initial->subprogs[i].stuck_insn = env->subprog_info[i].stuck_insn;
+		}
 	}
 	env->pass_again = false;
 	restore_snapshot(env, initial);

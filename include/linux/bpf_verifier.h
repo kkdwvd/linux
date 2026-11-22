@@ -505,6 +505,14 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_NO_ROOM,
 };
 
+/* What told that a subprog is stuck, see bpf_subprog_info.stuck and bpf_pads_log() */
+enum bpf_stuck_by {
+	BPF_STUCK_NO_PAD = 1,	/* the call at the insn hands it to a helper that has no pad for it */
+	BPF_STUCK_CALLED,	/* a frame that cannot unwind, or one of a stuck subprog, calls it */
+	BPF_STUCK_AT_SITE,	/* a frame of it that cannot unwind got to may_goto or to an access */
+	BPF_STUCK_CAME_BACK,	/* it came back unwound to the call, in a frame that cannot unwind */
+};
+
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
  * per argument of a release two to load it, per entry a test, the calls, one to save the value,
@@ -1474,6 +1482,9 @@ struct bpf_subprog_info {
 	 */
 	bool soft_unwinds: 1;
 	bool stuck: 1;
+	/* what told that it is stuck, in the run that found it: enum bpf_stuck_by, at this insn */
+	u8 stuck_by;
+	u32 stuck_insn;
 	/*
 	 * 'pad_skip_gen' of the env when bpf_pad_skip_faults() walked the subprog and what came
 	 * back to the calls in and below it. While the two are equal all of that is stuck.
@@ -1511,6 +1522,17 @@ struct bpf_subprog_info {
 static inline bool bpf_subprog_unwinds(const struct bpf_subprog_info *sub)
 {
 	return sub->can_unwind || (sub->recursive && sub->bail_unwinds);
+}
+
+/* @sub is stuck from now on. The first insn that tells is the one that the log names. */
+static inline void bpf_subprog_set_stuck(struct bpf_subprog_info *sub, enum bpf_stuck_by by,
+					 u32 insn_idx)
+{
+	if (sub->stuck)
+		return;
+	sub->stuck = true;
+	sub->stuck_by = by;
+	sub->stuck_insn = insn_idx;
 }
 
 /* How far the stack of @sub goes with its hidden slots */
@@ -2228,7 +2250,8 @@ void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *su
 bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
 void bpf_pads_must_unwind(struct bpf_verifier_env *env);
 void bpf_pads_mark_used(struct bpf_verifier_env *env);
-int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
+int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			int insn_idx);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_data *aux);
 void bpf_pads_note_causes(struct bpf_verifier_env *env);

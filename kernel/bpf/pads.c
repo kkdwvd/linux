@@ -2491,7 +2491,8 @@ static bool skip_walked(const struct bpf_verifier_env *env, const struct bpf_sub
  * in verifier.c: this is for a state that left its function before. If it finds a subprog that was
  * not stuck, the pass is done again, and the subprog is stuck from its start, see check_funcs().
  */
-int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			int insn_idx)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	int i, s, c, err = 0, cnt = env->subprog_cnt;
@@ -2530,7 +2531,8 @@ int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 		if (err)
 			break;
 		env->faults_late |= !sub->stuck;
-		sub->stuck = true;
+		/* what came back to a call below the first one is told by that one too */
+		bpf_subprog_set_stuck(sub, BPF_STUCK_CAME_BACK, insn_idx);
 		for (i = sub->start; i < sub[1].start; i++) {
 			plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
 			if (plan)
@@ -2635,7 +2637,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			 * made what came back stuck, and no run that finds a subprog stuck late
 			 * gets here. So the program still has the site, and no pad.
 			 */
-			err = bpf_pad_skip_faults(env, plan);
+			err = bpf_pad_skip_faults(env, plan, i);
 			if (err)
 				return err;
 			if (!env->faults_late) {
@@ -2858,11 +2860,50 @@ void bpf_pads_note_causes(struct bpf_verifier_env *env)
 	bpf_check_limits(env);
 }
 
-/* The plans of the sites that the program has */
+/*
+ * Subprog @s is stuck, in all its uses, and what told is one call, which the pass that is loaded
+ * may not even get to: a pass that keeps less apart found it, and every run after it knows from
+ * its start, see check_funcs(). So the line names the insn.
+ */
+static void print_stuck(struct bpf_verifier_env *env, int s)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	int by = bpf_find_containing_subprog(env, sub->stuck_insn) - env->subprog_info;
+
+	verbose(env, "func#%d cannot unwind", s);
+	switch (sub->stuck_by) {
+	case BPF_STUCK_NO_PAD:
+		verbose(env, ", the call at %u has no landing pad for it", sub->stuck_insn);
+		break;
+	case BPF_STUCK_CALLED:
+		verbose(env, ", func#%d calls it at %u and cannot unwind", by, sub->stuck_insn);
+		break;
+	case BPF_STUCK_CAME_BACK:
+		verbose(env, ", it came back to the call at %u in func#%d, which cannot unwind",
+			sub->stuck_insn, by);
+		break;
+	default:
+		verbose(env, " at %u", sub->stuck_insn);
+		break;
+	}
+	verbose(env, ": its may_goto jumps, its arena accesses are skipped\n");
+}
+
+/*
+ * The plans of the sites that the program has, the functions that cannot unwind where they could
+ * go on instead, and the functions that have hidden slots
+ */
 void bpf_pads_log(struct bpf_verifier_env *env)
 {
+	static const char * const group[] = {
+		[BPF_PAD_GROUP_RCU]	= "rcu",
+		[BPF_PAD_GROUP_PREEMPT]	= "preempt",
+		[BPF_PAD_GROUP_LOCKS]	= "locks",
+		[BPF_PAD_GROUP_REFS]	= "refs",
+	};
+	const struct bpf_subprog_info *sub;
 	const struct bpf_pad_plan *plan;
-	int i;
+	int i, s, g;
 
 	if (!(env->log.level & BPF_LOG_LEVEL2))
 		return;
@@ -2870,4 +2911,16 @@ void bpf_pads_log(struct bpf_verifier_env *env)
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
 			if (plan->used)
 				print_plan(env, i, plan);
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (sub->stuck)
+			print_stuck(env, s);
+		if (!sub->slots)
+			continue;
+		verbose(env, "func#%d has hidden slots for:", s);
+		for (g = 0; g < BPF_PAD_NR_GROUPS; g++)
+			if (sub->slots & BIT(g))
+				verbose(env, " %s", group[g]);
+		verbose(env, "\n");
+	}
 }
