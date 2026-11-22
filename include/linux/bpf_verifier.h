@@ -1299,6 +1299,11 @@ struct bpf_insn_aux_data {
 	u32 calls_callback:1;
 	/* true if some jump or call instruction targets this instruction */
 	u32 jump_target:1;
+	/*
+	 * unwind_goto of the program: its landing pad only cleans up and resumes, see
+	 * bpf_find_kernel_pads()
+	 */
+	u32 kpad:1;
 	/* it can read or write the frame of a caller, in a call with a known callee */
 	u32 reads_outer:1;
 	u32 writes_outer:1;
@@ -2396,6 +2401,7 @@ int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pa
 int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
 			struct bpf_insn *buf);
 void bpf_pads_log(struct bpf_verifier_env *env);
+int bpf_find_kernel_pads(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);

@@ -3033,3 +3033,120 @@ void bpf_pads_log(struct bpf_verifier_env *env)
 		verbose(env, "\n");
 	}
 }
+
+/*
+ * Does @insn leave the frame in a way that goes on with the caller? exit, a tail call that is
+ * taken, and LD_ABS or LD_IND that fails. Not unwind_exit: the caller is unwound in turn.
+ */
+static bool insn_returns(const struct bpf_insn *insn)
+{
+	if (insn->code == (BPF_JMP | BPF_EXIT))
+		return !bpf_is_unwind_exit(insn);
+	if (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call)
+		return true;
+	return BPF_CLASS(insn->code) == BPF_LD &&
+	       (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND);
+}
+
+/*
+ * The landing pads that a program has behind its calls are code like any other: a pad can end the
+ * unwinding and go on with the program, a catch clause of C++ does. What the kernel unwinds must
+ * not be caught. But a pad that only cleans up, a destructor and then unwind_exit, cannot catch
+ * anything, and what it does is what the program wants done when a frame is left.
+ *
+ * Find those pads, on the control flow graph, before any state is looked at. The landing pad of
+ * unwind_goto ONLY RESUMES if, from its first insn:
+ *   - no path in the function gets to an insn that returns to the caller, see insn_returns(), and
+ *   - a path gets to unwind_exit.
+ * The second one leaves out the pads that end in a call which never returns: std::terminate().
+ * What a pad does on the way is not asked. It can call, loop, fault in arena and call bpf_throw():
+ * those are sites of the frame like any other.
+ *
+ *	~Guard()		try { } catch (...)	noexcept
+ *
+ *	call foo		call foo		call foo
+ *	unwind_goto pad		unwind_goto pad		unwind_goto pad
+ *	...			...			...
+ * pad:	r6 = r0			call begin_catch	call terminate
+ *	call dtor		...			goto -1
+ *	r0 = r6			r0 = 0
+ *	unwind_exit		exit
+ *
+ *	only resumes		returns			no unwind_exit
+ *
+ * A typed catch gets to its handler by a branch on what the personality routine of the program
+ * says, which is a value like any other: the pad returns. Pads that share their last insns, as the
+ * pads of one function of C++ do, are judged one by one, each from its first insn.
+ *
+ * The answer is a property of the insns, the same in every pass: 'kpad' of unwind_goto.
+ * Dead branches are gone from the graph, see bpf_prune_dead_branches().
+ */
+int bpf_find_kernel_pads(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn *insns = env->prog->insnsi, *insn;
+	int i, p, t, pad, cnt, len = env->prog->len, err = 0;
+	unsigned long *returns, *resumes;
+	struct bpf_iarray *succ;
+	bool changed, ret, res;
+
+	for (i = 0; i < len && !bpf_is_unwind_goto(&insns[i]); i++)
+		;
+	if (i == len)
+		return 0;
+	returns = bitmap_zalloc(len, BPF_VERIFIER_GFP);
+	resumes = bitmap_zalloc(len, BPF_VERIFIER_GFP);
+	if (!returns || !resumes) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < len; i++) {
+		if (insn_returns(&insns[i]))
+			__set_bit(i, returns);
+		if (bpf_is_unwind_exit(&insns[i]))
+			__set_bit(i, resumes);
+	}
+	/* an insn gets to what the insns behind it get to: those come first in the postorder */
+	do {
+		changed = false;
+		err = bpf_add_cost_and_check(env, env->cfg.cur_postorder, BPF_COST_SCAN);
+		if (err)
+			goto out;
+		for (p = 0; p < env->cfg.cur_postorder; p++) {
+			i = env->cfg.insn_postorder[p];
+			insn = &insns[i];
+			ret = test_bit(i, returns);
+			res = test_bit(i, resumes);
+			succ = bpf_insn_successors(env, i);
+			/*
+			 * The exit that stands for the return of a tail call or of LD_ABS can be
+			 * unwind_exit: the insn returns, whatever that exit is.
+			 */
+			cnt = insn_returns(insn) ? min(succ->cnt, 1) : succ->cnt;
+			for (t = 0; t < cnt; t++) {
+				ret |= test_bit(succ->items[t], returns);
+				res |= test_bit(succ->items[t], resumes);
+			}
+			if (ret && !__test_and_set_bit(i, returns))
+				changed = true;
+			if (res && !__test_and_set_bit(i, resumes))
+				changed = true;
+		}
+	} while (changed);
+	for (i = 0; i < len; i++) {
+		insn = &insns[i];
+		if (!bpf_is_unwind_goto(insn))
+			continue;
+		pad = i + 1 + bpf_jmp_offset(insn);
+		ret = test_bit(pad, returns);
+		res = test_bit(pad, resumes);
+		env->insn_aux_data[i].kpad = !ret && res;
+		if (!(env->log.level & BPF_LOG_LEVEL2))
+			continue;
+		verbose(env, "landing pad at %d of the call at %d %s\n", pad, i - 1,
+			ret ? "returns" : res ? "only resumes" : "has no unwind_exit");
+	}
+out:
+	bitmap_free(returns);
+	bitmap_free(resumes);
+	return err;
+}
