@@ -82,6 +82,8 @@
 #include "verifier_kfunc_uninit.skel.h"
 #include "verifier_kfunc_uninit_multi.skel.h"
 #include "verifier_kfunc_perfmon.skel.h"
+#include "verifier_kunwind.skel.h"
+#include "verifier_kunwind_arena.skel.h"
 #include "verifier_ld_ind.skel.h"
 #include "verifier_large_stack.skel.h"
 #include "verifier_ldsx.skel.h"
@@ -391,6 +393,8 @@ void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
 void test_verifier_throw(void)                { RUN(verifier_throw); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
+void test_verifier_kunwind(void)              { RUN(verifier_kunwind); }
+void test_verifier_kunwind_arena(void)        { RUN(verifier_kunwind_arena); }
 /* The helpers have pads with asm goto outputs only, and the kernel says -ENOTSUPP without */
 static bool cb_pads_supported(void)
 {

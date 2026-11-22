@@ -470,6 +470,138 @@ __naked void unwind_out_of_helper(void)
 	: __clobber_all);
 }
 
+/* It ends the loop, or it leaves with unwind_exit: by what is in memory, which is 0 */
+static __naked __noinline __used long cb_returns_or_unwinds(void)
+{
+	asm volatile (
+	"r1 = %[last_r12] ll;"
+	"r1 = *(u64 *)(r1 + 0);"
+	"if r1 == 0 goto +2;"
+	"r0 = 0;"
+	".8byte %[unwind_exit];"
+	"r0 = 1;"
+	"exit;"
+	:
+	: __imm_addr(last_r12),
+	  __imm_insn(unwind_exit, BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0))
+	: __clobber_all);
+}
+
+/*
+ * The same call when the helper returns. x86-64 loads r9 again behind the native call of a
+ * helper. On the way of unwind_exit to the pad that is done in a landing behind the last insn of
+ * the prog: the next insn of the prog follows the load, with no jump over a landing.
+ */
+SEC("syscall")
+__description("arena stack: no jump behind the call of a helper that has a landing")
+__arch_x86_64
+__success __retval(1)
+__jited("...")
+__jited("	movq	%r9, -0x{{[0-9a-f]+}}(%rbp)")
+__jited("...") /* call depth accounting */
+__jited("	callq	0x{{.*}}")
+__jited("	movq	-0x{{[0-9a-f]+}}(%rbp), %r9")
+__jited("	movl	$0x1, %eax")
+__jited("...")
+__jited("	movq	-0x{{[0-9a-f]+}}(%rbp), %r9")
+__jited("	jmp	L{{.*}}")
+__naked void return_from_helper_with_landing(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+	".8byte %[st];"		/* *(u64 *)(r12 - 16) = 5 */
+	"r1 = 1;"
+	"r2 = %[cb_returns_or_unwinds] ll;"
+	"r3 = 0;"
+	"r4 = %[first_r12] ll;"	/* 0, not known to the verifier: bpf_loop() is not inlined */
+	"r4 = *(u64 *)(r4 + 0);"
+	"call %[bpf_loop];"
+	".8byte %[unwind_goto];"
+	"r0 = 1;"
+	"exit;"
+	".8byte %[ldx];"	/* r0 = *(u64 *)(r12 - 16) */
+	"exit;"
+	:
+	: __imm_addr(cb_returns_or_unwinds), __imm_addr(first_r12), __imm(bpf_loop),
+	  __imm_insn(adj, ADJ(16)), __imm_insn(st, ST(BPF_DW, -16, 5)),
+	  __imm_insn(ldx, LDX(BPF_DW, BPF_REG_0, -16)),
+	  __imm_insn(unwind_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 2, 0))
+	: __clobber_all);
+}
+
+/* What the landing pad below found at r12 - 16, and a loop that nothing ends */
+unsigned long seen_in_pad, forever = 1;
+
+/* The kernel unwinds it when its time is up */
+static __naked __noinline __used long cb_spins(void)
+{
+	asm volatile (
+	"r2 = %[forever] ll;"
+"1:"
+	"r1 = *(u64 *)(r2 + 0);"
+	"if r1 != 0 goto 1b;"
+	"r0 = 1;"
+	"exit;"
+	:
+	: __imm_addr(forever)
+	: __clobber_all);
+}
+
+__noinline int returns_what_the_pad_saw(__u64 cookie)
+{
+	return seen_in_pad;
+}
+
+/*
+ * The kernel unwinds the callback, and kexit comes back to the call of the helper through its own
+ * landing, which loads r9 again like the one of unwind_exit. The landing pad of the prog only
+ * resumes, so the kernel enters it. It reads the stack in arena: the 5 is there only if r9 is the
+ * one of the prog again. The exception callback returns what the pad read.
+ */
+SEC("syscall")
+__description("arena stack: r12 in the landing pad that the kernel enters after a helper")
+__arch_x86_64
+__success __retval(5)
+__exception_cb(returns_what_the_pad_saw)
+__jited("...")
+__jited("	movq	%r9, -0x{{[0-9a-f]+}}(%rbp)")
+__jited("...") /* call depth accounting */
+__jited("	callq	0x{{.*}}")
+__jited("	movq	-0x{{[0-9a-f]+}}(%rbp), %r9")
+__jited("	movl	$0x1, %eax")
+__jited("...")
+/* the landing of unwind_goto, then the one of kgoto: the last insns of the prog */
+__jited("	movq	-0x{{[0-9a-f]+}}(%rbp), %r9")
+__jited("	jmp	L{{.*}}")
+__jited("	movq	-0x{{[0-9a-f]+}}(%rbp), %r9")
+__jited("	jmp	L{{[0-9]+[[:space:]]+}}func #1:")
+__naked void kunwind_out_of_helper(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+	".8byte %[st];"		/* *(u64 *)(r12 - 16) = 5 */
+	"r1 = 1;"
+	"r2 = %[cb_spins] ll;"
+	"r3 = 0;"
+	"r4 = %[first_r12] ll;"	/* 0, not known to the verifier: bpf_loop() is not inlined */
+	"r4 = *(u64 *)(r4 + 0);"
+	"call %[bpf_loop];"
+	".8byte %[unwind_goto];"
+	"r0 = 1;"
+	"exit;"
+	".8byte %[ldx];"	/* r0 = *(u64 *)(r12 - 16) */
+	"r1 = %[seen_in_pad] ll;"
+	"*(u64 *)(r1 + 0) = r0;"
+	".8byte %[unwind_exit];"
+	:
+	: __imm_addr(cb_spins), __imm_addr(first_r12), __imm_addr(seen_in_pad), __imm(bpf_loop),
+	  __imm_insn(adj, ADJ(16)), __imm_insn(st, ST(BPF_DW, -16, 5)),
+	  __imm_insn(ldx, LDX(BPF_DW, BPF_REG_0, -16)),
+	  __imm_insn(unwind_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 2, 0)),
+	  __imm_insn(unwind_exit, BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0))
+	: __clobber_all);
+}
+
 #ifdef __BPF_FEATURE_STACK_ARGUMENT
 
 extern __u64 bpf_kfunc_call_stack_arg(__u64 a, __u64 b, __u64 c, __u64 d, __u64 e, __u64 f,
@@ -1396,6 +1528,74 @@ __naked void gotox_first_insn_of_callback(void)
 	"call %[bpf_loop];"
 	/* the flag through r6, r7, r8 and no change of r12: 1 + 10 + 100 + 0 */
 	"r0 = *(u64 *)(r10 - 8);"
+	"exit;"
+	:
+	: __imm(bpf_loop)
+	: __clobber_all);
+}
+
+/* takes a stack in arena and spins in a loop that nothing ends: the kernel unwinds it */
+static __naked __noinline __used long spins_cb(void)
+{
+	asm volatile (
+	".8byte %[adj];"
+"1:"
+	"call %[bpf_get_prandom_u32];"
+	"if r0 != 0 goto 1b;"
+	"exit;"
+	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm_insn(adj, ADJ(16))
+	: __clobber_all);
+}
+
+/*
+ * The landing pad of the callback leaves with kexit, and r2 is 0 there. The code that gives the
+ * stack in arena back stands in front of each kexit: it keeps r2 as it is where the stack of the
+ * cpu was free, and sets it again behind the call that gives another stack back.
+ */
+SEC("syscall")
+__description("arena stack: r2 is 0 at kexit of a callback that gives its stack back")
+__success
+/* the exit of the callback, where r2 is free */
+__xlated("...")
+__xlated("w12 += -16")
+__xlated("if w12 & 0x{{.*}} goto pc+5")
+__xlated("r2 = 0x{{.*}}")
+__xlated("r2 = &(void __percpu *)(r2)")
+__xlated("*(u64 *)(r2 +{{[0-9]+}}) = 0")
+__xlated("exit")
+__xlated("r6 = r0")
+__xlated("r1 = 0x{{.*}}")
+__xlated("r2 = r12")
+__xlated("call {{.*}}")
+__xlated("r0 = r6")
+__xlated("exit")
+/* its landing pad, with the value of an unwound syscall prog: -ECANCELED */
+__xlated("r0 = -125")
+__xlated("r2 = 0")
+__xlated("w12 += -16")
+__xlated("if w12 & 0x{{.*}} goto pc+5")
+__xlated("r1 = 0x{{.*}}")
+__xlated("r1 = &(void __percpu *)(r1)")
+__xlated("*(u64 *)(r1 +{{[0-9]+}}) = 0")
+__xlated("kexit")
+__xlated("r6 = r0")
+__xlated("r1 = 0x{{.*}}")
+__xlated("r2 = r12")
+__xlated("call {{.*}}")
+__xlated("r0 = r6")
+__xlated("r2 = 0")
+__xlated("kexit")
+__naked void kexit_gives_stack_back(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"r2 = spins_cb ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"r0 = 0;"
 	"exit;"
 	:
 	: __imm(bpf_loop)

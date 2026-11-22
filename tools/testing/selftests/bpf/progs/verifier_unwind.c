@@ -1367,6 +1367,65 @@ __naked int ld_abs_in_subprog(void)
 	);
 }
 
+/* It reads through a pointer to the stack of the main prog: verified in the frames of its callers */
+__naked __noinline __used
+static unsigned long unwinds_with_0_or_5(void)
+{
+	asm volatile (
+		"r6 = *(u64 *)(r1 + 0);"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 == 0 goto +2;"
+		"r0 = 5;"
+		unwind_exit
+		"r0 = 0;"
+		unwind_exit
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm_unwind_exit
+		: __clobber_all
+	);
+}
+
+/* No unwind_goto: the verifier adds it, and a landing pad that passes on what unwind_exit left */
+__naked __noinline __used
+static unsigned long calls_unwinds_with_0_or_5(void)
+{
+	asm volatile ("call unwinds_with_0_or_5; r0 = 1; exit;" ::: __clobber_all);
+}
+
+/*
+ * Two unwound states that differ in what unwind_exit left alone meet where no insn of the prog
+ * reads r0, behind the call in the frame in between. r0 stays apart all the same: the pad of the
+ * prog reads it, and takes 5 for a pointer.
+ */
+SEC("tc")
+__description("unwind: two values of unwind_exit through a plain call, the pad of the prog expects 0")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("R1 invalid mem access 'scalar'")
+__naked int two_values_through_plain_call(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call calls_unwinds_with_0_or_5;"
+		unwind_goto(2)
+		"r0 = 1;"
+		"exit;"
+		"if r0 == 0 goto +2;"
+		"r1 = 0;"
+		"r0 = *(u64 *)(r1 + 0);"
+		"r0 = 2;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
 /*
  * JITs don't emit anything for unwind_goto. It's an extable entry, where
  * unwind_exit looks its return address up.
