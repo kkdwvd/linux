@@ -481,6 +481,18 @@ enum bpf_site_kind {
 	 */
 	BPF_SITE_KCALL,
 	/*
+	 * The same call, where the program has unwind_goto whose landing pad only resumes, see
+	 * bpf_find_kernel_pads(): kgoto goes to code that the verifier adds in front of that pad,
+	 * the entry, and the frame is not left. It goes on in the landing pad of the program,
+	 * FORCED: the kernel is unwinding it.
+	 */
+	BPF_SITE_KENTRY,
+	/*
+	 * unwind_exit of the program that a forced frame gets to: the insn becomes a jump to code
+	 * of the verifier that releases what the frame still holds and leaves with kexit
+	 */
+	BPF_SITE_REMAINDER,
+	/*
 	 * A flag on top of a kind: the frame that is left at the site is one that the kernel
 	 * unwinds already. It is left with kexit at every kind of site, and with the value that
 	 * its unwinding began with. The states that leave such a frame have a plan of their own at
@@ -495,15 +507,20 @@ static inline enum bpf_site_kind bpf_site_base(enum bpf_site_kind kind)
 	return kind & ~BPF_SITE_FORCED;
 }
 
+/* The frame that is left there is one that the kernel unwinds already */
 static inline bool bpf_site_is_forced(enum bpf_site_kind kind)
 {
-	return kind & BPF_SITE_FORCED;
+	return (kind & BPF_SITE_FORCED) || kind == BPF_SITE_REMAINDER;
 }
 
-/* The frame is left at a call, to which what it called came back unwound */
+/*
+ * The site is a call, to which what it called came back unwound. The frame is left there, or the
+ * kernel enters the landing pad that the program has behind the call.
+ */
 static inline bool bpf_site_is_call(enum bpf_site_kind kind)
 {
-	return bpf_site_base(kind) == BPF_SITE_CALL || bpf_site_base(kind) == BPF_SITE_KCALL;
+	return bpf_site_base(kind) == BPF_SITE_CALL || bpf_site_base(kind) == BPF_SITE_KCALL ||
+	       kind == BPF_SITE_KENTRY;
 }
 
 /*
@@ -757,6 +774,14 @@ struct bpf_func_state {
 	bool in_rcu_callback_fn;
 	/* parent_id of the args that are gone when this frame returns */
 	u32 frame_id;
+	/*
+	 * BPF_FRAME_FORCED: the kernel is unwinding the frame, through a landing pad of the
+	 * program that only resumes, see enter_kernel_pad(). Never cleared: the frame is left
+	 * with kexit. Such a state and one of the normal path are never joined.
+	 * BPF_FRAME_BELOW: the first frame of a function that is verified on its own, for a call
+	 * out of a frame that has a mark. It only keeps the function apart from its other calls.
+	 */
+	u32 forced;
 	);
 	bool no_stack_arg_load;
 	/*
@@ -829,6 +854,18 @@ struct bpf_equations {
 	u32 clean_sym_cnt;	/* after the last bpf_equations_clean() */
 };
 
+/* see 'forced' of struct bpf_func_state */
+enum {
+	BPF_FRAME_FORCED = 1,
+	BPF_FRAME_BELOW = 2,
+};
+
+/* The kernel is unwinding @frame, which is in a landing pad of the program on its way out */
+static inline bool bpf_frame_is_forced(const struct bpf_func_state *frame)
+{
+	return frame->forced & BPF_FRAME_FORCED;
+}
+
 /* see 'unwound' of struct bpf_verifier_state */
 enum {
 	BPF_UNWOUND = 1,
@@ -894,7 +931,8 @@ struct bpf_verifier_state {
 	 * adds it before that insn, see check_unwound_arrival().
 	 * BPF_KUNWOUND: the kernel unwound the callee, which left with kexit. The verifier adds
 	 * kgoto before the next insn, whatever that insn is: unwind_goto of the program is not
-	 * taken.
+	 * taken. If that is unwind_goto whose landing pad only resumes, kgoto goes there too,
+	 * through the entry, see enter_kernel_pad().
 	 * BPF_UNWOUND_CB, BPF_KUNWOUND_CB: the callee is a callback. Next insn is the call of the
 	 * helper or the kfunc that called it, once more, see prepare_func_exit().
 	 * The states of the two kinds stay apart: this is in the join key.
@@ -1322,7 +1360,8 @@ struct bpf_insn_aux_data {
 	u32 jump_target:1;
 	/*
 	 * unwind_goto of the program: its landing pad only cleans up and resumes, see
-	 * bpf_find_kernel_pads()
+	 * bpf_find_kernel_pads(). The kernel enters it when it unwinds what the call in front
+	 * calls.
 	 */
 	u32 kpad:1;
 	/* it can read or write the frame of a caller, in a call with a known callee */
@@ -1595,8 +1634,18 @@ struct bpf_subprog_info {
 	 * for that. If the subprog is stuck later, the pass is done again, see stuck_frame_calls().
 	 */
 	bool made_calls: 1;
-	/* scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it */
+	/*
+	 * scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it, or
+	 * the kernel entered a landing pad of the program in it
+	 */
 	bool below_conflict: 1;
+	/* it has unwind_goto whose landing pad only resumes, see bpf_find_kernel_pads() */
+	bool has_kpads: 1;
+	/*
+	 * The kernel enters one of them, as the program is in the end: its frames can be forced.
+	 * See bpf_mark_subprogs_that_unwind().
+	 */
+	bool enters_kpads: 1;
 	/* the kinds of site that the program leaves it at, bits by enum bpf_site_kind */
 	u16 left_at;
 	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
@@ -1605,6 +1654,8 @@ struct bpf_subprog_info {
 	u8 slots: 4;
 	/* they take that many words of 8 bytes below its stack */
 	u8 hidden_words;
+	/* the stack has no room for 'value_off', as take_value_word() found in this settle */
+	bool no_value_word: 1;
 	/* stack_depth has them, see bpf_pads_settle(). Until then it is what the program uses. */
 	bool hidden_in_depth: 1;
 	u8 code_stack_args;
@@ -2429,6 +2480,8 @@ void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
 void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save);
 void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
+struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env,
+				   const struct bpf_verifier_state *st, int call_idx);
 struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st, int insn_idx,
 				   enum bpf_site_kind kind);

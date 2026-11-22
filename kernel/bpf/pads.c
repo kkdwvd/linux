@@ -97,10 +97,9 @@
  * with insns of its own: unwind_exit leaves a frame and goes to unwind_goto after the call, where
  * the program has a landing pad, which is code like any other. It can end the unwinding and go on.
  * WHAT THE KERNEL UNWINDS MUST NOT BE CAUGHT: the program was stopped because it ran out of time
- * or of stack, faulted, or called bpf_throw(). So the two never meet. kexit does not go to
- * unwind_goto, a state that the kernel unwound is marked for it, BPF_KUNWOUND, and at a call that
- * has unwind_goto of the program such a state goes to a pad of the verifier all the same, see
- * check_unwound_arrival():
+ * or of stack, faulted, or called bpf_throw(). kexit does not go to unwind_goto, a state that the
+ * kernel unwound is marked for it, BPF_KUNWOUND, and at a call that has unwind_goto of the program
+ * such a state goes to a pad of the verifier all the same, see check_unwound_arrival():
  *
  *	try {						   call wait
  *		v = wait();				   unwind_goto catch	unwind_exit
@@ -111,9 +110,61 @@
  *						      pad: r0 = 0
  *							   exit
  *
- * No landing pad of the program runs on the way, also none that only cleans up: the pad of the
- * verifier releases what the frame holds of the kernel, and what the program keeps for itself is
- * its own to lose.
+ * A landing pad that can go on with the program does not run on the way: the pad of the verifier
+ * releases what the frame holds of the kernel.
+ *
+ * A landing pad that ONLY RESUMES does run: it cannot catch, and what it does is what the program
+ * wants done when a frame is left. A destructor of C++ or drop glue of Rust unlocks a lock word in
+ * arena, frees memory there. Which pads those are is asked of the control flow graph, before the
+ * main pass, see bpf_find_kernel_pads(): from the pad no insn that returns to the caller can be
+ * reached, and unwind_exit can. At such a call kgoto goes to an ENTRY in front of the pad of the
+ * program, BPF_SITE_KENTRY, and unwind_exit that the pad ends in becomes a jump to code that leaves
+ * the frame as a pad of the verifier does, BPF_SITE_REMAINDER:
+ *
+ *	{						   *(u64 *)(r10 - 8) = 0
+ *		Guard g;				   ...
+ *							   call wait
+ *		v = wait();				   unwind_goto pad
+ *	}						   kgoto entry
+ *							   ...
+ *						      pad: r6 = r0
+ *							   call ~Guard
+ *							   r0 = r6
+ *							   gotol rest
+ *							   ...
+ *						    entry: ax = *(u64 *)(r10 - 8)
+ *							   if ax != 0 goto 1f
+ *							   *(u64 *)(r10 - 8) = 1
+ *							1: r0 = 0
+ *							   gotol pad
+ *						     rest: ax = *(u64 *)(r10 - 8)
+ *							   if ax == 0 goto 2f
+ *							   r0 = V
+ *							   r2 = 0
+ *							   kexit
+ *							2: unwind_exit
+ *
+ * K, the word at r10 - 8 here, is a hidden word of the frame that says whether the kernel unwinds
+ * it. It is 0 from the entry of the function on, and only the entry of a pad sets it. The main
+ * pass has the same in the frame of a state: 'forced', see enter_kernel_pad() in verifier.c. From
+ * there the pad is verified once more, with what the frame holds when the kernel unwinds the
+ * callee and with 0 in R0. An error on that way is an error of the program. A forced frame has
+ * two ways out, and both leave with kexit and the value of the kernel:
+ *   - unwind_exit of the program. The program has released what it wanted to, and the verifier
+ *     releases what the frame still holds. That needs a plan like any site, with places that are
+ *     good at that insn: sections, a lock at a constant address, an object in the stack of the
+ *     frame, a pointer in R0.
+ *   - A site of the frame, in the pad: a destructor loops until its time is up, faults in arena,
+ *     calls what is unwound in turn. The states that leave a forced frame have a plan of their own
+ *     there, BPF_SITE_FORCED, and its pad loads the value that the frame has, not the one of the
+ *     site: the first start of an unwinding decides what the program returns. Where a frame gets
+ *     to a site in both ways a test of K picks the pad.
+ * No plan for one of them is an error of the program, as it is at any site: THE KERNEL ENTERS A
+ * LANDING PAD THAT ONLY RESUMES, OR THE PROGRAM IS REJECTED, see bpf_pads_settle(). No pad is
+ * passed by for what the verifier cannot arrange around it.
+ * And WHAT THE KERNEL UNWINDS CANNOT BE CAUGHT still holds: a forced frame never returns to its
+ * caller, and no state of the normal path is joined with one of a forced frame.
+ *
  * The other way around a frame that has no unwind_goto at a call can be on the way of unwind_exit
  * of the program, BPF_SITE_CALL. The verifier gives it unwind_goto and a pad, as upstream does not:
  * that pad ends in unwind_exit and passes on what the callee left in R0, see
@@ -1430,6 +1481,32 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	return plan;
 }
 
+/*
+ * The kernel unwound what the call at @call_idx called, and the current frame of @st goes on in
+ * the landing pad that the program has behind the call, see enter_kernel_pad() in verifier.c. The
+ * plan of the entry is no plan of a pad: the frame is not left, and nothing is released. It says
+ * that the call has an entry, and what the entry has to find: in a program with bpf_throw() the
+ * value of the kernel is in R0, a number, and goes to the hidden word of the frame.
+ * With a conflict the state ends here, and bpf_pads_settle() rejects the program.
+ * Returns the plan.
+ */
+struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env,
+				   const struct bpf_verifier_state *st, int call_idx)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	struct bpf_pad_plan *plan;
+
+	plan = bpf_pad_plan_get(env, call_idx, BPF_SITE_KENTRY);
+	if (!plan)
+		return ERR_PTR(-ENOMEM);
+	plan->visited = true;
+	if (plan->conflict)
+		return plan;
+	if (env->has_throw && frame->regs[BPF_REG_0].type != SCALAR_VALUE)
+		plan->conflict = BPF_CONFLICT_NO_VALUE;
+	return plan;
+}
+
 /* The group of @class */
 static int class_group(int class)
 {
@@ -1942,7 +2019,10 @@ bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan
 	const struct bpf_subprog_info *sub;
 	int s;
 
-	/* the frame was being unwound when it got to the site: what began that is asked */
+	/*
+	 * The frame was being unwound when it got to the site. What began that is asked: the call
+	 * behind which the kernel entered a landing pad of the program, BPF_SITE_KENTRY.
+	 */
 	if (bpf_site_is_forced(plan->kind))
 		return false;
 	if (!bpf_site_is_call(plan->kind))
@@ -2004,6 +2084,8 @@ static const char * const site_kind[] = {
 	[BPF_SITE_THROW]		= "bpf_throw",
 	[BPF_SITE_MAY_GOTO]		= "may_goto of the program",
 	[BPF_SITE_KCALL]		= "call",
+	[BPF_SITE_KENTRY]		= "call",
+	[BPF_SITE_REMAINDER]		= "unwind_exit",
 };
 
 /* The program has unwind_exit in the subprog. No site: the last bit, far from those of the kinds. */
@@ -2015,8 +2097,8 @@ static const char * const site_kind[] = {
  */
 static u16 kinds_of_plan(const struct bpf_pad_plan *plan, u16 kinds)
 {
-	return bpf_site_base(plan->kind) == BPF_SITE_KCALL ? kinds & ~LEFT_AT_UNWIND_EXIT
-							   : kinds & LEFT_AT_UNWIND_EXIT;
+	return bpf_site_is_kernel(bpf_site_base(plan->kind)) ? kinds & ~LEFT_AT_UNWIND_EXIT
+							     : kinds & LEFT_AT_UNWIND_EXIT;
 }
 
 /*
@@ -2052,10 +2134,16 @@ static int sites_of_subprogs(struct bpf_verifier_env *env)
 				if (aux[i].fault_empty && !aux[i].fault_skips)
 					kinds |= BIT(BPF_SITE_FAULT);
 				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
-					if (!plan->used)
+					/* the frame is not left at the entry of a pad */
+					if (!plan->used || plan->kind == BPF_SITE_KENTRY)
 						continue;
+					/* a frame that the kernel unwinds: wherever it is left */
+					if (bpf_site_is_forced(plan->kind)) {
+						kinds |= BIT(BPF_SITE_REMAINDER);
+						continue;
+					}
 					if (!bpf_site_is_call(plan->kind)) {
-						kinds |= BIT(bpf_site_base(plan->kind));
+						kinds |= BIT(plan->kind);
 						continue;
 					}
 					bpf_pad_for_each_callee(plan, c)
@@ -2104,6 +2192,8 @@ static void print_sites_below(struct bpf_verifier_env *env, int i, const struct 
 	for (k = 0; k <= BPF_SITE_MAY_GOTO; k++)
 		if (kinds & BIT(k))
 			verbose(env, " %s%s", site_kind[k], kinds >> (k + 1) ? "," : "");
+	if (kinds & BIT(BPF_SITE_REMAINDER))
+		verbose(env, " a landing pad of the program");
 	if (kinds & LEFT_AT_UNWIND_EXIT)
 		verbose(env, " unwind_exit");
 	verbose(env, "\n");
@@ -2121,9 +2211,14 @@ static bool plan_is_stuck(const struct bpf_pad_plan *plan)
  * was out of time, or from an access that faulted, was not verified. But not where the frame cannot
  * unwind and the site has another way out, see bpf_pad_must_unwind(): what comes back to a call
  * there is stuck, see bpf_pad_skip_faults().
+ * A frame that the kernel unwinds through a landing pad of the program has no other way out,
+ * wherever it is left, and neither has the entry of such a pad: the kernel enters the pad, or the
+ * program is rejected.
  */
 static bool plan_rejects(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
+	if (plan->kind == BPF_SITE_KENTRY || bpf_site_is_forced(plan->kind))
+		return plan->conflict;
 	return plan->conflict && (bpf_pad_must_unwind(env, plan) || !plan_is_stuck(plan));
 }
 
@@ -2310,6 +2405,7 @@ static int settle_slots(struct bpf_verifier_env *env)
 		env->subprog_info[s].slots = 0;
 		env->subprog_info[s].hidden_words = 0;
 		env->subprog_info[s].value_off = 0;
+		env->subprog_info[s].no_value_word = false;
 	}
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
@@ -2535,30 +2631,36 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 	verbose(env, ")%s ", ent_is_tested(ent) ? " if not 0" : "");
 }
 
+static const char * const conflict_why[] = {
+	[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
+	[BPF_CONFLICT_TOO_MUCH]		= "too much is held",
+	[BPF_CONFLICT_PLAN_FULL]	=
+		"the paths to the site hold more different things than a pad releases",
+	[BPF_CONFLICT_SLOTS_FULL]	= "the function has more hidden slots than a pad has entries",
+	[BPF_CONFLICT_NO_RELEASE]	= "the program can call nothing that releases a resource",
+	[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
+	[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
+	[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
+	[BPF_CONFLICT_CANNOT_UNWIND]	=
+		"the JIT or the helper that calls the function cannot unwind it",
+	[BPF_CONFLICT_NO_EXIT]		= "the function has no exit",
+	[BPF_CONFLICT_NO_PERFMON]	= "the program is loaded without CAP_PERFMON",
+	[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
+	[BPF_CONFLICT_NO_VALUE]		= "the value of unwind_exit is not a number",
+	[BPF_CONFLICT_NO_ROOM]		= "no room in the stack for the value",
+};
+
 /* The plan of the site at insn @i, or why there is none */
 static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
-	static const char * const why[] = {
-		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
-		[BPF_CONFLICT_TOO_MUCH]		= "too much is held",
-		[BPF_CONFLICT_PLAN_FULL]	=
-			"the paths to the site hold more different things than a pad releases",
-		[BPF_CONFLICT_SLOTS_FULL]	=
-			"the function has more hidden slots than a pad has entries",
-		[BPF_CONFLICT_NO_RELEASE]	= "the program can call nothing that releases a resource",
-		[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
-		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
-		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
-		[BPF_CONFLICT_CANNOT_UNWIND]	=
-			"the JIT or the helper that calls the function cannot unwind it",
-		[BPF_CONFLICT_NO_EXIT]		= "the function has no exit",
-		[BPF_CONFLICT_NO_PERFMON]	= "the program is loaded without CAP_PERFMON",
-		[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
-		[BPF_CONFLICT_NO_VALUE]		= "the value of unwind_exit is not a number",
-		[BPF_CONFLICT_NO_ROOM]		= "no room in the stack for the value",
-	};
 	int j;
 
+	/* no pad of the verifier: the landing pad of the program, with code in front of it */
+	if (plan->kind == BPF_SITE_KENTRY) {
+		verbose(env, "landing pad of the program behind the call at %d: the kernel enters it\n",
+			i);
+		return;
+	}
 	/*
 	 * A call has one for what the kernel unwinds, and one for unwind_exit of the program. And
 	 * any site one more for the frames that the kernel unwinds already.
@@ -2569,7 +2671,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	for (j = plan->nr_ents - 1; !plan->conflict && j >= 0; j--)
 		print_ent(env, &plan->ents[j]);
 	if (plan->conflict)
-		verbose(env, "conflict: %s\n", why[plan->conflict]);
+		verbose(env, "conflict: %s\n", conflict_why[plan->conflict]);
 	else
 		verbose(env, "rcu=%d preempt=%d\n", plan->sections[BPF_PAD_RCU],
 			plan->sections[BPF_PAD_PREEMPT]);
@@ -2590,7 +2692,10 @@ void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pa
 void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
 		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind)
 {
-	sub->left_at |= bpf_site_is_call(kind) ? sites_below(env, plan) : BIT(bpf_site_base(kind));
+	if (bpf_site_is_forced(kind))
+		sub->left_at |= BIT(BPF_SITE_REMAINDER);
+	else
+		sub->left_at |= bpf_site_is_call(kind) ? sites_below(env, plan) : BIT(kind);
 }
 
 /* Did bpf_pad_skip_faults() walk @sub, and has no call in or below it got a new callee since? */
@@ -2668,6 +2773,10 @@ int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan 
  * The pads of @sub keep the value over their calls in a hidden word of the frame, below the
  * hidden slots. Nothing else writes it. A subprog whose pads pass on R2 has a second word above
  * it, see bpf_pad_passes_r2(). Returns the reason of a conflict.
+ * Every plan of the subprog whose pad keeps the value asks for the word, also behind one that has
+ * no room for it, see bpf_pads_settle(), and bpf_hidden_slots_fit() looks at the whole program. So
+ * the answer is kept, a no as well: 'no_value_word'. It holds until the next bpf_pads_settle(),
+ * since until then the frames get no smaller.
  */
 static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info *sub)
 {
@@ -2676,10 +2785,13 @@ static int take_value_word(struct bpf_verifier_env *env, struct bpf_subprog_info
 
 	if (sub->value_off)
 		return 0;
+	if (sub->no_value_word)
+		return BPF_CONFLICT_NO_ROOM;
 	sub->hidden_words += words;
 	err = bpf_hidden_slots_fit(env);
 	if (err <= 0) {
 		sub->hidden_words -= words;
+		sub->no_value_word = !err;
 		return err ?: BPF_CONFLICT_NO_ROOM;
 	}
 	sub->value_off = -(int)bpf_stack_depth_with_slots(sub);
@@ -2711,24 +2823,36 @@ void bpf_pads_mark_used(struct bpf_verifier_env *env)
  * for sure. A conflict that shows only now, at a site that the program has, is an error of the
  * pass as well, and its site is an unproven insn for the next one, see
  * bpf_find_unproven_after_pass().
+ * That holds for every plan, also for those that are there because the kernel enters landing pads
+ * of the program: the entry of such a pad, a site that a frame gets to while the kernel unwinds it
+ * through the pad, unwind_exit where the pad ends, and a pad of the verifier in a caller that gets
+ * what such a frame left. What the program does in its pad is its own business. What the verifier
+ * adds around it has to be right, or the program does not load: no landing pad is passed by
+ * because the verifier has no plan.
  */
 int bpf_pads_settle(struct bpf_verifier_env *env)
 {
+	const struct bpf_pad_plan *reject = NULL;
 	struct bpf_subprog_info *sub;
 	struct bpf_pad_plan *plan;
-	int i, s, err;
+	int i, s, err, at = 0;
+	u64 plans = 0;
 
 	err = bpf_pads_must_unwind(env) ?: sites_of_subprogs(env);
 	if (err)
 		return err;
 	/* hidden slots take their places among entries that have theirs */
 	for (i = 0; i < env->prog->len; i++) {
-		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
+		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next, plans++) {
 			err = order_ents(env, plan);
 			if (err)
 				return err;
 		}
 	}
+	/* what follows looks at each insn and at the entries of each plan a few times */
+	err = bpf_add_cost_and_check(env, env->prog->len + BPF_PAD_MAX_ENTS * plans, BPF_COST_XREG);
+	if (err)
+		return err;
 	err = settle_slots(env);
 	if (err)
 		return err;
@@ -2738,33 +2862,48 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
 			if (!plan->used)
 				continue;
-			err = settle_plan(env, plan);
 			sub = bpf_find_containing_subprog(env, i);
-			if (!err && (plan_saves_value(env, plan, sub - env->subprog_info) ||
+			/* the plan of an entry is no plan of a pad: its conflict is what it is */
+			if (plan->kind != BPF_SITE_KENTRY) {
+				err = settle_plan(env, plan);
+				if (!err &&
+				    (plan_saves_value(env, plan, sub - env->subprog_info) ||
 				     (bpf_site_is_forced(plan->kind) && env->has_throw)))
-				err = take_value_word(env, sub);
-			if (err < 0)
-				return err;
-			plan->conflict = err;
-			if (plan_rejects(env, plan)) {
-				bpf_pad_log(env, i, plan);
-				return -EINVAL;
+					err = take_value_word(env, sub);
+				if (err < 0)
+					return err;
+				plan->conflict = err;
 			}
 			if (!plan->conflict)
 				continue;
-			/*
-			 * The frame cannot unwind and the site has another way out. The main pass
-			 * made what came back stuck, and no run that finds a subprog stuck late
-			 * gets here. So the program still has the site, and no pad.
-			 */
-			err = bpf_pad_skip_faults(env, plan, i);
-			if (err)
-				return err;
-			if (!env->faults_late) {
-				bpf_pad_log(env, i, plan);
-				return -EINVAL;
+			if (!plan_rejects(env, plan)) {
+				/*
+				 * The frame cannot unwind and the site has another way out. The
+				 * main pass made what came back stuck, and no run that finds a
+				 * subprog stuck late gets here. So the program still has the site,
+				 * and no pad.
+				 */
+				err = bpf_pad_skip_faults(env, plan, i);
+				if (err)
+					return err;
+				if (env->faults_late)
+					continue;
 			}
+			/* the first one is the one that the log names */
+			if (!reject)
+				at = i;
+			reject = reject ?: plan;
 		}
+	}
+	/*
+	 * The error is raised here, behind all plans: a pass can have several conflicts that show
+	 * only now, and each of them is one that the next pass keeps more apart for, see
+	 * bpf_find_unproven_after_pass() and bpf_pads_note_causes(). One per pass would be a pass
+	 * per conflict.
+	 */
+	if (reject) {
+		bpf_pad_log(env, at, reject);
+		return -EINVAL;
 	}
 	/* The main pass is over: the program has no access to its stack that is not known. */
 	for (s = 0; !env->faults_late && s < env->subprog_cnt; s++) {
@@ -2859,6 +2998,10 @@ static bool left_at_insn(const struct bpf_insn_aux_data *aux)
  * The dependencies of the next pass know exit, unwind_exit and bpf_throw() as the ways out of a
  * function, and none of these stands for such an insn. Where only the calls together get to it,
  * the jumps that can skip it are the cause: the insn is noted, and they are what controls it.
+ *
+ * Where the kernel enters a landing pad of the program behind a call the frame is not left at the
+ * call. What the kernel unwound below it has a part in what follows all the same, and that is not
+ * told by a plan: see note_entered().
  */
 static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
@@ -2869,6 +3012,53 @@ static void note_causes(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 		return;
 	bpf_pad_for_each_callee(plan, s)
 		sub[s].below_conflict = true;
+}
+
+/*
+ * The pass has an error, and the kernel entered landing pads of the program in it: a state went
+ * through the entry of a call, 'visited' of its plan, see bpf_pad_enter(). The kernel may have got
+ * into such a pad only because calls were verified together: the function of count() above with a
+ * landing pad behind its call. Kept apart nothing comes back unwound to that call, no state gets
+ * into the pad, and what such a state had a part in is gone. That can be any error, and neither
+ * the state nor the plan that has it needs to know of the pad:
+ *   - a conflict where the pad ends, at a site in its code, or in a caller that gets what the
+ *     pad left;
+ *   - an error or a conflict in what its code calls, also in a callback that it only arms;
+ *   - a conflict at a call of the normal path, in a function that the code of the pad calls as
+ *     well: the numbers that the pad passes take the trip count from its loop, and may_goto is in
+ *     the code for every call of the function;
+ *   - hidden slots that a function does not get because of what the code of the pad releases.
+ * So there is one rule: whatever the error is, every function in which the kernel entered a pad
+ * is marked. The calls behind which it did are causes, and so is what makes their callees unwind,
+ * see note_causes_below(). The marks say what the next pass keeps apart and nothing else: no
+ * verdict rests on them.
+ * They are those of this pass, and every pass that has an error makes them again while the
+ * kernel still gets into a pad: the causes have to be there for each step of
+ * bpf_partition_more() in turn, until the calls are apart. They are no step of their own. A pass
+ * after which nothing more is kept apart is the last one with them as without them, and the
+ * limit on the cost of a load that is rejected is the same, see do_check_all().
+ * A program that is rejected for another reason pays for them: for the dependencies of the calls
+ * of the marked functions, in every pass, and where only calls that are verified together get
+ * into the pad, for keeping those apart. An error behind such calls depends on the loop of their
+ * callee from then on, and costs what an error that reads the result of that loop costs.
+ */
+static void note_entered(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
+	struct bpf_subprog_info *sub;
+	int i, s;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (!sub->has_kpads || sub->below_conflict)
+			continue;
+		bpf_add_cost(env, sub[1].start - sub->start, BPF_COST_SCAN);
+		for (i = sub->start; !sub->below_conflict && i < sub[1].start; i++) {
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+			sub->below_conflict = plan && plan->visited;
+		}
+	}
 }
 
 /*
@@ -2911,13 +3101,14 @@ static void note_causes_below(struct bpf_verifier_env *env)
 			break;
 		for (i = sub[s].start; i < sub[s + 1].start; i++) {
 			for (below = aux[i].pad_plans; below; below = below->next) {
-				if (bpf_site_base(below->kind) != BPF_SITE_KCALL ||
-				    !below->visited)
+				if ((bpf_site_base(below->kind) != BPF_SITE_KCALL &&
+				     below->kind != BPF_SITE_KENTRY) || !below->visited)
 					continue;
 				/*
-				 * The frame is left at this call, whatever what it calls
-				 * was left at: the check of a recursion is no insn to
-				 * note. The jumps that can skip the call are a cause.
+				 * The frame is left at this call, or goes on in the landing pad
+				 * of the program behind it and is left there, whatever what it
+				 * calls was left at: the check of a recursion is no insn to note.
+				 * The jumps that can skip the call are a cause.
 				 */
 				bpf_note_controlled_cause(env, i);
 				bpf_pad_for_each_callee(below, c) {
@@ -2961,6 +3152,8 @@ static void note_causes_below(struct bpf_verifier_env *env)
 /*
  * The pass is over and has an error. Note the causes of the conflicts that are one: those that a
  * state made an error where it visited, see unwind_frame(), and those that bpf_pads_settle() found.
+ * And those that any error has where the kernel entered landing pads of the program, see
+ * note_entered().
  */
 void bpf_pads_note_causes(struct bpf_verifier_env *env)
 {
@@ -2973,6 +3166,7 @@ void bpf_pads_note_causes(struct bpf_verifier_env *env)
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next)
 			if (plan->failed || (plan->used && plan_rejects(env, plan)))
 				note_causes(env, plan);
+	note_entered(env);
 	note_causes_below(env);
 	/* the caller looks at the limits before it goes on. This is for a load that is to end. */
 	bpf_check_limits(env);
@@ -3087,6 +3281,13 @@ static bool insn_returns(const struct bpf_insn *insn)
  * says, which is a value like any other: the pad returns. Pads that share their last insns, as the
  * pads of one function of C++ do, are judged one by one, each from its first insn.
  *
+ * What a frame that the kernel unwinds runs from there on is what the pad gets to, and that need
+ * not be code of a pad: a pad can jump back in front of its call, or to the first insn of its
+ * function, and in a function that has no exit every pad only resumes. Such a frame runs the
+ * normal path of the function once more. What holds for it is not that it runs cleanup code only,
+ * it is that no insn which it can get to returns to its caller: it is left at unwind_exit or at a
+ * site, with kexit, and nowhere else. See enter_kernel_pad() in verifier.c.
+ *
  * The answer is a property of the insns, the same in every pass: 'kpad' of unwind_goto.
  * Dead branches are gone from the graph, see bpf_prune_dead_branches().
  */
@@ -3149,6 +3350,8 @@ int bpf_find_kernel_pads(struct bpf_verifier_env *env)
 		ret = test_bit(pad, returns);
 		res = test_bit(pad, resumes);
 		env->insn_aux_data[i].kpad = !ret && res;
+		if (!ret && res)
+			bpf_find_containing_subprog(env, i)->has_kpads = true;
 		if (!(env->log.level & BPF_LOG_LEVEL2))
 			continue;
 		verbose(env, "landing pad at %d of the call at %d %s\n", pad, i - 1,

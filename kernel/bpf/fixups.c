@@ -664,6 +664,13 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 {
 	int s;
 
+	/*
+	 * A frame is one that the kernel unwinds already only behind a landing pad of the program
+	 * that the kernel enters: if the function has none after all, no frame of it gets here
+	 * that way.
+	 */
+	if (bpf_site_is_forced(plan->kind) && !bpf_find_containing_subprog(env, i)->enters_kpads)
+		return false;
 	switch (bpf_site_base(plan->kind)) {
 	case BPF_SITE_GUARD:
 		return env->insn_aux_data[i].loop_guard;
@@ -679,12 +686,15 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 				return true;
 		return false;
 	case BPF_SITE_KCALL:
+	case BPF_SITE_KENTRY:
 		if (!plan->visited)
 			return false;
 		bpf_pad_for_each_callee(plan, s)
 			if (env->subprog_info[s].can_kunwind)
 				return true;
 		return false;
+	case BPF_SITE_REMAINDER:
+		return plan->visited;
 	case BPF_SITE_FAULT:
 		return !env->insn_aux_data[i].fault_skips;
 	case BPF_SITE_MAY_GOTO:
@@ -702,6 +712,9 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
  * them: of one kind, of the other, or of both. The main pass asks the same when a global subprog
  * unwinds, see settle_late_unwinds(). The main program leaves with exit: it is marked for
  * bpf_check_attach_target(), see bpf_insert_sites().
+ * And the subprogs in which the kernel enters a landing pad of the program, 'enters_kpads': a
+ * callee of that call is left with kexit. Only there a frame can get to a site, or to unwind_exit,
+ * while the kernel unwinds it, and only there the plans for that count.
  */
 int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
 {
@@ -711,6 +724,8 @@ int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
 	bool changed, unwinds, kunwinds;
 	int i, k, s, err;
 
+	for (s = 0; s < env->subprog_cnt; s++)
+		env->subprog_info[s].enters_kpads = false;
 	do {
 		changed = false;
 		/*
@@ -724,6 +739,12 @@ int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
 		for (k = 0; k < env->subprog_cnt; k++) {
 			s = env->subprog_topo_order[k];
 			sub = &env->subprog_info[s];
+			for (i = sub->start; sub->has_kpads && !sub->enters_kpads &&
+			     i < sub[1].start; i++) {
+				plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+				if (plan && bpf_site_is_used(env, i, plan))
+					sub->enters_kpads = changed = true;
+			}
 			if ((sub->can_unwind && sub->can_kunwind) || (s && !sub->bail_unwinds))
 				continue;
 			unwinds = sub->can_unwind;
@@ -732,7 +753,9 @@ int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
 				kunwinds |= aux[i].loop_guard ||
 					    (aux[i].fault_empty && !aux[i].fault_skips);
 				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
-					if (!bpf_site_is_used(env, i, plan))
+					/* the frame is not left at the entry of a landing pad */
+					if (plan->kind == BPF_SITE_KENTRY ||
+					    !bpf_site_is_used(env, i, plan))
 						continue;
 					if (bpf_site_is_kernel(plan->kind))
 						kunwinds = true;
