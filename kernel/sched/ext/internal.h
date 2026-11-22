@@ -1718,6 +1718,7 @@ struct scx_sched {
 	};
 	bool			is_cid_type;	/* true if registered via bpf_sched_ext_ops_cid */
 	bool			dead;		/* set after ops.exit(), gates scx_prog_sched() */
+	bool			failed;		/* an error was claimed, see scx_has_failed() */
 	/* counted in scx_nr_ops_cid_sched_updated, see scx_ops_cid_sched_updated_enable() */
 	bool			cid_sched_updated_counted;
 

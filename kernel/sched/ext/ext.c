@@ -329,6 +329,39 @@ static void run_deferred(struct rq *rq);
 static bool task_dead_and_done(struct task_struct *p);
 static void scx_disable(struct scx_sched *sch, enum scx_exit_kind kind);
 
+/*
+ * A program that was unwound returns 0 in place of what it would have computed,
+ * and the scheduler was told: it has failed, see bpf_scx_unwound(). The enable
+ * path asks after an operator whose value it relies on.
+ * exit_kind does not tell: scx_disable_workfn() makes the claimed error
+ * SCX_EXIT_DONE on another kthread, as its first step, before it waits for the
+ * enable path. So scx_claim_exit() notes an error where it stays.
+ */
+static bool scx_has_failed(struct scx_sched *sch)
+{
+	return READ_ONCE(sch->failed);
+}
+
+/*
+ * Turn on the operators from @begin to @end - 1 that @ops has. After an error
+ * all of them are off and stay off, see scx_claim_exit(), which can run while
+ * @sch is being enabled. It notes the error before it clears has_op, so look
+ * for it once the bits are set: one of the two clears them.
+ */
+static void scx_set_has_ops(struct scx_sched *sch, const struct sched_ext_ops *ops,
+			    int begin, int end)
+{
+	int i;
+
+	for (i = begin; i < end; i++)
+		if (((void (**)(void))ops)[i])
+			set_bit(i, sch->has_op);
+	/* pairs with smp_store_mb() in scx_claim_exit() */
+	smp_mb();
+	if (scx_has_failed(sch))
+		bitmap_zero(sch->has_op, SCX_OPI_END);
+}
+
 __printf(5, 6) bool __scx_exit(struct scx_sched *sch,
 			       enum scx_exit_kind kind, s64 exit_code,
 			       s32 exit_cpu, const char *fmt, ...)
@@ -6095,7 +6128,8 @@ static int scx_cgroup_init(struct scx_sched *sch)
 		if ((tg->scx.flags & (SCX_TG_ONLINE | SCX_TG_INITED)) != SCX_TG_ONLINE)
 			continue;
 
-		if (sch->ops.cgroup_init) {
+		/* not the operator of a scheduler that failed, see scx_claim_exit() */
+		if (SCX_HAS_OP(sch, cgroup_init)) {
 			struct scx_cgroup_init_args args = {
 				.weight = tg->scx.weight,
 				.bw_period_us = tg->scx.bw_period_us,
@@ -7749,9 +7783,14 @@ static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 	 * the rq lock, until its time slice is over, and the disable path calls
 	 * operators for each task. Turn them off, as scx_root_disable() does at
 	 * its end. ops.exit() is not covered by has_op.
+	 * The enable path may be turning them on: it sets the bits and then
+	 * looks for the error, see scx_set_has_ops(), so the error is there
+	 * for it before the bits are cleared here.
 	 */
-	if (kind >= SCX_EXIT_ERROR)
+	if (kind >= SCX_EXIT_ERROR) {
+		smp_store_mb(sch->failed, true);
 		bitmap_zero(sch->has_op, SCX_OPI_END);
+	}
 
 	if (kind == SCX_EXIT_PARENT) {
 		/* an ancestor is already sweeping the subtree */
@@ -8662,7 +8701,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	struct scx_sched *sch;
 	struct scx_task_iter sti;
 	struct task_struct *p;
-	int i, cpu, ret;
+	int cpu, ret;
 
 	mutex_lock(&scx_enable_mutex);
 
@@ -8767,6 +8806,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 */
 	if (sch->is_cid_type && sch->ops_cid.init_cids) {
 		ret = SCX_CALL_OP_RET(sch, init_cids, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init_cids", ret);
 			cpus_read_unlock();
@@ -8801,6 +8842,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	/* the cid caps and shards are live now, so ops.init() can query them */
 	if (sch->ops.init) {
 		ret = SCX_CALL_OP_RET(sch, init, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init", ret);
 			cpus_read_unlock();
@@ -8816,9 +8859,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		goto err_disable;
 	}
 
-	for (i = SCX_OPI_CPU_HOTPLUG_BEGIN; i < SCX_OPI_CPU_HOTPLUG_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_CPU_HOTPLUG_BEGIN, SCX_OPI_CPU_HOTPLUG_END);
 
 	ret = check_hotplug_seq(sch, ops);
 	if (ret) {
@@ -8866,9 +8907,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 */
 	scx_bypass(sch, true);
 
-	for (i = SCX_OPI_NORMAL_BEGIN; i < SCX_OPI_NORMAL_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_NORMAL_BEGIN, SCX_OPI_NORMAL_END);
 
 	scx_ops_cid_sched_updated_enable(sch);
 

@@ -2238,7 +2238,7 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 	struct scx_sched *parent, *sch;
 	struct scx_task_iter sti;
 	struct task_struct *p;
-	s32 i, ret;
+	s32 ret;
 
 	mutex_lock(&scx_enable_mutex);
 
@@ -2335,6 +2335,8 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 
 	if (sch->ops.init) {
 		ret = SCX_CALL_OP_RET(sch, init, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init", ret);
 			scx_error(sch, "ops.init() failed (%d)", ret);
@@ -2372,9 +2374,7 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 
 	scx_bypass(sch, true);
 
-	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_BEGIN, SCX_OPI_END);
 
 	scx_ops_cid_sched_updated_enable(sch);
 
