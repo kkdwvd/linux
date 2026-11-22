@@ -22117,12 +22117,31 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge
 }
 
 /*
+ * What an operator of a struct_ops returns when the verifier unwinds it. The struct_ops says, for
+ * the operators where 0 is wrong, see bpf_struct_ops.unwound_retval: it knows what each member
+ * returns, and @prog has the member, see check_struct_ops_btf_id(). It is asked about an operator
+ * that returns a number only: nothing or NULL is all that another one may return, and any number
+ * passes check_return_code().
+ */
+static int struct_ops_unwound_retval(const struct bpf_prog *prog)
+{
+	const struct bpf_struct_ops *st_ops = prog->aux->st_ops;
+	const struct btf_type *proto = prog->aux->attach_func_proto;
+
+	if (!st_ops->unwound_retval || !proto->type ||
+	    btf_type_resolve_ptr(prog->aux->attach_btf, proto->type, NULL))
+		return 0;
+	return st_ops->unwound_retval(prog);
+}
+
+/*
  * What the program returns when the verifier unwinds it, see unwind_frame(). No code of the program
  * makes that value, so it is the one that refuses, drops or changes nothing. That is 0, but:
  *
  *	tc					TC_ACT_SHOT, 0 is TC_ACT_OK
  *	lwt, flow dissector			BPF_DROP, 0 is BPF_OK
  *	syscall					-ECANCELED, 0 tells user space that all was done
+ *	struct_ops				what the struct_ops says for the operator, or 0
  *	lsm, the hook returns an errno		-EPERM, 0 lets the operation go on
  *	the range is [1, 1]			1, hooks that cannot refuse
  *
@@ -22159,6 +22178,8 @@ int bpf_unwound_retval(struct bpf_verifier_env *env)
 	}
 	while (prog->type == BPF_PROG_TYPE_EXT)
 		prog = prog->aux->dst_prog;
+	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+		return struct_ops_unwound_retval(prog);
 	if (get_func_retval_range(prog, &range) && range.minval < 0)
 		return -EPERM;
 	if (!program_returns_void(env) && return_retval_range(env, &range) && range.minval > 0)
