@@ -6336,10 +6336,23 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 
 	find_subprog_properties(env, true);
 	/* see bpf_remove_fastcall_spills_fills() */
-	for (s = 0; s < env->subprog_cnt; s++)
-		for (int i = si[s].start; i < si[s + 1].start && !si[s].keep_fastcall_stack; i++)
-			if (env->insn_aux_data[i].fastcall_spills_num)
+	for (s = 0; s < env->subprog_cnt; s++) {
+		for (int i = si[s].start; i < si[s + 1].start && !si[s].keep_fastcall_stack; i++) {
+			if (!env->insn_aux_data[i].fastcall_spills_num)
+				continue;
+			/*
+			 * The hidden words of the landing pads are below the slots of the spills,
+			 * and the stack of the callees must not be put there: the frame stays as
+			 * deep as it is. The insns of the program do not use these slots any more,
+			 * see bpf_stack_depth_of_prog().
+			 */
+			if (si[s].hidden_in_depth)
+				si[s].fastcall_spills_gone = true;
+			else
 				si[s].stack_depth = -si[s].fastcall_stack_off;
+			break;
+		}
+	}
 
 	for (int i = 0; i < env->subprog_cnt; i++) {
 		if (si[i].has_tail_call) {
@@ -6386,8 +6399,12 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 		 * Request private stack support only if the subprog stack
 		 * depth is no less than BPF_PRIV_STACK_MIN_SIZE. This is to
 		 * avoid jit penalty if the stack usage is small.
+		 * What the program uses decides. The hidden words of its landing pads are
+		 * read and written where it is unwound, and a store or two at its entry: they
+		 * must not make every call of a small function pay for a private stack.
 		 */
-		if (round_up_stack_depth(env, si[s].stack_depth) >= BPF_PRIV_STACK_MIN_SIZE) {
+		if (round_up_stack_depth(env, bpf_stack_depth_of_prog(&si[s])) >=
+		    BPF_PRIV_STACK_MIN_SIZE) {
 			si[s].priv_stack_mode = PRIV_STACK_ADAPTIVE;
 			env->prog->aux->jits_use_priv_stack = true;
 		}
@@ -6417,11 +6434,9 @@ static int try_max_stack_depth(struct bpf_verifier_env *env, bool with_slots)
 		return -ENOMEM;
 	for (s = 0; with_slots && s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		if (!sub->hidden_words)
-			continue;
-		sub->stack_depth = bpf_stack_depth_with_slots(sub);
-		/* or check_max_stack_depth() takes the spills of bpf_fastcall off the stack */
-		sub->keep_fastcall_stack = true;
+		/* the frame as it is going to be, see bpf_stack_take_hidden_words() */
+		if (sub->hidden_words)
+			bpf_stack_take_hidden_words(sub);
 	}
 	env->log.level = 0;
 	err = check_max_stack_depth(env);

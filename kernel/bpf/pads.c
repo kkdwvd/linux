@@ -2758,11 +2758,8 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	/* The main pass is over: the program has no access to its stack that is not known. */
 	for (s = 0; !env->faults_late && s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		if (!sub->hidden_words)
-			continue;
-		sub->stack_depth = bpf_stack_depth_with_slots(sub);
-		/* check_max_stack_depth() would put the stack of the callees there */
-		sub->keep_fastcall_stack = true;
+		if (sub->hidden_words)
+			bpf_stack_take_hidden_words(sub);
 	}
 	return 0;
 }

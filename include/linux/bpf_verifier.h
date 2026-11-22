@@ -1495,6 +1495,11 @@ struct bpf_subprog_info {
 	bool ret_reg_pair: 1;
 	/* true if bpf_fastcall stack region is used by functions that can't be inlined */
 	bool keep_fastcall_stack: 1;
+	/*
+	 * Its bpf_fastcall spills are removed, and their slots are still in the frame: the hidden
+	 * words of its landing pads are below them, see check_max_stack_depth()
+	 */
+	bool fastcall_spills_gone: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
 	bool uses_arena_sp: 1;
@@ -1579,6 +1584,8 @@ struct bpf_subprog_info {
 	u8 slots: 4;
 	/* they take that many words of 8 bytes below its stack */
 	u8 hidden_words;
+	/* stack_depth has them, see bpf_pads_settle(). Until then it is what the program uses. */
+	bool hidden_in_depth: 1;
 	u8 code_stack_args;
 	/* the pad that releases nothing, for all accesses to arena with 'fault_unwinds'. 0: none */
 	u32 fault_pad;
@@ -1622,6 +1629,30 @@ static inline void bpf_subprog_set_stuck(struct bpf_subprog_info *sub, enum bpf_
 static inline u32 bpf_stack_depth_with_slots(const struct bpf_subprog_info *sub)
 {
 	return round_up(sub->stack_depth, BPF_REG_SIZE) + sub->hidden_words * BPF_REG_SIZE;
+}
+
+/*
+ * The words of the landing pads go below the stack of @sub for good: also below the slots of its
+ * bpf_fastcall spills, which check_max_stack_depth() does not cut off the frame then
+ */
+static inline void bpf_stack_take_hidden_words(struct bpf_subprog_info *sub)
+{
+	sub->stack_depth = bpf_stack_depth_with_slots(sub);
+	sub->hidden_in_depth = true;
+}
+
+/*
+ * How much of its stack the insns of the program use: without the words of the landing pads, and
+ * without the slots of the bpf_fastcall spills that are removed, which stay in a frame that has
+ * such words below them
+ */
+static inline u32 bpf_stack_depth_of_prog(const struct bpf_subprog_info *sub)
+{
+	if (!sub->hidden_in_depth)
+		return sub->stack_depth;
+	if (sub->fastcall_spills_gone)
+		return -sub->fastcall_stack_off;
+	return sub->stack_depth - sub->hidden_words * BPF_REG_SIZE;
 }
 
 static inline u16 bpf_in_stack_arg_cnt(const struct bpf_subprog_info *sub)
