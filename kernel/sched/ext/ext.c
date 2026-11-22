@@ -335,7 +335,7 @@ static void scx_disable(struct scx_sched *sch, enum scx_exit_kind kind);
  * path asks after an operator whose value it relies on.
  * exit_kind does not tell: scx_disable_workfn() makes the claimed error
  * SCX_EXIT_DONE on another kthread, as its first step, before it waits for the
- * enable path. So scx_claim_exit() notes an error where it stays.
+ * enable path. So scx_fail() notes a failure where it stays.
  */
 static bool scx_has_failed(struct scx_sched *sch)
 {
@@ -343,10 +343,27 @@ static bool scx_has_failed(struct scx_sched *sch)
 }
 
 /*
+ * The state of the BPF scheduler cannot be trusted any more. An operator may
+ * wait for a lock that an unwound one left behind, under the rq lock, until its
+ * time slice is over, and the disable path calls operators for each task. Turn
+ * them off, as scx_root_disable() does at its end. ops.exit() is not covered by
+ * has_op.
+ * The enable path may be turning them on: it sets the bits and then looks for
+ * the failure, see scx_set_has_ops(), so the failure is there for it before the
+ * bits are cleared here.
+ * Lock-free and safe to call from any context including NMI.
+ */
+static void scx_fail(struct scx_sched *sch)
+{
+	smp_store_mb(sch->failed, true);
+	bitmap_zero(sch->has_op, SCX_OPI_END);
+}
+
+/*
  * Turn on the operators from @begin to @end - 1 that @ops has. After an error
- * all of them are off and stay off, see scx_claim_exit(), which can run while
- * @sch is being enabled. It notes the error before it clears has_op, so look
- * for it once the bits are set: one of the two clears them.
+ * all of them are off and stay off, see scx_fail(), which can run while @sch is
+ * being enabled. It notes the failure before it clears has_op, so look for it
+ * once the bits are set: one of the two clears them.
  */
 static void scx_set_has_ops(struct scx_sched *sch, const struct sched_ext_ops *ops,
 			    int begin, int end)
@@ -356,7 +373,7 @@ static void scx_set_has_ops(struct scx_sched *sch, const struct sched_ext_ops *o
 	for (i = begin; i < end; i++)
 		if (((void (**)(void))ops)[i])
 			set_bit(i, sch->has_op);
-	/* pairs with smp_store_mb() in scx_claim_exit() */
+	/* pairs with smp_store_mb() in scx_fail() */
 	smp_mb();
 	if (scx_has_failed(sch))
 		bitmap_zero(sch->has_op, SCX_OPI_END);
@@ -7777,20 +7794,9 @@ static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 	if (!atomic_try_cmpxchg(&sch->exit_kind, &none, kind))
 		return false;
 
-	/*
-	 * After an error the state of the BPF scheduler cannot be trusted. An
-	 * operator may wait for a lock that an unwound one left behind, under
-	 * the rq lock, until its time slice is over, and the disable path calls
-	 * operators for each task. Turn them off, as scx_root_disable() does at
-	 * its end. ops.exit() is not covered by has_op.
-	 * The enable path may be turning them on: it sets the bits and then
-	 * looks for the error, see scx_set_has_ops(), so the error is there
-	 * for it before the bits are cleared here.
-	 */
-	if (kind >= SCX_EXIT_ERROR) {
-		smp_store_mb(sch->failed, true);
-		bitmap_zero(sch->has_op, SCX_OPI_END);
-	}
+	/* an exit that is no error calls all operators as before */
+	if (kind >= SCX_EXIT_ERROR)
+		scx_fail(sch);
 
 	if (kind == SCX_EXIT_PARENT) {
 		/* an ancestor is already sweeping the subtree */
@@ -9457,14 +9463,16 @@ static int bpf_scx_validate(void *kdata)
  * @prog was unwound, and scx_prog_sched() has no scheduler for it.
  * A program that is in no struct_ops map, or in more than one, has no scheduler
  * of its own, and below a root that takes sub-schedulers it can be an operator
- * of any of them. The failure is the root's then, whose exit ends them all.
+ * of any of them. The failure is the root's then, whose exit ends them all. A
+ * sub-scheduler does not exit with an error then, and the unwound operator may
+ * be one of its own: turn off the operators of them all, see scx_fail().
  * A program whose map is gone, or has no scheduler, or one that is gone, is
  * taken for an async callback that has outlived its scheduler, and nobody is
  * told: the root may be another scheduler by now.
  */
 static void scx_unknown_prog_unwound(const struct bpf_prog *prog)
 {
-	struct scx_sched *root;
+	struct scx_sched *root, *pos;
 
 	if (bpf_prog_get_assoc_struct_ops(prog->aux) || bpf_prog_assoc_struct_ops_gone(prog->aux))
 		return;
@@ -9473,6 +9481,8 @@ static void scx_unknown_prog_unwound(const struct bpf_prog *prog)
 		return;
 	scx_error(root, "program %s (ops.%s, id %u) was unwound and its scheduler is not known, see its stderr stream",
 		  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+	scx_for_each_descendant_pre(pos, root)
+		scx_fail(pos);
 }
 
 /*
@@ -9481,6 +9491,9 @@ static void scx_unknown_prog_unwound(const struct bpf_prog *prog)
  * CPU or for success, so this is as fatal to the scheduler as scx_bpf_error().
  * The rq lock of the operator's caller may be held here. scx_error() only
  * claims the exit and leaves the disabling to irq_work and the helper kthread.
+ * It claims nothing when the exit is claimed already, be it for another reason
+ * than an error: the disable path of such an exit calls the operators for each
+ * task, and one that is unwound there is as bad. Turn them off all the same.
  */
 static void bpf_scx_unwound(const struct bpf_prog *prog)
 {
@@ -9501,8 +9514,9 @@ static void bpf_scx_unwound(const struct bpf_prog *prog)
 	 */
 	if (bpf_prog_assoc_struct_ops_gone(prog->aux))
 		return;
-	scx_error(sch, "program %s (ops.%s, id %u) was unwound, see its stderr stream",
-		  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+	if (!scx_error(sch, "program %s (ops.%s, id %u) was unwound, see its stderr stream",
+		       prog->aux->name, prog->aux->attach_func_name, prog->aux->id))
+		scx_fail(sch);
 }
 
 static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
