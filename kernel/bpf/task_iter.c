@@ -763,7 +763,7 @@ BPF_CALL_x(5, noinline notrace, bpf_find_vma, struct task_struct *, task, u64, s
 	bool __maybe_unused mmput_needed = false;
 	struct mm_struct *mm;
 	int ret = -ENOENT;
-	u64 r0;
+	u64 r0, kind;
 
 	if (flags)
 		return -EINVAL;
@@ -817,7 +817,7 @@ BPF_CALL_x(5, noinline notrace, bpf_find_vma, struct task_struct *, task, u64, s
 		 * verifier checks it as an RCU read-side critical section.
 		 */
 		rcu_read_lock();
-		bpf_call_cb(callback_fn, task, vma, callback_ctx, 0, 0, r0, unwound);
+		bpf_call_cb(callback_fn, task, vma, callback_ctx, 0, 0, r0, kind, unwound);
 		rcu_read_unlock();
 		ret = 0;
 	}
@@ -831,8 +831,8 @@ out:
 
 unwound:
 	/*
-	 * The callback left with unwind_exit, under the mmap lock and in the
-	 * RCU section. The way out is the same as after a return.
+	 * The callback left with unwind_exit or kexit, under the mmap lock and in
+	 * the RCU section. The way out is the same as after a return.
 	 */
 	rcu_read_unlock();
 	bpf_mmap_unlock_mm(work, mm);
@@ -840,7 +840,7 @@ unwound:
 	if (mmput_needed)
 		mmput_async(mm);
 #endif
-	bpf_unwind_leave();
+	bpf_unwind_leave(kind);
 	return r0;
 }
 NOKPROBE_SYMBOL(bpf_find_vma);

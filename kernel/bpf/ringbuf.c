@@ -822,7 +822,8 @@ BPF_CALL_x(4, noinline notrace, bpf_user_ringbuf_drain, struct bpf_map *, map,
 	long samples, discarded_samples = 0, ret = 0;
 	bpf_callback_t callback = (bpf_callback_t)callback_fn;
 	u64 wakeup_flags = BPF_RB_NO_WAKEUP | BPF_RB_FORCE_WAKEUP;
-	bool unwound = false;
+	/* not at all, or the way in which the callback left: 1 + what bpf_call_cb() says */
+	u64 kind, unwound = 0;
 	int busy = 0;
 
 	if (unlikely(flags & ~wakeup_flags))
@@ -854,17 +855,18 @@ BPF_CALL_x(4, noinline notrace, bpf_user_ringbuf_drain, struct bpf_map *, map,
 		}
 
 		bpf_dynptr_init(&dynptr, sample, BPF_DYNPTR_TYPE_LOCAL, 0, size);
-		bpf_call_cb(callback, &dynptr, callback_ctx, 0, 0, 0, ret, unwound_at);
+		bpf_call_cb(callback, &dynptr, callback_ctx, 0, 0, 0, ret, kind, unwound_at);
 		if (0) {
 unwound_at:
 			/*
-			 * The callback left with unwind_exit. The sample is
-			 * consumed and counted like after a return, so that
-			 * the wakeup below is sent for it, and the helper
-			 * leaves through the door below, as the error paths
-			 * do, with the r0 of the callback.
+			 * The callback left with unwind_exit or kexit. The
+			 * sample is consumed and counted like after a return,
+			 * so that the wakeup below is sent for it, and the
+			 * helper leaves through the door below, as the error
+			 * paths do, with the r0 of the callback and the way
+			 * that the callback left.
 			 */
-			unwound = true;
+			unwound = 1 + !!kind;
 		}
 		__bpf_user_ringbuf_sample_release(rb, size, flags);
 		if (unwound) {
@@ -885,7 +887,7 @@ schedule_work_return:
 	else if (!(flags & BPF_RB_NO_WAKEUP) && samples > 0)
 		irq_work_queue(&rb->work);
 	if (unwound)
-		bpf_unwind_leave();
+		bpf_unwind_leave(unwound - 1);
 	return ret;
 }
 NOKPROBE_SYMBOL(bpf_user_ringbuf_drain);

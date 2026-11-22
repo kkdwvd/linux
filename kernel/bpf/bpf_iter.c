@@ -745,14 +745,15 @@ BPF_CALL_x(4, noinline notrace, bpf_for_each_map_elem, struct bpf_map *, map, vo
 	   void *, callback_ctx, u64, flags)
 {
 #if BPF_HAS_CB_PADS
-	u64 ret;
+	u64 ret, kind;
 
 	__bpf_call_cb(__bpf_for_each_op, map->ops->map_for_each_callback, map, callback_fn,
-		      callback_ctx, flags, 0, ret, unwound);
+		      callback_ctx, flags, 0, ret, kind, unwound);
 	return ret;
 
 unwound:
-	bpf_unwind_leave();
+	/* the op left the way the callback did, and so does the helper */
+	bpf_unwind_leave(kind);
 	return ret;
 #else
 	/* The plain call, with the type of the op: the fallback of bpf_call_cb() has a callback's */
@@ -775,7 +776,7 @@ BPF_CALL_x(4, noinline notrace, bpf_loop, u32, nr_loops, void *, callback_fn, vo
 	   u64, flags)
 {
 	bpf_callback_t callback = (bpf_callback_t)callback_fn;
-	u64 ret;
+	u64 ret, kind;
 	u32 i;
 
 	/* Note: these safety checks are also verified when bpf_loop
@@ -788,7 +789,7 @@ BPF_CALL_x(4, noinline notrace, bpf_loop, u32, nr_loops, void *, callback_fn, vo
 		return -E2BIG;
 
 	for (i = 0; i < nr_loops; i++) {
-		bpf_call_cb(callback, i, callback_ctx, 0, 0, 0, ret, unwound);
+		bpf_call_cb(callback, i, callback_ctx, 0, 0, 0, ret, kind, unwound);
 		/* return value: 0 - continue, 1 - stop and return */
 		if (ret)
 			return i + 1;
@@ -797,8 +798,8 @@ BPF_CALL_x(4, noinline notrace, bpf_loop, u32, nr_loops, void *, callback_fn, vo
 	return i;
 
 unwound:
-	/* The callback left with unwind_exit: the loop is over, and so is the helper */
-	bpf_unwind_leave();
+	/* The callback left with unwind_exit or kexit: the loop is over, and so is the helper */
+	bpf_unwind_leave(kind);
 	return ret;
 }
 NOKPROBE_SYMBOL(bpf_loop);

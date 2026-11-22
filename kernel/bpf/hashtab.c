@@ -2530,7 +2530,7 @@ static noinline notrace long bpf_for_each_hash_elem(struct bpf_map *map, bpf_cal
 	struct bucket *b;
 	void *key, *val;
 	bool is_percpu;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 
 	cant_migrate();
 
@@ -2557,7 +2557,8 @@ static noinline notrace long bpf_for_each_hash_elem(struct bpf_map *map, bpf_cal
 				val = htab_elem_value(elem, map->key_size);
 			}
 			num_elems++;
-			bpf_call_cb(callback_fn, map, key, val, callback_ctx, 0, ret, unwound);
+			bpf_call_cb(callback_fn, map, key, val, callback_ctx, 0, ret, kind,
+				    unwound);
 			/* return value: 0 - continue, 1 - stop and return */
 			if (ret) {
 				rcu_read_unlock();
@@ -2570,9 +2571,9 @@ out:
 	return num_elems;
 
 unwound:
-	/* The callback left with unwind_exit, inside the RCU section of the bucket */
+	/* The callback left with unwind_exit or kexit, inside the RCU section of the bucket */
 	rcu_read_unlock();
-	bpf_unwind_leave();
+	bpf_unwind_leave(kind);
 	return ret;
 }
 NOKPROBE_SYMBOL(bpf_for_each_hash_elem);
@@ -3436,7 +3437,7 @@ static noinline notrace long bpf_each_rhash_elem(struct bpf_map *map, bpf_callba
 	void *prev_key = NULL;
 	struct rhtab_elem *elem;
 	int num_elems = 0;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 
 	cant_migrate();
 
@@ -3454,7 +3455,7 @@ static noinline notrace long bpf_each_rhash_elem(struct bpf_map *map, bpf_callba
 			break;
 		num_elems++;
 		bpf_call_cb(callback_fn, map, elem->data, rhtab_elem_value(elem, map->key_size),
-			    callback_ctx, 0, ret, unwound);
+			    callback_ctx, 0, ret, kind, unwound);
 		if (ret)
 			break;
 
@@ -3465,9 +3466,9 @@ static noinline notrace long bpf_each_rhash_elem(struct bpf_map *map, bpf_callba
 	return num_elems;
 
 unwound:
-	/* The callback left with unwind_exit, under RCU */
+	/* The callback left with unwind_exit or kexit, under RCU */
 	rcu_read_unlock();
-	bpf_unwind_leave();
+	bpf_unwind_leave(kind);
 	return ret;
 }
 NOKPROBE_SYMBOL(bpf_each_rhash_elem);

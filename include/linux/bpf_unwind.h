@@ -40,6 +40,19 @@
  * Without asm goto outputs, or on an arch whose JIT does no unwinding, the
  * callback is called the plain way and BPF_HAS_CB_PADS tells the verifier that
  * a callback cannot unwind.
+ *
+ * A callback leaves in two ways, and the helper has to leave the way its
+ * callback did: with unwind_exit when the program unwinds, which goes to
+ * unwind_goto after the call of the helper, and with kexit when the kernel
+ * unwinds the program, which goes to kgoto and never to a landing pad that the
+ * program has. A return address has one entry in the table, so the entry
+ * points to a stub with two ways in, BPF_CB_PAD_OFF and BPF_CB_KPAD_OFF bytes
+ * from its start: the first one is where unwind_exit returns to, the second one
+ * is where kexit does, see bpf_kunwind_target(). The stub tells the label which
+ * one it was, in 'kind', and bpf_unwind_leave() looks for the pad of the same
+ * kind. The stub is out of line: the helper pays nothing for it when the
+ * callback returns. Nothing else of the callback gets through the frame of a
+ * helper: R2 after kexit is not what the callback left there.
  */
 
 #include <linux/bug.h>
@@ -92,6 +105,17 @@
 #endif
 
 /*
+ * How far the two ways into the stub are from its start. unwind_exit returns behind
+ * a nop: a stack walk looks up the insn in front of a return address, and for
+ * the frame of the helper that has to be an insn of the stub. Without the nop it
+ * is the end of whatever stands in front of the stub in the section, and a
+ * sample that is taken between the store of the new return address and the
+ * return goes wrong above the callback. kexit returns behind clc and jnc.
+ */
+#define BPF_CB_PAD_OFF	1
+#define BPF_CB_KPAD_OFF	4
+
+/*
  * The registers the call clobbers are outputs, so that none of them can be an
  * operand of anything else. r0 is rax, on the way out and on the way to the pad.
  * The return address stays the byte after the call through what
@@ -99,8 +123,16 @@
  * it, never behind it. The arguments are evaluated before the register variables
  * are set: a call among them, instrumentation included, would clobber what the
  * variables hold, which the compiler does not keep across a call.
+ *
+ * The stub is behind the code of the section, where nothing falls into it.
+ * unwind_exit returns behind the nop at 4, with the carry flag clear from there
+ * on, kexit to 5, which sets it, and 'kind' is 0 or not from the flag: rcx is
+ * clobbered by the call anyway. objtool gets to 4 by the table and to 5 by what
+ * it takes for the other edge of the jump, which is always taken. The jump is
+ * spelled in bytes, for the distance not to depend on what an assembler makes
+ * of it.
  */
-#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, unwound)		\
+#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, kind, unwound)		\
 do {										\
 	u64 __f = (u64)(long)(fn), __1 = (u64)(long)(a1), __2 = (u64)(long)(a2),	\
 	    __3 = (u64)(long)(a3), __4 = (u64)(long)(a4), __5 = (u64)(long)(a5);	\
@@ -108,13 +140,21 @@ do {										\
 	register u64 __a5 asm("r8") = __5;					\
 	register u64 __c5 asm("r8");						\
 	register u64 __c11 asm("r11");						\
-	u64 __c1, __c2, __c3, __c4;						\
+	u64 __c1, __c2, __c3;							\
 										\
 	asm_goto_output(BPF_KCFI_CHECK(type)					\
 		 "	" CALL_NOSPEC "\n"					\
 		 "1:\n"								\
-		 _ASM_EXTABLE_TYPE(1b, %l[unwound], EX_TYPE_BPF)		\
-		 : "=a"(r0), "=D"(__c1), "=S"(__c2), "=d"(__c3), "=c"(__c4),	\
+		 "	.subsection 1\n"					\
+		 "4:	nop\n"							\
+		 "	clc\n"							\
+		 "	.byte 0x73, 0x01\n"	/* jnc 6f */			\
+		 "5:	stc\n"							\
+		 "6:	sbb %%ecx, %%ecx\n"					\
+		 "	jmp %l[" __stringify(unwound) "]\n"			\
+		 "	.previous\n"						\
+		 _ASM_EXTABLE_TYPE(1b, 4b, EX_TYPE_BPF)				\
+		 : "=a"(r0), "=D"(__c1), "=S"(__c2), "=d"(__c3), "=c"(kind),	\
 		   "=r"(__c5), "=r"(__c11)					\
 		 : [thunk_target] "r"(__fn), "D"(__1), "S"(__2), "d"(__3),	\
 		   "c"(__4), "r"(__a5)						\
@@ -127,15 +167,17 @@ do {										\
  * address. The pad is in the frame that BPF code called, see above, so there is
  * a pad to go to. It is the return address itself after 'unwind_goto +0': the
  * JIT emits no code for unwind_goto, so the same address says nothing of a miss.
+ * @kind: what the stub of bpf_call_cb() left, not 0 if the callback left with
+ * kexit. Then the pad is the one of kgoto.
  * The store is the last thing before the return, into the frame of the function
  * itself, which a compiler may take for a dead store: hence WRITE_ONCE(), as
  * lkdtm writes its return address through a volatile pointer.
  */
-static __always_inline void bpf_unwind_leave(void)
+static __always_inline void bpf_unwind_leave(u64 kind)
 {
 	unsigned long *slot = (unsigned long *)__builtin_dwarf_cfa() - 1;
 
-	WRITE_ONCE(*slot, bpf_unwind_target(*slot));
+	WRITE_ONCE(*slot, kind ? bpf_kunwind_target(*slot) : bpf_unwind_target(*slot));
 }
 
 #elif defined(CONFIG_ARM64) && defined(CONFIG_CC_HAS_ASM_GOTO_OUTPUT)
@@ -179,6 +221,10 @@ static __always_inline void bpf_unwind_leave(void)
 #define BPF_CB_CLOBBER_X18	"x18",
 #endif
 
+/* How far the two ways into the stub are from its start: the second one is two insns in */
+#define BPF_CB_PAD_OFF	0
+#define BPF_CB_KPAD_OFF	8
+
 /*
  * r0 is x0, which only a register variable can name, and gcc does not keep what
  * such a variable holds across a call. KCOV puts a call at the head of each
@@ -186,9 +232,14 @@ static __always_inline void bpf_unwind_leave(void)
  * either edge. Hence the asm moves x0 to r0 itself, behind the call and where
  * the callback unwinds to, out of line. For the same reason the arguments are
  * evaluated before the register variables are set.
+ * unwind_exit returns to 3 and kexit to 4. Each goes to a label of its own in
+ * here, where 'kind' is set, and from there to the label of the helper: a
+ * register that says which one it was would have to be one that the call keeps,
+ * and the helper would save it also when the callback returns.
  */
-#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, unwound)		\
+#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, kind, unwound)		\
 do {										\
+	__label__ __prog, __kern;						\
 	u64 __f = (u64)(long)(fn), __1 = (u64)(long)(a1), __2 = (u64)(long)(a2),	\
 	    __3 = (u64)(long)(a3), __4 = (u64)(long)(a4), __5 = (u64)(long)(a5);	\
 	register u64 __fn asm("x15") = __f;					\
@@ -209,7 +260,9 @@ do {										\
 		 "1:	mov %[ret], x0\n"					\
 		 "	.subsection 1\n"					\
 		 "3:	mov %[ret], x0\n"					\
-		 "	b %l[" __stringify(unwound) "]\n"			\
+		 "	b %l[__prog]\n"						\
+		 "4:	mov %[ret], x0\n"					\
+		 "	b %l[__kern]\n"						\
 		 "	.previous\n"						\
 		 __ASM_EXTABLE_RAW("1b", "3b", __stringify(EX_TYPE_BPF), "0")	\
 		 : [ret] "=r"(r0), "=r"(__c0), "=r"(__c1), "=r"(__c2),		\
@@ -218,7 +271,14 @@ do {										\
 		   "r"(__a4)							\
 		 : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",	\
 		   "x14", "x16", "x17", BPF_CB_CLOBBER_X18 "x30", "memory", "cc"	\
-		 : unwound);							\
+		 : __prog, __kern);						\
+	break;									\
+__prog:										\
+	(kind) = 0;								\
+	goto unwound;								\
+__kern:										\
+	(kind) = 1;								\
+	goto unwound;								\
 } while (0)
 
 /*
@@ -237,13 +297,14 @@ do {										\
  * from 21 on sign first, so the copy is the word of the frame record, clang up
  * to 20 pushes first and pops last, so the copy is plain. KASAN has the shadow
  * call stack poisoned, like the compiler the asm is not checked.
+ * @kind: see x86-64 above.
  */
-static __always_inline void bpf_unwind_leave(void)
+static __always_inline void bpf_unwind_leave(u64 kind)
 {
 	unsigned long *slot = (unsigned long *)__builtin_frame_address(0) + 1;
 	unsigned long old = *slot;
 	unsigned long from = ptrauth_strip_kernel_insn_pac(old);
-	unsigned long to = bpf_unwind_target(from), sig = to;
+	unsigned long to = kind ? bpf_kunwind_target(from) : bpf_unwind_target(from), sig = to;
 
 	WARN_ON_ONCE(to == from);
 #ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
@@ -275,19 +336,22 @@ static __always_inline void bpf_unwind_leave(void)
 #else
 
 #define BPF_HAS_CB_PADS 0
+#define BPF_CB_PAD_OFF	0
+#define BPF_CB_KPAD_OFF	0
 
 #define BPF_CB_PAD_TYPE(name, type)
 
-#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, unwound)		\
+#define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, kind, unwound)		\
 do {										\
 	(r0) = ((bpf_callback_t)(void *)(fn))((u64)(long)(a1), (u64)(long)(a2),	\
 					      (u64)(long)(a3), (u64)(long)(a4),	\
 					      (u64)(long)(a5));			\
+	(kind) = 0;								\
 	if (0)									\
 		goto unwound;							\
 } while (0)
 
-static __always_inline void bpf_unwind_leave(void)
+static __always_inline void bpf_unwind_leave(u64 kind)
 {
 }
 
@@ -296,7 +360,7 @@ static __always_inline void bpf_unwind_leave(void)
 /* A callback: bpf_callback_t */
 BPF_CB_PAD_TYPE(__bpf_callback_fn, typeof(*(bpf_callback_t)0));
 
-#define bpf_call_cb(fn, a1, a2, a3, a4, a5, r0, unwound)			\
-	__bpf_call_cb(__bpf_callback_fn, fn, a1, a2, a3, a4, a5, r0, unwound)
+#define bpf_call_cb(fn, a1, a2, a3, a4, a5, r0, kind, unwound)			\
+	__bpf_call_cb(__bpf_callback_fn, fn, a1, a2, a3, a4, a5, r0, kind, unwound)
 
 #endif /* _LINUX_BPF_UNWIND_H */

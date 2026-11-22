@@ -2789,7 +2789,7 @@ static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
 	struct rb_node *parent = NULL, *n = &node->rb_node;
 	bpf_callback_t cb = (bpf_callback_t)less;
 	bool leftmost = true;
-	u64 r0;
+	u64 r0, kind;
 
 	/* node->owner != NULL implies !RB_EMPTY_NODE(n), no need to separately
 	 * check the latter
@@ -2802,7 +2802,7 @@ static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
 
 	while (*link) {
 		parent = *link;
-		bpf_call_cb(cb, node, parent, 0, 0, 0, r0, unwound);
+		bpf_call_cb(cb, node, parent, 0, 0, 0, r0, kind, unwound);
 		if (r0) {
 			link = &parent->rb_left;
 		} else {
@@ -2818,13 +2818,14 @@ static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
 
 unwound:
 	/*
-	 * The comparator left with unwind_exit. The node is not in the tree, and
-	 * the caller has let go of it: unlink it for whoever else holds it, as
-	 * bpf_rb_root_free() does, and drop it, as the error path above does.
+	 * The comparator left with unwind_exit or kexit. The node is not in the
+	 * tree, and the caller has let go of it: unlink it for whoever else holds
+	 * it, as bpf_rb_root_free() does, and drop it, as the error path above
+	 * does.
 	 */
 	smp_store_release(&node->owner, NULL);
 	__bpf_obj_drop_impl((void *)n - off, rec, false);
-	bpf_unwind_leave();
+	bpf_unwind_leave(kind);
 	return r0;
 }
 

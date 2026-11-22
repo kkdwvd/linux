@@ -807,7 +807,7 @@ static noinline notrace long bpf_for_each_array_elem(struct bpf_map *map, bpf_ca
 	u32 i, key, num_elems = 0;
 	struct bpf_array *array;
 	bool is_percpu;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 	void *val;
 
 	cant_migrate();
@@ -824,7 +824,7 @@ static noinline notrace long bpf_for_each_array_elem(struct bpf_map *map, bpf_ca
 			val = array_map_elem_ptr(array, i);
 		num_elems++;
 		key = i;
-		bpf_call_cb(callback_fn, map, &key, val, callback_ctx, 0, ret, unwound);
+		bpf_call_cb(callback_fn, map, &key, val, callback_ctx, 0, ret, kind, unwound);
 		/* return value: 0 - continue, 1 - stop and return */
 		if (ret)
 			break;
@@ -833,8 +833,8 @@ static noinline notrace long bpf_for_each_array_elem(struct bpf_map *map, bpf_ca
 	return num_elems;
 
 unwound:
-	/* The callback left with unwind_exit: nothing to drop here */
-	bpf_unwind_leave();
+	/* The callback left with unwind_exit or kexit: nothing to drop here */
+	bpf_unwind_leave(kind);
 	return ret;
 }
 NOKPROBE_SYMBOL(bpf_for_each_array_elem);
