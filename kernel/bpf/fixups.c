@@ -945,7 +945,7 @@ static bool site_unit(struct bpf_verifier_env *env, int i, enum bpf_site_kind ba
  * BPF_SITE_KENTRY, the entry of a landing pad of the program that the kernel enters. kexit of the
  * callee comes back here:
  *
- *	bpf_pad_kentry_insns()
+ *	bpf_pad_kentry_insns()		with or without a test of K, as the plan says
  *	gotol pad			bpf_insert_sites() sets the offset
  *
  * BPF_SITE_REMAINDER, in place of unwind_exit of the program that a frame gets to while the kernel
@@ -987,6 +987,18 @@ static int emit_unit(struct bpf_verifier_env *env, int s, enum bpf_site_kind bas
 		return n;
 	}
 	return n + emit_pad(env, s, unit->plan, buf + n, aux + n);
+}
+
+/*
+ * What the insns of a unit note about themselves in their aux data, see load_handle() and
+ * release_ents() in pads.c: the map of an address, the type of an object that is freed. Nothing
+ * else of @to changes: it is an insn of the program already.
+ */
+static void copy_pad_aux(struct bpf_insn_aux_data *to, const struct bpf_insn_aux_data *from)
+{
+	to->map_index = from->map_index;
+	to->map_off = from->map_off;
+	to->kptr_struct_meta = from->kptr_struct_meta;
 }
 
 /* Units with the same insns do the same: but for an entry, which goes to its own landing pad */
@@ -1173,6 +1185,24 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 			/* there is no K to test, or to set */
 			if (verifier_bug_if((unit.forced || base >= BPF_SITE_KENTRY) && !sub->k_off,
 					    env, "func#%d has no hidden word for insn %d", s, i))
+				return -EFAULT;
+			/*
+			 * Is this call in pad code? Asked here, on the insns that
+			 * bpf_find_kernel_pads() looked at, and never again: the plan keeps the
+			 * answer for when the entry is emitted the second time.
+			 */
+			if (base == BPF_SITE_KENTRY)
+				unit.plan->untested = !sub->kpads_mixed && !aux[i].kpad_code;
+			/*
+			 * The main pass has seen it for itself where a frame that the kernel
+			 * unwinds got to the entry: there the entry is the second one of the
+			 * frame. Without a test it would replace the value and the handles that
+			 * the first one kept.
+			 */
+			if (verifier_bug_if(base == BPF_SITE_KENTRY && unit.plan->untested &&
+					    unit.plan->forced_visit, env,
+					    "the entry behind insn %d of func#%d does not test K",
+					    i, s))
 				return -EFAULT;
 			n = emit_unit(env, s, base, &unit, new, new_aux, new_aux);
 			pad = add_pad(pads, new, n, unit_can_be_shared(base, &unit));
@@ -1467,11 +1497,11 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 {
 	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
 	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
-	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux, *unit_aux;
 	struct bpf_insn *new, *insn;
 	struct pad_buf pads = {};
 	struct bpf_subprog_info *sub;
-	int i, s, n, cnt, base, err = 0;
+	int i, k, s, n, cnt, base, err = 0;
 	struct pad_unit unit;
 	int *added, *stubbed;
 
@@ -1481,7 +1511,8 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	new = kvzalloc_objs(*new, max(PAD_UNIT_MAX_INSNS, BPF_PAD_MAX_SLOT_INSNS + 1),
 			    BPF_VERIFIER_GFP);
 	pad_aux = kvzalloc_objs(*pad_aux, PAD_UNIT_MAX_INSNS, BPF_VERIFIER_GFP);
-	if (!added || !stubbed || !new || !pad_aux) {
+	unit_aux = kvzalloc_objs(*unit_aux, PAD_UNIT_MAX_INSNS, BPF_VERIFIER_GFP);
+	if (!added || !stubbed || !new || !pad_aux || !unit_aux) {
 		err = -ENOMEM;
 		goto out;
 	}
@@ -1556,7 +1587,26 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 				if (!site_unit(env, i, base, &unit))
 					continue;
 				cnt = sub[1].start - added[s] + (unit.plan ?: unit.forced)->pad;
-				n = emit_unit(env, s, base, &unit, new, &aux[cnt], pad_aux);
+				n = emit_unit(env, s, base, &unit, new, unit_aux, pad_aux);
+				/*
+				 * The unit is emitted a second time, for its aux data. What stands
+				 * in the program is what collect_pads() made of the same plans: an
+				 * entry that tests K there and not here, or the other way round,
+				 * must not load. The aux data go to the program when that is
+				 * known, not before: a unit that is another one could have more
+				 * insns than there are behind its place.
+				 */
+				if (verifier_bug_if(cnt + n > sub[1].start ||
+						    memcmp(new, &env->prog->insnsi[cnt],
+							   n * sizeof(*new)), env,
+						    "the pad of insn %d is not the one at insn %d",
+						    i, cnt)) {
+					err = -EFAULT;
+					goto out;
+				}
+				for (k = 0; k < n; k++)
+					copy_pad_aux(&aux[cnt + k], &unit_aux[k]);
+				memset(unit_aux, 0, n * sizeof(*unit_aux));
 				insn = &env->prog->insnsi[i];
 				if (base == BPF_SITE_FAULT && aux[i].fault_unwinds)
 					sub->fault_pad = cnt;
@@ -1589,6 +1639,7 @@ out:
 	kvfree(stubbed);
 	kvfree(new);
 	kvfree(pad_aux);
+	kvfree(unit_aux);
 	kvfree(pads.insns);
 	kvfree(pads.ends);
 	kvfree(pads.index.slots);

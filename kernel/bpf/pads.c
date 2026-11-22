@@ -1760,6 +1760,8 @@ struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_veri
 	if (!plan)
 		return ERR_PTR(-ENOMEM);
 	plan->visited = true;
+	/* the entry is the second one of this frame, and has to test K: collect_pads() asks */
+	plan->forced_visit |= bpf_frame_is_forced(frame);
 	if (plan->conflict || bpf_frame_is_forced(frame))
 		return plan;
 	if (env->has_throw && frame->regs[BPF_REG_0].type != SCALAR_VALUE) {
@@ -2855,8 +2857,8 @@ static const struct bpf_pad_ent *saved_ent(const struct bpf_subprog_info *sub,
  * verifier.c: kgoto behind the call goes here, and from here the program goes on in its pad. But for
  * the last insn, which is that jump.
  *
- *	ax = K
- *	if ax != 0 goto 1f		the kernel unwinds the frame already: a call in the pad
+ *	ax = K				behind a call in pad code:
+ *	if ax != 0 goto 1f		the kernel unwinds the frame already
  *	K = 1
  *	*(u64 *)(r10 - W) = r0		in a program with bpf_throw(): the value
  *	r0 = r6				per save word of the function: the pointer, see
@@ -2868,6 +2870,11 @@ static const struct bpf_pad_ent *saved_ent(const struct bpf_subprog_info *sub,
  * pad gets 0 in R0, where unwind_exit of the program leaves what the program threw: the value of
  * the kernel is none of its business, and a pad that takes R0 for an object of the program finds
  * none.
+ * Only a call in pad code can be the second entry of a frame: a frame that the kernel unwinds runs
+ * nothing else, see bpf_find_kernel_pads(). So only the entry of such a call tests K. Behind any
+ * other call the entry is the first one, 'untested' of its plan, and stores without the two insns
+ * of the test: it does not read the word. In a mixed function no call is known to be such a
+ * one, and every entry tests.
  * A pointer that the program has not compared with NULL yet can be 0: so is the handle then.
  * The pointer goes through R0, which has the value no longer and is 0 behind the entry. Where the
  * register of the program has more than the handle, the constant that is taken off is one that
@@ -2882,8 +2889,10 @@ int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan
 	const struct bpf_pad_ent *ent;
 	int word, off, first, n = 0;
 
-	buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, sub->k_off);
-	buf[n++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 0);
+	if (!plan->untested) {
+		buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, sub->k_off);
+		buf[n++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 0);
+	}
 	buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 1);
 	if (env->has_throw)
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, sub->value_off);
@@ -2901,7 +2910,8 @@ int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan
 			buf[first + 1].off = 1;
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, off);
 	}
-	buf[1].off = n - 2;
+	if (!plan->untested)
+		buf[1].off = n - 2;
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
 	return n;
 }

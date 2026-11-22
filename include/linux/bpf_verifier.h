@@ -699,6 +699,17 @@ struct bpf_pad_plan {
 	bool ordered;			/* see order_ents() */
 	/* BPF_SITE_KENTRY: 'ents' are what the frame holds at the call, see visit_saves() */
 	bool saves;
+	/*
+	 * BPF_SITE_KENTRY, emission: the call is not in pad code, the entry sets K without a test,
+	 * see bpf_pad_kentry_insns(). collect_pads() decides, once.
+	 */
+	bool untested;
+	/*
+	 * BPF_SITE_KENTRY: a frame that the kernel unwinds already got to the entry, see
+	 * bpf_pad_enter(). Its call is in pad code: what the main pass saw of that, next to what
+	 * the control flow graph says, see collect_pads().
+	 */
+	bool forced_visit;
 	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
 	/*
 	 * Entry i has to stand before these entries: a visit held both, and has to release them
