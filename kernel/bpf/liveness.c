@@ -1858,6 +1858,26 @@ static int record_arg_access(struct bpf_verifier_env *env,
 	return err;
 }
 
+/*
+ * Is the insn at @idx the one behind a call of a subprog that does not return, see
+ * bpf_compute_might_return()? What comes back to such a call is unwound. Where the program has no
+ * unwind_goto there, the frame is left through a landing pad of the verifier, and the places of
+ * what the pad releases are judged at this insn, which no frame runs: for liveness it reads what
+ * the pad may read, as a call of bpf_throw() does. Not if a jump gets to the insn as well: it is
+ * code of the normal path then, and its liveness is that of the code.
+ */
+static bool behind_call_without_return(struct bpf_verifier_env *env, int idx)
+{
+	const struct bpf_insn *insns = env->prog->insnsi;
+	int callee;
+
+	if (!idx || !bpf_pseudo_call(&insns[idx - 1]) || bpf_is_unwind_goto(&insns[idx]) ||
+	    bpf_is_jump_target(env, idx))
+		return false;
+	callee = bpf_find_subprog(env, idx + insns[idx - 1].imm);
+	return callee >= 0 && !env->subprog_info[callee].might_return;
+}
+
 /* Record stack access for a given 'at' state of helper/kfunc/global subprog 'insn' */
 static int record_call_access(struct bpf_verifier_env *env,
 			      struct func_instance *instance,
@@ -2210,6 +2230,13 @@ redo:
 		err = record_load_store_access(env, instance, at_in[i], idx);
 		if (err)
 			goto err_free;
+
+		/* the landing pad reads whichever stack slots hold resources there */
+		if (behind_call_without_return(env, idx)) {
+			err = mark_stack_read_all(env, instance, instance->depth, idx, true);
+			if (err)
+				goto err_free;
+		}
 
 		if (BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_CALL) {
 			err = record_call_access(env, instance, at_in[i], idx);
@@ -2840,6 +2867,10 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		}
 		break;
 	}
+
+	/* the landing pad reads whichever registers hold resources there */
+	if (behind_call_without_return(env, insn - env->prog->insnsi))
+		use |= mask_widen(GENMASK(BPF_REG_9, BPF_REG_6));
 
 	info->def = def;
 	info->use = use;
