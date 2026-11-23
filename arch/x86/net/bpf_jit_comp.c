@@ -288,6 +288,18 @@ int bpf_arch_text_invalidate(void *dst, size_t len)
 	return IS_ERR_OR_NULL(text_poke_set(dst, 0xcc, len));
 }
 
+/*
+ * A LANDING: where unwind_exit of a callee comes back to when the call has code
+ * behind its native call, like 'pop r9'. That code, done once more, and a jump
+ * to the insn that unwind_goto goes to. The landings stand behind the body of
+ * the function, see do_jit().
+ */
+struct jit_landing {
+	u8 code[16];
+	u8 len;
+	int to;
+};
+
 struct jit_context {
 	int cleanup_addr; /* Epilogue code offset */
 
@@ -298,6 +310,14 @@ struct jit_context {
 	 */
 	int tail_call_direct_label;
 	int tail_call_indirect_label;
+
+	/*
+	 * Room for one landing per unwind_goto of the prog. Each pass fills it
+	 * again. It lives as long as addrs[]: the extra pass of a prog with
+	 * subprogs has it from the first call of bpf_int_jit_compile().
+	 */
+	struct jit_landing *landings;
+	int max_landings;
 };
 
 /* Maximum number of bytes emitted while JITing one eBPF insn */
@@ -2428,6 +2448,8 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	/* the code of the last call insn that follows the native call, see unwind_goto */
 	u8 after_call[16], *ret_addr;
 	int after_call_len = 0;
+	/* the landings of this pass, and how many bytes they have so far */
+	int nr_landings = 0, tail = 0;
 	int err;
 
 	stack_depth = bpf_prog->aux->stack_depth;
@@ -3432,38 +3454,48 @@ populate_extable:
 
 			/* unwind_goto. The verifier expanded may_goto. */
 		case BPF_JMP | BPF_JCOND:
-		case BPF_JMP32 | BPF_JCOND:
+		case BPF_JMP32 | BPF_JCOND: {
+			/* the insn that it goes to */
+			int to = i + bpf_jmp_offset(insn);
+			int target = addrs[to];
+			struct jit_landing *landing;
+
 			/* an access to arena is in front: no call, nothing to redo */
 			if (BPF_CLASS(insn[-1].code) != BPF_JMP)
 				after_call_len = 0;
-			if (!after_call_len) {
-				err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-							 addrs[i - 1],
-							 addrs[i + bpf_jmp_offset(insn)]);
-				if (err)
-					return err;
-				break;
-			}
 			/*
 			 * What follows the native call, like 'pop r9', has to be
-			 * done on the way to the pad too:
+			 * done on the way to the pad too. Not in the way of what
+			 * returns: the landing goes behind the body of the
+			 * function, and the next insn follows the call.
 			 *   call foo
 			 *   pop r9      <- exit returns here
-			 *   jmp 1f
+			 *   ...
+			 *   leave; ret
+			 *   ...
 			 *   pop r9      <- unwind_exit returns here
 			 *   jmp pad
-			 * 1:
+			 * addrs[insn_cnt] is where the body ended in the pass before.
+			 * The entry is written when no insn moves any more.
 			 */
+			if (after_call_len) {
+				if (nr_landings >= ctx->max_landings) {
+					pr_err("bpf_jit: landings bug\n");
+					return -EFAULT;
+				}
+				landing = &ctx->landings[nr_landings++];
+				memcpy(landing->code, after_call, after_call_len);
+				landing->len = after_call_len;
+				landing->to = to;
+				target = addrs[insn_cnt] + tail;
+				tail += after_call_len + 5;
+			}
 			err = add_unwind_exentry(bpf_prog, image, rw_image, &excnt,
-						 addrs[i - 1] - after_call_len, addrs[i - 1] + 2);
+						 addrs[i - 1] - after_call_len, target);
 			if (err)
 				return err;
-			EMIT2(0xEB, after_call_len + 5);
-			memcpy(prog, after_call, after_call_len);
-			prog += after_call_len;
-			EMIT1_off32(0xE9, addrs[i + bpf_jmp_offset(insn)] -
-					  (addrs[i - 1] + 2 + after_call_len + 5));
 			break;
+		}
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
@@ -3795,6 +3827,30 @@ emit_jmp:
 		proglen += ilen;
 		moved = addrs[i] - proglen;
 		addrs[i] = proglen;
+		prog = temp;
+	}
+
+	/*
+	 * The landings, behind the last insn. A jump of 32 bits whatever the
+	 * distance, so the tail has one size in every pass and the image
+	 * shrinks only when the body does. addrs[insn_cnt] stays the end of
+	 * the body, and the length that is returned has the tail.
+	 */
+	for (i = 0; i < nr_landings; i++) {
+		const struct jit_landing *landing = &ctx->landings[i];
+
+		memcpy(prog, landing->code, landing->len);
+		prog += landing->len;
+		EMIT1_off32(0xE9, addrs[landing->to] - (proglen + landing->len + 5));
+		ilen = prog - temp;
+		if (image) {
+			if (unlikely(proglen + ilen > oldproglen)) {
+				pr_err("bpf_jit: fatal error\n");
+				return -EFAULT;
+			}
+			memcpy(rw_image + proglen, temp, ilen);
+		}
+		proglen += ilen;
 		prog = temp;
 	}
 
@@ -4857,6 +4913,13 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	addrs = kvmalloc_objs(*addrs, prog->len + 1);
 	if (!addrs)
 		goto out_addrs;
+	for (i = 0; i < prog->len; i++)
+		ctx.max_landings += bpf_is_unwind_goto(&prog->insnsi[i]);
+	if (ctx.max_landings) {
+		ctx.landings = kvmalloc_objs(*ctx.landings, ctx.max_landings);
+		if (!ctx.landings)
+			goto out_addrs;
+	}
 
 	/*
 	 * Before first pass, make a rough estimation of addrs[]
@@ -4869,7 +4932,6 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	}
 	ctx.cleanup_addr = proglen;
 skip_init_addrs:
-
 	/*
 	 * Jumps are sized by the insns they jump over, which start at
 	 * their maximum size, so no insn grows from one pass to the
@@ -4989,6 +5051,7 @@ out_image:
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
 out_addrs:
 		kvfree(addrs);
+		kvfree(ctx.landings);
 		if (!image && priv_stack_ptr) {
 			free_percpu(priv_stack_ptr);
 			prog->aux->priv_stack_ptr = NULL;
@@ -5093,6 +5156,7 @@ void bpf_jit_free(struct bpf_prog *prog)
 			bpf_jit_binary_pack_finalize(jit_data->header,
 						     jit_data->rw_header);
 			kvfree(jit_data->addrs);
+			kvfree(jit_data->ctx.landings);
 			kfree(jit_data);
 		}
 		prog->bpf_func = (void *)prog->bpf_func - cfi_get_offset();

@@ -1198,7 +1198,9 @@ static unsigned long may_unwind_big_stack(void)
 
 /*
  * x86-64 keeps the pointer to the private stack in r9 and saves it around a call.
- * The value that is read back in the pad is there only when r9 is restored.
+ * The value that is read back in the pad is there only when r9 is restored: on the way of
+ * unwind_exit a landing behind the last insn of the prog does that. What returns goes on with
+ * the exit that follows the call.
  */
 SEC("raw_tp")
 __description("unwind: private stack, the callee unwinds")
@@ -1210,7 +1212,8 @@ __jited("	pushq	%r9")
 __jited("...") /* call depth accounting */
 __jited("	callq	0x{{.*}}")
 __jited("	popq	%r9")
-__jited("	jmp	L{{.*}}")
+__jited("L{{.*}}:	leave")
+__jited("...")
 __jited("	popq	%r9")
 __jited("	jmp	L{{.*}}")
 __arch_arm64
