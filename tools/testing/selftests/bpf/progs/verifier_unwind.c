@@ -24,6 +24,10 @@
 extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
 extern void bpf_throw(__u64 cookie) __ksym;
+extern void __bpf_trap(void) __ksym;
+struct task_struct {};
+extern struct task_struct *bpf_task_from_pid(int pid) __ksym;
+extern void bpf_task_release(struct task_struct *p) __ksym;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
@@ -806,6 +810,860 @@ __naked int global_pad_is_checked(void)
 	);
 }
 
+/*
+ * GLOBAL SUBPROGS THAT NEVER RETURN. The verifier does not look into a global subprog at its
+ * call. It knows which subprogs have no path from their first insn to an exit, see
+ * bpf_compute_might_return(), and it does not go on behind a call of one: what follows the call
+ * is dead code, as it is behind a call of always_unwinds().
+ *
+ * In each of these progs what follows the call reads through r0, which is a number behind the call
+ * of a global subprog: the prog loads only if the verifier does not go on there. A subprog that
+ * has a way to return, however unlikely, makes the same prog fail.
+ */
+#define BEHIND_CALL(name, callee)				\
+__naked int name(void)						\
+{								\
+	asm volatile (						\
+		"call " #callee ";"				\
+		unwind_goto(2)					\
+		"r0 = *(u64 *)(r0 + 0);"			\
+		"exit;"						\
+		"r0 += 10;"					\
+		"exit;"						\
+		:						\
+		: __imm_unwind_goto(2)				\
+		: __clobber_all);				\
+}
+
+#define NEVER_RETURNS						\
+	__arch_x86_64 __arch_arm64				\
+	__load_if_JITed()					\
+	__success
+
+#define MIGHT_RETURN						\
+	__arch_x86_64 __arch_arm64				\
+	__load_if_JITed()					\
+	__failure __msg("R0 invalid mem access 'scalar'")
+
+__naked __noinline __used
+unsigned long global_always_unwinds(void)
+{
+	asm volatile (
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+/* A trap stands where the cpu predicts that the call returns, and the pad gets r0 of unwind_exit */
+SEC("tc")
+__description("unwind: a global subprog never returns")
+NEVER_RETURNS __retval(15)
+__xlated("0: call pc+4")
+__xlated("1: unwind_goto pc+1")
+__xlated("2: goto pc-1")
+__xlated("3: r0 += 10")
+__xlated("4: exit")
+BEHIND_CALL(global_never_returns, global_always_unwinds)
+
+/* Its exit stands behind a jump that is never taken: that edge is gone from the graph */
+__naked __noinline __used
+unsigned long global_exit_is_folded(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"if r1 != 0 goto 1f;"
+		"r0 = 5;"
+		unwind_exit
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog whose exit a jump on a constant skips never returns")
+NEVER_RETURNS __retval(15)
+BEHIND_CALL(global_folded_never_returns, global_exit_is_folded)
+
+/*
+ * A path ends at a call of __bpf_trap(), which the verifier rejects when it gets there. It does
+ * not get there here: the first jump leaves r1 <= 5, and the second one is always taken then.
+ * The edge to the trap stays in the graph, no constant decides that jump.
+ */
+__naked __noinline __used
+unsigned long global_trap_is_dead(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 > 5 goto 1f;"
+		"if r1 < 7 goto 1f;"
+		"call __bpf_trap;"
+		"exit;"
+	"1:"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog whose other path ends in __bpf_trap() never returns")
+NEVER_RETURNS __retval(15)
+BEHIND_CALL(global_trap_never_returns, global_trap_is_dead)
+
+/* A state gets to this trap. The summary is none the wiser: the prog is rejected for the trap. */
+__naked __noinline __used
+unsigned long global_traps(void)
+{
+	asm volatile (
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call __bpf_trap;"
+	"1:"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_addr(zero),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that gets to __bpf_trap() is rejected there")
+__arch_x86_64 __arch_arm64
+__load_if_JITed()
+__failure __msg("unexpected __bpf_trap() due to uninitialized variable?")
+BEHIND_CALL(global_trap_is_rejected, global_traps)
+
+/*
+ * Its exit stands behind the call of itself. A path gets to the exit only if that call returns, so
+ * no path does. The recursion ends when the stack is used up, and the kernel unwinds the prog. What
+ * follows the call is dead code, in the subprog and in the prog.
+ */
+__naked __noinline __used
+unsigned long global_calls_itself(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"call global_calls_itself;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that calls itself in front of its exit never returns")
+NEVER_RETURNS __retval(2)
+__xlated("...")
+__xlated("call pc+4")
+__xlated("kgoto pc+1")
+__xlated("goto pc-1")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("...")
+__xlated("r6 = 0")
+__xlated("call pc-")
+__xlated("kgoto pc+1")
+__xlated("goto pc-1")
+__xlated("r0 = 2")
+__xlated("r2 = 0")
+__xlated("kexit")
+__naked int global_recursion_never_returns(void)
+{
+	asm volatile (
+		"call global_calls_itself;"
+		"r0 = *(u64 *)(r0 + 0);"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* Two that call each other in front of their exits: neither returns */
+__naked __noinline __used
+unsigned long global_calls_other(void);
+
+__naked __noinline __used
+unsigned long global_calls_one(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"call global_calls_other;"
+		"exit;"
+	);
+}
+
+__naked __noinline __used
+unsigned long global_calls_other(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"call global_calls_one;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: two global subprogs that call each other in front of their exits never return")
+NEVER_RETURNS __retval(2)
+BEHIND_CALL(global_cycle_never_returns, global_calls_one)
+
+/*
+ * A static subprog that only calls what never returns does not return either, and so on up: the
+ * exit of each of them stands behind such a call. What unwind_exit left gets through the static
+ * frame, and out of the global one comes the value of the kernel, TC_ACT_SHOT.
+ */
+__naked __noinline __used
+static unsigned long calls_global_always_unwinds(void)
+{
+	asm volatile (
+		"call global_always_unwinds;"
+		"exit;"
+	);
+}
+
+__naked __noinline __used
+unsigned long global_calls_static_never_returns(void)
+{
+	asm volatile (
+		"call calls_global_always_unwinds;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog whose exit is behind calls that never return never returns")
+NEVER_RETURNS __retval(12)
+BEHIND_CALL(global_chain_never_returns, global_calls_static_never_returns)
+
+/*
+ * It has no unwind_exit, and the kernel unwinds it on every path: in a loop that nothing ends when
+ * the tests run it, or at bpf_throw(), which is where its paths end. The exit is there because a
+ * subprog cannot end in a call.
+ */
+__naked __noinline __used
+unsigned long global_spins_or_throws(void)
+{
+	asm volatile (
+		"r2 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r1 = 0;"
+		"call %[bpf_throw];"
+		"exit;"
+		:
+		: __imm_addr(one),
+		  __imm(bpf_throw)
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that the kernel unwinds on every path never returns")
+NEVER_RETURNS __retval(2)
+BEHIND_CALL(global_kunwinds_never_returns, global_spins_or_throws)
+
+/*
+ * THE WAYS TO RETURN. Each of these subprogs unwinds when the tests run it, and each has a path to
+ * an exit that the verifier cannot rule out before it looks at the states: what follows a call
+ * of it is verified. global_unwinds() has a plain exit behind a jump on a variable.
+ */
+SEC("tc")
+__description("unwind: a global subprog with an exit behind a jump might return")
+MIGHT_RETURN
+BEHIND_CALL(global_exit_might_return, global_unwinds)
+
+/*
+ * No state gets to this exit: the first jump leaves r1 <= 5, and the second one is always taken
+ * then. That is known to the main pass only. For the summary the edge is there.
+ */
+__naked __noinline __used
+unsigned long global_exit_is_dead(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 > 5 goto 1f;"
+		"if r1 < 7 goto 1f;"
+		"r0 = 0;"
+		"exit;"
+	"1:"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog with an exit that only ranges rule out might return")
+MIGHT_RETURN
+BEHIND_CALL(global_dead_exit_might_return, global_exit_is_dead)
+
+/*
+ * A tail call that is taken leaves the subprog like exit does, and so does ld_abs or ld_ind that
+ * fails. These three static subprogs have no exit insn: the hidden exit is their one way to
+ * return. Each global subprog only calls one of them, and has its exit behind that call.
+ */
+__naked __noinline __used
+static unsigned long tail_calls_or_unwinds(void)
+{
+	asm volatile (
+		"r2 = %[prog_array] ll;"
+		"r3 = 0;"
+		"call %[bpf_tail_call];"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm(bpf_tail_call),
+		  __imm_addr(prog_array),
+		  __imm_unwind_exit
+	);
+}
+
+__noinline unsigned long global_tail_calls_or_unwinds(struct __sk_buff *skb)
+{
+	return tail_calls_or_unwinds();
+}
+
+SEC("tc")
+__description("unwind: a global subprog that returns by a tail call only might return")
+MIGHT_RETURN
+BEHIND_CALL(global_tail_call_might_return, global_tail_calls_or_unwinds)
+
+/* The packet is shorter than that */
+__naked __noinline __used
+static unsigned long ld_abs_or_unwinds(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r0 = *(u8 *)skb[1000];"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+__noinline unsigned long global_ld_abs_or_unwinds(struct __sk_buff *skb)
+{
+	return ld_abs_or_unwinds();
+}
+
+SEC("tc")
+__description("unwind: a global subprog that returns by ld_abs only might return")
+MIGHT_RETURN
+BEHIND_CALL(global_ld_abs_might_return, global_ld_abs_or_unwinds)
+
+__naked __noinline __used
+static unsigned long ld_ind_or_unwinds(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = %[zero] ll;"
+		"r7 = *(u64 *)(r7 + 0);"
+		"r0 = *(u8 *)skb[r7];"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_addr(zero),
+		  __imm_unwind_exit
+	);
+}
+
+__noinline unsigned long global_ld_ind_or_unwinds(struct __sk_buff *skb)
+{
+	return ld_ind_or_unwinds();
+}
+
+SEC("tc")
+__description("unwind: a global subprog that returns by ld_ind only might return")
+MIGHT_RETURN
+BEHIND_CALL(global_ld_ind_might_return, global_ld_ind_or_unwinds)
+
+/*
+ * ld_abs leaves the static subprog with r0 = 0, the global one returns that, and the prog goes
+ * on at run time. So the insn behind unwind_goto has to be the code of the prog. A trap there,
+ * which is what follows a call that never returns, would spin when the call returns: this test
+ * looks at the insns and runs nothing. prog_tests/unwind_attach.c runs the prog, once it has seen
+ * the same.
+ */
+SEC("tc")
+__description("unwind: a global subprog returns by ld_abs")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success
+__xlated("0: call pc+")
+__xlated("1: unwind_goto pc+")
+__xlated("2: r0 += 7")
+__xlated("3: exit")
+__naked int global_ld_abs_returns(void)
+{
+	asm volatile (
+		"call global_ld_abs_or_unwinds;"
+		unwind_goto(2)
+		"r0 += 7;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/* may_goto of the prog jumps to the exit, in a function that the kernel cannot unwind */
+__naked __noinline __used
+unsigned long global_may_goto_exits(void)
+{
+	asm volatile (
+	"1:"
+		"may_goto 2f;"
+		"goto 1b;"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog whose may_goto jumps to an exit might return")
+MIGHT_RETURN
+BEHIND_CALL(global_may_goto_might_return, global_may_goto_exits)
+
+/* The callee of callx is not known to the summary: callx returns, whatever it calls here */
+__naked __noinline __used
+unsigned long global_callx_then_exit(void)
+{
+	asm volatile (
+		"r6 = %[always_unwinds] ll;"
+		"callx r6;"
+		"exit;"
+		:
+		: __imm_addr(always_unwinds)
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog with an exit behind callx might return")
+MIGHT_RETURN
+BEHIND_CALL(global_callx_might_return, global_callx_then_exit)
+
+/* What comes back to the call of always_unwinds() goes to its pad, and the pad returns */
+__naked __noinline __used
+unsigned long global_pad_exits(void)
+{
+	asm volatile (
+		"call always_unwinds;"
+		unwind_goto(1)
+		unwind_exit
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_unwind_goto(1),
+		  __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog whose pad of a call that never returns exits might return")
+MIGHT_RETURN
+BEHIND_CALL(global_pad_might_return, global_pad_exits)
+
+/* The exit is behind a call of a subprog that might return */
+__naked __noinline __used
+unsigned long global_calls_global_unwinds(void)
+{
+	asm volatile (
+		"call global_unwinds;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog with an exit behind a call that might return might return")
+MIGHT_RETURN
+BEHIND_CALL(global_call_might_return, global_calls_global_unwinds)
+
+/* A recursion with a way out */
+__naked __noinline __used
+unsigned long global_recursion_with_exit(void)
+{
+	asm volatile (
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call global_recursion_with_exit;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that calls itself and has another exit might return")
+MIGHT_RETURN
+BEHIND_CALL(global_recursion_might_return, global_recursion_with_exit)
+
+/*
+ * Two that call each other, of which one has a way out: both might return. The first has its exit
+ * behind the call of the second, so it returns if the second does.
+ */
+__naked __noinline __used
+unsigned long global_returns_or_calls_back(void);
+
+__naked __noinline __used
+unsigned long global_exit_behind_cycle(void)
+{
+	asm volatile (
+		"call global_returns_or_calls_back;"
+		"exit;"
+	);
+}
+
+__naked __noinline __used
+unsigned long global_returns_or_calls_back(void)
+{
+	asm volatile (
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call global_exit_behind_cycle;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog in a cycle of calls that has a way out might return")
+MIGHT_RETURN
+BEHIND_CALL(global_cycle_might_return, global_exit_behind_cycle)
+
+/*
+ * The call returns at run time: the second subprog returns 0, then the first, and the prog goes
+ * on. No trap behind the call here either, and prog_tests/unwind_attach.c runs the prog. The
+ * kernel can unwind the cycle, when its stack is used up: kgoto stands behind the call.
+ */
+SEC("tc")
+__description("unwind: a global subprog returns out of a cycle of calls")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success
+__xlated("...")
+__xlated("{{[0-9]+}}: call pc+5")
+__xlated("{{[0-9]+}}: kgoto pc+2")
+__xlated("{{[0-9]+}}: r0 += 7")
+__xlated("{{[0-9]+}}: exit")
+__naked int global_cycle_returns(void)
+{
+	asm volatile (
+		"call global_exit_behind_cycle;"
+		unwind_goto(2)
+		"r0 += 7;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/*
+ * The summary walks a callee ahead of its callers, and no subprog returns until a walk shows it. In
+ * a cycle of calls some callee comes ahead of a caller that it calls back. Here the prog gets into
+ * the cycle through global_out_or_round(), which has the way out, so global_goes_round() is walked
+ * first: its exit is behind the call of a subprog that is not known to return yet, and only a
+ * second round of walks finds that it returns. The insn that reads through r0 stands behind the
+ * call of global_goes_round(), in the other subprog: it is verified only if that call returns.
+ */
+__naked __noinline __used
+unsigned long global_goes_round(void);
+
+__naked __noinline __used
+unsigned long global_out_or_round(void)
+{
+	asm volatile (
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call global_goes_round;"
+		"r0 = *(u64 *)(r0 + 0);"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+	);
+}
+
+__naked __noinline __used
+unsigned long global_goes_round(void)
+{
+	asm volatile (
+		"call global_out_or_round;"
+		"exit;"
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that returns if its caller in a cycle does might return")
+MIGHT_RETURN
+__naked int global_round_might_return(void)
+{
+	asm volatile (
+		"call global_out_or_round;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* The same with the two subprogs defined the other way around */
+__naked __noinline __used
+unsigned long global_out_or_round_2(void);
+
+__naked __noinline __used
+unsigned long global_goes_round_2(void)
+{
+	asm volatile (
+		"call global_out_or_round_2;"
+		"exit;"
+	);
+}
+
+__naked __noinline __used
+unsigned long global_out_or_round_2(void)
+{
+	asm volatile (
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call global_goes_round_2;"
+		"r0 = *(u64 *)(r0 + 0);"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that returns if its caller in a cycle does, defined first, might return")
+MIGHT_RETURN
+__naked int global_round_might_return_2(void)
+{
+	asm volatile (
+		"call global_out_or_round_2;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* gotox is its one way to the exit: the walk follows the jump table of the subprog */
+__naked __noinline __used
+unsigned long global_gotox_exits(void)
+{
+	asm volatile ("						\
+	.pushsection .jumptables,\"\",@progbits;		\
+jt0_%=:								\
+	.quad ret0_%= - .text;					\
+	.size jt0_%=, 8;					\
+	.global jt0_%=;						\
+	.popsection;						\
+								\
+	r0 = jt0_%= ll;						\
+	r0 = *(u64 *)(r0 + 0);					\
+	.8byte %[gotox_r0];					\
+ret0_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm_insn(gotox_r0, BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, BPF_REG_0, 0, 0, 0))
+	);
+}
+
+SEC("tc")
+__description("unwind: a global subprog that gets to its exit by gotox only might return")
+MIGHT_RETURN
+BEHIND_CALL(global_gotox_might_return, global_gotox_exits)
+
+/*
+ * It returns 0 through its jump table, and the prog goes on: no trap behind the call here either.
+ * prog_tests/unwind_attach.c runs it. Nothing unwinds the subprog, so unwind_goto of the prog and
+ * its landing pad are gone.
+ */
+SEC("tc")
+__description("unwind: a global subprog returns by gotox")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success
+__xlated("0: call pc+2")
+__xlated("1: r0 += 7")
+__xlated("2: exit")
+__naked int global_gotox_returns(void)
+{
+	asm volatile (
+		"call global_gotox_exits;"
+		unwind_goto(2)
+		"r0 += 7;"
+		"exit;"
+		"r0 = 42;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/*
+ * The landing pad of a call of a subprog that never returns releases what the frame holds. What
+ * follows the call is dead code that reads nothing of it, here an exit. No frame runs that insn,
+ * so for liveness it reads what the pad may read, as a call of bpf_throw() does: r6 is a place of
+ * the task, and the frame needs no hidden slot. The verifier adds unwind_goto, and the pad ends the
+ * prog with TC_ACT_SHOT.
+ */
+SEC("tc")
+__description("unwind: a reference in r6 at a call of a subprog that never returns needs no hidden slot")
+NEVER_RETURNS __retval(2)
+__log_level(2)
+__msg("landing pad of call at 6 for unwind_exit: ref@1(r6) rcu=0 preempt=0")
+__not_msg("has hidden slots")
+__naked int task_at_call_never_returns(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 != 0 goto 1f;"
+		"r0 = 7;"
+		"exit;"
+	"1:"
+		"r6 = r0;"
+		"call global_always_unwinds;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * Here a jump goes to the insn behind the call, from the path that has released the task: that
+ * insn is code of the normal path, which does not read r6, and its liveness is that of the code.
+ * The task has no place behind the call, and the frame keeps it in a hidden slot.
+ */
+SEC("tc")
+__description("unwind: a reference in r6 at a call that never returns in front of live code has a hidden slot")
+NEVER_RETURNS __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: refs")
+__naked int task_at_call_in_front_of_live_code(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 == 0 goto 2f;"
+		"r6 = r0;"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"goto 2f;"
+	"1:"
+		"call global_always_unwinds;"
+	"2:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid),
+		  __imm(bpf_task_release),
+		  __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/*
+ * The same for a stack slot: nothing reads fp-8 behind the call, but the stack of the frame is
+ * live there too, so the slot is a place of the task. The pad loads the task from it and releases
+ * it once, and the prog gets no insn for a hidden slot.
+ */
+SEC("tc")
+__description("unwind: a reference in the stack at a call of a subprog that never returns needs no hidden slot")
+NEVER_RETURNS __retval(2)
+__log_level(2)
+__msg("landing pad of call at 6 for unwind_exit: ref@1(*fp-8) rcu=0 preempt=0")
+__not_msg("has hidden slots")
+__xlated("5: *(u64 *)(r10 -8) = r0")
+__xlated("6: call pc+6")
+__xlated("7: unwind_goto pc+1")
+__xlated("8: goto pc-1")
+__xlated("9: r1 = *(u64 *)(r10 -8)")
+__xlated("10: call kernel-function")
+__xlated("11: r0 = 2")
+__xlated("12: exit")
+__naked int task_in_stack_at_call_never_returns(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 != 0 goto 1f;"
+		"r0 = 7;"
+		"exit;"
+	"1:"
+		"*(u64 *)(r10 - 8) = r0;"
+		"call global_always_unwinds;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * The rule does not ask whether the callee is global. The verifier follows always_unwinds() and
+ * knows from that that nothing comes back, but what is live behind the call is decided before
+ * that, by the summary.
+ */
+SEC("tc")
+__description("unwind: a reference in r6 at a call of a static subprog that never returns needs no hidden slot")
+NEVER_RETURNS __retval(2)
+__log_level(2)
+__msg("landing pad of call at 6 for unwind_exit: ref@1(r6) rcu=0 preempt=0")
+__not_msg("has hidden slots")
+__naked int task_at_static_call_never_returns(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 != 0 goto 1f;"
+		"r0 = 7;"
+		"exit;"
+	"1:"
+		"r6 = r0;"
+		"call always_unwinds;"
+		"exit;"
+		:
+		: __imm(bpf_task_from_pid)
+		: __clobber_all
+	);
+}
+
 __naked __noinline __used
 unsigned long global_never_unwinds(void)
 {
@@ -1579,6 +2437,9 @@ void __kfunc_btf_root(void)
 {
 	bpf_rcu_read_lock();
 	bpf_rcu_read_unlock();
+	bpf_task_release(bpf_task_from_pid(1));
+	__bpf_trap();
+	bpf_throw(0);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -85,6 +85,46 @@ static void helper_with_pad(void)
 	unwind_attach__destroy(skel);
 }
 
+/*
+ * @name calls a global subprog that returns, and goes on behind the call. A kernel that takes the
+ * subprog for one that never returns puts a trap behind the call, an insn that jumps to itself,
+ * and a return would spin there for good. So look at the insn first: the test fails, and the prog
+ * does not run.
+ */
+static void returns_behind_call(const char *name)
+{
+	struct bpf_insn *insns = NULL;
+	struct verifier_unwind *skel;
+	struct bpf_program *prog, *p;
+	__u32 i, cnt = 0;
+
+	skel = verifier_unwind__open();
+	if (!ASSERT_OK_PTR(skel, "verifier_unwind__open"))
+		return;
+	prog = bpf_object__find_program_by_name(skel->obj, name);
+	if (!ASSERT_OK_PTR(prog, name))
+		goto out;
+	bpf_object__for_each_program(p, skel->obj)
+		bpf_program__set_autoload(p, p == prog);
+	if (!ASSERT_OK(verifier_unwind__load(skel), name) ||
+	    !ASSERT_OK(get_xlated_program(bpf_program__fd(prog), &insns, &cnt), "xlated"))
+		goto out;
+	/* the first call of a subprog, the unwind_goto and kgoto behind it, what it returns to */
+	for (i = 0; i < cnt; i++)
+		if (insns[i].code == (BPF_JMP | BPF_CALL) && insns[i].src_reg == BPF_PSEUDO_CALL)
+			break;
+	for (i++; i < cnt && BPF_OP(insns[i].code) == BPF_JCOND &&
+		  (BPF_CLASS(insns[i].code) == BPF_JMP || BPF_CLASS(insns[i].code) == BPF_JMP32); i++)
+		;
+	if (ASSERT_LT(i, cnt, "the insn behind the call") &&
+	    ASSERT_FALSE(insns[i].code == (BPF_JMP | BPF_JA) && insns[i].off == -1,
+			 "a trap behind the call"))
+		ASSERT_EQ(run(bpf_program__fd(prog)), 7, "retval");
+	free(insns);
+out:
+	verifier_unwind__destroy(skel);
+}
+
 /* An extension of an LSM prog whose time slice is over denies */
 static void extension_of_lsm_prog(void)
 {
@@ -114,9 +154,18 @@ out:
 
 void test_unwind_attach(void)
 {
+	static const char * const never_returns[][2] = {
+		/* it has unwind_exit, and nothing else */
+		{ "global_never_returns", "global_always_unwinds" },
+		/* the kernel unwinds it, and it has no unwind_exit */
+		{ "global_kunwinds_never_returns", "global_spins_or_throws" },
+		/* it only calls what never returns */
+		{ "global_chain_never_returns", "global_calls_static_never_returns" },
+	};
 	struct verifier_unwind *tgt;
 	struct bpf_program *prog;
-	int tgt_fd, plain_fd, shared_fd, tail_fd, throws_fd, err, key = 0;
+	int tgt_fd, plain_fd, shared_fd, tail_fd, throws_fd, err, key = 0, i;
+	char msg[128];
 
 	if (!is_jit_enabled()) {
 		printf("%s:SKIP:JIT is disabled\n", __func__);
@@ -131,7 +180,10 @@ void test_unwind_attach(void)
 						prog == tgt->progs.calls_global_never_unwinds ||
 						prog == tgt->progs.shared_pad ||
 						prog == tgt->progs.tail_call_in_subprog ||
-						prog == tgt->progs.exception_callback_unwinds);
+						prog == tgt->progs.exception_callback_unwinds ||
+						prog == tgt->progs.global_never_returns ||
+						prog == tgt->progs.global_kunwinds_never_returns ||
+						prog == tgt->progs.global_chain_never_returns);
 	err = verifier_unwind__load(tgt);
 	if (err == -ENOTSUPP) {
 		printf("%s:SKIP:JIT does not support unwinding\n", __func__);
@@ -161,6 +213,19 @@ void test_unwind_attach(void)
 	extension_of_lsm_prog();
 
 	/*
+	 * The verifier does not go on behind a call of a global subprog that never returns. No
+	 * extension returns in its place: such a subprog unwinds, whichever way.
+	 */
+	for (i = 0; i < ARRAY_SIZE(never_returns); i++) {
+		prog = bpf_object__find_program_by_name(tgt->obj, never_returns[i][0]);
+		if (!ASSERT_OK_PTR(prog, never_returns[i][0]))
+			continue;
+		snprintf(msg, sizeof(msg), "Only fentry can attach to %s", never_returns[i][1]);
+		attach(bpf_program__fd(prog), never_returns[i][1], "freplace_returns", msg, 0);
+		attach(bpf_program__fd(prog), never_returns[i][1], "fexit_unwind", msg, 0);
+	}
+
+	/*
 	 * The pad of the main prog calls the exception callback and leaves with
 	 * exit. unwind_exit of the callback gets to that exit like its exit
 	 * does: nothing unwinds into the prog that is extended.
@@ -176,6 +241,10 @@ void test_unwind_attach(void)
 		ASSERT_EQ(run(tail_fd), 7, "retval");
 
 	helper_with_pad();
+	/* by LD_ABS that fails, out of a cycle of calls, and through a jump table */
+	returns_behind_call("global_ld_abs_returns");
+	returns_behind_call("global_cycle_returns");
+	returns_behind_call("global_gotox_returns");
 out:
 	verifier_unwind__destroy(tgt);
 }
