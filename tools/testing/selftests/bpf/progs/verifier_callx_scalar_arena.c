@@ -118,6 +118,28 @@ int callx_scalar_c_arena(void *ctx)
 	return exc_end(e);
 }
 
+/*
+ * exc_dtor() accesses arena, where the kernel may unwind it. A callee of callx of a number is
+ * verified after the functions that call it, like a global function, and in a prog with an arena
+ * they expect the kernel to unwind it from the first pass on: the prog takes one pass, not two.
+ */
+SEC("syscall")
+__description("callx scalar: a callee that the kernel may unwind costs no second pass")
+__callx_scalar
+__success __retval(99)
+__log_level(2) __not_msg("pass 1")
+int callx_scalar_one_pass(void *ctx)
+{
+	struct exc *e;
+
+	e = bpf_arena_alloc_pages(&arena, NULL, 1, -1, 0);
+	if (!e)
+		return 1;
+	e->dtor = exc_dtor;
+	e->val = 9;
+	return exc_end(e);
+}
+
 #else
 
 SEC("socket")
