@@ -15911,6 +15911,17 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+	/*
+	 * bpf_percpu_obj_new() refuses a type that has special fields, so there
+	 * is no such object. The pointer can still come out of a field of a map,
+	 * where it is NULL.
+	 */
+	if (is_bpf_percpu_obj_drop_kfunc(meta.func_id) &&
+	    btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id)) {
+		verbose(env, "bpf_percpu_obj_drop type must not contain special fields\n");
+		return -EINVAL;
+	}
+
 	if (is_bpf_rbtree_add_kfunc(meta.func_id)) {
 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
 					 set_rbtree_add_callback_state);
