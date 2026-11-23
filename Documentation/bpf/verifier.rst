@@ -792,12 +792,14 @@ or drop glue of Rust. ``kgoto`` goes there through an *entry* that the verifier
 emits::
 
   call foo                      call foo
-  unwind_goto pad               unwind_goto pad
+  unwind_goto pad               unwind_goto stub
   ...                           kgoto entry
   pad: call dtor                ...
        unwind_exit              pad:   call dtor
                                        gotol rest
-                                entry: if K == 0 { K = 1 }
+                                stub:  K = 0
+                                       gotol pad
+                                entry: K = 1
                                        r0 = 0
                                        gotol pad
                                 rest:  if K == 0 goto +N
@@ -805,7 +807,18 @@ emits::
                                        kexit
                                        unwind_exit
 
-``K`` is a hidden word of the stack frame, 0 from the entry of the function on.
+``K`` is a hidden word of the stack frame: 1 while the kernel unwinds the frame.
+No insn on the normal path of the function writes it. It is written where a
+frame gets from the normal path into a landing pad: ``unwind_goto`` of the
+program goes to a *stub* that clears it, and the entry sets it. Only *pad code*
+reads it, which is what can be reached from the first insn of a landing pad that
+only resumes, see ``find_pad_code()``. A call in pad code can be made by a frame
+that the kernel unwinds already: there ``unwind_goto`` keeps its target, and the
+entry tests ``K`` and stores only if it is 0. A function in which some insn is
+pad code and can be reached from the first insn of the function without the
+jump of ``unwind_goto`` as well is *mixed*. It clears ``K`` at its entry
+instead, with one store per call, has no stub, and all its entries test.
+
 The frame of a state has the same mark, *forced*, see ``enter_kernel_pad()``. A
 forced state and one of the normal path are never joined. The pad is verified
 once more for the forced state, with 0 in ``R0``; an error there rejects the

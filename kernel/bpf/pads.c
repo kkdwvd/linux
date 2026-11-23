@@ -121,35 +121,34 @@
  * program, BPF_SITE_KENTRY, and unwind_exit that the pad ends in becomes a jump to code that leaves
  * the frame as a pad of the verifier does, BPF_SITE_REMAINDER:
  *
- *	{						   *(u64 *)(r10 - 8) = 0
- *		Guard g;				   ...
- *							   call wait
- *		v = wait();				   unwind_goto pad
- *	}						   kgoto entry
- *							   ...
+ *	{						   ...
+ *		Guard g;				   call wait
+ *							   unwind_goto stub
+ *		v = wait();				   kgoto entry
+ *	}						   ...
  *						      pad: r6 = r0
  *							   call ~Guard
  *							   r0 = r6
  *							   gotol rest
  *							   ...
- *						    entry: ax = *(u64 *)(r10 - 8)
- *							   if ax != 0 goto 1f
- *							   *(u64 *)(r10 - 8) = 1
- *							1: r0 = 0
+ *						     stub: *(u64 *)(r10 - 8) = 0
+ *							   gotol pad
+ *						    entry: *(u64 *)(r10 - 8) = 1
+ *							   r0 = 0
  *							   gotol pad
  *						     rest: ax = *(u64 *)(r10 - 8)
- *							   if ax == 0 goto 2f
+ *							   if ax == 0 goto 1f
  *							   r0 = V
  *							   r2 = 0
  *							   kexit
- *							2: unwind_exit
+ *							1: unwind_exit
  *
  * K, the word at r10 - 8 here, is a hidden word of the frame that says whether the kernel unwinds
- * it. It is 0 from the entry of the function on, and only the entry of a pad sets it. The main
- * pass has the same in the frame of a state: 'forced', see enter_kernel_pad() in verifier.c. From
- * there the pad is verified once more, with what the frame holds when the kernel unwinds the
- * callee and with 0 in R0. An error on that way is an error of the program. A forced frame has
- * two ways out, and both leave with kexit and the value of the kernel:
+ * it: the entry of a pad sets it. The main pass has the same in the frame of a state: 'forced',
+ * see enter_kernel_pad() in verifier.c. From there the pad is verified once more, with what the
+ * frame holds when the kernel unwinds the callee and with 0 in R0. An error on that way is an
+ * error of the program. A forced frame has two ways out, and both leave with kexit and the value
+ * of the kernel:
  *   - unwind_exit of the program. The program has released what it wanted to, and the verifier
  *     releases what the frame still holds. That needs a plan like any site, with places that are
  *     good at that insn. No register is read there any more, so the entry of the pad copies the
@@ -167,6 +166,31 @@
  * for the hidden words.
  * And WHAT THE KERNEL UNWINDS CANNOT BE CAUGHT still holds: a forced frame never returns to its
  * caller, and no state of the normal path is joined with one of a forced frame.
+ *
+ * NOTHING ON THE NORMAL PATH WRITES K. A function does not clear the word where it begins: that
+ * would be a store per call, paid by a path that never unwinds. A frame finds there what an
+ * earlier frame at that depth left, 1 as well as 0, and on a private stack what the last
+ * invocation left. The word is written on the two edges that take a frame from the normal path
+ * into a landing pad, see find_pad_code() for the kinds of code:
+ *   - unwind_exit of a callee comes back to unwind_goto of the program: that goes to a STUB, which
+ *     clears K and goes on to the pad, see collect_stubs() in fixups.c.
+ *   - kexit of a callee comes back to kgoto: the entry sets K, without reading it first, see
+ *     bpf_pad_kentry_insns().
+ * All that reads K stands in pad code: an entry behind a call in pad code, which tests K, a unit
+ * of two pads behind a test, and what stands in for unwind_exit. Pad code and the normal path
+ * share no insn, so a frame gets to a reader over one of the two edges, and from there on the word
+ * is written. Both edges must write, and no other may: the code that reads K as 1 releases from
+ * the save words, so on an edge that lacks its store a kfunc would release what the program chose
+ * to leave in that word. And behind a call in pad code neither edge writes. A frame that the
+ * kernel unwinds gets there: a stub would clear its K and let it leave as one that the program
+ * unwinds, and an entry without its test would replace the value and the handles that the first
+ * entry kept. There unwind_goto of the program keeps its target and the entry tests.
+ * Where the code is emitted, collect_pads() and insert_unwind_gotos() in fixups.c check that
+ * every reader stands in pad code, and that every unwind_goto of the program goes to a stub or
+ * follows a call in pad code. A program that fails there does not load.
+ * A MIXED function, in which an insn is pad code and on the normal path as well, has neither
+ * store: its entry clears K, see bpf_pad_entry_insns(), no unwind_goto goes to a stub, and every
+ * entry tests.
  *
  * The other way around a frame that has no unwind_goto at a call can be on the way of unwind_exit
  * of the program, BPF_SITE_CALL. The verifier gives it unwind_goto and a pad, as upstream does not:
@@ -2814,11 +2838,11 @@ int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad
 /*
  * The entry of a function: all words of its hidden slots are 0. The frame holds nothing of its own,
  * and a pad reads all slots, also at a site that is before the calls that fill them.
- * And K is 0: the kernel is not unwinding the frame. Only the entry of a landing pad that the
- * kernel enters sets it, see bpf_pad_kentry_insns(), and what tests it comes after that or after
- * this store, in the same frame: the landing pads that the frame gets to on both ways, and what
- * stands in for unwind_exit of the program. This is what the normal path pays for the landing
- * pads of the program that the kernel enters: one store per call of the function.
+ * And in a MIXED function K is 0: the kernel is not unwinding the frame. There an insn is pad code
+ * and on the normal path as well, see find_pad_code(), so what tests K can be reached from the
+ * first insn of the function with no landing in between that would write the word. Such a
+ * function pays one store per call for the landing pads that the kernel enters. Any other function
+ * has no store for K here: its stubs and its entries write the word, see kernel/bpf/pads.c.
  */
 int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			int nr, struct bpf_insn *buf)
@@ -2829,7 +2853,7 @@ int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad
 		for (k = 0; k < notes[i]->nr_slots * slot_words(notes[i]); k++)
 			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, notes[i]->off - k * BPF_REG_SIZE,
 					      0);
-	if (sub->k_off)
+	if (bpf_subprog_clears_k(sub))
 		buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 0);
 	return n;
 }
@@ -2873,8 +2897,9 @@ static const struct bpf_pad_ent *saved_ent(const struct bpf_subprog_info *sub,
  * Only a call in pad code can be the second entry of a frame: a frame that the kernel unwinds runs
  * nothing else, see bpf_find_kernel_pads(). So only the entry of such a call tests K. Behind any
  * other call the entry is the first one, 'untested' of its plan, and stores without the two insns
- * of the test: it does not read the word. In a mixed function no call is known to be such a
- * one, and every entry tests.
+ * of the test: it must not read the word, which nothing has written on that way. In a mixed
+ * function no call is known to be such a one, every entry tests, and the entry of the function
+ * clears K for them.
  * A pointer that the program has not compared with NULL yet can be 0: so is the handle then.
  * The pointer goes through R0, which has the value no longer and is 0 behind the entry. Where the
  * register of the program has more than the handle, the constant that is taken off is one that

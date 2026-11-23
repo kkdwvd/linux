@@ -22763,7 +22763,7 @@ static int check_unwound_arrival(struct bpf_verifier_env *env)
  * bpf_pad_kentry_insns(), and from there to the pad.
  *
  *	call foo			call foo
- *	unwind_goto pad			unwind_goto pad
+ *	unwind_goto pad			unwind_goto stub
  *	...				kgoto entry
  * pad:	r6 = r0				...
  *	call dtor		   pad:	r6 = r0
@@ -22771,9 +22771,9 @@ static int check_unwound_arrival(struct bpf_verifier_env *env)
  *	unwind_exit			r0 = r6
  *					gotol rest
  *					...
- *				 entry: ax = K
- *					if ax != 0 goto +1
- *					K = 1
+ *				  stub: K = 0
+ *					gotol pad
+ *				 entry: K = 1
  *					r0 = 0
  *					gotol pad
  *				  rest:	ax = K
@@ -22795,8 +22795,12 @@ static int check_unwound_arrival(struct bpf_verifier_env *env)
  *     taken where the program has unwind_goto for it, and the kernel that unwinds a callee
  *     enters the landing pad of that call as it did this one: K is set, and it stays set.
  *
- * At run time K says the same as the mark: a hidden word of the frame that is 0 from the entry of
- * the function on and that only the entry of a pad sets, see bpf_pad_entry_insns().
+ * At run time K says the same as the mark: a hidden word of the frame that only the entry of a
+ * pad sets. A frame that gets into a landing pad by unwind_exit of a callee has it cleared on
+ * the way, by the stub that unwind_goto goes to, and nothing reads it before one of the two has
+ * written it: what reads it stands in pad code, see find_pad_code() in pads.c. A frame is
+ * forced only in pad code too, and that is why the entry behind a call in pad code tests K
+ * before it stores, and why unwind_goto behind such a call has no stub.
  *
  * Returns PROCESS_BPF_EXIT if the state ends.
  */

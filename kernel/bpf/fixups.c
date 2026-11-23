@@ -887,7 +887,7 @@ static int add_pad(struct pad_buf *pads, const struct bpf_insn *new, int n, bool
  *			     1:	the pad of 'plan'
  *
  * With one plan no frame gets there in the other way, in any state of the pass. K is the hidden
- * word of the function that says which it is, see bpf_pad_entry_insns(). Two pads that have the
+ * word of the function that says which it is, see kernel/bpf/pads.c. Two pads that have the
  * same insns need no test: in a program without bpf_throw() both load the value of the kernel, and
  * they differ only where the frames hold something else. See unit_pads_are_same().
  * Two kinds have a unit that is no pad: the entry of a landing pad that the kernel enters, and
@@ -1204,6 +1204,20 @@ static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *ne
 					    "the entry behind insn %d of func#%d does not test K",
 					    i, s))
 				return -EFAULT;
+			/*
+			 * What reads K: a unit with a pad for the frames that the kernel unwinds,
+			 * and the code in place of unwind_exit. Where the entry of the function
+			 * does not clear the word, each of them has to stand in pad code: no
+			 * frame gets there without a store on its way, see kernel/bpf/pads.c.
+			 * An entry that tests reads K too. It is one behind a call in pad code
+			 * by what makes it test, so there is nothing to ask of it here: what
+			 * the main pass saw is asked above.
+			 */
+			if (verifier_bug_if(!bpf_subprog_clears_k(sub) && !aux[i].kpad_code &&
+					    (unit.forced || base == BPF_SITE_REMAINDER),
+					    env, "insn %d of func#%d reads K outside of pad code",
+					    i, s))
+				return -EFAULT;
 			n = emit_unit(env, s, base, &unit, new, new_aux, new_aux);
 			pad = add_pad(pads, new, n, unit_can_be_shared(base, &unit));
 			if (pad < 0)
@@ -1238,8 +1252,9 @@ static int unit_pad(struct bpf_verifier_env *env, int i, enum bpf_site_kind base
  * What collect_stubs() decided is all that is read here. But look at every unwind_goto of the
  * program once more, with or without a plan at its call. In a function that has K and is not
  * mixed, one whose landing pad is not dead code and that has no stub lets a frame into pad code
- * past the store that clears K, unless its call is in pad code. In any other function a stub
- * would write to a word that the frame does not have. Neither loads.
+ * past the store that clears K, with the word as an earlier frame left it, unless its call is in
+ * pad code. In any other function a stub would write to a word that the frame does not have, or
+ * that the kernel may have set. Neither loads.
  */
 static int goto_stub(struct bpf_verifier_env *env, int s, int i, int *stub)
 {
@@ -1439,8 +1454,8 @@ static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		/* K is cleared where the slots are, see bpf_pad_entry_insns() */
-		if ((!sub->slots && !sub->k_off) || !added[s])
+		/* a mixed function clears K where the slots are, see bpf_pad_entry_insns() */
+		if ((!sub->slots && !bpf_subprog_clears_k(sub)) || !added[s])
 			continue;
 		nr = sub->slots ? bpf_pad_slot_notes(env, s, notes) : 0;
 		if (nr < 0)

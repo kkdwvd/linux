@@ -1613,7 +1613,8 @@ struct bpf_subprog_info {
 	s16 value_off;
 	/*
 	 * The hidden word K of a function in which the kernel enters a landing pad of the program:
-	 * 0 from the entry of the function on, 1 once the kernel unwinds the frame. 0: none.
+	 * 1 once the kernel unwinds the frame, 0 once the program does. Not written before a frame
+	 * gets into a landing pad, unless the function is mixed. 0: none.
 	 */
 	s16 k_off;
 	/* its save words: the first one, the others are above it. See bpf_pad_enter(). */
@@ -1813,6 +1814,15 @@ static inline void bpf_subprog_set_stuck(struct bpf_subprog_info *sub, enum bpf_
 	sub->stuck = true;
 	sub->stuck_by = by;
 	sub->stuck_insn = insn_idx;
+}
+
+/*
+ * Does the entry of @sub clear its hidden word K? Only in a mixed function, see
+ * bpf_pad_entry_insns(): any other one writes the word where a frame gets into a landing pad.
+ */
+static inline bool bpf_subprog_clears_k(const struct bpf_subprog_info *sub)
+{
+	return sub->k_off && sub->kpads_mixed;
 }
 
 /* How far the stack of @sub goes with its hidden slots */
