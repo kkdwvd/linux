@@ -38,6 +38,8 @@ struct bpf_res_spin_lock {
 	__u32 val;
 };
 
+extern int bpf_res_spin_lock(struct bpf_res_spin_lock *lock) __ksym;
+extern void bpf_res_spin_unlock(struct bpf_res_spin_lock *lock) __ksym;
 extern int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock, unsigned long *flags) __ksym;
 extern void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock,
 					   unsigned long *flags) __ksym;
@@ -3898,8 +3900,1311 @@ __naked void irq_flags_in_caller_no_place(void)
 	);
 }
 
+/*
+ * r1: where the irq flags go, in the stack of a caller. It returns 0 with the flags saved and
+ * preemption disabled, as a function that takes a lock for its caller does, or -EBUSY with
+ * neither. r2: it spins once it has both, if not 0.
+ */
+__naked __noinline __used
+static unsigned long locks_for_caller(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = r2;"
+		"call %[bpf_local_irq_save];"
+		"call %[bpf_preempt_disable];"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"call %[bpf_preempt_enable];"
+		"r1 = r6;"
+		"call %[bpf_local_irq_restore];"
+		"r0 = -16;"
+		"exit;"
+	"2:"
+		"if r7 == 0 goto 3f;"
+	SPIN
+	"3:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm_addr(one),
+		  __imm(bpf_local_irq_save), __imm(bpf_local_irq_restore),
+		  __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* r1: the irq flags of a caller. r2: it spins before it releases, if not 0. */
+__naked __noinline __used
+static unsigned long unlocks_for_caller(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"if r2 == 0 goto 3f;"
+	SPIN
+	"3:"
+		"call %[bpf_preempt_enable];"
+		"r1 = r6;"
+		"call %[bpf_local_irq_restore];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_restore), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * A call of a subprog is to the hidden slots of its caller what a call of a kfunc is. The subprog
+ * returns with irq flags and in a section, if it returns 0: behind the call a slot takes 1 for the
+ * section and another one the address of the flags, which waited in the pending word, both under
+ * a test of R0. The call of the subprog that releases clears both slots.
+ * The loop is in the section or not, with the flags or not: only the slots tell.
+ */
+SEC("tc")
+__description("budget: a subprog takes a lock for its caller, the caller has hidden slots for it")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__naked void lock_by_subprog(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"call locks_for_caller;"
+		"if r0 != 0 goto 6f;"
+	"4:"
+	SPIN
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"call unlocks_for_caller;"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+	"6:"
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog that takes the lock is unwound when it has the flags and the section: its own pad
+ * releases both. The stores behind its call are not reached, so the slots of the caller are 0
+ * and the pad of the call releases nothing more.
+ */
+SEC("tc")
+__description("budget: a subprog that takes a lock for its caller is unwound with the lock")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__naked void lock_by_subprog_that_spins(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 1;"
+		"call locks_for_caller;"
+		"if r0 != 0 goto 6f;"
+	"4:"
+		"r2 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"call unlocks_for_caller;"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+	"6:"
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/* r1: where the irq flags go, in the stack of its caller. Nothing reads it behind the second call. */
+__naked __noinline __used
+static unsigned long locks_and_unlocks_for_caller(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r2 = 0;"
+		"call locks_for_caller;"
+		"if r0 != 0 goto 1f;"
+		"r1 = r6;"
+		"r2 = 1;"
+		"call unlocks_for_caller;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/*
+ * The flags are in the stack of the prog, the function in between holds them, and the subprog
+ * that is to restore them is unwound before it does. The pad of that call has to restore them,
+ * and no register of the frame has their address behind the call: the hidden slot that the call
+ * of the first subprog filled has it.
+ */
+SEC("tc")
+__description("budget: a subprog that releases the lock of its caller is unwound before that")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#1 has hidden slots for: locks")
+__naked void unlock_by_subprog_that_spins(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"call locks_and_unlocks_for_caller;"
+		"r0 = 7;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* r1: the irq flags of the caller. It spins before it restores them, and behind that. */
+__naked __noinline __used
+static unsigned long spins_restores_and_spins(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r7 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r1 = r6;"
+		"call %[bpf_local_irq_restore];"
+	"2:"
+		"r1 = *(u64 *)(r7 + 0);"
+		"if r1 != 0 goto 2b;"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * A subprog that has released irq flags of its caller is unwound before it returns: the store
+ * that would clear the slot of the caller stands behind the call. So the function of the caller
+ * gets no hidden slots for its locks, and the pad of the call cannot tell whether the flags are
+ * still saved: the subprog is left in front of the release as well.
+ */
+SEC("tc")
+__description("budget: a subprog is unwound in front of and behind the release of irq flags of its caller")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of call at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void unlock_by_subprog_then_spin(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call spins_restores_and_spins;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save)
+		: __clobber_all
+	);
+}
+
+/*
+ * r1: where the irq flags go. r2: where it says whether it has saved them. It returns 0 either
+ * way.
+ */
+__naked __noinline __used
+static unsigned long may_lock_for_caller(void)
+{
+	asm volatile (
+		"r6 = r2;"
+		"r2 = 0;"
+		"*(u64 *)(r6 + 0) = r2;"
+		"r2 = %[zero] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"if r2 != 0 goto 1f;"
+		"call %[bpf_local_irq_save];"
+		"call %[bpf_preempt_disable];"
+		"r2 = 1;"
+		"*(u64 *)(r6 + 0) = r2;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm(bpf_local_irq_save), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog tells its caller in the stack whether it took the lock, and R0 is 0 on both
+ * returns. The prog can tell, the store behind the call cannot: it has R0 and nothing else. No
+ * hidden slots, and the loop is in a section or not.
+ */
+SEC("tc")
+__description("budget: a subprog takes a lock for its caller on some returns, R0 does not tell")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__naked void lock_by_subprog_no_tell(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call may_lock_for_caller;"
+	SPIN
+		"r1 = *(u64 *)(r10 - 16);"
+		"if r1 == 0 goto 5f;"
+		"call %[bpf_preempt_enable];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_restore), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+#define LOCK_SPIN_UNLOCK				\
+		"if r9 == 0 goto 4f;"			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"r2 = 0;"				\
+		"call locks_for_caller;"		\
+		"if r0 != 0 goto 6f;"			\
+	"4:"						\
+		"r2 = %[one] ll;"			\
+	"1:"						\
+		"r1 = *(u64 *)(r2 + 0);"		\
+		"if r1 != 0 goto 1b;"			\
+		"if r9 == 0 goto 5f;"			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"r2 = 0;"				\
+		"call unlocks_for_caller;"		\
+	"5:"
+
+/*
+ * The frame holds one lock at a time, so the calls that take it share one slot, and those that
+ * enter the section share another: a function that takes a lock in more places than a landing
+ * pad has entries has hidden slots all the same.
+ */
+SEC("tc")
+__description("budget: nine calls of a subprog that takes a lock share the hidden slots")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__naked void lock_by_subprog_nine_times(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+	LOCK_SPIN_UNLOCK
+		"r0 = 7;"
+		"exit;"
+	"6:"
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/* a loop that the verifier cannot count and that ends at once at run time */
+#define PASS						\
+		"r2 = %[zero] ll;"			\
+	"11:"						\
+		"r1 = *(u64 *)(r2 + 0);"		\
+		"if r1 != 0 goto 11b;"
+
+/* locks_for_caller() that fails at run time: it returns -EBUSY with neither */
+__naked __noinline __used
+static unsigned long fails_to_lock_for_caller(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"call %[bpf_local_irq_save];"
+		"call %[bpf_preempt_disable];"
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 2f;"
+		"call %[bpf_preempt_enable];"
+		"r1 = r6;"
+		"call %[bpf_local_irq_restore];"
+		"r0 = -16;"
+		"exit;"
+	"2:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_save), __imm(bpf_local_irq_restore),
+		  __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* It passes the flags of its caller on to the function that releases */
+__naked __noinline __used
+static unsigned long unlocks_through(void)
+{
+	asm volatile (
+		"r2 = 0;"
+		"call unlocks_for_caller;"
+		"r0 = 0;"
+		"exit;"
+		::: __clobber_all
+	);
+}
+
+/* The lock is taken or not, a loop needs the slots, the lock is dropped, and then the prog spins */
+#define LOCK_PASS_UNLOCK_SPIN(lock, unlock)		\
+		"r9 = %[one] ll;"			\
+		"r9 = *(u64 *)(r9 + 0);"		\
+		"if r9 == 0 goto 4f;"			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"r2 = 0;"				\
+		"call " #lock ";"			\
+		"if r0 != 0 goto 5f;"			\
+	"4:"						\
+	PASS						\
+		"if r9 == 0 goto 5f;"			\
+		"r1 = r10;"				\
+		"r1 += -8;"				\
+		"r2 = 0;"				\
+		"call " #unlock ";"			\
+	"5:"						\
+	SPIN						\
+		"r0 = 7;"				\
+		"exit;"
+
+/*
+ * The stores behind the two calls, as they are emitted. In front of the first call the address of
+ * the flags goes to the pending word. Behind it, under a test of R0, the slot of the section takes
+ * 1 and the slot of the flags takes the address from the pending word. Behind the second call the
+ * slot of the section is cleared if it is not 0, and the slot of the flags is cleared.
+ * The prog spins when the lock is dropped: the pad finds both slots 0, or it would enable
+ * preemption once more.
+ */
+SEC("tc")
+__description("budget: a subprog drops the lock that a subprog took, the hidden slots are cleared")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__xlated("...")
+__xlated("r2 = 0")
+__xlated("*(u64 *)(r10 -32) = r1")
+__xlated("call pc+")
+__xlated("if w0 != 0x0 goto pc+1")
+__xlated("*(u64 *)(r10 -16) = 1")
+__xlated("if w0 != 0x0 goto pc+2")
+__xlated("r1 = *(u64 *)(r10 -32)")
+__xlated("*(u64 *)(r10 -24) = r1")
+__xlated("...")
+__xlated("r1 += -8")
+__xlated("r2 = 0")
+__xlated("call pc+")
+__xlated("r13 = *(u64 *)(r10 -16)")
+__xlated("if r13 == 0x0 goto pc+1")
+__xlated("*(u64 *)(r10 -16) = 0")
+__xlated("*(u64 *)(r10 -24) = 0")
+__naked void lock_and_unlock_by_subprogs(void)
+{
+	asm volatile (
+	LOCK_PASS_UNLOCK_SPIN(locks_for_caller, unlocks_for_caller)
+		:
+		: __imm_addr(one), __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog fails at run time and returns with neither: the test of R0 keeps the stores from
+ * filling the slots, and the pad of the loop behind it releases nothing.
+ */
+SEC("tc")
+__description("budget: a subprog fails to take the lock for its caller, the hidden slots stay 0")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__naked void lock_by_subprog_fails(void)
+{
+	asm volatile (
+	LOCK_PASS_UNLOCK_SPIN(fails_to_lock_for_caller, unlocks_for_caller)
+		:
+		: __imm_addr(one), __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+/* The release is two frames down: each call on the way is a release for its caller */
+SEC("tc")
+__description("budget: the lock that a subprog took is dropped two frames down")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt locks")
+__naked void unlock_two_frames_down(void)
+{
+	asm volatile (
+	LOCK_PASS_UNLOCK_SPIN(locks_for_caller, unlocks_through)
+		:
+		: __imm_addr(one), __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
+unsigned long buf[8];
+
+/*
+ * r2: where the irq flags go, in the stack of the caller. r1 is read as a number. Both successors
+ * of the jump are block starts, so a state that had another R1 is pruned behind it.
+ */
+__naked __noinline __used
+static unsigned long saves_irq_reads_r1(void)
+{
+	asm volatile (
+		"r3 = r1;"
+		"r4 = %[zero] ll;"
+		"r4 = *(u64 *)(r4 + 0);"
+		"if r4 == 0 goto 1f;"
+		"r4 = 1;"
+	"1:"
+		"r1 = r2;"
+		"call %[bpf_local_irq_save];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm(bpf_local_irq_save)
+		: __clobber_all
+	);
+}
+
+/*
+ * The first argument points into the frame of the flags on one path to the call and is the
+ * address of a global on the other, which is the one that runs. The store in front of the call
+ * takes the argument that has the address itself, the second one. What the arguments of a call
+ * were is part of the join key of the callee, so the state with the global is not answered for by
+ * the other one where the callee no longer reads R1.
+ */
+SEC("tc")
+__description("budget: another argument of the call points to the stack on some paths only")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of may_goto at {{[0-9]+}}: irq@{{[0-9]+}}(*fp-16) if not 0 rcu=0 preempt=0")
+__msg("func#0 has hidden slots for: locks")
+__xlated("...")
+__xlated("*(u64 *)(r10 -24) = r2")
+__xlated("call pc+")
+__xlated("r1 = *(u64 *)(r10 -24)")
+__xlated("*(u64 *)(r10 -16) = r1")
+__naked void other_arg_on_stack_or_not(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"r8 = %[one] ll;"
+		"r8 = *(u64 *)(r8 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -24;"
+		"if r8 == 0 goto +2;"
+		"r1 = %[buf] ll;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call saves_irq_reads_r1;"
+	"4:"
+	SPIN
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(buf), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/* The same with a number in the first argument on the path that runs */
+SEC("tc")
+__description("budget: another argument of the call points to the stack or is a number")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of may_goto at {{[0-9]+}}: irq@{{[0-9]+}}(*fp-16) if not 0 rcu=0 preempt=0")
+__naked void other_arg_on_stack_or_number(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"r8 = %[one] ll;"
+		"r8 = *(u64 *)(r8 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -24;"
+		"if r8 == 0 goto +1;"
+		"r1 = 0x100;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call saves_irq_reads_r1;"
+	"4:"
+	SPIN
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * Both arguments have the address of the flags on one path, and the first one is a number on the
+ * other. The callee stops reading the first one before it returns, so only the join key of its
+ * frame keeps the two states apart there. Each returns and names another argument, the stores of
+ * the call would differ, and the function gets no hidden slots for its locks.
+ */
+SEC("tc")
+__description("budget: the argument that has the address of the irq flags differs by path")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void arg_with_flags_differs(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"r8 = %[one] ll;"
+		"r8 = *(u64 *)(r8 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"if r8 == 0 goto +1;"
+		"r1 = 0x100;"
+		"r2 = r10;"
+		"r2 += -8;"
+		"call saves_irq_reads_r1;"
+	"4:"
+	SPIN
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/* r1: a guard in the stack of the caller, 8 bytes and then the irq flags */
+__naked __noinline __used
+static unsigned long saves_irq_in_guard(void)
+{
+	asm volatile (
+		"r1 += 8;"
+		"call %[bpf_local_irq_save];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_save)
+		: __clobber_all
+	);
+}
+
+/*
+ * The argument has the address of a guard, and the flags are 8 bytes behind it: the slot takes
+ * the argument, and the pad adds the 8. The prog restores the flags itself, and its call finds
+ * the slot by the same 8.
+ */
+SEC("tc")
+__description("budget: a subprog saves irq flags in a guard of its caller")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of may_goto at {{[0-9]+}}: irq@{{[0-9]+}}(*fp-24+8) if not 0 rcu=0 preempt=0")
+__msg("func#0 has hidden slots for: locks")
+__naked void irq_flags_in_guard(void)
+{
+	asm volatile (
+		"r0 = 0;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call saves_irq_in_guard;"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+	SPIN
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * A callback restores the irq flags of the frame that called its helper. r2: 8 bytes that say
+ * whether it has done so, the flags are behind them.
+ */
+__naked __noinline __used
+static unsigned long cb_restores_irq(void)
+{
+	asm volatile (
+		"r6 = r2;"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1f;"
+		"r1 = 1;"
+		"*(u64 *)(r6 + 0) = r1;"
+		"r1 = r6;"
+		"r1 += 8;"
+		"call %[bpf_local_irq_restore];"
+	"1:"
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * No store follows a callback that returns to its helper. The frame that it returns from has
+ * released irq flags of the prog, so the prog gets no hidden slots for them, and the loop behind
+ * the helper cannot tell whether the flags are saved.
+ */
+SEC("tc")
+__description("budget: a callback restores the irq flags of the caller of its helper")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void callback_restores_irq_of_caller(void)
+{
+	asm volatile (
+		"r0 = 0;"
+		"*(u64 *)(r10 - 16) = r0;"
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"r1 = 1;"
+		"r2 = cb_restores_irq ll;"
+		"r3 = r10;"
+		"r3 += -16;"
+		"r4 = 0;"
+		"call %[bpf_loop];"
+		"r1 = *(u64 *)(r10 - 16);"
+		"if r1 != 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+	SPIN
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_save), __imm(bpf_loop),
+		  __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/* r1: the irq flags of the caller. r2: where it says whether it has restored them. 0 either way. */
+__naked __noinline __used
+static unsigned long may_unlock_for_caller(void)
+{
+	asm volatile (
+		"r6 = r2;"
+		"r2 = 0;"
+		"*(u64 *)(r6 + 0) = r2;"
+		"r2 = %[zero] ll;"
+		"r2 = *(u64 *)(r2 + 0);"
+		"if r2 != 0 goto 1f;"
+		"call %[bpf_local_irq_restore];"
+		"r2 = 1;"
+		"*(u64 *)(r6 + 0) = r2;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog has restored the flags of its caller on some returns only, and says so in the stack.
+ * No store behind the call is right for both: the function gets no hidden slots for its locks,
+ * and the first loop cannot tell whether the flags are saved.
+ */
+SEC("tc")
+__description("budget: a subprog releases irq flags of its caller on some returns only")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void unlock_by_subprog_on_some_returns(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call may_unlock_for_caller;"
+		"r1 = *(u64 *)(r10 - 16);"
+		"if r1 != 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/* It leaves the section of the frame that called its helper, and spins there */
+__naked __noinline __used
+static unsigned long cb_leaves_section_and_spins(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+	SPIN
+		"call %[bpf_preempt_disable];"
+		"r0 = 1;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_preempt_enable), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/* The frame of a callback is unwound with the sections of its call as well */
+SEC("tc")
+__description("budget: a callback that has left the section of the caller of its helper is unwound")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__naked void callback_left_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"r1 = 1;"
+		"r2 = cb_leaves_section_and_spins ll;"
+		"r3 = 0;"
+		"r4 = 0;"
+		"call %[bpf_loop];"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable), __imm(bpf_loop)
+		: __clobber_all
+	);
+}
+
+/*
+ * The prog is in the section on some paths and has a hidden slot for it. The subprog leaves the
+ * section and is unwound: its pad enters the section again, and the slot of the prog, which no
+ * store has cleared, is right.
+ */
+SEC("tc")
+__description("budget: the caller has a hidden slot for the section that its subprog has left")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt")
+__naked void slot_for_section_that_callee_left(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"call %[bpf_preempt_disable];"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"call leaves_section_and_spins;"
+		"call %[bpf_preempt_enable];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_preempt_disable),
+		  __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* No arguments: it is verified on its own. It returns 1 in a section, or 0 in none. */
+__naked __noinline __used
+static unsigned long enters_section_or_not(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 == 0 goto 1f;"
+		"call %[bpf_preempt_disable];"
+		"r0 = 1;"
+		"exit;"
+	"1:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/* No arguments: it leaves the section of its caller */
+__naked __noinline __used
+static unsigned long leaves_section_for_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog returns in a section where R0 is not 0: the store behind its call is under the
+ * opposite test. Both subprogs are verified on their own, and each of their exits is noted at
+ * the call that waits for it.
+ */
+SEC("tc")
+__description("budget: a subprog returns in a section if R0 is not 0")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("func#0 has hidden slots for: preempt")
+__xlated("...")
+__xlated("call pc+")
+__xlated("if w0 == 0x0 goto pc+1")
+__xlated("*(u64 *)(r10 -8) = 1")
+__naked void section_if_r0_not_zero(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"r8 = 0;"
+		"if r9 == 0 goto 4f;"
+		"call enters_section_or_not;"
+		"r8 = r0;"
+	"4:"
+	SPIN
+		"if r8 == 0 goto 5f;"
+		"call leaves_section_for_caller;"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one)
+		: __clobber_all
+	);
+}
+
+/* It releases a pointer of its caller: the caller gets no hidden slots for pointers */
+__naked __noinline __used
+static unsigned long releases_task_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_task_release];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
+/* Called in a section, which it leaves: a task is in r3 only while it spins */
+__naked __noinline __used
+static unsigned long leaves_section_with_task_in_r3(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 != 0 goto 2f;"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+	"2:"
+		"r3 = r0;"
+		"r2 = %[one] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r1 = r3;"
+		"call releases_task_of_caller;"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_preempt_enable), __imm(bpf_preempt_disable),
+		  __imm(bpf_task_from_pid)
+		: __clobber_all
+	);
+}
+
+/*
+ * The pad of the loop releases the task, which only R3 has, and then enters the section that the
+ * frame has left: the release is still the first call of the pad, so R3 will do as a place.
+ */
+SEC("tc")
+__description("budget: a pointer in R3 only in a frame that has left the section of its caller")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of may_goto at {{[0-9]+}}: ref@{{[0-9]+}}(r3) rcu=0 preempt=-1")
+__naked void task_in_r3_and_section_left(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call leaves_section_with_task_in_r3;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+struct bpf_res_spin_lock caller_lock SEC(".data.caller_lock") __hidden;
+
+/*
+ * r1: where the irq flags go, in the stack of the caller. It takes a lock in a global as well and
+ * spins with both.
+ */
+__naked __noinline __used
+static unsigned long saves_irq_of_caller_locks_and_spins(void)
+{
+	asm volatile (
+		"call %[bpf_local_irq_save];"
+		"r1 = %[caller_lock] ll;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 7f;"
+	SPIN
+		"r1 = %[caller_lock] ll;"
+		"call %[bpf_res_spin_unlock];"
+	"7:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(caller_lock), __imm(bpf_local_irq_save),
+		  __imm(bpf_res_spin_lock), __imm(bpf_res_spin_unlock)
+		: __clobber_all
+	);
+}
+
+/*
+ * No register has the address of the flags at the loop, and the function gets no hidden slots
+ * for them: it holds the flags and a lock at a time, and slots keep no order. Flags that no
+ * place has and no slot has cannot be restored: a conflict, not a pad without them.
+ */
+SEC("tc")
+__description("budget: irq flags in the stack of the caller, no place and no hidden slots")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: no place has the handle on all paths")
+__naked void irq_flags_in_caller_no_place_no_slots(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"call saves_irq_of_caller_locks_and_spins;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * Called in a section of the prog. It is in a section of its own on some paths to the loop, and
+ * then it calls what leaves a section while it is in none of its own: that is the section of
+ * the prog.
+ */
+__naked __noinline __used
+static unsigned long has_section_then_callee_leaves_one(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"call %[bpf_preempt_disable];"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"call %[bpf_preempt_enable];"
+	"5:"
+		"call leaves_section_for_caller;"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_preempt_disable),
+		  __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * A call that leaves a section clears a hidden slot of its caller only where the caller is in a
+ * section of its own. Here the section is one of the prog: behind the call the function is in
+ * one section less than it was called in, which no slot can say, so it gets no hidden slots for
+ * its sections, and its loop has no plan.
+ */
+SEC("tc")
+__description("budget: a subprog leaves a section of the caller of its caller, which needs hidden slots")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__naked void callee_leaves_section_of_callers_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call has_section_then_callee_leaves_one;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * The prog has saved irq flags on some paths when it calls the subprog that returns with a
+ * second set. A frame with hidden slots for its locks holds one at a time: the slots keep no
+ * order, the calls of one kind share a slot, and a release by a subprog clears them all. That
+ * holds for what comes through a call as for what the frame takes itself: no hidden slots, and
+ * the loop cannot tell whether the first flags are saved.
+ */
+SEC("tc")
+__description("budget: a subprog takes a lock for a caller that holds irq flags on some paths")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void lock_by_subprog_while_irq_saved(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"4:"
+	PASS
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 0;"
+		"call locks_for_caller;"
+		"if r0 != 0 goto 6f;"
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 0;"
+		"call unlocks_for_caller;"
+	"6:"
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/* No arguments. It unlocks the lock that the caller of its caller holds. */
+__naked __noinline __used
+static unsigned long unlocks_lock_of_callers_caller(void)
+{
+	asm volatile (
+		"r1 = %[caller_lock] ll;"
+		"call %[bpf_res_spin_unlock];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(caller_lock), __imm(bpf_res_spin_unlock)
+		: __clobber_all
+	);
+}
+
+/* No arguments: verified on its own first. It needs hidden slots for its own irq flags. */
+__naked __noinline __used
+static unsigned long has_irq_and_callee_unlocks(void)
+{
+	asm volatile (
+		"call unlocks_lock_of_callers_caller;"
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"4:"
+	PASS
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+	"5:"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * The lock that the subprog two frames down releases is one of the prog. The function in between
+ * holds irq flags of its own on some paths and has hidden slots for them, whether it is verified
+ * on its own or in the frames of the prog: on its own no frame of the state holds the lock of
+ * the prog, and nothing is noted for the call.
+ */
+SEC("tc")
+__description("budget: a function with hidden slots for its irq flags calls what unlocks the lock of its caller")
+__arch_x86_64
+__arch_arm64
+__success __retval(7)
+__log_level(2)
+__msg("func#1 has hidden slots for: locks")
+__naked void slots_in_function_between(void)
+{
+	asm volatile (
+		"r1 = %[caller_lock] ll;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 6f;"
+		"call has_irq_and_callee_unlocks;"
+	"6:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(caller_lock), __imm(bpf_res_spin_lock)
+		: __clobber_all
+	);
+}
+
 void __kfunc_btf_root(void)
 {
+	bpf_res_spin_lock(0);
+	bpf_res_spin_unlock(0);
 	bpf_rcu_read_lock();
 	bpf_rcu_read_unlock();
 	bpf_preempt_disable();

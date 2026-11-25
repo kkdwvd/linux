@@ -1417,6 +1417,101 @@ int cleared_in_another_pass(void *ctx)
 	return 7;
 }
 
+/* It leaves the section of its caller, loads from the arena, and would enter the section again */
+__naked __noinline __used
+static unsigned long leaves_section_and_faults(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+	NO_PAGE
+		"r2 = *(u32 *)(r8 + 0);"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(arena), __imm(bpf_preempt_enable), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/*
+ * The function that gets a new chunk for an allocator: called under a lock, which it drops to
+ * take pages. The frame holds nothing where the load faults, and is in one section less than it
+ * was called in: the pad of the load enters the section, and the pad of the call leaves it.
+ */
+SEC("tc")
+__description("fault: a load in a subprog that has left the section of its caller")
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of call at 1: rcu=0 preempt=1")
+__msg("landing pad of arena access at {{[0-9]+}}: rcu=0 preempt=-1")
+__naked void load_where_section_of_caller_is_left(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call leaves_section_and_faults;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* r1: the irq flags of the caller. It restores them and then loads from the arena. */
+__naked __noinline __used
+static unsigned long restores_irq_and_faults(void)
+{
+	asm volatile (
+		"call %[bpf_local_irq_restore];"
+	NO_PAGE
+		"r2 = *(u32 *)(r8 + 0);"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(arena), __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
+/*
+ * The prog saves the flags on some paths, so the loop needs a hidden slot for them. The subprog
+ * restores them and can fault behind that: its frame holds nothing there, but it is left with the
+ * slot of the prog not cleared. The load is a site for that, the function of the prog gets no
+ * hidden slots for its locks, and the loop has no plan.
+ */
+SEC("tc")
+__description("fault: a load in a subprog that has restored the irq flags of its caller")
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void load_where_irq_of_caller_is_restored(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_save];"
+	"4:"
+		"r2 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"if r9 == 0 goto 5f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call restores_irq_and_faults;"
+	"5:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm_addr(zero), __imm(bpf_local_irq_save)
+		: __clobber_all
+	);
+}
+
 #endif /* __BPF_FEATURE_ADDR_SPACE_CAST */
 
 #else

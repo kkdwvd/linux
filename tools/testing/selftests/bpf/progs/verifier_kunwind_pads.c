@@ -1416,6 +1416,59 @@ __naked void pad_leaves_section_of_caller(void)
 		:: __imm(bpf_rcu_read_lock) : __clobber_all);
 }
 
+/* It unlocks the lock of its caller and leaves with unwind_exit of the program */
+__naked __noinline __used
+static unsigned long unlocks_and_throws(void)
+{
+	asm volatile (
+		"call %[bpf_res_spin_unlock];"
+		"r0 = 5;"
+		unwind_exit
+		:: __imm(bpf_res_spin_unlock) : __clobber_all);
+}
+
+/*
+ * The prog takes the lock on some paths and has hidden slots for it. The subprog releases it and
+ * leaves with unwind_exit, the prog has unwind_goto behind the call and goes on into a loop. The
+ * stores behind a call stand behind unwind_goto: none clears the slot on that way. So a frame
+ * that has released a lock of a caller and is left this way takes the slots from the function of
+ * that caller, and the loop cannot tell whether the lock is held.
+ */
+SEC("tc")
+__description("kunwind pads: a subprog unlocks the lock of its caller and leaves with unwind_exit")
+__failure
+__load_if_JITed()
+__arch_x86_64 __arch_arm64
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+__naked void unlock_then_unwind_exit(void)
+{
+	asm volatile (
+		"r9 = %[one] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 4f;"
+		"r1 = %[top_lock] ll;"
+		"call %[bpf_res_spin_lock];"
+		"if r0 != 0 goto 6f;"
+	"4:	r2 = %[zero] ll;"
+	"1:	r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"if r9 == 0 goto 5f;"
+		"r1 = %[top_lock] ll;"
+		"call unlocks_and_throws;"
+		unwind_goto(7f)
+		"goto 5f;"
+	"7:	r0 = 0;"
+	"5:	r2 = %[one] ll;"
+	"2:	r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 2b;"
+		"r0 = 7;"
+		"exit;"
+	"6:	r0 = 1;"
+		"exit;"
+		:: __imm_addr(one), __imm_addr(zero), __imm_addr(top_lock),
+		   __imm(bpf_res_spin_lock) : __clobber_all);
+}
+
 /*
  * A guard that was moved into the function: every way out leaves the section of the caller, the
  * normal one and the pad. When the kernel unwinds the callee of the function it enters the pad,
@@ -1885,6 +1938,57 @@ static void leaves_section_of_its_caller(void)
 		"call %[bpf_rcu_read_unlock];"
 		"exit;"
 		:: __imm(bpf_rcu_read_unlock) : __clobber_all);
+}
+
+/*
+ * The function is in an RCU section on some ways to its loop, so the pad of the loop needs a
+ * hidden slot. Its landing pad calls a function that leaves the section which the normal path
+ * leaves by itself. The call is to the slots what a call of bpf_rcu_read_unlock() is: behind it
+ * the slot is cleared. So the function has its slots, the kernel enters the pad, and what stands
+ * in for unwind_exit finds nothing to leave.
+ */
+__naked __noinline __used
+static unsigned long pad_calls_what_leaves_section(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"if r6 == 0 goto 1f;"
+		"call %[bpf_rcu_read_lock];"
+	"1:	r2 = %[zero] ll;"
+	"2:	r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 2b;"
+		"if r6 == 0 goto 3f;"
+		"call %[bpf_rcu_read_unlock];"
+	"3:	call %[bpf_rcu_read_lock];"
+	CALL_SPINS
+		unwind_goto(4f)
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		"exit;"
+	"4:	r6 = r0;"
+		"call leaves_section_of_its_caller;"
+		"r0 = r6;"
+		unwind_exit
+		:: __imm_addr(zero), __imm_addr(one), __imm(bpf_rcu_read_lock),
+		   __imm(bpf_rcu_read_unlock) : __clobber_all);
+}
+
+SEC("tc")
+__description("kunwind pads: a pad calls what leaves the section of its function, which has hidden slots")
+__success __retval(2)
+__load_if_JITed()
+__arch_x86_64 __arch_arm64
+__log_level(2)
+__msg("landing pad of the program behind the call at {{[0-9]+}}: the kernel enters it")
+__msg("func#1 has hidden slots for: rcu")
+__naked void pad_calls_what_leaves_section_of_function(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"call pad_calls_what_leaves_section;"
+		"exit;"
+		:: __imm_addr(one) : __clobber_all);
 }
 
 /*
