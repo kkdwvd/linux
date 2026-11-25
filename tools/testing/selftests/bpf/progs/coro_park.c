@@ -631,6 +631,154 @@ static __always_inline int park_carriers(void)
 	return XDP_PASS;
 }
 
+__u64 looped;
+
+/*
+ * A continuation with a loop that may_goto bounds, long enough for the time of may_goto to be
+ * looked at. A program of another type calls it, some time after this program last ran here.
+ */
+static __noinline __used void resume_loops(void *frame)
+{
+	__u64 i, n = 0;
+
+	bpf_coro_frame_free(frame);
+	for (i = 0; i < 300000 && can_loop; i++)
+		n++;
+	looped = n;
+}
+
+static __noinline __used void destroy_plain(void *frame)
+{
+	bpf_coro_frame_free(frame);
+}
+
+/* The program itself loops that long too, which leaves a time on this CPU */
+static __always_inline int park_loops(void)
+{
+	__u64 i, n = 0;
+	__u64 *f;
+
+	for (i = 0; i < 300000 && can_loop; i++)
+		n++;
+	f = bpf_coro_frame_alloc(16, NULL);
+	if (!f)
+		return XDP_ABORTED;
+	f[0] = (__u64)resume_loops;
+	f[1] = (__u64)destroy_plain;
+	if (keep_sys(bpf_coro_park_syscall(f), 1))
+		return XDP_ABORTED;
+	return n == 300000 ? XDP_PASS : XDP_DROP;
+}
+
+__u64 second;
+
+/*
+ * A continuation that a function of the program calls too, with a second argument, which it
+ * reads when the third slot of the frame says so: the insns that start its time slice leave
+ * the arguments alone.
+ */
+__naked __noinline __used
+static void resume_two(void *frame, __u64 x)
+{
+	asm volatile (
+		"r3 = *(u64 *)(r1 + 16);"
+		"if r3 == 0 goto 1f;"
+		"r4 = %[second] ll;"
+		"*(u64 *)(r4 + 0) = r2;"
+	"1:	call %[bpf_coro_frame_free];"
+		"exit;"
+		:
+		: __imm_addr(second), __imm(bpf_coro_frame_free)
+		: __clobber_all
+	);
+}
+
+static __always_inline int park_two(void)
+{
+	__u64 *f = bpf_coro_frame_alloc(24, NULL);
+
+	if (!f)
+		return XDP_ABORTED;
+	f[0] = (__u64)resume_two;
+	f[1] = (__u64)destroy_plain;
+	f[2] = 0;
+	return keep_xdp(bpf_coro_park_xdp(f), 0) ? XDP_ABORTED : XDP_PASS;
+}
+
+static __always_inline int call_two(void)
+{
+	__u64 *f = bpf_coro_frame_alloc(24, NULL);
+
+	if (!f)
+		return XDP_ABORTED;
+	f[2] = 1;
+	resume_two(f, 42);
+	return XDP_PASS;
+}
+
+__u64 nested, rounds, overran;
+
+/* A continuation that parks its frame again, and that another continuation calls */
+static __noinline __used void resume_inner(void *frame)
+{
+	keep_xdp(bpf_coro_park_xdp(frame), 0);
+}
+
+static __noinline __used void resume_outer(void *frame)
+{
+	nested++;
+	resume_inner(frame);
+}
+
+static __always_inline int park_nested(void)
+{
+	__u64 *f;
+
+	/* nothing resumes this one: it makes resume_inner() a continuation */
+	f = bpf_coro_frame_alloc(16, NULL);
+	if (!f)
+		return XDP_ABORTED;
+	f[0] = (__u64)resume_inner;
+	f[1] = (__u64)destroy_plain;
+	if (keep_xdp(bpf_coro_park_xdp(f), 2))
+		return XDP_ABORTED;
+	f = bpf_coro_frame_alloc(16, NULL);
+	if (!f)
+		return XDP_ABORTED;
+	f[0] = (__u64)resume_outer;
+	f[1] = (__u64)destroy_plain;
+	return keep_xdp(bpf_coro_park_xdp(f), 0) ? XDP_ABORTED : XDP_PASS;
+}
+
+/*
+ * A loop that only may_goto ends resumes the frame in each round. Every continuation starts a
+ * time slice and puts back the one of its caller: the time of this loop goes on.
+ */
+static __always_inline int spin(void)
+{
+	__u64 start = bpf_ktime_get_ns();
+	struct bpf_coro_xdp *coro;
+	struct slot *s;
+	__u32 idx = 0;
+
+	while (can_loop) {
+		s = bpf_map_lookup_elem(&slots, &idx);
+		if (!s)
+			return XDP_ABORTED;
+		coro = bpf_kptr_xchg(&s->xdp, NULL);
+		if (!coro)
+			return XDP_DROP;
+		coro_resume(coro);
+		rounds++;
+		/* four times the slice */
+		if (bpf_ktime_get_ns() - start > 1000000000ULL) {
+			overran = 1;
+			break;
+		}
+	}
+	return XDP_PASS;
+}
+
 /* What the program that parks does in this run */
 int op;
 
@@ -665,6 +813,16 @@ int owner(struct xdp_md *ctx)
 		return park_hash();
 	case OP_PARK_CARRIERS:
 		return park_carriers();
+	case OP_PARK_LOOPS:
+		return park_loops();
+	case OP_PARK_TWO:
+		return park_two();
+	case OP_CALL_TWO:
+		return call_two();
+	case OP_PARK_NESTED:
+		return park_nested();
+	case OP_SPIN:
+		return spin();
 	}
 	return XDP_ABORTED;
 }

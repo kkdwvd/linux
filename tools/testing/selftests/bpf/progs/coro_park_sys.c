@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * A syscall program, which may sleep, parks coroutine frames for the XDP program that is bound
- * to it. See prog_tests/coro_park.c.
+ * A syscall program, which may sleep and which a task can preempt, parks coroutine frames for
+ * the XDP program that is bound to it. See prog_tests/coro_park.c.
  */
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
@@ -43,9 +43,11 @@ struct {
 	__type(value, __u64);
 } go SEC(".maps");
 
-__u64 resumed, destroyed;
+__u64 resumed, destroyed, spun, after, work;
 /* the callback of the bpf_wq has the frame; it has put it back */
 __u64 holds, held;
+/* the program that parks is in its loop; the continuation began then */
+int in_loop, interfered;
 int op;
 
 static __noinline __used void destroy_counts(void *frame)
@@ -58,6 +60,18 @@ static __noinline __used void resume_counts(void *frame)
 {
 	resumed += ((__u64 *)frame)[2];
 	bpf_coro_frame_free(frame);
+}
+
+/*
+ * A continuation that loops until its time is up: the count of may_goto is 0 then, and the
+ * kernel unwinds it.
+ */
+static __noinline __used void resume_spins(void *frame)
+{
+	bpf_coro_frame_free(frame);
+	interfered = in_loop;
+	while (can_loop)
+		spun++;
 }
 
 /*
@@ -156,6 +170,16 @@ static __always_inline int resume_sys(void)
 	return 0;
 }
 
+/*
+ * Only the kernel ends the loop of SYS_SPIN, by unwinding the program: this runs then, behind
+ * the landing pad, and the loop is no longer what a continuation interrupts.
+ */
+__noinline int sys_unwound(u64 cookie)
+{
+	in_loop = 0;
+	return 0;
+}
+
 static __always_inline int park(void *resume, __u64 arg)
 {
 	struct bpf_coro_xdp *coro;
@@ -179,17 +203,38 @@ static __always_inline int park(void *resume, __u64 arg)
 }
 
 SEC("syscall")
+__exception_cb(sys_unwound)
 int sys_owner(void *ctx)
 {
+	__u64 j;
+
 	switch (op) {
 	case SYS_PARK:
 		return park(resume_counts, 7);
+	case SYS_PARK_SPINS:
+		return park(resume_spins, 0);
 	case SYS_PARK_SYS:
 		return park_sys(100);
 	case SYS_RESUME_SYS:
 		return resume_sys();
 	case SYS_WQ:
 		return start_wq();
+	case SYS_SPIN:
+		/*
+		 * Only may_goto ends it, and the kernel unwinds the program then. A round is
+		 * long next to the insns of may_goto, so a task that preempts this one finds it
+		 * behind the count of its round, and the next round is one that may_goto let
+		 * begin after that.
+		 */
+		in_loop = 1;
+		while (can_loop) {
+			if (interfered)
+				after++;
+			for (j = 0; j < 64; j++)
+				work += bpf_ktime_get_ns() & 1;
+		}
+		in_loop = 0;
+		return 0;
 	}
 	return 3;
 }

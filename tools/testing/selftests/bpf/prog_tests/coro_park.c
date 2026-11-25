@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Parked coroutine frames, see progs/coro_park.c */
+#define _GNU_SOURCE
+#include <sched.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
@@ -725,8 +727,149 @@ out:
 		close(works_fd);
 }
 
+/*
+ * The time slice of may_goto is the program's on each CPU. A continuation that another program
+ * calls starts its own: it is not ended by the time that its program's last run here began.
+ */
+static void test_time_slice(void)
+{
+	struct coro_park *skel;
+	cpu_set_t old, one;
+
+	if (!ASSERT_OK(sched_getaffinity(0, sizeof(old), &old), "sched_getaffinity"))
+		return;
+	CPU_ZERO(&one);
+	CPU_SET(sched_getcpu(), &one);
+	if (!ASSERT_OK(sched_setaffinity(0, sizeof(one), &one), "sched_setaffinity"))
+		return;
+	skel = load();
+	if (!skel)
+		goto out;
+	if (run_op(skel, OP_PARK_LOOPS, XDP_PASS))
+		goto out;
+	/* longer than the slice */
+	usleep(400000);
+	if (run_syscall(skel->progs.resume_syscall, 0))
+		goto out;
+	ASSERT_EQ(skel->bss->looped, 300000, "looped");
+	ASSERT_EQ(skel->bss->returned, 1, "returned");
+out:
+	coro_park__destroy(skel);
+	sched_setaffinity(0, sizeof(old), &old);
+}
+
+/*
+ * A function that is a continuation starts its slice in its first insns, also when a function
+ * of the program calls it: they leave its arguments alone.
+ */
+static void test_slice_args(void)
+{
+	struct coro_park *skel = load();
+
+	if (!skel)
+		return;
+	if (!run_op(skel, OP_PARK_TWO, XDP_PASS) && !run_op(skel, OP_CALL_TWO, XDP_PASS))
+		ASSERT_EQ(skel->bss->second, 42, "second argument");
+	coro_park__destroy(skel);
+}
+
+/*
+ * A continuation puts back the slice of its caller, also when it has called another function
+ * that is a continuation: a loop of the caller that only may_goto ends is ended by it.
+ */
+static void test_slice_nested(void)
+{
+	char data[64] = {};
+	LIBBPF_OPTS(bpf_test_run_opts, opts,
+		    .data_in = data,
+		    .data_size_in = sizeof(data),
+		    .repeat = 1);
+	struct coro_park *skel = load();
+
+	if (!skel)
+		return;
+	if (run_op(skel, OP_PARK_NESTED, XDP_PASS))
+		goto out;
+	skel->bss->op = OP_SPIN;
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.owner), &opts), "spin"))
+		goto out;
+	ASSERT_GT(skel->bss->rounds, 0, "rounds");
+	ASSERT_EQ(skel->bss->nested, skel->bss->rounds, "nested");
+	ASSERT_EQ(skel->bss->overran, 0, "the time of the loop is up");
+out:
+	coro_park__destroy(skel);
+}
+
+static void *spinner_thread(void *arg)
+{
+	struct coro_park_sys *skel = arg;
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+	/* the kernel unwinds it when its time is up, whatever happened before */
+	skel->bss->op = SYS_SPIN;
+	bpf_prog_test_run_opts(bpf_program__fd(skel->progs.sys_owner), &opts);
+	return NULL;
+}
+
+/*
+ * A continuation that the kernel unwinds puts back the slice of its caller too. The program
+ * that parks is in a loop that only may_goto ends, in a task. Another task on the same CPU
+ * preempts it and runs an XDP program, which no task preempts, that resumes a frame of it: the
+ * continuation uses up its time and is unwound. The loop goes on for the time that it has left:
+ * it does not find the count of the continuation, which is 0.
+ */
+static void test_slice_unwound(void)
+{
+	struct coro_park_sys *skel;
+	cpu_set_t old, one;
+	pthread_t thread;
+	int try;
+
+	if (!ASSERT_OK(sched_getaffinity(0, sizeof(old), &old), "sched_getaffinity"))
+		return;
+	CPU_ZERO(&one);
+	CPU_SET(sched_getcpu(), &one);
+	if (!ASSERT_OK(sched_setaffinity(0, sizeof(one), &one), "sched_setaffinity"))
+		return;
+	skel = load_sys();
+	if (!skel)
+		goto out;
+	/*
+	 * Until this task has preempted the other one inside its loop: in_loop is 1 from the
+	 * start of the loop until the kernel has unwound the program, see sys_unwound().
+	 */
+	for (try = 0; try < 5; try++) {
+		skel->bss->in_loop = 0;
+		skel->bss->interfered = 0;
+		skel->bss->after = 0;
+		if (run_sys(skel, SYS_PARK_SPINS) ||
+		    !ASSERT_OK(pthread_create(&thread, NULL, spinner_thread, skel), "pthread_create"))
+			goto out;
+		usleep(50000);
+		run_xdp(skel->progs.xdp_resumer, XDP_ABORTED);
+		pthread_join(thread, NULL);
+		if (skel->bss->interfered)
+			break;
+	}
+	if (!ASSERT_LT(try, 5, "the loop was preempted"))
+		goto out;
+	ASSERT_GT(skel->bss->spun, 0, "the continuation used up its time");
+	ASSERT_GT(skel->bss->after, 0, "the loop went on");
+out:
+	coro_park_sys__destroy(skel);
+	sched_setaffinity(0, sizeof(old), &old);
+}
+
 void test_coro_park(void)
 {
+	if (test__start_subtest("time_slice"))
+		test_time_slice();
+	if (test__start_subtest("slice_args"))
+		test_slice_args();
+	if (test__start_subtest("slice_nested"))
+		test_slice_nested();
+	if (test__start_subtest("slice_unwound"))
+		test_slice_unwound();
 	if (test__start_subtest("owner_grace"))
 		test_owner_grace();
 	if (test__start_subtest("sleepable"))
