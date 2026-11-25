@@ -176,8 +176,60 @@ static void test_tasks(struct coro_unwind *skel)
 	ASSERT_HAS_SUBSTR(read_stream(skel->progs.cont_task_two_deep_r7), RECURSION_TOO_DEEP,
 			  "cont_task_two_deep_r7 stream");
 	ASSERT_EQ(task_users(skel), users, "cont_task_two_deep_r7");
+
+	/* .. and in no register: the pad follows the slot of the first frame to the second one */
+	ASSERT_EQ(run(skel->progs.cont_task_two_deep), TC_ACT_OK, "cont_task_two_deep");
+	ASSERT_EQ(cont_result(skel), 1, "cont_task_two_deep unwound");
+	ASSERT_HAS_SUBSTR(read_stream(skel->progs.cont_task_two_deep), RECURSION_TOO_DEEP,
+			  "cont_task_two_deep stream");
+	ASSERT_EQ(task_users(skel), users, "cont_task_two_deep");
+
+	/*
+	 * The continuation has the task in the slot of its frame, or has released it and
+	 * cleared the slot: the pad tests the slot
+	 */
+	for (skel->bss->late = 0; skel->bss->late < 2; skel->bss->late++) {
+		ASSERT_EQ(run(skel->progs.cont_task_some_paths), TC_ACT_OK, "cont_task_some_paths");
+		ASSERT_EQ(cont_result(skel), 1, "cont_task_some_paths unwound");
+		ASSERT_HAS_SUBSTR(read_stream(skel->progs.cont_task_some_paths), RECURSION_TOO_DEEP,
+				  "cont_task_some_paths stream");
+		ASSERT_EQ(task_users(skel), users, "cont_task_some_paths");
+	}
+	skel->bss->late = 0;
+
+	/* a plain function with the task in the slot, or with a 0 there, or with no frame */
+	for (skel->data->some = 0; skel->data->some < 2; skel->data->some++) {
+		unwound(skel, skel->progs.task_in_frame_some_paths);
+		ASSERT_EQ(task_users(skel), users, "task_in_frame_some_paths");
+		unwound(skel, skel->progs.task_in_spilled_frame_some_paths);
+		ASSERT_EQ(task_users(skel), users, "task_in_spilled_frame_some_paths");
+		unwound(skel, skel->progs.frame_with_task_some_paths);
+		ASSERT_EQ(task_users(skel), users, "frame_with_task_some_paths");
+	}
+
+	/* chains of frames that end early, end in a 0, or end in the task */
+	for (skel->data->links = 0; skel->data->links < 3; skel->data->links++) {
+		for (skel->data->some = 0; skel->data->some < 2; skel->data->some++) {
+			unwound(skel, skel->progs.chain_of_two);
+			ASSERT_EQ(task_users(skel), users, "chain_of_two");
+			unwound(skel, skel->progs.chain_of_three);
+			ASSERT_EQ(task_users(skel), users, "chain_of_three");
+		}
+	}
+	skel->data->some = 1;
+	skel->data->links = 3;
 out:
 	stop_child(&child);
+}
+
+/*
+ * The pad unlocks through the slot of the coroutine frame: the lock is free for the next run,
+ * which would wait for it for ever
+ */
+static void test_lock(struct coro_unwind *skel)
+{
+	ASSERT_EQ(run(skel->progs.lock_in_frame_at_fault), TC_ACT_SHOT, "lock_in_frame_at_fault");
+	ASSERT_EQ(run(skel->progs.lock_in_frame_at_fault), TC_ACT_SHOT, "the lock is free");
 }
 
 /* Is the program with @id freed within two seconds? The kernel frees it in the background. */
@@ -239,8 +291,13 @@ void serial_test_coro_unwind(void)
 	if (!ASSERT_OK_PTR(skel, "coro_unwind__open"))
 		return;
 	/* the progs that the verifier rejects */
-	bpf_program__set_autoload(skel->progs.cont_task_some_paths, false);
-	bpf_program__set_autoload(skel->progs.cont_task_two_deep, false);
+	bpf_program__set_autoload(skel->progs.cont_task_not_cleared, false);
+	bpf_program__set_autoload(skel->progs.cont_task_not_cleared_last, false);
+	bpf_program__set_autoload(skel->progs.cont_task_or_number, false);
+	bpf_program__set_autoload(skel->progs.cont_number_or_task, false);
+	bpf_program__set_autoload(skel->progs.chain_of_four, false);
+	bpf_program__set_autoload(skel->progs.task_given_to_callee, false);
+	bpf_program__set_autoload(skel->progs.task_given_to_coroutine, false);
 	bpf_program__set_autoload(skel->progs.cont_task_far, false);
 	if (!ASSERT_OK(coro_unwind__load(skel), "coro_unwind__load"))
 		goto out;
@@ -253,6 +310,8 @@ void serial_test_coro_unwind(void)
 	}
 	if (test__start_subtest("tasks"))
 		test_tasks(skel);
+	if (test__start_subtest("lock"))
+		test_lock(skel);
 	destroy_and_check(skel);
 	return;
 out:
