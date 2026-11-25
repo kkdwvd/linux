@@ -128,9 +128,12 @@ struct bpf_prog_load_opts {
 
 	/* if set, provides the length of fd_array */
 	__u32 fd_array_cnt;
+
+	/* the program whose parked coroutine frames the new program calls */
+	__u32 coro_prog_fd;
 	size_t :0;
 };
-#define bpf_prog_load_opts__last_field fd_array_cnt
+#define bpf_prog_load_opts__last_field coro_prog_fd
 
 LIBBPF_API int bpf_prog_load(enum bpf_prog_type prog_type,
 			     const char *prog_name, const char *license,
