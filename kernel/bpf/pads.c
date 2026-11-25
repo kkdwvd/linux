@@ -1372,6 +1372,28 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 	return err;
 }
 
+/*
+ * Is @ref irq flags that are saved in the stack of a caller of the current frame of @st? The
+ * function got the address in an argument and saved the flags there, like the function that takes
+ * a lock for its caller. The compiler keeps the address no longer than the function reads it, so a
+ * site behind the last read has no place for it: the hidden slot of the call that saved the flags
+ * has the address, see bpf_pad_note_acquire().
+ * The object is there: its slots are those of irq flags in every state that is joined with @st,
+ * see bpf_same_join_key().
+ */
+static bool irq_in_caller(const struct bpf_verifier_state *st, const struct bpf_reference_state *ref)
+{
+	int f, i;
+
+	if (ref->type != REF_TYPE_IRQ)
+		return false;
+	for (f = st->curframe - 1; f >= 0; f--)
+		for (i = 0; i < bpf_stack_nr_slots(st->frame[f]); i++)
+			if (slot_is_obj(st->frame[f], i, ref))
+				return true;
+	return false;
+}
+
 /* The entry of @plan that refs[@ref] is on this visit */
 static struct bpf_pad_ent *held_ent(const struct bpf_pad_plan *plan, int ref)
 {
@@ -1588,6 +1610,11 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 				plan->no_place = err;
 				/* nothing here says what releases it: see settle_plan() */
 				plan->no_place_atomic |= !pad_can_sleep(st, false);
+				continue;
+			}
+			/* the same for irq flags that a caller has, see irq_in_caller() */
+			if (err == BPF_CONFLICT_NO_PLACE && irq_in_caller(st, ref)) {
+				plan->no_irq_place = err;
 				continue;
 			}
 			if (err)
@@ -2501,6 +2528,7 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	if (!err && plan->sections_differ)
 		err = BPF_CONFLICT_SECTIONS_DIFFER;
 	err = err ?: plan->no_place;
+	err = err ?: plan->no_irq_place;
 	for (i = 0; !err && i < plan->nr_ents; i++)
 		err = settle_ent(env, plan, &plan->ents[i]);
 	/*
@@ -2776,6 +2804,8 @@ static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_pl
 		return 0;
 	if (plan->no_place && all_ptrs)
 		groups |= BIT(BPF_PAD_GROUP_REFS);
+	if (plan->no_irq_place)
+		groups |= BIT(BPF_PAD_GROUP_LOCKS);
 	for (i = 0; i < plan->nr_ents; i++) {
 		err = settle_ent(env, plan, &plan->ents[i]);
 		if (err == BPF_CONFLICT_NOT_ALWAYS_HELD || err == BPF_CONFLICT_CALLER_SAVED)
@@ -2801,6 +2831,8 @@ static u8 conflict_groups(struct bpf_verifier_env *env, const struct bpf_pad_pla
 		break;
 	case BPF_CONFLICT_NO_PLACE:
 		groups = BIT(BPF_PAD_GROUP_REFS);
+		if (plan->no_irq_place)
+			groups |= BIT(BPF_PAD_GROUP_LOCKS);
 		break;
 	case BPF_CONFLICT_NOT_ALWAYS_HELD:
 	case BPF_CONFLICT_CALLER_SAVED:
@@ -2863,8 +2895,10 @@ static int plan_take_slots(struct bpf_pad_plan *plan, int group, struct bpf_pad_
 	}
 	if (all_ptrs)
 		plan->no_place = 0;
-	if (group == BPF_PAD_GROUP_LOCKS)
+	if (group == BPF_PAD_GROUP_LOCKS) {
+		plan->no_irq_place = 0;
 		pos = plan->nr_ents;
+	}
 	while (group == BPF_PAD_GROUP_REFS && pos < plan->nr_ents &&
 	       plan->ents[pos].class < BPF_PAD_NR_SECTIONS)
 		pos++;

@@ -698,6 +698,7 @@ struct bpf_pad_plan {
 	/* a visit that set 'no_place' left the frame where its pad cannot sleep: pad_can_sleep() */
 	bool no_place_atomic;
 	u8 no_place;			/* the conflict unless hidden slots have all pointers */
+	u8 no_irq_place;		/* the same for irq flags in the stack of a caller */
 	/* the groups that it asked hidden slots for, bits by enum bpf_pad_group: settle_slots() */
 	u8 asked_slots;
 	/*
