@@ -859,7 +859,11 @@ struct bpf_prog_stats {
 struct bpf_timed_may_goto {
 	u64 count;
 	u64 timestamp;
-	/* the async callback that has set count and timestamp, see bpf_timed_may_goto_save() */
+	/*
+	 * Who has set count and timestamp: what an async callback saved the old ones in, see
+	 * bpf_timed_may_goto_save(), and the continuation of a parked coroutine frame, which
+	 * does the same in its first insns, see bpf_do_misc_fixups(). 0: the main prog.
+	 */
 	void *owner;
 };
 

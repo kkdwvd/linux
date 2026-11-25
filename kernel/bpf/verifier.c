@@ -13518,6 +13518,7 @@ static int check_func_callx_set(struct bpf_verifier_env *env, int regno, int *in
  *   or an async callback of that one may call: it calls no parked frame.
  * - The callee is code that does not sleep, see push_coro_suspend(): the call is in a read
  *   section of RCU.
+ * - The time slice of may_goto is the callee's own, see bpf_do_misc_fixups().
  * - The kernel unwinds the callee where it unwinds any function, and the callee leaves with
  *   kexit, see push_coro_resume_cb(). That comes back to this call like kexit of a function of
  *   the program, and the caller is unwound too: its invocation ends with the continuation's.
@@ -17689,6 +17690,7 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 		return -EINVAL;
 	}
 	info->coro_cont = true;
+	info->coro_parked |= parked;
 	/*
 	 * The kernel calls it like any callback: what is refused in one is, see
 	 * check_callbacks() and check_tail_calls(), and a stack in arena, see
