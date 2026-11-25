@@ -72,6 +72,15 @@ extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
 extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __ksym;
 
+struct bpf_iter_kmem_cache {
+	__u64 opaque[1];
+};
+
+struct kmem_cache {};
+extern int bpf_iter_kmem_cache_new(struct bpf_iter_kmem_cache *it) __ksym;
+extern struct kmem_cache *bpf_iter_kmem_cache_next(struct bpf_iter_kmem_cache *it) __ksym;
+extern void bpf_iter_kmem_cache_destroy(struct bpf_iter_kmem_cache *it) __ksym;
+
 /* The verifier doesn't know what is in there */
 unsigned long zero;
 unsigned long one = 1;
@@ -3529,6 +3538,366 @@ __naked void ten_trips_that_differ(void)
  * libbpf to link the program. The function below is a hack
  * to ensure that BTF FUNC records are generated.
  */
+/* It is called in a section with preemption disabled, and spins where it has left that section */
+__naked __noinline __used
+static unsigned long leaves_section_and_spins(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+	SPIN
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_preempt_enable), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/*
+ * A frame is unwound with the sections of its call. The subprog is called under a lock of the
+ * prog, as a function that drops the lock, waits and takes it again. When the loop is out of time
+ * the frame is in one section less than it was called in: its pad enters the section, and the pad
+ * of the call leaves it, as it does when the subprog is unwound anywhere else.
+ */
+SEC("tc")
+__description("budget: a subprog that has left the section of its caller enters it when it is unwound")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of call at 1: rcu=0 preempt=1")
+__msg("landing pad of may_goto at {{[0-9]+}}: rcu=0 preempt=-1")
+__xlated("call kernel-function")
+__xlated("call pc+")
+__xlated("kgoto pc+")
+__xlated("call kernel-function")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 2")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("...")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 2")
+__xlated("r2 = 0")
+__xlated("kexit")
+__naked void callee_left_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call leaves_section_and_spins;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* The same, but it has left the section of its caller on one path to the loop only */
+__naked __noinline __used
+static unsigned long may_leave_section_and_spins(void)
+{
+	asm volatile (
+		"r9 = %[zero] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto +1;"
+		"call %[bpf_preempt_enable];"
+	SPIN
+		"if r9 == 0 goto +1;"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm_addr(one),
+		  __imm(bpf_preempt_enable), __imm(bpf_preempt_disable)
+		: __clobber_all
+	);
+}
+
+/*
+ * The pad of the loop would enter the section on one path and nothing on the other. A function
+ * that leaves a section of a caller gets no hidden slots for it.
+ */
+SEC("tc")
+__description("budget: a subprog has left the section of its caller on some paths only")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__naked void callee_may_have_left_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call may_leave_section_and_spins;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * It is called in a section with preemption disabled. It leaves the section, as it has to for an
+ * iterator whose kfuncs may sleep, and spins in the section again while it has the iterator.
+ */
+__naked __noinline __used
+static unsigned long spins_with_iter_that_sleeps(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_kmem_cache_new];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_kmem_cache_next];"
+		"call %[bpf_preempt_disable];"
+	SPIN
+		"call %[bpf_preempt_enable];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_kmem_cache_destroy];"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_preempt_enable), __imm(bpf_preempt_disable),
+		  __imm(bpf_iter_kmem_cache_new), __imm(bpf_iter_kmem_cache_next),
+		  __imm(bpf_iter_kmem_cache_destroy)
+		: __clobber_all
+	);
+}
+
+/*
+ * The frame is in as many sections as it was called in, and the destructor takes a mutex. The pad
+ * does what the subprog does where it returns: it leaves the section of the caller, destroys the
+ * iterator, and enters the section again.
+ */
+SEC("syscall")
+__description("budget: a subprog is in the section of its caller again and holds what may sleep")
+__arch_x86_64
+__arch_arm64
+__success __retval(-125)
+__log_level(2)
+__msg("landing pad of call at 1: rcu=0 preempt=1")
+__msg("landing pad of may_goto at {{[0-9]+}}: iter@{{[0-9]+}}(fp-8) rcu=0 preempt=0 sleeps outside rcu=0 preempt=1")
+__xlated("call kernel-function")
+__xlated("call pc+")
+__xlated("kgoto pc+")
+__xlated("call kernel-function")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = -125")
+__xlated("exit")
+__xlated("...")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -8")
+__xlated("call kernel-function")
+__xlated("call kernel-function")
+__xlated("r0 = -125")
+__xlated("r2 = 0")
+__xlated("kexit")
+__naked void callee_sleeps_in_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call spins_with_iter_that_sleeps;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/* The same, but it makes the iterator on one path to the loop only */
+__naked __noinline __used
+static unsigned long spins_with_iter_that_sleeps_on_one_path(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_enable];"
+		"r9 = %[zero] ll;"
+		"r9 = *(u64 *)(r9 + 0);"
+		"if r9 == 0 goto 2f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_kmem_cache_new];"
+	"2:"
+		"call %[bpf_preempt_disable];"
+	SPIN
+		"call %[bpf_preempt_enable];"
+		"if r9 == 0 goto 3f;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_kmem_cache_destroy];"
+	"3:"
+		"call %[bpf_preempt_disable];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(zero), __imm_addr(one),
+		  __imm(bpf_preempt_enable), __imm(bpf_preempt_disable),
+		  __imm(bpf_iter_kmem_cache_new), __imm(bpf_iter_kmem_cache_destroy)
+		: __clobber_all
+	);
+}
+
+/*
+ * The pad would leave the section of the caller on the path that has the iterator, and nothing
+ * says that the frame may be out of it on the other one.
+ */
+SEC("syscall")
+__description("budget: a subprog in the section of its caller holds what may sleep on some paths only")
+__arch_x86_64
+__arch_arm64
+__failure
+__msg("landing pad of may_goto at {{[0-9]+}}: conflict: the number of sections differs")
+__naked void callee_may_sleep_in_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_preempt_disable];"
+		"call spins_with_iter_that_sleeps_on_one_path;"
+		"call %[bpf_preempt_enable];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+/*
+ * It is called in an RCU section. It leaves that section, enters one of its own with preemption
+ * disabled, and gives a task out of the map to the caller there. What it calls leaves with
+ * unwind_exit.
+ */
+static __noinline __used int own_section_and_unwinds(struct task_struct * volatile *p)
+{
+	struct with_task *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&tasks, &key);
+	if (!v)
+		return 0;
+	bpf_rcu_read_unlock();
+	bpf_preempt_disable();
+	*p = v->task;
+	if (*(volatile unsigned long *)&one)
+		unwinds_at_once();
+	*p = NULL;
+	bpf_preempt_enable();
+	bpf_rcu_read_lock();
+	return 7;
+}
+
+/*
+ * The landing pad of the subprog leaves the section of the subprog and then enters the one of the
+ * prog: nothing protects the task in between, so the landing pad of the prog cannot use it.
+ */
+SEC("syscall")
+__description("budget: the landing pad enters the section of the caller, the caller has an RCU pointer")
+__arch_x86_64
+__arch_arm64
+__failure __msg("R1 must be a rcu pointer")
+__naked void pointer_of_caller_under_section_of_callee(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"call %[bpf_rcu_read_lock];"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call own_section_and_unwinds;"
+		unwind_goto(3)
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		"exit;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"if r1 == 0 goto 1f;"
+		"call %[bpf_task_acquire];"
+		"if r0 == 0 goto 1f;"
+		"r1 = r0;"
+		"call %[bpf_task_release];"
+	"1:"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock),
+		  __imm(bpf_task_acquire), __imm(bpf_task_release),
+		  __imm_unwind_goto(3)
+		: __clobber_all
+	);
+}
+
+/* r1: where the irq flags go, in the stack of the caller. Nothing reads it behind the call. */
+__naked __noinline __used
+static unsigned long saves_irq_of_caller_and_spins(void)
+{
+	asm volatile (
+		"call %[bpf_local_irq_save];"
+	SPIN
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_local_irq_save)
+		: __clobber_all
+	);
+}
+
+/*
+ * The subprog saves irq flags for its caller, as the function that takes a lock does, and no
+ * register of its frame has their address when the loop is out of time. The hidden slot of the
+ * call that saved them has it.
+ */
+SEC("tc")
+__description("budget: irq flags in the stack of the caller, no place has their address")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+__log_level(2)
+__msg("landing pad of may_goto at {{[0-9]+}}: irq@{{[0-9]+}}(*fp-8) if not 0 rcu=0 preempt=0")
+__msg("func#1 has hidden slots for: locks")
+__xlated("...")
+__xlated("*(u64 *)(r10 -8) = 0")
+__xlated("*(u64 *)(r10 -8) = r1")
+__xlated("call kernel-function")
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r0 = 2")
+__xlated("r2 = 0")
+__xlated("kexit")
+__naked void irq_flags_in_caller_no_place(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"call saves_irq_of_caller_and_spins;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_local_irq_restore];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm(bpf_local_irq_restore)
+		: __clobber_all
+	);
+}
+
 void __kfunc_btf_root(void)
 {
 	bpf_rcu_read_lock();
@@ -3550,6 +3919,9 @@ void __kfunc_btf_root(void)
 	bpf_iter_num_new(0, 0, 0);
 	bpf_iter_num_next(0);
 	bpf_iter_num_destroy(0);
+	bpf_iter_kmem_cache_new(0);
+	bpf_iter_kmem_cache_next(0);
+	bpf_iter_kmem_cache_destroy(0);
 }
 
 char _license[] SEC("license") = "GPL";

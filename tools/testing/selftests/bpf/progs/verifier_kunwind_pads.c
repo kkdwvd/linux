@@ -1417,6 +1417,47 @@ __naked void pad_leaves_section_of_caller(void)
 }
 
 /*
+ * A guard that was moved into the function: every way out leaves the section of the caller, the
+ * normal one and the pad. When the kernel unwinds the callee of the function it enters the pad,
+ * which leaves the section, and behind it the frame is in one section less than it was called
+ * in: what stands in for unwind_exit enters the section again, and the pad of the verifier in the
+ * prog leaves it.
+ */
+__naked __noinline __used
+static unsigned long drops_section_of_caller(void)
+{
+	asm volatile (
+	CALL_SPINS
+		unwind_goto(1f)
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		"exit;"
+	"1:	r6 = r0;"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = r6;"
+		unwind_exit
+		:: __imm_addr(one), __imm(bpf_rcu_read_unlock) : __clobber_all);
+}
+
+SEC("tc")
+__description("kunwind pads: every way out of the function leaves the RCU section of the caller")
+__success __retval(2)
+__load_if_JITed()
+__arch_x86_64 __arch_arm64
+__log_level(2)
+__msg("landing pad of call at 1: rcu=1 preempt=0")
+__msg("landing pad of unwind_exit at {{[0-9]+}} in a frame that the kernel unwinds: rcu=-1 preempt=0")
+__naked void pad_drops_section_of_caller(void)
+{
+	asm volatile (
+		"call %[bpf_rcu_read_lock];"
+		"call drops_section_of_caller;"
+		"r0 = 7;"
+		"exit;"
+		:: __imm(bpf_rcu_read_lock) : __clobber_all);
+}
+
+/*
  * The function in between has no landing pad: the conflict is two calls above the pads, and the
  * log names the function that came back to the call, below which the pads are
  */
