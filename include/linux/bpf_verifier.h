@@ -433,6 +433,8 @@ struct bpf_reference_state {
  * interpreter runs has. Every copy of a state copies them, like the stack.
  */
 #define BPF_MAX_REF_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
+/* a bit per slot, see struct bpf_pad_frame */
+static_assert(BPF_MAX_REF_SLOTS <= BITS_PER_LONG_LONG);
 
 struct bpf_retval_range {
 	s32 minval;
@@ -605,17 +607,22 @@ enum bpf_stuck_by {
 
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
- * per argument of a release two to load it, and one more for a handle in a coroutine frame, per
- * entry a test, the calls, two to save the value, three to tell the struct_ops, two to bring the
- * value back, one for R2 of kexit. emit_pad() has the insn that leaves on top of that, or the call
- * of the exception callback.
+ * per argument of a release two to load it, for a handle in a coroutine frame a load and a test
+ * for each frame on the way, per entry a test, the calls, two to save the value, three to tell
+ * the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has the insn that
+ * leaves on top of that, or the call of the exception callback.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
-#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 3) + \
+/* a handle is at most that many coroutine frames away from a register or a stack slot */
+#define BPF_PAD_MAX_HOPS	3
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 3 +		\
+						     2 * BPF_PAD_MAX_HOPS) +		\
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
 #define BPF_PAD_MAX_CANDS	6
+/* The frames whose zero slots a plan follows from visit to visit, see struct bpf_pad_frame */
+#define BPF_PAD_MAX_FRAMES	8
 /* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
 #define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS
 /*
@@ -644,20 +651,39 @@ struct bpf_pad_place {
 	bool maybe_null:1;	/* on a visit that holds the entry the pointer is not checked yet */
 	bool null:1;		/* it is 0 on all visits that don't hold the entry */
 	/*
-	 * The handle is in a slot of a coroutine frame, 'frame_off' bytes from where the pointer at
-	 * (loc, at) points to, see find_frame_cands() in pads.c. 'delta' is about the handle.
+	 * The handle is in a slot of a coroutine frame, like in a slot of the stack: what is at
+	 * (loc, at) points to the frame, and the slot is 'hop[0]' bytes from where it points to.
+	 * With more hops that slot points to a frame in turn, and so on: 'hop[i]' bytes from where
+	 * the pointer before it points to, see find_frame_cands() in pads.c. 'delta' is about
+	 * what the last slot has. 0: the handle is at (loc, at).
 	 */
-	bool in_frame:1;
+	u8 hops:2;
 	s16 at;			/* number of the register | offset from R10 | index in used_maps */
 	s32 delta;		/* what is there is that much more than the handle */
-	s16 frame_off;
+	s16 hop[BPF_PAD_MAX_HOPS];
 };
+
+/* 'hops' has two bits */
+static_assert(BPF_PAD_MAX_HOPS <= 3);
 
 /* The registers and the stack slots of a frame that are 0 */
 struct bpf_pad_nulls {
 	u16 regs;
 	u16 unsaved;		/* save words: the entry of the frame has put no handle there */
 	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+};
+
+/*
+ * The slots of a coroutine frame that are 0, for a frame that a place of the function leads to:
+ * 'at' is where the pointer to the frame is, a register, a stack slot, or a slot of another
+ * such frame, and what is there is 'at.delta' more than the address of the frame. Bit k of
+ * 'zero': on every visit so far slot k of the frame was 0, or the way to the frame ended in a 0
+ * before it got there, which a landing pad tests for on its way. A plan has one for each such
+ * way that a visit came with, see visit_frames() in pads.c.
+ */
+struct bpf_pad_frame {
+	struct bpf_pad_place at;
+	u64 zero;
 };
 
 /*
@@ -758,6 +784,9 @@ struct bpf_pad_plan {
 	 */
 	u8 before[BPF_PAD_MAX_ENTS];
 	struct bpf_pad_nulls nulls;	/* on all visits so far */
+	/* .. and what is 0 in the coroutine frames that the places lead to */
+	struct bpf_pad_frame *frames;
+	u8 nr_frames;
 	/*
 	 * BPF_SITE_CALL: the subprogs that were left with unwind_exit and came back to the call.
 	 * BPF_SITE_KCALL: those that were left with kexit.
