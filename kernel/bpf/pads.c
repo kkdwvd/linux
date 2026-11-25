@@ -502,6 +502,7 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
 			struct bpf_insn *release)
 {
 	const struct btf *btf = reg->btf;
+	struct bpf_prog view;
 	s32 id = -ENOENT;
 
 	/*
@@ -519,7 +520,7 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
 		return 0;
 	}
 	if (btf_is_module(btf)) {
-		id = btf_find_release_kfunc(btf, reg->btf_id, env->prog);
+		id = btf_find_release_kfunc(btf, reg->btf_id, bpf_state_prog(env, &view));
 		/* the module releases it itself, and nothing says where its BTF is in fd_array */
 		if (id >= 0 && !off)
 			return -ENOENT;
@@ -528,8 +529,9 @@ static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state
 			off = 0;
 		}
 	}
+	/* what a program of the type that the state is verified as calls, see bpf_state_prog() */
 	if (id < 0)
-		id = btf_find_release_kfunc(btf, reg->btf_id, env->prog);
+		id = btf_find_release_kfunc(btf, reg->btf_id, bpf_state_prog(env, &view));
 	*release = BPF_CALL_KFUNC(off, id);
 	return min(id, 0);
 }
@@ -605,21 +607,29 @@ static int ref_release(struct bpf_verifier_env *env, const struct bpf_reference_
  * A pad is going to call what @insn calls, if the program can call that. The passes that follow the
  * emission look for the descriptor of a kfunc, which the program gets here, and for the prototype
  * of a helper.
+ * No state is there when this asks, and what a program may call depends on the type that the
+ * state which held the resource was verified as: @type, see bpf_state_prog(). 0 is the type of
+ * the program.
  * Returns the reason of a conflict.
  */
-static int get_release(struct bpf_verifier_env *env, const struct bpf_insn *insn)
+static int get_release(struct bpf_verifier_env *env, const struct bpf_insn *insn, int type)
 {
 	const struct bpf_func_proto *fn;
 	u32 log_level = env->log.level;
 	struct bpf_call_arg_meta meta;
 	int err;
 
-	if (bpf_helper_call(insn))
-		return bpf_get_helper_proto(env, insn->imm, &fn) ? BPF_CONFLICT_NO_RELEASE : 0;
+	env->pad_prog_type = type;
+	if (bpf_helper_call(insn)) {
+		err = bpf_get_helper_proto(env, insn->imm, &fn) ? BPF_CONFLICT_NO_RELEASE : 0;
+		env->pad_prog_type = 0;
+		return err;
+	}
 	env->log.level = 0;
 	err = bpf_add_kfunc_call(env, insn->imm, insn->off);
 	err = err ?: bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta);
 	env->log.level = log_level;
+	env->pad_prog_type = 0;
 	if (err == -ENOMEM)
 		return err;
 	return err ? BPF_CONFLICT_NO_RELEASE : 0;
@@ -731,6 +741,23 @@ int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
 	if (!plan)
 		return -ENOMEM;
 	return plan_add_callee(env, plan, call_idx, callee);
+}
+
+/*
+ * What the call at @call_idx called is no function of the program: the continuation of a parked
+ * coroutine frame, which the program called through the pointer in the frame, see
+ * check_coro_callx() in verifier.c. The kernel may unwind it wherever it unwinds a function, and
+ * it comes back to the call left with kexit: a site of @kind, BPF_SITE_KCALL, with no callee to
+ * ask what it is left at, and none that has to be.
+ */
+int bpf_pad_note_external(struct bpf_verifier_env *env, int call_idx, enum bpf_site_kind kind)
+{
+	struct bpf_pad_plan *plan = bpf_pad_plan_get(env, call_idx, kind);
+
+	if (!plan)
+		return -ENOMEM;
+	plan->external = true;
+	return 0;
 }
 
 /* Returns what the plans had of env->mem */
@@ -1492,6 +1519,7 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 	memset(ent, 0, sizeof(*ent));
 	ent->origin = ref->origin;
 	ent->class = class;
+	ent->prog_type = st->frame[0] ? st->frame[0]->coro_prog_type : 0;
 	if (class != BPF_PAD_REF)
 		ent->release = release_call(class);
 	if (class == BPF_PAD_REF || class == BPF_PAD_IRQ)
@@ -2334,6 +2362,7 @@ static bool slot_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 	memset(ent, 0, sizeof(*ent));
 	ent->ref = -1;
 	ent->class = ref_class(ref);
+	ent->prog_type = st->frame[0] ? st->frame[0]->coro_prog_type : 0;
 	ent->nr_cands[0] = 1;
 	ent->cand[0][0] = (struct bpf_pad_place){ .loc = BPF_PLACE_SPILL, .null = true };
 	if (ent->class == BPF_PAD_RES_LOCK_IRQ)
@@ -2559,12 +2588,17 @@ static u8 ret_class(const struct bpf_reg_state *r0)
 	return BPF_RET_UNKNOWN;
 }
 
-/* What the hidden slot of a section of @class is to a plan, but for the offset */
-static void section_ent(struct bpf_pad_ent *ent, enum bpf_pad_class class)
+/*
+ * What the hidden slot of a section of @class is to a plan, but for the offset. @st: the state
+ * that brings it, whose type of program has the release, see get_release().
+ */
+static void section_ent(struct bpf_pad_ent *ent, const struct bpf_verifier_state *st,
+			enum bpf_pad_class class)
 {
 	*ent = (struct bpf_pad_ent){
 		.ref = -1,
 		.class = class,
+		.prog_type = st->frame[0]->coro_prog_type,
 		.release = release_call(class),
 		.nr_cands[0] = 1,
 		.cand[0][0] = { .loc = BPF_PLACE_SPILL, .null = true },
@@ -2708,7 +2742,7 @@ void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier
 		keeps |= BIT(i);
 		if (d == 1) {
 			brings |= BIT(i);
-			section_ent(&ent, i);
+			section_ent(&ent, st, i);
 			note_acquire(env, sub, call_idx, &ent, 0, max(before, 0), true, true);
 		} else if (d) {
 			sub_no_slots(sub, st, BIT(i));
@@ -2718,7 +2752,7 @@ void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier
 	arg = nr_locks == 1 ? irq_arg(st, callee, lock, &delta) : -1;
 	if (arg >= 0) {
 		brings |= BIT(BPF_PAD_GROUP_LOCKS);
-		section_ent(&ent, BPF_PAD_IRQ);
+		section_ent(&ent, st, BPF_PAD_IRQ);
 		ent.cand[0][0].delta = delta;
 		note_acquire(env, sub, call_idx, &ent, arg,
 			     count_refs(st, caller->entry_refs, callee->entry_refs,
@@ -2874,6 +2908,8 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 		if (is_obj_drop(&ent->release))
 			aux[n].kptr_struct_meta = btf_find_struct_meta(env->prog->aux->btf,
 								       ent->obj_type);
+		/* a helper is that of the type which get_release() asked for, see the fixups */
+		aux[n].helper_prog_type = ent->prog_type;
 		buf[n++] = ent->release;
 		if (ent_is_tested(ent))
 			buf[first + handle_test_at(&ent->cand[0][0])].off =
@@ -3034,7 +3070,7 @@ static int settle_ent(struct bpf_verifier_env *env, const struct bpf_pad_plan *p
 	/* R1 is loaded first */
 	if (ent->nr_cands[1] && place_is_caller_saved(&ent->cand[1][0]))
 		return BPF_CONFLICT_CALLER_SAVED;
-	return get_release(env, &ent->release);
+	return get_release(env, &ent->release, ent->prog_type);
 }
 
 /* All visits of @plan are over. Returns the reason of a conflict. */
@@ -3059,10 +3095,10 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	for (class = 0; !err && class < BPF_PAD_NR_SECTIONS; class++) {
 		release = release_call(class);
 		if (pad_leaves(plan, class))
-			err = get_release(env, &release);
+			err = get_release(env, &release, 0);
 		release = enter_call(class);
 		if (!err && pad_enters(plan, class))
-			err = get_release(env, &release);
+			err = get_release(env, &release, 0);
 	}
 	return err;
 }
@@ -3086,6 +3122,13 @@ bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan
 		return false;
 	if (!bpf_site_is_call(plan->kind))
 		return plan->kind != BPF_SITE_FAULT && plan->kind != BPF_SITE_MAY_GOTO;
+	/*
+	 * The continuation of a parked coroutine frame leaves with kexit where the kernel unwinds
+	 * it, see bpf_pad_note_external(): it did not do what it was verified to do, and nothing
+	 * goes on behind its call.
+	 */
+	if (plan->external)
+		return true;
 	/* the callees came back to the call in the way of the plan, and that way is asked */
 	bpf_pad_for_each_callee(plan, s) {
 		sub = &env->subprog_info[s];
@@ -3208,6 +3251,9 @@ static int sites_of_subprogs(struct bpf_verifier_env *env)
 					bpf_pad_for_each_callee(plan, c)
 						kinds |= kinds_of_plan(plan,
 								       env->subprog_info[c].left_at);
+					/* wherever the kernel unwinds what is not the program's */
+					if (plan->external)
+						kinds |= BIT(BPF_SITE_REMAINDER);
 				}
 			}
 			changed |= kinds != sub->left_at;
@@ -3232,6 +3278,8 @@ static u16 sites_below(struct bpf_verifier_env *env, const struct bpf_pad_plan *
 		if (env->subprog_info[s].can_unwind)
 			kinds |= LEFT_AT_UNWIND_EXIT;
 	}
+	if (plan->external)
+		kinds |= BIT(BPF_SITE_REMAINDER);
 	return kinds_of_plan(plan, kinds);
 }
 
@@ -3478,7 +3526,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 		for (note = head; note; note = note->next) {
 			if (!note->acquires || class_group(note->ent.class) != group)
 				continue;
-			err = get_release(env, &note->ent.release);
+			err = get_release(env, &note->ent.release, note->ent.prog_type);
 			if (err)
 				return min(err, 0);
 			/* when does the subprog return with it? See bpf_pad_note_return(). */

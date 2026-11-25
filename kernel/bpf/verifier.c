@@ -221,6 +221,10 @@ static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
+static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
+					  const struct bpf_verifier_state *st);
+static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg);
+static enum bpf_prog_type coro_park_type(const struct bpf_insn *insn);
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static bool in_rcu_callback(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
@@ -3046,6 +3050,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 			    struct bpf_kfunc_meta *kfunc)
 {
 	const struct btf_type *func, *func_proto;
+	struct bpf_prog view;
 	const char *func_name;
 	u32 *kfunc_flags;
 	struct btf *btf;
@@ -3068,7 +3073,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 	 * call.  However we don't fail with an error here,
 	 * and let the caller decide what to do with NULL kfunc->flags.
 	 */
-	kfunc_flags = btf_kfunc_flags(btf, func_id, env->prog);
+	kfunc_flags = btf_kfunc_flags(btf, func_id, bpf_state_prog(env, &view));
 
 	func = btf_type_by_id(btf, func_id);
 	if (!func || !btf_type_is_func(func)) {
@@ -5913,6 +5918,7 @@ enum {
 	CG_CB		= BIT(6),
 	CG_GLOBAL	= BIT(7),
 	CG_IN_EXC_CB	= BIT(8), /* the exception callback and what it gets to */
+	CG_IN_CORO_CONT	= BIT(9), /* continuations of coroutines and what they get to */
 };
 
 #define for_each_marked_subprog(cg, s, mark) \
@@ -5955,12 +5961,13 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 		cg->marks[s] |= (si[s].is_cb ? CG_CB | CG_IN_CB : 0) |
 				(si[s].is_exception_cb ? CG_IN_EXC_CB : 0) |
 				(si[s].is_async_cb ? CG_IN_ASYNC_CB : 0) |
+				(si[s].coro_cont ? CG_IN_CORO_CONT : 0) |
 				(bpf_call_graph_recursive(cg, s) ? CG_IN_RECURSION : 0) |
 				(si[s].has_tail_call ? CG_TAIL_CALL : 0) |
 				(si[s].uses_arena_sp ? CG_ARENA_SP : 0) |
 				(bpf_subprog_is_global(env, s) ? CG_GLOBAL : 0);
 	bpf_call_graph_mark_callees(cg, CG_IN_CB | CG_IN_ASYNC_CB | CG_IN_RECURSION |
-					CG_IN_EXC_CB);
+					CG_IN_CORO_CONT | CG_IN_EXC_CB);
 	bpf_call_graph_mark_callers(cg, CG_TAIL_CALL, 0);
 	return 0;
 }
@@ -6100,6 +6107,35 @@ static int check_callbacks(struct bpf_verifier_env *env, struct bpf_call_graph *
  * this info will be utilized by JIT so that we will be preserving the
  * tail call counter throughout bpf2bpf calls combined with tailcalls
  */
+/*
+ * A function that calls a parked coroutine frame, see check_coro_callx(), is verified in the
+ * frames of its caller or on its own, and on its own it does not know who calls it. The call
+ * graph of the pass does: no continuation gets to such a function, or continuations would
+ * nest, and in an XDP program no async callback does, which has no network context.
+ */
+static int check_coro_calls(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	int s;
+
+	for_each_marked_subprog(cg, s, CG_LIVE) {
+		if (!si[s].calls_parked)
+			continue;
+		if (cg->marks[s] & CG_IN_CORO_CONT) {
+			verbose(env, "func#%d calls a parked coro_frame, and a coroutine continuation gets to it\n",
+				s);
+			return -EACCES;
+		}
+		if (resolve_prog_type(env->prog) == BPF_PROG_TYPE_XDP &&
+		    (cg->marks[s] & CG_IN_ASYNC_CB)) {
+			verbose(env, "func#%d calls a parked coro_frame, and an async callback gets to it, which has no network context\n",
+				s);
+			return -EACCES;
+		}
+	}
+	return 0;
+}
+
 static int check_tail_calls(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
@@ -6646,6 +6682,7 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	ret = ret ?: check_recursion(env, &cg);
 	ret = ret ?: check_callbacks(env, &cg);
 	ret = ret ?: check_tail_calls(env, &cg);
+	ret = ret ?: check_coro_calls(env, &cg);
 	if (ret)
 		goto out;
 	mark_arena_stack_entries(env, &cg);
@@ -7372,6 +7409,29 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	u32 btf_id = 0;
 	s64 min_off;
 	int ret;
+
+	/*
+	 * The resume and the destroy function in the first two slots of a parked frame that the
+	 * program holds, as the compiler loads them to call them: nothing else of the frame is
+	 * read, and nothing but callx takes what is loaded, see check_coro_callx().
+	 */
+	if (coro_handle_type(reg)) {
+		if (atype != BPF_READ || value_regno < 0 || size != BPF_REG_SIZE ||
+		    !reg_is_referenced(env, reg) || type_flag(reg->type) & ~PTR_TRUSTED ||
+		    !tnum_is_const(reg->var_off) || reg->var_off.value ||
+		    (off != 0 && off != BPF_REG_SIZE)) {
+			verbose(env, "%s is a parked coro_frame: only the function in one of its first two slots is loaded, through the pointer that holds the frame\n",
+				reg_arg_name(env, argno));
+			return -EACCES;
+		}
+		/* @reg may be the register that takes the function */
+		ret = reg->id;
+		mark_reg_known_zero(env, regs, value_regno);
+		regs[value_regno].type = PTR_TO_CORO_FUNC;
+		/* gone with the frame, and of that frame only */
+		regs[value_regno].parent_id = ret;
+		return 0;
+	}
 
 	if (!env->allow_ptr_leaks) {
 		verbose(env,
@@ -12867,6 +12927,8 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	init_func_state(env, callee, BPF_MAIN_FUNC, 0, subprog);
 	/* the frame that says so is not there when the function is verified */
 	callee->in_rcu_callback_fn = in_rcu_callback(env);
+	/* nor is the continuation that makes it code of another type of program */
+	callee->coro_prog_type = state->frame[0]->coro_prog_type;
 	/*
 	 * What a frame that the kernel unwinds calls gets other arguments than the calls of the
 	 * normal path do: a landing pad has 0 in R0 where the program has the object that it
@@ -13212,6 +13274,16 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		const char *operation;
 		bool returns_void;
 
+		/*
+		 * It is verified once, as code of a program of the program's own type, and so
+		 * is the extension that replaces it.
+		 */
+		if (state->frame[0]->coro_prog_type) {
+			verbose(env, "global function %s() cannot be called from the continuation of a coro_frame that is parked for another type of program\n",
+				sub_name);
+			return -EINVAL;
+		}
+
 		if (env->cur_state->active_locks) {
 			verbose(env, "global function calls are not allowed while holding a lock,\n"
 				     "use static function instead\n");
@@ -13428,6 +13500,102 @@ static int check_func_callx_set(struct bpf_verifier_env *env, int regno, int *in
 	return err ?: PROCESS_BPF_EXIT;
 }
 
+/*
+ * callx of the resume or the destroy function of a parked coroutine frame, which was loaded from
+ * the frame in R1, see check_ptr_to_btf_access(). What it calls is not known here, and may be a
+ * function of another program: the continuation that was verified from the snapshot of the frame
+ * when a program parked it, as code of the type of program that the frame was parked for, see
+ * push_coro_suspend() and state_prog_type(). So the caller is a program of that type, in the
+ * context that such a program runs in. For the rest the callee is like any function that is
+ * verified on its own: it takes R1, the frame, which is its own from here on, and leaves a number
+ * in R0.
+ *
+ * No kernel code stands between the two, so what the kernel does around a continuation that it
+ * resumes itself, see bpf_coro_run(), is the caller's to have or the callee's to do:
+ * - A continuation that calls a continuation would nest without bound: it is refused, in the
+ *   continuation and in what it calls, see check_coro_calls(). That looks at the functions of
+ *   this program. An extension replaces a global function of another one, which a continuation
+ *   or an async callback of that one may call: it calls no parked frame.
+ * - The callee is code that does not sleep, see push_coro_suspend(): the call is in a read
+ *   section of RCU.
+ * - The kernel unwinds the callee where it unwinds any function, and the callee leaves with
+ *   kexit, see push_coro_resume_cb(). That comes back to this call like kexit of a function of
+ *   the program, and the caller is unwound too: its invocation ends with the continuation's.
+ *   There is no other way on from the call, see bpf_pad_must_unwind().
+ */
+static int check_coro_callx(struct bpf_verifier_env *env, struct bpf_insn *insn, int *insn_idx)
+{
+	struct bpf_verifier_state *st = env->cur_state, *branch;
+	struct bpf_func_state *caller = cur_func(env);
+	struct bpf_reg_state *regs = caller->regs, *fn = &regs[insn->dst_reg];
+	struct bpf_reg_state *frame = &regs[BPF_REG_1];
+	enum bpf_prog_type type = coro_handle_type(frame);
+	const struct bpf_func_state *root = st->frame[0];
+	enum bpf_site_kind forced;
+	int err, call_idx = *insn_idx;
+
+	if (!type || !reg_is_referenced(env, frame) || fn->parent_id != frame->id ||
+	    type_flag(frame->type) & ~PTR_TRUSTED || !tnum_is_const(frame->var_off) ||
+	    frame->var_off.value) {
+		verbose(env, "R%d is a function of a parked coro_frame: R1 has to be the pointer that holds the frame\n",
+			insn->dst_reg);
+		return -EACCES;
+	}
+	/* as it was loaded */
+	err = check_ptr_off_reg(env, fn, insn->dst_reg);
+	if (err)
+		return err;
+	if (env->prog->type == BPF_PROG_TYPE_EXT) {
+		verbose(env, "an extension program cannot call a parked coro_frame\n");
+		return -EACCES;
+	}
+	/* in its own code; what it calls is asked after the pass, see check_coro_calls() */
+	if (root->coro_suspend_site) {
+		verbose(env, "a coroutine continuation cannot call a parked coro_frame\n");
+		return -EACCES;
+	}
+	if (state_prog_type(env, st) != type ||
+	    (type == BPF_PROG_TYPE_XDP && root->in_async_callback_fn)) {
+		verbose(env, "the coro_frame in R1 was parked for another type of program, or for a context that this code does not run in\n");
+		return -EACCES;
+	}
+	bpf_find_containing_subprog(env, call_idx)->calls_parked = true;
+	if (!in_rcu_cs(env)) {
+		verbose(env, "a parked coro_frame is called in a read section of RCU\n");
+		return -EACCES;
+	}
+	if (st->active_locks || st->active_irq_id) {
+		verbose(env, "a parked coro_frame cannot be called with a lock held or with IRQs off\n");
+		return -EACCES;
+	}
+	err = require_callx_jit(env);
+	if (err)
+		return err;
+
+	/* the callee has the frame, and R0-R5 are what it left */
+	err = release_reference(env, frame->id);
+	if (err)
+		return err;
+	clear_caller_saved_regs(env, regs);
+	invalidate_outgoing_stack_args(env, caller);
+	mark_reg_unknown(env, regs, BPF_REG_0);
+
+	/* It comes back unwound by the kernel as well, like a global function that kexit left. */
+	forced = bpf_frame_is_forced(caller) ? BPF_SITE_FORCED : 0;
+	if (env->insn_aux_data[call_idx + 1].kpad)
+		err = bpf_pad_note_external(env, call_idx, BPF_SITE_KENTRY);
+	err = err ?: bpf_pad_note_external(env, call_idx, BPF_SITE_KCALL | forced);
+	if (err)
+		return err;
+	branch = push_stack(env, call_idx + 1, call_idx, false);
+	if (IS_ERR(branch))
+		return PTR_ERR(branch);
+	branch->unwound = bpf_unwound_mark(true, false);
+	if (env->has_throw)
+		mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+	return 0;
+}
+
 static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx)
 {
@@ -13440,6 +13608,8 @@ static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	reg = reg_state(env, insn->dst_reg);
+	if (reg->type == PTR_TO_CORO_FUNC)
+		return check_coro_callx(env, insn, insn_idx);
 	if (reg->type != PTR_TO_FUNC) {
 		bpf_note_needs_ptr(env, reg);
 		verbose(env, "R%d has type %s, expected func\n", insn->dst_reg,
@@ -14263,16 +14433,37 @@ static bool can_elide_value_nullness(const struct bpf_map *map)
 	}
 }
 
+/*
+ * A helper is one function for programs of one type and may be another one for another type.
+ * A call that states of two types get to, in a function that a program and a continuation
+ * which is parked for another type both call, is one call when the program is fixed up: it
+ * has to be the same function for both. Fixups ask as the states did.
+ */
+static int note_helper_prog_type(struct bpf_verifier_env *env, int insn_idx,
+				 const struct bpf_func_proto *fn)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	enum bpf_prog_type type = state_prog_type(env, env->cur_state);
+	int func_id = env->prog->insnsi[insn_idx].imm;
+
+	if (aux->helper_prog_type && aux->helper_prog_type != type &&
+	    bpf_helper_proto_as(env, func_id, aux->helper_prog_type) != fn) {
+		verbose(env, "helper %s#%d is not the same function for the types of program that this call is verified as\n",
+			func_id_name(func_id), func_id);
+		return -EINVAL;
+	}
+	aux->helper_prog_type = type;
+	return 0;
+}
+
 int bpf_get_helper_proto(struct bpf_verifier_env *env, int func_id,
 			 const struct bpf_func_proto **ptr)
 {
 	if (func_id < 0 || func_id >= __BPF_FUNC_MAX_ID)
 		return -ERANGE;
 
-	if (!env->ops->get_func_proto)
-		return -EINVAL;
-
-	*ptr = env->ops->get_func_proto(func_id, env->prog);
+	*ptr = bpf_helper_proto_as(env, func_id,
+				   env->pad_prog_type ?: state_prog_type(env, env->cur_state));
 	return *ptr && (*ptr)->func ? 0 : -EINVAL;
 }
 
@@ -14338,6 +14529,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	enum bpf_type_flag ret_flag;
 	struct bpf_reg_state *regs, unwound_r0;
 	struct bpf_call_arg_meta meta;
+	struct bpf_prog view;
 	const char *operation;
 	int insn_idx = *insn_idx_p;
 	bool changes_data;
@@ -14361,6 +14553,10 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 	}
 
+	err = note_helper_prog_type(env, insn_idx, fn);
+	if (err)
+		return err;
+
 	/* eBPF programs must be GPL compatible to use GPL-ed functions */
 	if (!env->prog->gpl_compatible && fn->gpl_only) {
 		verbose(env, "cannot call GPL-restricted function from non-GPL compatible program\n");
@@ -14372,7 +14568,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return -EINVAL;
 	}
 
-	if (fn->allowed && !fn->allowed(env->prog)) {
+	if (fn->allowed && !fn->allowed(bpf_state_prog(env, &view))) {
 		verbose(env, "helper call is not allowed in probe\n");
 		operation = bpf_diag_fmt(env, "helper %s#%d", func_id_name(func_id), func_id);
 		bpf_diag_policy(
@@ -15498,6 +15694,8 @@ enum special_kfunc_type {
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
 	KF_bpf_coro_frame_alloc,
+	KF_bpf_coro_park_xdp,
+	KF_bpf_coro_park_syscall,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -15604,6 +15802,93 @@ BTF_ID(func, bpf_session_is_return)
 BTF_ID_UNUSED
 #endif
 BTF_ID(func, bpf_coro_frame_alloc)
+BTF_ID(func, bpf_coro_park_xdp)
+BTF_ID(func, bpf_coro_park_syscall)
+
+/* What bpf_coro_park_xdp() and bpf_coro_park_syscall() return */
+BTF_ID_LIST(coro_handle_ids)
+BTF_ID(struct, bpf_coro_xdp)
+BTF_ID(struct, bpf_coro_syscall)
+
+/*
+ * The type of program that the kfunc which @insn calls parks a coroutine frame for, see
+ * kernel/bpf/coro.c. 0 if it calls no such kfunc.
+ */
+static enum bpf_prog_type coro_park_type(const struct bpf_insn *insn)
+{
+	if (!bpf_pseudo_kfunc_call(insn) || insn->off)
+		return BPF_PROG_TYPE_UNSPEC;
+	if (insn->imm == special_kfunc_list[KF_bpf_coro_park_xdp])
+		return BPF_PROG_TYPE_XDP;
+	if (insn->imm == special_kfunc_list[KF_bpf_coro_park_syscall])
+		return BPF_PROG_TYPE_SYSCALL;
+	return BPF_PROG_TYPE_UNSPEC;
+}
+
+/* The type of program whose context a pointer to a parked frame is called in. 0 if none. */
+static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg)
+{
+	if (base_type(reg->type) != PTR_TO_BTF_ID || !btf_is_vmlinux(reg->btf))
+		return BPF_PROG_TYPE_UNSPEC;
+	if (reg->btf_id == coro_handle_ids[0])
+		return BPF_PROG_TYPE_XDP;
+	if (reg->btf_id == coro_handle_ids[1])
+		return BPF_PROG_TYPE_SYSCALL;
+	return BPF_PROG_TYPE_UNSPEC;
+}
+
+/*
+ * The type of program that the code of @st is verified as. A continuation of a parked frame
+ * is called by a program of the type that the frame was parked for, with no kernel code in
+ * between that would make its context one of the program's own type: from the suspension on
+ * its helpers and kfuncs are those of that type. The first frame of the state says which, see
+ * push_coro_resume_cb(), and no two states that differ in it are joined: it is in the join_key.
+ * A function that is verified on its own has it from the state that calls it, see
+ * call_func_on_its_own(), and is verified once for each type that calls it.
+ */
+static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
+					  const struct bpf_verifier_state *st)
+{
+	/* a state that has left its last frame is asked too, by a landing pad */
+	enum bpf_prog_type type = st && st->frame[0] ? st->frame[0]->coro_prog_type : 0;
+
+	return type ?: resolve_prog_type(env->prog);
+}
+
+/*
+ * The program, for whoever asks what a program of its type may call: the program itself, or a
+ * copy in @view that has the type which the current state is verified as.
+ */
+const struct bpf_prog *bpf_state_prog(struct bpf_verifier_env *env, struct bpf_prog *view)
+{
+	/* no state is there when the landing pads are settled: the entry of a pad says */
+	enum bpf_prog_type type = env->pad_prog_type ?: state_prog_type(env, env->cur_state);
+
+	if (type == resolve_prog_type(env->prog))
+		return env->prog;
+	memcpy(view, env->prog, sizeof(*view));
+	view->type = type;
+	view->expected_attach_type = 0;
+	return view;
+}
+
+/* The helper @func_id of a program of @type; of the program's own type if @type is 0 */
+const struct bpf_func_proto *bpf_helper_proto_as(struct bpf_verifier_env *env, int func_id,
+						 enum bpf_prog_type type)
+{
+	const struct bpf_verifier_ops *ops = env->ops;
+	const struct bpf_prog *prog = env->prog;
+	struct bpf_prog view;
+
+	if (type && type != resolve_prog_type(env->prog)) {
+		memcpy(&view, env->prog, sizeof(view));
+		view.type = type;
+		view.expected_attach_type = 0;
+		prog = &view;
+		ops = bpf_verifier_ops[type];
+	}
+	return ops && ops->get_func_proto ? ops->get_func_proto(func_id, prog) : NULL;
+}
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -16692,6 +16977,7 @@ int bpf_fetch_kfunc_arg_meta(struct bpf_verifier_env *env,
 			     s16 offset,
 			     struct bpf_call_arg_meta *meta)
 {
+	struct bpf_prog view;
 	struct bpf_kfunc_meta kfunc;
 	int err;
 
@@ -16706,7 +16992,7 @@ int bpf_fetch_kfunc_arg_meta(struct bpf_verifier_env *env,
 	meta->func_proto = kfunc.proto;
 	meta->func_name = kfunc.name;
 
-	if (!kfunc.flags || !btf_kfunc_is_allowed(kfunc.btf, kfunc.id, env->prog))
+	if (!kfunc.flags || !btf_kfunc_is_allowed(kfunc.btf, kfunc.id, bpf_state_prog(env, &view)))
 		return -EACCES;
 
 	meta->kfunc_flags = *kfunc.flags;
@@ -17355,11 +17641,13 @@ static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bp
 static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
 			       struct bpf_reference_state *frame, u32 *moved, int nr_moved)
 {
+	enum bpf_prog_type type = coro_park_type(&env->prog->insnsi[insn_idx]);
 	struct bpf_subprog_info *info = &env->subprog_info[subprog];
 	struct bpf_verifier_state *cur = env->cur_state, *async_cb;
 	struct bpf_reference_state *ref, *src;
 	struct bpf_func_state *callee;
 	struct bpf_reg_state *reg;
+	bool parked = type;
 	int i;
 
 	/*
@@ -17378,6 +17666,15 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	 */
 	if (info->can_unwind && !BPF_HAS_CB_PADS) {
 		verbose(env, "coroutine continuation %s() has unwind_exit, and bpf_coro_run() cannot tell\n",
+			bpf_subprog_name(env, subprog));
+		return -EINVAL;
+	}
+	/*
+	 * A program calls the continuation of a parked frame, see check_coro_callx(), and it may
+	 * be another program: what unwind_exit leaves is nothing that its landing pads know.
+	 */
+	if (info->can_unwind && parked) {
+		verbose(env, "coroutine continuation %s() has unwind_exit, which would unwind into the program that calls a parked coro_frame\n",
 			bpf_subprog_name(env, subprog));
 		return -EINVAL;
 	}
@@ -17411,6 +17708,12 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	callee = async_cb->frame[0];
 	callee->in_async_callback_fn = true;
 	callee->coro_suspend_site = insn_idx + 1;
+	/*
+	 * A kfunc that keeps the frame resumes it in a context of the type of program that
+	 * could call the kfunc: the type of the code that suspends, see bpf_coro_run().
+	 */
+	type = type ?: state_prog_type(env, cur);
+	callee->coro_prog_type = type == resolve_prog_type(env->prog) ? 0 : type;
 	callee->callback_ret_range = retval_range(0, 0);
 
 	/*
@@ -17497,6 +17800,26 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 				break;
 		if (j == nr_moved)
 			moved[nr_moved++] = reg->id;
+	}
+
+	/*
+	 * A parked frame is called by a program that holds it, see check_coro_callx(), or
+	 * destroyed by the kernel when nothing does, see bpf_coro_drop(): it needs both functions.
+	 * Whoever calls them is in a read section of RCU and nothing more. That keeps a program
+	 * which is freed after a grace period of RCU, and not one that is freed after one of
+	 * RCU Tasks Trace: a sleepable program, or one with a callback that may sleep, which is
+	 * known when the pass is over, see mark_sleepable_async_cb().
+	 */
+	if (coro_park_type(&env->prog->insnsi[insn_idx])) {
+		if (destroy < 0) {
+			verbose(env, "parked coro_frame has no destroy function in its second slot\n");
+			return -EINVAL;
+		}
+		if (env->prog->sleepable) {
+			verbose(env, "a sleepable program cannot park a coro_frame\n");
+			return -EINVAL;
+		}
+		env->prog->aux->coro_parks = true;
 	}
 
 	/*
@@ -23708,6 +24031,9 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
 		return false;
 	case BPF_SITE_KCALL:
 	case BPF_SITE_KENTRY:
+		/* what is not the program's is left wherever the kernel unwinds it */
+		if (plan->external)
+			return true;
 		/* unwind_exit that a callee has says nothing about its kexit */
 		bpf_pad_for_each_callee(plan, s)
 			if (env->subprog_info[s].kunwinds_for_sure)
@@ -23838,6 +24164,19 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	 */
 	if (frame_is_top(st) && sub->coro_cont && (!sub->bail_unwinds || !BPF_HAS_CB_PADS)) {
 		verbose(env, "insn %d: coroutine continuation %s() cannot be unwound here: bpf_coro_run() would not be told\n",
+			insn_idx, bpf_subprog_name(env, frame->subprogno));
+		err = -EINVAL;
+		goto unproven;
+	}
+	/*
+	 * A program calls the continuation of a parked frame, see check_coro_callx(), and it may
+	 * be another program: unwind_exit would leave into landing pads that know nothing of
+	 * this one. Its own text has none, see push_coro_resume_cb(), and neither does it pass on
+	 * the unwinding of a function that it calls.
+	 */
+	if (frame_is_top(st) && !kernel && frame->coro_suspend_site &&
+	    coro_park_type(&env->prog->insnsi[frame->coro_suspend_site - 1])) {
+		verbose(env, "insn %d: coroutine continuation %s() of a parked coro_frame is left by an unwinding of the program, which would unwind the program that calls it\n",
 			insn_idx, bpf_subprog_name(env, frame->subprogno));
 		err = -EINVAL;
 		goto unproven;
@@ -26593,6 +26932,11 @@ reject:
 		restart_log(env, &log);
 	if (err && (!path_err || guess) && (limit || (env->for_log && !env->err)))
 		verbose(env, "the limit on cost or memory ended pass %u\n", env->pass);
+	/* see push_coro_suspend() */
+	if (!err && env->sleepable_async_cb && env->prog->aux->coro_parks) {
+		verbose(env, "a program with a callback that may sleep cannot park a coro_frame\n");
+		err = -EINVAL;
+	}
 	if (!err && env->sleepable_async_cb)
 		mark_sleepable_async_cb(env);
 	bpf_precision_free(env);

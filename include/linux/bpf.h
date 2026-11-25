@@ -1166,6 +1166,8 @@ enum bpf_reg_type {
 	PTR_TO_INSN,		 /* reg points to a bpf program instruction */
 	CONST_PTR_TO_DYNPTR,	 /* reg points to a const struct bpf_dynptr */
 	PTR_TO_CORO_FRAME,	 /* reg points to a frame from bpf_coro_frame_alloc() */
+	/* the resume or the destroy function of a parked frame, see check_coro_callx() */
+	PTR_TO_CORO_FUNC,
 	__BPF_REG_TYPE_MAX,
 
 	/* Extended reg_types. */
@@ -1941,6 +1943,7 @@ struct bpf_prog_aux {
 	bool attach_tracing_prog; /* true if tracing another tracing program */
 	bool tramp_linked; /* true if it was ever linked to a trampoline */
 	bool sleepable_async_cb; /* has a bpf_wq or bpf_task_work callback */
+	bool coro_parks; /* parks coroutine frames, see push_coro_suspend() */
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;

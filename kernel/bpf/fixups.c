@@ -689,6 +689,9 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 	case BPF_SITE_KENTRY:
 		if (!plan->visited)
 			return false;
+		/* the kernel unwinds what is not the program's wherever it does that */
+		if (plan->external)
+			return true;
 		bpf_pad_for_each_callee(plan, s)
 			if (env->subprog_info[s].can_kunwind)
 				return true;
@@ -4212,7 +4215,8 @@ patch_map_ops_generic:
 			goto next_insn;
 		}
 patch_call_imm:
-		fn = env->ops->get_func_proto(insn->imm, env->prog);
+		/* as the states that got to the call found it, see note_helper_prog_type() */
+		fn = bpf_helper_proto_as(env, insn->imm, env->insn_aux_data[i].helper_prog_type);
 		/* all functions that have prototype and verifier allowed
 		 * programs to call them, must be real in-kernel functions
 		 */

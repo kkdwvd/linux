@@ -677,6 +677,8 @@ struct bpf_pad_ent {
 	struct bpf_insn release; /* the call that releases it */
 	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
 	u8 class;		/* enum bpf_pad_class */
+	/* coro_prog_type of the state that held it: who may call the release, see get_release() */
+	u8 prog_type;
 	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
 	bool always;		/* all visits hold it: the program counter tells */
 	/*
@@ -763,6 +765,11 @@ struct bpf_pad_plan {
 	 */
 	u32 *callee;
 	u32 nr_callees;
+	/*
+	 * BPF_SITE_KCALL: what the call called is also the continuation of a parked coroutine
+	 * frame, which is no function of the program, see bpf_pad_note_external()
+	 */
+	bool external;
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
 	u32 bytes;			/* its part of env->mem, see charge_plan() */
@@ -957,6 +964,14 @@ struct bpf_func_state {
 	 * continuations of two suspend points have two join_keys.
 	 */
 	u32 coro_suspend_site;
+	/*
+	 * Of the first frame: the type of program that the code of the state is verified as when
+	 * that is not the program's own, see state_prog_type(). The continuation of a coroutine
+	 * frame that was parked for a program of that type has it, the continuation of a frame
+	 * that it suspends for the kernel to resume, and a function that either calls and that
+	 * is verified on its own.
+	 */
+	u8 coro_prog_type;
 	);
 	bool no_stack_arg_load;
 	/*
@@ -1597,6 +1612,11 @@ struct bpf_insn_aux_data {
 	 */
 	u32 kpad:1;
 	/*
+	 * A call of a helper: the type of program that the states which got to it were verified
+	 * as, see bpf_state_prog() and note_helper_prog_type(). 0 if none got there.
+	 */
+	u8 helper_prog_type;
+	/*
 	 * PAD CODE: an insn that such a landing pad of its function gets to. A frame that the
 	 * kernel unwinds runs nothing else, see bpf_find_kernel_pads().
 	 */
@@ -1808,6 +1828,8 @@ struct bpf_subprog_info {
 	bool is_async_cb: 1;
 	/* the resume or destroy function of a suspended coroutine, see push_coro_suspend() */
 	bool coro_cont: 1;
+	/* it has callx of a function of a parked coroutine frame, see check_coro_callx() */
+	bool calls_parked: 1;
 	bool is_exception_cb: 1;
 	bool in_exception_cb: 1; /* it is the exception callback, or that may get to it */
 	/* bpf_loop() or bpf_for_each_map_elem() call it in a loop */
@@ -2241,6 +2263,8 @@ struct bpf_verifier_env {
 	/* a global function is verified for BPF_FUNC_CTX_NO_RCU_LOCK */
 	bool no_rcu_read_lock;
 	bool has_throw;			/* the program has a call of bpf_throw() */
+	/* not 0 while a landing pad looks for a release with no state, see bpf_state_prog() */
+	u8 pad_prog_type;
 	bool signature;
 	u8 bug:1;			/* ends the load, see bpf_note_bug() */
 	u8 log_level:7;			/* of the user */
@@ -2557,6 +2581,9 @@ bool bpf_scalar_subsumes(const struct bpf_reg_state *old, const struct bpf_reg_s
 bool bpf_same_type_and_object(struct bpf_verifier_env *env, const struct bpf_reg_state *a,
 			      const struct bpf_reg_state *b);
 bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b);
+const struct bpf_prog *bpf_state_prog(struct bpf_verifier_env *env, struct bpf_prog *view);
+const struct bpf_func_proto *bpf_helper_proto_as(struct bpf_verifier_env *env, int func_id,
+						 enum bpf_prog_type type);
 u64 bpf_hash64(const void *p, size_t len, u64 hash);
 u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verifier_state *st);
 int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
@@ -2760,6 +2787,7 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 				      enum bpf_site_kind kind);
 int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
 			enum bpf_site_kind kind);
+int bpf_pad_note_external(struct bpf_verifier_env *env, int call_idx, enum bpf_site_kind kind);
 bool bpf_pad_passes_r2(struct bpf_verifier_env *env, int subprog, enum bpf_site_kind kind);
 void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
 void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);

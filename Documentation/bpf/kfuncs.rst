@@ -1115,3 +1115,33 @@ mapping performed by these kfuncs.
 
 .. kernel-doc:: kernel/bpf/helpers.c
    :identifiers: bpf_copy_to_user bpf_user_anon_mmap bpf_user_munmap
+
+4.5 Parked coroutine frames
+---------------------------
+
+A program that schedules its own coroutines keeps their frames itself.
+``bpf_coro_park_xdp()`` and ``bpf_coro_park_syscall()`` suspend a frame of
+``bpf_coro_frame_alloc()`` and hand it back as a pointer that the program owns
+and can only move: into a ``__kptr`` field of a map value or of an allocated
+object, a node of a list or an rbtree among them, and out again with
+``bpf_kptr_xchg()``. The frame has the resume function of the coroutine in its
+first slot and the destroy function in its second one.
+
+A program that has the pointer resumes or destroys the coroutine as a compiler
+does for a coroutine handle: it loads the function from the first or the second
+slot of the frame through the pointer and calls it with the pointer as the only
+argument. The kfunc names the type of program that does so, XDP or syscall, and
+from the suspension on the two functions are verified as code of a program of
+that type, whatever program they are a part of: they call the helpers and the
+kfuncs of that type. A program of another type, or one that has no use for the
+coroutine any more, gives the pointer to ``bpf_coro_drop_xdp()`` or
+``bpf_coro_drop_syscall()``, and the kernel calls the destroy function soon
+after, in a context of the type.
+
+The call is in a read section of RCU, with no lock held and with IRQs on. If
+the kernel unwinds the continuation, its caller is unwound too. A continuation
+calls no parked frame, and neither does an extension program. A sleepable
+program, and one with a callback that may sleep, parks no frame.
+
+.. kernel-doc:: kernel/bpf/coro.c
+   :identifiers: bpf_coro_park_xdp bpf_coro_park_syscall bpf_coro_drop_xdp bpf_coro_drop_syscall

@@ -13,20 +13,24 @@
 #include <linux/rcupdate.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 /*
  * In front of every frame. The program gets the address behind it: the verifier bounds the
  * accesses through a PTR_TO_CORO_FRAME by the frame, and passes only the start of the frame
- * to a __coro_frame argument. The header is 8 bytes, also where a pointer has 4, and kmalloc
- * aligns the allocation to ARCH_KMALLOC_MINALIGN, 8 bytes at least on the architectures whose
- * JITs call kfuncs: the frame has the 8-byte alignment that the accesses of the program need.
+ * to a __coro_frame argument. The header is a multiple of 8 bytes, where a pointer has 4 too,
+ * and kmalloc aligns the allocation to ARCH_KMALLOC_MINALIGN, 8 bytes at least on the
+ * architectures whose JITs call kfuncs: the frame has the 8-byte alignment that the accesses
+ * of the program need.
  */
 struct bpf_coro_frame_hdr {
 	/* the program that allocated the frame, which the frame holds a reference on */
 	struct bpf_prog *prog;
+	/* a parked frame that the kernel is to destroy, see bpf_coro_drop() */
+	struct llist_node drop;
 } __aligned(8);
 
-static_assert(sizeof(struct bpf_coro_frame_hdr) == sizeof(u64));
+static_assert(sizeof(struct bpf_coro_frame_hdr) % sizeof(u64) == 0);
 
 static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
 {
@@ -163,10 +167,10 @@ static int bpf_coro_run_level(void)
  * Returns true when the continuation did not return: the kernel unwound it, or the program's
  * own unwinding left it. The kfunc can react, by closing a connection or waking a waiter, say.
  */
-noinline bool bpf_coro_run(void *frame)
+static noinline bool __bpf_coro_run(void *frame, int slot)
 {
 	struct bpf_prog *prog = bpf_coro_frame_hdr(frame)->prog;
-	bpf_callback_t resume = READ_ONCE(*(bpf_callback_t *)frame);
+	bpf_callback_t resume = READ_ONCE(((bpf_callback_t *)frame)[slot]);
 	bool sleepable = bpf_prog_runs_sleepable(prog);
 	struct bpf_timed_may_goto saved;
 	struct task_struct *runner;
@@ -198,4 +202,190 @@ done:
 		rcu_read_unlock_trace();
 	return unwound;
 }
+
+bool bpf_coro_run(void *frame)
+{
+	return __bpf_coro_run(frame, 0);
+}
 EXPORT_SYMBOL_GPL(bpf_coro_run);
+
+/*
+ * Parked frames.
+ *
+ * bpf_coro_park_xdp() and bpf_coro_park_syscall() suspend a coroutine like a kfunc that keeps
+ * the frame, and give the frame back to the program, as a pointer that it owns and can only
+ * move: into a kptr field of a map value or of an allocated object, and out of it again with
+ * bpf_kptr_xchg(). The kernel resumes no such frame. A program does, when it has the pointer:
+ * it loads the resume function from the first slot of the frame, or the destroy function from
+ * the second one, and calls it with the frame, see check_coro_callx(). No kernel code is on
+ * that way, so the continuation was verified for the context that calls it: the kfunc names
+ * the type of program whose context that is, the continuation is verified as code of such a
+ * program from the suspension on, and the type of the pointer says so to whoever holds it.
+ *
+ * Where no program calls the destroy function the kernel does: bpf_coro_drop_xdp() and
+ * bpf_coro_drop_syscall() for a program that is not of the type the frame was parked for, or
+ * that a landing pad stands in for, and the destructors of the kptr fields when a map or an
+ * object goes with a frame in it. That may be in any context, so the frame waits on a list of
+ * the CPU for a work item in a context of the type: softirq with a network context for XDP,
+ * a kernel thread for a syscall program.
+ */
+struct bpf_coro_xdp {
+};
+
+struct bpf_coro_syscall {
+};
+
+struct bpf_coro_drops {
+	struct llist_head frames;
+	struct irq_work irq_work;
+	struct work_struct work;
+	bool net;
+};
+
+static void bpf_coro_drop_work(struct work_struct *work)
+{
+	struct bpf_coro_drops *drops = container_of(work, struct bpf_coro_drops, work);
+	struct bpf_net_context net_ctx, *net = NULL;
+	struct llist_node *node, *next;
+
+	llist_for_each_safe(node, next, llist_del_all(&drops->frames)) {
+		void *frame = container_of(node, struct bpf_coro_frame_hdr, drop) + 1;
+
+		if (drops->net) {
+			local_bh_disable();
+			net = bpf_net_ctx_set(&net_ctx);
+		}
+		/* The destroy function frees the frame, also when the kernel unwinds it. */
+		__bpf_coro_run(frame, 1);
+		if (drops->net) {
+			bpf_net_ctx_clear(net);
+			local_bh_enable();
+		}
+	}
+}
+
+/* Queueing work takes locks: not where the frame is dropped, which may be NMI. */
+static void bpf_coro_drop_irq_work(struct irq_work *irq_work)
+{
+	struct bpf_coro_drops *drops = container_of(irq_work, struct bpf_coro_drops, irq_work);
+
+	queue_work(drops->net ? system_bh_wq : system_percpu_wq, &drops->work);
+}
+
+static DEFINE_PER_CPU(struct bpf_coro_drops, bpf_coro_drops_xdp) = {
+	.frames = LLIST_HEAD_INIT(frames),
+	.irq_work = IRQ_WORK_INIT(bpf_coro_drop_irq_work),
+	.net = true,
+};
+
+static DEFINE_PER_CPU(struct bpf_coro_drops, bpf_coro_drops_syscall) = {
+	.frames = LLIST_HEAD_INIT(frames),
+	.irq_work = IRQ_WORK_INIT(bpf_coro_drop_irq_work),
+};
+
+static void bpf_coro_drop(void *frame, struct bpf_coro_drops *drops)
+{
+	llist_add(&bpf_coro_frame_hdr(frame)->drop, &drops->frames);
+	irq_work_queue(&drops->irq_work);
+}
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_coro_park_xdp - suspend a coroutine for an XDP program to resume
+ * @frame__coro_suspend: the frame
+ *
+ * The frame is the program's again, as a pointer that it can keep in a kptr field. The resume
+ * and the destroy function in its first two slots are verified as code of an XDP program from
+ * here on, whatever program this is, and an XDP program that holds the pointer calls them.
+ */
+__bpf_kfunc struct bpf_coro_xdp *bpf_coro_park_xdp(void *frame__coro_suspend)
+{
+	return frame__coro_suspend;
+}
+
+/**
+ * bpf_coro_park_syscall - suspend a coroutine for a syscall program to resume
+ * @frame__coro_suspend: the frame
+ *
+ * Like bpf_coro_park_xdp(), for a syscall program and the kernel threads that it runs.
+ */
+__bpf_kfunc struct bpf_coro_syscall *bpf_coro_park_syscall(void *frame__coro_suspend)
+{
+	return frame__coro_suspend;
+}
+
+/**
+ * bpf_coro_drop_xdp - have the kernel destroy a parked coroutine
+ * @coro: the frame
+ *
+ * The destroy function of the frame runs soon, in softirq context. It takes the frame alone
+ * and is KF_RELEASE with no other flag: a landing pad calls it too.
+ */
+__bpf_kfunc void bpf_coro_drop_xdp(struct bpf_coro_xdp *coro)
+{
+	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_xdp));
+}
+
+/**
+ * bpf_coro_drop_syscall - have the kernel destroy a parked coroutine
+ * @coro: the frame
+ *
+ * Like bpf_coro_drop_xdp(); the destroy function runs in a kernel thread.
+ */
+__bpf_kfunc void bpf_coro_drop_syscall(struct bpf_coro_syscall *coro)
+{
+	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_syscall));
+}
+
+/* The destructors of kptr fields that hold a parked frame */
+__bpf_kfunc void bpf_coro_xdp_dtor(void *coro)
+{
+	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_xdp));
+}
+CFI_NOSEAL(bpf_coro_xdp_dtor);
+
+__bpf_kfunc void bpf_coro_syscall_dtor(void *coro)
+{
+	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_syscall));
+}
+CFI_NOSEAL(bpf_coro_syscall_dtor);
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(bpf_coro_park_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_coro_park_xdp, KF_ACQUIRE)
+BTF_ID_FLAGS(func, bpf_coro_park_syscall, KF_ACQUIRE)
+BTF_ID_FLAGS(func, bpf_coro_drop_xdp, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_coro_drop_syscall, KF_RELEASE)
+BTF_KFUNCS_END(bpf_coro_park_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_coro_park_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_coro_park_kfunc_ids,
+};
+
+BTF_ID_LIST(bpf_coro_dtor_ids)
+BTF_ID(struct, bpf_coro_xdp)
+BTF_ID(func, bpf_coro_xdp_dtor)
+BTF_ID(struct, bpf_coro_syscall)
+BTF_ID(func, bpf_coro_syscall_dtor)
+
+static int __init bpf_coro_init(void)
+{
+	const struct btf_id_dtor_kfunc dtors[] = {
+		{ .btf_id = bpf_coro_dtor_ids[0], .kfunc_btf_id = bpf_coro_dtor_ids[1] },
+		{ .btf_id = bpf_coro_dtor_ids[2], .kfunc_btf_id = bpf_coro_dtor_ids[3] },
+	};
+	int cpu, ret;
+
+	for_each_possible_cpu(cpu) {
+		INIT_WORK(&per_cpu(bpf_coro_drops_xdp, cpu).work, bpf_coro_drop_work);
+		INIT_WORK(&per_cpu(bpf_coro_drops_syscall, cpu).work, bpf_coro_drop_work);
+	}
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_coro_park_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &bpf_coro_park_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_coro_park_kfunc_set);
+	return ret ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
+}
+late_initcall(bpf_coro_init);

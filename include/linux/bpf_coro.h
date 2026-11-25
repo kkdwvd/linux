@@ -13,8 +13,11 @@
  * taking the frame as its only argument, which the verifier checked as the continuation of
  * the suspend point. Once the event that the kfunc waits for has happened, the kfunc resumes
  * the coroutine exactly once with bpf_coro_run(), and the continuation owns the frame then.
- * It does so later, from kernel context in which the kfuncs of the program type are valid:
- * softirq, irq_work or a workqueue, as the kfunc arranges. Never inside an invocation of a
+ * It does so later, from kernel context in which the kfuncs of every type of program that
+ * may call the kfunc are valid: softirq, irq_work or a workqueue, as the kfunc arranges. Its
+ * caller may be the continuation of a frame that was parked for a program of another type
+ * than the one it is in, see kernel/bpf/coro.c, and the next continuation is verified as code
+ * of that type. Never inside an invocation of a
  * program, in the call that took the frame or in another kfunc that a program calls, also
  * when the kfunc fails after it took the frame. bpf_coro_run() returns true when the
  * continuation did not return: the kernel unwound it, or the program's own unwinding left it.
