@@ -27,6 +27,8 @@
 #include <trace/events/xdp.h>
 #include <net/xdp_sock_drv.h>
 
+#include "dev.h"
+
 #define REG_STATE_NEW		0x0
 #define REG_STATE_REGISTERED	0x1
 #define REG_STATE_UNREGISTERED	0x2
@@ -1074,6 +1076,14 @@ EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
  * from the steal on, the program's and the one the consumed redirect drops,
  * and is returned once both are gone, whichever goes last. The count shares
  * its storage with dev_rx, which a frame the program owns never uses.
+ *
+ * Next to the count is the id of the NAPI instance that the frame arrived
+ * through, which is how bpf_xdp_frame_xmit() finds the device to send it out
+ * of again: by a lookup under RCU, in whatever namespace the device is, with
+ * no reference that would keep a device for as long as a program keeps a
+ * frame. A driver tells which instance serves a queue with
+ * netif_queue_set_napi(). A frame of a queue it didn't tell about, or of a
+ * NAPI instance that is gone, cannot be sent.
  */
 /*
  * A frame given back from a kptr destructor may be given back where the map
@@ -1103,6 +1113,44 @@ static void bpf_xdp_frame_free_irq_work_fn(struct irq_work *work)
 }
 
 static struct irq_work bpf_xdp_frame_free_irq_work = IRQ_WORK_INIT(bpf_xdp_frame_free_irq_work_fn);
+
+/*
+ * Send a frame that nothing refers to any more out of the device it arrived
+ * on, with one call of ndo_xdp_xmit() that also has the driver kick the queue.
+ * The driver picks the queue by the CPU and expects softirqs to be off, as
+ * they are where a redirect is flushed. The frame is gone on return: the
+ * driver's on success, returned to its memory otherwise.
+ */
+static int bpf_xdp_frame_send(struct xdp_frame *frame)
+{
+	u32 napi_id = frame->bpf_napi_id;
+	struct net_device *dev;
+	int err;
+
+	/* It is as a driver made it: nothing of the program's goes along. */
+	frame->dev_rx = NULL;
+
+	local_bh_disable();
+	rcu_read_lock();
+	dev = dev_get_by_napi_id(napi_id);
+	if (!dev)
+		err = -ENODEV;
+	else if (!(dev->xdp_features & NETDEV_XDP_ACT_NDO_XMIT) ||
+		 (xdp_frame_has_frags(frame) && !(dev->xdp_features & NETDEV_XDP_ACT_NDO_XMIT_SG)))
+		err = -EOPNOTSUPP;
+	else
+		err = xdp_ok_fwd_dev(dev, xdp_get_frame_len(frame));
+	if (!err) {
+		err = dev->netdev_ops->ndo_xdp_xmit(dev, 1, &frame, XDP_XMIT_FLUSH);
+		/* the number of frames it took, or an error */
+		err = err == 1 ? 0 : err ?: -ENOBUFS;
+	}
+	if (err)
+		xdp_return_frame(frame);
+	rcu_read_unlock();
+	local_bh_enable();
+	return err;
+}
 
 void bpf_xdp_frame_put(struct xdp_frame *frame)
 {
@@ -1137,6 +1185,7 @@ __bpf_kfunc struct xdp_frame *bpf_xdp_frame_steal(struct xdp_md *ctx)
 	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
 	struct xdp_buff *xdp = (struct xdp_buff *)ctx;
 	struct xdp_rxq_info *rxq = xdp->rxq;
+	struct napi_struct *napi;
 	struct xdp_frame *xdpf;
 
 	/*
@@ -1166,6 +1215,13 @@ __bpf_kfunc struct xdp_frame *bpf_xdp_frame_steal(struct xdp_md *ctx)
 	if (!xdpf)
 		return NULL;
 	refcount_set(&xdpf->bpf_refs, 2);
+	/*
+	 * The instance that polls the queue, where the driver told the core about it. One of
+	 * another device, which nothing keeps a driver from naming, is none to send by.
+	 */
+	napi = rxq->queue_index < rxq->dev->num_rx_queues ?
+	       READ_ONCE(__netif_get_rx_queue(rxq->dev, rxq->queue_index)->napi) : NULL;
+	xdpf->bpf_napi_id = napi && napi->dev == rxq->dev ? READ_ONCE(napi->napi_id) : 0;
 	ri->consumed_frame = xdpf;
 	ri->kern_flags |= BPF_RI_F_XDP_CONSUMED;
 	return xdpf;
@@ -1185,6 +1241,51 @@ __bpf_kfunc struct xdp_frame *bpf_xdp_frame_steal(struct xdp_md *ctx)
 __bpf_kfunc void bpf_xdp_frame_release(struct xdp_frame *frame)
 {
 	bpf_xdp_frame_put(frame);
+}
+
+/**
+ * bpf_xdp_frame_xmit - send a frame the program keeps out of the device it arrived on
+ * @frame: the frame, which is gone when the call returns, whatever it returns
+ * @flags: must be 0
+ *
+ * The frame goes out as it is, from its first byte, through the device's
+ * ndo_xdp_xmit(), on the queue that the driver has for the CPU of the call,
+ * and the driver is told to send at once. The device is the one whose NAPI
+ * instance the frame arrived through, see bpf_xdp_frame_steal().
+ *
+ * Only a frame that nothing else refers to is sent. The driver refers to it
+ * until it has handed the buffer over, which it does once the invocation that
+ * took the frame has returned: a call in that invocation fails, and so does
+ * one on another CPU that gets to the frame before then. The frame is not
+ * sent later either: it goes back to its memory when the driver is done. A
+ * reply in the invocation that received the request is what XDP_TX is for,
+ * and a program that makes a kept frame reachable from another CPU before it
+ * returns has to do without the reply that loses this race.
+ *
+ * Returns 0 when the driver took the frame; -EINVAL for @flags; -EBUSY for a
+ * frame that the driver still hands over;
+ * -ENODEV when the NAPI instance is not known or gone; -EOPNOTSUPP for a
+ * device that does not transmit XDP frames, or not ones with fragments, and
+ * where IRQs are off; -ENETDOWN and -EMSGSIZE for a device that is down or
+ * whose MTU the frame exceeds; -ENOBUFS when the driver took no frame and
+ * gave no error, as with a full queue; and what else the driver returns.
+ */
+__bpf_kfunc int bpf_xdp_frame_xmit(struct xdp_frame *frame, u64 flags)
+{
+	int err = 0;
+
+	if (flags)
+		err = -EINVAL;
+	else if (unlikely(in_hardirq() || in_nmi() || irqs_disabled()))
+		err = -EOPNOTSUPP;	/* no driver can be entered */
+	if (err) {
+		bpf_xdp_frame_put(frame);
+		return err;
+	}
+	/* Whoever else refers to it gives it back, see bpf_xdp_frame_put(). */
+	if (!refcount_dec_and_test(&frame->bpf_refs))
+		return -EBUSY;
+	return bpf_xdp_frame_send(frame);
 }
 
 /* The destructor of a kptr field holding a frame. */
@@ -1230,6 +1331,7 @@ static const struct btf_kfunc_id_set xdp_frame_steal_kfunc_set = {
 
 BTF_KFUNCS_START(xdp_frame_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_xdp_frame_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_xdp_frame_xmit, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_dynptr_from_xdp_frame)
 BTF_KFUNCS_END(xdp_frame_kfunc_ids)
 

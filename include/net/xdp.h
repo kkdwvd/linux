@@ -307,8 +307,12 @@ struct xdp_frame {
 	enum xdp_mem_type mem_type:32;
 	union {
 		struct net_device *dev_rx; /* used by cpumap */
-		/* References to a frame a BPF program took, see bpf_xdp_frame_steal(). */
-		refcount_t bpf_refs;
+		/* A frame a BPF program took, see bpf_xdp_frame_steal(). */
+		struct {
+			refcount_t bpf_refs;
+			/* the NAPI instance it arrived through, 0 if not known */
+			u32 bpf_napi_id;
+		};
 	};
 	u32 frame_sz;
 	u32 flags; /* supported values defined in xdp_buff_flags */
