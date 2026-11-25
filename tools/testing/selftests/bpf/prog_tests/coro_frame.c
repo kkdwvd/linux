@@ -95,7 +95,7 @@ static int kept_result(struct coro_frame *skel)
 }
 
 /*
- * bpf_testmod keeps a frame of a program whose fd is closed: the frame keeps the program.
+ * bpf_testmod keeps a frame of a program whose fd is closed, and holds the program for it.
  * Another program has the frame resumed, and the continuation runs and frees it, or has
  * bpf_testmod free it, with interrupts off: the program goes with it.
  */

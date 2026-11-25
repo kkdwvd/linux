@@ -96,6 +96,11 @@ struct bpf_map_ops {
 	void (*map_free_pre_rcu)(struct bpf_map *map);
 	int (*map_get_next_key)(struct bpf_map *map, void *key, void *next_key);
 	void (*map_release_uref)(struct bpf_map *map);
+	/*
+	 * Have the kernel destroy the parked coroutine frames in all that the map has of values,
+	 * with bpf_obj_free_parked(). A map without it holds no such frames.
+	 */
+	void (*map_free_parked)(struct bpf_map *map);
 	void *(*map_lookup_elem_sys_only)(struct bpf_map *map, void *key);
 	int (*map_lookup_batch)(struct bpf_map *map, const union bpf_attr *attr,
 				union bpf_attr __user *uattr);
@@ -335,6 +340,12 @@ struct bpf_map {
 	atomic64_t writecnt;
 	spinlock_t owner_lock;
 	struct bpf_map_owner *owner;
+	/*
+	 * A map that can hold parked coroutine frames: the one program whose frames they are, see
+	 * bpf_record_holds_parked(). It and the programs that are bound to it use the map, and no
+	 * other program.
+	 */
+	struct bpf_prog_aux *coro_owner;
 	bool bypass_spec_v1;
 	bool frozen; /* write-once; write-protected by freeze_mutex */
 	bool free_after_mult_rcu_gp;
@@ -744,6 +755,10 @@ int map_check_no_btf(struct bpf_map *map,
 
 bool bpf_map_meta_equal(const struct bpf_map *meta0,
 			const struct bpf_map *meta1);
+
+int bpf_record_holds_parked(const struct btf_record *rec);
+unsigned long *bpf_record_parked_fields(const struct btf_record *rec);
+void bpf_obj_free_parked(const struct btf_record *rec, void *obj, const unsigned long *fields);
 
 static inline bool bpf_map_has_internal_structs(struct bpf_map *map)
 {
@@ -1936,6 +1951,15 @@ struct bpf_prog_aux {
 	struct bpf_trampoline *dst_trampoline;
 	enum bpf_prog_type saved_dst_prog_type;
 	enum bpf_attach_type saved_dst_attach_type;
+	/*
+	 * The program whose parked coroutine frames this one calls, and holds until it is freed
+	 * itself, see check_coro_callx()
+	 */
+	struct bpf_prog *coro_prog;
+	/* how often the kernel was given a parked frame of the program to destroy */
+	atomic_long_t coro_drops;
+	/* it parks frames: they are destroyed before it is freed, see bpf_coro_prog_release() */
+	bool coro_parks;
 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
 	bool dev_bound; /* Program is bound to the netdev. */
 	bool offload_requested; /* Program is bound and offloaded to the netdev. */
@@ -1943,7 +1967,6 @@ struct bpf_prog_aux {
 	bool attach_tracing_prog; /* true if tracing another tracing program */
 	bool tramp_linked; /* true if it was ever linked to a trampoline */
 	bool sleepable_async_cb; /* has a bpf_wq or bpf_task_work callback */
-	bool coro_parks; /* parks coroutine frames, see push_coro_suspend() */
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;

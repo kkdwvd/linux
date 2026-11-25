@@ -20,6 +20,7 @@
 #include <uapi/linux/btf.h>
 #include <linux/ctype.h>
 #include <linux/filter.h>
+#include <linux/bpf_coro.h>
 #include <linux/sched/signal.h>
 #include <linux/skbuff.h>
 #include <linux/static_call.h>
@@ -3610,6 +3611,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
 		bpf_cgroup_atype_put(aux->cgroup_atype);
 #endif
+	bpf_coro_prog_disown(aux->prog);
 	bpf_free_used_maps(aux);
 	bpf_free_used_btfs(aux);
 	bpf_prog_disassoc_struct_ops(aux->prog);
@@ -3635,6 +3637,13 @@ void bpf_prog_free(struct bpf_prog *fp)
 
 	if (aux->dst_prog)
 		bpf_prog_put(aux->dst_prog);
+	/*
+	 * Code of this program that may sleep has ended. Where the grace period for that was
+	 * the only one, the rest of it may still be in a read section of RCU, and the release
+	 * of that program waits for those before anything else, see bpf_coro_prog_release().
+	 */
+	if (aux->coro_prog)
+		bpf_prog_put(aux->coro_prog);
 	bpf_token_put(aux->token);
 	INIT_WORK(&aux->work, bpf_prog_free_deferred);
 	/*

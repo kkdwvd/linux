@@ -377,14 +377,14 @@ responsibility for its subsequent lifetime. Explicit ``KF_RELEASE`` retains
 its first-argument semantics and does not consume a ``__coro_frame`` first
 argument twice.
 
-A frame holds a reference on the program that allocated it until it is
-freed, so the program stays loaded while the kernel keeps one of its frames.
-A program holds the modules whose kfuncs it calls: a module cannot be
-unloaded while it keeps a frame of a program that calls its kfuncs, so it
-frees or resumes the frames it keeps on its own, not in its exit function.
-The reference is in a header in front of the frame: kernel code frees a frame
-with ``bpf_coro_frame_free()``, in any context, and never with ``kfree()`` or
-``kfree_nolock()``::
+A frame takes no reference on the program that allocated it. Kernel code
+that keeps a frame past the call that gave it one holds the program for as
+long as it has the frame, see ``__coro_suspend`` below. A program holds the
+modules whose kfuncs it calls: a module cannot be unloaded while it keeps a
+frame of a program that calls its kfuncs, so it frees or resumes the frames
+it keeps on its own, not in its exit function. A frame has a header in front
+of it: kernel code frees a frame with ``bpf_coro_frame_free()``, in any
+context, and never with ``kfree()`` or ``kfree_nolock()``::
 
         __bpf_kfunc void bpf_foo_done(void *frame__coro_frame)
         {
@@ -440,8 +440,17 @@ a program: not in the call that took the frame, nor in another kfunc that a
 program calls. A continuation that suspends its frame again to a kfunc that
 resumed it in the call would nest without bound. A kfunc that fails after
 taking the frame defers the resume too, with the error reported in memory
-the coroutine can see. The frame holds its reference on the program all
-along, so the kfunc takes none.
+the coroutine can see.
+
+A frame takes no reference on its program, so the kfunc holds the program
+for as long as it has the frame. Before it returns it takes a reference on
+``bpf_coro_frame_prog()`` with ``bpf_prog_inc_not_zero()``. That fails when
+the last reference of the calling program is gone and the program only runs
+until a grace period ends: the kfunc frees the frame at once then. It puts
+the reference after ``bpf_coro_run()`` or ``bpf_coro_frame_free()``, through
+a pointer to the program that it took before the call, since the frame is
+gone by then. A kfunc that keeps the frames of one program for an object of
+its own, a connection say, can hold the program once for the object.
 
 Or the kfunc frees the frame with ``bpf_coro_frame_free()`` without resuming
 it. That does not release the references that the coroutine keeps in the
@@ -1140,8 +1149,28 @@ after, in a context of the type.
 
 The call is in a read section of RCU, with no lock held and with IRQs on. If
 the kernel unwinds the continuation, its caller is unwound too. A continuation
-calls no parked frame, and neither does an extension program. A sleepable
-program, and one with a callback that may sleep, parks no frame.
+calls no parked frame, and neither does an extension program.
+
+A program that may sleep parks frames like any other. A continuation never
+sleeps, whichever program it is a part of and whichever calls it: what it calls
+is what a program that cannot sleep calls.
+
+A frame gets from one program to another through a map. A map whose values can
+hold a frame, in a field or in what a field leads to, belongs to the first
+program that uses it and is bound to no other program: the one that parks the
+frames. Any other program that uses the map is bound to that one when it is
+loaded, with ``coro_prog_fd`` of ``BPF_PROG_LOAD``, and does not load otherwise.
+A bound program holds the other one for as long as it is loaded itself, calls
+its frames, and parks none of its own. The map stays that program's until the
+program is freed, which is later than the day its last reference goes: code of
+it may run until then. Such a map is no inner map, and a list or an rbtree whose
+nodes can hold a frame is guarded by a ``bpf_spin_lock``.
+
+No frame keeps its program loaded. When the last reference of the program that
+parks is gone, the kernel calls the destroy function of every frame that is
+still parked, before anything of the program is freed. For that a map which
+holds frames is an array map or a preallocated hash map, and the destroy
+function of a parked frame suspends no frame.
 
 .. kernel-doc:: kernel/bpf/coro.c
    :identifiers: bpf_coro_park_xdp bpf_coro_park_syscall bpf_coro_drop_xdp bpf_coro_drop_syscall

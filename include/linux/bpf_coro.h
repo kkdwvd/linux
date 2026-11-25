@@ -3,12 +3,15 @@
  * BPF coroutine frames, and their resumption from the kernel.
  *
  * bpf_coro_frame_alloc() gives a program the frame that the compiler-generated code of a
- * coroutine keeps its state in. A header in front of the frame, which the program cannot
- * reach, holds a reference on the program: the program stays loaded while one of its frames
- * exists, whoever owns the frame. Whoever frees a frame does so with bpf_coro_frame_free(),
- * which drops the reference.
+ * coroutine keeps its state in. Whoever frees a frame does so with bpf_coro_frame_free().
+ * A frame takes no reference on its program: whoever can resume it holds the program, see
+ * kernel/bpf/coro.c.
  *
- * A kfunc that takes a frame through a __coro_suspend argument owns the frame from then on.
+ * A kfunc that takes a frame through a __coro_suspend argument owns the frame from then on,
+ * and takes a reference on the frame's program, bpf_coro_frame_prog(), before it returns,
+ * with bpf_prog_inc_not_zero(): the program is the caller's, and its last reference may be
+ * gone. The kfunc frees the frame at once then. It puts the reference when it has resumed or
+ * freed the frame, with a pointer to the program that it took before: the frame is gone.
  * The frame's first slot holds the address of the coroutine's resume function, a subprogram
  * taking the frame as its only argument, which the verifier checked as the continuation of
  * the suspend point. Once the event that the kfunc waits for has happened, the kfunc resumes
@@ -29,9 +32,15 @@
 
 #include <linux/types.h>
 
+struct bpf_prog;
+
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_coro_frame_free(void *frame);
+struct bpf_prog *bpf_coro_frame_prog(void *frame);
 bool bpf_coro_run(void *frame);
+bool bpf_coro_is_parked_dtor(void (*dtor)(void *));
+void bpf_coro_prog_disown(struct bpf_prog *prog);
+void bpf_coro_prog_release(struct bpf_prog *prog);
 #else
 static inline void bpf_coro_frame_free(void *frame)
 {
@@ -40,6 +49,19 @@ static inline void bpf_coro_frame_free(void *frame)
 static inline bool bpf_coro_run(void *frame)
 {
 	return false;
+}
+
+static inline bool bpf_coro_is_parked_dtor(void (*dtor)(void *))
+{
+	return false;
+}
+
+static inline void bpf_coro_prog_disown(struct bpf_prog *prog)
+{
+}
+
+static inline void bpf_coro_prog_release(struct bpf_prog *prog)
+{
 }
 #endif
 

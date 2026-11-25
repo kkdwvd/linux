@@ -24,7 +24,7 @@
  * of the program need.
  */
 struct bpf_coro_frame_hdr {
-	/* the program that allocated the frame, which the frame holds a reference on */
+	/* the program that allocated the frame, which is there for as long as the frame is */
 	struct bpf_prog *prog;
 	/* a parked frame that the kernel is to destroy, see bpf_coro_drop() */
 	struct llist_node drop;
@@ -38,83 +38,61 @@ static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
 }
 
 /*
- * The frames that hold the last reference on their program. bpf_prog_put() frees the
- * program then, which takes locks and queues work: a program in NMI, or one that traces the
- * code holding such a lock, may do neither. irq_work does it in their place. Such a frame is
- * dead, and its first 8 bytes link it into the list, see bpf_coro_frame_alloc().
+ * The lifetime of a frame.
+ *
+ * A frame takes no reference on its program: its allocation and its free write nothing that
+ * another CPU reads. What keeps the image of the program for as long as one of its frames can
+ * be resumed or destroyed is whoever can do that:
+ * - The program itself, while it runs.
+ * - A kfunc that keeps the frame it suspends, see bpf_coro_run(): it takes a reference on
+ *   bpf_coro_frame_prog() before it returns, and puts it when it has resumed or freed the
+ *   frame.
+ * - A program that takes a parked frame out of a map and calls it, see "Parked frames" below:
+ *   it is the frame's program, or it is bound to that program and holds it, see
+ *   claim_coro_maps() in verifier.c.
+ * - The kernel, which destroys the parked frames that a program drops or leaves behind: the
+ *   program is not freed before that is done, see bpf_coro_prog_release().
  */
-struct bpf_coro_free_list {
-	struct llist_head frames;
-	struct irq_work work;
-};
-
-static void bpf_coro_free_deferred(struct irq_work *work)
-{
-	struct bpf_coro_free_list *list = container_of(work, struct bpf_coro_free_list, work);
-	struct llist_node *node, *next;
-	struct bpf_coro_frame_hdr *hdr;
-
-	llist_for_each_safe(node, next, llist_del_all(&list->frames)) {
-		hdr = bpf_coro_frame_hdr(node);
-		bpf_prog_put(hdr->prog);
-		kfree_nolock(hdr);
-	}
-}
-
-static DEFINE_PER_CPU(struct bpf_coro_free_list, bpf_coro_free_lists) = {
-	.frames = LLIST_HEAD_INIT(frames),
-	.work = IRQ_WORK_INIT(bpf_coro_free_deferred),
-};
-
 __bpf_kfunc_start_defs();
 
 /*
  * Coroutine frames are heap memory whose contents the verifier tracks slot by slot like the
  * program stack, see PTR_TO_CORO_FRAME. The size is a verifier-checked constant, so the
- * allocation and the tracked size agree, except that a frame has room for the llist_node of
- * its free. The frame holds a reference on the program: a program whose last reference is
- * gone, and which only runs until a grace period ends, gets no frame.
+ * allocation and the tracked size agree. A program whose last reference is gone, and which
+ * only runs until a grace period ends, gets no frame: so does the destroy function of a frame
+ * that such a program left parked, and bpf_coro_prog_release() comes to an end.
  */
 __bpf_kfunc void *bpf_coro_frame_alloc(u64 size__k, void *ctx__ign, struct bpf_prog_aux *aux)
 {
 	struct bpf_coro_frame_hdr *hdr;
-	struct bpf_prog *prog;
 
-	hdr = kmalloc_nolock(sizeof(*hdr) + max_t(u64, size__k, sizeof(struct llist_node)),
-			     __GFP_ACCOUNT, NUMA_NO_NODE);
+	if (unlikely(!atomic64_read(&aux->refcnt)))
+		return NULL;
+	hdr = kmalloc_nolock(sizeof(*hdr) + size__k, __GFP_ACCOUNT, NUMA_NO_NODE);
 	if (!hdr)
 		return NULL;
-	prog = bpf_prog_inc_not_zero(aux->prog);
-	if (IS_ERR(prog)) {
-		kfree_nolock(hdr);
-		return NULL;
-	}
-	hdr->prog = prog;
+	hdr->prog = aux->prog;
 	return hdr + 1;
 }
 
-/*
- * Free a frame and drop its reference on the program. It is the kfunc, and what kernel code
- * frees a frame with: it may be called in any context.
- */
+/* Free a frame. It is the kfunc, and what kernel code frees a frame with, in any context. */
 __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
 {
-	struct bpf_coro_frame_hdr *hdr = bpf_coro_frame_hdr(p__coro_frame);
-	struct bpf_coro_free_list *list;
-
-	/* Not the last reference: the program stays, and the memory goes at once. */
-	if (atomic64_add_unless(&hdr->prog->aux->refcnt, -1, 1)) {
-		kfree_nolock(hdr);
-		return;
-	}
-	/* The work frees what is on its own list, so the list of any CPU will do. */
-	list = raw_cpu_ptr(&bpf_coro_free_lists);
-	llist_add(p__coro_frame, &list->frames);
-	irq_work_queue(&list->work);
+	kfree_nolock(bpf_coro_frame_hdr(p__coro_frame));
 }
 EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
 
 __bpf_kfunc_end_defs();
+
+/*
+ * The program of @frame, for the kfunc that keeps the frame: it holds the program for as long as
+ * it has the frame, see "The lifetime of a frame" above.
+ */
+struct bpf_prog *bpf_coro_frame_prog(void *frame)
+{
+	return bpf_coro_frame_hdr(frame)->prog;
+}
+EXPORT_SYMBOL_GPL(bpf_coro_frame_prog);
 
 /* The task that runs bpf_coro_run() on this CPU at each context level, see bpf_coro_run(). */
 struct bpf_coro_runners {
@@ -138,7 +116,7 @@ static int bpf_coro_run_level(void)
 
 /*
  * Resume the coroutine of @frame: call the resume function in its first slot with the frame
- * as its argument. It is a subprogram of the program that the frame holds a reference on, and
+ * as its argument. It is a subprogram of the program of the frame, which the caller holds, and
  * runs like any invocation of the program, under RCU with migration disabled, in a context
  * where the kfuncs of the program type are valid, which the caller sees to. Like the call of
  * any async callback it is an invocation of its own for the time of may_goto, see
@@ -151,10 +129,10 @@ static int bpf_coro_run_level(void)
  * call of a program that no bpf_coro_run() entered, nor one that nests while another task's
  * call of this CPU, which was preempted, holds the task level.
  *
- * The continuation owns the frame and may free it, and with it the reference that keeps the
- * program loaded. A program is freed after a grace period of RCU, or of RCU Tasks Trace if it
- * runs sleepable, see __bpf_prog_put_noref(): the call and what follows it here are in a read
- * section of the one that applies.
+ * The continuation owns the frame and may free it. The caller puts its reference on the
+ * program after the call, which may be the last one: a program is freed after a grace period
+ * of RCU, or of RCU Tasks Trace if it runs sleepable, see __bpf_prog_put_noref(), and the call
+ * and what follows it here are in a read section of the one that applies.
  *
  * The call has a landing pad, like the call of a helper whose callback may unwind, see
  * bpf_call_cb(). The verifier has a continuation leave with kexit when the kernel unwinds it,
@@ -224,10 +202,16 @@ EXPORT_SYMBOL_GPL(bpf_coro_run);
  *
  * Where no program calls the destroy function the kernel does: bpf_coro_drop_xdp() and
  * bpf_coro_drop_syscall() for a program that is not of the type the frame was parked for, or
- * that a landing pad stands in for, and the destructors of the kptr fields when a map or an
- * object goes with a frame in it. That may be in any context, so the frame waits on a list of
- * the CPU for a work item in a context of the type: softirq with a network context for XDP,
- * a kernel thread for a syscall program.
+ * that a landing pad stands in for, the destructors of the kptr fields when an object goes
+ * with a frame in it, and bpf_coro_prog_release() for all that is left when the program of
+ * the frames goes. That may be in any context, so the frame waits on a list of the CPU for a
+ * work item in a context of the type: softirq with a network context for XDP, a kernel thread
+ * for a syscall program.
+ *
+ * The program that calls a frame is the frame's own or holds it, see "The lifetime of a
+ * frame" above. A frame goes from one program to another through a map only, so a map whose
+ * values can hold frames has one owner, the program that parks them, and is used by that
+ * program and by the programs that are bound to it, see claim_coro_maps() in verifier.c.
  */
 struct bpf_coro_xdp {
 };
@@ -283,10 +267,87 @@ static DEFINE_PER_CPU(struct bpf_coro_drops, bpf_coro_drops_syscall) = {
 	.irq_work = IRQ_WORK_INIT(bpf_coro_drop_irq_work),
 };
 
+/* The work destroys what is on its own list, so the list of any CPU will do. */
 static void bpf_coro_drop(void *frame, struct bpf_coro_drops *drops)
 {
-	llist_add(&bpf_coro_frame_hdr(frame)->drop, &drops->frames);
+	struct bpf_coro_frame_hdr *hdr = bpf_coro_frame_hdr(frame);
+
+	/* first, see bpf_coro_prog_release() */
+	atomic_long_inc(&hdr->prog->aux->coro_drops);
+	llist_add(&hdr->drop, &drops->frames);
 	irq_work_queue(&drops->irq_work);
+}
+
+/* All that was given to bpf_coro_drop() is destroyed, as far as it has got to its list. */
+static void bpf_coro_drops_flush(void)
+{
+	struct bpf_coro_drops *drops;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		drops = &per_cpu(bpf_coro_drops_xdp, cpu);
+		irq_work_sync(&drops->irq_work);
+		flush_work(&drops->work);
+		drops = &per_cpu(bpf_coro_drops_syscall, cpu);
+		irq_work_sync(&drops->irq_work);
+		flush_work(&drops->work);
+	}
+}
+
+/**
+ * bpf_coro_prog_release - destroy the parked frames of a program whose last reference is gone
+ * @prog: the program, which parks frames
+ *
+ * No frame holds the program, so nothing but this stands between a parked frame and the day
+ * on which its functions are freed. Whatever could call one is going: the programs that are
+ * bound to @prog held it until they were freed, and what still runs of them and of @prog
+ * itself ends with a grace period. The frames are in the maps that @prog owns, see
+ * claim_coro_maps() in verifier.c, or on their way out of one, in a destructor or on a list of
+ * bpf_coro_drop(). The kernel destroys them all, in the context of their type, while all of
+ * @prog is still there.
+ *
+ * A destroy function is code of @prog, and may move another frame from one value to another,
+ * or drop one. So this looks again until a round finds nothing: no frame in a map, and no
+ * frame given to bpf_coro_drop() from before the round began until all that was on the lists
+ * when it ended has been destroyed. bpf_coro_drop() counts first, in a section that a grace
+ * period waits for. Then no code of @prog has run in the round, nothing has moved, and there
+ * is no frame. That round comes: a destroy function gets no new frame, see
+ * bpf_coro_frame_alloc(), and suspends none, see push_coro_suspend() in verifier.c, so each
+ * one that runs leaves one frame less.
+ *
+ * Process context, in which it sleeps.
+ */
+void bpf_coro_prog_release(struct bpf_prog *prog)
+{
+	struct bpf_prog_aux *aux = prog->aux;
+	struct bpf_map *map;
+	long drops;
+	u32 i;
+
+	/*
+	 * Code of it that may sleep, the program or an async callback, holds frames in a read
+	 * section of RCU Tasks Trace: they are back in a map, or on a list, when it has ended.
+	 */
+	if (bpf_prog_runs_sleepable(prog))
+		synchronize_rcu_tasks_trace();
+	do {
+		drops = atomic_long_read(&aux->coro_drops);
+		synchronize_rcu();
+		bpf_coro_drops_flush();
+		/* for the objects that go with their frames, see __bpf_obj_drop_impl() */
+		migrate_disable();
+		for (i = 0; i < aux->used_map_cnt; i++) {
+			map = aux->used_maps[i];
+			if (READ_ONCE(map->coro_owner) == aux)
+				map->ops->map_free_parked(map);
+		}
+		migrate_enable();
+		/* something was found: it is on a list now, and the next round begins with it */
+		if (drops != atomic_long_read(&aux->coro_drops))
+			continue;
+		synchronize_rcu();
+		bpf_coro_drops_flush();
+	} while (drops != atomic_long_read(&aux->coro_drops));
 }
 
 __bpf_kfunc_start_defs();
@@ -297,7 +358,8 @@ __bpf_kfunc_start_defs();
  *
  * The frame is the program's again, as a pointer that it can keep in a kptr field. The resume
  * and the destroy function in its first two slots are verified as code of an XDP program from
- * here on, whatever program this is, and an XDP program that holds the pointer calls them.
+ * here on, whatever program this is, and an XDP program that holds the pointer calls them:
+ * this program, or one that is bound to it and takes the pointer out of a map of this one.
  */
 __bpf_kfunc struct bpf_coro_xdp *bpf_coro_park_xdp(void *frame__coro_suspend)
 {
@@ -324,7 +386,7 @@ __bpf_kfunc struct bpf_coro_syscall *bpf_coro_park_syscall(void *frame__coro_sus
  */
 __bpf_kfunc void bpf_coro_drop_xdp(struct bpf_coro_xdp *coro)
 {
-	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_xdp));
+	bpf_coro_drop(coro, raw_cpu_ptr(&bpf_coro_drops_xdp));
 }
 
 /**
@@ -335,23 +397,50 @@ __bpf_kfunc void bpf_coro_drop_xdp(struct bpf_coro_xdp *coro)
  */
 __bpf_kfunc void bpf_coro_drop_syscall(struct bpf_coro_syscall *coro)
 {
-	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_syscall));
+	bpf_coro_drop(coro, raw_cpu_ptr(&bpf_coro_drops_syscall));
 }
 
 /* The destructors of kptr fields that hold a parked frame */
 __bpf_kfunc void bpf_coro_xdp_dtor(void *coro)
 {
-	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_xdp));
+	bpf_coro_drop(coro, raw_cpu_ptr(&bpf_coro_drops_xdp));
 }
 CFI_NOSEAL(bpf_coro_xdp_dtor);
 
 __bpf_kfunc void bpf_coro_syscall_dtor(void *coro)
 {
-	bpf_coro_drop(coro, this_cpu_ptr(&bpf_coro_drops_syscall));
+	bpf_coro_drop(coro, raw_cpu_ptr(&bpf_coro_drops_syscall));
 }
 CFI_NOSEAL(bpf_coro_syscall_dtor);
 
 __bpf_kfunc_end_defs();
+
+/* Does a kptr field with destructor @dtor hold a parked frame? See bpf_record_holds_parked(). */
+bool bpf_coro_is_parked_dtor(void (*dtor)(void *))
+{
+	return dtor == bpf_coro_xdp_dtor || dtor == bpf_coro_syscall_dtor;
+}
+
+/*
+ * @prog is freed, and the maps that could hold its parked frames, see claim_coro_maps() in
+ * verifier.c, are nobody's again: no frame of it is left, see bpf_coro_prog_release(), and no
+ * program that could put one there.
+ *
+ * Not at its last put: code of it may run on until a grace period ends, and would find the
+ * frames of the next owner in the map, which it does not hold: it could keep one past that
+ * owner's release. bpf_prog_free_deferred() calls this where it gives up the maps of the
+ * program altogether, behind the grace period of __bpf_prog_put_noref(): nothing of the
+ * program runs there that could use a map, or the map itself would go under it. A program
+ * that did not load never ran.
+ */
+void bpf_coro_prog_disown(struct bpf_prog *prog)
+{
+	struct bpf_prog_aux *aux = prog->aux;
+	u32 i;
+
+	for (i = 0; i < aux->used_map_cnt; i++)
+		cmpxchg(&aux->used_maps[i]->coro_owner, aux, NULL);
+}
 
 BTF_KFUNCS_START(bpf_coro_park_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_coro_park_xdp, KF_ACQUIRE)

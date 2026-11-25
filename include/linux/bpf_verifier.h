@@ -972,6 +972,12 @@ struct bpf_func_state {
 	 * is verified on its own.
 	 */
 	u8 coro_prog_type;
+	/*
+	 * Of the first frame: it is the destroy function of a parked coroutine frame, or a
+	 * function that one calls and that is verified on its own. It suspends no frame, see
+	 * push_coro_suspend().
+	 */
+	bool coro_destroy;
 	);
 	bool no_stack_arg_load;
 	/*

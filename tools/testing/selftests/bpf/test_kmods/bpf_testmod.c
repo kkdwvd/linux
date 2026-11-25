@@ -338,6 +338,9 @@ __bpf_kfunc int bpf_kfunc_coro_frames_stack(void *a__coro_frame, u64 b, u64 c,
  * program types that may suspend are valid: tc and syscall programs. What became of the
  * resume of an id is in bpf_testmod_coro_results until the next suspension with the id: the
  * lock keeps the two together, so a result is never that of an earlier frame.
+ *
+ * A frame takes no reference on its program. bpf_testmod holds the program for every frame
+ * that it has, from the kfunc that takes the frame until the frame is resumed or freed.
  */
 #define BPF_TESTMOD_CORO_IDS 16
 
@@ -348,8 +351,26 @@ static int bpf_testmod_coro_results[BPF_TESTMOD_CORO_IDS] = {
 	[0 ... BPF_TESTMOD_CORO_IDS - 1] = -ENOENT,
 };
 
+/* False if the program of @frame is going: the frame is freed. */
+static bool bpf_testmod_coro_hold(void *frame)
+{
+	if (!IS_ERR(bpf_prog_inc_not_zero(bpf_coro_frame_prog(frame))))
+		return true;
+	bpf_coro_frame_free(frame);
+	return false;
+}
+
+static void bpf_testmod_coro_free(void *frame)
+{
+	struct bpf_prog *prog = bpf_coro_frame_prog(frame);
+
+	bpf_coro_frame_free(frame);
+	bpf_prog_put(prog);
+}
+
 static void bpf_testmod_coro_resume(struct work_struct *work)
 {
+	struct bpf_prog *prog;
 	unsigned long flags;
 	void *frame;
 	int id, ret;
@@ -361,6 +382,8 @@ static void bpf_testmod_coro_resume(struct work_struct *work)
 		raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
 		if (!frame)
 			continue;
+		/* the continuation frees the frame, or gives it to a kfunc again */
+		prog = bpf_coro_frame_prog(frame);
 		ret = bpf_coro_run(frame);
 		raw_spin_lock_irqsave(&bpf_testmod_coro_lock, flags);
 		/*
@@ -370,12 +393,13 @@ static void bpf_testmod_coro_resume(struct work_struct *work)
 		if (!bpf_testmod_coro_frames[id])
 			smp_store_release(&bpf_testmod_coro_results[id], ret);
 		raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
+		bpf_prog_put(prog);
 	}
 }
 
 static DECLARE_WORK(bpf_testmod_coro_work, bpf_testmod_coro_resume);
 
-/* Have @frame resumed soon. A frame that is not resumed is freed. */
+/* Have @frame, whose program is held, resumed soon. A frame that is not resumed is freed. */
 static int bpf_testmod_coro_queue(u32 id, void *frame)
 {
 	unsigned long flags;
@@ -389,7 +413,7 @@ static int bpf_testmod_coro_queue(u32 id, void *frame)
 	}
 	raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
 	if (busy) {
-		bpf_coro_frame_free(frame);
+		bpf_testmod_coro_free(frame);
 		return -EBUSY;
 	}
 	queue_work(system_bh_highpri_wq, &bpf_testmod_coro_work);
@@ -406,20 +430,27 @@ __bpf_kfunc int bpf_kfunc_coro_suspend(u32 id, void *frame__coro_suspend)
 		bpf_coro_frame_free(frame__coro_suspend);
 		return -EINVAL;
 	}
+	if (!bpf_testmod_coro_hold(frame__coro_suspend))
+		return -ENOENT;
 	return bpf_testmod_coro_queue(id, frame__coro_suspend);
 }
 
 /*
  * Keep @frame__coro_suspend until bpf_kfunc_coro_resume_kept() or bpf_kfunc_coro_free_kept(),
- * which a test calls from another program: the frame outlives the program's file descriptor.
- * One at a time for an id, -EBUSY frees another one at once.
+ * which a test calls from another program: the frame outlives the program's file descriptor,
+ * and the program stays with it. One at a time for an id, -EBUSY frees another one at once.
  */
 __bpf_kfunc int bpf_kfunc_coro_keep(u32 id, void *frame__coro_suspend)
 {
-	if (id >= BPF_TESTMOD_CORO_IDS ||
-	    cmpxchg(&bpf_testmod_coro_kept[id], NULL, frame__coro_suspend)) {
+	if (id >= BPF_TESTMOD_CORO_IDS) {
 		bpf_coro_frame_free(frame__coro_suspend);
-		return id >= BPF_TESTMOD_CORO_IDS ? -EINVAL : -EBUSY;
+		return -EINVAL;
+	}
+	if (!bpf_testmod_coro_hold(frame__coro_suspend))
+		return -ENOENT;
+	if (cmpxchg(&bpf_testmod_coro_kept[id], NULL, frame__coro_suspend)) {
+		bpf_testmod_coro_free(frame__coro_suspend);
+		return -EBUSY;
 	}
 	return 0;
 }
@@ -452,7 +483,7 @@ __bpf_kfunc int bpf_kfunc_coro_free_kept(u32 id)
 	if (!frame)
 		return -ENOENT;
 	local_irq_save(flags);
-	bpf_coro_frame_free(frame);
+	bpf_testmod_coro_free(frame);
 	local_irq_restore(flags);
 	return 0;
 }
@@ -2885,7 +2916,7 @@ static void bpf_testmod_exit(void)
 	tasklet_kill(&ctx_check_tasklet);
 
 	bpf_kfunc_close_sock();
-	/* A frame that is kept or queued holds its program, which holds this module. */
+	/* The program of a frame that is kept or queued is held, and holds this module. */
 	flush_work(&bpf_testmod_coro_work);
 	sysfs_remove_bin_file(kernel_kobj, &bin_attr_bpf_testmod_file);
 	unregister_bpf_testmod_uprobe();

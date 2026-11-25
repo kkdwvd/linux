@@ -12929,6 +12929,7 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	callee->in_rcu_callback_fn = in_rcu_callback(env);
 	/* nor is the continuation that makes it code of another type of program */
 	callee->coro_prog_type = state->frame[0]->coro_prog_type;
+	callee->coro_destroy = state->frame[0]->coro_destroy;
 	/*
 	 * What a frame that the kernel unwinds calls gets other arguments than the calls of the
 	 * normal path do: a landing pad has 0 in R0 where the program has the object that it
@@ -16811,6 +16812,7 @@ __process_kf_arg_ptr_to_graph_root(struct bpf_verifier_env *env,
 	struct btf_field *field;
 	struct btf_record *rec;
 	u32 head_off;
+	int err;
 
 	if (meta->btf != btf_vmlinux) {
 		verifier_bug(env, "unexpected btf mismatch in kfunc call");
@@ -16840,6 +16842,19 @@ __process_kf_arg_ptr_to_graph_root(struct bpf_verifier_env *env,
 	if (check_reg_allocation_locked(env, reg)) {
 		verbose(env, "bpf_spin_lock at off=%d must be held for %s\n",
 			rec->spin_lock_off, head_type_name);
+		return -EINVAL;
+	}
+	/*
+	 * Nothing empties what a bpf_res_spin_lock guards when its value or its object goes,
+	 * see bpf_obj_free_fields(), nor when the program of the frames in it does, see
+	 * bpf_obj_free_parked(): a frame there would outlive its program.
+	 */
+	err = rec->spin_lock_off < 0 ? bpf_record_holds_parked(field->graph_root.value_rec) : 0;
+	if (err < 0)
+		return err;
+	if (err) {
+		verbose(env, "a %s whose nodes can hold a parked coro_frame has to be guarded by a bpf_spin_lock\n",
+			head_type_name);
 		return -EINVAL;
 	}
 
@@ -17638,9 +17653,13 @@ static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bp
 	}
 }
 
-/* Verify subprog 'subprog' as the continuation of the suspended 'frame'. */
+/*
+ * Verify subprog 'subprog' as the continuation of the suspended 'frame'. @destroy: it is in the
+ * second slot.
+ */
 static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
-			       struct bpf_reference_state *frame, u32 *moved, int nr_moved)
+			       struct bpf_reference_state *frame, u32 *moved, int nr_moved,
+			       bool destroy)
 {
 	enum bpf_prog_type type = coro_park_type(&env->prog->insnsi[insn_idx]);
 	struct bpf_subprog_info *info = &env->subprog_info[subprog];
@@ -17716,6 +17735,7 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	 */
 	type = type ?: state_prog_type(env, cur);
 	callee->coro_prog_type = type == resolve_prog_type(env->prog) ? 0 : type;
+	callee->coro_destroy = parked && destroy;
 	callee->callback_ret_range = retval_range(0, 0);
 
 	/*
@@ -17757,6 +17777,15 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 
 	if (verifier_bug_if(!frame, env, "suspended coro_frame %d has no slots", id))
 		return -EFAULT;
+	/*
+	 * The kernel calls the destroy function of every parked frame that is left when its
+	 * program goes, and waits until none is, see bpf_coro_prog_release(): the function ends
+	 * the coroutine.
+	 */
+	if (cur->frame[0]->coro_destroy) {
+		verbose(env, "the destroy function of a parked coro_frame cannot suspend a coro_frame\n");
+		return -EINVAL;
+	}
 	/* one function: only that one is verified from the snapshot, see mark_reg_func_set() */
 	if (frame->nr_slots < 1 || !bpf_is_spilled_reg(&frame->slots[0]) ||
 	    frame->slots[0].spilled_ptr.type != PTR_TO_FUNC ||
@@ -17807,20 +17836,24 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 	/*
 	 * A parked frame is called by a program that holds it, see check_coro_callx(), or
 	 * destroyed by the kernel when nothing does, see bpf_coro_drop(): it needs both functions.
-	 * Whoever calls them is in a read section of RCU and nothing more. That keeps a program
-	 * which is freed after a grace period of RCU, and not one that is freed after one of
-	 * RCU Tasks Trace: a sleepable program, or one with a callback that may sleep, which is
-	 * known when the pass is over, see mark_sleepable_async_cb().
+	 * Whoever calls them is in a read section of RCU. The continuation is verified as code
+	 * that does not sleep, see push_coro_resume_cb(), also where the code that parks may:
+	 * a sleepable program and a callback that may sleep park like any other code.
 	 */
 	if (coro_park_type(&env->prog->insnsi[insn_idx])) {
 		if (destroy < 0) {
 			verbose(env, "parked coro_frame has no destroy function in its second slot\n");
 			return -EINVAL;
 		}
-		if (env->prog->sleepable) {
-			verbose(env, "a sleepable program cannot park a coro_frame\n");
+		/*
+		 * Every frame that such a program takes out of a map is one of the program that
+		 * it holds. Its own would be called by that one, which does not hold it.
+		 */
+		if (env->prog->aux->coro_prog) {
+			verbose(env, "a program that is bound to the coroutines of another program cannot park a coro_frame\n");
 			return -EINVAL;
 		}
+		/* the frames that it leaves parked are destroyed when it goes */
 		env->prog->aux->coro_parks = true;
 	}
 
@@ -17829,12 +17862,13 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 	 * see push_callback_call(): it runs only if the call did.
 	 */
 	if (!cur->speculative) {
-		err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved);
+		err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved,
+					  destroy == resume);
 		if (err)
 			return err;
 	}
 	if (!cur->speculative && destroy >= 0 && destroy != resume) {
-		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved);
+		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved, true);
 		if (err)
 			return err;
 	}
@@ -25908,6 +25942,44 @@ next_insn:
 	return claim_used_maps(env);
 }
 
+/*
+ * A parked coroutine frame takes no reference on its program, see kernel/bpf/coro.c, and
+ * whoever takes one out of a map may call it, see check_coro_callx(). So a map that can hold
+ * such frames is that of one program, the first one that uses it and is bound to none. It is
+ * the one whose frames they are: it parks them, and so does none of the programs that are bound
+ * to it and hold it, which use the map too. No other program does. Whatever calls a frame is
+ * the frame's program then, or holds it.
+ */
+static int claim_coro_maps(struct bpf_verifier_env *env)
+{
+	struct bpf_prog_aux *aux = env->prog->aux, *owner, *old;
+	struct bpf_map *map;
+	int i, err;
+
+	owner = aux->coro_prog ? aux->coro_prog->aux : aux;
+	for (i = 0; i < env->used_map_cnt; i++) {
+		map = env->used_maps[i];
+		err = bpf_record_holds_parked(map->record);
+		if (err < 0)
+			return err;
+		if (!err)
+			continue;
+		old = READ_ONCE(map->coro_owner);
+		if (!old && owner == aux)
+			old = cmpxchg(&map->coro_owner, NULL, aux) ?: aux;
+		if (old == owner)
+			continue;
+		if (aux->coro_prog)
+			verbose(env, "map '%s' can hold parked coro_frames and is not a map of the program that this one is bound to\n",
+				map->name);
+		else
+			verbose(env, "map '%s' holds the parked coro_frames of another program, which this one is not bound to\n",
+				map->name);
+		return -EACCES;
+	}
+	return 0;
+}
+
 static int add_func_ptr(struct bpf_verifier_env *env, struct bpf_map *map, u32 map_off,
 			u32 xlated_off)
 {
@@ -26934,11 +27006,6 @@ reject:
 		restart_log(env, &log);
 	if (err && (!path_err || guess) && (limit || (env->for_log && !env->err)))
 		verbose(env, "the limit on cost or memory ended pass %u\n", env->pass);
-	/* see push_coro_suspend() */
-	if (!err && env->sleepable_async_cb && env->prog->aux->coro_parks) {
-		verbose(env, "a program with a callback that may sleep cannot park a coro_frame\n");
-		err = -EINVAL;
-	}
 	if (!err && env->sleepable_async_cb)
 		mark_sleepable_async_cb(env);
 	bpf_precision_free(env);
@@ -29099,6 +29166,10 @@ skip_full_check:
 	env->prog->aux->used_map_cnt = env->used_map_cnt;
 	env->prog->aux->used_btfs = env->used_btfs;
 	env->prog->aux->used_btf_cnt = env->used_btf_cnt;
+	/* what it has claimed is given back when it is freed, see bpf_coro_prog_disown() */
+	ret = claim_coro_maps(env);
+	if (ret)
+		goto err_release_maps;
 	if (env->used_map_cnt || env->used_btf_cnt) {
 		/* program is valid. Convert pseudo bpf_ld_imm64 into generic
 		 * bpf_ld_imm64 instructions
