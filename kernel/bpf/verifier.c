@@ -11667,6 +11667,8 @@ static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int calls
 	callee->entry_refs = state->acquired_refs;
 	callee->entry_rcu_locks = state->active_rcu_locks;
 	callee->entry_preempt_locks = state->active_preempt_locks;
+	callee->call_rcu_locks = state->active_rcu_locks;
+	callee->call_preempt_locks = state->active_preempt_locks;
 	err = set_callee_state_cb(env, caller, callee, callsite);
 	if (err)
 		goto err_out;
@@ -12190,6 +12192,8 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	callee->entry_refs = entry.acquired_refs;
 	callee->entry_rcu_locks = entry.active_rcu_locks;
 	callee->entry_preempt_locks = entry.active_preempt_locks;
+	callee->call_rcu_locks = entry.active_rcu_locks;
+	callee->call_preempt_locks = entry.active_preempt_locks;
 
 	account_current_path(env);
 	env->subprog_info[subprog].on_its_own = true;
@@ -22201,14 +22205,17 @@ static bool frame_is_top(const struct bpf_verifier_state *st)
 	       frame->in_exception_callback_fn;
 }
 
-/* The current frame of @st holds resources that it acquired since its entry */
+/*
+ * The current frame of @st holds resources that it acquired since its entry, or it is in other
+ * sections than it was called in: more of them, or fewer, where it has left one of a caller
+ */
 static bool frame_holds_resources(const struct bpf_verifier_state *st)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 
 	return st->acquired_refs != frame->entry_refs ||
-	       st->active_rcu_locks != frame->entry_rcu_locks ||
-	       st->active_preempt_locks != frame->entry_preempt_locks;
+	       st->active_rcu_locks != frame->call_rcu_locks ||
+	       st->active_preempt_locks != frame->call_preempt_locks;
 }
 
 /*
@@ -22482,12 +22489,14 @@ static void unmark_stack_obj(struct bpf_verifier_env *env, int id)
  * its entry. Do to the current state what the calls of the pad do to it, with the functions that
  * such a call of the program ends up in, and unmark_stack_obj(). The callers may have pointers that
  * are good as long as a lock or a section is held.
+ * @plan: the plan of the site that the state has visited. NULL at an access to arena where the
+ * frames hold nothing.
  */
-static int release_frame_resources(struct bpf_verifier_env *env)
+static int release_frame_resources(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = cur_func(env);
-	u32 refs = st->acquired_refs;
+	u32 rcu, preempt, refs = st->acquired_refs;
 	struct bpf_reference_state *ref;
 	int id, err;
 
@@ -22510,10 +22519,29 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 	/* a lock went, or an object was freed under the lock of a caller, who may point to it */
 	if (st->acquired_refs != refs)
 		invalidate_non_owning_refs(env);
-	st->active_rcu_locks = frame->entry_rcu_locks;
-	st->active_preempt_locks = frame->entry_preempt_locks;
+	/*
+	 * Where the pad releases the pointers: the locks and the irq flags of the frame are gone,
+	 * its sections are left, and those of the callers too if a release may sleep, see
+	 * bpf_pad_visit(). Only behind that the pad enters what is missing of the sections of the
+	 * call. The RCU pointers of the callers have to be good there, with what is still held.
+	 */
+	rcu = min(st->active_rcu_locks, frame->call_rcu_locks);
+	preempt = min(st->active_preempt_locks, frame->call_preempt_locks);
+	if (plan) {
+		rcu -= min(rcu, plan->outside[BPF_PAD_RCU]);
+		preempt -= min(preempt, plan->outside[BPF_PAD_PREEMPT]);
+	}
+	st->active_rcu_locks = rcu;
+	st->active_preempt_locks = preempt;
 	if (!in_rcu_cs(env))
 		invalidate_rcu_protected_refs(env);
+	/*
+	 * The sections of the call, whatever the frame did to them: the pad leaves what the frame
+	 * entered, and enters again what the frame left of its callers. So a caller is in the
+	 * sections that it was in when it made the call, wherever the callee was unwound.
+	 */
+	st->active_rcu_locks = frame->call_rcu_locks;
+	st->active_preempt_locks = frame->call_preempt_locks;
 	return 0;
 }
 
@@ -22665,7 +22693,8 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			goto out;
 	}
 
-	err = release_frame_resources(env);
+	/* at an access to arena the state has visited the plan in check_arena_site() */
+	err = release_frame_resources(env, bpf_pad_plan(&env->insn_aux_data[insn_idx], kind));
 	if (err)
 		goto out;
 	if (forced && env->has_throw) {

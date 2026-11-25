@@ -50,7 +50,8 @@
  * the number of sections. A call that the type of the program cannot make is a conflict, see
  * get_release(). The pad of a callee releases pointers under the locks of its callers. A call that
  * the program could not make there is a conflict too, except the free of an object that has only
- * memory to give back, see can_release_under_lock().
+ * memory to give back, see can_release_under_lock(). So is a release that may sleep where the pad
+ * cannot get to a sleepable context, see bpf_pad_visit().
  *
  * A state that is pruned or joined on the way does not get to the site. The state that it was found
  * within, or was joined with, visits for both. The pad is right for it too, because a plan is made
@@ -199,7 +200,33 @@
  * get a number, bpf_unwound_retval(), whatever the callee left and whether the program has
  * bpf_throw() or not. So a call can have a pad of each kind, and a subprog can be left in both ways.
  *
- * A section has no handle: the plan has their number. Every other resource that the frame
+ * A section has no handle: the plan has their number. A frame can also be in fewer sections than
+ * it was called in: a function that is called under a lock, drops it and takes it again, where the
+ * lock is a section with preemption disabled and a word in arena.
+ *
+ *	static void *grow(struct pool *pool)		grow:
+ *	{						   call bpf_preempt_enable
+ *		unlock(pool);				   ...
+ *		p = bpf_arena_alloc_pages(...);		   r1 = *(u64 *)(r0 + 0)
+ *		v = *p;					   unwind_goto pad
+ *		lock(pool);				   call bpf_preempt_disable
+ *		return p;				   exit
+ *	}					      pad: call bpf_preempt_disable
+ *							   r0 = 0
+ *							   r2 = 0
+ *							   kexit
+ *
+ * The pad ENTERS what the frame has left: the frame is unwound with the sections of its call,
+ * wherever it is left, and the pad of the caller leaves what the caller entered. A section can
+ * always be entered again, and nothing is read under it: only the count has to be right when the
+ * program ends. Without that the caller would be in one section more or less by the site at which
+ * the callee was left, and no store in the caller can follow what the callee does.
+ * A frame that has entered such a section again can hold what only a sleepable context may release.
+ * Its pad leaves the sections of the callers once more for that, see bpf_pad_visit().
+ * What a caller has that only a section protects is not kept by the count: where the pad releases
+ * the pointers it can be in no section at all, and the main pass looks at the state as it is there,
+ * see release_frame_resources() in verifier.c.
+ * Every other resource that the frame
  * acquired is an ENTRY of the plan. Its release takes a handle: the address of the lock, of
  * the irq flags. A PLACE is where the pad finds it: a register or a stack slot of the program that
  * is live at the site, a constant address. What is there may differ from the handle by a constant,
@@ -370,6 +397,11 @@ BTF_ID(func, bpf_local_irq_restore)
 BTF_ID(func, bpf_res_spin_unlock)
 BTF_ID(func, bpf_res_spin_unlock_irqrestore)
 
+/* The kfunc that enters a section, by enum bpf_pad_class */
+BTF_ID_LIST(pad_enter_kfuncs)
+BTF_ID(func, bpf_rcu_read_lock)
+BTF_ID(func, bpf_preempt_disable)
+
 /* They free an object of the program, and one per cpu */
 BTF_ID_LIST(pad_obj_drop)
 BTF_ID(func, bpf_obj_drop)
@@ -389,6 +421,12 @@ static struct bpf_insn release_call(enum bpf_pad_class class)
 	if (class == BPF_PAD_SPIN_LOCK)
 		return helper_call(BPF_FUNC_spin_unlock);
 	return BPF_CALL_KFUNC(0, pad_kfuncs[class]);
+}
+
+/* The insn of a pad that enters a section of @class once more */
+static struct bpf_insn enter_call(enum bpf_pad_class class)
+{
+	return BPF_CALL_KFUNC(0, pad_enter_kfuncs[class]);
 }
 
 static bool is_obj_drop(const struct bpf_insn *insn)
@@ -574,6 +612,18 @@ static int get_release(struct bpf_verifier_env *env, const struct bpf_insn *insn
 	return err ? BPF_CONFLICT_NO_RELEASE : 0;
 }
 
+/* May what @insn calls sleep? The program itself calls that in a sleepable context only. */
+static bool call_sleeps(struct bpf_verifier_env *env, const struct bpf_insn *insn)
+{
+	const struct bpf_func_proto *fn;
+	struct bpf_call_arg_meta meta;
+
+	if (bpf_helper_call(insn))
+		return !bpf_get_helper_proto(env, insn->imm, &fn) && fn->might_sleep;
+	return !bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta) &&
+	       bpf_is_kfunc_sleepable(&meta);
+}
+
 struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind)
 {
 	struct bpf_pad_plan *plan;
@@ -727,14 +777,56 @@ void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt)
 	}
 }
 
-/* How many sections of @class the current frame of @st has entered and not left */
-static u32 frame_sections(const struct bpf_verifier_state *st, enum bpf_pad_class class)
+/*
+ * How many sections of @class the current frame of @st is in beyond those that it was called in:
+ * what it entered and did not leave, and what a subprog that it called returned with. Less than 0
+ * if it has left sections of its callers, itself or in a subprog that returned.
+ */
+static int frame_sections(const struct bpf_verifier_state *st, enum bpf_pad_class class)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 
 	if (class == BPF_PAD_RCU)
-		return st->active_rcu_locks - frame->entry_rcu_locks;
-	return st->active_preempt_locks - frame->entry_preempt_locks;
+		return st->active_rcu_locks - frame->call_rcu_locks;
+	return st->active_preempt_locks - frame->call_preempt_locks;
+}
+
+/*
+ * How many sections of @class that its callers entered the current frame of @st is in when its pad
+ * gets to the pointers: the pad has left what the frame is in beyond the sections of its call
+ */
+static int caller_sections(const struct bpf_verifier_state *st, enum bpf_pad_class class)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+
+	if (class == BPF_PAD_RCU)
+		return min(st->active_rcu_locks, frame->call_rcu_locks);
+	return min(st->active_preempt_locks, frame->call_preempt_locks);
+}
+
+/*
+ * Can the pad of the current frame of @st call what may sleep when it gets to the pointers? The
+ * program can where it is sleepable, holds no lock and no irq flags and is in no section, see
+ * in_sleepable_context() in verifier.c. The pad has released the locks and the irq flags of the
+ * frame by then and has left its sections. What the callers hold is still held.
+ * @leaves: the pad leaves the sections of the callers as well, see bpf_pad_visit(). Only if the
+ * frame has been out of all of them since its call: entry_rcu_locks and entry_preempt_locks are
+ * the fewest that it has been in, see release_context_state(), and have to be 0 either way.
+ */
+static bool pad_can_sleep(const struct bpf_verifier_state *st, bool leaves)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int i;
+
+	if (!st->in_sleepable || frame->entry_rcu_locks || frame->entry_preempt_locks)
+		return false;
+	for (i = 0; i <= st->curframe; i++)
+		if (st->frame[i]->in_rcu_callback_fn)
+			return false;
+	for (i = 0; i < frame->entry_refs; i++)
+		if (st->refs[i].type != REF_TYPE_PTR)
+			return false;
+	return leaves || (!caller_sections(st, BPF_PAD_RCU) && !caller_sections(st, BPF_PAD_PREEMPT));
 }
 
 /* The class of @ref */
@@ -1494,6 +1586,8 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 			if (ref->type == REF_TYPE_PTR &&
 			    (err == BPF_CONFLICT_NO_PLACE || err == BPF_CONFLICT_CALLER_SAVED)) {
 				plan->no_place = err;
+				/* nothing here says what releases it: see settle_plan() */
+				plan->no_place_atomic |= !pad_can_sleep(st, false);
 				continue;
 			}
 			if (err)
@@ -1565,8 +1659,20 @@ static bool state_is_in_kpad(const struct bpf_verifier_state *st)
  * The current frame of @st is about to be unwound at the site of @kind at @insn_idx. Make the plan
  * of the site serve @st too. A visit at which the frame holds nothing is a visit like any other.
  *
- * Sections: the pad leaves as many as the frame has entered. That is a number of calls in the
- * code of the pad, so it has to be the same on all visits, or the function gets hidden slots.
+ * Sections: the pad leaves as many as the frame has entered, and enters as many as the frame has
+ * left of its callers, see frame_sections(). That is a number of calls in the code of the pad, so
+ * it has to be the same on all visits, or the function gets hidden slots.
+ *
+ * A release may sleep: bpf_iter_kmem_cache_destroy(). A frame can hold such a thing in a section
+ * of a caller: it left the section, made the iterator and entered the section again. Then the pad
+ * leaves the sections of the callers too ahead of the pointers and enters them again behind the
+ * pointers: 'outside' of the plan, as many as the frame is in at the site. The frame has been out
+ * of each of them since its call, or there is a conflict, see pad_can_sleep(): the pad takes
+ * nothing from the callers that the frame has not taken before. The frame need not have been out
+ * of all of them at once, so the main pass does to the state what the pad does, see
+ * release_frame_resources() in verifier.c: the callers do not trust their RCU pointers behind the
+ * call. A state that holds nothing of the kind is not told, and its frame may never have left
+ * the sections: 'outside' is 0 for it, and it has to be the same on all visits.
  *
  * Returns the plan. It tells whether there is a conflict.
  */
@@ -1574,9 +1680,10 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   const struct bpf_verifier_state *st, int insn_idx,
 				   enum bpf_site_kind kind)
 {
+	const struct bpf_pad_ent *ent;
 	struct bpf_pad_plan *plan;
-	u32 class, nr;
-	int err;
+	int i, class, nr, out, err;
+	bool sleeps = false;
 
 	plan = bpf_pad_plan_get(env, insn_idx, kind);
 	if (!plan)
@@ -1592,13 +1699,27 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	if (err < 0)
 		return ERR_PTR(err);
 	plan->conflict = err;
+	for (i = 0; !err && i < plan->nr_ents; i++) {
+		ent = &plan->ents[i];
+		if (ent->ref < 0 || ent->class < BPF_PAD_REF || !call_sleeps(env, &ent->release))
+			continue;
+		sleeps = true;
+		/* an iterator that RCU protects is destroyed ahead of all else, see enum pad_turn */
+		if (ent->rcu || !pad_can_sleep(st, true))
+			plan->conflict = BPF_CONFLICT_NO_RELEASE;
+	}
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++) {
 		nr = frame_sections(st, class);
-		if (nr > BPF_PAD_MAX_SECTIONS)
+		out = sleeps ? caller_sections(st, class) : 0;
+		if (abs(nr) + 2 * out > BPF_PAD_MAX_SECTIONS)
 			plan->conflict = BPF_CONFLICT_TOO_MUCH;
 		else if (plan->visited && plan->sections[class] != nr)
 			plan->sections_differ |= BIT(class);
+		/* no hidden slot tells how many sections of its callers a frame is in */
+		if (plan->visited && plan->outside[class] != out && !plan->conflict)
+			plan->conflict = BPF_CONFLICT_SECTIONS_DIFFER;
 		plan->sections[class] = nr;
+		plan->outside[class] = out;
 	}
 	plan->visited = true;
 	return plan;
@@ -2059,8 +2180,8 @@ void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class
 	};
 
 	if (enter)
-		note_acquire(env, sub, env->insn_idx, &ent, 0, frame_sections(st, class));
-	else if (frame_sections(st, class))
+		note_acquire(env, sub, env->insn_idx, &ent, 0, max(frame_sections(st, class), 0));
+	else if (frame_sections(st, class) > 0)
 		note_release(env, sub, class, 0, 0);
 	else
 		released_of_caller(env, class_group(class));
@@ -2160,6 +2281,7 @@ static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
  * it, see in_rcu_cs(). So it goes under the locks of the frame, see can_release_under_lock().
  */
 enum pad_turn {
+	/* the sections of callers that the frame left are entered behind all three */
 	PAD_TURN_RCU_ITERS,
 	PAD_TURN_LOCKS,
 	PAD_TURN_POINTERS,
@@ -2170,6 +2292,24 @@ static enum pad_turn release_turn(const struct bpf_pad_ent *ent)
 	if (ent->rcu)
 		return PAD_TURN_RCU_ITERS;
 	return ent->class < BPF_PAD_REF ? PAD_TURN_LOCKS : PAD_TURN_POINTERS;
+}
+
+/*
+ * How many sections of @class the pad of @plan leaves ahead of the pointers: those that the frame
+ * is in beyond the sections of its call, and those of its callers if a release may sleep
+ */
+static int pad_leaves(const struct bpf_pad_plan *plan, enum bpf_pad_class class)
+{
+	return max(plan->sections[class], 0) + plan->outside[class];
+}
+
+/*
+ * How many it enters behind them, so that the frame is unwound in the sections of its call: those
+ * of its callers that the frame has left, and those that the pad itself left for the release
+ */
+static int pad_enters(const struct bpf_pad_plan *plan, enum bpf_pad_class class)
+{
+	return max(-plan->sections[class], 0) + plan->outside[class];
 }
 
 /* The insns that release the entries of @plan whose turn it is, the youngest first */
@@ -2275,9 +2415,13 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 	n += release_ents(env, plan, PAD_TURN_RCU_ITERS, &buf[n], &aux[n]);
 	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
-		for (i = 0; i < plan->sections[class]; i++)
+		for (i = 0; i < pad_leaves(plan, class); i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
+	/* the sections of the callers: last, a release of a pointer may sleep */
+	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
+		for (i = 0; i < pad_enters(plan, class); i++)
+			buf[n++] = enter_call(class);
 	if (pad_reports(env, subprog)) {
 		buf[n++] = ld_aux[0];
 		buf[n++] = ld_aux[1];
@@ -2320,8 +2464,9 @@ static bool released_first(const struct bpf_pad_plan *plan, const struct bpf_pad
 		    (release_turn(other) == release_turn(ent) && other > ent))
 			return false;
 	}
+	/* the sections that the pad enters come behind the pointers, see bpf_pad_insns() */
 	return release_turn(ent) != PAD_TURN_POINTERS ||
-	       (!plan->sections[BPF_PAD_RCU] && !plan->sections[BPF_PAD_PREEMPT]);
+	       (!pad_leaves(plan, BPF_PAD_RCU) && !pad_leaves(plan, BPF_PAD_PREEMPT));
 }
 
 /*
@@ -2358,9 +2503,19 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	err = err ?: plan->no_place;
 	for (i = 0; !err && i < plan->nr_ents; i++)
 		err = settle_ent(env, plan, &plan->ents[i]);
+	/*
+	 * A pointer that no place had is released through its hidden slot, whatever it is. A slot
+	 * may sleep, and on a visit with such a pointer the pad cannot.
+	 */
+	for (i = 0; !err && plan->no_place_atomic && i < plan->nr_ents; i++)
+		if (plan->ents[i].class >= BPF_PAD_REF && call_sleeps(env, &plan->ents[i].release))
+			err = BPF_CONFLICT_NO_RELEASE;
 	for (class = 0; !err && class < BPF_PAD_NR_SECTIONS; class++) {
 		release = release_call(class);
-		if (plan->sections[class])
+		if (pad_leaves(plan, class))
+			err = get_release(env, &release);
+		release = enter_call(class);
+		if (!err && pad_enters(plan, class))
 			err = get_release(env, &release);
 	}
 	return err;
@@ -3254,6 +3409,10 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		print_ent(env, &plan->ents[j]);
 	if (plan->conflict)
 		verbose(env, "conflict: %s\n", conflict_why[plan->conflict]);
+	else if (plan->outside[BPF_PAD_RCU] || plan->outside[BPF_PAD_PREEMPT])
+		verbose(env, "rcu=%d preempt=%d sleeps outside rcu=%d preempt=%d\n",
+			plan->sections[BPF_PAD_RCU], plan->sections[BPF_PAD_PREEMPT],
+			plan->outside[BPF_PAD_RCU], plan->outside[BPF_PAD_PREEMPT]);
 	else
 		verbose(env, "rcu=%d preempt=%d\n", plan->sections[BPF_PAD_RCU],
 			plan->sections[BPF_PAD_PREEMPT]);

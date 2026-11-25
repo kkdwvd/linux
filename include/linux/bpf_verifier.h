@@ -684,8 +684,19 @@ struct bpf_pad_plan {
 	 */
 	bool from_kpad;
 	bool from_normal;
-	u8 sections[BPF_PAD_NR_SECTIONS]; /* how many of each class the frame has entered */
+	/*
+	 * How many sections of each class the frame is in beyond those of its call. Less than 0:
+	 * it has left that many of its callers, and the pad enters them again.
+	 */
+	s8 sections[BPF_PAD_NR_SECTIONS];
 	u8 sections_differ;		/* bit per class: not the same number on all visits */
+	/*
+	 * A release of the pad may sleep, and the frame is in that many sections of its callers:
+	 * the pad leaves them too ahead of the pointers, and enters them again behind the pointers.
+	 */
+	u8 outside[BPF_PAD_NR_SECTIONS];
+	/* a visit that set 'no_place' left the frame where its pad cannot sleep: pad_can_sleep() */
+	bool no_place_atomic;
 	u8 no_place;			/* the conflict unless hidden slots have all pointers */
 	/* the groups that it asked hidden slots for, bits by enum bpf_pad_group: settle_slots() */
 	u8 asked_slots;
@@ -825,6 +836,12 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * How many sections the state was in when the frame was called. This never changes: a
+	 * frame that is unwound puts the state back there, see release_frame_resources().
+	 */
+	u32 call_rcu_locks;
+	u32 call_preempt_locks;
 	struct bpf_retval_range callback_ret_range;
 	bool in_callback_fn;
 	bool in_async_callback_fn;

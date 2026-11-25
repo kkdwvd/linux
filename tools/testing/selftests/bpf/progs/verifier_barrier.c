@@ -162,17 +162,16 @@ static __naked __noinline __used int recurse_in_frames(void)
 }
 
 /*
- * This prog loads on a kernel where the check of a recursion returns 0 to the caller, which goes on
- * and leaves the section. Here the check unwinds, and no landing pad serves the call in the prog.
- * The function leaves the section of its caller and enters one of its own. When its first check
- * fails the prog is in the section that it entered. When a deeper one does the pad of the function
- * has left the only section there is. A pad is a fixed number of calls, and no store of the prog
- * can count what its callee leaves: a hidden slot follows the insns of its own frame.
+ * The function leaves the section of its caller and enters one of its own. Here the check of the
+ * recursion unwinds. A frame is unwound with the sections of its call, so the prog is in one
+ * section at its call whichever check fails: the first one, when nothing has left the section, or
+ * a deeper one, when the frame in between is in as many sections as it was called in and its pad
+ * has no call. The pad of the prog leaves that one section.
  * Without CAP_PERFMON there is no pad, and no way out of a recursion that is too deep.
  */
 SEC("tc")
 __description("a recursion needs CAP_PERFMON")
-__failure __msg("landing pad of call at 2: conflict: the number of sections differs")
+__success
 SPECULATES
 __failure_unpriv
 __msg_unpriv("landing pad of recursion check at 6: conflict: the program is loaded without CAP_PERFMON")
