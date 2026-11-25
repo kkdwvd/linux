@@ -634,6 +634,22 @@ struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_
 	return NULL;
 }
 
+/*
+ * The plans and the notes of a pass count for its memory, see bpf_check_limits(). @plan may have
+ * got its entries, or more room for callees.
+ */
+static void charge_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
+{
+	u32 bytes = sizeof(*plan);
+
+	if (plan->ents)
+		bytes += BPF_PAD_MAX_ENTS * sizeof(*plan->ents);
+	if (plan->nr_callees)
+		bytes += roundup_pow_of_two(plan->nr_callees) * sizeof(*plan->callee);
+	env->mem += bytes - (s64)plan->bytes;
+	plan->bytes = bytes;
+}
+
 /* @callee came back to the call of @plan, at @call_idx: it takes its place in the list */
 static int plan_add_callee(struct bpf_verifier_env *env, struct bpf_pad_plan *plan, int call_idx,
 			   u32 callee)
@@ -664,6 +680,7 @@ static int plan_add_callee(struct bpf_verifier_env *env, struct bpf_pad_plan *pl
 	/* what bpf_pad_skip_faults() found below the function of the call is no longer all */
 	if (bpf_find_containing_subprog(env, call_idx)->skip_gen)
 		env->pad_skip_gen++;
+	charge_plan(env, plan);
 	return 0;
 }
 
@@ -685,6 +702,7 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 	bitmap_fill(plan->nulls.slots, MAX_BPF_STACK_SLOTS);
 	plan->next = aux->pad_plans;
 	aux->pad_plans = plan;
+	charge_plan(env, plan);
 	return plan;
 }
 
@@ -702,22 +720,46 @@ int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
 	return plan_add_callee(env, plan, call_idx, callee);
 }
 
-static void free_plans(struct bpf_pad_plan *plan)
+/* Returns what the plans had of env->mem */
+static size_t free_plans(struct bpf_pad_plan *plan)
 {
 	struct bpf_pad_plan *next;
+	size_t bytes = 0;
 
 	for (; plan; plan = next) {
 		next = plan->next;
+		bytes += plan->bytes;
 		kfree(plan->ents);
 		kfree(plan->callee);
 		kfree(plan);
 	}
+	return bytes;
 }
 
-void bpf_pad_plans_free(struct bpf_insn_aux_data *aux)
+/* Returns what the plans of the insn had of env->mem */
+size_t bpf_pad_plans_free(struct bpf_insn_aux_data *aux)
 {
-	free_plans(aux->pad_plans);
+	size_t bytes = free_plans(aux->pad_plans);
+
 	aux->pad_plans = NULL;
+	return bytes;
+}
+
+/*
+ * The notes of an insn are freed: a call of a subprog can have several, see bpf_pad_note_return().
+ * Returns what they had of env->mem.
+ */
+size_t bpf_pad_note_free(struct bpf_pad_note *note)
+{
+	struct bpf_pad_note *next;
+	size_t bytes = 0;
+
+	for (; note; note = next) {
+		next = note->next;
+		bytes += sizeof(*note);
+		kfree(note);
+	}
+	return bytes;
 }
 
 /* A pass or a path-sensitive run begins */
@@ -729,8 +771,8 @@ void bpf_pads_new_round(struct bpf_verifier_env *env)
 	env->pads_late = false;
 	env->pad_skip_gen++;
 	for (i = 0; i < env->prog->len; i++, aux++) {
-		bpf_pad_plans_free(aux);
-		kfree(aux->pad_note);
+		env->mem -= bpf_pad_plans_free(aux);
+		env->mem -= bpf_pad_note_free(aux->pad_note);
 		aux->pad_note = NULL;
 	}
 }
@@ -749,15 +791,15 @@ void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, b
 	env->pad_skip_gen++;
 	for (i = 0; i < env->prog->len; i++, aux++, moved++) {
 		if (save) {
-			free_plans(moved->plans);
-			kfree(moved->note);
+			env->mem -= free_plans(moved->plans);
+			env->mem -= bpf_pad_note_free(moved->note);
 			moved->plans = aux->pad_plans;
 			moved->note = aux->pad_note;
 			aux->pad_plans = NULL;
 			aux->pad_note = NULL;
 		} else {
-			free_plans(aux->pad_plans);
-			kfree(aux->pad_note);
+			env->mem -= free_plans(aux->pad_plans);
+			env->mem -= bpf_pad_note_free(aux->pad_note);
 			aux->pad_plans = moved->plans;
 			aux->pad_note = moved->note;
 			moved->plans = NULL;
@@ -766,15 +808,17 @@ void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, b
 	}
 }
 
-/* The snapshot that has @moved of @cnt insns is freed */
-void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt)
+/* The snapshot that has @moved of @cnt insns is freed. Returns what they had of env->mem. */
+size_t bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt)
 {
+	size_t bytes = 0;
 	u32 i;
 
 	for (i = 0; i < cnt; i++) {
-		free_plans(moved[i].plans);
-		kfree(moved[i].note);
+		bytes += free_plans(moved[i].plans);
+		bytes += bpf_pad_note_free(moved[i].note);
 	}
+	return bytes;
 }
 
 /*
@@ -1683,6 +1727,35 @@ static bool state_is_in_kpad(const struct bpf_verifier_state *st)
 }
 
 /*
+ * @sub gets no hidden slots for @groups, for what @st did. If the kernel had brought @st into a
+ * landing pad of the program that is noted too, for the log of a conflict that the slots would
+ * have settled, see bpf_pad_log().
+ */
+static void sub_no_slots(struct bpf_subprog_info *sub, const struct bpf_verifier_state *st,
+			 u8 groups)
+{
+	sub->no_slots |= groups;
+	if (state_is_in_kpad(st))
+		sub->no_slots_kpad |= groups;
+}
+
+/*
+ * A frame of @st has the mark @took, see took_lock_of_caller(), and is left in a way that no store
+ * of a caller follows: the functions of the frames that had the locks get no hidden slots for
+ * their locks. Their plans say what their frames hold, as they do without slots.
+ */
+static void took_locks_no_slots(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+				u32 took)
+{
+	int f;
+
+	for (f = 0; took; f++, took >>= 1)
+		if (took & 1)
+			sub_no_slots(&env->subprog_info[st->frame[f]->subprogno], st,
+				     BIT(BPF_PAD_GROUP_LOCKS));
+}
+
+/*
  * The current frame of @st is about to be unwound at the site of @kind at @insn_idx. Make the plan
  * of the site serve @st too. A visit at which the frame holds nothing is a visit like any other.
  *
@@ -1715,6 +1788,13 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	plan = bpf_pad_plan_get(env, insn_idx, kind);
 	if (!plan)
 		return ERR_PTR(-ENOMEM);
+	/*
+	 * The frame, or a subprog that returned to it, has released a lock or irq flags of a
+	 * caller, see took_lock_of_caller(), and the frame is unwound before it returns: no store
+	 * behind its call clears the slot that has the handle. The function of that caller gets
+	 * no slots for its locks: its plans say what its frames hold, as they do without slots.
+	 */
+	took_locks_no_slots(env, st, st->frame[st->curframe]->took_locks);
 	/* how the states got to the function, for the log of a conflict: see bpf_pad_log() */
 	if (state_is_in_kpad(st))
 		plan->from_kpad = true;
@@ -1723,6 +1803,7 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 	if (plan->conflict)
 		return plan;
 	err = visit_refs(env, plan, st, insn_idx);
+	charge_plan(env, plan);
 	if (err < 0)
 		return ERR_PTR(err);
 	plan->conflict = err;
@@ -1942,6 +2023,7 @@ struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_veri
 	}
 	if (!plan->no_saves) {
 		err = visit_saves(env, plan, st, call_idx);
+		charge_plan(env, plan);
 		if (err < 0)
 			return ERR_PTR(err);
 		plan->no_saves = err;
@@ -1983,9 +2065,47 @@ static struct bpf_pad_note *pad_note_get(struct bpf_verifier_env *env, int insn_
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
 
-	if (!aux->pad_note)
+	if (!aux->pad_note) {
 		aux->pad_note = kzalloc_obj(*aux->pad_note, BPF_VERIFIER_GFP);
+		if (aux->pad_note)
+			env->mem += sizeof(*aux->pad_note);
+	}
 	return aux->pad_note;
+}
+
+/*
+ * The note of the insn at @insn_idx for what it acquires of @group. An insn has one note. A call of
+ * a subprog can have more, @chain: the subprog can return with a section and with irq flags, and
+ * each has slots of its own. NULL if there is no memory.
+ */
+static struct bpf_pad_note *acquire_note_get(struct bpf_verifier_env *env, int insn_idx, int group,
+					     bool chain)
+{
+	struct bpf_pad_note *head = pad_note_get(env, insn_idx), *note;
+
+	if (!head || !chain)
+		return head;
+	for (note = head; note; note = note->next)
+		if (!note->acquires || class_group(note->ent.class) == group)
+			return note;
+	note = kzalloc_obj(*note, BPF_VERIFIER_GFP);
+	if (!note)
+		return NULL;
+	env->mem += sizeof(*note);
+	note->next = head->next;
+	head->next = note;
+	return note;
+}
+
+/* Does the insn of @aux acquire something of @group, itself or by the subprog that it calls? */
+static bool insn_acquires(const struct bpf_insn_aux_data *aux, int group)
+{
+	const struct bpf_pad_note *note;
+
+	for (note = aux->pad_note; note; note = note->next)
+		if (note->acquires && class_group(note->ent.class) == group)
+			return true;
+	return false;
 }
 
 /*
@@ -2018,6 +2138,47 @@ static void released_of_caller(struct bpf_verifier_env *env, enum bpf_pad_group 
 		return;
 	for (f = 0; f <= st->curframe; f++)
 		env->subprog_info[st->frame[f]->subprogno].no_slots_kpad |= BIT(group);
+}
+
+/*
+ * The current insn leaves a section of @class that a caller of its frame entered. The function is
+ * in one section less than it was called in from here on, and no slot of it can say so: it gets no
+ * hidden slots for the sections. Its callers keep theirs. If the frame is unwound its pad enters
+ * the section again, see frame_sections(), and if it returns the call is what leaves the section
+ * for the caller, see bpf_pad_note_return().
+ */
+static void left_of_caller(struct bpf_verifier_env *env, enum bpf_pad_class class)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+
+	sub_no_slots(&env->subprog_info[st->frame[st->curframe]->subprogno], st, BIT(class));
+}
+
+/*
+ * The current insn releases refs[@idx], a lock or irq flags that a caller of its frame acquired.
+ * The frame that acquired it has the handle in a hidden slot, if its function has slots. What
+ * clears the slot is the call that the frame made, when the callee returns: every frame from
+ * there to this one is marked for that, 'took_locks', and bpf_pad_note_return() looks at the mark
+ * of the one that returns to the frame.
+ * A frame with a mark can be unwound before it returns. Then the slot is not cleared and the lock
+ * is gone: see bpf_pad_visit().
+ */
+static void took_lock_of_caller(struct bpf_verifier_env *env, int idx)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	int f, j;
+
+	for (f = st->curframe - 1; f > 0 && st->frame[f]->entry_refs > idx; f--)
+		;
+	/*
+	 * The lock of a caller of a function that is verified on its own: no frame of this state
+	 * holds it, frame 0 came with it too. The function is verified once more in the frames
+	 * of its caller, for the release, see bpf_flow_return(): the frames are marked there.
+	 */
+	if (f < 0 || st->frame[f]->entry_refs > idx)
+		return;
+	for (j = f + 1; j <= st->curframe; j++)
+		st->frame[j]->took_locks |= BIT(f);
 }
 
 /*
@@ -2063,10 +2224,10 @@ static bool slot_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
  * slots don't have: one at a time.
  */
 static void note_acquire(struct bpf_verifier_env *env, struct bpf_subprog_info *sub, int insn_idx,
-			 const struct bpf_pad_ent *ent, int src, int held)
+			 const struct bpf_pad_ent *ent, int src, int held, bool chain, bool by_callee)
 {
-	struct bpf_pad_note *note = pad_note_get(env, insn_idx);
 	int group = class_group(ent->class);
+	struct bpf_pad_note *note = acquire_note_get(env, insn_idx, group, chain);
 
 	if (!note) {
 		sub->no_slots |= BIT(group);
@@ -2074,11 +2235,13 @@ static void note_acquire(struct bpf_verifier_env *env, struct bpf_subprog_info *
 	}
 	if (!note->acquires) {
 		note->acquires = true;
+		note->by_callee = by_callee;
 		note->src = src;
 		note->ent = *ent;
 		note->ent.origin = insn_idx;
 	}
-	if (note->src != src || note->ent.class != ent->class || note->ent.rcu != ent->rcu ||
+	if (note->src != src || note->by_callee != by_callee ||
+	    note->ent.class != ent->class || note->ent.rcu != ent->rcu ||
 	    memcmp(&note->ent.release, &ent->release, sizeof(ent->release)) ||
 	    note->ent.obj_type != ent->obj_type ||
 	    note->ent.cand[0][0].delta != ent->cand[0][0].delta ||
@@ -2112,7 +2275,8 @@ void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_sta
 		sub->no_slots |= BIT(group);
 	else
 		note_acquire(env, sub, env->insn_idx, &ent, reg - frame->regs,
-			     count_refs(st, frame->entry_refs, st->acquired_refs - 1, group));
+			     count_refs(st, frame->entry_refs, st->acquired_refs - 1, group),
+			     false, false);
 }
 
 /*
@@ -2176,7 +2340,10 @@ void bpf_pad_note_release(struct bpf_verifier_env *env, int idx)
 	if (env->pad_releases)
 		return;
 	if (idx < frame->entry_refs) {
-		released_of_caller(env, group);
+		if (group == BPF_PAD_GROUP_LOCKS)
+			took_lock_of_caller(env, idx);
+		else
+			released_of_caller(env, group);
 		return;
 	}
 	obj = find_obj(st, ref, &addr);
@@ -2207,49 +2374,251 @@ void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class
 	};
 
 	if (enter)
-		note_acquire(env, sub, env->insn_idx, &ent, 0, max(frame_sections(st, class), 0));
+		note_acquire(env, sub, env->insn_idx, &ent, 0, max(frame_sections(st, class), 0),
+			     false, false);
 	else if (frame_sections(st, class) > 0)
 		note_release(env, sub, class, 0, 0);
 	else
-		released_of_caller(env, class_group(class));
+		left_of_caller(env, class);
+}
+
+/*
+ * What R1-R5 of @caller have at the call of @callee, as far as bpf_pad_note_return() asks: a pointer
+ * to the stack at a constant offset can be the address of irq flags that the callee saves for its
+ * caller. The registers are gone when the callee returns.
+ * They are part of the join key of the frame: the callee stops reading an argument long before it
+ * returns, and a state that had something else in the register would be pruned by one that had
+ * the address, which then answers for both.
+ * @caller is NULL for a function that is verified on its own: it has no frame of a caller to
+ * point into, and its instance is one for all calls.
+ */
+void bpf_pad_note_args(struct bpf_func_state *callee, const struct bpf_func_state *caller)
+{
+	const struct bpf_reg_state *reg;
+	struct bpf_pad_arg *arg;
+	int i;
+
+	memset(callee->call_args, 0, sizeof(callee->call_args));
+	for (i = 0; caller && i < MAX_BPF_FUNC_REG_ARGS; i++) {
+		reg = &caller->regs[BPF_REG_1 + i];
+		arg = &callee->call_args[i];
+		if (reg->type != PTR_TO_STACK || !tnum_is_const(reg->var_off) ||
+		    (s64)reg->var_off.value != (s16)reg->var_off.value)
+			continue;
+		arg->stack = true;
+		arg->frame = reg->frameno;
+		arg->off = reg->var_off.value;
+	}
+}
+
+/* How the lower half of R0 is on a return, see enum bpf_pad_cond */
+static u8 ret_class(const struct bpf_reg_state *r0)
+{
+	if (r0->type != SCALAR_VALUE)
+		return BPF_RET_UNKNOWN;
+	if (tnum_subreg_is_const(r0->var_off) && !tnum_subreg(r0->var_off).value)
+		return BPF_RET_ZERO;
+	if (reg_u32_min(r0) > 0 || reg_s32_max(r0) < 0 || reg_s32_min(r0) > 0)
+		return BPF_RET_NONZERO;
+	return BPF_RET_UNKNOWN;
+}
+
+/* What the hidden slot of a section of @class is to a plan, but for the offset */
+static void section_ent(struct bpf_pad_ent *ent, enum bpf_pad_class class)
+{
+	*ent = (struct bpf_pad_ent){
+		.ref = -1,
+		.class = class,
+		.release = release_call(class),
+		.nr_cands[0] = 1,
+		.cand[0][0] = { .loc = BPF_PLACE_SPILL, .null = true },
+	};
+}
+
+/*
+ * The frame @callee of @st returns with the irq flags @ref, which it saved for its caller. Which
+ * argument of its call had their address? The register number, and what it had more than the
+ * address goes to *@delta: the argument that had the address itself, else the first one that
+ * pointed into the same frame, as the address of a guard that has the flags does. -1 if no
+ * argument had it: the callee found the address elsewhere.
+ * Every state that this one stands for had the same in that register, see bpf_pad_note_args().
+ * Flags that a lock saved come and go with the lock, and the object is in a frame above the callee:
+ * a frame cannot return with flags in its own stack.
+ */
+static int irq_arg(const struct bpf_verifier_state *st, const struct bpf_func_state *callee,
+		   const struct bpf_reference_state *ref, int *delta)
+{
+	const struct bpf_stack_state *obj;
+	const struct bpf_pad_arg *arg;
+	struct bpf_reg_state addr;
+	int k, pass;
+
+	if (ref->type != REF_TYPE_IRQ)
+		return -1;
+	obj = find_obj(st, ref, &addr);
+	if (!obj || obj->spilled_ptr.irq.kfunc_class != IRQ_NATIVE_KFUNC ||
+	    addr.frameno >= callee->frameno)
+		return -1;
+	for (pass = 0; pass < 2; pass++) {
+		for (k = 0; k < MAX_BPF_FUNC_REG_ARGS; k++) {
+			arg = &callee->call_args[k];
+			if (!arg->stack || arg->frame != addr.frameno)
+				continue;
+			*delta = arg->off - (int)addr.var_off.value;
+			if (*delta != (s16)*delta || (!pass && *delta))
+				continue;
+			return BPF_REG_1 + k;
+		}
+	}
+	return -1;
 }
 
 /*
  * The current frame of @st returns to the call at @call_idx in @caller, with what it acquired and
  * did not release. @plain: with exit, and it is no callback.
- * One pointer that is in R0 is what a kfunc returns: the call acquires it. What releases it follows
- * from its type: states with the same pointer from different insns are the same to the main pass.
- * The store after the call takes R0 as it is, so it has to be 0 when nothing comes with it.
- * Nothing else has a store: it goes past the store if the frame unwinds.
+ *
+ * The call is to the hidden slots of the caller what a call of a kfunc is: it acquires what the
+ * subprog returns with, and it releases what the subprog has released of the frame. A store in
+ * the subprog cannot do it: the slots are those of the frame that holds the resource when the
+ * subprog has returned. The stores of such a call stand behind it, where only a normal return
+ * gets: a subprog that is unwound has released what it acquired, has entered again the sections
+ * that it left, see frame_sections(), and has not released a lock of a caller, see
+ * bpf_pad_visit().
+ *
+ *	static int lock(struct lock *l, unsigned long *flags)	   r1 = r6
+ *	{							   r2 = r10
+ *		bpf_local_irq_save(flags);			   r2 += -8
+ *		bpf_preempt_disable();				   *(u64 *)(r10 - 32) = r2
+ *		if (!try_lock(l)) {				   call lock
+ *			bpf_preempt_enable();			   if w0 != 0 goto +1
+ *			bpf_local_irq_restore(flags);		   *(u64 *)(r10 - 16) = 1
+ *			return -EBUSY;				   if w0 != 0 goto +2
+ *		}						   r1 = *(u64 *)(r10 - 32)
+ *		return 0;					   *(u64 *)(r10 - 24) = r1
+ *	}
+ *
+ * What a call can stand for:
+ *   - One pointer that is in R0 is what a kfunc returns. What releases it follows from its type:
+ *     states with the same pointer from different insns are the same to the main pass. The store
+ *     takes R0 as it is, so it has to be 0 when nothing comes with it.
+ *   - One section more of a class.
+ *   - Irq flags that the subprog saved where an argument of the call points, see irq_arg(). The
+ *     argument is gone behind the call: it waits in a hidden word of the function, the PENDING
+ *     WORD, which the store behind the call reads.
+ *   - One section less of a class, of those that the frame itself is in. The first slot of the
+ *     class that is not 0 is cleared.
+ *   - The lock or the irq flags that the frame holds are released: a frame with slots for them
+ *     holds one at a time, see note_acquire(), so all of those slots are cleared.
+ * A subprog that returns with something on some returns only is like bpf_res_spin_lock(): R0 has
+ * to tell, 0 or not 0 in its lower half on all returns of the one kind and the opposite on all
+ * others. Each return is noted, and subprog_take_slots() decides when all have been here. One
+ * that has released on some returns only cannot be told: no slots for the group.
+ * Anything else that comes back has no store either, and the function gets no slots for its
+ * group: two pointers, an iterator, a lock, a section that the frame is not in, more than one
+ * section.
  */
 void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			 const struct bpf_func_state *caller, int call_idx, bool plain)
 {
 	const struct bpf_func_state *callee = st->frame[st->curframe];
-	const struct bpf_reference_state *ref = &st->refs[callee->entry_refs];
+	const struct bpf_reference_state *ref = &st->refs[callee->entry_refs], *lock = NULL, *ptr = NULL;
 	struct bpf_subprog_info *sub = &env->subprog_info[caller->subprogno];
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[call_idx];
 	const struct bpf_reg_state *r0 = &callee->regs[BPF_REG_0];
-	int i, nr = st->acquired_refs - callee->entry_refs, in_r0 = 0;
+	int i, d, before, delta, arg, nr = st->acquired_refs - callee->entry_refs, in_r0 = 0;
+	int nr_locks = 0, nr_refs = 0;
+	u8 brings = 0, takes = 0, keeps = 0, cls;
+	struct bpf_pad_note *head;
 	struct bpf_pad_place place;
 	struct bpf_pad_ent ent;
 
-	for (i = 0; i < BPF_PAD_NR_SECTIONS; i++)
-		if (frame_sections(st, i))
-			sub->no_slots |= BIT(i);
-	if (plain && nr == 1 && ref->type == REF_TYPE_PTR && !ref->parent_id)
-		add_ref_cand(&place, &in_r0, r0, ref, BPF_PLACE_REG, BPF_REG_0);
-	if (in_r0 && slot_ent(env, &ent, st, ref, r0, true) &&
+	head = plain ? pad_note_get(env, call_idx) : NULL;
+	/*
+	 * No store follows this return: a callback returns to its helper, the stores behind a
+	 * call are behind unwind_goto for a frame that left with unwind_exit, or there is no
+	 * memory for the note. What the frame returns with has no slot, and a lock that it has
+	 * released of the frame that it returns to stays in its slot, as it does where such a
+	 * frame is unwound, see bpf_pad_visit(). The locks of the frames further up are for that
+	 * frame to answer for when it is left in its turn: it has the mark as well.
+	 */
+	if (!head) {
+		for (i = 0; i < BPF_PAD_NR_SECTIONS; i++)
+			if (frame_sections(st, i))
+				sub_no_slots(sub, st, BIT(i));
+		for (i = 0; i < nr; i++)
+			sub_no_slots(sub, st, BIT(class_group(ref_class(&ref[i]))));
+		took_locks_no_slots(env, st, callee->took_locks & BIT(caller->frameno));
+		goto out;
+	}
+	for (i = 0; i < nr; i++) {
+		if (class_group(ref_class(&ref[i])) == BPF_PAD_GROUP_LOCKS) {
+			lock = &ref[i];
+			nr_locks++;
+		} else {
+			ptr = &ref[i];
+			nr_refs++;
+		}
+	}
+
+	for (i = 0; i < BPF_PAD_NR_SECTIONS; i++) {
+		/* what the call did to the number of sections, and how many the caller was in */
+		d = frame_sections(st, i);
+		before = i == BPF_PAD_RCU ? callee->call_rcu_locks - caller->call_rcu_locks :
+					    callee->call_preempt_locks - caller->call_preempt_locks;
+		if (d == -1 && before > 0) {
+			takes |= BIT(i);
+			continue;
+		}
+		keeps |= BIT(i);
+		if (d == 1) {
+			brings |= BIT(i);
+			section_ent(&ent, i);
+			note_acquire(env, sub, call_idx, &ent, 0, max(before, 0), true, true);
+		} else if (d) {
+			sub_no_slots(sub, st, BIT(i));
+		}
+	}
+
+	arg = nr_locks == 1 ? irq_arg(st, callee, lock, &delta) : -1;
+	if (arg >= 0) {
+		brings |= BIT(BPF_PAD_GROUP_LOCKS);
+		section_ent(&ent, BPF_PAD_IRQ);
+		ent.cand[0][0].delta = delta;
+		note_acquire(env, sub, call_idx, &ent, arg,
+			     count_refs(st, caller->entry_refs, callee->entry_refs,
+					BPF_PAD_GROUP_LOCKS), true, true);
+	} else if (nr_locks) {
+		sub_no_slots(sub, st, BIT(BPF_PAD_GROUP_LOCKS));
+	}
+	if (callee->took_locks & BIT(caller->frameno))
+		takes |= BIT(BPF_PAD_GROUP_LOCKS);
+	else
+		keeps |= BIT(BPF_PAD_GROUP_LOCKS);
+
+	if (nr_refs == 1 && ptr->type == REF_TYPE_PTR && !ptr->parent_id)
+		add_ref_cand(&place, &in_r0, r0, ptr, BPF_PLACE_REG, BPF_REG_0);
+	if (in_r0 && slot_ent(env, &ent, st, ptr, r0, true) &&
 	    can_release_under_lock(env, st, caller, &ent)) {
 		note_acquire(env, sub, call_idx, &ent, BPF_REG_0,
 			     count_refs(st, caller->entry_refs, callee->entry_refs,
-					BPF_PAD_GROUP_REFS));
+					BPF_PAD_GROUP_REFS), true, false);
 	} else {
-		for (i = 0; i < nr; i++)
-			sub->no_slots |= BIT(class_group(ref_class(&ref[i])));
-		aux->call_brings_nothing |= plain && !reg_is_null(r0);
+		if (nr_refs)
+			sub->no_slots |= BIT(BPF_PAD_GROUP_REFS);
+		aux->call_brings_nothing |= !reg_is_null(r0);
 	}
-	if (aux->call_brings_nothing && aux->pad_note && aux->pad_note->acquires)
+
+	cls = ret_class(r0);
+	for (i = 0; i < BPF_PAD_NR_GROUPS; i++) {
+		if (brings & BIT(i))
+			head->hold_r0[i] |= cls;
+		else
+			head->nohold_r0[i] |= cls;
+	}
+	head->takes |= takes;
+	head->keeps |= keeps;
+out:
+	if (aux->call_brings_nothing && insn_acquires(aux, BPF_PAD_GROUP_REFS))
 		sub->no_slots |= BIT(BPF_PAD_GROUP_REFS);
 }
 
@@ -2773,11 +3142,10 @@ static bool acquires_stack_obj(struct bpf_verifier_env *env, const struct bpf_su
 	const struct bpf_pad_note *note;
 	int i;
 
-	for (i = sub->start; i < sub[1].start; i++) {
-		note = env->insn_aux_data[i].pad_note;
-		if (note && note->acquires && note->ent.class > BPF_PAD_REF)
-			return true;
-	}
+	for (i = sub->start; i < sub[1].start; i++)
+		for (note = env->insn_aux_data[i].pad_note; note; note = note->next)
+			if (note->acquires && note->ent.class > BPF_PAD_REF)
+				return true;
 	return false;
 }
 
@@ -2919,6 +3287,23 @@ static int plan_take_slots(struct bpf_pad_plan *plan, int group, struct bpf_pad_
 }
 
 /*
+ * Can the calls of @a and @b share a hidden slot? A frame holds one lock or one set of irq flags
+ * at a time, see note_acquire(), so its calls that acquire the same kind of thing never have a
+ * handle to keep at the same time. The same for the sections of a class where no call enters one
+ * while the frame is in one. A function that takes a lock in sixteen places has one slot for it,
+ * and not more slots than a landing pad has entries.
+ */
+static bool notes_share_slot(const struct bpf_pad_note *a, const struct bpf_pad_note *b)
+{
+	int group = class_group(a->ent.class);
+
+	if (group == BPF_PAD_GROUP_REFS || a->held || b->held)
+		return false;
+	return same_release(&a->ent, &b->ent) &&
+	       a->ent.cand[0][0].delta == b->ent.cand[0][0].delta;
+}
+
+/*
  * Give subprog @s hidden slots for all that it acquires of @group, below its stack: every access of
  * the program to the frame, also one of a callee through a pointer, has raised stack_depth.
  * A call that is on no cycle runs once per frame: one slot. Any other has one more than the frame
@@ -2930,26 +3315,57 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	struct bpf_pad_note *note, *notes[BPF_PAD_MAX_ENTS];
+	struct bpf_pad_note *head, *note, *notes[BPF_PAD_MAX_ENTS];
 	bool all_ptrs = group == BPF_PAD_GROUP_REFS && !acquires_stack_obj(env, sub);
-	int i, err, nr = 0, slots = 0, words = 0;
+	int i, k, err, nr = 0, slots = 0, words = 0, pend_off = 0;
 	struct bpf_pad_plan *plan;
+	u8 hold, nohold;
 
 	for (i = sub->start; i < sub[1].start; i++) {
-		note = aux[i].pad_note;
-		if (!note || !note->acquires || class_group(note->ent.class) != group)
-			continue;
-		err = nr < BPF_PAD_MAX_ENTS ? get_release(env, &note->ent.release) : 1;
-		if (err)
-			return min(err, 0);
-		notes[nr++] = note;
-		note->nr_slots = bpf_loop_at_index(env, i) < 0 ? 1 : 1 + note->held;
-		note->off = -(int)bpf_stack_depth_with_slots(sub) - (words + 1) * BPF_REG_SIZE;
-		slots += note->nr_slots;
-		words += note->nr_slots * slot_words(note);
+		head = aux[i].pad_note;
+		/* the subprog has released on some returns only: no store behind the call is right */
+		if (head && (head->takes & head->keeps & BIT(group)))
+			return 0;
+		for (note = head; note; note = note->next) {
+			if (!note->acquires || class_group(note->ent.class) != group)
+				continue;
+			err = get_release(env, &note->ent.release);
+			if (err)
+				return min(err, 0);
+			/* when does the subprog return with it? See bpf_pad_note_return(). */
+			hold = head->hold_r0[group];
+			nohold = head->nohold_r0[group];
+			if (!note->by_callee || !nohold)
+				note->cond = BPF_PAD_ALWAYS;
+			else if (hold == BPF_RET_ZERO && nohold == BPF_RET_NONZERO)
+				note->cond = BPF_PAD_IF_ZERO;
+			else if (hold == BPF_RET_NONZERO && nohold == BPF_RET_ZERO)
+				note->cond = BPF_PAD_IF_NONZERO;
+			else
+				return 0;
+			/* the address of irq flags waits there over the call that saves them */
+			if (note->by_callee && note->ent.class == BPF_PAD_IRQ)
+				pend_off = -1;
+			note->nr_slots = bpf_loop_at_index(env, i) < 0 ? 1 : 1 + note->held;
+			for (k = 0; k < nr && !notes_share_slot(notes[k], note); k++)
+				;
+			if (k < nr) {
+				note->off = notes[k]->off;
+				continue;
+			}
+			if (nr == BPF_PAD_MAX_ENTS)
+				return 0;
+			notes[nr++] = note;
+			note->off = -(int)bpf_stack_depth_with_slots(sub) -
+				    (words + 1) * BPF_REG_SIZE;
+			slots += note->nr_slots;
+			words += note->nr_slots * slot_words(note);
+		}
 	}
 	if (!nr)
 		return 0;
+	if (pend_off)
+		pend_off = -(int)bpf_stack_depth_with_slots(sub) - ++words * BPF_REG_SIZE;
 	/* a plan of a frame that the kernel unwinds has a conflict instead, see below */
 	for (i = sub->start; i < sub[1].start; i++)
 		for (plan = aux[i].pad_plans; plan; plan = plan->next)
@@ -2963,6 +3379,8 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 		sub->hidden_words -= words;
 		return err;
 	}
+	if (pend_off)
+		sub->pend_off = pend_off;
 	for (i = sub->start; i < sub[1].start; i++) {
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 			/* the program does not have its site, or the kernel unwinds its frame */
@@ -2970,6 +3388,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 				plan->conflict = BPF_CONFLICT_SLOTS_FULL;
 			err = plan_has_slots(plan) ?
 			      plan_take_slots(plan, group, notes, nr, all_ptrs) : 0;
+			charge_plan(env, plan);
 			if (err)
 				return err;
 		}
@@ -2998,6 +3417,7 @@ static int settle_slots(struct bpf_verifier_env *env)
 		env->subprog_info[s].value_off = 0;
 		env->subprog_info[s].no_value_word = false;
 		env->subprog_info[s].k_off = 0;
+		env->subprog_info[s].pend_off = 0;
 		env->subprog_info[s].save_off = 0;
 		env->subprog_info[s].save_words = 0;
 	}
@@ -3033,7 +3453,8 @@ static bool note_has_slots(const struct bpf_subprog_info *sub, const struct bpf_
 }
 
 /*
- * The calls of subprog @s that have hidden slots go to @notes, which has room for BPF_PAD_MAX_ENTS.
+ * The calls of subprog @s that have hidden slots go to @notes, which has room for BPF_PAD_MAX_ENTS:
+ * one call for each slot.
  * A slot is an entry of each plan of the subprog, so all groups together have no more slots than
  * that, see plan_has_room(), and the insns of the stores are sized for as many, see
  * BPF_PAD_MAX_SLOT_INSNS. Nothing else keeps the calls that few: check it where they are written.
@@ -3043,18 +3464,24 @@ int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad
 {
 	const struct bpf_subprog_info *sub = &env->subprog_info[s];
 	const struct bpf_pad_note *note;
-	int i, nr = 0, slots = 0;
+	int i, k, nr = 0, slots = 0;
 
 	for (i = sub->start; i < sub[1].start; i++) {
-		note = env->insn_aux_data[i].pad_note;
-		if (!note_has_slots(sub, note))
-			continue;
-		slots += note->nr_slots;
-		if (verifier_bug_if(slots > BPF_PAD_MAX_ENTS, env,
-				    "func#%d has %d hidden slots, a landing pad has %d entries",
-				    s, slots, BPF_PAD_MAX_ENTS))
-			return -EFAULT;
-		notes[nr++] = note;
+		for (note = env->insn_aux_data[i].pad_note; note; note = note->next) {
+			if (!note_has_slots(sub, note))
+				continue;
+			/* calls that share a slot, see notes_share_slot(): the first one stands for it */
+			for (k = 0; k < nr && notes[k]->off != note->off; k++)
+				;
+			if (k < nr)
+				continue;
+			slots += note->nr_slots;
+			if (verifier_bug_if(slots > BPF_PAD_MAX_ENTS, env,
+					    "func#%d has %d hidden slots, a landing pad has %d entries",
+					    s, slots, BPF_PAD_MAX_ENTS))
+				return -EFAULT;
+			notes[nr++] = note;
+		}
 	}
 	return nr;
 }
@@ -3241,8 +3668,9 @@ int bpf_pad_check_saves(struct bpf_verifier_env *env, int s)
  * that nothing was acquired, and 0 in a slot means the same. A section has no handle: 1.
  * If the call has several slots the first one that is 0 is filled. The frame holds no more than
  * 'held' of the group, so there is one.
+ * @src: the register that has the handle.
  */
-static int set_insns(const struct bpf_pad_note *note, struct bpf_insn *buf)
+static int set_insns(const struct bpf_pad_note *note, int src, struct bpf_insn *buf)
 {
 	int k, n = 0, nr = note->nr_slots, off = note->off;
 
@@ -3254,13 +3682,13 @@ static int set_insns(const struct bpf_pad_note *note, struct bpf_insn *buf)
 		if (note->ent.class < BPF_PAD_NR_SECTIONS)
 			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, off, 1);
 		else
-			buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, note->src, off);
+			buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, src, off);
 		if (k < nr - 1)
 			buf[n++] = BPF_JMP_A((nr - 1 - k) * 4 - 1);
 	}
 	/* the irq flags, the next argument: the pad reads the word if the slot is not 0 */
 	if (slot_words(note) == 2)
-		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, note->src + 1, off);
+		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, src + 1, off);
 	return n;
 }
 
@@ -3306,7 +3734,10 @@ static int clear_insns(const struct bpf_pad_note **notes, int nr, const struct b
 	return n;
 }
 
-/* The insns that go before the call of @note in @sub. @notes: the @nr calls with slots. */
+/*
+ * The insns that go before the insn of @note in @sub, the first note of the insn. @notes: the @nr
+ * calls with slots.
+ */
 int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf)
 {
@@ -3314,26 +3745,75 @@ int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pa
 
 	if (note && note->releases && (sub->slots & BIT(note->group)))
 		n = clear_insns(notes, nr, note, buf);
-	/* an address that the call takes. The resource is held when the call returns. */
-	if (note_has_slots(sub, note) && note->ent.class != BPF_PAD_REF)
-		n += set_insns(note, &buf[n]);
+	for (; note; note = note->next) {
+		if (!note_has_slots(sub, note))
+			continue;
+		/*
+		 * The subprog saves irq flags where the argument points: the address waits in the
+		 * pending word until the subprog has returned with them, see bpf_pad_insns_after().
+		 */
+		if (note->by_callee && note->ent.class == BPF_PAD_IRQ)
+			buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, note->src, sub->pend_off);
+		/* an address that the call takes. The resource is held when the call returns. */
+		else if (!note->by_callee && note->ent.class != BPF_PAD_REF)
+			n += set_insns(note, note->src, &buf[n]);
+	}
 	return n;
 }
 
-/* The insns that go after the call of @note, which is in @sub */
-int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
-			struct bpf_insn *buf)
+/*
+ * The insns that go after the insn of @note, the first note of the insn, which is in @sub. @notes:
+ * the @nr calls with slots.
+ * Behind a call of a subprog, see bpf_pad_note_return(): the slots of what the subprog has
+ * released are cleared, then the slots of what it returned with are filled, if R0 says that it
+ * returned with it. R1-R5 are dead there: R1 takes the address from the pending word.
+ */
+int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, const struct bpf_pad_note *note, struct bpf_insn *buf)
 {
-	int n = 0;
+	struct bpf_pad_note rel = {};
+	int g, i, k, n = 0, first;
+	u8 takes;
 
-	if (!note_has_slots(sub, note))
+	if (!note)
 		return 0;
-	if (note->ent.class == BPF_PAD_REF)
-		return set_insns(note, buf);
-	/* the lock was not taken. The upper half of an int is not defined. */
-	if (note->ent.class == BPF_PAD_RES_LOCK || note->ent.class == BPF_PAD_RES_LOCK_IRQ) {
-		buf[n++] = BPF_JMP32_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
-		buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, note->off, 0);
+	takes = note->takes & sub->slots;
+	for (g = 0; g < BPF_PAD_NR_SECTIONS; g++) {
+		if (!(takes & BIT(g)))
+			continue;
+		rel.group = g;
+		n += clear_insns(notes, nr, &rel, &buf[n]);
+	}
+	/* the frame holds one lock or irq flag at a time: whichever slot had it */
+	for (i = 0; (takes & BIT(BPF_PAD_GROUP_LOCKS)) && i < nr; i++) {
+		if (class_group(notes[i]->ent.class) != BPF_PAD_GROUP_LOCKS)
+			continue;
+		for (k = 0; k < notes[i]->nr_slots * slot_words(notes[i]); k++)
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP,
+					      notes[i]->off - k * BPF_REG_SIZE, 0);
+	}
+	for (; note; note = note->next) {
+		if (!note_has_slots(sub, note))
+			continue;
+		if (note->by_callee) {
+			first = n;
+			/* the upper half of an int is not defined */
+			if (note->cond != BPF_PAD_ALWAYS)
+				buf[n++] = BPF_JMP32_IMM(note->cond == BPF_PAD_IF_ZERO ?
+							 BPF_JNE : BPF_JEQ, BPF_REG_0, 0, 0);
+			if (note->ent.class == BPF_PAD_IRQ)
+				buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_FP, sub->pend_off);
+			n += set_insns(note, BPF_REG_1, &buf[n]);
+			if (note->cond != BPF_PAD_ALWAYS)
+				buf[first].off = n - first - 1;
+		} else if (note->ent.class == BPF_PAD_REF) {
+			n += set_insns(note, note->src, &buf[n]);
+		} else if (note->ent.class == BPF_PAD_RES_LOCK ||
+			   note->ent.class == BPF_PAD_RES_LOCK_IRQ) {
+			/* the lock was not taken. The upper half of an int is not defined. */
+			buf[n++] = BPF_JMP32_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
+			buf[n++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, note->off, 0);
+		}
 	}
 	return n;
 }

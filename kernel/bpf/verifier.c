@@ -11669,6 +11669,7 @@ static int setup_func_entry(struct bpf_verifier_env *env, int subprog, int calls
 	callee->entry_preempt_locks = state->active_preempt_locks;
 	callee->call_rcu_locks = state->active_rcu_locks;
 	callee->call_preempt_locks = state->active_preempt_locks;
+	bpf_pad_note_args(callee, caller);
 	err = set_callee_state_cb(env, caller, callee, callsite);
 	if (err)
 		goto err_out;
@@ -12194,6 +12195,7 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	callee->entry_preempt_locks = entry.active_preempt_locks;
 	callee->call_rcu_locks = entry.active_rcu_locks;
 	callee->call_preempt_locks = entry.active_preempt_locks;
+	bpf_pad_note_args(callee, NULL);
 
 	account_current_path(env);
 	env->subprog_info[subprog].on_its_own = true;
@@ -22207,13 +22209,15 @@ static bool frame_is_top(const struct bpf_verifier_state *st)
 
 /*
  * The current frame of @st holds resources that it acquired since its entry, or it is in other
- * sections than it was called in: more of them, or fewer, where it has left one of a caller
+ * sections than it was called in: more of them, or fewer, where it has left one of a caller. Or it
+ * has released a lock of a caller: a landing pad has nothing to do for that, but the visit of the
+ * site tells the hidden slots of the caller, see bpf_pad_visit().
  */
 static bool frame_holds_resources(const struct bpf_verifier_state *st)
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 
-	return st->acquired_refs != frame->entry_refs ||
+	return st->acquired_refs != frame->entry_refs || frame->took_locks ||
 	       st->active_rcu_locks != frame->call_rcu_locks ||
 	       st->active_preempt_locks != frame->call_preempt_locks;
 }
@@ -24940,7 +24944,7 @@ static void free_snapshot(struct bpf_verifier_env *env, struct bpf_snapshot *sna
 {
 	if (!snapshot)
 		return;
-	bpf_pads_free_moved(snapshot->pads, env->prog->len);
+	env->mem -= bpf_pads_free_moved(snapshot->pads, env->prog->len);
 	kvfree(snapshot);
 }
 

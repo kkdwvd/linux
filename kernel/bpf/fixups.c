@@ -1470,7 +1470,7 @@ static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf
 			/* nothing stands between a call and unwind_goto of the program */
 			call = i - 1 - (i > sub->start && bpf_is_unwind_goto(insn - 1));
 			if (call >= (int)sub->start && !bpf_is_unwind_goto(insn))
-				n += bpf_pad_insns_after(sub, aux[call].pad_note, &buf[n]);
+				n += bpf_pad_insns_after(sub, notes, nr, aux[call].pad_note, &buf[n]);
 			err = n ? bpf_patch_list_append(env, i - 1, buf, n) : 0;
 			if (err)
 				return err;
@@ -1792,8 +1792,8 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 		free_loop(aux_data[i].callback_loop);
 		free_loop(aux_data[i].recursion_loop);
 		aux_data[i].loop = aux_data[i].callback_loop = aux_data[i].recursion_loop = NULL;
-		bpf_pad_plans_free(&aux_data[i]);
-		kfree(aux_data[i].pad_note);
+		env->mem -= bpf_pad_plans_free(&aux_data[i]);
+		env->mem -= bpf_pad_note_free(aux_data[i].pad_note);
 		aux_data[i].pad_note = NULL;
 	}
 }

@@ -600,9 +600,10 @@ enum bpf_stuck_by {
 #define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS
 /*
  * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
- * five to compare and clear, four to find a free one. And the call.
+ * five to compare and clear, four to find a free one. And the call. Behind a call of a subprog
+ * per group one more for the test of R0, and two for the address that waited in the pending word.
  */
-#define BPF_PAD_MAX_SLOT_INSNS	(BPF_PAD_MAX_ENTS * 9 + 1)
+#define BPF_PAD_MAX_SLOT_INSNS	(BPF_PAD_MAX_ENTS * 9 + 3 * BPF_PAD_NR_GROUPS + 1)
 
 /* Where a place is */
 enum bpf_place_loc {
@@ -738,6 +739,7 @@ struct bpf_pad_plan {
 	u32 nr_callees;
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
+	u32 bytes;			/* its part of env->mem, see charge_plan() */
 };
 
 /*
@@ -757,7 +759,40 @@ enum bpf_pad_group {
  * It holds for all states that got to the call in the pass. Like the plans it moves with the
  * snapshot of the pass, see bpf_pads_move().
  */
+/* How R0 is on a return of a subprog, for the test that tells what the call brought */
+enum {
+	BPF_RET_ZERO	= BIT(0),	/* the lower half is 0 */
+	BPF_RET_NONZERO	= BIT(1),	/* the lower half is not 0 */
+	BPF_RET_UNKNOWN	= BIT(2),
+};
+
+/* When the store behind the call of a subprog runs, see bpf_pad_note_return() */
+enum bpf_pad_cond {
+	BPF_PAD_ALWAYS,
+	BPF_PAD_IF_ZERO,	/* the lower half of R0 is 0 */
+	BPF_PAD_IF_NONZERO,
+};
+
 struct bpf_pad_note {
+	/* a call of a subprog has one note for each group that the subprog returns with */
+	struct bpf_pad_note *next;
+	/*
+	 * The call is one of a subprog, and the subprog returns with the resource: the slot is
+	 * filled behind the call, on a normal return only. 'src' is the argument that had the
+	 * address when the call was made: it waits in the pending word of the function.
+	 */
+	bool by_callee;
+	u8 cond;		/* enum bpf_pad_cond, see subprog_take_slots() */
+	/*
+	 * The first note of a call of a subprog, by group: how R0 was on the returns that came
+	 * with something of the group, and on those that did not. And the groups of which the
+	 * subprog had released what the frame held when it returned, and those of which it had
+	 * not on some return.
+	 */
+	u8 hold_r0[BPF_PAD_NR_GROUPS];
+	u8 nohold_r0[BPF_PAD_NR_GROUPS];
+	u8 takes;
+	u8 keeps;
 	/* The call acquires a resource, or it calls a subprog that returns with one. */
 	bool acquires;
 	u8 src;			/* the register that goes to the slot */
@@ -814,6 +849,13 @@ static inline bool bpf_trip_is_saved(const struct loop_stack_entry *entry)
 /* state of the program:
  * type of all registers and stack info
  */
+/* What an argument register had when a frame was called. All 0 if it is no such pointer. */
+struct bpf_pad_arg {
+	s16 off;
+	u8 frame;
+	bool stack;	/* a pointer to the stack of 'frame', at the constant offset 'off' */
+};
+
 struct bpf_func_state {
 	struct bpf_reg_state regs[MAX_BPF_REG];
 	/* equal in states that have a join, see bpf_same_join_key() */
@@ -868,6 +910,21 @@ struct bpf_func_state {
 	 * of the program releases what it is for: 'saved' of the reference says what is held.
 	 */
 	u16 saved_mask;
+	/*
+	 * Bit f: the frame, or a subprog that returned to it, has released a lock or irq flags
+	 * that frame f acquired. The call that did it releases for frame f, see
+	 * bpf_pad_note_return(), and a frame that is unwound with a bit tells that the hidden
+	 * slots of frame f are no longer what it holds, see bpf_pad_visit().
+	 */
+	u32 took_locks;
+	/*
+	 * What R1-R5 had when the frame was called, see bpf_pad_note_args(). A store of the
+	 * caller takes one of them for the address of irq flags that the frame returns with, see
+	 * irq_arg(), and it is code: the states that it stands for have the same here. The frame
+	 * no longer has these registers when it returns, and what is not live is not compared
+	 * when one state stands for another.
+	 */
+	struct bpf_pad_arg call_args[MAX_BPF_FUNC_REG_ARGS];
 	);
 	bool no_stack_arg_load;
 	/*
@@ -1635,6 +1692,11 @@ struct bpf_subprog_info {
 	 * gets into a landing pad, unless the function is mixed. 0: none.
 	 */
 	s16 k_off;
+	/*
+	 * The hidden word where the address of irq flags waits over the call of a subprog that
+	 * saves them, see bpf_pad_note_return(). 0: none.
+	 */
+	s16 pend_off;
 	/* its save words: the first one, the others are above it. See bpf_pad_enter(). */
 	s16 save_off;
 	u8 save_words;
@@ -2624,13 +2686,15 @@ bool bpf_pad_passes_r2(struct bpf_verifier_env *env, int subprog, enum bpf_site_
 void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
 void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 void bpf_pad_note_release(struct bpf_verifier_env *env, int idx);
+void bpf_pad_note_args(struct bpf_func_state *callee, const struct bpf_func_state *caller);
+size_t bpf_pad_note_free(struct bpf_pad_note *note);
 void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class, bool enter);
 void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
 			 const struct bpf_func_state *caller, int call_idx, bool plain);
-void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
+size_t bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
 void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save);
-void bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
+size_t bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
 struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 				   int call_idx);
 struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
@@ -2660,8 +2724,8 @@ int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan
 int bpf_pad_check_saves(struct bpf_verifier_env *env, int s);
 int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
 			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
-int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note *note,
-			struct bpf_insn *buf);
+int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
 void bpf_pads_log(struct bpf_verifier_env *env);
 int bpf_find_kernel_pads(struct bpf_verifier_env *env);
 
