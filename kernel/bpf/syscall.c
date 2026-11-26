@@ -3180,6 +3180,12 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	if (err < 0)
 		goto free_used_maps;
 
+	/*
+	 * The exception table of the main program is found through its
+	 * symbol, and the program can run as soon as it has an id.
+	 */
+	bpf_prog_kallsyms_add(prog);
+
 	err = bpf_prog_alloc_id(prog);
 	if (err)
 		goto free_used_maps;
@@ -3198,7 +3204,6 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	 * Also, any failure handling from this point onwards must
 	 * be using bpf_prog_put() given the program is exposed.
 	 */
-	bpf_prog_kallsyms_add(prog);
 	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
 	bpf_audit_prog(prog, BPF_AUDIT_LOAD);
 
