@@ -500,6 +500,30 @@ there is none, a continuation that can be unwound is not loaded.
 The pads of a continuation release the references that it holds only in the
 frame's memory through the frame, and free the frame after them.
 
+2.3.12 __coro_defer Annotation
+------------------------------
+
+A ``__coro_defer`` parameter is a ``__coro_suspend`` frame that the kernel
+keeps where it is, in the host that the program got with it, and resumes on
+a receive path::
+
+        __bpf_kfunc void bpf_napi_defer(void *frame__coro_defer, u32 where)
+
+Only a frame in memory of a reference is accepted, with that reference in
+one of its slots. The reference may be a ``__ref`` argument of a struct_ops
+member, which no other suspension lets a frame carry: the host is the
+kernel's for good once the frame is, and the continuation gives it up.
+
+The kernel resumes the frame with bottom halves off and a network context,
+whatever the code that suspends runs in, and the continuation is verified
+as code of an XDP program. So a kfunc that the suspending code must not
+call and the continuation may is registered for XDP programs, with a filter
+that knows the program by its struct_ops.
+
+The frame holds no reference but its host. The kfunc's side can therefore
+end a frame that it does not resume by forgetting it, where it takes the
+host back, and never has to call the program for that.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

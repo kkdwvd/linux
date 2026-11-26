@@ -3344,6 +3344,8 @@ struct bpf_call_arg_meta {
 		u32 cnt;
 		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
 		u32 suspend_mask;
+		/* and a __coro_defer one, which it keeps in the frame's host */
+		u32 defer_mask;
 	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,

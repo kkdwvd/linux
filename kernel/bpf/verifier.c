@@ -222,6 +222,7 @@ static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
+static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg);
 static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
 					  const struct bpf_verifier_state *st);
 static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg);
@@ -10835,6 +10836,8 @@ static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_re
 
 	if (suspend)
 		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
+	if (suspend && is_kfunc_arg_coro_defer(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.defer_mask |= BIT(meta->coro_frames.cnt);
 	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
 	return 0;
 
@@ -15350,7 +15353,22 @@ static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_para
  */
 static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg)
 {
-	return btf_param_match_suffix(btf, arg, "__coro_suspend");
+	return btf_param_match_suffix(btf, arg, "__coro_suspend") ||
+	       btf_param_match_suffix(btf, arg, "__coro_defer");
+}
+
+/*
+ * A __coro_defer parameter is a __coro_suspend frame that the kernel keeps where it is, in the
+ * host that the program got with it, and resumes on a receive path: with bottom halves off
+ * and a network context, whatever code suspends it. Its continuation is verified as code
+ * that such a context runs, an XDP program's. The host is in a slot of the frame, also where
+ * it is an argument of the program, which is the kernel's for good once the frame is: the
+ * continuation gives it up. The frame holds no other reference, so that the kernel can end
+ * it and take its host back without a call of the program, see push_coro_suspend().
+ */
+static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_defer");
 }
 
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
@@ -17804,7 +17822,7 @@ static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bp
  */
 static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
 			       struct bpf_reference_state *frame, u32 *moved, int nr_moved,
-			       bool destroy)
+			       bool destroy, bool defer)
 {
 	enum bpf_prog_type type = coro_park_type(&env->prog->insnsi[insn_idx]);
 	struct bpf_subprog_info *info = &env->subprog_info[subprog];
@@ -17878,6 +17896,9 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	 * A kfunc that keeps the frame resumes it in a context of the type of program that
 	 * could call the kfunc: the type of the code that suspends, see bpf_coro_run().
 	 */
+	/* Or a receive path does, whatever the code that defers is: see __coro_defer. */
+	if (defer)
+		type = BPF_PROG_TYPE_XDP;
 	type = type ?: state_prog_type(env, cur);
 	callee->coro_prog_type = type == resolve_prog_type(env->prog) ? 0 : type;
 	callee->coro_destroy = parked && destroy;
@@ -17913,12 +17934,13 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	return 0;
 }
 
-static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
+static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id, bool defer)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_reference_state *frame = bpf_find_ref_slots(cur, id);
 	u32 moved[BPF_MAX_REF_SLOTS];
 	int i, j, err, nr_moved = 0, resume, destroy = -1;
+	bool host;
 
 	if (verifier_bug_if(!frame, env, "suspended coro_frame %d has no slots", id))
 		return -EFAULT;
@@ -17929,6 +17951,10 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 	 */
 	if (cur->frame[0]->coro_destroy) {
 		verbose(env, "the destroy function of a parked coro_frame cannot suspend a coro_frame\n");
+		return -EINVAL;
+	}
+	if (defer && frame->type != REF_TYPE_HOSTED) {
+		verbose(env, "deferred coro_frame is not in memory of a host for the kernel to keep it in\n");
 		return -EINVAL;
 	}
 	/* one function: only that one is verified from the snapshot, see mark_reg_func_set() */
@@ -17964,7 +17990,14 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 			}
 			continue;
 		}
-		if (!coro_slot_reg_survives(env, reg)) {
+		/*
+		 * The host of a frame that is deferred goes to the kernel with the frame,
+		 * also where it was the kernel's all along: an argument of the program.
+		 */
+		host = defer && frame->type == REF_TYPE_HOSTED && frame->parent_id &&
+		       coro_slot_reg_is_ref(reg) && reg->id == frame->parent_id &&
+		       !(reg->type & (MEM_RCU | NON_OWN_REF | PTR_UNTRUSTED | PTR_MAYBE_NULL));
+		if (!host && !coro_slot_reg_survives(env, reg)) {
 			verbose(env, "coro_frame slot %d holds %s which cannot survive a suspension\n",
 				i, reg_type_str(env, reg->type));
 			return -EINVAL;
@@ -17998,6 +18031,12 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 			return -EINVAL;
 		}
 	}
+	/* the kernel ends such a frame without the program: its host is all that it has */
+	if (defer && nr_moved > 1) {
+		verbose(env, "deferred coro_frame holds a reference besides its host, id=%d\n",
+			moved[0] == frame->parent_id ? moved[1] : moved[0]);
+		return -EINVAL;
+	}
 
 	/*
 	 * A parked frame is called by a program that holds it, see check_coro_callx(), or
@@ -18029,12 +18068,13 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 	 */
 	if (!cur->speculative) {
 		err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved,
-					  destroy == resume);
+					  destroy == resume, defer);
 		if (err)
 			return err;
 	}
 	if (!cur->speculative && destroy >= 0 && destroy != resume) {
-		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved, true);
+		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved, true,
+					  defer);
 		if (err)
 			return err;
 	}
@@ -18398,7 +18438,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	for (i = 0; i < meta.coro_frames.cnt; i++) {
 		if (!(meta.coro_frames.suspend_mask & BIT(i)))
 			continue;
-		err = push_coro_suspend(env, insn_idx, meta.coro_frames.ids[i]);
+		err = push_coro_suspend(env, insn_idx, meta.coro_frames.ids[i],
+					meta.coro_frames.defer_mask & BIT(i));
 		if (err)
 			return err;
 	}
