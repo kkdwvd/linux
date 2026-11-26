@@ -1960,6 +1960,8 @@ struct bpf_prog_aux {
 	atomic_long_t coro_drops;
 	/* it parks frames: they are destroyed before it is freed, see bpf_coro_prog_release() */
 	bool coro_parks;
+	/* the size classes of the frames that it allocates, see bpf_coro_frame_size() */
+	u16 coro_classes;
 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
 	bool dev_bound; /* Program is bound to the netdev. */
 	bool offload_requested; /* Program is bound and offloaded to the netdev. */
@@ -2021,6 +2023,14 @@ struct bpf_prog_aux {
 	struct mutex used_maps_mutex; /* mutex for used_maps and used_map_cnt */
 	struct btf_mod_pair *used_btfs;
 	struct bpf_prog *prog;
+	/*
+	 * The coroutine frames that the program has freed on each CPU, for the next ones that it
+	 * allocates there, see "The frame cache" in kernel/bpf/coro.c: where
+	 * bpf_coro_frame_alloc() looks, and what the program has for them. Here, and not with
+	 * the other fields for coroutines: bpf_coro_drop() writes to their line.
+	 */
+	struct bpf_coro_frame_cache __percpu *coro_cache;
+	struct bpf_coro_frames *coro_frames;
 	struct user_struct *user;
 	u64 load_time; /* ns since boottime */
 	u32 verified_insns;

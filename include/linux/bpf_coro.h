@@ -5,7 +5,8 @@
  * bpf_coro_frame_alloc() gives a program the frame that the compiler-generated code of a
  * coroutine keeps its state in. Whoever frees a frame does so with bpf_coro_frame_free().
  * A frame takes no reference on its program: whoever can resume it holds the program, see
- * kernel/bpf/coro.c.
+ * kernel/bpf/coro.c, and so does whoever frees it, until bpf_coro_frame_free() has returned:
+ * the program keeps the frame for its next one.
  *
  * A kfunc that takes a frame through a __coro_suspend argument owns the frame from then on,
  * and takes a reference on the frame's program, bpf_coro_frame_prog(), before it returns,
@@ -33,9 +34,14 @@
 #include <linux/types.h>
 
 struct bpf_prog;
+struct bpf_prog_aux;
 
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_coro_frame_free(void *frame);
+u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size);
+int bpf_coro_frames_init(struct bpf_prog *prog);
+void bpf_coro_frames_stop(struct bpf_prog *prog);
+void bpf_coro_frames_free(struct bpf_prog *prog);
 struct bpf_prog *bpf_coro_frame_prog(void *frame);
 bool bpf_coro_run(void *frame);
 bool bpf_coro_is_parked_dtor(void (*dtor)(void *));
@@ -43,6 +49,10 @@ void bpf_coro_prog_disown(struct bpf_prog *prog);
 void bpf_coro_prog_release(struct bpf_prog *prog);
 #else
 static inline void bpf_coro_frame_free(void *frame)
+{
+}
+
+static inline void bpf_coro_frames_free(struct bpf_prog *prog)
 {
 }
 

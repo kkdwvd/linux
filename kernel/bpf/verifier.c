@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
@@ -17510,7 +17511,7 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 		if (meta->slice_buf.size)
 			env->seen_stack_slice = true;
 	} else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc])) {
-		u64 size = meta->arg_constant.value;
+		u64 size = meta->arg_constant.value, arg;
 
 		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
 			return -EFAULT;
@@ -17519,6 +17520,18 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 			verbose(env, "coro_frame size %llu out of range [1, %u]\n",
 				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
 			return -EINVAL;
+		}
+		/*
+		 * The program gets a cache for frames of this size, see bpf_coro_frames_init(),
+		 * and the call passes the class with the size, see bpf_fixup_kfunc_call(), if it
+		 * is the one size at this call on every path.
+		 */
+		arg = bpf_coro_frame_size(env->prog->aux, size);
+		if (!cur_aux(env)->call_recorded) {
+			cur_aux(env)->call_recorded = true;
+			cur_aux(env)->call_num = arg;
+		} else if (cur_aux(env)->call_num != arg) {
+			cur_aux(env)->call_num = 0;
 		}
 		mark_reg_known_zero(env, regs, BPF_REG_0);
 		regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
@@ -28608,6 +28621,16 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		/* bpf_iter_num_destroy() is a no-op; emit a nop to drop the call */
 		insn_buf[0] = BPF_JMP_A(0);
 		*cnt = 1;
+	} else if (desc->func_id == special_kfunc_list[KF_bpf_coro_frame_alloc] &&
+		   env->insn_aux_data[insn_idx].call_num) {
+		/* the size with its class: the call itself follows, behind the program */
+		struct bpf_insn ld_size[2] = {
+			BPF_LD_IMM64(BPF_REG_1, env->insn_aux_data[insn_idx].call_num)
+		};
+
+		insn_buf[0] = ld_size[0];
+		insn_buf[1] = ld_size[1];
+		*cnt = 2;
 	}
 
 	if (env->insn_aux_data[insn_idx].arg_prog) {
@@ -29168,6 +29191,10 @@ skip_full_check:
 	env->prog->aux->used_btf_cnt = env->used_btf_cnt;
 	/* what it has claimed is given back when it is freed, see bpf_coro_prog_disown() */
 	ret = claim_coro_maps(env);
+	if (ret)
+		goto err_release_maps;
+	/* and so is the cache of its coroutine frames, see bpf_coro_frames_free() */
+	ret = bpf_coro_frames_init(env->prog);
 	if (ret)
 		goto err_release_maps;
 	if (env->used_map_cnt || env->used_btf_cnt) {
