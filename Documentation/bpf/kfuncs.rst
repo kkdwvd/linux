@@ -535,6 +535,23 @@ can ask a bare frame for its program, so no ``__coro_suspend`` kfunc takes
 one: only a ``__coro_defer`` kfunc of the host's subsystem does, which knows
 the program by where it is attached.
 
+2.3.13 __coro_offer Annotation
+------------------------------
+
+A ``__coro_offer`` parameter is a ``__coro_defer`` frame that the kfunc may
+decline, a boundary that answers at once::
+
+        __bpf_kfunc bool bpf_rx_gro(void *frame__coro_offer)
+
+The kfunc returns true where it took the frame: then all of ``__coro_defer``
+holds, and the code that called it has neither the frame nor its host. It
+returns false where it did not: nothing has happened to the frame or to
+what it holds, and the code goes on with both. The verifier checks the two
+outcomes apart, each with the return value known, so a program tells them
+by that value alone. In C++ it is an ``await_suspend()`` that returns bool.
+
+Such a kfunc takes one frame and no other reference, and returns a scalar.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

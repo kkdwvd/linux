@@ -223,6 +223,7 @@ static int ref_set_non_owning(struct bpf_verifier_env *env,
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
 static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg);
+static bool is_kfunc_arg_coro_offer(const struct btf *btf, const struct btf_param *arg);
 static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
 					  const struct bpf_verifier_state *st);
 static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg);
@@ -10838,6 +10839,8 @@ static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_re
 		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
 	if (suspend && is_kfunc_arg_coro_defer(meta->btf, &btf_params(meta->func_proto)[arg]))
 		meta->coro_frames.defer_mask |= BIT(meta->coro_frames.cnt);
+	if (suspend && is_kfunc_arg_coro_offer(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.offer_mask |= BIT(meta->coro_frames.cnt);
 	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
 	return 0;
 
@@ -15354,7 +15357,8 @@ static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_para
 static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg)
 {
 	return btf_param_match_suffix(btf, arg, "__coro_suspend") ||
-	       btf_param_match_suffix(btf, arg, "__coro_defer");
+	       btf_param_match_suffix(btf, arg, "__coro_defer") ||
+	       btf_param_match_suffix(btf, arg, "__coro_offer");
 }
 
 /*
@@ -15368,7 +15372,20 @@ static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_pa
  */
 static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg)
 {
-	return btf_param_match_suffix(btf, arg, "__coro_defer");
+	return btf_param_match_suffix(btf, arg, "__coro_defer") ||
+	       btf_param_match_suffix(btf, arg, "__coro_offer");
+}
+
+/*
+ * A __coro_offer parameter is a __coro_defer frame that the kfunc may decline: a boundary
+ * that answers at once. The kfunc returns true where it took the frame, which is the case of
+ * __coro_defer, and false where it did not: then nothing has happened to the frame or to
+ * what it holds, and the code goes on with both. The two are verified apart, see
+ * push_coro_declined(), so the code tells them by the return value alone.
+ */
+static bool is_kfunc_arg_coro_offer(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_offer");
 }
 
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
@@ -17949,6 +17966,30 @@ static bool coro_frame_is_bare(struct bpf_verifier_env *env,
 	       bpf_coro_host_bare(insn->imm);
 }
 
+/*
+ * A kfunc with a __coro_offer argument did not take the frame: the state behind the call in
+ * which the frame and what it holds are the program's as before, and the kfunc returned
+ * false. It is verified beside the one in which the kfunc took the frame, like the two
+ * outcomes of the next() of an iterator, see process_iter_next_call(): made of the state at
+ * the call, before anything of it goes to the continuation.
+ */
+static int push_coro_declined(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_verifier_state *st;
+	struct bpf_reg_state *regs;
+	int i;
+
+	st = push_stack(env, insn_idx + 1, insn_idx, false);
+	if (IS_ERR(st))
+		return PTR_ERR(st);
+	regs = st->frame[st->curframe]->regs;
+	for (i = 0; i < CALLER_SAVED_REGS; i++)
+		bpf_mark_reg_not_init(env, &regs[caller_saved[i]]);
+	mark_reg_unknown(env, regs, BPF_REG_0);
+	__mark_reg_const_zero(&regs[BPF_REG_0]);
+	return 0;
+}
+
 static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id, bool defer)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
@@ -18452,6 +18493,24 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	/*
+	 * A frame that the kfunc may decline: the state in which it did, before the frame and
+	 * what it holds go to the continuation. Such a kfunc takes the one frame, releases
+	 * nothing else and says which it was: that is all that the two states differ in.
+	 */
+	if (meta.coro_frames.offer_mask) {
+		t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
+		if (meta.coro_frames.cnt != 1 || meta.release_regno || is_kfunc_acquire(&meta) ||
+		    !btf_type_is_scalar(t) || env->cur_state->unwound) {
+			verbose(env, "kfunc %s offers a coro_frame and does more than take or decline it\n",
+				func_name);
+			return -EFAULT;
+		}
+		err = push_coro_declined(env, insn_idx);
+		if (err)
+			return err;
+	}
+
+	/*
 	 * Frames the kernel resumes later: verify their continuations from a
 	 * snapshot of the frame before the frame reference goes away.
 	 */
@@ -18797,6 +18856,10 @@ unwound:
 		if (err)
 			return err;
 	}
+
+	/* it took the frame: the other outcome is the state of push_coro_declined() */
+	if (meta.coro_frames.offer_mask)
+		__mark_reg_known(&regs[BPF_REG_0], 1);
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_session_cookie])
 		env->prog->call_session_cookie = true;

@@ -3348,6 +3348,8 @@ struct bpf_call_arg_meta {
 		u32 suspend_mask;
 		/* and a __coro_defer one, which it keeps in the frame's host */
 		u32 defer_mask;
+		/* and a __coro_offer one, which it may decline */
+		u32 offer_mask;
 	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
