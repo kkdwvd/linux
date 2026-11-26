@@ -17,6 +17,8 @@
 
 extern void *bpf_coro_frame_alloc_skb(__u64 size, struct sk_buff *skb) __ksym;
 extern bool bpf_rx_gro(void *frame) __ksym;
+extern bool bpf_rx_backlog(void *frame, __u32 cpu) __ksym;
+extern void bpf_rx_deliver(struct sk_buff *skb) __ksym;
 extern void bpf_rx_set_state(struct sk_buff *skb, __u64 state) __ksym;
 extern __u64 bpf_rx_state(struct sk_buff *skb) __ksym;
 extern void bpf_rx_batch(struct sk_buff *skb) __ksym;
@@ -34,6 +36,12 @@ __u64 arrived, taken, declined, resumed, native, no_frame;
 __s64 frame_off;
 /* by the one with state: the merges, and the state of every packet that went onto a batch */
 __u64 merges, state_sum;
+/*
+ * by the one that steers: the CPU, the packets whose backlog took them and did not, and
+ * those that went on there, on that CPU and with the state that they left with
+ */
+__u32 steer_cpu;
+__u64 steered, not_steered, delivered, on_cpu, state_kept;
 
 /* by the observers: what the stack got, in order, and the lists that it got them in */
 struct rx_seen seen[RX_SEEN];
@@ -161,6 +169,70 @@ SEC(".struct_ops.link")
 struct bpf_rx_ops rx_state = {
 	.arrive = (void *)arrive_state,
 	.merge = (void *)merge,
+};
+
+/*
+ * An extension that steers: a packet that comes out of GRO goes to the backlog of a CPU, as
+ * RPS has it, and on to the stack from there. Where the backlog does not take it, onto the
+ * batch. The frame says where the coroutine is: 0 in GRO, 1 in the backlog.
+ */
+static __always_inline void steer(__u64 *f, struct sk_buff *skb)
+{
+	f[3] = 1;
+	bpf_rx_set_state(skb, 0x5eed);
+	if (bpf_rx_backlog(f, steer_cpu)) {
+		__sync_fetch_and_add(&steered, 1);
+		return;
+	}
+	__sync_fetch_and_add(&not_steered, 1);
+	bpf_rx_batch(skb);
+}
+
+static __noinline __used void steer_fn(void *frame)
+{
+	__u64 *f = frame;
+	struct sk_buff *skb = (struct sk_buff *)f[2];
+
+	if (f[3]) {
+		__sync_fetch_and_add(&delivered, 1);
+		if (bpf_get_smp_processor_id() == steer_cpu)
+			__sync_fetch_and_add(&on_cpu, 1);
+		if (bpf_rx_state(skb) == 0x5eed)
+			__sync_fetch_and_add(&state_kept, 1);
+		bpf_rx_deliver(skb);
+		return;
+	}
+	__sync_fetch_and_add(&resumed, 1);
+	steer(f, skb);
+}
+
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_steer, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	f = bpf_coro_frame_alloc_skb(32, skb);
+	if (!f) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_native(skb);
+		return;
+	}
+	f[0] = (__u64)steer_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	f[3] = 0;
+	if (bpf_rx_gro(f)) {
+		__sync_fetch_and_add(&taken, 1);
+		return;
+	}
+	__sync_fetch_and_add(&declined, 1);
+	steer(f, skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_steer = {
+	.arrive = (void *)arrive_steer,
 };
 
 /* The null extension, and nothing else: what the path costs as code of an extension */

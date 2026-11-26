@@ -130,6 +130,11 @@ static void forget(void)
 	ext->bss->no_frame = 0;
 	ext->bss->merges = 0;
 	ext->bss->state_sum = 0;
+	ext->bss->steered = 0;
+	ext->bss->not_steered = 0;
+	ext->bss->delivered = 0;
+	ext->bss->on_cpu = 0;
+	ext->bss->state_kept = 0;
 }
 
 static struct rx_seen kernel_saw[RX_SEEN];
@@ -228,6 +233,36 @@ static bool wait_seen(__u64 want, const char *what)
 	return ASSERT_EQ(ext->bss->nr_seen, want, what);
 }
 
+/*
+ * The extension that steers: what comes out of GRO goes to the backlog of @cpu and on to the
+ * stack from there, in a continuation that runs on that CPU; what the backlog does not take
+ * goes onto the batch. @out packets come out of GRO, with all the segments that arrived.
+ */
+static void steer(const char *what, __u32 cpu, __u32 kind, __u32 n, __u64 out, bool all)
+{
+	ext_map = ext->maps.rx_steer;
+	ext->bss->steer_cpu = cpu;
+	if (!attach())
+		goto out;
+	forget();
+	receive(kind, n, POLLS);
+	if (!wait_seen(out, what))
+		goto out;
+	ASSERT_EQ(segments(), POLLS * n, what);
+	ASSERT_EQ(ext->bss->arrived, POLLS * n, what);
+	ASSERT_EQ(ext->bss->steered + ext->bss->not_steered, out, what);
+	ASSERT_EQ(ext->bss->delivered, ext->bss->steered, what);
+	ASSERT_EQ(ext->bss->on_cpu, ext->bss->steered, what);
+	ASSERT_EQ(ext->bss->state_kept, ext->bss->steered, what);
+	ASSERT_EQ(ext->bss->no_frame, 0, what);
+	if (all)
+		ASSERT_EQ(ext->bss->steered, out, what);
+out:
+	if (ext_link)
+		detach();
+	ext_map = NULL;
+}
+
 static void test_path(void)
 {
 	LIBBPF_OPTS(bpf_tc_hook, hook, .attach_point = BPF_TC_INGRESS);
@@ -246,6 +281,7 @@ static void test_path(void)
 	ext->struct_ops.rx_null->ifindex = ifindex;
 	ext->struct_ops.rx_entry->ifindex = ifindex;
 	ext->struct_ops.rx_state->ifindex = ifindex;
+	ext->struct_ops.rx_steer->ifindex = ifindex;
 	ext->bss->ifindex = ifindex;
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;
@@ -309,6 +345,22 @@ static void test_path(void)
 	path("a flow, chained", RX_FLOW, 8, POLLS * 8, POLLS);
 	state("state, a flow, chained", RX_FLOW, 8);
 	SYS(out, "ethtool -K napitest0 rx-gro-list off");
+
+	/* to another CPU's backlog behind GRO, as RPS has it, and to this one's */
+	steer("steered, datagrams", 2, RX_UDP, 8, POLLS * 8, true);
+	steer("steered, a flow", 2, RX_FLOW, 8, POLLS, true);
+	steer("steered, flows", 1, RX_FLOWS, 16, POLLS * 16, true);
+	steer("steered, to every CPU in turn", 0, RX_FEW, 20, POLLS * 4, true);
+	steer("steered, to every CPU in turn", 3, RX_FEW, 20, POLLS * 4, true);
+	/* a CPU that is not there takes nothing: onto the batch */
+	steer("steered nowhere", 4096, RX_FLOWS, 16, POLLS * 16, false);
+	ASSERT_EQ(ext->bss->steered, 0, "steered nowhere");
+	/* nor does a backlog that is full: the rest goes onto the batch, and nothing is lost */
+	SYS(out, "sysctl -qw net.core.netdev_max_backlog=1");
+	steer("steered, a full backlog", 2, RX_UDP, 60, POLLS * 60, false);
+	ASSERT_GT(ext->bss->not_steered, 0, "not steered, a full backlog");
+	ASSERT_GT(ext->bss->steered, 0, "steered, a full backlog");
+	SYS(out, "sysctl -qw net.core.netdev_max_backlog=1000");
 
 	/* past GRO: every segment goes up by itself */
 	detach();
@@ -455,6 +507,7 @@ static void test_cost(void)
 	ext->struct_ops.rx_null->ifindex = ifindex;
 	ext->struct_ops.rx_entry->ifindex = ifindex;
 	ext->struct_ops.rx_state->ifindex = ifindex;
+	ext->struct_ops.rx_steer->ifindex = ifindex;
 	/* no observer: nothing but the path */
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;
