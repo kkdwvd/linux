@@ -51,6 +51,7 @@
 #include "verifier_const.skel.h"
 #include "verifier_const_or.skel.h"
 #include "verifier_coro_frame.skel.h"
+#include "verifier_coro_frame_xdp.skel.h"
 #include "verifier_ctx.skel.h"
 #include "verifier_ctx_rewritten.skel.h"
 #include "verifier_ctx_sk_msg.skel.h"
@@ -277,6 +278,7 @@ void test_verifier_cgroup_storage(void)       { RUN(verifier_cgroup_storage); }
 void test_verifier_const(void)                { RUN(verifier_const); }
 void test_verifier_const_or(void)             { RUN(verifier_const_or); }
 void test_verifier_coro_frame(void)          { RUN(verifier_coro_frame); }
+void test_verifier_coro_frame_xdp(void)      { RUN(verifier_coro_frame_xdp); }
 void test_verifier_ctx(void)                  { RUN_TESTS(verifier_ctx); }
 void test_verifier_ctx_rewritten(void)        { RUN_TESTS(verifier_ctx_rewritten); }
 void test_verifier_ctx_sk_msg(void)           { RUN(verifier_ctx_sk_msg); }
