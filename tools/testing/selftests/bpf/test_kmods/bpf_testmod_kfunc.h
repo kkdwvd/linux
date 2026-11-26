@@ -335,6 +335,10 @@ void bpf_kfunc_call_test_mem_len_fail1(void *mem, int len);
 
 void bpf_kfunc_common_test(void) __ksym;
 int bpf_kfunc_coro_frames(__u64 cookie, void *a, void *b, __u64 *rdonly_buf) __ksym;
+int bpf_kfunc_napi_test_dev(bool up) __ksym;
+__u32 bpf_kfunc_napi_test_id(void) __ksym;
+__u64 bpf_kfunc_napi_test_run(__u32 n) __ksym;
+__s64 bpf_kfunc_napi_test_ctl(__u32 op) __ksym;
 void bpf_kfunc_coro_frames_release(void *a, void *b) __ksym;
 int bpf_kfunc_coro_frames_stack(void *a, __u64 b, __u64 c, __u64 d, __u64 e,
 				void *f) __ksym;
