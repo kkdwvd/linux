@@ -2,12 +2,17 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
+#include <linux/bpf_verifier.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/capability.h>
 #include <linux/netdevice.h>
+#include <linux/nsproxy.h>
 #include <linux/sched.h>
+#include <linux/static_call.h>
 #include <net/net_namespace.h>
+#include <trace/events/napi.h>
 
 #include "dev.h"
 
@@ -158,3 +163,707 @@ static int __init bpf_napi_kfunc_init(void)
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_napi_kfunc_set);
 }
 late_initcall(bpf_napi_kfunc_init);
+
+#ifdef CONFIG_BPF_JIT
+/*
+ * The extension at the step where a NAPI is scheduled.
+ *
+ * A NAPI that is scheduled has to be polled, and where and when is a step of the receive
+ * path that the kernel decides in ____napi_schedule(): softirq on the CPU that scheduled it,
+ * or the thread of the NAPI. An extension takes that step over for the NAPIs of one device.
+ * It is code in place of the kernel's, not a setting: __napi_schedule() and
+ * __napi_schedule_irqoff() call it where they called ____napi_schedule(), and so does
+ * __napi_poll() where a poll in softirq has used up its budget and the NAPI wants its next
+ * one. What the step is made of stays the kernel's: the queues, the wake, the driver's poll.
+ *
+ * The unit is a POLL: one call of the driver's poll that is owed. The extension is entered
+ * with the NAPI as a reference that it has to give up, see struct bpf_napi_ops, and is a
+ * coroutine as a rule:
+ *
+ *	frame = bpf_coro_frame_alloc_napi(size, napi);	its frame is in the NAPI
+ *	bpf_napi_defer(frame, BPF_NAPI_SOFTIRQ);	the boundary: the poll waits
+ *	...						softirq, or the thread, gets to it
+ *	bpf_napi_poll_run(napi);			the operation, and the end of the frame
+ *
+ * The NAPI is the host of the frame, see "Hosts" in kernel/bpf/coro.c: it lends the frame
+ * napi_struct::bpf_poll_frame, and the frame is there for as long as the code has the NAPI.
+ * NAPI_STATE_SCHED is what makes that one owner at a time, and the frame is alive inside
+ * its span only: from the entry to the call of the driver's poll, which gives the reference
+ * up before it calls the driver. The driver may complete the NAPI in its poll, and another
+ * CPU may schedule it and write the next frame while the first poll is on its way out.
+ *
+ * bpf_napi_defer() is the kernel's own two choices: softirq on this CPU, by the local half
+ * of ____napi_schedule(), or the thread that the NAPI is bound to, by napi_bpf_schedule().
+ * The kernel keeps the frame where it is and marks the NAPI, napi_struct::bpf_poll_gen, and
+ * __napi_poll() resumes the continuation in place of its call of the driver's poll,
+ * wherever it runs: net_rx_action(), or a thread's bpf_napi_poll(). Both have bottom halves
+ * off and a network context, and the continuation is verified as code for that, whatever
+ * the entry was, see __coro_defer in kernel/bpf/verifier.c. So the entry, which runs with
+ * interrupts off, cannot poll, and the continuation can.
+ *
+ * A thread that polls a NAPI nobody scheduled for it enters by itself, at again(): its
+ * next poll of a NAPI that used up its budget, and a busy poll that takes an idle NAPI.
+ * There the code may call bpf_napi_poll_run() at once: the poll runs in the thread, with no
+ * suspension, which is the kernel's inline.
+ *
+ * Nothing of the receive path is lost on the way. A repoll in softirq that is deferred to
+ * softirq stays on the list of the round that polled it, under that round's budget and
+ * time: the entry only marks it. What the driver's poll did under the continuation is what
+ * __napi_poll() returns. The timers of GRO and of interrupt deferral schedule the NAPI
+ * like an interrupt, and pass the entry. A schedule of a NAPI that is scheduled sets
+ * NAPI_STATE_MISSED and folds into the poll that is owed, and napi_complete_done() enters
+ * for it once. Busy polling by a socket takes the NAPI without a schedule and polls it in
+ * the caller: it does not pass. Nor does a NAPI in the kernel's threaded mode.
+ *
+ * The device stays in control:
+ * - The verifier refuses an entry that returns with the NAPI, see __ref.
+ * - A frame that is deferred holds nothing but its NAPI, so the kernel ends it without a
+ *   call of the program wherever it takes the NAPI back: the watchdog of a thread that does
+ *   not poll, an unbind, a detach. It forgets the mark, and polls.
+ * - A continuation that returns without the poll, or that the kernel unwinds, leaves the
+ *   poll to __napi_poll(), which calls the driver as it would have. So does an entry that
+ *   the kernel unwinds: its landing pad gives the NAPI to ____napi_schedule().
+ * - Only one extension is attached at a time, to one device.
+ *
+ * One extension in one place is also what makes its calls direct. The kernel knows at the
+ * attach what it will call at the entries and where it resumes. The calls of schedule() and
+ * again() are static calls that the attach patches, to the programs themselves and not to
+ * the members of the struct_ops, which are trampolines around them. A trampoline is for a
+ * caller that may be anywhere: it enters a read section of RCU, disables migration and
+ * notes the program for the helpers that ask what runs. The entries have interrupts or
+ * bottom halves off, which is the first two, and no helper of this program type asks. And a
+ * frame whose first slot is the resume function that the verifier noted for the program of
+ * schedule() is resumed by bpf_coro_run_bh(), which asks the frame nothing, in place of
+ * bpf_coro_run(). BPF_NAPI_OPS_F_INDIRECT keeps the calls through the pointers of the
+ * extension and of the frame, to compare the two.
+ *
+ * The kernel's unwinding of an entry needs nothing of the trampoline. An entry is the main
+ * program of its invocation: where the kernel stops it, the landing pads in its own text
+ * give up what it holds, the NAPI to bpf_napi_poll_native() or bpf_napi_poll_run(), and it
+ * leaves with exit like any return, to whoever called.
+ */
+
+/**
+ * struct bpf_napi_ops - the extension
+ * @schedule: The NAPI was scheduled, @reason BPF_NAPI_SCHEDULE: with interrupts off, in
+ *	hard interrupt context as a rule. Or softirq polled it and it wants its next poll,
+ *	BPF_NAPI_REPOLL. The code defers the poll with bpf_napi_defer(), or leaves it to the
+ *	kernel with bpf_napi_poll_native().
+ * @again: The thread that polls the NAPI is in bpf_napi_poll() and nothing was deferred
+ *	to it, BPF_NAPI_AGAIN. The code polls with bpf_napi_poll_run(), or defers.
+ * @ifindex: the device, in the network namespace of whoever attaches
+ * @flags: BPF_NAPI_OPS_F_INDIRECT, or 0
+ */
+struct bpf_napi_ops {
+	void (*schedule)(struct napi_struct *napi, u32 reason);
+	void (*again)(struct napi_struct *napi, u32 reason);
+	u32 ifindex;
+	u32 flags;
+};
+
+static_assert(sizeof_field(struct napi_struct, bpf_poll_frame) > BPF_CORO_FRAME_HDR);
+
+/* The largest frame of a poll */
+#define BPF_NAPI_POLL_FRAME	(sizeof_field(struct napi_struct, bpf_poll_frame) - BPF_CORO_FRAME_HDR)
+
+DEFINE_STATIC_KEY_FALSE(napi_ext_key);
+
+static unsigned int napi_ext_no_prog(const void *ctx, const struct bpf_insn *insn)
+{
+	return 0;
+}
+
+/* schedule() and again() of the extension that is attached, and whether the calls are direct */
+DEFINE_STATIC_CALL(napi_ext_schedule_call, napi_ext_no_prog);
+DEFINE_STATIC_CALL(napi_ext_again_call, napi_ext_no_prog);
+static DEFINE_STATIC_KEY_FALSE(napi_ext_direct_key);
+/* the programs of the two, and what the kernel resumes of the frames that it defers */
+static const struct bpf_prog *napi_ext_prog, *napi_ext_again_prog;
+static void *napi_ext_resume;
+
+static DEFINE_MUTEX(napi_ext_mutex);
+static const struct bpf_napi_ops __rcu *napi_ext_ops;
+static struct net_device *napi_ext_dev;
+static netdevice_tracker napi_ext_dev_tracker;
+
+/* What the code of the extension is in, on this CPU */
+enum {
+	NAPI_EXT_NONE,
+	/* the three reasons of an entry, in their order: see napi_ext_enter() */
+	NAPI_EXT_SCHEDULE,	/* schedule(BPF_NAPI_SCHEDULE): interrupts off */
+	NAPI_EXT_REPOLL,	/* schedule(BPF_NAPI_REPOLL): softirq, in __napi_poll() */
+	NAPI_EXT_AGAIN,		/* again(): a thread, in __napi_poll() */
+	NAPI_EXT_RESUME,	/* a continuation, in __napi_poll() */
+	NAPI_EXT_DONE,		/* it gave the NAPI up */
+};
+
+/*
+ * A CPU runs the code for one NAPI at a time, with interrupts or bottom halves off, except
+ * that the driver's poll which the code calls may schedule its NAPI again, which enters
+ * anew: napi_ext_enter() saves this and puts it back.
+ */
+struct napi_ext_cpu {
+	/* the two arguments of schedule() and again(): what a program has for its context */
+	struct napi_struct *napi;
+	u64 reason;
+	int work;	/* what the driver's poll did, -1 if nothing called it */
+	u8 ctx;
+	bool repoll;	/* NAPI_EXT_REPOLL: softirq is to keep the NAPI on the list of its round */
+};
+
+static DEFINE_PER_CPU(struct napi_ext_cpu, napi_ext_cpu);
+
+/*
+ * Which attachment this is, never 0: what a NAPI with a frame deferred has in bpf_poll_gen,
+ * so that a frame of an extension that is gone is nothing to the next one.
+ */
+static u32 napi_ext_gen;
+
+/**
+ * napi_ext_enter - have the extension do the step where a NAPI is scheduled
+ * @napi: the NAPI, which the caller owns: NAPI_STATE_SCHED is set, and it is on no list
+ * @reason: BPF_NAPI_SCHEDULE with interrupts off, BPF_NAPI_REPOLL in softirq
+ * @repoll: for BPF_NAPI_REPOLL: set if softirq is to poll the NAPI again in a later round
+ *
+ * Returns false if the extension is gone, and for an entry that did not give the NAPI up,
+ * which the verifier does not load: the kernel does its own step then.
+ */
+static __always_inline int __napi_ext_enter(struct napi_ext_cpu *cur,
+					    const struct bpf_napi_ops *ops,
+					    struct napi_struct *napi, u32 reason)
+{
+	int ret;
+
+	BUILD_BUG_ON(NAPI_EXT_SCHEDULE != 1 + BPF_NAPI_SCHEDULE ||
+		     NAPI_EXT_REPOLL != 1 + BPF_NAPI_REPOLL);
+	/*
+	 * The context is the first thing stored: an entry from an interrupt that finds none
+	 * has all of this one's stores still to come, and one that finds it puts back what
+	 * it found, see napi_ext_enter_nested().
+	 */
+	cur->ctx = 1 + reason;
+	barrier();
+	cur->napi = napi;
+	cur->reason = reason;
+	cur->repoll = false;
+	/* the context of a struct_ops program: the arguments of its member */
+	if (static_branch_likely(&napi_ext_direct_key))
+		static_call(napi_ext_schedule_call)(&cur->napi, napi_ext_prog->insnsi);
+	else
+		ops->schedule(napi, reason);
+	ret = cur->ctx != NAPI_EXT_DONE ? 0 : cur->repoll ? NAPI_EXT_REPOLLS : NAPI_EXT_ENTERED;
+	barrier();
+	cur->ctx = NAPI_EXT_NONE;
+	return ret;
+}
+
+/*
+ * An entry inside one that is on this CPU already, from an interrupt or from what the
+ * code of the other one called: what that one has is put back, in one piece.
+ */
+static noinline int napi_ext_enter_nested(const struct bpf_napi_ops *ops,
+					  struct napi_struct *napi, u32 reason)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu), saved = *cur;
+	unsigned long flags;
+	int ret;
+
+	cur->ctx = NAPI_EXT_NONE;
+	ret = __napi_ext_enter(cur, ops, napi, reason);
+	local_irq_save(flags);
+	*cur = saved;
+	local_irq_restore(flags);
+	return ret;
+}
+
+int napi_ext_enter(struct napi_struct *napi, u32 reason)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+	const struct bpf_napi_ops *ops;
+
+	/* interrupts or bottom halves are off: a read section that napi_ext_detach() waits for */
+	ops = rcu_dereference_sched(napi_ext_ops);
+	if (unlikely(!ops) || !napi_ext_on(napi))
+		return 0;
+	/* nothing of the extension is on this CPU as a rule, and then nothing to put back */
+	if (unlikely(cur->ctx != NAPI_EXT_NONE))
+		return napi_ext_enter_nested(ops, napi, reason);
+	return __napi_ext_enter(cur, ops, napi, reason);
+}
+
+/**
+ * napi_ext_poll - the extension's part of a poll, in __napi_poll()
+ * @napi: the NAPI, scheduled, with bottom halves off
+ * @deferred: set if the code deferred the poll once more: the NAPI is the caller's no more
+ *
+ * A poll that was deferred goes on in its continuation, which calls the driver's poll. A
+ * thread that polls without one enters at again(). Returns what the driver's poll did, or
+ * -1 if nothing called it: the kernel does.
+ */
+static __always_inline int __napi_ext_poll(struct napi_ext_cpu *cur,
+					   const struct bpf_napi_ops *ops,
+					   struct napi_struct *napi, u32 gen)
+{
+	int work;
+
+	/* the context first, see __napi_ext_enter() */
+	cur->ctx = gen ? NAPI_EXT_RESUME : NAPI_EXT_AGAIN;
+	barrier();
+	cur->napi = napi;
+	cur->work = -1;
+	if (gen) {
+		void *frame = (void *)napi->bpf_poll_frame + BPF_CORO_FRAME_HDR;
+
+		/* the program is the attachment's, which waits for this: see napi_ext_detach() */
+		if (static_branch_likely(&napi_ext_direct_key) &&
+		    *(void **)frame == READ_ONCE(napi_ext_resume))
+			bpf_coro_run_bh(napi_ext_prog, frame);
+		else
+			bpf_coro_run(frame);
+		work = cur->work;
+	} else {
+		/* a thread that keeps the NAPI in hand comes by with nothing deferred */
+		cur->reason = BPF_NAPI_AGAIN;
+		if (static_branch_likely(&napi_ext_direct_key))
+			static_call(napi_ext_again_call)(&cur->napi, napi_ext_again_prog->insnsi);
+		else
+			ops->again(napi, BPF_NAPI_AGAIN);
+		work = cur->work;
+		if (cur->ctx == NAPI_EXT_DONE && work < 0)
+			work = NAPI_EXT_DEFERRED;
+	}
+	barrier();
+	cur->ctx = NAPI_EXT_NONE;
+	return work;
+}
+
+static noinline int napi_ext_poll_nested(const struct bpf_napi_ops *ops,
+					 struct napi_struct *napi, u32 gen)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu), saved = *cur;
+	unsigned long flags;
+	int work;
+
+	cur->ctx = NAPI_EXT_NONE;
+	work = __napi_ext_poll(cur, ops, napi, gen);
+	local_irq_save(flags);
+	*cur = saved;
+	local_irq_restore(flags);
+	return work;
+}
+
+int napi_ext_poll(struct napi_struct *napi)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+	const struct bpf_napi_ops *ops = rcu_dereference_sched(napi_ext_ops);
+	u32 gen = napi->bpf_poll_gen;
+
+	/* the caller owns the NAPI: the mark is its to take */
+	if (gen)
+		napi->bpf_poll_gen = 0;
+	/* the kernel polls: the extension is gone, or left a frame of another */
+	if (unlikely(!ops))
+		return -1;
+	if (!gen) {
+		/* softirq, or a kernel thread, with a NAPI that came by the kernel's own hand */
+		if (!(READ_ONCE(napi->state) & NAPIF_STATE_BPF_POLLING))
+			return -1;
+	} else if (unlikely(gen != READ_ONCE(napi_ext_gen))) {
+		return -1;
+	}
+	if (unlikely(cur->ctx != NAPI_EXT_NONE))
+		return napi_ext_poll_nested(ops, napi, gen);
+	return __napi_ext_poll(cur, ops, napi, gen);
+}
+
+/*
+ * A NAPI appears, with the lock of its device: it has the extension if the device has it.
+ * Its memory may have been a NAPI before, and what it was then says nothing.
+ */
+void napi_ext_add(struct napi_struct *napi)
+{
+	napi->bpf_poll_gen = 0;
+	if (napi->dev == READ_ONCE(napi_ext_dev))
+		set_bit(NAPI_STATE_EXT, &napi->state);
+	else
+		clear_bit(NAPI_STATE_EXT, &napi->state);
+}
+
+/* Has the code on this CPU @napi in hand, in one of @ctxs, a mask? */
+static __always_inline bool napi_ext_in(const struct napi_ext_cpu *cur,
+					const struct napi_struct *napi, u32 ctxs)
+{
+	return !WARN_ON_ONCE(cur->napi != napi || !(BIT(cur->ctx) & ctxs));
+}
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_coro_frame_alloc_napi - the coroutine frame of a poll, in its NAPI
+ * @size__k: the size of the frame, which the verifier checked against BPF_NAPI_POLL_FRAME
+ * @napi__coro_host: the NAPI that the extension was entered with
+ * @aux: the program
+ *
+ * The frame is there for as long as the code has the NAPI, and nothing frees it. Returns
+ * the frame, or NULL for a program whose last reference is gone.
+ */
+__bpf_kfunc void *bpf_coro_frame_alloc_napi(u64 size__k, struct napi_struct *napi__coro_host,
+					    struct bpf_prog_aux *aux)
+{
+	return bpf_coro_frame_in(napi__coro_host->bpf_poll_frame, aux);
+}
+
+/**
+ * bpf_napi_defer - have the poll of a NAPI wait for softirq, or for the thread of the NAPI
+ * @frame__coro_defer: the frame of the poll, from bpf_coro_frame_alloc_napi(), with the
+ *	NAPI in one of its slots
+ * @where: BPF_NAPI_SOFTIRQ, or BPF_NAPI_THREAD
+ *
+ * The step that ____napi_schedule() is, as a boundary: the kernel keeps the frame in the
+ * NAPI and resumes its continuation where the NAPI is polled next, in softirq on this CPU
+ * or under the bpf_napi_poll() of a thread. BPF_NAPI_THREAD is softirq for a NAPI that is
+ * bound to no thread, or whose thread the kernel took it from. A repoll that waits for
+ * softirq stays in the round that polled it. Never resumes in the call.
+ */
+__bpf_kfunc void bpf_napi_defer(void *frame__coro_defer, u32 where)
+{
+	struct napi_struct *napi = container_of(frame__coro_defer - BPF_CORO_FRAME_HDR,
+						struct napi_struct, bpf_poll_frame);
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+	unsigned long flags = 0;
+
+	if (!napi_ext_in(cur, napi,
+			 BIT(NAPI_EXT_SCHEDULE) | BIT(NAPI_EXT_REPOLL) | BIT(NAPI_EXT_AGAIN)))
+		return;
+	/* before the NAPI is where another CPU finds it */
+	napi->bpf_poll_gen = READ_ONCE(napi_ext_gen);
+	/* schedule() has interrupts off as it is */
+	if (cur->ctx != NAPI_EXT_SCHEDULE)
+		local_irq_save(flags);
+	if (where == BPF_NAPI_THREAD && napi_bpf_schedule(napi)) {
+		/* its thread has it: an again() that keeps it for the next call, too */
+	} else if (cur->ctx == NAPI_EXT_REPOLL) {
+		cur->repoll = true;
+	} else {
+		if (cur->ctx == NAPI_EXT_AGAIN) {
+			/*
+			 * The thread lets it go, as a poll that completes it does, and a busy
+			 * poll ends with the mark: softirq has to be able to complete it.
+			 */
+			clear_bit(NAPI_STATE_IN_BUSY_POLL, &napi->state);
+			clear_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
+		}
+		napi_schedule_local(napi);
+	}
+	if (cur->ctx != NAPI_EXT_SCHEDULE)
+		local_irq_restore(flags);
+	cur->ctx = NAPI_EXT_DONE;
+}
+
+/**
+ * bpf_napi_poll_native - leave the poll of a NAPI to the kernel
+ * @napi: the NAPI that schedule() was entered with
+ *
+ * The kernel's own step for this poll, with no frame: ____napi_schedule(), or for a repoll
+ * the list of the round. It is what the landing pad of schedule() calls too.
+ */
+__bpf_kfunc void bpf_napi_poll_native(struct napi_struct *napi)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+
+	if (!napi_ext_in(cur, napi, BIT(NAPI_EXT_SCHEDULE) | BIT(NAPI_EXT_REPOLL)))
+		return;
+	if (cur->ctx == NAPI_EXT_REPOLL)
+		cur->repoll = true;
+	else
+		napi_schedule_native(napi);
+	cur->ctx = NAPI_EXT_DONE;
+}
+
+/**
+ * bpf_napi_poll_run - the driver's poll of a NAPI, once, with its budget
+ * @napi: the NAPI, which the caller owns: the continuation of a poll that was deferred,
+ *	or again()
+ *
+ * The operation of the unit, and the end of its frame: the caller has no NAPI when the
+ * driver is entered, and looks at no frame afterwards. No lookup, no claim and no sleep:
+ * the code is in __napi_poll(), which gets what the poll did.
+ */
+__bpf_kfunc void bpf_napi_poll_run(struct napi_struct *napi)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+	int work;
+
+	if (!napi_ext_in(cur, napi, BIT(NAPI_EXT_RESUME) | BIT(NAPI_EXT_AGAIN)))
+		return;
+	cur->ctx = NAPI_EXT_DONE;
+	work = napi->poll(napi, napi->weight);
+	trace_napi_poll(napi, work, napi->weight);
+	xdp_do_check_flushed(napi);
+	/* the same CPU, and what the driver's poll entered on the way has put @cur back */
+	cur->work = work;
+}
+
+__bpf_kfunc_end_defs();
+
+static int bpf_napi_ops__schedule(struct napi_struct *napi__ref, u32 reason)
+{
+	return 0;
+}
+
+static int bpf_napi_ops__again(struct napi_struct *napi__ref, u32 reason)
+{
+	return 0;
+}
+
+static struct bpf_napi_ops __bpf_napi_ops_stubs = {
+	.schedule = (void *)bpf_napi_ops__schedule,
+	.again = (void *)bpf_napi_ops__again,
+};
+
+static struct bpf_struct_ops bpf_bpf_napi_ops;
+
+BTF_KFUNCS_START(napi_ext_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc_napi, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_napi_defer)
+BTF_ID_FLAGS(func, bpf_napi_poll_native, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_napi_poll_run, KF_RELEASE)
+BTF_KFUNCS_END(napi_ext_kfunc_ids)
+
+/* what a continuation calls: code that __napi_poll() resumes */
+BTF_KFUNCS_START(napi_ext_cont_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_napi_poll_run, KF_RELEASE)
+BTF_KFUNCS_END(napi_ext_cont_kfunc_ids)
+
+BTF_ID_LIST(napi_ext_ids)
+BTF_ID(func, bpf_napi_poll_native)
+BTF_ID(func, bpf_napi_poll_run)
+BTF_ID(func, bpf_coro_frame_alloc_napi)
+
+/*
+ * schedule() runs with interrupts off and cannot poll, and again() is in the poll and has
+ * no other step to leave the NAPI to. Each has one call that takes the NAPI alone, which
+ * is what its landing pad calls.
+ */
+static int napi_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	u32 moff;
+
+	if (!btf_id_set8_contains(&napi_ext_kfunc_ids, kfunc_id))
+		return 0;
+	if (prog->aux->st_ops != &bpf_bpf_napi_ops)
+		return -EACCES;
+	/* a continuation, see __coro_defer: as __napi_poll() resumes it */
+	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
+		return kfunc_id == napi_ext_ids[1] ? 0 : -EACCES;
+	moff = prog->aux->attach_st_ops_member_off;
+	if (kfunc_id == napi_ext_ids[0])
+		return moff == offsetof(struct bpf_napi_ops, schedule) ? 0 : -EACCES;
+	if (kfunc_id == napi_ext_ids[1])
+		return moff == offsetof(struct bpf_napi_ops, again) ? 0 : -EACCES;
+	return 0;
+}
+
+static const struct btf_kfunc_id_set napi_ext_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &napi_ext_kfunc_ids,
+	.filter = napi_ext_kfunc_filter,
+};
+
+static const struct btf_kfunc_id_set napi_ext_cont_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &napi_ext_cont_kfunc_ids,
+	.filter = napi_ext_kfunc_filter,
+};
+
+static const struct bpf_verifier_ops bpf_napi_verifier_ops = {
+	.get_func_proto = bpf_base_func_proto,
+	.is_valid_access = bpf_tracing_btf_ctx_access,
+};
+
+static int bpf_napi_ops_init(struct btf *btf)
+{
+	return 0;
+}
+
+static int bpf_napi_ops_init_member(const struct btf_type *t, const struct btf_member *member,
+				    void *kdata, const void *udata)
+{
+	const struct bpf_napi_ops *uops = udata;
+	struct bpf_napi_ops *ops = kdata;
+
+	switch (__btf_member_bit_offset(t, member) / 8) {
+	case offsetof(struct bpf_napi_ops, ifindex):
+		ops->ifindex = uops->ifindex;
+		return 1;
+	case offsetof(struct bpf_napi_ops, flags):
+		if (uops->flags & ~BPF_NAPI_OPS_F_INDIRECT)
+			return -EINVAL;
+		ops->flags = uops->flags;
+		return 1;
+	}
+	return 0;
+}
+
+static int bpf_napi_ops_validate(void *kdata)
+{
+	struct bpf_napi_ops *ops = kdata;
+
+	return ops->schedule && ops->again && ops->ifindex ? 0 : -EINVAL;
+}
+
+/* Take the extension off its device. With napi_ext_mutex. */
+static void napi_ext_detach(void)
+{
+	struct net_device *dev = napi_ext_dev;
+	struct napi_struct *napi;
+
+	if (!dev)
+		return;
+	netdev_lock(dev);
+	WRITE_ONCE(napi_ext_dev, NULL);
+	list_for_each_entry(napi, &dev->napi_list, dev_list)
+		clear_bit(NAPI_STATE_EXT, &napi->state);
+	netdev_unlock(dev);
+	rcu_assign_pointer(napi_ext_ops, NULL);
+	/*
+	 * No entry and no continuation runs any more, and none begins. The polls that it
+	 * deferred are the kernel's, each where it waits: a mark that is left says which
+	 * attachment its frame was of, and that one is gone, see napi_ext_poll().
+	 */
+	synchronize_rcu();
+	if (static_key_enabled(&napi_ext_direct_key)) {
+		static_branch_disable(&napi_ext_direct_key);
+		static_call_update(napi_ext_schedule_call, napi_ext_no_prog);
+		static_call_update(napi_ext_again_call, napi_ext_no_prog);
+		WRITE_ONCE(napi_ext_resume, NULL);
+	}
+	static_branch_dec(&napi_ext_key);
+	static_branch_dec(&napi_poll_hook_key);
+	netdev_put(dev, &napi_ext_dev_tracker);
+}
+
+/* The programs of schedule() and again(), in that order */
+static int napi_ext_member_progs(struct bpf_prog *prog, void *data)
+{
+	const struct bpf_prog **progs = data;
+
+	if (prog->aux->attach_st_ops_member_off == offsetof(struct bpf_napi_ops, schedule))
+		progs[0] = prog;
+	else if (prog->aux->attach_st_ops_member_off == offsetof(struct bpf_napi_ops, again))
+		progs[1] = prog;
+	return 0;
+}
+
+static int bpf_napi_ops_reg(void *kdata, struct bpf_link *link)
+{
+	struct bpf_napi_ops *ops = kdata;
+	struct napi_struct *napi;
+	struct net_device *dev;
+	int err = 0;
+
+	mutex_lock(&napi_ext_mutex);
+	if (rcu_access_pointer(napi_ext_ops)) {
+		err = -EBUSY;
+		goto out;
+	}
+	dev = netdev_get_by_index(current->nsproxy->net_ns, ops->ifindex, &napi_ext_dev_tracker,
+				  GFP_KERNEL);
+	if (!dev) {
+		err = -ENODEV;
+		goto out;
+	}
+	if (!(ops->flags & BPF_NAPI_OPS_F_INDIRECT)) {
+		/* before a NAPI can enter */
+		const struct bpf_prog *progs[2] = {};
+
+		bpf_struct_ops_for_each_prog(kdata, napi_ext_member_progs, progs);
+		napi_ext_prog = progs[0];
+		napi_ext_again_prog = progs[1];
+		WRITE_ONCE(napi_ext_resume, bpf_coro_defer_resume(napi_ext_prog));
+		static_call_update(napi_ext_schedule_call, napi_ext_prog->bpf_func);
+		static_call_update(napi_ext_again_call, napi_ext_again_prog->bpf_func);
+		static_branch_enable(&napi_ext_direct_key);
+	}
+	/* another attachment than any before it: never 0 */
+	WRITE_ONCE(napi_ext_gen, napi_ext_gen + 1 ?: 1);
+	static_branch_inc(&napi_ext_key);
+	static_branch_inc(&napi_poll_hook_key);
+	rcu_assign_pointer(napi_ext_ops, ops);
+	netdev_lock(dev);
+	if (dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+	} else {
+		WRITE_ONCE(napi_ext_dev, dev);
+		list_for_each_entry(napi, &dev->napi_list, dev_list)
+			if (!test_bit(NAPI_STATE_PERCPU, &napi->state))
+				set_bit(NAPI_STATE_EXT, &napi->state);
+	}
+	netdev_unlock(dev);
+	if (err) {
+		rcu_assign_pointer(napi_ext_ops, NULL);
+		synchronize_rcu();
+		if (static_key_enabled(&napi_ext_direct_key)) {
+			static_branch_disable(&napi_ext_direct_key);
+			static_call_update(napi_ext_schedule_call, napi_ext_no_prog);
+			static_call_update(napi_ext_again_call, napi_ext_no_prog);
+		}
+		static_branch_dec(&napi_ext_key);
+		static_branch_dec(&napi_poll_hook_key);
+		netdev_put(dev, &napi_ext_dev_tracker);
+	}
+out:
+	mutex_unlock(&napi_ext_mutex);
+	return err;
+}
+
+static void bpf_napi_ops_unreg(void *kdata, struct bpf_link *link)
+{
+	mutex_lock(&napi_ext_mutex);
+	if (rcu_access_pointer(napi_ext_ops) == kdata) {
+		napi_ext_detach();
+		rcu_assign_pointer(napi_ext_ops, NULL);
+	}
+	mutex_unlock(&napi_ext_mutex);
+}
+
+/* The device goes with the extension on it: the extension stays registered, on nothing */
+static int napi_ext_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	if (event != NETDEV_UNREGISTER || netdev_notifier_info_to_dev(ptr) != READ_ONCE(napi_ext_dev))
+		return NOTIFY_DONE;
+	mutex_lock(&napi_ext_mutex);
+	if (netdev_notifier_info_to_dev(ptr) == napi_ext_dev)
+		napi_ext_detach();
+	mutex_unlock(&napi_ext_mutex);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block napi_ext_netdev_notifier = {
+	.notifier_call = napi_ext_netdev_event,
+};
+
+static struct bpf_struct_ops bpf_bpf_napi_ops = {
+	.verifier_ops = &bpf_napi_verifier_ops,
+	.reg = bpf_napi_ops_reg,
+	.unreg = bpf_napi_ops_unreg,
+	.validate = bpf_napi_ops_validate,
+	.init_member = bpf_napi_ops_init_member,
+	.init = bpf_napi_ops_init,
+	.name = "bpf_napi_ops",
+	.cfi_stubs = &__bpf_napi_ops_stubs,
+	.owner = THIS_MODULE,
+};
+
+static int __init napi_ext_init(void)
+{
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &napi_ext_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &napi_ext_cont_kfunc_set);
+	ret = ret ?: bpf_coro_register_host(napi_ext_ids[2], BPF_NAPI_POLL_FRAME);
+	ret = ret ?: register_netdevice_notifier(&napi_ext_netdev_notifier);
+	return ret ?: register_bpf_struct_ops(&bpf_bpf_napi_ops, bpf_napi_ops);
+}
+late_initcall(napi_ext_init);
+#endif /* CONFIG_BPF_JIT */

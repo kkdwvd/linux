@@ -5185,10 +5185,10 @@ int dev_weight_tx_bias __read_mostly = 1;  /* bias for output_queue quota */
 
 #ifdef CONFIG_BPF_SYSCALL
 /*
- * __napi_poll() has more to do than the kernel's own: a NAPI is bound to a BPF kthread.
- * Counted.
+ * __napi_poll() has more to do than the kernel's own: a NAPI is bound to a BPF kthread, or
+ * an extension is attached, see net/core/napi_bpf.c. Counted, once for either.
  */
-static DEFINE_STATIC_KEY_FALSE(napi_poll_hook_key);
+DEFINE_STATIC_KEY_FALSE(napi_poll_hook_key);
 
 static inline bool napi_poll_hooked(void)
 {
@@ -5238,7 +5238,7 @@ static void napi_bpf_bound_dec(void)
  * NAPI is not bound, or its thread no longer owns its scheduling, or the
  * schedule comes from inside a poll that the thread must not run beside.
  */
-static bool napi_bpf_schedule(struct napi_struct *napi)
+bool napi_bpf_schedule(struct napi_struct *napi)
 {
 	unsigned long new, val = READ_ONCE(napi->state);
 	struct task_struct *thread;
@@ -5300,12 +5300,20 @@ static inline void napi_poll_begin(struct napi_struct *napi)
 static inline void napi_poll_end(void)
 {
 }
-
-static bool napi_bpf_schedule(struct napi_struct *napi)
-{
-	return false;
-}
 #endif
+
+/* Queue @napi for softirq on this CPU. Called with irq disabled */
+static inline void __napi_schedule_local(struct softnet_data *sd, struct napi_struct *napi)
+{
+	DEBUG_NET_WARN_ON_ONCE(!list_empty(&napi->poll_list));
+	list_add_tail(&napi->poll_list, &sd->poll_list);
+	WRITE_ONCE(napi->list_owner, smp_processor_id());
+	/* If not called from net_rx_action()
+	 * we have to raise NET_RX_SOFTIRQ.
+	 */
+	if (!sd->in_net_rx_action)
+		raise_softirq_irqoff(NET_RX_SOFTIRQ);
+}
 
 /* Called with irq disabled */
 static inline void ____napi_schedule(struct softnet_data *sd,
@@ -5344,15 +5352,25 @@ static inline void ____napi_schedule(struct softnet_data *sd,
 	}
 
 use_local_napi:
-	DEBUG_NET_WARN_ON_ONCE(!list_empty(&napi->poll_list));
-	list_add_tail(&napi->poll_list, &sd->poll_list);
-	WRITE_ONCE(napi->list_owner, smp_processor_id());
-	/* If not called from net_rx_action()
-	 * we have to raise NET_RX_SOFTIRQ.
-	 */
-	if (!sd->in_net_rx_action)
-		raise_softirq_irqoff(NET_RX_SOFTIRQ);
+	__napi_schedule_local(sd, napi);
 }
+
+#ifdef CONFIG_BPF_SYSCALL
+/*
+ * The two for an extension that has the step, see net/core/napi_bpf.c: softirq on this
+ * CPU whatever the NAPI is bound to, and the kernel's own choice. Called with irq disabled.
+ */
+void napi_schedule_local(struct napi_struct *napi)
+{
+	lockdep_assert_irqs_disabled();
+	__napi_schedule_local(this_cpu_ptr(&softnet_data), napi);
+}
+
+void napi_schedule_native(struct napi_struct *napi)
+{
+	____napi_schedule(this_cpu_ptr(&softnet_data), napi);
+}
+#endif
 
 #ifdef CONFIG_RPS
 
@@ -5645,6 +5663,18 @@ static void trigger_rx_softirq(void *data)
  * - If this is our own queue, NAPI schedule our backlog.
  *   Note that this also raises NET_RX_SOFTIRQ.
  */
+/*
+ * __napi_schedule_irqoff() for the NAPI of a backlog, which is no device's and has no
+ * extension: the kernel's step, as it is compiled with none in the tree.
+ */
+static inline void backlog_schedule_irqoff(struct napi_struct *n)
+{
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+		__napi_schedule(n);
+	else
+		____napi_schedule(this_cpu_ptr(&softnet_data), n);
+}
+
 static void napi_schedule_rps(struct softnet_data *sd)
 {
 	struct softnet_data *mysd = this_cpu_ptr(&softnet_data);
@@ -5652,7 +5682,7 @@ static void napi_schedule_rps(struct softnet_data *sd)
 #ifdef CONFIG_RPS
 	if (sd != mysd) {
 		if (use_backlog_threads()) {
-			__napi_schedule_irqoff(&sd->backlog);
+			backlog_schedule_irqoff(&sd->backlog);
 			return;
 		}
 
@@ -5667,7 +5697,7 @@ static void napi_schedule_rps(struct softnet_data *sd)
 		return;
 	}
 #endif /* CONFIG_RPS */
-	__napi_schedule_irqoff(&mysd->backlog);
+	backlog_schedule_irqoff(&mysd->backlog);
 }
 
 void kick_defer_list_purge(unsigned int cpu)
@@ -5679,7 +5709,7 @@ void kick_defer_list_purge(unsigned int cpu)
 		backlog_lock_irq_save(sd, &flags);
 
 		if (!__test_and_set_bit(NAPI_STATE_SCHED, &sd->backlog.state))
-			__napi_schedule_irqoff(&sd->backlog);
+			backlog_schedule_irqoff(&sd->backlog);
 
 		backlog_unlock_irq_restore(sd, flags);
 
@@ -7083,6 +7113,17 @@ static int process_backlog(struct napi_struct *napi, int quota)
 	return work;
 }
 
+/*
+ * The step where a NAPI is scheduled while an extension is attached: its code in place of
+ * ours, where @n has one, see net/core/napi_bpf.c. Interrupts are off. A function of its
+ * own, so that the kernel's step is compiled as it is with no extension in the tree.
+ */
+static noinline void napi_ext_schedule(struct napi_struct *n)
+{
+	if (!napi_ext_enter(n, BPF_NAPI_SCHEDULE))
+		____napi_schedule(this_cpu_ptr(&softnet_data), n);
+}
+
 /**
  * __napi_schedule - schedule for receive
  * @n: entry to schedule
@@ -7095,7 +7136,10 @@ void __napi_schedule(struct napi_struct *n)
 	unsigned long flags;
 
 	local_irq_save(flags);
-	____napi_schedule(this_cpu_ptr(&softnet_data), n);
+	if (napi_ext_attached())
+		napi_ext_schedule(n);
+	else
+		____napi_schedule(this_cpu_ptr(&softnet_data), n);
 	local_irq_restore(flags);
 }
 EXPORT_SYMBOL(__napi_schedule);
@@ -7144,10 +7188,12 @@ EXPORT_SYMBOL(napi_schedule_prep);
  */
 void __napi_schedule_irqoff(struct napi_struct *n)
 {
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		____napi_schedule(this_cpu_ptr(&softnet_data), n);
-	else
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
 		__napi_schedule(n);
+	else if (napi_ext_attached())
+		napi_ext_schedule(n);
+	else
+		____napi_schedule(this_cpu_ptr(&softnet_data), n);
 }
 EXPORT_SYMBOL(__napi_schedule_irqoff);
 
@@ -7614,6 +7660,21 @@ static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
  * driver, from napi_bpf_release() once the poller is out. Returns false for a
  * NAPI that is not bound.
  */
+/*
+ * The kernel has taken a NAPI that was scheduled for its thread, and passes it on to softirq
+ * itself: no extension is asked, and a poll that one had deferred to the thread is over,
+ * without a call of its code. The kernel polls.
+ */
+static void napi_bpf_to_softirq(struct napi_struct *napi)
+{
+	unsigned long flags;
+
+	napi_ext_end(napi);
+	local_irq_save(flags);
+	____napi_schedule(this_cpu_ptr(&softnet_data), napi);
+	local_irq_restore(flags);
+}
+
 static bool napi_bpf_revoke(struct napi_struct *napi, unsigned long bits)
 {
 	unsigned long new, val = READ_ONCE(napi->state);
@@ -7635,7 +7696,7 @@ static bool napi_bpf_revoke(struct napi_struct *napi, unsigned long bits)
 	/* NAPI_STATE_SCHED is still set and now ours to pass on. */
 	if ((val & (NAPIF_STATE_SCHED_THREADED | NAPIF_STATE_BPF_POLLING)) ==
 	    NAPIF_STATE_SCHED_THREADED)
-		__napi_schedule(napi);
+		napi_bpf_to_softirq(napi);
 	return true;
 }
 
@@ -7730,7 +7791,7 @@ static bool napi_bpf_release(struct napi_struct *napi)
 	if (!(val & NAPIF_STATE_SCHED_THREADED))
 		return false;
 	if (!(val & NAPIF_STATE_THREADED)) {
-		__napi_schedule(napi);
+		napi_bpf_to_softirq(napi);
 		return false;
 	}
 
@@ -8425,6 +8486,7 @@ void netif_napi_add_weight_locked(struct net_device *dev,
 				weight);
 	napi->weight = weight;
 	napi->dev = dev;
+	napi_ext_add(napi);
 #ifdef CONFIG_NETPOLL
 	napi->poll_owner = -1;
 #endif
@@ -8576,9 +8638,9 @@ void __netif_napi_del_locked(struct napi_struct *napi)
 EXPORT_SYMBOL(__netif_napi_del_locked);
 
 /*
- * @hooked: a NAPI is bound to a BPF kthread, and the poll has more to do than the kernel's
- * own, see napi_poll_hook_key. Compiled once for each, so that the kernel's own is as it is
- * with none of this in the tree.
+ * @hooked: a NAPI is bound to a BPF kthread or an extension is attached, and the poll has
+ * more to do than the kernel's own, see napi_poll_hook_key. Compiled once for each, so that
+ * the kernel's own is as it is with none of this in the tree.
  */
 static __always_inline int ____napi_poll(struct napi_struct *n, bool *repoll, const bool hooked)
 {
@@ -8594,12 +8656,25 @@ static __always_inline int ____napi_poll(struct napi_struct *n, bool *repoll, co
 	 */
 	work = 0;
 	if (napi_is_scheduled(n)) {
-		if (hooked)
+		/*
+		 * A poll that an extension deferred goes on here, in its continuation, and a
+		 * thread that polls of its own accord enters the extension. Unless that polled,
+		 * the kernel does.
+		 */
+		if (hooked) {
 			napi_poll_begin(n);
-		work = n->poll(n, weight);
-		trace_napi_poll(n, work, weight);
+			work = napi_ext_has_poll(n) ? napi_ext_poll(n) : -1;
+			if (work == NAPI_EXT_DEFERRED) {
+				napi_poll_end();
+				return 0;
+			}
+		}
+		if (!hooked || work < 0) {
+			work = n->poll(n, weight);
+			trace_napi_poll(n, work, weight);
 
-		xdp_do_check_flushed(n);
+			xdp_do_check_flushed(n);
+		}
 		if (hooked)
 			napi_poll_end();
 	}
@@ -8644,6 +8719,21 @@ static __always_inline int ____napi_poll(struct napi_struct *n, bool *repoll, co
 		pr_warn_once("%s: Budget exhausted after napi rescheduled\n",
 			     n->dev ? n->dev->name : "backlog");
 		return work;
+	}
+
+	/*
+	 * The next poll is a step of its own for an extension, as the first one was. Softirq
+	 * keeps the NAPI on the list of its round, and a thread enters with its next call.
+	 */
+	if (hooked && napi_ext_attached() &&
+	    !this_cpu_read(softnet_data.in_napi_threaded_poll)) {
+		int entered = napi_ext_enter(n, BPF_NAPI_REPOLL);
+
+		if (entered) {
+			if (entered == NAPI_EXT_REPOLLS)
+				*repoll = true;
+			return work;
+		}
 	}
 
 	*repoll = true;

@@ -394,9 +394,17 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task);
 void napi_bpf_unbind_locked(struct napi_struct *napi);
 struct napi_struct *napi_bpf_by_id_lock(unsigned int napi_id);
 int napi_bpf_poll(unsigned int napi_id, u64 flags);
+bool napi_bpf_schedule(struct napi_struct *napi);
+void napi_schedule_local(struct napi_struct *napi);
+void napi_schedule_native(struct napi_struct *napi);
 #else
 static inline void napi_bpf_unbind_locked(struct napi_struct *napi)
 {
+}
+
+static inline bool napi_bpf_schedule(struct napi_struct *napi)
+{
+	return false;
 }
 #endif
 
@@ -434,4 +442,84 @@ int dev_get_hwtstamp_phylib(struct net_device *dev,
 			    struct kernel_hwtstamp_config *cfg);
 int net_hwtstamp_validate(const struct kernel_hwtstamp_config *cfg);
 
+#endif
+
+/* The extension at the step where a NAPI is scheduled, see net/core/napi_bpf.c */
+/* napi_ext_enter(): the extension has the step, and softirq keeps the NAPI for its round */
+#define NAPI_EXT_ENTERED	1
+#define NAPI_EXT_REPOLLS	2
+/* napi_ext_poll(): the extension deferred the poll once more, and nobody polls now */
+#define NAPI_EXT_DEFERRED	(-2)
+#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_BPF_JIT)
+DECLARE_STATIC_KEY_FALSE(napi_ext_key);
+DECLARE_STATIC_KEY_FALSE(napi_poll_hook_key);
+int napi_ext_enter(struct napi_struct *napi, u32 reason);
+int napi_ext_poll(struct napi_struct *napi);
+void napi_ext_add(struct napi_struct *napi);
+
+/* Is an extension attached, to some device? */
+static inline bool napi_ext_attached(void)
+{
+	return static_branch_unlikely(&napi_ext_key);
+}
+
+/*
+ * Has the extension that is attached the step where @napi is scheduled? Not while the NAPI
+ * is in the kernel's threaded mode, which its administrator chose for it.
+ */
+static inline bool napi_ext_on(const struct napi_struct *napi)
+{
+	unsigned long val = READ_ONCE(napi->state);
+
+	return (val & NAPIF_STATE_EXT) &&
+	       (val & (NAPIF_STATE_THREADED | NAPIF_STATE_BPF)) != NAPIF_STATE_THREADED;
+}
+
+/*
+ * Is there something of an extension to do where @napi is polled? A poll that it deferred,
+ * or a thread's own poll, see napi_ext_poll(). Softirq with a NAPI that came by the kernel's
+ * own hand has nothing to ask.
+ */
+static inline bool napi_ext_has_poll(const struct napi_struct *napi)
+{
+	const unsigned long thread = NAPIF_STATE_EXT | NAPIF_STATE_BPF_POLLING;
+
+	return static_branch_unlikely(&napi_ext_key) &&
+	       (napi->bpf_poll_gen || (READ_ONCE(napi->state) & thread) == thread);
+}
+
+/* The kernel takes @napi, which it owns, for itself: a poll that was deferred is over */
+static inline void napi_ext_end(struct napi_struct *napi)
+{
+	if (static_branch_unlikely(&napi_ext_key))
+		napi->bpf_poll_gen = 0;
+}
+#else
+static inline int napi_ext_enter(struct napi_struct *napi, u32 reason)
+{
+	return 0;
+}
+
+static inline bool napi_ext_attached(void)
+{
+	return false;
+}
+
+static inline int napi_ext_poll(struct napi_struct *napi)
+{
+	return -1;
+}
+
+static inline void napi_ext_add(struct napi_struct *napi)
+{
+}
+
+static inline bool napi_ext_has_poll(const struct napi_struct *napi)
+{
+	return false;
+}
+
+static inline void napi_ext_end(struct napi_struct *napi)
+{
+}
 #endif

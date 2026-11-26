@@ -383,6 +383,9 @@ struct napi_config {
 	unsigned int napi_id;
 };
 
+/* The frame of a poll that an extension deferred and what is in front of it, in u64 */
+#define BPF_NAPI_POLL_WORDS	10
+
 /*
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */
@@ -430,6 +433,17 @@ struct napi_struct {
 	struct napi_config	*config;
 #ifdef CONFIG_BPF_SYSCALL
 	struct timer_list	bpf_timer;
+	/*
+	 * What the extensions of net/core/napi_bpf.c keep per NAPI, behind everything else:
+	 * nothing that the kernel has here is anywhere else for it.
+	 *
+	 * @bpf_poll_gen: which attachment the frame of a deferred poll is of, 0 for none
+	 * deferred. Whoever owns NAPI_STATE_SCHED writes it, and nobody else looks.
+	 * @bpf_poll_frame: the frame of the poll that an extension has deferred, behind its
+	 * header: written where the NAPI is scheduled and read where it is polled.
+	 */
+	u32			bpf_poll_gen;
+	u64			bpf_poll_frame[BPF_NAPI_POLL_WORDS];
 #endif
 };
 
@@ -450,6 +464,7 @@ enum {
 	NAPI_STATE_DISABLED,		/* NAPI is disabled */
 	NAPI_STATE_BPF,			/* The thread is a BPF kthread, see napi_bpf_bind_locked() */
 	NAPI_STATE_BPF_POLLING,		/* A caller of napi_bpf_poll() is in the driver's poll */
+	NAPI_STATE_EXT,			/* An extension has the step where the NAPI is scheduled */
 };
 
 enum {
@@ -469,6 +484,26 @@ enum {
 	NAPIF_STATE_DISABLED		= BIT(NAPI_STATE_DISABLED),
 	NAPIF_STATE_BPF			= BIT(NAPI_STATE_BPF),
 	NAPIF_STATE_BPF_POLLING		= BIT(NAPI_STATE_BPF_POLLING),
+	NAPIF_STATE_EXT			= BIT(NAPI_STATE_EXT),
+};
+
+/* Why the extension is entered with a poll, see struct bpf_napi_ops in net/core/napi_bpf.c */
+enum bpf_napi_reason {
+	BPF_NAPI_SCHEDULE,	/* the NAPI was scheduled: an interrupt, a timer, a kick */
+	BPF_NAPI_REPOLL,	/* softirq polled it, and the poll used up its budget */
+	BPF_NAPI_AGAIN,		/* the thread that polls it is here for its next poll */
+};
+
+/* Flags of struct bpf_napi_ops */
+enum {
+	/* call the extension through its pointers, and resume with bpf_coro_run() */
+	BPF_NAPI_OPS_F_INDIRECT	= BIT(0),
+};
+
+/* Where bpf_napi_defer() has a poll wait */
+enum bpf_napi_where {
+	BPF_NAPI_SOFTIRQ,	/* for softirq on this CPU */
+	BPF_NAPI_THREAD,	/* for the thread the NAPI is bound to; softirq if there is none */
 };
 
 /* napi_bpf_poll() returns the work done, ORed with BPF_NAPI_POLL_MORE while
