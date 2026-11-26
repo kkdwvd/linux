@@ -1166,6 +1166,7 @@ static int bpf_xdp_frame_send(struct xdp_frame *frame)
 	int err;
 
 	/* It is as a driver made it: nothing of the program's goes along. */
+	frame->flags &= ~(XDP_FLAGS_BPF_TCP_HELD | XDP_FLAGS_BPF_TCP_OOO | XDP_FLAGS_BPF_RDONLY);
 	frame->dev_rx = NULL;
 
 	local_bh_disable();
@@ -1347,10 +1348,12 @@ __bpf_kfunc void bpf_xdp_frame_release(struct xdp_frame *frame)
  * sent later either: it goes back to its memory when the driver is done. A
  * reply in the invocation that received the request is what XDP_TX is for,
  * and a program that makes a kept frame reachable from another CPU before it
- * returns has to do without the reply that loses this race.
+ * returns has to do without the reply that loses this race. A frame that a
+ * TCP connection has admitted, see bpf_xdp_tcp_hold(), is the connection's
+ * to deliver and is not sent.
  *
  * Returns 0 when the driver took the frame; -EINVAL for @flags; -EBUSY for a
- * frame that the driver still hands over;
+ * frame that the driver still hands over, or that a TCP connection holds;
  * -ENODEV when the NAPI instance is not known or gone; -EOPNOTSUPP for a
  * device that does not transmit XDP frames, or not ones with fragments, and
  * where IRQs are off; -ENETDOWN and -EMSGSIZE for a device that is down or
@@ -1363,6 +1366,8 @@ __bpf_kfunc int bpf_xdp_frame_xmit(struct xdp_frame *frame, u64 flags)
 
 	if (flags)
 		err = -EINVAL;
+	else if (frame->flags & XDP_FLAGS_BPF_TCP_HELD)
+		err = -EBUSY;
 	else if (unlikely(in_hardirq() || in_nmi() || irqs_disabled()))
 		err = -EOPNOTSUPP;	/* no driver can be entered */
 	if (err) {

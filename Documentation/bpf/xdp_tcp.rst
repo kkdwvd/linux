@@ -876,7 +876,8 @@ Concurrency and execution context
      - returns NULL
      - no
      - no
-   * - ``bpf_xdp_frame_release()``, ``bpf_dynptr_from_xdp_frame()``
+   * - ``bpf_xdp_frame_release()``, ``bpf_dynptr_from_xdp_frame()``,
+       ``bpf_xdp_frame_xmit()``
      - yes
      - yes
      - yes
@@ -886,6 +887,13 @@ Concurrency and execution context
      - yes
      - no
      - no
+
+``bpf_xdp_frame_xmit()`` sends a frame that nothing else refers to out of the
+device it arrived on, as it is, which is how a program answers over a
+protocol the kernel does not speak for it. It fails with ``-EBUSY`` for a
+frame that a connection holds, and until the invocation that took the frame
+has returned and the driver has handed the buffer over: a reply in that
+invocation is what ``XDP_TX`` is for.
 
 A timer or workqueue callback is checked as the program type that armed it.
 Tracing programs do not get the kfuncs, since the function being traced may
@@ -1147,7 +1155,7 @@ Reference
 
 .. kernel-doc:: net/core/xdp.c
    :identifiers: bpf_xdp_frame_steal bpf_xdp_frame_release
-                 bpf_dynptr_from_xdp_frame
+                 bpf_xdp_frame_xmit bpf_dynptr_from_xdp_frame
 
 .. kernel-doc:: net/xdp/xsk.c
    :identifiers: bpf_xsk_rx_space
