@@ -1570,6 +1570,16 @@ static inline bool bpf_ret_reg_pair(struct bpf_verifier_env *env, int subprog)
 	return subprog_info(env, subprog)->ret_reg_pair;
 }
 
+/*
+ * No speculative state is verified on the way to a landing pad or in one, so a program may unwind
+ * only if it is loaded with CAP_PERFMON and neither mitigation applies to it. The three flags come
+ * from three queries of the capability, which need not give the same answer.
+ */
+static inline bool bpf_may_unwind(const struct bpf_verifier_env *env)
+{
+	return env->allow_ptr_leaks && env->bypass_spec_v1 && env->bypass_spec_v4;
+}
+
 struct bpf_call_summary {
 	u8 arg_slot_cnt;
 	/* the last of them are filled in by the verifier, the prog doesn't pass them */

@@ -3395,6 +3395,10 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 	}
 	if (!seen)
 		return 0;
+	if (!bpf_may_unwind(env)) {
+		verbose(env, "CAP_PERFMON is required to unwind\n");
+		return -EPERM;
+	}
 	if (!bpf_jit_supports_unwind() || bpf_prog_is_offloaded(env->prog->aux)) {
 		verbose(env, "JIT does not support unwinding\n");
 		return -ENOTSUPP;
@@ -16561,13 +16565,7 @@ static void sanitize_mark_insn_seen(struct bpf_verifier_env *env)
 static void need_nospec(struct bpf_verifier_env *env, u32 idx)
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
-	struct bpf_insn *insn = &env->prog->insnsi[idx];
 
-	/* nothing fits between it and the call */
-	if (bpf_is_unwind_goto(insn)) {
-		need_nospec(env, idx + 1);
-		return need_nospec(env, idx + insn->off + 1);
-	}
 	note_pessimized_insn(env, idx);
 	aux->nospec = true;
 	aux->alu_state = 0;
@@ -19285,15 +19283,6 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		if (!env->cur_state->unwound)
 			return 0;
 		env->cur_state->unwound = false;
-		/*
-		 * unwind_exit changed its return address, so the return is
-		 * mispredicted and what follows unwind_goto runs speculatively.
-		 */
-		if (!env->bypass_spec_v1) {
-			err = sanitize_speculative_path(env, NULL, *insn_idx + 1, *insn_idx);
-			if (err)
-				return err;
-		}
 		*insn_idx += insn->off;
 		return 0;
 	}

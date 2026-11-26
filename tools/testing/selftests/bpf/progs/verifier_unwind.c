@@ -527,21 +527,17 @@ static unsigned long ctx_or_unwind(void)
 
 /*
  * unwind_exit changes its return address, so the cpu mispredicts the return and
- * runs what follows unwind_goto with r0 of unwind_exit.
+ * runs what follows unwind_goto with r0 of unwind_exit. No speculative state is
+ * verified there: the insns need CAP_PERFMON.
  */
 SEC("socket")
-__description("unwind: what follows unwind_goto runs speculatively")
+__description("unwind: unwind_exit and unwind_goto need CAP_PERFMON")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
 __success __retval(50) /* 64 without the ethernet header */
-__success_unpriv __retval_unpriv(50)
+__failure_unpriv __msg_unpriv("CAP_PERFMON is required to unwind")
 __caps_unpriv(CAP_BPF)
-#ifdef SPEC_V1
-__xlated_unpriv("unwind_goto pc+{{.*}}")
-__xlated_unpriv("nospec") /* inserted to prevent `R0 invalid mem access 'scalar'` */
-__xlated_unpriv("r0 = *(u32 *)(r0 +{{.*}})")
-#endif
 __naked int speculative_fall_through(void)
 {
 	asm volatile (
