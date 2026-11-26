@@ -919,6 +919,16 @@ static bool pad_can_sleep(const struct bpf_verifier_state *st, bool leaves)
 	return leaves || (!caller_sections(st, BPF_PAD_RCU) && !caller_sections(st, BPF_PAD_PREEMPT));
 }
 
+/*
+ * A coroutine frame in memory of its host, see REF_TYPE_HOSTED: no call releases it. So it is no
+ * entry of a pad, has no hidden slot and no save word, and is of no class. Its slots are places
+ * like those of any frame, for as long as the host is there, see frame_ent().
+ */
+static bool ref_is_hosted(const struct bpf_reference_state *ref)
+{
+	return ref->type == REF_TYPE_HOSTED;
+}
+
 /* The class of @ref */
 static int ref_class(const struct bpf_reference_state *ref)
 {
@@ -1999,22 +2009,31 @@ static int order_ents(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 }
 
 /*
- * The entry of @plan that is the coroutine frame which @place gets to on this visit after @hops of
- * its hops, see find_frame_cands(). NULL if the way does not get there, or the frame is not one
- * of what the current frame of @st holds.
+ * The entry of @plan whose release frees the coroutine frame which @place gets to on this visit
+ * after @hops of its hops, see find_frame_cands(): the frame, or the reference that hosts it, in
+ * whose memory it is. NULL if the way does not get there, or the current frame of @st does not
+ * hold that: a caller does, or the frame is in memory of the program context.
  */
 static struct bpf_pad_ent *frame_ent(const struct bpf_pad_plan *plan,
 				     const struct bpf_verifier_state *st,
 				     const struct bpf_pad_place *place, int hops)
 {
 	const struct bpf_reg_state *reg;
-	int i;
+	int i, id;
 
 	if (walk_place(st, place, hops, &reg) != PAD_WALK_REG || reg->type == SCALAR_VALUE ||
 	    reg->type == NOT_INIT)
 		return NULL;
-	for (i = st->frame[st->curframe]->entry_refs; i < st->acquired_refs; i++)
+	for (i = 0; i < st->acquired_refs; i++)
 		if (st->refs[i].slots && st->refs[i].id == reg->id)
+			break;
+	if (i == st->acquired_refs)
+		return NULL;
+	if (!ref_is_hosted(&st->refs[i]))
+		return held_ent(plan, i);
+	id = st->refs[i].parent_id;
+	for (i = 0; id && i < st->acquired_refs; i++)
+		if (st->refs[i].type == REF_TYPE_PTR && st->refs[i].id == id)
 			return held_ent(plan, i);
 	return NULL;
 }
@@ -2064,12 +2083,16 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	 * each trip and has no way out but this site has no state that fails for what leaks.
 	 */
 	for (i = st->frame[st->curframe]->entry_refs, pos = 0; i < st->acquired_refs; i++)
-		pos += !i || st->refs[i - 1].type != REF_TYPE_RES_LOCK_IRQ;
+		pos += !ref_is_hosted(&st->refs[i]) &&
+		       (!i || st->refs[i - 1].type != REF_TYPE_RES_LOCK_IRQ);
 	if (pos > BPF_PAD_MAX_ENTS)
 		return BPF_CONFLICT_TOO_MUCH;
 	for (pass = 0; pass < 2; pass++) {
 		for (i = st->frame[st->curframe]->entry_refs; i < st->acquired_refs; i++) {
 			ref = &st->refs[i];
+			/* nothing releases it */
+			if (ref_is_hosted(ref))
+				continue;
 			/* irq flags that a lock saved are an argument of its entry */
 			if (i && ref[-1].type == REF_TYPE_RES_LOCK_IRQ)
 				continue;
@@ -2128,7 +2151,9 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	 * A handle that the pad reads through a coroutine frame is read before the frame is freed:
 	 * each frame on the way stands before the entry, on this visit for each candidate in a
 	 * frame. Also where the visit does not hold the entry: the pad reads the slot all the
-	 * same, to find the 0 in it.
+	 * same, to find the 0 in it. For a frame in memory of a reference that reference stands
+	 * before the entry, see frame_ent(): its release is the end of the frame. The reference
+	 * itself may be what the pad reads there.
 	 */
 	for (i = 0; i < plan->nr_ents; i++) {
 		ent = &plan->ents[i];
@@ -2502,7 +2527,8 @@ static int count_refs(const struct bpf_verifier_state *st, int from, int to, int
 	int i, n = 0;
 
 	for (i = from; i < to; i++)
-		n += class_group(ref_class(&st->refs[i])) == group;
+		n += !ref_is_hosted(&st->refs[i]) &&
+		     class_group(ref_class(&st->refs[i])) == group;
 	return n;
 }
 
@@ -2998,11 +3024,15 @@ void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier
 			if (frame_sections(st, i))
 				sub_no_slots(sub, st, BIT(i));
 		for (i = 0; i < nr; i++)
-			sub_no_slots(sub, st, BIT(class_group(ref_class(&ref[i]))));
+			if (!ref_is_hosted(&ref[i]))
+				sub_no_slots(sub, st, BIT(class_group(ref_class(&ref[i]))));
 		took_locks_no_slots(env, st, callee->took_locks & BIT(caller->frameno));
 		goto out;
 	}
 	for (i = 0; i < nr; i++) {
+		/* it comes back with nothing that a pad would release */
+		if (ref_is_hosted(&ref[i]))
+			continue;
 		if (class_group(ref_class(&ref[i])) == BPF_PAD_GROUP_LOCKS) {
 			lock = &ref[i];
 			nr_locks++;
