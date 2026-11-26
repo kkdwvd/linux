@@ -8,6 +8,7 @@ enum napi_ext_mode {
 	MODE_NATIVE,	/* leaves it to the kernel */
 	MODE_DIVES,	/* defers it, and the kernel unwinds the continuation before the poll */
 	MODE_ENTRY_DIVES, /* the kernel unwinds the entry with the frame in hand */
+	MODE_INSIDE,	/* defers it to softirq, and to the thread if softirq is what schedules it */
 };
 
 #endif

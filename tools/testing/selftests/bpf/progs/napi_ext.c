@@ -66,7 +66,12 @@ static __noinline __used void poll_fn(void *frame)
 
 static __always_inline void defer(struct napi_struct *napi, int how)
 {
+	int to = where;
 	__u64 *f;
+
+	/* softirq schedules a NAPI from inside the poll of one, which may be this one */
+	if (how == MODE_INSIDE)
+		to = bpf_in_serving_softirq() ? BPF_NAPI_THREAD : BPF_NAPI_SOFTIRQ;
 
 	f = bpf_coro_frame_alloc_napi(32, napi);
 	if (!f) {
@@ -82,7 +87,7 @@ static __always_inline void defer(struct napi_struct *napi, int how)
 	if (how == MODE_ENTRY_DIVES)
 		dives();
 	__sync_fetch_and_add(&deferred, 1);
-	bpf_napi_defer(f, where);
+	bpf_napi_defer(f, to);
 }
 
 SEC("struct_ops/schedule")

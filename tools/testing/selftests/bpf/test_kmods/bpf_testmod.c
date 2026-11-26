@@ -1294,6 +1294,14 @@ enum {
 	 * one completes the NAPI: whoever polls comes back at once, each time.
 	 */
 	NAPI_TEST_MORE,
+	/*
+	 * A poll whose completion fails stays in the driver for as many microseconds as the
+	 * upper half says, as a driver does that still has something to do with its device
+	 * there: virtio-net masks the interrupt. And how often a poll began while another
+	 * was in the driver.
+	 */
+	NAPI_TEST_TAIL,
+	NAPI_TEST_OVERLAPS,
 };
 
 /* What a poll receives */
@@ -1313,6 +1321,10 @@ enum {
 static u32 napi_test_rx_kind, napi_test_rx_n, napi_test_rx_half;
 /* the polls of a schedule that use up their budget, and how many of them are still to come */
 static u32 napi_test_more, napi_test_more_left;
+/* what a failed completion is followed by, a poll is in the driver, and polls that met one there */
+static u32 napi_test_tail_us;
+static atomic_t napi_test_in_poll;
+static atomic64_t napi_test_overlaps;
 /* the next segment of the one flow, and of each of the others: only the poll writes them */
 static u32 napi_test_rx_seq, napi_test_rx_seqs[256];
 static u16 napi_test_rx_id;
@@ -1405,10 +1417,14 @@ static u32 napi_test_rx(struct napi_struct *napi)
 static int napi_test_poll(struct napi_struct *napi, int budget)
 {
 	/* work that was done, for the timers of GRO, and less than the budget, to complete */
-	int work = min_t(u32, napi_test_rx(napi), budget - 1);
+	int work;
 
+	if (atomic_xchg(&napi_test_in_poll, 1))
+		atomic64_inc(&napi_test_overlaps);
+	work = min_t(u32, napi_test_rx(napi), budget - 1);
 	if (napi_test_more_left) {
 		napi_test_more_left--;
+		atomic_set(&napi_test_in_poll, 0);
 		return budget;
 	}
 	napi_test_more_left = READ_ONCE(napi_test_more);
@@ -1422,7 +1438,9 @@ static int napi_test_poll(struct napi_struct *napi, int budget)
 	} else {
 		napi_test_missed = false;
 	}
-	napi_complete_done(napi, work);
+	if (!napi_complete_done(napi, work) && READ_ONCE(napi_test_tail_us))
+		udelay(READ_ONCE(napi_test_tail_us));
+	atomic_set(&napi_test_in_poll, 0);
 	atomic64_inc(&napi_test_polls);
 	if (wq_has_sleeper(&napi_test_wq))
 		wake_up(&napi_test_wq);
@@ -1536,6 +1554,12 @@ __bpf_kfunc s64 bpf_kfunc_napi_test_ctl(u32 op)
 		napi_test_rx_kind = op >> 8 & 0xff;
 		napi_test_rx_half = op >> 31;
 		WRITE_ONCE(napi_test_rx_n, op >> 16 & 0xfff);
+		break;
+	case NAPI_TEST_TAIL:
+		WRITE_ONCE(napi_test_tail_us, op >> 16);
+		break;
+	case NAPI_TEST_OVERLAPS:
+		ret = atomic64_read(&napi_test_overlaps);
 		break;
 	case NAPI_TEST_MORE:
 		/* no poll is on its way, as above */

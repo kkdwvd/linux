@@ -8,6 +8,8 @@
  * that could keep a NAPI from being polled are not loaded. What a driver does with its NAPIs
  * beside the poll is on the NAPI of bpf_testmod.
  */
+#define _GNU_SOURCE
+#include <sched.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -44,6 +46,8 @@ enum {
 	NAPI_TEST_POLLS,
 	NAPI_TEST_RX,
 	NAPI_TEST_MORE,
+	NAPI_TEST_TAIL,
+	NAPI_TEST_OVERLAPS,
 };
 
 /* The polls beside the one that completes, in a row whose schedules are polled more than once */
@@ -594,6 +598,51 @@ static void missed(struct napi_ext_null *drv, const char *what)
 }
 
 /*
+ * A schedule from inside softirq's poll of a NAPI stays with softirq, whatever the extension
+ * asks for: the driver is not through with the NAPI there. The test NAPI stays in its poll
+ * for a while behind a completion that failed, as virtio-net does to mask its interrupt, and
+ * counts the polls that begin meanwhile. Its thread is on another CPU than softirq, and
+ * would be one of them.
+ */
+static void inside(struct napi_ext_null *drv)
+{
+	__u64 polls = run_null(drv->progs.test_ctl, NAPI_TEST_POLLS, NULL);
+	__u64 overlaps = run_null(drv->progs.test_ctl, NAPI_TEST_OVERLAPS, NULL);
+	__u64 of_thread = pool->bss->polls[0];
+	cpu_set_t old, one;
+	int i, j;
+
+	if (libbpf_num_possible_cpus() < 2)
+		return;
+	sched_getaffinity(0, sizeof(old), &old);
+	CPU_ZERO(&one);
+	CPU_SET(0, &one);
+	if (!ASSERT_OK(sched_setaffinity(0, sizeof(one), &one), "this task on a CPU"))
+		return;
+	SYS_NOFAIL("for p in $(pgrep '^bpfk/'); do taskset -pc 1 $p > /dev/null; done");
+	ext->bss->mode = MODE_INSIDE;
+	run_null(drv->progs.test_ctl, NAPI_TEST_TAIL | 500 << 16, NULL);
+	run_null(drv->progs.test_ctl, NAPI_TEST_MISS, NULL);
+	for (i = 1; i <= 20; i++) {
+		run_null(drv->progs.test_run, 1, NULL);
+		for (j = 0; j < 2000; j++) {
+			if (run_null(drv->progs.test_ctl, NAPI_TEST_POLLS, NULL) >= polls + 2 * i)
+				break;
+			usleep(1000);
+		}
+	}
+	run_null(drv->progs.test_ctl, NAPI_TEST_NO_MISS, NULL);
+	run_null(drv->progs.test_ctl, NAPI_TEST_TAIL, NULL);
+	ext->bss->mode = MODE_DEFER;
+	sched_setaffinity(0, sizeof(old), &old);
+	ASSERT_EQ(run_null(drv->progs.test_ctl, NAPI_TEST_POLLS, NULL), polls + 40, "polls, inside");
+	ASSERT_EQ(run_null(drv->progs.test_ctl, NAPI_TEST_OVERLAPS, NULL), overlaps,
+		  "polls beside a poll");
+	ASSERT_EQ(pool->bss->polls[0], of_thread, "polls of the thread, inside softirq's");
+	ASSERT_EQ(ext->bss->resumed, ext->bss->deferred, "resumed, inside");
+}
+
+/*
  * What a device does with its NAPIs while an extension is about. One that it adds has the
  * extension if the device has it, whatever its memory was before: a driver that reopens
  * its channels allocates them anew, and another one keeps them for the next time.
@@ -631,6 +680,7 @@ static void test_device(void)
 	polls = pool->bss->polls[0];
 	missed(drv, "missed, thread");
 	ASSERT_GE(pool->bss->polls[0], polls + 40, "polls of the thread, missed");
+	inside(drv);
 	ASSERT_OK(run_prog(pool->progs.unbind_napi, 0, id, 0), "unbind");
 	ext->bss->where = BPF_NAPI_SOFTIRQ;
 
