@@ -523,3 +523,18 @@ static inline void napi_ext_end(struct napi_struct *napi)
 {
 }
 #endif
+
+/*
+ * The extension on the path of a packet, see net/core/napi_bpf.c, which is there under
+ * CONFIG_BPF_JIT: net/core/gro.c asks RX_EXT before it names any of this.
+ */
+#define RX_EXT	(IS_ENABLED(CONFIG_BPF_SYSCALL) && IS_ENABLED(CONFIG_BPF_JIT))
+DECLARE_STATIC_KEY_FALSE(rx_ext_key);
+extern u32 rx_ext_gen;
+gro_result_t rx_ext_arrive(struct gro_node *gro, struct sk_buff *skb);
+bool rx_ext_resume(struct gro_node *gro, struct sk_buff *skb);
+
+/* The NAPI that @gro is the node of. Not for a node of its own, which has no id. */
+#define gro_napi(node)	container_of_const(node, struct napi_struct, gro)
+
+enum gro_result rx_ext_gro_receive(struct gro_node *gro, struct sk_buff *skb);

@@ -11,6 +11,7 @@
 #include <linux/nsproxy.h>
 #include <linux/sched.h>
 #include <linux/static_call.h>
+#include <net/gro.h>
 #include <net/net_namespace.h>
 #include <trace/events/napi.h>
 
@@ -285,6 +286,9 @@ static DEFINE_MUTEX(napi_ext_mutex);
 static const struct bpf_napi_ops __rcu *napi_ext_ops;
 static struct net_device *napi_ext_dev;
 static netdevice_tracker napi_ext_dev_tracker;
+/* and of the extension on the path of a packet, below */
+static struct net_device *rx_ext_dev;
+static void rx_ext_detach(void);
 
 /* What the code of the extension is in, on this CPU */
 enum {
@@ -487,6 +491,9 @@ void napi_ext_add(struct napi_struct *napi)
 		set_bit(NAPI_STATE_EXT, &napi->state);
 	else
 		clear_bit(NAPI_STATE_EXT, &napi->state);
+	/* a node with no frames, and with the extension that its device has */
+	napi->bpf_held = 0;
+	WRITE_ONCE(napi->bpf_rx, napi->dev == READ_ONCE(rx_ext_dev));
 }
 
 /* Has the code on this CPU @napi in hand, in one of @ctxs, a mask? */
@@ -755,6 +762,13 @@ static int napi_ext_member_progs(struct bpf_prog *prog, void *data)
 	return 0;
 }
 
+/* The program of the first member of a struct_ops */
+static int napi_ext_first_prog(struct bpf_prog *prog, void *data)
+{
+	*(const struct bpf_prog **)data = prog;
+	return 1;
+}
+
 static int bpf_napi_ops_reg(void *kdata, struct bpf_link *link)
 {
 	struct bpf_napi_ops *ops = kdata;
@@ -830,11 +844,16 @@ static void bpf_napi_ops_unreg(void *kdata, struct bpf_link *link)
 /* The device goes with the extension on it: the extension stays registered, on nothing */
 static int napi_ext_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
-	if (event != NETDEV_UNREGISTER || netdev_notifier_info_to_dev(ptr) != READ_ONCE(napi_ext_dev))
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+
+	if (event != NETDEV_UNREGISTER ||
+	    (dev != READ_ONCE(napi_ext_dev) && dev != READ_ONCE(rx_ext_dev)))
 		return NOTIFY_DONE;
 	mutex_lock(&napi_ext_mutex);
-	if (netdev_notifier_info_to_dev(ptr) == napi_ext_dev)
+	if (dev == napi_ext_dev)
 		napi_ext_detach();
+	if (dev == rx_ext_dev)
+		rx_ext_detach();
 	mutex_unlock(&napi_ext_mutex);
 	return NOTIFY_DONE;
 }
@@ -866,4 +885,645 @@ static int __init napi_ext_init(void)
 	return ret ?: register_bpf_struct_ops(&bpf_bpf_napi_ops, bpf_napi_ops);
 }
 late_initcall(napi_ext_init);
+
+/*
+ * The extension on the path of a packet.
+ *
+ * A packet that a driver hands to napi_gro_receive() has a path that the kernel wrote in
+ * gro_receive_skb(): into GRO, which merges it into a packet of its flow, holds it for the
+ * next one, or has no use for it; and then, alone or with what was merged into it, onto the
+ * batch of its NAPI, which the kernel delivers as a list. An extension is that path for the
+ * packets of one device, as code in place of the kernel's: gro_receive_skb() calls arrive()
+ * where it called dev_gro_receive(). What the path is made of stays the kernel's: GRO, the
+ * batch, the delivery.
+ *
+ * The unit is a PACKET. The extension is entered with the skb as a reference that it has to
+ * give up, see struct bpf_rx_ops, and is a coroutine:
+ *
+ *	frame = bpf_coro_frame_alloc_skb(size, skb);	its frame is in the head of the packet
+ *	if (bpf_rx_gro(frame))				the boundary: GRO has the packet
+ *		return;
+ *	bpf_rx_batch(skb);				or not: it goes on, to the batch
+ *	...
+ *	bpf_rx_batch(skb);				the continuation, at the flush
+ *
+ * The packet is the host of the frame, see "Hosts" in kernel/bpf/coro.c: it lends the first
+ * NET_SKB_PAD bytes of its head, the headroom that every driver leaves below a packet and
+ * that nothing on the receive path writes. The frame is bare: nothing is written where it
+ * starts but what the code stores, and it is there for as long as the code has the packet.
+ * A head that is shared with a clone, or that has its link layer header or metadata within
+ * those bytes, lends nothing: bpf_coro_frame_alloc_skb() returns NULL, and the code leaves
+ * the packet to the kernel with bpf_rx_native(), or goes on without a frame. No other
+ * memory stands in.
+ *
+ * bpf_rx_gro() is dev_gro_receive() as a boundary that answers at once, see __coro_offer in
+ * kernel/bpf/verifier.c. GRO merges the packet into one that it holds: the packet is gone
+ * as a unit and its frame with it, there is nothing to resume. Or GRO holds the packet: the
+ * frame stays suspended in the head, and gro_complete() resumes its continuation where it
+ * called gro_normal_one(), in whichever flush that is. In both cases the kfunc returns true
+ * and the entry has no packet. Or GRO has no use for the packet: the kfunc returns false,
+ * nothing has happened to the frame, and the code goes on in the entry.
+ *
+ * bpf_rx_batch() is gro_normal_one(), the end of the unit and of its frame: the packet is
+ * on the list of its NAPI, with the segments that GRO counted for it, and the kernel
+ * delivers the list when it is full or the poll is over, as before. bpf_rx_native() is the
+ * kernel's own remainder of the path wherever the packet is, with no frame: all of it for
+ * a packet that GRO has not seen, the batch for one that it has.
+ *
+ * So the null extension, bpf_rx_gro() and then bpf_rx_batch() on both ways out, is the
+ * kernel's path exactly: the same calls in the same order on the same packets. The driver
+ * builds the skb as before, no XDP program is involved, and checksum, hash and what the
+ * hardware merged are what they were.
+ *
+ * A continuation runs inside the flush that resumes it, which may be inside bpf_rx_gro()
+ * for another packet: GRO flushes a held packet to make room, or because the one that
+ * arrives ends its flow's run. The code of the extension nests then, a continuation under
+ * its own entry, and what the outer one has in hand is saved and put back, see
+ * rx_ext_resume_nested(). An entry that finds nothing of the extension on its CPU, which is
+ * the rule, saves nothing.
+ *
+ * The device stays in control:
+ * - The verifier refuses an entry or a continuation that returns with the packet.
+ * - A frame that is suspended holds nothing but its packet, so wherever the kernel takes a
+ *   held packet for itself the frame is over without a call of the program: a NAPI that is
+ *   deleted frees what it holds, and a packet whose protocol fails to complete it is freed.
+ * - A detach forgets the frames that are suspended in held packets: each packet is the
+ *   kernel's at its flush. Frames are told apart by attachment, not by program, see
+ *   rx_ext_hold(), so that a frame of an extension that is gone is never resumed, by the
+ *   next one either.
+ * - A continuation that the kernel unwinds gives the packet to the batch by its landing
+ *   pad, and so does an entry: the packet of code that is unwound may go past GRO.
+ * - Only one extension is attached at a time, to one device. It is another one than the
+ *   extension at the step where a NAPI is scheduled, and either is there without the other.
+ *
+ * Packets that a driver hands to napi_gro_frags() do not pass, nor those of a GRO node
+ * that is not a NAPI's: they take the kernel's path.
+ */
+
+/**
+ * struct bpf_rx_ops - the extension on the path of a packet
+ * @arrive: A driver handed @skb to napi_gro_receive(), in the poll of a NAPI of the device:
+ *	with bottom halves off. The code offers it to GRO with bpf_rx_gro(), puts it on the
+ *	batch with bpf_rx_batch(), or leaves it to the kernel with bpf_rx_native().
+ * @ifindex: the device, in the network namespace of whoever attaches
+ * @flags: 0
+ */
+struct bpf_rx_ops {
+	void (*arrive)(struct sk_buff *skb);
+	u32 ifindex;
+	u32 flags;
+};
+
+/* What the head of a packet lends a frame: the headroom below any packet of any driver */
+#define BPF_RX_FRAME	round_down(NET_SKB_PAD, sizeof(u64))
+
+DEFINE_STATIC_KEY_FALSE(rx_ext_key);
+/* which attachment this is: never 0, see rx_ext_hold() */
+u32 rx_ext_gen;
+
+static unsigned int rx_ext_no_arrive(const void *ctx, const struct bpf_insn *insn)
+{
+	return 0;
+}
+
+/*
+ * arrive() of the extension that is attached: the program itself, not the trampoline of the
+ * struct_ops member. The trampoline is for a caller that may be anywhere: it enters a read
+ * section of RCU, disables migration and notes the program for the helpers that ask what
+ * runs. gro_receive_skb() is in the poll of a NAPI, with bottom halves off, which is the
+ * first two, and no helper of this program type asks. Per packet that is half of what the
+ * extension costs. The program's run statistics do not count these calls.
+ */
+DEFINE_STATIC_CALL(rx_ext_arrive_call, rx_ext_no_arrive);
+/* the program that arrive() and its continuations are */
+static const struct bpf_prog *rx_ext_prog;
+static const struct bpf_rx_ops __rcu *rx_ext_ops;
+static netdevice_tracker rx_ext_dev_tracker;
+
+/* What the code of the extension is in, on this CPU */
+enum {
+	RX_EXT_NONE,
+	RX_EXT_ARRIVE,		/* arrive(): in gro_receive_skb() */
+	RX_EXT_RESUME,		/* a continuation: in gro_complete() */
+	RX_EXT_DONE,		/* it gave the packet up */
+};
+
+/*
+ * A CPU runs the code for one packet at a time, with bottom halves off, except that GRO
+ * and the delivery of a batch, which the code calls, may flush a held packet and resume its
+ * continuation: rx_ext_arrive() and rx_ext_resume() save this and put it back.
+ */
+struct rx_ext_cpu {
+	struct gro_node *gro;
+	/* the argument of arrive(): what its program has for a context */
+	struct sk_buff *skb;
+	gro_result_t ret;	/* what gro_receive_skb() returns for the packet */
+	union {
+		struct {
+			u8 ctx;
+			bool offered;	/* GRO has seen the packet: not a second time */
+		};
+		u16 state;		/* the two, in the one store that begins an entry */
+	};
+};
+
+/*
+ * An entry begins, with a packet that GRO has @seen or not: the context is in the first
+ * thing stored. An entry from an interrupt that finds none has all of this one's
+ * stores still to come, and one that finds it puts back what it found, see
+ * rx_ext_arrive_nested().
+ */
+static __always_inline void rx_ext_begin(struct rx_ext_cpu *cur, u8 ctx, bool seen)
+{
+	const struct rx_ext_cpu begin = { .ctx = ctx, .offered = seen };
+
+	cur->state = begin.state;
+	barrier();
+}
+
+static DEFINE_PER_CPU(struct rx_ext_cpu, rx_ext_cpu);
+
+/**
+ * rx_ext_arrive - have the extension be the path of a packet from gro_receive_skb() on
+ * @gro: the node of the NAPI that is polled
+ * @skb: the packet
+ * @ret: what gro_receive_skb() returns for it
+ *
+ * Returns false if the extension is gone: the kernel's own path then.
+ */
+/*
+ * gro_skb_finish() said again: that one has one caller, gro_receive_skb(), and is compiled
+ * into it, which a second caller would undo.
+ */
+static __always_inline gro_result_t rx_ext_gro_finish(struct gro_node *gro, struct sk_buff *skb,
+						      gro_result_t ret)
+{
+	switch (ret) {
+	case GRO_NORMAL:
+		gro_normal_one(gro, skb, 1);
+		break;
+
+	case GRO_MERGED_FREE:
+		if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
+			napi_skb_free_stolen_head(skb);
+		else if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
+			__kfree_skb(skb);
+		else
+			__napi_kfree_skb(skb, SKB_CONSUMED);
+		break;
+
+	case GRO_HELD:
+	case GRO_MERGED:
+	case GRO_CONSUMED:
+		break;
+	}
+
+	return ret;
+}
+
+/* The kernel's own path for a packet from where gro_receive_skb() asks the extension */
+static noinline gro_result_t rx_ext_none(struct gro_node *gro, struct sk_buff *skb)
+{
+	return rx_ext_gro_finish(gro, skb, rx_ext_gro_receive(gro, skb));
+}
+
+/*
+ * An entry returned with its packet, which no code does that was loaded: one that GRO has
+ * seen goes no second time, and one that it has not goes the kernel's way.
+ */
+static noinline void rx_ext_kept(struct rx_ext_cpu *cur)
+{
+	WARN_ON_ONCE(1);
+	if (cur->offered)
+		gro_normal_one(cur->gro, cur->skb, 1);
+	else
+		cur->ret = rx_ext_none(cur->gro, cur->skb);
+	cur->ctx = RX_EXT_DONE;
+}
+
+static __always_inline gro_result_t __rx_ext_arrive(struct rx_ext_cpu *cur, struct gro_node *gro,
+						    struct sk_buff *skb)
+{
+	gro_result_t ret;
+
+	rx_ext_begin(cur, RX_EXT_ARRIVE, false);
+	cur->gro = gro;
+	cur->skb = skb;
+	cur->ret = GRO_NORMAL;
+	/* the context of a struct_ops program: the arguments of its member */
+	static_call(rx_ext_arrive_call)(&cur->skb, rx_ext_prog->insnsi);
+	if (unlikely(cur->ctx != RX_EXT_DONE))
+		rx_ext_kept(cur);
+	ret = cur->ret;
+	barrier();
+	cur->ctx = RX_EXT_NONE;
+	return ret;
+}
+
+/*
+ * An entry inside one that is on this CPU already, which called the kernel, or was
+ * interrupted by code that polls: what that one has is put back, in one piece.
+ */
+static noinline gro_result_t rx_ext_arrive_nested(struct gro_node *gro, struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu), saved = *cur;
+	unsigned long flags;
+	gro_result_t ret;
+
+	cur->ctx = RX_EXT_NONE;
+	ret = __rx_ext_arrive(cur, gro, skb);
+	local_irq_save(flags);
+	*cur = saved;
+	local_irq_restore(flags);
+	return ret;
+}
+
+/**
+ * rx_ext_arrive - a packet arrives at a node while an extension is attached
+ * @gro: the node
+ * @skb: the packet, as gro_receive_skb() has it for dev_gro_receive()
+ *
+ * The extension is the path of the packet from here, where the node has one: the node of a
+ * NAPI of the device that it is attached to. A node of its own, which has no id, is no
+ * NAPI's. Returns what gro_receive_skb() returns for the packet.
+ */
+gro_result_t rx_ext_arrive(struct gro_node *gro, struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+
+	/* bottom halves are off: a read section that rx_ext_detach() waits for */
+	if (unlikely(!gro->cached_napi_id || !READ_ONCE(gro_napi(gro)->bpf_rx) ||
+		     !rcu_dereference_sched(rx_ext_ops)))
+		return rx_ext_none(gro, skb);
+	/* nothing of the extension is on this CPU as a rule, and then nothing to put back */
+	if (unlikely(cur->ctx != RX_EXT_NONE))
+		return rx_ext_arrive_nested(gro, skb);
+	return __rx_ext_arrive(cur, gro, skb);
+}
+
+/**
+ * rx_ext_resume - the packet that GRO held goes on in its continuation, in gro_complete()
+ * @gro: the node that held it
+ * @skb: the packet, off the list of the node, with a frame suspended in its head
+ *
+ * Returns false if nothing put the packet on the batch: the kernel does.
+ */
+static __always_inline bool __rx_ext_resume(struct rx_ext_cpu *cur, struct gro_node *gro,
+					    struct sk_buff *skb)
+{
+	bool done;
+
+	rx_ext_begin(cur, RX_EXT_RESUME, true);
+	cur->gro = gro;
+	cur->skb = skb;
+	bpf_coro_run_bh(rx_ext_prog, skb->head);
+	done = cur->ctx == RX_EXT_DONE;
+	barrier();
+	cur->ctx = RX_EXT_NONE;
+	return done;
+}
+
+/* A flush inside bpf_rx_gro() for another packet, as a rule */
+static noinline bool rx_ext_resume_nested(struct gro_node *gro, struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu), saved = *cur;
+	unsigned long flags;
+	bool done;
+
+	cur->ctx = RX_EXT_NONE;
+	done = __rx_ext_resume(cur, gro, skb);
+	local_irq_save(flags);
+	*cur = saved;
+	local_irq_restore(flags);
+	return done;
+}
+
+bool rx_ext_resume(struct gro_node *gro, struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+
+	/* the frame is of this attachment, see rx_ext_held(), unless that is gone */
+	if (unlikely(!rcu_dereference_sched(rx_ext_ops)))
+		return false;
+	if (cur->ctx != RX_EXT_NONE)
+		return rx_ext_resume_nested(gro, skb);
+	return __rx_ext_resume(cur, gro, skb);
+}
+
+/*
+ * @skb is held in @gro with a frame of the extension suspended in its head. The packets
+ * that the node holds are marked one by one, and the mark means something only while the
+ * node knows the attachment: frames of an extension that was here before, and whatever was
+ * in the mark of a packet that was held with none attached, are nothing to this one. So
+ * the first frame of an attachment in a node clears the marks that it finds there.
+ */
+static void rx_ext_hold(struct gro_node *gro, struct sk_buff *skb)
+{
+	struct napi_struct *napi = gro_napi(gro);
+	u32 gen = READ_ONCE(rx_ext_gen);
+	struct sk_buff *p;
+	u32 i;
+
+	if (unlikely(napi->bpf_held != gen)) {
+		for (i = 0; i < GRO_HASH_BUCKETS; i++)
+			list_for_each_entry(p, &gro->hash[i].list, list)
+				NAPI_GRO_CB(p)->bpf_frame = 0;
+		napi->bpf_held = gen;
+	}
+	NAPI_GRO_CB(skb)->bpf_frame = 1;
+}
+
+/* Has the code on this CPU @skb in hand, in one of @ctxs, a mask? */
+static __always_inline bool rx_ext_in(const struct rx_ext_cpu *cur, const struct sk_buff *skb,
+				      u32 ctxs)
+{
+	return !WARN_ON_ONCE(cur->skb != skb || !(BIT(cur->ctx) & ctxs));
+}
+
+/* The batch of the NAPI: with the segments that GRO counted for a packet that it flushes */
+static void rx_ext_batch(struct rx_ext_cpu *cur, struct sk_buff *skb)
+{
+	int segs = cur->ctx == RX_EXT_RESUME ? NAPI_GRO_CB(skb)->count : 1;
+
+	cur->ret = GRO_NORMAL;
+	cur->ctx = RX_EXT_DONE;
+	gro_normal_one(cur->gro, skb, segs);
+}
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_coro_frame_alloc_skb - the coroutine frame of a packet's path, in the head of the packet
+ * @size__k: the size of the frame, which the verifier checked against BPF_RX_FRAME
+ * @skb__coro_host: the packet that the extension was entered with
+ *
+ * The frame is the first bytes of the head, as they are, and is there for as long as the
+ * code has the packet. Returns the frame, or NULL for a head that is shared with a clone
+ * or that has the link layer header or metadata of the packet within those bytes.
+ */
+__bpf_kfunc void *bpf_coro_frame_alloc_skb(u64 size__k, struct sk_buff *skb__coro_host)
+{
+	struct sk_buff *skb = skb__coro_host;
+
+	if (unlikely(!skb_mac_header_was_set(skb) || skb_cloned(skb) || skb_shared(skb) ||
+		     skb->mac_header < BPF_RX_FRAME + skb_metadata_len(skb)))
+		return NULL;
+	return skb->head;
+}
+
+/**
+ * bpf_rx_gro - offer a packet to GRO
+ * @frame__coro_offer: the frame of the packet's path, from bpf_coro_frame_alloc_skb(), with
+ *	the packet in one of its slots
+ *
+ * dev_gro_receive() as a boundary. Returns true where GRO has the packet: merged into one
+ * that it holds, and then the frame is over with the packet; or held, and then
+ * gro_complete() resumes the continuation with the packet that is flushed, which stands for
+ * all that were merged into it. Returns false where GRO has no use for the packet, and
+ * for one that it has seen: the code goes on with packet and frame.
+ */
+__bpf_kfunc bool bpf_rx_gro(void *frame__coro_offer)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct gro_node *gro = cur->gro;
+	struct sk_buff *skb = cur->skb;
+	enum gro_result ret;
+
+	if (WARN_ON_ONCE(cur->ctx != RX_EXT_ARRIVE || skb->head != frame__coro_offer) ||
+	    cur->offered)
+		return false;
+	cur->offered = true;
+	ret = rx_ext_gro_receive(gro, skb);
+	/* the same CPU, and what GRO flushed and resumed on the way has put @cur back */
+	if (ret == GRO_NORMAL)
+		return false;
+	if (ret == GRO_HELD)
+		rx_ext_hold(gro, skb);
+	cur->ret = rx_ext_gro_finish(gro, skb, ret);
+	cur->ctx = RX_EXT_DONE;
+	return true;
+}
+
+/**
+ * bpf_rx_native - leave a packet to the kernel
+ * @skb: the packet, which the caller owns: arrive(), or the continuation of a packet that
+ *	GRO held
+ *
+ * The kernel's own remainder of the path, with no frame: GRO and what follows from it for a
+ * packet that GRO has not seen, the batch for one that it has.
+ */
+__bpf_kfunc void bpf_rx_native(struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct gro_node *gro;
+
+	if (!rx_ext_in(cur, skb, BIT(RX_EXT_ARRIVE) | BIT(RX_EXT_RESUME)))
+		return;
+	if (cur->offered) {
+		rx_ext_batch(cur, skb);
+		return;
+	}
+	gro = cur->gro;
+	cur->offered = true;
+	cur->ctx = RX_EXT_DONE;
+	cur->ret = rx_ext_gro_finish(gro, skb, rx_ext_gro_receive(gro, skb));
+}
+
+/**
+ * bpf_rx_batch - put a packet on the batch of its NAPI
+ * @skb: the packet, as for bpf_rx_native()
+ *
+ * gro_normal_one(), the end of the unit and of its frame: the kernel delivers the batch as
+ * a list. A packet that GRO has not seen goes past GRO. The landing pads of the extension
+ * call this or bpf_rx_native(), whichever btf_find_release_kfunc() finds first: both end
+ * the unit wherever it is.
+ */
+__bpf_kfunc void bpf_rx_batch(struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+
+	if (rx_ext_in(cur, skb, BIT(RX_EXT_ARRIVE) | BIT(RX_EXT_RESUME)))
+		rx_ext_batch(cur, skb);
+}
+
+__bpf_kfunc_end_defs();
+
+static int bpf_rx_ops__arrive(struct sk_buff *skb__ref)
+{
+	return 0;
+}
+
+static struct bpf_rx_ops __bpf_rx_ops_stubs = {
+	.arrive = (void *)bpf_rx_ops__arrive,
+};
+
+static struct bpf_struct_ops bpf_bpf_rx_ops;
+
+BTF_KFUNCS_START(rx_ext_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc_skb, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rx_gro)
+BTF_ID_FLAGS(func, bpf_rx_native, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_rx_batch, KF_RELEASE)
+BTF_KFUNCS_END(rx_ext_kfunc_ids)
+
+/* what a continuation calls: code that gro_complete() resumes */
+BTF_KFUNCS_START(rx_ext_cont_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_rx_native, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_rx_batch, KF_RELEASE)
+BTF_KFUNCS_END(rx_ext_cont_kfunc_ids)
+
+BTF_ID_LIST(rx_ext_ids)
+BTF_ID(func, bpf_coro_frame_alloc_skb)
+BTF_ID(func, bpf_rx_gro)
+
+/* A continuation has its frame, and its packet has been through GRO. */
+static int rx_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	if (!btf_id_set8_contains(&rx_ext_kfunc_ids, kfunc_id))
+		return 0;
+	if (prog->aux->st_ops != &bpf_bpf_rx_ops)
+		return -EACCES;
+	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
+		return kfunc_id == rx_ext_ids[0] || kfunc_id == rx_ext_ids[1] ? -EACCES : 0;
+	return prog->aux->attach_st_ops_member_off == offsetof(struct bpf_rx_ops, arrive) ?
+	       0 : -EACCES;
+}
+
+static const struct btf_kfunc_id_set rx_ext_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &rx_ext_kfunc_ids,
+	.filter = rx_ext_kfunc_filter,
+};
+
+static const struct btf_kfunc_id_set rx_ext_cont_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &rx_ext_cont_kfunc_ids,
+	.filter = rx_ext_kfunc_filter,
+};
+
+static int bpf_rx_ops_init_member(const struct btf_type *t, const struct btf_member *member,
+				  void *kdata, const void *udata)
+{
+	const struct bpf_rx_ops *uops = udata;
+	struct bpf_rx_ops *ops = kdata;
+
+	switch (__btf_member_bit_offset(t, member) / 8) {
+	case offsetof(struct bpf_rx_ops, ifindex):
+		ops->ifindex = uops->ifindex;
+		return 1;
+	case offsetof(struct bpf_rx_ops, flags):
+		if (uops->flags)
+			return -EINVAL;
+		return 1;
+	}
+	return 0;
+}
+
+static int bpf_rx_ops_validate(void *kdata)
+{
+	struct bpf_rx_ops *ops = kdata;
+
+	return ops->arrive && ops->ifindex ? 0 : -EINVAL;
+}
+
+/* Take the extension off its device. With napi_ext_mutex. */
+static void rx_ext_detach(void)
+{
+	struct net_device *dev = rx_ext_dev;
+	struct napi_struct *napi;
+
+	if (!dev)
+		return;
+	netdev_lock(dev);
+	WRITE_ONCE(rx_ext_dev, NULL);
+	list_for_each_entry(napi, &dev->napi_list, dev_list)
+		WRITE_ONCE(napi->bpf_rx, 0);
+	netdev_unlock(dev);
+	rcu_assign_pointer(rx_ext_ops, NULL);
+	/*
+	 * No entry and no continuation runs any more, and none begins. The frames that are
+	 * suspended in held packets are forgotten where they are: each packet is the kernel's
+	 * at its flush, and the next attachment is another one to the nodes, see rx_ext_hold().
+	 */
+	synchronize_rcu();
+	static_call_update(rx_ext_arrive_call, rx_ext_no_arrive);
+	static_branch_dec(&rx_ext_key);
+	netdev_put(dev, &rx_ext_dev_tracker);
+}
+
+static int bpf_rx_ops_reg(void *kdata, struct bpf_link *link)
+{
+	struct bpf_rx_ops *ops = kdata;
+	struct napi_struct *napi;
+	struct net_device *dev;
+	int err = 0;
+
+	mutex_lock(&napi_ext_mutex);
+	if (rcu_access_pointer(rx_ext_ops)) {
+		err = -EBUSY;
+		goto out;
+	}
+	dev = netdev_get_by_index(current->nsproxy->net_ns, ops->ifindex, &rx_ext_dev_tracker,
+				  GFP_KERNEL);
+	if (!dev) {
+		err = -ENODEV;
+		goto out;
+	}
+	/* before a packet can enter */
+	bpf_struct_ops_for_each_prog(kdata, napi_ext_first_prog, &rx_ext_prog);
+	static_call_update(rx_ext_arrive_call, rx_ext_prog->bpf_func);
+	WRITE_ONCE(rx_ext_gen, rx_ext_gen + 1 ?: 1);
+	static_branch_inc(&rx_ext_key);
+	rcu_assign_pointer(rx_ext_ops, ops);
+	netdev_lock(dev);
+	if (dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+	} else {
+		WRITE_ONCE(rx_ext_dev, dev);
+		list_for_each_entry(napi, &dev->napi_list, dev_list)
+			WRITE_ONCE(napi->bpf_rx, 1);
+	}
+	netdev_unlock(dev);
+	if (err) {
+		rcu_assign_pointer(rx_ext_ops, NULL);
+		synchronize_rcu();
+		static_call_update(rx_ext_arrive_call, rx_ext_no_arrive);
+		static_branch_dec(&rx_ext_key);
+		netdev_put(dev, &rx_ext_dev_tracker);
+	}
+out:
+	mutex_unlock(&napi_ext_mutex);
+	return err;
+}
+
+static void bpf_rx_ops_unreg(void *kdata, struct bpf_link *link)
+{
+	mutex_lock(&napi_ext_mutex);
+	if (rcu_access_pointer(rx_ext_ops) == kdata)
+		rx_ext_detach();
+	mutex_unlock(&napi_ext_mutex);
+}
+
+static struct bpf_struct_ops bpf_bpf_rx_ops = {
+	.verifier_ops = &bpf_napi_verifier_ops,
+	.reg = bpf_rx_ops_reg,
+	.unreg = bpf_rx_ops_unreg,
+	.validate = bpf_rx_ops_validate,
+	.init_member = bpf_rx_ops_init_member,
+	.init = bpf_napi_ops_init,
+	.name = "bpf_rx_ops",
+	.cfi_stubs = &__bpf_rx_ops_stubs,
+	.owner = THIS_MODULE,
+};
+
+static int __init rx_ext_init(void)
+{
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &rx_ext_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &rx_ext_cont_kfunc_set);
+	ret = ret ?: bpf_coro_register_bare_host(rx_ext_ids[0], BPF_RX_FRAME);
+	return ret ?: register_bpf_struct_ops(&bpf_bpf_rx_ops, bpf_rx_ops);
+}
+late_initcall(rx_ext_init);
 #endif /* CONFIG_BPF_JIT */

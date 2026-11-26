@@ -439,10 +439,15 @@ struct napi_struct {
 	 *
 	 * @bpf_poll_gen: which attachment the frame of a deferred poll is of, 0 for none
 	 * deferred. Whoever owns NAPI_STATE_SCHED writes it, and nobody else looks.
+	 * @bpf_rx: an extension is the path of the packets that arrive at this NAPI.
+	 * @bpf_held: which attachment the frames are of that are suspended in packets that
+	 * the node of this NAPI holds, 0 for none.
 	 * @bpf_poll_frame: the frame of the poll that an extension has deferred, behind its
 	 * header: written where the NAPI is scheduled and read where it is polled.
 	 */
 	u32			bpf_poll_gen;
+	u32			bpf_rx;
+	u32			bpf_held;
 	u64			bpf_poll_frame[BPF_NAPI_POLL_WORDS];
 #endif
 };

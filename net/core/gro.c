@@ -6,6 +6,8 @@
 #include <trace/events/net.h>
 #include <linux/skbuff_ref.h>
 
+#include "dev.h"
+
 #define MAX_GRO_SKBS 8
 
 static DEFINE_SPINLOCK(offload_lock);
@@ -275,6 +277,26 @@ int skb_gro_receive_list(struct sk_buff *p, struct sk_buff *skb)
 	return 0;
 }
 
+/* Is an extension on the path of a packet attached, to some device? See net/core/napi_bpf.c. */
+static inline bool rx_ext_attached(void)
+{
+	return RX_EXT && static_branch_unlikely(&rx_ext_key);
+}
+
+/*
+ * Is a frame of the extension that is attached suspended in @skb, which @gro held? The mark
+ * of a packet counts where the node has seen a frame of this attachment, see rx_ext_hold().
+ */
+static inline bool rx_ext_held(const struct gro_node *gro, const struct sk_buff *skb)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	return rx_ext_attached() && NAPI_GRO_CB(skb)->bpf_frame && gro->cached_napi_id &&
+	       gro_napi(gro)->bpf_held == READ_ONCE(rx_ext_gen);
+#else
+	return false;
+#endif
+}
+
 static void gro_complete(struct gro_node *gro, struct sk_buff *skb)
 {
 	struct list_head *head = &net_hotdata.offload_base;
@@ -310,6 +332,9 @@ static void gro_complete(struct gro_node *gro, struct sk_buff *skb)
 	}
 
 out:
+	/* The packet goes on in the continuation that was suspended in the hold. */
+	if (rx_ext_held(gro, skb) && rx_ext_resume(gro, skb))
+		return;
 	gro_normal_one(gro, skb, NAPI_GRO_CB(skb)->count);
 }
 
@@ -587,6 +612,9 @@ found_ptype:
 
 	NAPI_GRO_CB(skb)->age = jiffies;
 	NAPI_GRO_CB(skb)->last = skb;
+	/* held with no frame, unless an extension says otherwise */
+	if (rx_ext_attached())
+		NAPI_GRO_CB(skb)->bpf_frame = 0;
 	if (!skb_is_gso(skb))
 		skb_shinfo(skb)->gso_size = skb_gro_len(skb);
 	list_add(&skb->list, &gro_list->list);
@@ -661,6 +689,15 @@ static gro_result_t gro_skb_finish(struct gro_node *gro, struct sk_buff *skb,
 	return ret;
 }
 
+/*
+ * dev_gro_receive() for the extension on a packet's path, see net/core/napi_bpf.c. A function
+ * of its own, so that the kernel's path is compiled as it is with no extension in the tree.
+ */
+enum gro_result rx_ext_gro_receive(struct gro_node *gro, struct sk_buff *skb)
+{
+	return dev_gro_receive(gro, skb);
+}
+
 gro_result_t gro_receive_skb(struct gro_node *gro, struct sk_buff *skb)
 {
 	gro_result_t ret;
@@ -670,7 +707,11 @@ gro_result_t gro_receive_skb(struct gro_node *gro, struct sk_buff *skb)
 
 	skb_gro_reset_offset(skb, 0);
 
-	ret = gro_skb_finish(gro, skb, dev_gro_receive(gro, skb));
+	/* An extension is the path of the packet from here, see net/core/napi_bpf.c. */
+	if (rx_ext_attached())
+		ret = rx_ext_arrive(gro, skb);
+	else
+		ret = gro_skb_finish(gro, skb, dev_gro_receive(gro, skb));
 	trace_napi_gro_receive_exit(ret);
 
 	return ret;
