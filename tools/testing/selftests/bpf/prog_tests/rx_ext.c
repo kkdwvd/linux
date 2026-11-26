@@ -64,6 +64,7 @@ static void test_refused(void)
 	refused("ext_no_host", "no_host", "which is in none of its slots");
 	refused("ext_holds", "holds", "deferred coro_frame holds a reference besides its host");
 	refused("ext_cached", "cached", "deferred coro_frame is not in memory of a host");
+	refused("ext_merge_calls", "merge_calls", "calling kernel function bpf_rx_state is not allowed");
 }
 
 struct test_args {
@@ -90,10 +91,12 @@ static __u64 run_drv(struct bpf_program *prog, __u32 arg, int *retval)
 static struct napi_ext_null *drv;
 static struct rx_ext *ext;
 static struct bpf_link *ext_link;
+/* which of the extensions of the object: the one that counts, unless a test says otherwise */
+static struct bpf_map *ext_map;
 
 static bool attach(void)
 {
-	ext_link = bpf_map__attach_struct_ops(ext->maps.rx_ext);
+	ext_link = bpf_map__attach_struct_ops(ext_map ?: ext->maps.rx_ext);
 	return ASSERT_OK_PTR(ext_link, "attach_struct_ops");
 }
 
@@ -125,6 +128,8 @@ static void forget(void)
 	ext->bss->resumed = 0;
 	ext->bss->native = 0;
 	ext->bss->no_frame = 0;
+	ext->bss->merges = 0;
+	ext->bss->state_sum = 0;
 }
 
 static struct rx_seen kernel_saw[RX_SEEN];
@@ -197,6 +202,23 @@ static __u64 segments(void)
 	return segs;
 }
 
+/*
+ * The extension with state: what it keeps per packet is combined where GRO merges two, and
+ * what goes onto the batches is what arrived. The stack gets what it gets with none.
+ */
+static void state(const char *what, __u32 kind, __u32 n)
+{
+	ext_map = ext->maps.rx_state;
+	if (same(what, MODE_GRO, kind, n)) {
+		ASSERT_EQ(ext->bss->state_sum, POLLS * n, what);
+		ASSERT_EQ(ext->bss->merges, POLLS * n - ext->bss->resumed - ext->bss->declined, what);
+		ASSERT_EQ(ext->bss->no_frame, 0, what);
+	}
+	if (ext_link)
+		detach();
+	ext_map = NULL;
+}
+
 static bool wait_seen(__u64 want, const char *what)
 {
 	int i;
@@ -223,6 +245,7 @@ static void test_path(void)
 	ext->struct_ops.rx_ext->ifindex = ifindex;
 	ext->struct_ops.rx_null->ifindex = ifindex;
 	ext->struct_ops.rx_entry->ifindex = ifindex;
+	ext->struct_ops.rx_state->ifindex = ifindex;
 	ext->bss->ifindex = ifindex;
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;
@@ -273,6 +296,19 @@ static void test_path(void)
 	ASSERT_EQ(segments(), POLLS * 8, "segments, entry unwound");
 	ASSERT_EQ(ext->bss->taken + ext->bss->declined, 0, "offered, entry unwound");
 	ASSERT_GT(ext->bss->frames, 0, "frames of the recursion");
+
+	/* what an extension keeps per packet goes through the fold */
+	state("state, datagrams", RX_UDP, 8);
+	state("state, a flow", RX_FLOW, 8);
+	state("state, a flow, pushed", RX_PUSH, 8);
+	state("state, four flows", RX_FEW, 20);
+	state("state, flows", RX_FLOWS, 80);
+	ASSERT_GT(ext->bss->resumed, 0, "resumed, state");
+	/* and where GRO chains the packets that it merges, in place of their data */
+	SYS(out, "ethtool -K napitest0 rx-gro-list on");
+	path("a flow, chained", RX_FLOW, 8, POLLS * 8, POLLS);
+	state("state, a flow, chained", RX_FLOW, 8);
+	SYS(out, "ethtool -K napitest0 rx-gro-list off");
 
 	/* past GRO: every segment goes up by itself */
 	detach();
@@ -418,6 +454,7 @@ static void test_cost(void)
 	ext->struct_ops.rx_ext->ifindex = ifindex;
 	ext->struct_ops.rx_null->ifindex = ifindex;
 	ext->struct_ops.rx_entry->ifindex = ifindex;
+	ext->struct_ops.rx_state->ifindex = ifindex;
 	/* no observer: nothing but the path */
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;

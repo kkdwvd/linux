@@ -15,6 +15,7 @@ extern void *bpf_coro_frame_alloc(__u64 size, void *ctx) __ksym;
 extern bool bpf_rx_gro(void *frame) __ksym;
 extern void bpf_rx_batch(struct sk_buff *skb) __ksym;
 extern void bpf_rx_native(struct sk_buff *skb) __ksym;
+extern __u64 bpf_rx_state(struct sk_buff *skb) __ksym;
 
 char _license[] SEC("license") = "GPL";
 
@@ -232,3 +233,23 @@ void BPF_PROG(cached, struct sk_buff *skb)
 		bpf_rx_batch(skb);
 }
 EXT(ext_cached, cached);
+
+/* A merge that asks for the state of a packet: it has the two words, and no packet */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrives, struct sk_buff *skb)
+{
+	bpf_rx_native(skb);
+}
+
+SEC("struct_ops/merge")
+__u64 BPF_PROG(merge_calls, __u64 into, __u64 from)
+{
+	return into + bpf_rx_state((struct sk_buff *)from);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops ext_merge_calls = {
+	.arrive = (void *)arrives,
+	.merge = (void *)merge_calls,
+	.ifindex = 1,
+};

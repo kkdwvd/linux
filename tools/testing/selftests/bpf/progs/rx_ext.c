@@ -17,6 +17,8 @@
 
 extern void *bpf_coro_frame_alloc_skb(__u64 size, struct sk_buff *skb) __ksym;
 extern bool bpf_rx_gro(void *frame) __ksym;
+extern void bpf_rx_set_state(struct sk_buff *skb, __u64 state) __ksym;
+extern __u64 bpf_rx_state(struct sk_buff *skb) __ksym;
 extern void bpf_rx_batch(struct sk_buff *skb) __ksym;
 extern void bpf_rx_native(struct sk_buff *skb) __ksym;
 
@@ -30,6 +32,8 @@ int ifindex;
 __u64 arrived, taken, declined, resumed, native, no_frame;
 /* the last frame, behind the head of its packet */
 __s64 frame_off;
+/* by the one with state: the merges, and the state of every packet that went onto a batch */
+__u64 merges, state_sum;
 
 /* by the observers: what the stack got, in order, and the lists that it got them in */
 struct rx_seen seen[RX_SEEN];
@@ -105,6 +109,58 @@ void BPF_PROG(arrive, struct sk_buff *skb)
 SEC(".struct_ops.link")
 struct bpf_rx_ops rx_ext = {
 	.arrive = (void *)arrive,
+};
+
+/*
+ * An extension with state: each packet starts as one segment, and where GRO merges two the
+ * segments add up. What goes onto the batches is what arrived.
+ */
+static __noinline __used void flush_state_fn(void *frame)
+{
+	__u64 *f = frame;
+	struct sk_buff *skb = (struct sk_buff *)f[2];
+
+	__sync_fetch_and_add(&resumed, 1);
+	__sync_fetch_and_add(&state_sum, bpf_rx_state(skb));
+	bpf_rx_batch(skb);
+}
+
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_state, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	f = bpf_coro_frame_alloc_skb(24, skb);
+	if (!f) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_native(skb);
+		return;
+	}
+	f[0] = (__u64)flush_state_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	bpf_rx_set_state(skb, 1);
+	if (bpf_rx_gro(f)) {
+		__sync_fetch_and_add(&taken, 1);
+		return;
+	}
+	__sync_fetch_and_add(&declined, 1);
+	__sync_fetch_and_add(&state_sum, bpf_rx_state(skb));
+	bpf_rx_batch(skb);
+}
+
+SEC("struct_ops/merge")
+__u64 BPF_PROG(merge, __u64 into, __u64 from)
+{
+	__sync_fetch_and_add(&merges, 1);
+	return into + from;
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_state = {
+	.arrive = (void *)arrive_state,
+	.merge = (void *)merge,
 };
 
 /* The null extension, and nothing else: what the path costs as code of an extension */
