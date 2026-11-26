@@ -81,6 +81,13 @@ enum xdp_buff_flags {
 	 * XDP program is not attached.
 	 */
 	XDP_FLAGS_FRAGS_UNREADABLE	= BIT(2),
+	/*
+	 * How many bytes of the headroom, behind the room for struct xdp_frame,
+	 * the program that runs on the buffer has for an object of its own, see
+	 * xdp_buff_lend_headroom(). For that run: gone with the next packet,
+	 * and in no frame that is made of the buffer.
+	 */
+	XDP_FLAGS_HEADROOM_LENT		= GENMASK(15, 8),
 };
 
 struct xdp_buff {
@@ -174,6 +181,8 @@ xdp_prepare_buff(struct xdp_buff *xdp, unsigned char *hard_start,
 	xdp->data = data;
 	xdp->data_end = data + data_len;
 	xdp->data_meta = meta_valid ? data : data + 1;
+	/* nothing where xdp_init_buff() comes first, a driver that sets up once has to */
+	xdp->flags &= ~XDP_FLAGS_HEADROOM_LENT;
 }
 
 /* Reserve memory area at end-of data area.
@@ -318,6 +327,19 @@ struct xdp_frame {
 	u32 flags; /* supported values defined in xdp_buff_flags */
 };
 
+void *xdp_buff_lend_headroom(struct xdp_buff *xdp, u32 size);
+
+/*
+ * Where the headroom begins that a program can move the packet and its metadata
+ * into: behind the room for struct xdp_frame, and behind what an object of the
+ * program has, see xdp_buff_lend_headroom().
+ */
+static __always_inline void *xdp_buff_headroom_start(const struct xdp_buff *xdp)
+{
+	return xdp->data_hard_start + sizeof(struct xdp_frame) +
+	       FIELD_GET(XDP_FLAGS_HEADROOM_LENT, xdp->flags);
+}
+
 void bpf_xdp_frame_put(struct xdp_frame *frame);
 
 static __always_inline bool xdp_frame_has_frags(const struct xdp_frame *frame)
@@ -435,7 +457,7 @@ int xdp_update_frame_from_buff(const struct xdp_buff *xdp,
 	xdp_frame->headroom = headroom - sizeof(*xdp_frame);
 	xdp_frame->metasize = metasize;
 	xdp_frame->frame_sz = xdp->frame_sz;
-	xdp_frame->flags = xdp->flags;
+	xdp_frame->flags = xdp->flags & ~XDP_FLAGS_HEADROOM_LENT;
 
 	return 0;
 }

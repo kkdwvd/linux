@@ -1060,6 +1060,44 @@ void xdp_features_clear_redirect_target(struct net_device *dev)
 }
 EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
 
+/**
+ * xdp_buff_lend_headroom - lend headroom of a buffer to the program that runs on it
+ * @xdp: the buffer
+ * @size: how many bytes
+ *
+ * The program gets memory for an object of its own in the buffer, which costs
+ * no allocation and is in the cache lines that the packet has brought in: a
+ * coroutine frame, see bpf_coro_frame_alloc_xdp(). It is the lowest part of
+ * the headroom that the program could move the packet into, behind the room
+ * for struct xdp_frame: the buffer is made a frame with the object in it, and
+ * the object is where the frame is, for as long as the frame is.
+ *
+ * What is lent is no headroom for the rest of the run: bpf_xdp_adjust_head(),
+ * bpf_xdp_adjust_meta() and bpf_xdp_pull_data() stop in front of it, see
+ * xdp_buff_headroom_start(). Nothing takes it back, and a buffer lends once.
+ * The kernel reads nothing there. Whoever has the buffer when the program is
+ * done with it finds bytes in its headroom, as behind any program that moved
+ * the packet up.
+ *
+ * Returns the memory, aligned to 8 bytes. NULL if the packet or its metadata
+ * are in the way, if the buffer has lent already, or if its memory is that of
+ * an AF_XDP socket, which user space reads and writes.
+ */
+void *xdp_buff_lend_headroom(struct xdp_buff *xdp, u32 size)
+{
+	void *room = xdp->data_hard_start + sizeof(struct xdp_frame);
+	void *start = PTR_ALIGN(room, sizeof(u64)), *end = start + size;
+	void *used = xdp_data_meta_unsupported(xdp) ? xdp->data : xdp->data_meta;
+	unsigned long lent = end - room;
+
+	if (xdp->flags & XDP_FLAGS_HEADROOM_LENT || end > used ||
+	    lent > FIELD_MAX(XDP_FLAGS_HEADROOM_LENT) ||
+	    xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL)
+		return NULL;
+	xdp->flags |= FIELD_PREP(XDP_FLAGS_HEADROOM_LENT, lent);
+	return start;
+}
+
 /*
  * Frames as kptrs.
  *
