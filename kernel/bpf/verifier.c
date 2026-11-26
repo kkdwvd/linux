@@ -15768,6 +15768,7 @@ enum special_kfunc_type {
 	KF_bpf_coro_frame_alloc,
 	KF_bpf_coro_park_xdp,
 	KF_bpf_coro_park_syscall,
+	KF_bpf_coro_frame_alloc_xdp,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -15876,11 +15877,26 @@ BTF_ID_UNUSED
 BTF_ID(func, bpf_coro_frame_alloc)
 BTF_ID(func, bpf_coro_park_xdp)
 BTF_ID(func, bpf_coro_park_syscall)
+#ifdef CONFIG_NET
+BTF_ID(func, bpf_coro_frame_alloc_xdp)
+#else
+BTF_ID_UNUSED
+#endif
 
 /* What bpf_coro_park_xdp() and bpf_coro_park_syscall() return */
 BTF_ID_LIST(coro_handle_ids)
 BTF_ID(struct, bpf_coro_xdp)
 BTF_ID(struct, bpf_coro_syscall)
+
+/*
+ * Does the kfunc return a coroutine frame? From the cache of the program, or in memory of
+ * the host that the kfunc is of, see "Hosts" in kernel/bpf/coro.c.
+ */
+static bool is_coro_frame_alloc_kfunc(const struct bpf_call_arg_meta *meta)
+{
+	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc]) ||
+	       is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp]);
+}
 
 /*
  * The type of program that the kfunc which @insn calls parks a coroutine frame for, see
@@ -17579,7 +17595,7 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 		regs[BPF_REG_0].buf = meta->slice_buf;
 		if (meta->slice_buf.size)
 			env->seen_stack_slice = true;
-	} else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc])) {
+	} else if (is_coro_frame_alloc_kfunc(meta)) {
 		u64 size = meta->arg_constant.value, arg;
 
 		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
@@ -17589,6 +17605,22 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 			verbose(env, "coro_frame size %llu out of range [1, %u]\n",
 				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
 			return -EINVAL;
+		}
+		if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp])) {
+			/*
+			 * The frame is in the headroom of the packet or there is none: a program
+			 * that asks for more than a buffer can lend asks in vain on every run.
+			 */
+			if (size > bpf_coro_frame_xdp_max()) {
+				verbose(env, "coro_frame of %llu bytes does not fit in the headroom of a packet, which lends %u\n",
+					size, bpf_coro_frame_xdp_max());
+				return -EINVAL;
+			}
+			bpf_coro_frames_hosted(env->prog->aux);
+			mark_reg_known_zero(env, regs, BPF_REG_0);
+			regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
+			regs[BPF_REG_0].mem_size = size;
+			return 1;
 		}
 		/*
 		 * The program gets a cache for frames of this size, see bpf_coro_frames_init(),
@@ -18425,7 +18457,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		    (!is_bpf_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_percpu_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_refcount_acquire_kfunc(meta.func_id) &&
-		     meta.func_id != special_kfunc_list[KF_bpf_coro_frame_alloc])) {
+		     !is_coro_frame_alloc_kfunc(&meta))) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}
@@ -18593,7 +18625,12 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			 */
 			if (is_kfunc_release_ctx(&meta))
 				move_hosted_frames(env->cur_state, 0, id);
-			bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
+			/* in memory of the context: no resource, see REF_TYPE_HOSTED */
+			if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp]))
+				env->cur_state->refs[env->cur_state->acquired_refs - 1].type =
+					REF_TYPE_HOSTED;
+			else
+				bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
 				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
 				if (err)

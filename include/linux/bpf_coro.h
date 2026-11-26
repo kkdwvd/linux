@@ -40,6 +40,7 @@ struct bpf_prog_aux;
 void bpf_coro_frame_free(void *frame);
 u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size);
 void bpf_coro_frames_hosted(struct bpf_prog_aux *aux);
+u32 bpf_coro_frame_xdp_max(void);
 int bpf_coro_frames_init(struct bpf_prog *prog);
 void bpf_coro_frames_stop(struct bpf_prog *prog);
 void bpf_coro_frames_free(struct bpf_prog *prog);

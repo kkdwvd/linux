@@ -399,6 +399,25 @@ with one exception: a frame is not accepted as the buffer of
 the buffer. The contents of a frame are tracked like those of the stack, and
 such a slice would be a second way to them.
 
+A frame can also be in memory that an object of the kernel lends, its host,
+where the request that the coroutine serves arrived in that object:
+``bpf_coro_frame_alloc_xdp()`` gives an XDP program a frame in the headroom
+of the packet. Such a frame costs no allocation, and it is no reference of
+the program: it is there for as long as the program has the host, and
+whatever takes the host from the program ends the frame. For a packet that
+is the return of the program, or, once the program has kept the packet with
+``bpf_xdp_frame_steal()``, the call that sends the packet, gives it back or
+stores it. The verifier refuses every use of the frame behind that point.
+A ``__coro_frame`` parameter does not accept such a frame, so nothing frees
+it, and ``bpf_coro_frame_free()`` in kernel code does nothing for it. A
+``__coro_suspend`` parameter accepts it if the host is a reference that one
+of the slots of the frame holds: the continuation gives the host up, which
+is the end of the frame. The kfunc returns a frame in the host or ``NULL``,
+never a frame from the cache of the program: the size is checked at load
+time against what such a host can lend at all, 192 bytes for a packet, and
+at run time the host may have less, or none. There is no fallback: the
+request that gets no frame ends.
+
 2.3.11 __coro_suspend Annotation
 --------------------------------
 
@@ -672,6 +691,11 @@ after the call, the value that it returns when the kernel unwinds it
 included, must not make its caller touch what the kfunc took: for XDP that is
 what XDP_CONSUME makes sure of. bpf_xdp_frame_steal() uses the flag to turn
 the frame behind an XDP context into a kptr the program owns.
+
+A coroutine frame in memory of the context, see ``__coro_frame`` above, goes
+over to the reference that such a kfunc returns, and ends where that goes. A
+KF_RELEASE_CTX kfunc that returns no reference is not called while the
+context has such a frame.
 
 2.6 Registering the kfuncs
 --------------------------

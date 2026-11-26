@@ -18,6 +18,7 @@
 #include <linux/rcupdate_trace.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/xdp.h>
 
 /*
  * In front of every frame. The program gets the address behind it: the verifier bounds the
@@ -136,6 +137,8 @@ static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
  *   program.
  * - It has the header: bpf_coro_frame_prog() and bpf_coro_drop() ask no question about where
  *   a frame is. So a program whose frames are all in hosts has a cache too, which is empty.
+ *
+ * The buffer of an XDP program is the one host so far, see bpf_coro_frame_alloc_xdp().
  */
 #define BPF_CORO_CACHE_MIN	64
 #define BPF_CORO_CACHE_MAX	1024
@@ -835,8 +838,49 @@ __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
 }
 EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
 
+#ifdef CONFIG_NET
+/**
+ * bpf_coro_frame_alloc_xdp - a coroutine frame in the headroom of the packet
+ * @size__k: the size of the frame, which the verifier checked against bpf_coro_frame_xdp_max()
+ * @ctx: the context of the XDP program
+ * @aux: the program
+ *
+ * The buffer of the packet is the host of the frame, see "Hosts" above and
+ * xdp_buff_lend_headroom(): the header is behind the room for struct xdp_frame, and the frame
+ * behind the header. The frame is good for the rest of the invocation, and nothing frees it.
+ * A program that keeps the packet with bpf_xdp_frame_steal() keeps the frame with it, for as
+ * long as it has the packet: until it sends the packet, gives it back, or puts it elsewhere.
+ * A frame that is suspended has the packet in one of its slots.
+ *
+ * Returns the frame, or NULL: the buffer cannot lend that much or has lent already, see
+ * xdp_buff_lend_headroom(), or the last reference of the program is gone, see
+ * bpf_coro_frames_stop().
+ */
+__bpf_kfunc void *bpf_coro_frame_alloc_xdp(u64 size__k, struct xdp_md *ctx,
+					   struct bpf_prog_aux *aux)
+{
+	struct bpf_coro_frame_cache __percpu *cache = READ_ONCE(aux->coro_cache);
+	struct bpf_coro_frame_hdr *hdr;
+
+	if (unlikely(cache == &bpf_coro_no_frames))
+		return NULL;
+	hdr = xdp_buff_lend_headroom((struct xdp_buff *)ctx, sizeof(*hdr) + size__k);
+	if (unlikely(!hdr))
+		return NULL;
+	hdr->cache = cache;
+	hdr->class = 0;
+	return hdr + 1;
+}
+#endif
+
 __bpf_kfunc_end_defs();
 
+/* The largest frame that fits in the headroom which every driver gives, for the verifier */
+u32 bpf_coro_frame_xdp_max(void)
+{
+	return round_down(XDP_PACKET_HEADROOM - sizeof(struct xdp_frame) -
+			  sizeof(struct bpf_coro_frame_hdr), sizeof(u64));
+}
 
 /*
  * The program of @frame, for the kfunc that keeps the frame: it holds the program for as long as
@@ -1208,6 +1252,17 @@ static const struct btf_kfunc_id_set bpf_coro_park_kfunc_set = {
 	.set = &bpf_coro_park_kfunc_ids,
 };
 
+#ifdef CONFIG_NET
+BTF_KFUNCS_START(bpf_coro_xdp_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc_xdp, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
+BTF_KFUNCS_END(bpf_coro_xdp_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_coro_xdp_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_coro_xdp_kfunc_ids,
+};
+#endif
+
 BTF_ID_LIST(bpf_coro_dtor_ids)
 BTF_ID(struct, bpf_coro_xdp)
 BTF_ID(func, bpf_coro_xdp_dtor)
@@ -1229,6 +1284,9 @@ static int __init bpf_coro_init(void)
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_coro_park_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &bpf_coro_park_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_coro_park_kfunc_set);
+#ifdef CONFIG_NET
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_coro_xdp_kfunc_set);
+#endif
 	return ret ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
 }
 late_initcall(bpf_coro_init);
