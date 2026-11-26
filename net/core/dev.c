@@ -7546,7 +7546,6 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
 #ifdef CONFIG_BPF_SYSCALL
 static int napi_threaded_poll_once(struct napi_struct *napi, bool busy_poll,
 				   bool *repoll);
-static void napi_bpf_softirq_work(struct napi_struct *napi, int work);
 
 /* NAPI polled by a BPF kthread.
  *
@@ -7597,15 +7596,11 @@ static void napi_bpf_softirq_work(struct napi_struct *napi, int work);
  * for NAPI_BPF_STALL. The NAPI stays bound, polls of it fail with -ECANCELED,
  * and a new bind gives the scheduling back.
  *
- * The thread can also let go by itself. A queue that sees a packet now and
- * then is served more cheaply by softirq, in the interrupt's wake, than by a
- * thread that has to be woken and switched to for each of them, and the same
- * queue under load is better off with the thread. napi_bpf_suspend() leaves
- * the scheduling to softirq exactly as the watchdog does and
- * napi_bpf_resume() takes it back by setting NAPI_STATE_THREADED, both
- * without a lock, so a thread can go back and forth as the traffic changes.
- * For the thread to notice that it changed, softirq wakes it once it has
- * processed a number of packets the thread chose.
+ * Whether a schedule of a bound NAPI is for the thread at all is no setting of
+ * the binding. A queue that sees a packet now and then is served more cheaply
+ * by softirq, in the interrupt's wake, and the same queue under load is better
+ * off with the thread: an extension at the step where the NAPI is scheduled
+ * decides that for each schedule, see net/core/napi_bpf.c.
  *
  * The binding holds a reference on the thread's rcu_users, the count a task
  * kptr holds, so that the task is freed only after an RCU grace period has
@@ -7658,8 +7653,7 @@ static void napi_bpf_watchdog(struct timer_list *t)
 	unsigned long val = READ_ONCE(napi->state);
 
 	/* Unbound: a bind starts the timer again. It keeps running for a NAPI
-	 * whose scheduling is with softirq for now, so that giving it back
-	 * to the thread is a matter of one bit, see napi_bpf_resume().
+	 * whose scheduling it took away, until a new bind.
 	 */
 	if (!(val & NAPIF_STATE_BPF))
 		return;
@@ -7804,101 +7798,6 @@ int napi_bpf_poll(unsigned int napi_id, u64 flags)
 }
 
 /**
- * napi_bpf_suspend() - leave a bound NAPI to softirq for the time being
- * @napi_id: ID of the NAPI
- * @wake_after: wake the NAPI's thread after softirq has processed this many
- *	packets, 0 to never wake it
- *
- * A NAPI scheduled for its thread, a busy poll included, is passed on to
- * softirq, which completes it and lets the driver unmask the interrupt.
- * Softirq's count of packets is not exact: two CPUs may poll the NAPI in
- * turn faster than they update it.
- *
- * Return: 0 on success, also for a NAPI that is suspended already, whose
- * count starts anew, -ENOENT if no NAPI with this ID is bound.
- */
-int napi_bpf_suspend(unsigned int napi_id, u32 wake_after)
-{
-	struct napi_struct *napi;
-	int ret = -ENOENT;
-
-	rcu_read_lock();
-	napi = napi_by_id(napi_id);
-	if (napi && test_bit(NAPI_STATE_BPF, &napi->state)) {
-		/* Before softirq can poll on the thread's behalf. */
-		WRITE_ONCE(napi->bpf_wake_after, wake_after);
-		local_bh_disable();
-		if (napi_bpf_revoke(napi, NAPIF_STATE_THREADED))
-			ret = 0;
-		local_bh_enable();
-	}
-	rcu_read_unlock();
-	return ret;
-}
-
-/**
- * napi_bpf_resume() - give the scheduling of a bound NAPI back to its thread
- * @napi_id: ID of the NAPI
- *
- * Undoes napi_bpf_suspend(), and what the watchdog did to a NAPI that was not
- * polled. Takes effect at the NAPI's next schedule: softirq finishes what it
- * is doing with the NAPI.
- *
- * Return: 0 on success, also for a NAPI whose thread has the scheduling,
- * -ENOENT if no NAPI with this ID is bound.
- */
-int napi_bpf_resume(unsigned int napi_id)
-{
-	struct napi_struct *napi;
-	unsigned long new, val;
-	int ret = -ENOENT;
-
-	rcu_read_lock();
-	napi = napi_by_id(napi_id);
-	if (!napi)
-		goto out;
-
-	/* An unbind clears NAPI_STATE_BPF first, and this sets
-	 * NAPI_STATE_THREADED only beside it, so a NAPI on its way out is not
-	 * routed to a thread again.
-	 */
-	val = READ_ONCE(napi->state);
-	do {
-		if (!(val & NAPIF_STATE_BPF))
-			goto out;
-		new = val | NAPIF_STATE_THREADED;
-	} while (!try_cmpxchg(&napi->state, &val, new));
-	ret = 0;
-out:
-	rcu_read_unlock();
-	return ret;
-}
-
-/* Softirq processed @work packets of a NAPI that is bound but not scheduled
- * through its thread at the moment. Wake the thread when the packets it asked
- * to be woken after have passed, see napi_bpf_suspend().
- */
-static void napi_bpf_softirq_work(struct napi_struct *napi, int work)
-{
-	u32 left = READ_ONCE(napi->bpf_wake_after);
-	struct task_struct *thread;
-
-	if (!left)
-		return;
-	if (work < left) {
-		WRITE_ONCE(napi->bpf_wake_after, left - work);
-		return;
-	}
-	WRITE_ONCE(napi->bpf_wake_after, 0);
-
-	rcu_read_lock();
-	thread = READ_ONCE(napi->thread);
-	if (thread)
-		bpf_task_wake_direct(thread);
-	rcu_read_unlock();
-}
-
-/**
  * napi_bpf_bind_locked() - make a BPF kthread the thread that polls a NAPI
  * @napi: NAPI context
  * @task: the BPF kthread
@@ -7986,9 +7885,8 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 	thread = napi->thread;
 
 	/* NAPI_STATE_BPF goes with the scheduling, in one step: from here on
-	 * no poll claims the NAPI and nothing gives the scheduling back to the
-	 * thread, see napi_bpf_resume(). A NAPI that was scheduled for the
-	 * thread is polled by softirq on this CPU before this returns.
+	 * no poll claims the NAPI. A NAPI that was scheduled for the thread is
+	 * polled by softirq on this CPU before this returns.
 	 */
 	local_bh_disable();
 	napi_bpf_revoke(napi, NAPIF_STATE_THREADED | NAPIF_STATE_BPF);
@@ -8709,13 +8607,6 @@ static __always_inline int ____napi_poll(struct napi_struct *n, bool *repoll, co
 	if (unlikely(work > weight))
 		netdev_err_once(n->dev, "NAPI poll function %pS returned %d, exceeding its budget of %d.\n",
 				n->poll, work, weight);
-
-#ifdef CONFIG_BPF_SYSCALL
-	/* Bound to a BPF thread, but polled on its behalf. */
-	if (unlikely((READ_ONCE(n->state) & (NAPIF_STATE_BPF | NAPIF_STATE_THREADED)) ==
-		     NAPIF_STATE_BPF) && work)
-		napi_bpf_softirq_work(n, work);
-#endif
 
 	if (likely(work < weight))
 		return work;

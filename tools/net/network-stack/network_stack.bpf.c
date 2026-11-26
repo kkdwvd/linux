@@ -94,8 +94,13 @@ extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym;
 extern int bpf_napi_bind(__u32 napi_id, struct task_struct *task, __u64 flags) __ksym;
 extern int bpf_napi_unbind(__u32 napi_id) __ksym;
 extern int bpf_napi_poll(__u32 napi_id, __u64 flags) __ksym;
-extern int bpf_napi_suspend(__u32 napi_id, __u32 wake_after) __ksym;
-extern int bpf_napi_resume(__u32 napi_id) __ksym;
+/*
+ * Gone from kernels in which an extension has the step where a NAPI is scheduled, and
+ * chooses between softirq and the thread for each schedule: the NAPIs stay with their
+ * threads there.
+ */
+extern int bpf_napi_suspend(__u32 napi_id, __u32 wake_after) __ksym __weak;
+extern int bpf_napi_resume(__u32 napi_id) __ksym __weak;
 /* Only kernels with TCP xmit queues have these, and only --tx uses them. */
 extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __ksym __weak;
 extern int bpf_tcp_tx_unbind(__u32 queue) __ksym __weak;
@@ -336,6 +341,8 @@ static __always_inline void route(struct ns_thread *t, bool to_softirq)
 		slot = *(volatile __u32 *)&t->napi[k];
 		if (slot >= NS_MAX_NAPIS)
 			continue;
+		if (!bpf_ksym_exists(bpf_napi_suspend) || !bpf_ksym_exists(bpf_napi_resume))
+			break;
 		if (to_softirq)
 			bpf_napi_suspend(napis[slot].id, NS_SOFTIRQ_WAKE);
 		else

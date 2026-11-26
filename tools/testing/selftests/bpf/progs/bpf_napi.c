@@ -192,16 +192,3 @@ int poll_napi(struct napi_args *args)
 {
 	return bpf_napi_poll(args->napi_id, args->flags);
 }
-
-/* Leave args->napi_id to softirq, with a wake after args->flags packets. */
-SEC("syscall")
-int suspend_napi(struct napi_args *args)
-{
-	return bpf_napi_suspend(args->napi_id, args->flags);
-}
-
-SEC("syscall")
-int resume_napi(struct napi_args *args)
-{
-	return bpf_napi_resume(args->napi_id);
-}
