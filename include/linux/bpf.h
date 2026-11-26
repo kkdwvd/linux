@@ -1962,6 +1962,8 @@ struct bpf_prog_aux {
 	bool coro_parks;
 	/* the size classes of the frames that it allocates, see bpf_coro_frame_size() */
 	u16 coro_classes;
+	/* a function of a program: what the kernel resumes of a frame that it kept in its host */
+	bool coro_defer;
 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
 	bool dev_bound; /* Program is bound to the netdev. */
 	bool offload_requested; /* Program is bound and offloaded to the netdev. */

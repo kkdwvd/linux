@@ -17873,6 +17873,8 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	}
 	info->coro_cont = true;
 	info->coro_parked |= parked;
+	/* for a keeper that calls it with no pointer from the frame, see bpf_coro_defer_resume() */
+	info->coro_defer |= defer && !destroy;
 	/*
 	 * The kernel calls it like any callback: what is refused in one is, see
 	 * check_callbacks() and check_tail_calls(), and a stack in arena, see

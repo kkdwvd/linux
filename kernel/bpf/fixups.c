@@ -2820,6 +2820,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 
 		func[i]->aux->name[0] = 'F';
 		func[i]->aux->stack_depth = env->subprog_info[i].stack_depth;
+		func[i]->aux->coro_defer = env->subprog_info[i].coro_defer;
 		if (env->subprog_info[i].priv_stack_mode == PRIV_STACK_ADAPTIVE)
 			func[i]->aux->jits_use_priv_stack = true;
 

@@ -51,6 +51,8 @@ void bpf_coro_frames_stop(struct bpf_prog *prog);
 void bpf_coro_frames_free(struct bpf_prog *prog);
 struct bpf_prog *bpf_coro_frame_prog(void *frame);
 bool bpf_coro_run(void *frame);
+bool bpf_coro_run_bh(const struct bpf_prog *prog, void *frame);
+void *bpf_coro_defer_resume(const struct bpf_prog *prog);
 bool bpf_coro_is_parked_dtor(void (*dtor)(void *));
 void bpf_coro_prog_disown(struct bpf_prog *prog);
 void bpf_coro_prog_release(struct bpf_prog *prog);

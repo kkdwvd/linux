@@ -1876,6 +1876,8 @@ struct bpf_subprog_info {
 	bool is_async_cb: 1;
 	/* the resume or destroy function of a suspended coroutine, see push_coro_suspend() */
 	bool coro_cont: 1;
+	/* the resume function of a frame that a __coro_defer argument took */
+	bool coro_defer: 1;
 	/* of a parked frame, which a program calls: it has a time slice, see the fixups */
 	bool coro_parked: 1;
 	/* it has callx of a function of a parked coroutine frame, see check_coro_callx() */

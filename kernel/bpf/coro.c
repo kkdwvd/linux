@@ -1034,6 +1034,62 @@ bool bpf_coro_run(void *frame)
 }
 EXPORT_SYMBOL_GPL(bpf_coro_run);
 
+/**
+ * bpf_coro_run_bh - resume a frame from a place that is one for a program as it stands
+ * @prog: the program of the frame, which the caller holds
+ * @frame: the frame, which the kernel kept in its host, see __coro_defer
+ *
+ * bpf_coro_run() for a caller on a receive path, with bottom halves off: that is a read
+ * section of RCU on one CPU already, the program does not sleep, and the caller knows the
+ * program without asking the frame and does not nest. What is left of the bookkeeping is
+ * the time slice of a program that has loops for one, and the landing pad.
+ *
+ * Returns true when the continuation did not return, as bpf_coro_run() does.
+ */
+noinline bool bpf_coro_run_bh(const struct bpf_prog *prog, void *frame)
+{
+	bpf_callback_t resume = READ_ONCE(*(bpf_callback_t *)frame);
+	struct bpf_timed_may_goto saved;
+	bool unwound = false;
+	u64 ret, kind;
+
+	bpf_timed_may_goto_save(prog, &saved);
+	bpf_call_cb(resume, frame, 0, 0, 0, 0, ret, kind, left);
+	goto done;
+left:
+	unwound = true;
+	if (kind)
+		bpf_prog_unwound_to_kernel((unsigned long)resume);
+done:
+	bpf_timed_may_goto_restore(prog, &saved);
+	return unwound;
+}
+
+/**
+ * bpf_coro_defer_resume - the function that the kernel resumes of a program's deferred frames
+ * @prog: the program, loaded
+ *
+ * A keeper that has one program in a place knows what it will call there before any frame
+ * comes its way: the resume function of the suspensions into a __coro_defer argument, if
+ * the program has one such function, as a coroutine that a compiler lowered has. It can
+ * tell that function's frames from any other by their first slot, and call it without a
+ * question to the frame. Returns the address, NULL if there is none or more than one.
+ */
+void *bpf_coro_defer_resume(const struct bpf_prog *prog)
+{
+	void *resume = NULL;
+	u32 i;
+
+	for (i = 0; i < prog->aux->func_cnt; i++) {
+		if (!prog->aux->func[i]->aux->coro_defer)
+			continue;
+		if (resume)
+			return NULL;
+		resume = prog->aux->func[i]->bpf_func;
+	}
+	return resume;
+}
+
 /*
  * Parked frames.
  *

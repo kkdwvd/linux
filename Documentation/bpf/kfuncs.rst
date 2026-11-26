@@ -524,6 +524,11 @@ The frame holds no reference but its host. The kfunc's side can therefore
 end a frame that it does not resume by forgetting it, where it takes the
 host back, and never has to call the program for that.
 
+A keeper that has one program in one place can ask what it will resume
+before any frame comes its way, ``bpf_coro_defer_resume()``, and resume
+such frames with ``bpf_coro_run_bh()``, which does none of the bookkeeping
+that a caller with bottom halves off has no need of.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function
