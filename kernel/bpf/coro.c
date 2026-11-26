@@ -43,7 +43,7 @@ struct bpf_coro_frame_hdr {
 	u8 class;
 } __aligned(8);
 
-static_assert(sizeof(struct bpf_coro_frame_hdr) % sizeof(u64) == 0);
+static_assert(sizeof(struct bpf_coro_frame_hdr) == BPF_CORO_FRAME_HDR);
 
 static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
 {
@@ -138,7 +138,10 @@ static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
  * - It has the header: bpf_coro_frame_prog() and bpf_coro_drop() ask no question about where
  *   a frame is. So a program whose frames are all in hosts has a cache too, which is empty.
  *
- * The buffer of an XDP program is the one host so far, see bpf_coro_frame_alloc_xdp().
+ * A kfunc of a host returns the frame, takes the host in a __coro_host argument, and is
+ * registered with what such a host can lend, see bpf_coro_register_host(). The host is the
+ * program context, as the buffer of an XDP program is for bpf_coro_frame_alloc_xdp(), or a
+ * reference that the program holds.
  */
 #define BPF_CORO_CACHE_MIN	64
 #define BPF_CORO_CACHE_MAX	1024
@@ -587,6 +590,63 @@ u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size)
 	return class << 32 | size;
 }
 
+/* The kfuncs that give out a frame in their host, and the largest frame that such a host has */
+static struct {
+	u32 kfunc;
+	u32 room;
+} bpf_coro_hosts[4];
+static u32 bpf_coro_nr_hosts;
+
+/**
+ * bpf_coro_register_host - register a kfunc that gives out coroutine frames in a host
+ * @kfunc: the BTF id of the kfunc, one of vmlinux
+ * @room: the largest frame that a host of its kind can lend, behind the header
+ *
+ * The kfunc is KF_ACQUIRE | KF_RET_NULL and returns void *. It takes the size of the frame
+ * as a constant first, which the verifier checks against @room, and the host in an argument
+ * with the suffix __coro_host. It gets the frame from bpf_coro_frame_in(). While the kernel
+ * boots, from an initcall.
+ */
+int __init bpf_coro_register_host(u32 kfunc, u32 room)
+{
+	if (bpf_coro_nr_hosts == ARRAY_SIZE(bpf_coro_hosts))
+		return -ENOSPC;
+	bpf_coro_hosts[bpf_coro_nr_hosts].kfunc = kfunc;
+	bpf_coro_hosts[bpf_coro_nr_hosts++].room = round_down(room, sizeof(u64));
+	return 0;
+}
+
+/* How large a frame the kfunc of vmlinux with BTF id @kfunc gives. -ENOENT: it gives none. */
+int bpf_coro_host_room(u32 kfunc)
+{
+	u32 i;
+
+	for (i = 0; i < bpf_coro_nr_hosts; i++)
+		if (bpf_coro_hosts[i].kfunc == kfunc)
+			return bpf_coro_hosts[i].room;
+	return -ENOENT;
+}
+
+/**
+ * bpf_coro_frame_in - make memory of a host a coroutine frame
+ * @mem: the memory, aligned to 8 bytes: BPF_CORO_FRAME_HDR bytes and the frame behind them
+ * @aux: the program that asks
+ *
+ * Returns the frame. NULL for a program whose last reference is gone, which gets no frame,
+ * see bpf_coro_frames_stop(). Any context.
+ */
+void *bpf_coro_frame_in(void *mem, const struct bpf_prog_aux *aux)
+{
+	struct bpf_coro_frame_cache __percpu *cache = READ_ONCE(aux->coro_cache);
+	struct bpf_coro_frame_hdr *hdr = mem;
+
+	if (unlikely(cache == &bpf_coro_no_frames))
+		return NULL;
+	hdr->cache = cache;
+	hdr->class = 0;
+	return hdr + 1;
+}
+
 /**
  * bpf_coro_frames_hosted - note that a program has frames in hosts
  * @aux: the program, in the verifier
@@ -841,8 +901,8 @@ EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
 #ifdef CONFIG_NET
 /**
  * bpf_coro_frame_alloc_xdp - a coroutine frame in the headroom of the packet
- * @size__k: the size of the frame, which the verifier checked against bpf_coro_frame_xdp_max()
- * @ctx: the context of the XDP program
+ * @size__k: the size of the frame, which the verifier checked against what the kfunc has
+ * @ctx__coro_host: the context of the XDP program
  * @aux: the program
  *
  * The buffer of the packet is the host of the frame, see "Hosts" above and
@@ -854,33 +914,22 @@ EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
  *
  * Returns the frame, or NULL: the buffer cannot lend that much or has lent already, see
  * xdp_buff_lend_headroom(), or the last reference of the program is gone, see
- * bpf_coro_frames_stop().
+ * bpf_coro_frame_in(). A program that asks at the end of its life has lent the headroom for
+ * nothing.
  */
-__bpf_kfunc void *bpf_coro_frame_alloc_xdp(u64 size__k, struct xdp_md *ctx,
+__bpf_kfunc void *bpf_coro_frame_alloc_xdp(u64 size__k, struct xdp_md *ctx__coro_host,
 					   struct bpf_prog_aux *aux)
 {
-	struct bpf_coro_frame_cache __percpu *cache = READ_ONCE(aux->coro_cache);
-	struct bpf_coro_frame_hdr *hdr;
+	void *mem;
 
-	if (unlikely(cache == &bpf_coro_no_frames))
-		return NULL;
-	hdr = xdp_buff_lend_headroom((struct xdp_buff *)ctx, sizeof(*hdr) + size__k);
-	if (unlikely(!hdr))
-		return NULL;
-	hdr->cache = cache;
-	hdr->class = 0;
-	return hdr + 1;
+	mem = xdp_buff_lend_headroom((struct xdp_buff *)ctx__coro_host,
+				     BPF_CORO_FRAME_HDR + size__k);
+	return likely(mem) ? bpf_coro_frame_in(mem, aux) : NULL;
 }
 #endif
 
 __bpf_kfunc_end_defs();
 
-/* The largest frame that fits in the headroom which every driver gives, for the verifier */
-u32 bpf_coro_frame_xdp_max(void)
-{
-	return round_down(XDP_PACKET_HEADROOM - sizeof(struct xdp_frame) -
-			  sizeof(struct bpf_coro_frame_hdr), sizeof(u64));
-}
 
 /*
  * The program of @frame, for the kfunc that keeps the frame: it holds the program for as long as
@@ -1261,6 +1310,8 @@ static const struct btf_kfunc_id_set bpf_coro_xdp_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set = &bpf_coro_xdp_kfunc_ids,
 };
+
+BTF_ID_LIST_SINGLE(bpf_coro_xdp_host_id, func, bpf_coro_frame_alloc_xdp)
 #endif
 
 BTF_ID_LIST(bpf_coro_dtor_ids)
@@ -1286,6 +1337,10 @@ static int __init bpf_coro_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &bpf_coro_park_kfunc_set);
 #ifdef CONFIG_NET
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_coro_xdp_kfunc_set);
+	/* what the headroom that every driver gives holds behind the room for struct xdp_frame */
+	ret = ret ?: bpf_coro_register_host(bpf_coro_xdp_host_id[0],
+					    XDP_PACKET_HEADROOM - sizeof(struct xdp_frame) -
+					    BPF_CORO_FRAME_HDR);
 #endif
 	return ret ?: register_btf_id_dtor_kfuncs(dtors, ARRAY_SIZE(dtors), THIS_MODULE);
 }

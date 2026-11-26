@@ -59,7 +59,7 @@ int frame_largest(struct xdp_md *ctx)
 
 SEC("xdp")
 __description("coro_frame in a packet: one byte more does not load")
-__failure __msg("coro_frame of 193 bytes does not fit in the headroom of a packet, which lends 192")
+__failure __msg("coro_frame of 193 bytes does not fit in its host: bpf_coro_frame_alloc_xdp() has 192")
 int frame_too_large(struct xdp_md *ctx)
 {
 	__u64 *f = bpf_coro_frame_alloc_xdp(193, ctx);

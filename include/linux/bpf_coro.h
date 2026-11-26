@@ -36,11 +36,16 @@
 struct bpf_prog;
 struct bpf_prog_aux;
 
+/* What a coroutine frame has in front of it, see struct bpf_coro_frame_hdr in kernel/bpf/coro.c */
+#define BPF_CORO_FRAME_HDR	24
+
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_coro_frame_free(void *frame);
 u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size);
 void bpf_coro_frames_hosted(struct bpf_prog_aux *aux);
-u32 bpf_coro_frame_xdp_max(void);
+int bpf_coro_register_host(u32 kfunc, u32 room);
+int bpf_coro_host_room(u32 kfunc);
+void *bpf_coro_frame_in(void *mem, const struct bpf_prog_aux *aux);
 int bpf_coro_frames_init(struct bpf_prog *prog);
 void bpf_coro_frames_stop(struct bpf_prog *prog);
 void bpf_coro_frames_free(struct bpf_prog *prog);

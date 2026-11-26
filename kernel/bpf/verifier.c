@@ -15768,7 +15768,6 @@ enum special_kfunc_type {
 	KF_bpf_coro_frame_alloc,
 	KF_bpf_coro_park_xdp,
 	KF_bpf_coro_park_syscall,
-	KF_bpf_coro_frame_alloc_xdp,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -15877,11 +15876,6 @@ BTF_ID_UNUSED
 BTF_ID(func, bpf_coro_frame_alloc)
 BTF_ID(func, bpf_coro_park_xdp)
 BTF_ID(func, bpf_coro_park_syscall)
-#ifdef CONFIG_NET
-BTF_ID(func, bpf_coro_frame_alloc_xdp)
-#else
-BTF_ID_UNUSED
-#endif
 
 /* What bpf_coro_park_xdp() and bpf_coro_park_syscall() return */
 BTF_ID_LIST(coro_handle_ids)
@@ -15889,13 +15883,50 @@ BTF_ID(struct, bpf_coro_xdp)
 BTF_ID(struct, bpf_coro_syscall)
 
 /*
- * Does the kfunc return a coroutine frame? From the cache of the program, or in memory of
- * the host that the kfunc is of, see "Hosts" in kernel/bpf/coro.c.
+ * The largest coroutine frame that the kfunc gives in memory of its host, see "Hosts" in
+ * kernel/bpf/coro.c. -ENOENT: it is no kfunc of a host.
  */
+static int coro_host_room(const struct bpf_call_arg_meta *meta)
+{
+	return meta->btf == btf_vmlinux ? bpf_coro_host_room(meta->func_id) : -ENOENT;
+}
+
+/* Does the kfunc return a coroutine frame? From the cache of the program, or in a host. */
 static bool is_coro_frame_alloc_kfunc(const struct bpf_call_arg_meta *meta)
 {
 	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc]) ||
-	       is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp]);
+	       coro_host_room(meta) >= 0;
+}
+
+/*
+ * The host of the frame that the kfunc returns: the argument with the suffix __coro_host. It
+ * is the program context, *@id 0, or a reference that the program holds, whose id goes to
+ * *@id: the frame is there for as long as the program has that, see REF_TYPE_HOSTED. The
+ * arguments in front of it take a register each.
+ */
+static int coro_frame_host(struct bpf_verifier_env *env, const struct bpf_call_arg_meta *meta,
+			   int *id)
+{
+	const struct btf_param *args = btf_params(meta->func_proto);
+	u32 i, nargs = btf_type_vlen(meta->func_proto);
+	struct bpf_reg_state *reg;
+
+	for (i = 0; i < nargs && i < MAX_BPF_FUNC_REG_ARGS; i++) {
+		if (!btf_param_match_suffix(meta->btf, &args[i], "__coro_host"))
+			continue;
+		reg = &cur_regs(env)[BPF_REG_1 + i];
+		*id = 0;
+		if (reg->type == PTR_TO_CTX)
+			return 0;
+		*id = reg->id;
+		if (reg_is_referenced(env, reg))
+			return 0;
+		verbose(env, "R%d is to host a coro_frame of %s() and is neither the program context nor a reference of the program\n",
+			BPF_REG_1 + i, meta->func_name);
+		return -EINVAL;
+	}
+	verifier_bug(env, "kfunc %s gives a coro_frame and names no host", meta->func_name);
+	return -EFAULT;
 }
 
 /*
@@ -17606,14 +17637,14 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
 			return -EINVAL;
 		}
-		if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp])) {
+		if (coro_host_room(meta) >= 0) {
 			/*
-			 * The frame is in the headroom of the packet or there is none: a program
-			 * that asks for more than a buffer can lend asks in vain on every run.
+			 * The frame is in its host or there is none: a program that asks for
+			 * more than such a host can lend asks in vain on every run.
 			 */
-			if (size > bpf_coro_frame_xdp_max()) {
-				verbose(env, "coro_frame of %llu bytes does not fit in the headroom of a packet, which lends %u\n",
-					size, bpf_coro_frame_xdp_max());
+			if (size > coro_host_room(meta)) {
+				verbose(env, "coro_frame of %llu bytes does not fit in its host: %s() has %d\n",
+					size, meta->func_name, coro_host_room(meta));
 				return -EINVAL;
 			}
 			bpf_coro_frames_hosted(env->prog->aux);
@@ -18026,6 +18057,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
+	bool hosted = false;
+	int host_id = 0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_call_arg_meta meta;
@@ -18304,6 +18337,14 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			env, insn_idx, func_name, BPF_DIAG_CONTEXT_RCU,
 			"Call this kfunc between bpf_rcu_read_lock() and bpf_rcu_read_unlock(), keeping all exit paths balanced.");
 		return -EACCES;
+	}
+
+	/* while the arguments are in their registers */
+	hosted = coro_host_room(&meta) >= 0;
+	if (hosted) {
+		err = coro_frame_host(env, &meta, &host_id);
+		if (err)
+			return err;
 	}
 
 	/* In case of release function, we get register number of refcounted
@@ -18625,12 +18666,16 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			 */
 			if (is_kfunc_release_ctx(&meta))
 				move_hosted_frames(env->cur_state, 0, id);
-			/* in memory of the context: no resource, see REF_TYPE_HOSTED */
-			if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_coro_frame_alloc_xdp]))
-				env->cur_state->refs[env->cur_state->acquired_refs - 1].type =
-					REF_TYPE_HOSTED;
-			else
+			/* in memory of its host: no resource, see REF_TYPE_HOSTED */
+			if (hosted) {
+				struct bpf_reference_state *ref;
+
+				ref = &env->cur_state->refs[env->cur_state->acquired_refs - 1];
+				ref->type = REF_TYPE_HOSTED;
+				ref->parent_id = host_id;
+			} else {
 				bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
+			}
 			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
 				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
 				if (err)

@@ -418,6 +418,18 @@ time against what such a host can lend at all, 192 bytes for a packet, and
 at run time the host may have less, or none. There is no fallback: the
 request that gets no frame ends.
 
+A kfunc gives out such frames once it is registered with
+``bpf_coro_register_host()``, with the largest frame that a host of its kind
+lends. It is ``KF_ACQUIRE | KF_RET_NULL``, returns ``void *``, takes the
+constant size first and its host in an argument with the suffix
+``__coro_host``: the program context, or a reference that the program
+holds, in which case the frame ends where that reference goes. It makes the
+memory that it found a frame with ``bpf_coro_frame_in()``::
+
+        __bpf_kfunc void *bpf_coro_frame_alloc_napi(u64 size__k,
+                                                    struct napi_struct *napi__coro_host,
+                                                    struct bpf_prog_aux *aux)
+
 2.3.11 __coro_suspend Annotation
 --------------------------------
 
