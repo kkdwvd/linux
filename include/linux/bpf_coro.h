@@ -39,6 +39,7 @@ struct bpf_prog_aux;
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_coro_frame_free(void *frame);
 u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size);
+void bpf_coro_frames_hosted(struct bpf_prog_aux *aux);
 int bpf_coro_frames_init(struct bpf_prog *prog);
 void bpf_coro_frames_stop(struct bpf_prog *prog);
 void bpf_coro_frames_free(struct bpf_prog *prog);

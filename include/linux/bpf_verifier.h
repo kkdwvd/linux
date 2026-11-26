@@ -371,6 +371,16 @@ struct bpf_reference_state {
 		REF_TYPE_LOCK		= (1 << 3),
 		REF_TYPE_RES_LOCK 	= (1 << 4),
 		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
+		/*
+		 * A coroutine frame in memory that its host lends, see "Hosts" in
+		 * kernel/bpf/coro.c. It has slots like any frame, and it is no resource: no call
+		 * releases it, no landing pad has an entry for it, and it is no leak. It is there
+		 * for as long as the program has the host. That is the program context where
+		 * 'parent_id' is 0, and the frame ends with the invocation. Else it is the
+		 * reference 'parent_id', and the frame ends where that goes, with every pointer
+		 * to it, see invalidate_reference().
+		 */
+		REF_TYPE_HOSTED		= (1 << 6),
 		REF_TYPE_LOCK_MASK	= REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
 	} type;
 	/* Track each reference created with a unique id, even if the same
@@ -396,7 +406,10 @@ struct bpf_reference_state {
 	 */
 	u8 saved;
 	union {
-		/* For REF_TYPE_PTR. Compared and hashed, see same_refs(): no holes. */
+		/*
+		 * For REF_TYPE_PTR, and 'parent_id' for REF_TYPE_HOSTED. Compared and hashed,
+		 * see same_refs(): no holes.
+		 */
 		struct {
 			int parent_id;
 			u16 ctx_arg;	/* it came with that __ref argument, the first is 1 */

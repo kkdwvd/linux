@@ -1765,6 +1765,42 @@ static bool reg_is_referenced(struct bpf_verifier_env *env, const struct bpf_reg
 	return find_reference_state(env->cur_state, reg->id);
 }
 
+/* The coroutine frame in memory of a host that @id is, see REF_TYPE_HOSTED. NULL: it is none. */
+static struct bpf_reference_state *find_hosted_frame(struct bpf_verifier_state *state, int id)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].id == id)
+			return &state->refs[i];
+	return NULL;
+}
+
+/* Is a coroutine frame in memory of @id, where 0 is the program context? */
+static bool hosts_frames(const struct bpf_verifier_state *state, int id)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].parent_id == id)
+			return true;
+	return false;
+}
+
+/*
+ * The frames that @from hosts are hosted by @to from now on, where 0 is the program context:
+ * a kfunc made the context a reference of the program, or the reference turned out to be
+ * NULL and the context is what the program still has.
+ */
+static void move_hosted_frames(struct bpf_verifier_state *state, int from, int to)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].parent_id == from)
+			state->refs[i].parent_id = to;
+}
+
 static u32 reg_lifetime_id(struct bpf_verifier_env *env,
 			   const struct bpf_reg_state *reg)
 {
@@ -10362,6 +10398,10 @@ static int check_func_arg_release(struct bpf_verifier_env *env, struct bpf_reg_s
 	if (arg_type_is_dynptr(arg_type) || reg_is_referenced(env, reg) ||
 	    bpf_register_is_null(reg))
 		return 0;
+	/* no reference of the program, but what takes the frame is asked whether it may */
+	if (base_type(arg_type) == ARG_PTR_TO_CORO_FRAME &&
+	    find_hosted_frame(env->cur_state, reg->id))
+		return 0;
 
 	verbose(env, "release function %s expects referenced PTR_TO_BTF_ID passed to %s\n",
 		meta->func_name, reg_arg_name(env, argno));
@@ -10767,7 +10807,20 @@ static enum bpf_access_type func_arg_access_type(enum bpf_arg_type arg_type)
 static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 				     u32 arg, argno_t argno, struct bpf_call_arg_meta *meta)
 {
+	bool suspend = meta->func_proto && arg < btf_type_vlen(meta->func_proto) &&
+		       is_kfunc_arg_coro_suspend(meta->btf, &btf_params(meta->func_proto)[arg]);
 	u32 i;
+
+	/*
+	 * A frame in memory of a host is not freed, and nothing takes it without the host: it
+	 * goes where the host goes. It is suspended with the host in it, see
+	 * push_coro_suspend().
+	 */
+	if (!suspend && find_hosted_frame(env->cur_state, reg->id)) {
+		verbose(env, "%s is a coro_frame in memory of its host: it goes with the host, and nothing else frees or takes it\n",
+			reg_arg_name(env, argno));
+		return -EINVAL;
+	}
 
 	/* An explicit KF_RELEASE on this argument must not release it twice. */
 	if (meta->release_regno == reg_from_argno(argno))
@@ -10780,8 +10833,7 @@ static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_re
 			goto duplicate;
 	}
 
-	if (meta->func_proto && arg < btf_type_vlen(meta->func_proto) &&
-	    is_kfunc_arg_coro_suspend(meta->btf, &btf_params(meta->func_proto)[arg]))
+	if (suspend)
 		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
 	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
 	return 0;
@@ -12208,6 +12260,19 @@ static int invalidate_reference(struct bpf_verifier_env *env, int id)
 		 * any child references that exist at this point are a leak.
 		 */
 		for (i = 0; i < vstate->acquired_refs; i++) {
+			/*
+			 * A coroutine frame in the memory of what goes ends here: its slots
+			 * are gone with it, and what points to it is invalid like what
+			 * points to the host.
+			 */
+			if (vstate->refs[i].type == REF_TYPE_HOSTED &&
+			    vstate->refs[i].parent_id == id) {
+				err = idstack_push(idstack, vstate->refs[i].id);
+				if (err)
+					return err;
+				release_reference_state(vstate, i--);
+				continue;
+			}
 			if (vstate->refs[i].type != REF_TYPE_PTR)
 				continue;
 			if (vstate->refs[i].parent_id != id)
@@ -14003,9 +14068,13 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			return -EACCES;
 		}
 
-		/* It's called any number of times: what it takes it has to release. */
+		/*
+		 * It's called any number of times: what it takes it has to release. A frame
+		 * in memory of a host has no release.
+		 */
 		for (i = callee->entry_refs; i < state->acquired_refs; i++) {
-			if (state->refs[i].type != REF_TYPE_PTR)
+			if (state->refs[i].type != REF_TYPE_PTR &&
+			    state->refs[i].type != REF_TYPE_HOSTED)
 				continue;
 			verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 				state->refs[i].id, state->refs[i].insn_idx);
@@ -17614,7 +17683,7 @@ static struct bpf_reference_state *coro_add_ref(struct bpf_verifier_state *st,
 	st->refs[n].insn_idx = src->insn_idx;
 	st->refs[n].origin = src->origin;
 	st->refs[n].diag_id = src->diag_id;
-	st->refs[n].type = REF_TYPE_PTR;
+	st->refs[n].type = src->type;
 	st->refs[n].id = src->id;
 	st->refs[n].parent_id = src->parent_id;
 	return &st->refs[n];
@@ -17847,6 +17916,27 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 	}
 
 	/*
+	 * A frame in memory of a host is there for as long as the program has the host. The
+	 * program context is gone when the invocation ends. A reference goes with the frame if
+	 * it is in the frame: the continuation has it then, and where it gives the reference
+	 * up the frame ends, see invalidate_reference(). That is how the destroy function of
+	 * such a frame ends too, whoever calls it.
+	 */
+	if (frame->type == REF_TYPE_HOSTED) {
+		if (!frame->parent_id) {
+			verbose(env, "suspended coro_frame is in memory of the program context, which the program has to keep first\n");
+			return -EINVAL;
+		}
+		for (j = 0; j < nr_moved && moved[j] != frame->parent_id; j++)
+			;
+		if (j == nr_moved) {
+			verbose(env, "suspended coro_frame is in memory of reference id=%d, which is in none of its slots\n",
+				frame->parent_id);
+			return -EINVAL;
+		}
+	}
+
+	/*
 	 * A parked frame is called by a program that holds it, see check_coro_callx(), or
 	 * destroyed by the kernel when nothing does, see bpf_coro_drop(): it needs both functions.
 	 * Whoever calls them is in a read section of RCU. The continuation is verified as code
@@ -17888,7 +17978,8 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id)
 
 	/*
 	 * The continuation owns the references now; every copy outside the
-	 * frame goes invalid. The frame itself is released by the caller.
+	 * frame goes invalid. The frame itself is released by the caller, if
+	 * it has not gone with its host here.
 	 */
 	for (i = 0; i < nr_moved; i++) {
 		err = release_reference(env, moved[i]);
@@ -18198,6 +18289,15 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				func_name);
 			return -EINVAL;
 		}
+		/*
+		 * A kfunc that returns the context as a reference of the program takes the
+		 * frames along, see below. With any other the memory would be gone under them.
+		 */
+		if (!is_kfunc_acquire(&meta) && hosts_frames(env->cur_state, 0)) {
+			verbose(env, "kfunc %s consumes the program context, which has a coro_frame in its memory\n",
+				func_name);
+			return -EINVAL;
+		}
 		consume_ctx(env);
 	}
 
@@ -18486,6 +18586,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			/*
+			 * The context is what the kfunc returns now, with the frames that it
+			 * hosts: they go where that reference goes. Unless it is NULL, see
+			 * mark_ptr_or_null_regs().
+			 */
+			if (is_kfunc_release_ctx(&meta))
+				move_hosted_frames(env->cur_state, 0, id);
 			bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
 				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
@@ -21280,14 +21387,25 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
 
 	if (is_null && find_reference_state(vstate, id)) {
 		ref = ref_of_caller(vstate, id);
-		if (ref)
+		if (ref) {
 			ref->found_null = true;
-		else
+		} else {
+			/*
+			 * The kfunc that was to make the program context a reference of the
+			 * program did not: the context is what hosts its frames still.
+			 */
+			move_hosted_frames(vstate, id, 0);
 			/* regs[regno] is in the " == NULL" branch.
 			 * No one could have freed the reference state before
 			 * doing the NULL check.
 			 */
 			WARN_ON_ONCE(__release_reference_nomark(vstate, id));
+		}
+	} else if (is_null) {
+		/* the host lent nothing: there is no frame */
+		ref = find_hosted_frame(vstate, id);
+		if (ref)
+			release_reference_state(vstate, ref - vstate->refs);
 	}
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
@@ -24014,12 +24132,17 @@ static int release_frame_resources(struct bpf_verifier_env *env, const struct bp
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
-		if (ref->type == REF_TYPE_PTR)
+		if (ref->type == REF_TYPE_PTR) {
 			err = release_reference(env, ref->id);
-		else if (ref->type == REF_TYPE_IRQ)
+		} else if (ref->type == REF_TYPE_HOSTED) {
+			/* the pad has no call for it: the frame that held it is left */
+			release_reference_state(st, st->acquired_refs - 1);
+			err = invalidate_reference(env, id);
+		} else if (ref->type == REF_TYPE_IRQ) {
 			err = release_irq_state(env, ref->id);
-		else
+		} else {
 			err = release_lock_state(env, ref->type, ref->id, ref->ptr);
+		}
 		if (verifier_bug_if(err, env, "the youngest of refs[] cannot be released"))
 			return -EFAULT;
 		unmark_stack_obj(env, id);

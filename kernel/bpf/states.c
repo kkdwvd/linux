@@ -89,7 +89,7 @@ int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 	map->cnt = 0;
 	for (i = 0; i < st->acquired_refs && i < BPF_ID_MAP_SIZE; i++) {
 		renumber_id(env, &st->refs[i].id, BPF_REF_ID(2 * i));
-		if (st->refs[i].type == REF_TYPE_PTR)
+		if (st->refs[i].type == REF_TYPE_PTR || st->refs[i].type == REF_TYPE_HOSTED)
 			renumber_id(env, &st->refs[i].parent_id, BPF_REF_ID(2 * i + 1));
 	}
 	/* they are among these */

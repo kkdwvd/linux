@@ -38,7 +38,7 @@ struct bpf_coro_frame_hdr {
 	 * beside the cache, see bpf_coro_frame_free_slow().
 	 */
 	struct llist_node drop;
-	/* its size class there */
+	/* its size class there. 0: none, the memory is that of a host, see "Hosts" below */
 	u8 class;
 } __aligned(8);
 
@@ -116,6 +116,26 @@ static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
  * from the allocator, and for as long as it is there, in use or in the cache. They all go back
  * when the program is freed, see bpf_coro_frames_free(). A CPU that goes offline keeps what it
  * has until then, or until it is back.
+ */
+/*
+ * Hosts.
+ *
+ * A request that arrives in an object of the kernel, a packet in its buffer, can have its
+ * frame there: the object is the HOST of the frame and lends it memory. Such a frame costs no
+ * allocation and no free, and is in the cache lines that the request has brought in. It has
+ * no life of its own:
+ * - It is allocated by a kfunc of the host, which takes the size that the verifier checked
+ *   against what such a host can lend, and gives a frame in the host or none. Never one from
+ *   the cache: a coroutine is compiled for one kind of frame, and where its host has no
+ *   room the request has none and ends there.
+ * - Nothing frees it. It is there for as long as the program has the host, and the verifier
+ *   ends it where the host goes, see REF_TYPE_HOSTED in bpf_verifier.h: whatever takes the
+ *   host from the program takes the frame. bpf_coro_frame_free() does nothing for it.
+ * - It is suspended only with its host in it: the continuation has the host to give up, and
+ *   that is the end of the frame, also where the kernel destroys a parked frame for the
+ *   program.
+ * - It has the header: bpf_coro_frame_prog() and bpf_coro_drop() ask no question about where
+ *   a frame is. So a program whose frames are all in hosts has a cache too, which is empty.
  */
 #define BPF_CORO_CACHE_MIN	64
 #define BPF_CORO_CACHE_MAX	1024
@@ -565,6 +585,18 @@ u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size)
 }
 
 /**
+ * bpf_coro_frames_hosted - note that a program has frames in hosts
+ * @aux: the program, in the verifier
+ *
+ * They are of no class, and the program has a cache for their headers to name, see "Hosts"
+ * above.
+ */
+void bpf_coro_frames_hosted(struct bpf_prog_aux *aux)
+{
+	aux->coro_classes |= BIT(0);
+}
+
+/**
  * bpf_coro_frames_init - give a program that allocates frames its cache
  * @prog: the program, which passed the verifier
  *
@@ -593,7 +625,9 @@ int bpf_coro_frames_init(struct bpf_prog *prog)
 
 		cache->owner = owner;
 		init_irq_work(&cache->tend, bpf_coro_frame_cache_tend);
-		for_each_set_bit(class, &classes, BPF_CORO_FRAME_CLASSES) {
+		/* class 0 keeps nothing, see bpf_coro_frames_hosted() */
+		class = 1;
+		for_each_set_bit_from(class, &classes, BPF_CORO_FRAME_CLASSES) {
 			struct bpf_coro_frame_class *c = &cache->class[class];
 
 			c->frames = kmalloc_array_node(BPF_CORO_CACHE_MIN, sizeof(*c->frames),
@@ -716,13 +750,22 @@ static noinline void *bpf_coro_frame_alloc_slow(struct bpf_prog_aux *aux, u64 si
 /*
  * A free that found no room in the cache, or an interrupt came over the code that has the
  * class: the frame waits on the list, which the CPU takes in when it has no frame left, and
- * which the irq_work looks at when it is long. Preemption as above.
+ * which the irq_work looks at when it is long. Class 0 never has room. Preemption as above.
  */
 static noinline void bpf_coro_frame_free_slow(struct bpf_coro_frame_hdr *hdr,
 					      struct bpf_coro_frame_class *c)
 {
 	struct bpf_coro_frame_cache *cache = this_cpu_ptr(hdr->cache);
 
+	/*
+	 * The memory is that of a host, and goes where the host goes. No program frees such a
+	 * frame. A kfunc that kept one does where it cannot resume it, and what the frame
+	 * holds is not released then, see bpf_coro.h: the host is among that.
+	 */
+	if (!hdr->class) {
+		preempt_enable();
+		return;
+	}
 	llist_add(&hdr->drop, &c->more);
 	if (atomic_inc_return(&c->more_nr) > bpf_coro_frame_class_batch(c))
 		irq_work_queue(&cache->tend);
@@ -793,6 +836,7 @@ __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
 EXPORT_SYMBOL_GPL(bpf_coro_frame_free);
 
 __bpf_kfunc_end_defs();
+
 
 /*
  * The program of @frame, for the kfunc that keeps the frame: it holds the program for as long as
