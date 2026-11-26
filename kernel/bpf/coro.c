@@ -142,6 +142,9 @@ static struct bpf_coro_frame_hdr *bpf_coro_frame_hdr(void *frame)
  * registered with what such a host can lend, see bpf_coro_register_host(). The host is the
  * program context, as the buffer of an XDP program is for bpf_coro_frame_alloc_xdp(), or a
  * reference that the program holds.
+ *
+ * A host with no room to spare lends a bare frame, see bpf_coro_register_bare_host(): no
+ * header, nothing written where the frame starts, and only the keeper of the host resumes it.
  */
 #define BPF_CORO_CACHE_MIN	64
 #define BPF_CORO_CACHE_MAX	1024
@@ -594,6 +597,7 @@ u64 bpf_coro_frame_size(struct bpf_prog_aux *aux, u64 size)
 static struct {
 	u32 kfunc;
 	u32 room;
+	bool bare;	/* no header in front of the frame, see bpf_coro_register_bare_host() */
 } bpf_coro_hosts[4];
 static u32 bpf_coro_nr_hosts;
 
@@ -616,6 +620,26 @@ int __init bpf_coro_register_host(u32 kfunc, u32 room)
 	return 0;
 }
 
+/**
+ * bpf_coro_register_bare_host - register a kfunc that gives out bare frames in a host
+ * @kfunc: the BTF id of the kfunc, one of vmlinux
+ * @room: the largest frame that a host of its kind can lend
+ *
+ * As bpf_coro_register_host(), for a host that has no room to spare: the frame has no header
+ * and the kfunc writes nothing, it returns the memory. Nothing can ask such a frame for its
+ * program, so bpf_coro_run() cannot resume it. Its keeper, a kfunc with a __coro_defer
+ * argument that the host's subsystem has, knows the program by where it is attached and
+ * resumes with bpf_coro_run_bh(). The verifier lets the frame go nowhere else.
+ */
+int __init bpf_coro_register_bare_host(u32 kfunc, u32 room)
+{
+	int ret = bpf_coro_register_host(kfunc, room);
+
+	if (!ret)
+		bpf_coro_hosts[bpf_coro_nr_hosts - 1].bare = true;
+	return ret;
+}
+
 /* How large a frame the kfunc of vmlinux with BTF id @kfunc gives. -ENOENT: it gives none. */
 int bpf_coro_host_room(u32 kfunc)
 {
@@ -625,6 +649,17 @@ int bpf_coro_host_room(u32 kfunc)
 		if (bpf_coro_hosts[i].kfunc == kfunc)
 			return bpf_coro_hosts[i].room;
 	return -ENOENT;
+}
+
+/* Are the frames that the kfunc of vmlinux with BTF id @kfunc gives bare? */
+bool bpf_coro_host_bare(u32 kfunc)
+{
+	u32 i;
+
+	for (i = 0; i < bpf_coro_nr_hosts; i++)
+		if (bpf_coro_hosts[i].kfunc == kfunc)
+			return bpf_coro_hosts[i].bare;
+	return false;
 }
 
 /**

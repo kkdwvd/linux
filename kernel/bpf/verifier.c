@@ -17936,6 +17936,19 @@ static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int s
 	return 0;
 }
 
+/*
+ * Is @frame a bare one, see bpf_coro_register_bare_host()? The kfunc that gave it out tells,
+ * and a reference keeps the insn that acquired it.
+ */
+static bool coro_frame_is_bare(struct bpf_verifier_env *env,
+			       const struct bpf_reference_state *frame)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[frame->insn_idx];
+
+	return frame->type == REF_TYPE_HOSTED && bpf_pseudo_kfunc_call(insn) && !insn->off &&
+	       bpf_coro_host_bare(insn->imm);
+}
+
 static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id, bool defer)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
@@ -17957,6 +17970,11 @@ static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id,
 	}
 	if (defer && frame->type != REF_TYPE_HOSTED) {
 		verbose(env, "deferred coro_frame is not in memory of a host for the kernel to keep it in\n");
+		return -EINVAL;
+	}
+	/* nothing in front of it says whose it is: bpf_coro_run() cannot resume it */
+	if (!defer && coro_frame_is_bare(env, frame)) {
+		verbose(env, "suspended coro_frame is a bare one of its host, which only the keeper of the host resumes\n");
 		return -EINVAL;
 	}
 	/* one function: only that one is verified from the snapshot, see mark_reg_func_set() */

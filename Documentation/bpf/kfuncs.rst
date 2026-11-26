@@ -529,6 +529,12 @@ before any frame comes its way, ``bpf_coro_defer_resume()``, and resume
 such frames with ``bpf_coro_run_bh()``, which does none of the bookkeeping
 that a caller with bottom halves off has no need of.
 
+A host that has no room for the header of a frame registers its kfunc with
+``bpf_coro_register_bare_host()`` and returns the memory as it is. Nothing
+can ask a bare frame for its program, so no ``__coro_suspend`` kfunc takes
+one: only a ``__coro_defer`` kfunc of the host's subsystem does, which knows
+the program by where it is attached.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function
