@@ -5819,6 +5819,25 @@ bad_dev:
 	return NET_RX_DROP;
 }
 
+/*
+ * enqueue_to_backlog() for the extension on a packet's path, see net/core/napi_bpf.c: a queue
+ * that is full, or a device that is down, leaves @skb to the caller, and nothing is dropped
+ * or counted. Returns false then. The look at the queue is one without its lock, as the
+ * kernel's first one is: a queue that fills in that instant, and the limit on a flow where one
+ * is set, drop the packet as they do of the kernel, and the packet was taken.
+ */
+bool backlog_enqueue(struct sk_buff *skb, int cpu)
+{
+	struct softnet_data *sd = &per_cpu(softnet_data, cpu);
+	unsigned int qtail;
+
+	if (skb_queue_len_lockless(&sd->input_pkt_queue) > READ_ONCE(net_hotdata.max_backlog) ||
+	    !netif_running(skb->dev))
+		return false;
+	enqueue_to_backlog(skb, cpu, &qtail);
+	return true;
+}
+
 static struct netdev_rx_queue *netif_get_rxqueue(struct sk_buff *skb)
 {
 	struct net_device *dev = skb->dev;
@@ -6730,6 +6749,11 @@ static int __netif_receive_skb(struct sk_buff *skb)
 	return ret;
 }
 
+int rx_ext_netif_receive_skb(struct sk_buff *skb)
+{
+	return __netif_receive_skb(skb);
+}
+
 static void __netif_receive_skb_list(struct list_head *head)
 {
 	unsigned long noreclaim_flag = 0;
@@ -7076,7 +7100,9 @@ static int process_backlog(struct napi_struct *napi, int quota)
 		while ((skb = __skb_dequeue(&sd->process_queue))) {
 			local_unlock_nested_bh(&softnet_data.process_queue_bh_lock);
 			rcu_read_lock();
-			__netif_receive_skb(skb);
+			/* An extension put the packet here, and goes on with it: net/core/napi_bpf.c */
+			if (!rx_ext_backlogged(skb) || !rx_ext_deliver(skb))
+				__netif_receive_skb(skb);
 			rcu_read_unlock();
 			if (++work >= quota) {
 				rps_input_queue_head_add(sd, work);

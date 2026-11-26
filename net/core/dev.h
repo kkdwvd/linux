@@ -538,5 +538,26 @@ int rx_ext_merge(struct sk_buff *p, struct sk_buff *skb);
 
 /* The NAPI that @gro is the node of. Not for a node of its own, which has no id. */
 #define gro_napi(node)	container_of_const(node, struct napi_struct, gro)
+bool rx_ext_deliver(struct sk_buff *skb);
+bool backlog_enqueue(struct sk_buff *skb, int cpu);
+int rx_ext_netif_receive_skb(struct sk_buff *skb);
+
+/*
+ * What the control block of a packet is while an extension has it wait in a backlog with
+ * a frame suspended in its head. @owner is an address that nothing else puts there.
+ */
+struct rx_ext_cb {
+	const void *owner;
+	u32 gen;	/* which attachment, see rx_ext_gen */
+};
+
+#define RX_EXT_CB(skb)	((struct rx_ext_cb *)(skb)->cb)
+
+/* Did an extension put @skb, which comes off a backlog, there? */
+static inline bool rx_ext_backlogged(const struct sk_buff *skb)
+{
+	return RX_EXT && static_branch_unlikely(&rx_ext_key) &&
+	       RX_EXT_CB(skb)->owner == &rx_ext_gen;
+}
 
 enum gro_result rx_ext_gro_receive(struct gro_node *gro, struct sk_buff *skb);

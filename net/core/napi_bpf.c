@@ -946,6 +946,14 @@ late_initcall(napi_ext_init);
  * stays. With no merge() the call is not there, and the word of the packet that stays is
  * what it was.
  *
+ * A packet can also wait for another CPU. bpf_rx_backlog() is the step that RPS is in the
+ * kernel, as a boundary that may decline: the packet goes onto the backlog of the CPU that
+ * the code names, with its frame suspended in its head, and process_backlog() resumes the
+ * continuation there, which hands the packet to the stack with bpf_rx_deliver(). A queue
+ * that is full takes nothing, as it does of the kernel, which then drops: here the kfunc
+ * returns false and the code goes on with the packet, onto the batch, say. A packet that
+ * waits in a backlog says so in its control block, which is the queue's while it waits.
+ *
  * A continuation runs inside the flush that resumes it, which may be inside bpf_rx_gro()
  * for another packet: GRO flushes a held packet to make room, or because the one that
  * arrives ends its flow's run. The code of the extension nests then, a continuation under
@@ -961,7 +969,8 @@ late_initcall(napi_ext_init);
  * - A detach forgets the frames that are suspended in held packets: each packet is the
  *   kernel's at its flush. Frames are told apart by attachment, not by program, see
  *   rx_ext_hold(), so that a frame of an extension that is gone is never resumed, by the
- *   next one either.
+ *   next one either. The same for a packet in a backlog: the kernel delivers it, and a
+ *   device that goes has its packets flushed from the backlogs as before.
  * - A continuation that the kernel unwinds gives the packet to the batch by its landing
  *   pad, and so does an entry: the packet of code that is unwound may go past GRO.
  * - Only one extension is attached at a time, to one device. It is another one than the
@@ -1034,6 +1043,7 @@ enum {
 	RX_EXT_NONE,
 	RX_EXT_ARRIVE,		/* arrive(): in gro_receive_skb() */
 	RX_EXT_RESUME,		/* a continuation: in gro_complete() */
+	RX_EXT_BACKLOG,		/* a continuation: in process_backlog() */
 	RX_EXT_DONE,		/* it gave the packet up */
 };
 
@@ -1043,7 +1053,7 @@ enum {
  * continuation: rx_ext_arrive() and rx_ext_resume() save this and put it back.
  */
 struct rx_ext_cpu {
-	struct gro_node *gro;
+	struct gro_node *gro;	/* NULL in process_backlog() */
 	/* the argument of arrive(): what its program has for a context */
 	struct sk_buff *skb;
 	gro_result_t ret;	/* what gro_receive_skb() returns for the packet */
@@ -1200,11 +1210,11 @@ gro_result_t rx_ext_arrive(struct gro_node *gro, struct sk_buff *skb)
  * Returns false if nothing put the packet on the batch: the kernel does.
  */
 static __always_inline bool __rx_ext_resume(struct rx_ext_cpu *cur, struct gro_node *gro,
-					    struct sk_buff *skb)
+					    struct sk_buff *skb, u8 ctx)
 {
 	bool done;
 
-	rx_ext_begin(cur, RX_EXT_RESUME, true);
+	rx_ext_begin(cur, ctx, true);
 	cur->gro = gro;
 	cur->skb = skb;
 	bpf_coro_run_bh(rx_ext_prog, skb->head);
@@ -1215,14 +1225,14 @@ static __always_inline bool __rx_ext_resume(struct rx_ext_cpu *cur, struct gro_n
 }
 
 /* A flush inside bpf_rx_gro() for another packet, as a rule */
-static noinline bool rx_ext_resume_nested(struct gro_node *gro, struct sk_buff *skb)
+static noinline bool rx_ext_resume_nested(struct gro_node *gro, struct sk_buff *skb, u8 ctx)
 {
 	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu), saved = *cur;
 	unsigned long flags;
 	bool done;
 
 	cur->ctx = RX_EXT_NONE;
-	done = __rx_ext_resume(cur, gro, skb);
+	done = __rx_ext_resume(cur, gro, skb, ctx);
 	local_irq_save(flags);
 	*cur = saved;
 	local_irq_restore(flags);
@@ -1237,8 +1247,29 @@ bool rx_ext_resume(struct gro_node *gro, struct sk_buff *skb)
 	if (unlikely(!rcu_dereference_sched(rx_ext_ops)))
 		return false;
 	if (cur->ctx != RX_EXT_NONE)
-		return rx_ext_resume_nested(gro, skb);
-	return __rx_ext_resume(cur, gro, skb);
+		return rx_ext_resume_nested(gro, skb, RX_EXT_RESUME);
+	return __rx_ext_resume(cur, gro, skb, RX_EXT_RESUME);
+}
+
+/**
+ * rx_ext_deliver - a packet that waited in a backlog goes on in its continuation
+ * @skb: the packet, off the queue, which says that an extension put it there
+ *
+ * Returns false if nothing handed the packet to the stack: process_backlog() does. That is
+ * the case of a packet whose extension is gone.
+ */
+bool rx_ext_deliver(struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	u32 gen = RX_EXT_CB(skb)->gen;
+
+	/* the control block is the stack's from here on */
+	RX_EXT_CB(skb)->owner = NULL;
+	if (unlikely(!rcu_dereference_sched(rx_ext_ops)) || gen != READ_ONCE(rx_ext_gen))
+		return false;
+	if (unlikely(cur->ctx != RX_EXT_NONE))
+		return rx_ext_resume_nested(NULL, skb, RX_EXT_BACKLOG);
+	return __rx_ext_resume(cur, NULL, skb, RX_EXT_BACKLOG);
 }
 
 /*
@@ -1301,15 +1332,25 @@ static __always_inline bool rx_ext_in(const struct rx_ext_cpu *cur, const struct
 	return !WARN_ON_ONCE(cur->skb != skb || !(BIT(cur->ctx) & ctxs));
 }
 
-/* The batch of the NAPI: with the segments that GRO counted for a packet that it flushes */
+/*
+ * The batch of the NAPI: with the segments that GRO counted for a packet that it flushes.
+ * In process_backlog() there is no batch: the stack gets the packet, as it does there.
+ */
 static void rx_ext_batch(struct rx_ext_cpu *cur, struct sk_buff *skb)
 {
 	int segs = cur->ctx == RX_EXT_RESUME ? NAPI_GRO_CB(skb)->count : 1;
+	struct gro_node *gro = cur->gro;
 
 	cur->ret = GRO_NORMAL;
 	cur->ctx = RX_EXT_DONE;
-	gro_normal_one(cur->gro, skb, segs);
+	if (gro)
+		gro_normal_one(gro, skb, segs);
+	else
+		rx_ext_netif_receive_skb(skb);
 }
+
+/* The contexts in which the code has a packet in hand */
+#define RX_EXT_HAS	(BIT(RX_EXT_ARRIVE) | BIT(RX_EXT_RESUME) | BIT(RX_EXT_BACKLOG))
 
 __bpf_kfunc_start_defs();
 
@@ -1400,6 +1441,55 @@ __bpf_kfunc bool bpf_rx_gro(void *frame__coro_offer)
 }
 
 /**
+ * bpf_rx_backlog - offer a packet to the backlog of a CPU
+ * @frame__coro_offer: the frame of the packet's path, with the packet in one of its slots
+ * @cpu: the CPU
+ *
+ * The step that RPS is, as a boundary. Returns true where the queue took the packet:
+ * process_backlog() resumes the continuation on that CPU, in softirq. Returns false where
+ * it did not, because it is full, the CPU is not there or the device is down: the code goes
+ * on with packet and frame. A queue that fills between the look at it and the packet, and
+ * the limit on a flow where the administrator set one, drop the packet as they do of RPS.
+ */
+__bpf_kfunc bool bpf_rx_backlog(void *frame__coro_offer, u32 cpu)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct sk_buff *skb = cur->skb;
+
+	if (WARN_ON_ONCE(!(BIT(cur->ctx) & RX_EXT_HAS) || skb->head != frame__coro_offer))
+		return false;
+	if (cpu >= nr_cpu_ids || !cpu_online(cpu))
+		return false;
+	/* the queue's while the packet waits, and how process_backlog() knows */
+	RX_EXT_CB(skb)->owner = &rx_ext_gen;
+	RX_EXT_CB(skb)->gen = READ_ONCE(rx_ext_gen);
+	if (!backlog_enqueue(skb, cpu)) {
+		RX_EXT_CB(skb)->owner = NULL;
+		return false;
+	}
+	/* the packet may be on its way on that CPU: nothing of it from here on */
+	cur->ret = GRO_NORMAL;
+	cur->ctx = RX_EXT_DONE;
+	return true;
+}
+
+/**
+ * bpf_rx_deliver - hand a packet to the stack
+ * @skb: the packet, which the caller owns
+ *
+ * __netif_receive_skb() for the continuation of a packet that waited in a backlog, the end
+ * of the unit and of its frame. In the poll of a NAPI, where the kernel delivers by the
+ * batch, it is the batch.
+ */
+__bpf_kfunc void bpf_rx_deliver(struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+
+	if (rx_ext_in(cur, skb, RX_EXT_HAS))
+		rx_ext_batch(cur, skb);
+}
+
+/**
  * bpf_rx_native - leave a packet to the kernel
  * @skb: the packet, which the caller owns: arrive(), or the continuation of a packet that
  *	GRO held
@@ -1412,7 +1502,7 @@ __bpf_kfunc void bpf_rx_native(struct sk_buff *skb)
 	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
 	struct gro_node *gro;
 
-	if (!rx_ext_in(cur, skb, BIT(RX_EXT_ARRIVE) | BIT(RX_EXT_RESUME)))
+	if (!rx_ext_in(cur, skb, RX_EXT_HAS))
 		return;
 	if (cur->offered) {
 		rx_ext_batch(cur, skb);
@@ -1429,15 +1519,16 @@ __bpf_kfunc void bpf_rx_native(struct sk_buff *skb)
  * @skb: the packet, as for bpf_rx_native()
  *
  * gro_normal_one(), the end of the unit and of its frame: the kernel delivers the batch as
- * a list. A packet that GRO has not seen goes past GRO. The landing pads of the extension
- * call this or bpf_rx_native(), whichever btf_find_release_kfunc() finds first: both end
- * the unit wherever it is.
+ * a list. A packet that GRO has not seen goes past GRO. In process_backlog(), where there
+ * is no batch, the stack gets the packet. The landing pads of the extension call this,
+ * bpf_rx_deliver() or bpf_rx_native(), whichever btf_find_release_kfunc() finds first: each
+ * ends the unit wherever it is.
  */
 __bpf_kfunc void bpf_rx_batch(struct sk_buff *skb)
 {
 	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
 
-	if (rx_ext_in(cur, skb, BIT(RX_EXT_ARRIVE) | BIT(RX_EXT_RESUME)))
+	if (rx_ext_in(cur, skb, RX_EXT_HAS))
 		rx_ext_batch(cur, skb);
 }
 
@@ -1465,16 +1556,20 @@ BTF_ID_FLAGS(func, bpf_coro_frame_alloc_skb, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_rx_set_state)
 BTF_ID_FLAGS(func, bpf_rx_state)
 BTF_ID_FLAGS(func, bpf_rx_gro)
+BTF_ID_FLAGS(func, bpf_rx_backlog)
 BTF_ID_FLAGS(func, bpf_rx_native, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_rx_batch, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_rx_deliver, KF_RELEASE)
 BTF_KFUNCS_END(rx_ext_kfunc_ids)
 
-/* what a continuation calls: code that gro_complete() resumes */
+/* what a continuation calls: code that gro_complete() or process_backlog() resumes */
 BTF_KFUNCS_START(rx_ext_cont_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_rx_set_state)
 BTF_ID_FLAGS(func, bpf_rx_state)
+BTF_ID_FLAGS(func, bpf_rx_backlog)
 BTF_ID_FLAGS(func, bpf_rx_native, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_rx_batch, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_rx_deliver, KF_RELEASE)
 BTF_KFUNCS_END(rx_ext_cont_kfunc_ids)
 
 BTF_ID_LIST(rx_ext_ids)
