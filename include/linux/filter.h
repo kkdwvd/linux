@@ -1238,6 +1238,10 @@ static inline unsigned int bpf_prog_size(unsigned int proglen)
 		   offsetof(struct bpf_prog, insns[proglen]));
 }
 
+/* The most insns that a program has room for: bpf_prog->pages counts its pages in 16 bits */
+#define BPF_PROG_MAX_LEN \
+	((U16_MAX * PAGE_SIZE - offsetof(struct bpf_prog, insnsi)) / sizeof(struct bpf_insn))
+
 bool bpf_prog_has_arena_insns(const struct bpf_prog *prog);
 
 /*

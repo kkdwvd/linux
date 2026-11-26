@@ -533,6 +533,9 @@ int bpf_patch_list_commit(struct bpf_verifier_env *env)
 	if (verifier_bug_if(err == -EFAULT, env, "insn %u jumps out of the program",
 			    img.bad))
 		goto out;
+	if (err == -E2BIG)
+		verbose(env, "BPF program is too large after the rewrites: more than %lu insns\n",
+			BPF_PROG_MAX_LEN);
 	if (err)
 		goto out;
 

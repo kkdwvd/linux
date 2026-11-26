@@ -107,6 +107,9 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	struct bpf_prog *fp;
 
 	size = round_up(size, __PAGE_SIZE);
+	/* fp->pages cannot count more */
+	if (size / PAGE_SIZE > U16_MAX)
+		return NULL;
 	fp = __vmalloc(size, gfp_flags);
 	if (fp == NULL)
 		return NULL;
@@ -266,6 +269,9 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 	pages = size / PAGE_SIZE;
 	if (pages <= fp_old->pages)
 		return fp_old;
+	/* fp->pages cannot count more */
+	if (pages > U16_MAX)
+		return NULL;
 
 	fp = __vmalloc(size, gfp_flags);
 	if (fp) {
@@ -665,6 +671,8 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
 	/* like kvmalloc(): the size of a prog fits into 32 bits */
 	if (map[cnt] > INT_MAX / sizeof(*insns))
 		return -ENOMEM;
+	if (map[cnt] > BPF_PROG_MAX_LEN)
+		return -E2BIG;
 	insns = kvrealloc(insns, array_size(map[cnt], sizeof(*insns)), BPF_VERIFIER_GFP);
 	if (!insns)
 		return -ENOMEM;
@@ -694,7 +702,9 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
  * its patch, img->new_tgt[] to where jumps to it land, both map a removed insn
  * to the next one that stays. img->new_linfo[] is there when insns are
  * removed, see patch_image_map_linfo(). On -EFAULT, img->bad is the old insn
- * whose jump is wrong. No list has both removed and inserted insns.
+ * whose jump is wrong. On -E2BIG, a program has no room for the image, see
+ * BPF_PROG_MAX_LEN: nothing of that size is allocated, here or by the caller.
+ * No list has both removed and inserted insns.
  */
 int bpf_patch_list_build(const struct bpf_patch_list *pl, const struct bpf_prog *prog,
 			 struct bpf_patch_image *img)
@@ -722,6 +732,8 @@ int bpf_patch_list_build(const struct bpf_patch_list *pl, const struct bpf_prog 
 		}
 	}
 	img->short_cnt = img->new_cnt = cnt + img->grow;
+	if (img->new_cnt > BPF_PROG_MAX_LEN)
+		return -E2BIG;
 
 	if (img->del && prog->aux->nr_linfo) {
 		err = patch_image_map_linfo(img, prog);
