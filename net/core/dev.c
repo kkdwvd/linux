@@ -5184,14 +5184,80 @@ int dev_weight_rx_bias __read_mostly = 1;  /* bias for backlog weight */
 int dev_weight_tx_bias __read_mostly = 1;  /* bias for output_queue quota */
 
 #ifdef CONFIG_BPF_SYSCALL
+/*
+ * __napi_poll() has more to do than the kernel's own: a NAPI is bound to a BPF kthread.
+ * Counted.
+ */
+static DEFINE_STATIC_KEY_FALSE(napi_poll_hook_key);
+
+static inline bool napi_poll_hooked(void)
+{
+	return static_branch_unlikely(&napi_poll_hook_key);
+}
+
+/* The NAPI whose poll function this CPU is in, see napi_bpf_schedule(): under the key */
+static DEFINE_PER_CPU(struct napi_struct *, napi_in_poll);
+static DEFINE_MUTEX(napi_bpf_bound_mutex);
+static unsigned int napi_bpf_nr_bound;
+
+static inline void napi_poll_begin(struct napi_struct *napi)
+{
+	__this_cpu_write(napi_in_poll, napi);
+}
+
+static inline void napi_poll_end(void)
+{
+	__this_cpu_write(napi_in_poll, NULL);
+}
+
+/*
+ * A NAPI is about to be bound. The first one has every CPU record the NAPI that it polls,
+ * and waits for the polls that began with nothing recorded: they are over before a NAPI can
+ * be handed to a thread.
+ */
+static void napi_bpf_bound_inc(void)
+{
+	mutex_lock(&napi_bpf_bound_mutex);
+	if (!napi_bpf_nr_bound++) {
+		static_branch_inc(&napi_poll_hook_key);
+		synchronize_rcu();
+	}
+	mutex_unlock(&napi_bpf_bound_mutex);
+}
+
+static void napi_bpf_bound_dec(void)
+{
+	mutex_lock(&napi_bpf_bound_mutex);
+	if (!--napi_bpf_nr_bound)
+		static_branch_dec(&napi_poll_hook_key);
+	mutex_unlock(&napi_bpf_bound_mutex);
+}
+
 /* Schedule a NAPI for the BPF kthread it is bound to, see the comment above
  * napi_bpf_bind_locked(). Called with irq disabled. Returns false when the
- * NAPI is not bound, or its thread no longer owns its scheduling.
+ * NAPI is not bound, or its thread no longer owns its scheduling, or the
+ * schedule comes from inside a poll that the thread must not run beside.
  */
 static bool napi_bpf_schedule(struct napi_struct *napi)
 {
 	unsigned long new, val = READ_ONCE(napi->state);
 	struct task_struct *thread;
+
+	/* A schedule that comes from inside the poll function of the NAPI, from
+	 * the driver or from napi_complete_done() for a schedule that was
+	 * missed, is for whoever is in that poll. The driver need not be
+	 * through with the NAPI: virtio-net masks the interrupt behind a
+	 * completion that failed. A thread that polled the NAPI on another CPU
+	 * meanwhile and completed it would leave it idle with its interrupt
+	 * masked, for good. So softirq keeps such a NAPI and polls it once
+	 * more, here, and the thread has the next schedule. Unless the thread
+	 * is what this CPU runs, in its own poll or below the softirq that is
+	 * in this one: then it cannot poll before the poll here has returned.
+	 */
+	if ((val & (NAPIF_STATE_THREADED | NAPIF_STATE_BPF)) ==
+	    (NAPIF_STATE_THREADED | NAPIF_STATE_BPF) &&
+	    __this_cpu_read(napi_in_poll) == napi && current != READ_ONCE(napi->thread))
+		return false;
 
 	/* Mark the NAPI as the thread's only while the thread owns its
 	 * scheduling, in one step. Whoever takes the scheduling away clears
@@ -5222,6 +5288,19 @@ static bool napi_bpf_schedule(struct napi_struct *napi)
 	return true;
 }
 #else
+static inline bool napi_poll_hooked(void)
+{
+	return false;
+}
+
+static inline void napi_poll_begin(struct napi_struct *napi)
+{
+}
+
+static inline void napi_poll_end(void)
+{
+}
+
 static bool napi_bpf_schedule(struct napi_struct *napi)
 {
 	return false;
@@ -7863,6 +7942,8 @@ int napi_bpf_bind_locked(struct napi_struct *napi, struct task_struct *task)
 	 * NAPI_STATE_BPF goes first: with NAPI_STATE_THREADED alone the
 	 * schedule path would wake the task as a kernel NAPI thread.
 	 */
+	if (!test_bit(NAPI_STATE_BPF, &napi->state))
+		napi_bpf_bound_inc();
 	smp_mb__before_atomic();
 	set_bit(NAPI_STATE_BPF, &napi->state);
 	set_bit(NAPI_STATE_THREADED, &napi->state);
@@ -7927,6 +8008,7 @@ void napi_bpf_unbind_locked(struct napi_struct *napi)
 
 	WRITE_ONCE(napi->thread, NULL);
 	put_task_struct_rcu_user(thread);
+	napi_bpf_bound_dec();
 }
 
 /**
@@ -8595,7 +8677,12 @@ void __netif_napi_del_locked(struct napi_struct *napi)
 }
 EXPORT_SYMBOL(__netif_napi_del_locked);
 
-static int __napi_poll(struct napi_struct *n, bool *repoll)
+/*
+ * @hooked: a NAPI is bound to a BPF kthread, and the poll has more to do than the kernel's
+ * own, see napi_poll_hook_key. Compiled once for each, so that the kernel's own is as it is
+ * with none of this in the tree.
+ */
+static __always_inline int ____napi_poll(struct napi_struct *n, bool *repoll, const bool hooked)
 {
 	int work, weight;
 
@@ -8609,10 +8696,14 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	 */
 	work = 0;
 	if (napi_is_scheduled(n)) {
+		if (hooked)
+			napi_poll_begin(n);
 		work = n->poll(n, weight);
 		trace_napi_poll(n, work, weight);
 
 		xdp_do_check_flushed(n);
+		if (hooked)
+			napi_poll_end();
 	}
 
 	if (unlikely(work > weight))
@@ -8667,6 +8758,18 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	*repoll = true;
 
 	return work;
+}
+
+static noinline int __napi_poll_hooked(struct napi_struct *n, bool *repoll)
+{
+	return ____napi_poll(n, repoll, true);
+}
+
+static int __napi_poll(struct napi_struct *n, bool *repoll)
+{
+	if (napi_poll_hooked())
+		return __napi_poll_hooked(n, repoll);
+	return ____napi_poll(n, repoll, false);
 }
 
 static int napi_poll(struct napi_struct *n, struct list_head *repoll)
