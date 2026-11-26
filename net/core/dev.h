@@ -533,6 +533,8 @@ DECLARE_STATIC_KEY_FALSE(rx_ext_key);
 extern u32 rx_ext_gen;
 gro_result_t rx_ext_arrive(struct gro_node *gro, struct sk_buff *skb);
 bool rx_ext_resume(struct gro_node *gro, struct sk_buff *skb);
+DECLARE_STATIC_KEY_FALSE(rx_ext_merge_key);
+int rx_ext_merge(struct sk_buff *p, struct sk_buff *skb);
 
 /* The NAPI that @gro is the node of. Not for a node of its own, which has no id. */
 #define gro_napi(node)	container_of_const(node, struct napi_struct, gro)

@@ -91,6 +91,15 @@ void dev_remove_offload(struct packet_offload *po)
 EXPORT_SYMBOL(dev_remove_offload);
 
 
+/*
+ * @skb has become part of @p, which GRO holds: an extension on the path of both combines
+ * what it keeps for each, see net/core/napi_bpf.c.
+ */
+static inline bool rx_ext_merges(void)
+{
+	return RX_EXT && static_branch_unlikely(&rx_ext_merge_key);
+}
+
 int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 {
 	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
@@ -230,6 +239,8 @@ done:
 		skb_shinfo(lp)->flags |= skbinfo->flags & SKBFL_SHARED_FRAG;
 	}
 	NAPI_GRO_CB(skb)->same_flow = 1;
+	if (rx_ext_merges())
+		return rx_ext_merge(p, skb);
 	return 0;
 }
 
@@ -273,6 +284,8 @@ int skb_gro_receive_list(struct sk_buff *p, struct sk_buff *skb)
 	skb_shinfo(p)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
 
 	NAPI_GRO_CB(skb)->same_flow = 1;
+	if (rx_ext_merges())
+		return rx_ext_merge(p, skb);
 
 	return 0;
 }
