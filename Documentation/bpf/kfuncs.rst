@@ -552,6 +552,20 @@ by that value alone. In C++ it is an ``await_suspend()`` that returns bool.
 
 Such a kfunc takes one frame and no other reference, and returns a scalar.
 
+2.3.14 __offer Annotation
+-------------------------
+
+An ``__offer`` parameter is a reference of the program that the kfunc may
+decline::
+
+        __bpf_kfunc bool bpf_rx_pass(struct sk_buff *skb__offer)
+
+The kfunc returns true where it took the reference, which the program no
+longer has then, and false where it did not: the program has it as before.
+The verifier checks the two outcomes apart, as for ``__coro_offer``. Such a
+kfunc is not ``KF_RELEASE``, takes no other reference, acquires none and
+returns a scalar.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function

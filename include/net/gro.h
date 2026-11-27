@@ -45,7 +45,11 @@ struct napi_gro_cb {
 	/* Used in ipv6_gro_receive() and foo-over-udp and esp-in-udp */
 	u16	proto;
 
-	u16	pad;
+	/* A held packet: an extension's coroutine frame is suspended in its
+	 * head, for gro_complete() to resume, see net/core/napi_bpf.c. Means
+	 * something only beside napi_struct::bpf_held.
+	 */
+	u16	bpf_frame;
 
 /* Used in napi_gro_cb::free */
 #define NAPI_GRO_FREE             1

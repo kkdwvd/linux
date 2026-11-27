@@ -18630,6 +18630,22 @@ static bool coro_frame_is_bare(struct bpf_verifier_env *env,
  * outcomes of the next() of an iterator, see process_iter_next_call(): made of the state at
  * the call, before anything of it goes to the continuation.
  */
+/*
+ * The register of the argument that a kfunc is offered, __offer, 0 if it has none: a
+ * reference of the program that the kfunc takes where it returns true and leaves to the
+ * program where it returns false.
+ */
+static int kfunc_offer_regno(const struct bpf_call_arg_meta *meta)
+{
+	const struct btf_param *args = btf_params(meta->func_proto);
+	u32 i, nargs = btf_type_vlen(meta->func_proto);
+
+	for (i = 0; i < nargs && i < MAX_BPF_FUNC_REG_ARGS; i++)
+		if (btf_param_match_suffix(meta->btf, &args[i], "__offer"))
+			return BPF_REG_1 + i;
+	return 0;
+}
+
 static int push_coro_declined(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state *st;
@@ -18827,7 +18843,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	u32 i, proto_slots, ptr_type_id, ret_nregs = 1;
 	struct bpf_kfunc_desc *desc;
 	struct btf *desc_btf;
-	int id;
+	int id, offer_regno;
 
 	if (!insn->imm) {
 		verbose(env, "invalid kernel function call not eliminated in verifier pass\n");
@@ -19148,6 +19164,34 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	hosted = coro_host_room(&meta) >= 0;
 	if (hosted) {
 		err = coro_frame_host(env, &meta, &host_id);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * A reference that the kfunc may decline, __offer: the state in which it did, with
+	 * the reference the program's as before and false returned, like a frame that is
+	 * offered, below. In this one the kfunc took it. Such a kfunc is no release function:
+	 * nothing may count on it to take what it is given.
+	 */
+	offer_regno = kfunc_offer_regno(&meta);
+	if (offer_regno) {
+		t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
+		if (meta.release_regno || meta.coro_frames.cnt || is_kfunc_acquire(&meta) ||
+		    !btf_type_is_scalar(t) || env->cur_state->unwound) {
+			verbose(env, "kfunc %s is offered a reference and does more than take or decline it\n",
+				func_name);
+			return -EFAULT;
+		}
+		if (!reg_is_referenced(env, &regs[offer_regno])) {
+			verbose(env, "kfunc %s is offered R%d, which is no reference of the program\n",
+				func_name, offer_regno);
+			return -EINVAL;
+		}
+		err = push_coro_declined(env, insn_idx);
+		if (err)
+			return err;
+		err = release_reg(env, &regs[offer_regno], false, false);
 		if (err)
 			return err;
 	}
@@ -19598,8 +19642,8 @@ unwound:
 			return err;
 	}
 
-	/* it took the frame: the other outcome is the state of push_coro_declined() */
-	if (meta.coro_frames.offer_mask)
+	/* it took the frame, or the reference: the other outcome is push_coro_declined()'s */
+	if (meta.coro_frames.offer_mask || offer_regno)
 		__mark_reg_known(&regs[BPF_REG_0], 1);
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_session_cookie])

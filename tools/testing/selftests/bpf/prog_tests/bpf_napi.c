@@ -228,29 +228,6 @@ void test_bpf_napi(void)
 	ASSERT_TRUE(ping(tx, rx), "ping_second_thread");
 	ASSERT_TRUE(polled_past(skel, 1, before), "second_thread_polled");
 
-	/*
-	 * Suspended, the NAPI is softirq's while it stays bound: datagrams
-	 * arrive without the thread, polls are refused, and after the two
-	 * packets it asked for the thread is woken and finds that out. Resumed,
-	 * the thread polls again.
-	 */
-	ASSERT_EQ(run_prog(skel->progs.suspend_napi, 0, 0x7fffffff, 0), -ENOENT, "suspend_unknown_napi");
-	ASSERT_EQ(run_prog(skel->progs.resume_napi, 0, 0x7fffffff, 0), -ENOENT, "resume_unknown_napi");
-	skel->bss->last_err[1] = 0;
-	if (!ASSERT_OK(run_prog(skel->progs.suspend_napi, 0, napi_id, 2), "suspend_napi"))
-		goto out;
-	ASSERT_EQ(run_prog(skel->progs.poll_napi, 0, napi_id, 0), -ECANCELED, "poll_suspended");
-	ASSERT_TRUE(ping(tx, rx), "ping_softirq_while_suspended");
-	ASSERT_TRUE(ping(tx, rx), "ping_softirq_while_suspended_2");
-	for (ret = 0; ret < 1000 && skel->bss->last_err[1] != -ECANCELED; ret++)
-		usleep(1000);
-	ASSERT_EQ(skel->bss->last_err[1], -ECANCELED, "thread_woken_after_count");
-	if (!ASSERT_OK(run_prog(skel->progs.resume_napi, 0, napi_id, 0), "resume_napi"))
-		goto out;
-	before = skel->bss->polls[1];
-	ASSERT_TRUE(ping(tx, rx), "ping_after_resume");
-	ASSERT_TRUE(polled_past(skel, 1, before), "resumed_thread_polled");
-
 	/* A write of the threaded setting ends the binding. */
 	if (!ASSERT_OK(set_threaded(0), "threaded_write_while_bound"))
 		goto out;
@@ -260,7 +237,7 @@ void test_bpf_napi(void)
 	/*
 	 * A thread that stops polling loses the NAPI's scheduling after about
 	 * a second: softirq delivers the packet, polls are refused, and a
-	 * resume puts the thread back in charge.
+	 * new bind puts the thread back in charge.
 	 */
 	skel->bss->paused[1] = 1;
 	if (!ASSERT_OK(run_prog(skel->progs.bind_napi, 1, napi_id, 0), "bind_paused"))
@@ -271,7 +248,7 @@ void test_bpf_napi(void)
 	ASSERT_EQ(run_prog(skel->progs.poll_napi, 0, napi_id, 0), -ECANCELED, "poll_after_watchdog");
 	ASSERT_TRUE(ping(tx, rx), "ping_softirq_after_watchdog");
 	skel->bss->paused[1] = 0;
-	if (!ASSERT_OK(run_prog(skel->progs.resume_napi, 0, napi_id, 0), "resume_after_watchdog"))
+	if (!ASSERT_OK(run_prog(skel->progs.bind_napi, 1, napi_id, 0), "bind_after_watchdog"))
 		goto out;
 	before = skel->bss->polls[1];
 	ASSERT_TRUE(ping(tx, rx), "ping_after_rebind");

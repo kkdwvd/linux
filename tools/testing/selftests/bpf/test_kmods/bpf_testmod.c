@@ -23,6 +23,13 @@
 #include <linux/rcupdate_trace.h>
 #include <net/sock.h>
 #include <linux/namei.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/wait.h>
+#include <net/ip.h>
 #include "bpf_testmod.h"
 #include "bpf_testmod_kfunc.h"
 
@@ -1254,7 +1261,353 @@ static int register_bpf_testmod_uprobe(void)
 static void unregister_bpf_testmod_uprobe(void) { }
 #endif
 
+/*
+ * A NAPI whose poll finds nothing, on a device of its own: what a schedule and the poll
+ * that it leads to cost by themselves, and what a driver does with its NAPI beside the
+ * poll, see prog_tests/napi_ext.c.
+ */
+static DEFINE_MUTEX(napi_test_mutex);
+static DECLARE_WAIT_QUEUE_HEAD(napi_test_wq);
+static struct net_device *napi_test_dev;
+static struct napi_struct napi_test;
+/* it is on the device; every other poll is to find it scheduled once more; this one did */
+static bool napi_test_listed, napi_test_miss, napi_test_missed;
+/* the next poll may be on its way on another CPU when one counts itself */
+static atomic64_t napi_test_polls;
+
+/* The @op of bpf_kfunc_napi_test_ctl(), in its low byte */
+enum {
+	NAPI_TEST_DEL,		/* take the NAPI off the device */
+	NAPI_TEST_ADD,		/* put it back as its memory is: returns its ID */
+	NAPI_TEST_ADD_ZEROED,	/* or zeroed, as a driver has it that allocates its channels anew */
+	NAPI_TEST_MISS,		/* every other poll finds the NAPI scheduled once more */
+	NAPI_TEST_NO_MISS,
+	NAPI_TEST_POLLS,	/* returns the polls so far */
+	/*
+	 * Every poll receives packets from here on, and the flows start anew: the second
+	 * byte is which, NAPI_TEST_RX_*, the next 12 bits how many a poll, the top bit which
+	 * half of the flows. None: none.
+	 */
+	NAPI_TEST_RX,
+	/*
+	 * A poll that was scheduled uses up its budget as often as the upper half says before
+	 * one completes the NAPI: whoever polls comes back at once, each time.
+	 */
+	NAPI_TEST_MORE,
+	/*
+	 * A poll whose completion fails stays in the driver for as many microseconds as the
+	 * upper half says, as a driver does that still has something to do with its device
+	 * there: virtio-net masks the interrupt. And how often a poll began while another
+	 * was in the driver.
+	 */
+	NAPI_TEST_TAIL,
+	NAPI_TEST_OVERLAPS,
+};
+
+/* What a poll receives */
+enum {
+	NAPI_TEST_RX_UDP,	/* datagrams, which GRO has no use for */
+	NAPI_TEST_RX_FLOW,	/* segments of one TCP flow in order: held, and merged into it */
+	NAPI_TEST_RX_FLOWS,	/* a segment of as many flows: held, each for itself */
+	NAPI_TEST_RX_PUSH,	/* as FLOW, and the last one ends the run: flushed where it is merged */
+	NAPI_TEST_RX_SMALL,	/* datagrams in heads with no headroom to speak of */
+	NAPI_TEST_RX_CLONE,	/* datagrams whose head a clone shares */
+	NAPI_TEST_RX_FEW,	/* segments of four flows in turn: four held, the others merged */
+};
+
+#define NAPI_TEST_RX_PAYLOAD	1000
+#define NAPI_TEST_RX_HLEN	(ETH_HLEN + sizeof(struct iphdr) + sizeof(struct tcphdr))
+
+static u32 napi_test_rx_kind, napi_test_rx_n, napi_test_rx_half;
+/* the polls of a schedule that use up their budget, and how many of them are still to come */
+static u32 napi_test_more, napi_test_more_left;
+/* what a failed completion is followed by, a poll is in the driver, and polls that met one there */
+static u32 napi_test_tail_us;
+static atomic_t napi_test_in_poll;
+static atomic64_t napi_test_overlaps;
+/* the next segment of the one flow, and of each of the others: only the poll writes them */
+static u32 napi_test_rx_seq, napi_test_rx_seqs[256];
+static u16 napi_test_rx_id;
+
+/*
+ * One packet as a driver has it for its NAPI: headers and payload in the head, the checksum
+ * done by the device, a hash. For a host that is not this one, so the stack drops it once
+ * it has gone all the way of a received packet.
+ */
+static void napi_test_rx_one(struct napi_struct *napi, u32 kind, u32 i, bool last)
+{
+	u32 flow = kind == NAPI_TEST_RX_FLOWS ? 1 + napi_test_rx_half * 128 + i % 128 :
+		   kind == NAPI_TEST_RX_FEW ? 1 + i % 4 : 0;
+	bool tcp = kind == NAPI_TEST_RX_FLOW || kind == NAPI_TEST_RX_FLOWS ||
+		   kind == NAPI_TEST_RX_PUSH || kind == NAPI_TEST_RX_FEW;
+	u32 *seq = flow ? &napi_test_rx_seqs[flow - 1] : &napi_test_rx_seq;
+	struct sk_buff *skb, *clone;
+	struct ethhdr *eth;
+	struct udphdr *uh;
+	struct tcphdr *th;
+	struct iphdr *iph;
+
+	if (kind == NAPI_TEST_RX_SMALL) {
+		skb = alloc_skb(NAPI_TEST_RX_HLEN + NAPI_TEST_RX_PAYLOAD + 8, GFP_ATOMIC);
+		if (skb)
+			skb_reserve(skb, 8);
+	} else {
+		skb = napi_alloc_skb(napi, NAPI_TEST_RX_HLEN + NAPI_TEST_RX_PAYLOAD);
+	}
+	if (!skb)
+		return;
+	eth = skb_put_zero(skb, NAPI_TEST_RX_HLEN + NAPI_TEST_RX_PAYLOAD);
+	eth->h_dest[0] = 0x02;
+	eth->h_dest[5] = 0x02;
+	eth->h_source[0] = 0x02;
+	eth->h_source[5] = 0x01;
+	eth->h_proto = htons(ETH_P_IP);
+	iph = (void *)(eth + 1);
+	iph->version = 4;
+	iph->ihl = 5;
+	iph->ttl = 64;
+	iph->frag_off = htons(IP_DF);
+	/* one more with each segment of a flow, as GRO has it for what it merges */
+	iph->id = htons(tcp ? *seq / NAPI_TEST_RX_PAYLOAD : napi_test_rx_id++);
+	iph->saddr = htonl(0x0a630001);
+	iph->daddr = htonl(0x0a630002);
+	if (tcp) {
+		iph->protocol = IPPROTO_TCP;
+		iph->tot_len = htons(sizeof(*iph) + sizeof(*th) + NAPI_TEST_RX_PAYLOAD);
+		th = (void *)(iph + 1);
+		th->source = htons(10000 + flow);
+		th->dest = htons(80);
+		th->seq = htonl(*seq);
+		th->ack_seq = htonl(1);
+		th->doff = 5;
+		th->ack = 1;
+		th->psh = kind == NAPI_TEST_RX_PUSH && last;
+		th->window = htons(1000);
+		*seq += NAPI_TEST_RX_PAYLOAD;
+	} else {
+		iph->protocol = IPPROTO_UDP;
+		iph->tot_len = htons(sizeof(*iph) + sizeof(*th) + NAPI_TEST_RX_PAYLOAD);
+		uh = (void *)(iph + 1);
+		uh->source = htons(10000);
+		uh->dest = htons(9);
+		uh->len = htons(sizeof(*th) + NAPI_TEST_RX_PAYLOAD);
+	}
+	iph->check = ip_fast_csum(iph, iph->ihl);
+	skb->protocol = eth_type_trans(skb, napi->dev);
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb_set_hash(skb, 0x1000 + flow, PKT_HASH_TYPE_L4);
+	if (kind == NAPI_TEST_RX_CLONE) {
+		clone = skb_clone(skb, GFP_ATOMIC);
+		napi_gro_receive(napi, skb);
+		consume_skb(clone);
+		return;
+	}
+	napi_gro_receive(napi, skb);
+}
+
+static u32 napi_test_rx(struct napi_struct *napi)
+{
+	u32 kind = READ_ONCE(napi_test_rx_kind), n = READ_ONCE(napi_test_rx_n), i;
+
+	for (i = 0; i < n; i++)
+		napi_test_rx_one(napi, kind, i, i == n - 1);
+	return n;
+}
+
+static int napi_test_poll(struct napi_struct *napi, int budget)
+{
+	/* work that was done, for the timers of GRO, and less than the budget, to complete */
+	int work;
+
+	if (atomic_xchg(&napi_test_in_poll, 1))
+		atomic64_inc(&napi_test_overlaps);
+	work = min_t(u32, napi_test_rx(napi), budget - 1);
+	if (napi_test_more_left) {
+		napi_test_more_left--;
+		atomic_set(&napi_test_in_poll, 0);
+		return budget;
+	}
+	napi_test_more_left = READ_ONCE(napi_test_more);
+	/*
+	 * An interrupt of the device while its NAPI is polled: the schedule sets
+	 * NAPI_STATE_MISSED, for which napi_complete_done() schedules the NAPI.
+	 */
+	if (READ_ONCE(napi_test_miss) && !napi_test_missed) {
+		napi_test_missed = true;
+		napi_schedule(napi);
+	} else {
+		napi_test_missed = false;
+	}
+	if (!napi_complete_done(napi, work) && READ_ONCE(napi_test_tail_us))
+		udelay(READ_ONCE(napi_test_tail_us));
+	atomic_set(&napi_test_in_poll, 0);
+	atomic64_inc(&napi_test_polls);
+	if (wq_has_sleeper(&napi_test_wq))
+		wake_up(&napi_test_wq);
+	return work;
+}
+
+static netdev_tx_t napi_test_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	dev_kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops napi_test_netdev_ops = {
+	.ndo_start_xmit = napi_test_xmit,
+};
+
+static void napi_test_remove(void)
+{
+	struct net_device *dev = napi_test_dev;
+
+	if (!dev)
+		return;
+	napi_test_dev = NULL;
+	if (napi_test_listed)
+		napi_disable(&napi_test);
+	napi_test_listed = false;
+	unregister_netdev(dev);
+	free_netdev(dev);
+}
+
+__bpf_kfunc_start_defs();
+
+/* Make the device, @up, or remove it. Returns its ifindex, 0 once it is gone, or an error. */
+__bpf_kfunc int bpf_kfunc_napi_test_dev(bool up)
+{
+	struct net_device *dev;
+	int ret = 0;
+
+	mutex_lock(&napi_test_mutex);
+	if (!up) {
+		napi_test_remove();
+	} else if (napi_test_dev) {
+		ret = napi_test_dev->ifindex;
+	} else {
+		dev = alloc_netdev(0, "napitest%d", NET_NAME_UNKNOWN, ether_setup);
+		ret = -ENOMEM;
+		if (dev) {
+			dev->netdev_ops = &napi_test_netdev_ops;
+			netif_napi_add(dev, &napi_test, napi_test_poll);
+			ret = register_netdev(dev);
+			if (ret) {
+				free_netdev(dev);
+			} else {
+				napi_enable(&napi_test);
+				napi_test_listed = true;
+				napi_test_dev = dev;
+				ret = dev->ifindex;
+			}
+		}
+	}
+	mutex_unlock(&napi_test_mutex);
+	return ret;
+}
+
+__bpf_kfunc u32 bpf_kfunc_napi_test_id(void)
+{
+	return napi_test.napi_id;
+}
+
+/*
+ * Schedule the NAPI @n times, each time once its last poll is over: softirq polls before
+ * the schedule returns here, a thread when it gets to it. Returns the ns that it took.
+ */
+__bpf_kfunc u64 bpf_kfunc_napi_test_run(u32 n)
+{
+	u64 polls, t0;
+	u32 i;
+
+	if (!napi_test_dev || !napi_test_listed)
+		return 0;
+	polls = atomic64_read(&napi_test_polls);
+	t0 = ktime_get_ns();
+	for (i = 0; i < n; i++) {
+		local_bh_disable();
+		napi_schedule(&napi_test);
+		local_bh_enable();
+		wait_event(napi_test_wq, atomic64_read(&napi_test_polls) > polls + i);
+		if (!(i & 0x3ff))
+			cond_resched();
+	}
+	return ktime_get_ns() - t0;
+}
+
+/* What a driver does with its NAPI beside the poll: @op is one of NAPI_TEST_*. */
+__bpf_kfunc s64 bpf_kfunc_napi_test_ctl(u32 op)
+{
+	s64 ret = 0;
+
+	mutex_lock(&napi_test_mutex);
+	if (!napi_test_dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+	switch (op & 0xff) {
+	case NAPI_TEST_RX:
+		/* no poll is on its way: the NAPI is scheduled by a task that waits for the poll */
+		napi_test_rx_n = 0;
+		napi_test_rx_seq = 1;
+		memset(napi_test_rx_seqs, 0, sizeof(napi_test_rx_seqs));
+		napi_test_rx_id = 1;
+		napi_test_rx_kind = op >> 8 & 0xff;
+		napi_test_rx_half = op >> 31;
+		WRITE_ONCE(napi_test_rx_n, op >> 16 & 0xfff);
+		break;
+	case NAPI_TEST_TAIL:
+		WRITE_ONCE(napi_test_tail_us, op >> 16);
+		break;
+	case NAPI_TEST_OVERLAPS:
+		ret = atomic64_read(&napi_test_overlaps);
+		break;
+	case NAPI_TEST_MORE:
+		/* no poll is on its way, as above */
+		napi_test_more_left = op >> 16;
+		WRITE_ONCE(napi_test_more, op >> 16);
+		break;
+	case NAPI_TEST_DEL:
+		if (!napi_test_listed)
+			break;
+		napi_disable(&napi_test);
+		netif_napi_del(&napi_test);
+		napi_test_listed = false;
+		break;
+	case NAPI_TEST_ADD:
+	case NAPI_TEST_ADD_ZEROED:
+		if (napi_test_listed) {
+			ret = -EBUSY;
+			break;
+		}
+		if ((op & 0xff) == NAPI_TEST_ADD_ZEROED)
+			memset(&napi_test, 0, sizeof(napi_test));
+		netif_napi_add(napi_test_dev, &napi_test, napi_test_poll);
+		napi_enable(&napi_test);
+		napi_test_listed = true;
+		ret = napi_test.napi_id;
+		break;
+	case NAPI_TEST_MISS:
+	case NAPI_TEST_NO_MISS:
+		WRITE_ONCE(napi_test_miss, (op & 0xff) == NAPI_TEST_MISS);
+		break;
+	case NAPI_TEST_POLLS:
+		ret = atomic64_read(&napi_test_polls);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+out:
+	mutex_unlock(&napi_test_mutex);
+	return ret;
+}
+
+__bpf_kfunc_end_defs();
+
 BTF_KFUNCS_START(bpf_testmod_common_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_kfunc_napi_test_dev, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_kfunc_napi_test_id)
+BTF_ID_FLAGS(func, bpf_kfunc_napi_test_run, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_kfunc_napi_test_ctl, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_iter_testmod_seq_new, KF_ITER_NEW)
 BTF_ID_FLAGS(func, bpf_iter_testmod_seq_next, KF_ITER_NEXT | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_iter_testmod_seq_destroy, KF_ITER_DESTROY)
@@ -2924,6 +3277,8 @@ static int bpf_testmod_init(void)
 
 static void bpf_testmod_exit(void)
 {
+	napi_test_remove();
+
         /* Need to wait for all references to be dropped because
          * bpf_kfunc_call_test_release() which currently resides in kernel can
          * be called after bpf_testmod is unloaded. Once release function is
