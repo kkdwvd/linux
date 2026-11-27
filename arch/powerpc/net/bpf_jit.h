@@ -183,8 +183,6 @@ struct codegen_context {
 	u64 arena_vm_start;
 	u64 user_vm_start;
 	bool is_subprog;
-	bool exception_boundary;
-	bool exception_cb;
 	void __percpu *priv_sp;
 	unsigned int priv_stack_size;
 };

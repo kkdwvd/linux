@@ -823,8 +823,10 @@ __naked void thresholds_over_budget(void)
 	"r0 = *(u8 *)(r1 + 0);"
 	".rept 500;"
 	"r6 = 0;"
-"3:"	MAY_GOTO(10)
+"3:"	MAY_GOTO(11)
 	"call %[bpf_get_prandom_u32];"
+	/* the way to what follows the loop: the jump of may_goto ends the prog */
+	"if r0 == 2 goto 5f;"
 	"if r0 & 1 goto 4f;"
 	"if r6 >= 60000 goto 4f;"
 	"r6 += 1;"
@@ -834,7 +836,7 @@ __naked void thresholds_over_budget(void)
 	"r1 = 0;"
 	"call long_dead_code;"
 	"goto 3b;"
-	"r6 >>= 10;"
+"5:	r6 >>= 10;"
 	"r1 = r9;"
 	"r1 += r6;"
 	"r0 = *(u8 *)(r1 + 0);"
@@ -1083,7 +1085,14 @@ int calls_hold_other_things(struct __sk_buff *skb)
 	return val;
 }
 
-/* a recursive function is verified on its own, also with an argument that can be NULL */
+/*
+ * a recursive function is verified on its own, also with an argument that can be NULL. When its
+ * check of the stack fails it is unwound, and the landing pad of the caller drops the object: it
+ * returns only with a pointer that it has tested.
+ * bpf_throw() unwinds through the callers as well. On the path with NULL the function still has
+ * the reference of its caller, who tests the pointer: it stays on its own.
+ * The progs call kfuncs and are unwound, which takes a JIT: without one they are not loaded.
+ */
 static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 {
 	if (!p)
@@ -1097,7 +1106,9 @@ static __noinline struct pair *throw_if_null(struct pair *p, long depth)
 SEC("tc")
 __description("calls: the function tests a reference of the caller for NULL")
 __arch_x86_64
-__failure __msg("invalid mem access 'scalar'") __not_msg("verifier bug")
+__load_if_JITed()
+__success __log_level(2) __not_msg("verifier bug")
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0")
 int callee_tests_null(struct __sk_buff *skb)
 {
 	struct pair *n = bpf_obj_new(typeof(*n)), *copy;
@@ -1107,6 +1118,126 @@ int callee_tests_null(struct __sk_buff *skb)
 	if (!n)
 		return *(volatile long *)&copy->a;
 	bpf_obj_drop(n);
+	return 0;
+}
+
+/*
+ * The same function, and a caller that does not read through what it returns. With NULL the
+ * function throws, and the caller holds nothing then: its landing pad tests the pointer.
+ */
+SEC("tc")
+__description("calls: the function throws if the reference of the caller is NULL")
+__arch_x86_64
+__load_if_JITed()
+__success __retval(0) __log_level(2) __not_msg("verifier bug")
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0")
+int callee_throws_on_null(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+
+	throw_if_null(n, skb->mark);
+	barrier_var(n);
+	if (n)
+		bpf_obj_drop(n);
+	return 0;
+}
+
+/*
+ * The same at run time, with a reference that is NULL there: no task has that pid. The function
+ * throws, and the landing pad of the caller runs with 0 in the place of the task. It releases
+ * nothing, and the prog returns what was thrown. With the task of pid 1 the function returns, and
+ * the prog releases the task itself.
+ */
+static __noinline struct task_struct *throw_if_no_task(struct task_struct *t, long depth)
+{
+	if (!t)
+		bpf_throw(7);
+	if (depth)
+		throw_if_no_task(t, depth - 1);
+	barrier_var(t);
+	return t;
+}
+
+int no_such_pid = 0x7fffffff;
+int init_pid = 1;
+
+#define THROWS_IF_NO_TASK(name, desc, pid, ret)						\
+SEC("tc")										\
+__description("calls: " desc)								\
+__arch_x86_64										\
+__load_if_JITed()									\
+__success __retval(ret) __log_level(2)							\
+__msg("landing pad of call at {{[0-9]+}}: ref@{{[0-9]+}}({{[^)]+}}) if not 0 rcu=0 preempt=0") \
+int name(struct __sk_buff *skb)								\
+{											\
+	struct task_struct *t = bpf_task_from_pid(pid);					\
+											\
+	throw_if_no_task(t, skb->mark);							\
+	barrier_var(t);									\
+	if (t)										\
+		bpf_task_release(t);							\
+	return 0;									\
+}
+
+THROWS_IF_NO_TASK(callee_throws_on_null_run, "the function throws, the reference of the caller is NULL when it runs",
+		  no_such_pid, 7)
+THROWS_IF_NO_TASK(callee_returns_on_task_run, "the function returns, the caller holds the reference when it runs",
+		  init_pid, 0)
+
+/*
+ * A function that returns when it finds the reference of its caller to be NULL. The caller may
+ * rely on what the function found: on the path with NULL it holds nothing. So such a call is
+ * verified in the frames of the caller, where the test is one of the caller's state, like a
+ * call that releases the reference. With a depth that is known the frames are enough.
+ */
+static __noinline long null_is_error(struct pair *p, long depth)
+{
+	long r = 1;
+
+	if (!p)
+		return -1;
+	if (depth)
+		r = null_is_error(p, depth - 1);
+	barrier_var(r);
+	return r;
+}
+
+SEC("tc")
+__description("calls: the caller believes the function that found its reference NULL")
+__arch_x86_64
+__load_if_JITed()
+__success __retval(0)
+int caller_believes_callee(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+	long depth = 2;
+
+	barrier_var(depth);
+	if (null_is_error(n, depth) < 0)
+		return 0;
+	if (n)
+		bpf_obj_drop(n);
+	return 0;
+}
+
+/*
+ * With a depth that is not known the frames have no end. That is a limit, the prog is safe: its
+ * caller tests the pointer itself. Only a function that is unwound when it finds NULL stays on
+ * its own, see throw_if_null().
+ */
+SEC("tc")
+__description("calls: a recursion of any depth returns if the reference of the caller is NULL")
+__arch_x86_64
+__load_if_JITed()
+__failure __msg("the call stack of {{[0-9]+}} frames is too deep")
+int callee_returns_on_null(struct __sk_buff *skb)
+{
+	struct pair *n = bpf_obj_new(typeof(*n));
+
+	null_is_error(n, skb->mark);
+	barrier_var(n);
+	if (n)
+		bpf_obj_drop(n);
 	return 0;
 }
 
@@ -1536,10 +1667,16 @@ __naked void ctx_moves(void)
 	EXIT_AT_9);
 }
 
-/* The verifier can't tell that the loop ends. It adds may_goto, which leaves with r7 = 0. */
+/*
+ * The verifier can't tell that the loop ends. It adds may_goto, which unwinds the function: no
+ * path continues with r7 = 0.
+ */
 SEC("tc")
-__description("failing_path: the path continues where may_goto leaves an infinite loop")
-__failure __msg("R7 invalid mem access 'scalar'")
+__description("failing_path: no path continues where may_goto ends an infinite loop")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success
 __naked void exit_of_infinite_loop(void)
 {
 	ASM(VALUE_IN_R9
@@ -1600,6 +1737,16 @@ SEC("tc")
 __description("failing_path: a guess skips the trips of a sum")
 __success __retval(0)
 __naked void guess_skips_sum(void)
+{
+	NO_CONSTANT_STEP(+=, 1000, 499500);
+}
+
+/* The path that skips the trips is marked in the log of level 2. A pass that peels them follows. */
+SEC("tc")
+__description("failing_path: level 2 marks the path that skips the trips of a sum as a guess")
+__success __log_level(2)
+__msg("path-sensitive run after pass 0") __msg("this path has a guess") __msg("pass 1")
+__naked void guess_of_sum_in_level_2(void)
 {
 	NO_CONSTANT_STEP(+=, 1000, 499500);
 }
@@ -1829,9 +1976,11 @@ __naked void spilled_iv_is_no_guess(void)
 }
 
 /*
- * With @bound 7 no execution disables preemption. The joined state does, and then may_goto of
- * the loop at 3 cannot return 0. It goes to the load, with r0 = NULL.
- * With @bound 8 an execution with r6 == 8 disables preemption, so the error is real.
+ * With @bound 7 no execution disables preemption. The joined state does, and then the landing
+ * pad of may_goto of the loop at 3 has two numbers of sections to leave: it takes them from
+ * hidden slots. A pass that keeps r6 apart has one number.
+ * With @bound 8 an execution with r6 == 8 disables preemption, once for each trip of the loop
+ * at 2, and never enables it: the error is real.
  */
 #define GUARD_OF_THE_JOIN(bound)					\
 	asm volatile (							\
@@ -1867,7 +2016,7 @@ __naked void spilled_iv_is_no_guess(void)
 	:: OPS, __imm(bpf_preempt_disable) : __clobber_all)
 
 SEC("tc")
-__description("failing_path: a joined state selects the target of may_goto")
+__description("failing_path: a joined state is in a section at may_goto")
 __success
 __naked void guess_takes_target_of_join(void)
 {
@@ -1875,17 +2024,20 @@ __naked void guess_takes_target_of_join(void)
 }
 
 SEC("tc")
-__description("failing_path: a real state selects the target of may_goto")
-__failure __msg("R0 invalid mem access 'map_value_or_null'") __msg("this path has a guess")
+__description("failing_path: a real state is in a section at may_goto")
+__failure
+__msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable-ed region")
+__not_msg("this path has a guess")
 __naked void guess_takes_real_target(void)
 {
 	GUARD_OF_THE_JOIN(8);
 }
 
 SEC("tc")
-__description("failing_path: level 2 marks a path with a guess")
+__description("failing_path: level 2 has the path-sensitive run and the next pass")
 __failure __log_level(2) __msg("path-sensitive run after pass 0")
-__msg("this path has a guess") __msg("pass 1")
+__msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable-ed region")
+__msg("pass 1")
 __naked void guess_in_level_2(void)
 {
 	GUARD_OF_THE_JOIN(8);
@@ -2557,13 +2709,21 @@ int leak_made_up_in_loop(struct __sk_buff *skb)
 	return 0;
 }
 
+/*
+ * The time of may_goto that is up ends the prog, and no state takes its jump. These loops have
+ * another way out, so that what follows them is verified.
+ */
+#define OR_BREAK	if (bpf_get_prandom_u32() & 1) break
+
 SEC("tc")
 __description("held: a loop acquires and does not release")
 __failure __msg("BPF_EXIT instruction in main prog cannot be used inside bpf_preempt_disable")
 int loop_only_acquires(void *unused)
 {
-	while (can_loop)
+	while (can_loop) {
+		OR_BREAK;
 		bpf_preempt_disable();
+	}
 	return 0;
 }
 
@@ -2571,6 +2731,7 @@ int loop_only_acquires(void *unused)
 	void *prev = NULL, *cur = NULL;					\
 									\
 	while (can_loop) {						\
+		OR_BREAK;						\
 		if (prev)						\
 			bpf_ringbuf_discard(prev, 0);			\
 		prev = cur;						\
@@ -2602,6 +2763,31 @@ SEC("tc")
 __description("held: a reference that is in no xreg")
 __failure __msg("Unreleased reference") FEW_INSNS
 int loop_drops_the_pointer(void *unused)
+{
+	void *cur = NULL;
+
+	while (can_loop) {
+		OR_BREAK;
+		cur = bpf_ringbuf_reserve(&rb, 8, 0);
+	}
+	if (cur)
+		bpf_ringbuf_discard(cur, 0);
+	return 0;
+}
+
+/*
+ * may_goto of the program is the only way out of the loop, and it ends the prog: no state gets
+ * to an exit with what leaks. A landing pad that releases what the frame holds at may_goto is
+ * needed all the same, and it has no room for one record more in each trip.
+ */
+SEC("tc")
+__description("held: a reference that is in no xreg, only may_goto ends the loop")
+__arch_x86_64 __arch_arm64
+__load_if_JITed()
+__failure
+__msg("landing pad of may_goto of the program at {{[0-9]+}}: conflict: too much is held")
+FEW_INSNS
+int loop_drops_the_pointer_for_good(void *unused)
 {
 	void *cur = NULL;
 
@@ -3100,7 +3286,10 @@ __naked void peel_does_not_starve(void)
 {
 	ASM(VALUE_IN_R9
 	"r6 = 0;"
-"1:"	MAY_GOTO(2)
+	/* the way to what follows the loop: the jump of may_goto ends the prog */
+"1:	call %[bpf_get_prandom_u32];"
+	"if r0 == 0 goto +3;"
+	MAY_GOTO(2)
 	"r6 += 1;"
 	"goto 1b;"
 	"call %[bpf_get_prandom_u32];"
@@ -3310,6 +3499,59 @@ __naked void good_pass_is_the_result(void)
 	"r0 = 0;"
 	"exit;"
 	:: __imm(bpf_get_prandom_u32), __imm(bpf_probe_read_kernel), __imm(bpf_loop)
+	: __clobber_all);
+}
+
+/*
+ * The same, and the good pass has a landing pad: its plans come back with it when the later pass
+ * fails. The loop is out of time with preemption off, and the pad turns it on. test_loader has no
+ * context for the prog: unwind_release runs one like it.
+ */
+SEC("syscall")
+__description("pessimized: a later pass is over the budget, the good pass has a landing pad")
+__arch_x86_64 __arch_arm64
+__success
+__log_level(6) __msg("landing pad of may_goto at {{[0-9]+}}: rcu=0 preempt=1")
+__msg("BPF program is too complex") __msg("stack depth max 128")
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("call kernel-function")
+/* -ECANCELED */
+__xlated("r0 = -125")
+__xlated("exit")
+__naked void good_pass_has_a_pad(void)
+{
+	asm volatile (
+	"r6 = r1;"
+	"*(u64 *)(r10 - 64) = 0;"
+	"call %[bpf_get_prandom_u32];"
+	"r5 = 1;"
+	"r7 = 0;"
+	".rept 14;"
+	"r0 >>= 1;"
+	"if r0 & 1 goto +1;"
+	"r7 += r5;"
+	"r5 <<= 1;"
+	".endr;"
+	"r1 = r6;"
+	"r1 += r7;"
+	"r2 = 8;"
+	"r3 = 0;"
+	"call %[bpf_probe_read_kernel];"
+	"r1 = 2;"
+	"r2 = frame_of_64 ll;"
+	"r3 = 0;"
+	"r4 = 0;"
+	"call %[bpf_loop];"
+	"call %[bpf_preempt_disable];"
+"1:	call %[bpf_get_prandom_u32];"
+	"if r0 != 5 goto 1b;"
+	"call %[bpf_preempt_enable];"
+	"r0 = 7;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32), __imm(bpf_probe_read_kernel), __imm(bpf_loop),
+	   __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
 	: __clobber_all);
 }
 

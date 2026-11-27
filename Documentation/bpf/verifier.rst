@@ -756,27 +756,151 @@ none of these holds                    the verifier adds ``may_goto``
 =====================================  =========================================
 
 *may_goto* is a jump that is taken when the program has looped too long. The
-verifier puts it before a jump that leaves the loop, or at the header. It
-checks the new edge like any other edge::
+verifier puts it before a jump that leaves the loop, or at the header. The new
+edge has one target, a *landing pad* that the verifier emits after the last
+insn of the function::
 
   do {                          do {
           p = lookup();                 p = lookup();
-  } while (!p);                         may_goto leave;
+  } while (!p);                         may_goto pad;
   use(p);                       } while (!p);
                                 use(p);
                                 ...
-                                leave: return 0;
+                                pad: release what the function holds
+                                     return, or unwind
 
-Where does the edge go? The verifier takes the first line that is possible:
+The pad releases what the function acquired since its entry. Then:
 
-- In the main function: ``return 0``, if nothing has to be released and 0 is a
-  valid result.
-- In another function: *unwind*, if nothing has to be released and each call has
-  an ``unwind_goto`` after it. The function leaves with ``unwind_exit``, and
-  ``unwind_goto`` jumps to the code of the caller that cleans up.
-- The exit of the loop. The code there has to be safe. From a header the edge
-  leaves the outer loops too. If the code there reads a register that is not
-  set, the function returns 0.
+- The main function returns the value of ``bpf_unwound_retval()``: 0 where 0
+  refuses or changes nothing.
+- Another function *unwinds*. It leaves with ``kexit``, and the ``kgoto`` after
+  its call jumps to the pad of the caller, which the verifier emits too. Only
+  the verifier emits these two insns.
+
+A program can unwind by itself: its ``unwind_exit`` leaves a function, and the
+``unwind_goto`` after the call jumps to a landing pad that the program has,
+which is code like any other and may go on with the program. What the kernel
+unwinds cannot be caught that way. ``kexit`` goes to ``kgoto`` only, at every
+call, whether the program has ``unwind_goto`` there or not: a program that is
+stopped ends in the function that the kernel called, with the value of the
+kernel.
+
+A landing pad of the program that *only resumes* runs all the same: from its
+first insn no ``exit``, tail call or ``LD_ABS`` can be reached, and
+``unwind_exit`` can, see ``bpf_find_kernel_pads()``. That is a destructor of C++
+or drop glue of Rust. ``kgoto`` goes there through an *entry* that the verifier
+emits::
+
+  call foo                      call foo
+  unwind_goto pad               unwind_goto stub
+  ...                           kgoto entry
+  pad: call dtor                ...
+       unwind_exit              pad:   call dtor
+                                       gotol rest
+                                stub:  K = 0
+                                       gotol pad
+                                entry: K = 1
+                                       r0 = 0
+                                       gotol pad
+                                rest:  if K == 0 goto +N
+                                       release what the function still holds
+                                       kexit
+                                       unwind_exit
+
+``K`` is a hidden word of the stack frame: 1 while the kernel unwinds the frame.
+No insn on the normal path of the function writes it. It is written where a
+frame gets from the normal path into a landing pad: ``unwind_goto`` of the
+program goes to a *stub* that clears it, and the entry sets it. Only *pad code*
+reads it, which is what can be reached from the first insn of a landing pad that
+only resumes, see ``find_pad_code()``. A call in pad code can be made by a frame
+that the kernel unwinds already: there ``unwind_goto`` keeps its target, and the
+entry tests ``K`` and stores only if it is 0. A function in which some insn is
+pad code and can be reached from the first insn of the function without the
+jump of ``unwind_goto`` as well is *mixed*. It clears ``K`` at its entry
+instead, with one store per call, has no stub, and all its entries test.
+
+The frame of a state has the same mark, *forced*, see ``enter_kernel_pad()``. A
+forced state and one of the normal path are never joined. The pad is verified
+once more for the forced state, with 0 in ``R0``; an error there rejects the
+program. A forced frame is left only with ``kexit`` and the value that its
+unwinding began with: at ``unwind_exit`` of the program, and at the sites that
+it gets to in the pad. No register is read at ``unwind_exit``, so the entry
+copies the pointers that the frame holds into hidden *save words*, see
+``visit_saves()``, and the code behind the pad releases from them what the
+state still holds. A save word has a pointer only: irq flags, an iterator or a
+dynptr in the stack of a caller and a lock that only a register has the address
+of must be released by the pad itself. Where the states that get to a call do
+not agree on what the frame holds, its entry saves nothing, and what the pad
+leaves has the places that it has without save words.
+
+The kernel enters every landing pad that only resumes and that it can get to,
+or the program does not load. The log of a program that is rejected for this
+says what could not be arranged, and names the landing pad where the verifier
+knows which one it is:
+
+- The stack of the function has no room for the hidden words, or the entry has
+  no value to keep.
+- What the frame still holds at ``unwind_exit`` of the pad has no plan, or a
+  site in the code of the pad or in a function that it calls has none. A frame
+  that the kernel unwinds gets no hidden slots of its own. What a destructor
+  releases in the pad needs neither a plan nor a slot there.
+- A pad of the verifier in a caller has no plan because of what the landing pad
+  does there: it unlocks a lock or leaves an RCU section of the caller on some
+  ways out of the function only, or writes to its irq flags. Or it releases of
+  a caller what a function on the stack needs a hidden slot for.
+
+The destructors of a frame do not run on a kernel unwind in these cases, and in
+no other. A pad behind a call that no kernel unwind comes back to skips nothing.
+
+- The pad can return, or never gets to ``unwind_exit``: a catch clause, and the
+  pad of a ``noexcept`` function, which ends in ``std::terminate()``. The
+  destructors that such a pad runs before its catch clause or before that call
+  do not run either.
+- The function cannot be unwound: the JIT cannot do it, or a helper without an
+  unwind label calls the function.
+- The frame in which the unwinding starts has no pad to enter: the frame of the
+  loop, of the access to arena, of the recursion check or of ``bpf_throw()``.
+  Its destructors do not run. Inlining decides which it is.
+- A frame above it whose call has no ``unwind_goto``, because the callee is
+  ``noexcept`` or ``nounwind`` or was inlined: its destructors do not run.
+
+A pad that the kernel enters runs to its end when the program was stopped for
+a fault in arena, for ``bpf_throw()`` or for a recursion that is too deep. When
+the time of the program was up it still is: a loop in pad code is left at its
+first ``may_goto``, of the program or of the verifier, the pad of that
+``may_goto`` releases what the function holds, and what follows the loop in the
+landing pad does not run.
+
+Where the program has no ``unwind_goto`` after a call that its ``unwind_exit``
+comes back to, the verifier adds one, and a pad that ends in ``unwind_exit``.
+What a landing pad of the program above reads depends on the functions in
+between:
+
+=====================================  =========================================
+the function in between                what gets through it
+=====================================  =========================================
+a static function                      ``R0`` as ``unwind_exit`` left it, a
+                                       pointer as well as a number, and ``R2``
+                                       if the function returns two registers
+a global function that has a landing   what that pad leaves at its
+pad of its own at the call             ``unwind_exit``: a number, or a pointer
+                                       to arena
+a global function without one          nothing: ``R0`` is the value of the
+                                       kernel, ``bpf_unwound_retval()``, and
+                                       ``R2`` is 0 if the function returns two
+                                       registers
+=====================================  =========================================
+
+The callers of a global function are verified without it and take what comes
+out of it for a number, so the pad that the verifier gives it passes nothing
+on. That depends neither on what ``unwind_exit`` left nor on ``bpf_throw()``
+being somewhere in the program. A compiler that wants an object to get through
+a global function gives the call there a landing pad that only resumes.
+
+No insn stands for a pad in a pass. The state on the edge leaves its function
+at the ``may_goto``, see ``unwind_frame()``. One pad has to serve all states
+that get there. If none does, or if the function cannot unwind, that is a
+*conflict*: an error of the pass, like an unproven insn.
 
 A loop without an exit is an error.
 
@@ -911,13 +1035,14 @@ recursion           the start of the function     a check at run time
 ==================  ============================  ==============================
 
 A recursive function starts with ``may_goto`` and a test of the free stack. If
-there is no room, it returns 0 or unwinds. The verifier checks that edge too.
+there is no room, it unwinds. The verifier checks that edge too.
 A recursion in frames is not joined. It has to end in ``MAX_CALL_FRAMES``.
 
 An async callback, for example of a timer, runs later. It starts as a new state
 with an empty stack. ``callx`` is checked as a call of each function that the
-register can hold. ``bpf_throw()`` ends the program from any frame, so nothing
-can be held there.
+register can hold. ``bpf_throw()`` unwinds the program from any frame, like
+``may_goto`` of the verifier: each frame is left through a landing pad that
+releases what the frame holds.
 
 After an error
 ==============
@@ -1071,7 +1196,7 @@ The run has the same checks as a pass, and other rules:
   insn.
 - If only the jump on the iv depends on the xregs that moved in a trip, and all
   other live xregs are the same, the path skips trips.
-- If a loop does not end, the path continues where ``may_goto`` leaves it.
+- If a loop does not end, the path leaves the function at its ``may_goto``.
 
 The path can end only at an unproven insn of the last pass. This includes an
 insn that was unproven because of another one. An error at any other insn drops
@@ -1082,7 +1207,7 @@ is something new: after ADD_DEPS, after a partition helped, after the budget
 grew, and before the final reject. It does not start again when there is a
 failing path.
 
-Three guesses of the run can make a path that the program cannot take. If such
+Two guesses of the run can make a path that the program cannot take. If such
 a path cuts the budget, a valid program can be rejected. So a path of such a
 run, a *path with a guess*, goes to the log, but the budget is not cut. If a
 pass has a real error, the log has that error.
@@ -1123,19 +1248,6 @@ also for a ring index. The same function finds it::
 
 The next runs keep this answer. So it is also a guess if the run made a guess
 before it.
-
-The third guess is the target of ``may_goto``. All states have the same one::
-
-  large = x > 7;
-  while (...) {
-          if (large && x <= 7) lock();        only a join gets here
-          do { p = lookup(); } while (!p);    gets may_goto
-          *p
-  }
-
-With no lock the target is ``return 0``. The joined state gets to ``lock()``, so
-the pass selects the code after the loop. A path with no lock goes there too,
-and ``*p`` fails.
 
 The run accepts nothing: it drops states and skips trips. It is not the verdict
 either: a path has ranges too, and it can fail at an insn that a pass proves.
@@ -1276,12 +1388,17 @@ A barrier has to stop each edge that leads to the insn::
 
   fall-through, jump, call, return     barrier before the insn
   exit of a callback --> helper        barrier at the exit
-  may_goto --> r0 = 0; exit            barrier before r0 = 0
   call --> recursion in frames         barrier at the call
   return --> dead code                 goto -1 replaces the code
 
 A speculative state is joined only with speculative states, and it subsumes
 only speculative states.
+
+A landing pad has no barrier, and no speculative state is verified on the way
+to one. So a program gets landing pads, and can have ``unwind_exit``,
+``unwind_goto`` and ``bpf_throw()``, only with ``CAP_PERFMON``. Without it no
+function can unwind: a loop that needs ``may_goto`` of the verifier and a
+recursion are conflicts, and ``may_goto`` of the program jumps.
 
 Some mechanisms depend on a capability. The last line is there because the cpu
 can go past the jump that a proof needs:
@@ -1292,7 +1409,7 @@ can go past the jump that a proof needs:
                                    full `Limits`_
 ``CAP_PERFMON``                    trip count, reads of stack that is not
                                    written, pointers as numbers, access to BTF
-                                   objects, arena
+                                   objects, arena, landing pads
 ``CAP_PERFMON`` or no mitigations  equations of pointers, equations that a join
                                    makes from constants, the end of infeasible
                                    states, skipped first trips, stack access
@@ -1459,6 +1576,9 @@ Common errors
 ``loop at insn 2 never exits``
   The loop has no edge that leaves it.
 
+``landing pad of may_goto at 7: conflict: the number of sections differs``
+  No landing pad serves all states that leave the function there.
+
 ``BPF program is too complex``, ``the limit on cost or memory ended pass 6``
   The load is over a limit. If a pass had an error before, the log has that
   error, or a path with a guess. That path can be false.
@@ -1471,6 +1591,8 @@ barrier             the ``nospec`` insn, it stops speculative execution
 basic block         a run of insns without a jump into it or out of it
 budget              a limit on the cost of one step
 checked             the bytes of a packet that are known to be before its end
+conflict            no landing pad serves all states that leave a function at
+                    an insn, or the function cannot unwind
 control_deps        xregs whose value flows to a jump that can skip an unproven
                     insn
 correlated          two branches: one tests a result that the other one stored
@@ -1483,6 +1605,8 @@ failing path        a path without joins on which the check of an unproven insn
                     fails; it is the result of a path-sensitive run
 fixpoint            the state at a header subsumes all states that come back
 fixups              what a pass notes for the rewrite of the program
+forced              a frame that the kernel unwinds through a landing pad of the
+                    program: it is left with ``kexit`` only
 fork                check an insn once for each part of the values of an operand
 gap                 a value of a join that is in neither state
 good pass           a pass without errors
@@ -1502,6 +1626,9 @@ iv                  induction variable: each trip adds a constant to it
 join                two states become one that has the values of both
 join point          an insn where states can meet
 join_key            what has no join: states with two join_keys never meet
+landing pad         code that the verifier emits after a function: it releases
+                    what the function holds, then the function returns or
+                    unwinds
 leftover            all trips that are not peeled
 live                read later, before it is written
 may_goto            a jump that is taken when the program has looped too long
@@ -1533,7 +1660,8 @@ trip count          the largest trip index + 1
 trip index          how many times the program came back to the header
 unproven            an insn or a part whose check failed in a state of the pass
 unreadable          an xreg without a value: an insn that reads it is unproven
-unwind              leave a function with ``unwind_exit``
+unwind              leave a function with ``kexit``, or with ``unwind_exit``
+                    that the program has
 walk                one check of the body of a loop
 widen               move a bound that grows to a threshold
 xreg                a register, a stack slot or the trip index of a loop

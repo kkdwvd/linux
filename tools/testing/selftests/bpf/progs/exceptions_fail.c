@@ -106,12 +106,12 @@ int reject_exception_cb_type_5(struct __sk_buff *ctx)
 __noinline
 static int timer_cb(void *map, int *key, struct bpf_timer *timer)
 {
-	bpf_throw(0);
+	bpf_throw(1);
 	return 0;
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback subprog")
+__success __retval(0)
 int reject_async_callback_throw(struct __sk_buff *ctx)
 {
 	struct hmap_elem *elem;
@@ -129,11 +129,12 @@ __noinline static int subprog_lock(struct __sk_buff *ctx)
 	bpf_spin_lock(&lock);
 	if (ctx->len)
 		bpf_throw(0);
+	bpf_spin_unlock(&lock);
 	return ret;
 }
 
 SEC("?tc")
-__failure __msg("function calls are not allowed while holding a lock")
+__success __retval(0)
 int reject_with_lock(void *ctx)
 {
 	bpf_spin_lock(&lock);
@@ -142,14 +143,14 @@ int reject_with_lock(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("function calls are not allowed while holding a lock")
+__success __retval(0)
 int reject_subprog_with_lock(void *ctx)
 {
 	return subprog_lock(ctx);
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -165,7 +166,7 @@ __noinline static int throwing_subprog(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_subprog_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -181,7 +182,7 @@ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
 }
 
 SEC("?tc")
-__failure __msg("function calls are not allowed while holding a lock")
+__success __retval(0)
 int reject_with_rbtree_add_throw(void *ctx)
 {
 	struct foo *f;
@@ -196,7 +197,7 @@ int reject_with_rbtree_add_throw(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_with_reference(void *ctx)
 {
 	struct foo *f;
@@ -216,7 +217,7 @@ __noinline int global_subprog_may_throw(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_global_subprog_throw_with_reference(struct __sk_buff *ctx)
 {
 	struct foo *f;
@@ -248,7 +249,7 @@ __noinline static int subprog_cb_ref(u32 i, void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_with_cb_reference(void *ctx)
 {
 	struct foo *f;
@@ -262,7 +263,7 @@ int reject_with_cb_reference(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__success __retval(0)
 int reject_with_cb(void *ctx)
 {
 	bpf_loop(5, subprog_cb_ref, NULL, 0);
@@ -270,7 +271,7 @@ int reject_with_cb(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_with_subprog_reference(void *ctx)
 {
 	return subprog_ref(ctx) + 1;
@@ -304,7 +305,7 @@ __noinline int global_func(struct __sk_buff *ctx)
 
 SEC("?tc")
 __exception_cb(throwing_exception_cb)
-__failure __msg("cannot be called from callback subprog")
+__success __retval(0)
 int reject_throwing_exception_cb(struct __sk_buff *ctx)
 {
 	return 0;
@@ -370,7 +371,7 @@ __noinline static int loop_cb2(u32 index, int *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__success __retval(0)
 int reject_exception_throw_cb(struct __sk_buff *ctx)
 {
 	bpf_loop(5, loop_cb1, NULL, 0);
@@ -378,7 +379,7 @@ int reject_exception_throw_cb(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__success __retval(0)
 int reject_exception_throw_cb_diff(struct __sk_buff *ctx)
 {
 	if (ctx->protocol)
@@ -417,7 +418,7 @@ __noinline static int rcu_lock_then_throw(void)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_subprog_rcu_lock_throw(void *ctx)
 {
 	rcu_lock_then_throw();
@@ -425,7 +426,7 @@ int reject_subprog_rcu_lock_throw(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_preempt_disable-ed region")
+__success __retval(0)
 int reject_subprog_throw_preempt_lock(void *ctx)
 {
 	bpf_preempt_disable();
@@ -435,7 +436,7 @@ int reject_subprog_throw_preempt_lock(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_local_irq_save-ed region")
+__success __retval(0)
 int reject_subprog_throw_irq_lock(void *ctx)
 {
 	unsigned long flags;

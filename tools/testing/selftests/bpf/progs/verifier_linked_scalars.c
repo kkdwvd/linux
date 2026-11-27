@@ -812,7 +812,10 @@ LINK_TEST(and_cuts_in_the_middle, TOO_FAR,
 LINK_TEST(and_rounds_down_far, TOO_FAR,
 	  "r6 &= 0xff; r7 = r6; r7 &= 0xf0; if r7 > 7 goto 1f;")
 
-/* r7 is 4 * trip + 8, r8 is 8 * trip. The loop has no trip count, so the products wrap. */
+/*
+ * r7 is 4 * trip + 8, r8 is 8 * trip. The loop has no trip count, so the products wrap. It is
+ * left when the random number is 0: the jump of may_goto ends the prog.
+ */
 #define STRIDE_TEST(name, verdict, body)			\
 SEC("raw_tp")							\
 verdict								\
@@ -823,6 +826,8 @@ __naked void name(void)						\
 	"r8 = 0;"						\
 	"*(u64 *)(r10 - 8) = r8;"				\
 "2:"								\
+	"call %[bpf_get_prandom_u32];"				\
+	"if r0 == 0 goto +4;"					\
 	".8byte %[may_goto];"					\
 	"r7 += 4;"						\
 	"r8 += 8;"						\

@@ -216,7 +216,11 @@ void scx_ops_cid_sched_updated_enable(struct scx_sched *sch)
 
 	lockdep_assert_held(&scx_enable_mutex);
 
-	if (!SCX_HAS_OP(sch, sub_cid_sched_updated) || scx_nr_ops_cid_sched_updated++)
+	if (!SCX_HAS_OP(sch, sub_cid_sched_updated))
+		return;
+	/* has_op goes when @sch fails, see scx_fail(): what was counted has to stay */
+	sch->cid_sched_updated_counted = true;
+	if (scx_nr_ops_cid_sched_updated++)
 		return;
 
 	static_branch_enable(&__scx_ops_cid_sched_updated_enabled);
@@ -241,7 +245,8 @@ void scx_ops_cid_sched_updated_enable(struct scx_sched *sch)
  * so that no sched is notified of @sch once it is gone. The last sched with the
  * op turns the key off first and clears every rq, so while the key is off every
  * rq->scx.sched is NULL. A sched whose enable failed before its has_op fill was
- * never counted, so has_op gates the decrement.
+ * never counted, and one that failed later has lost has_op, see scx_fail(). So
+ * the sched itself says whether it was counted, and that gates the decrement.
  */
 void scx_ops_cid_sched_updated_disable(struct scx_sched *sch)
 {
@@ -250,7 +255,8 @@ void scx_ops_cid_sched_updated_disable(struct scx_sched *sch)
 
 	lockdep_assert_held(&scx_enable_mutex);
 
-	last = SCX_HAS_OP(sch, sub_cid_sched_updated) && !--scx_nr_ops_cid_sched_updated;
+	last = sch->cid_sched_updated_counted && !--scx_nr_ops_cid_sched_updated;
+	sch->cid_sched_updated_counted = false;
 	if (last)
 		static_branch_disable(&__scx_ops_cid_sched_updated_enabled);
 
@@ -2155,7 +2161,8 @@ dump:
 	 */
 	wake_up_all(&scx_unlink_waitq);
 
-	if (parent->ops.sub_detach && sch->sub_attached) {
+	/* not the operator of a parent that failed, see scx_fail() */
+	if (parent->ops.sub_detach && sch->sub_attached && !scx_has_failed(parent)) {
 		struct scx_sub_detach_args sub_detach_args = {
 			.ops = &sch->ops,
 			.cgroup_path = sch->cgrp_path,
@@ -2231,7 +2238,7 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 	struct scx_sched *parent, *sch;
 	struct scx_task_iter sti;
 	struct task_struct *p;
-	s32 i, ret;
+	s32 ret;
 
 	mutex_lock(&scx_enable_mutex);
 
@@ -2328,6 +2335,8 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 
 	if (sch->ops.init) {
 		ret = SCX_CALL_OP_RET(sch, init, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init", ret);
 			scx_error(sch, "ops.init() failed (%d)", ret);
@@ -2352,8 +2361,16 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 		ret = -ENODEV;
 		goto err_disable;
 	}
-	ret = SCX_CALL_OP_RET(parent, sub_attach, NULL,
-			      &sub_attach_args);
+	/*
+	 * Not the operator of a parent that failed. And one that was unwound
+	 * returns 0, which is no consent, see scx_has_failed().
+	 */
+	ret = -ECANCELED;
+	if (!scx_has_failed(parent))
+		ret = SCX_CALL_OP_RET(parent, sub_attach, NULL,
+				      &sub_attach_args);
+	if (!ret && scx_has_failed(parent))
+		ret = -ECANCELED;
 	cgroup_unlock();
 
 	if (ret) {
@@ -2365,9 +2382,7 @@ void scx_sub_enable_workfn(struct kthread_work *work)
 
 	scx_bypass(sch, true);
 
-	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_BEGIN, SCX_OPI_END);
 
 	scx_ops_cid_sched_updated_enable(sch);
 
