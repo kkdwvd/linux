@@ -1069,19 +1069,12 @@ bool bpf_coro_run(void *frame)
 }
 EXPORT_SYMBOL_GPL(bpf_coro_run);
 
-/**
- * bpf_coro_run_bh - resume a frame from a place that is one for a program as it stands
- * @prog: the program of the frame, which the caller holds
- * @frame: the frame, which the kernel kept in its host, see __coro_defer
- *
- * bpf_coro_run() for a caller on a receive path, with bottom halves off: that is a read
- * section of RCU on one CPU already, the program does not sleep, and the caller knows the
- * program without asking the frame and does not nest. What is left of the bookkeeping is
- * the time slice of a program that has loops for one, and the landing pad.
- *
- * Returns true when the continuation did not return, as bpf_coro_run() does.
+/*
+ * bpf_coro_run_bh() for a program that has loops with a time slice: an invocation of its
+ * own, which puts the slice of the one that it may have interrupted aside and back, see
+ * bpf_timed_may_goto_save().
  */
-noinline bool bpf_coro_run_bh(const struct bpf_prog *prog, void *frame)
+static noinline bool bpf_coro_run_bh_timed(const struct bpf_prog *prog, void *frame)
 {
 	bpf_callback_t resume = READ_ONCE(*(bpf_callback_t *)frame);
 	struct bpf_timed_may_goto saved;
@@ -1098,6 +1091,35 @@ left:
 done:
 	bpf_timed_may_goto_restore(prog, &saved);
 	return unwound;
+}
+
+/**
+ * bpf_coro_run_bh - resume a frame from a place that is one for a program as it stands
+ * @prog: the program of the frame, which the caller holds
+ * @frame: the frame, which the kernel kept in its host, see __coro_defer
+ *
+ * bpf_coro_run() for a caller on a receive path, with bottom halves off: that is a read
+ * section of RCU on one CPU already, the program does not sleep, and the caller knows the
+ * program without asking the frame and does not nest. What is left of the bookkeeping is
+ * the landing pad, and the time slice of a program that has loops for one, which most
+ * have not: then the call of the continuation is all there is.
+ *
+ * Returns true when the continuation did not return, as bpf_coro_run() does.
+ */
+noinline bool bpf_coro_run_bh(const struct bpf_prog *prog, void *frame)
+{
+	bpf_callback_t resume;
+	u64 ret, kind;
+
+	if (unlikely(prog->aux->timed_may_goto))
+		return bpf_coro_run_bh_timed(prog, frame);
+	resume = READ_ONCE(*(bpf_callback_t *)frame);
+	bpf_call_cb(resume, frame, 0, 0, 0, 0, ret, kind, left);
+	return false;
+left:
+	if (kind)
+		bpf_prog_unwound_to_kernel((unsigned long)resume);
+	return true;
 }
 
 /**
