@@ -558,7 +558,7 @@ Such a kfunc takes one frame and no other reference, and returns a scalar.
 An ``__offer`` parameter is a reference of the program that the kfunc may
 decline::
 
-        __bpf_kfunc bool bpf_foo_take(struct foo *foo__offer)
+        __bpf_kfunc bool bpf_rx_pass(struct sk_buff *skb__offer)
 
 The kfunc returns true where it took the reference, which the program no
 longer has then, and false where it did not: the program has it as before.

@@ -202,6 +202,10 @@ late_initcall(bpf_napi_kfunc_init);
  * the entry was, see __coro_defer in kernel/bpf/verifier.c. So the entry, which runs with
  * interrupts off, cannot poll, and the continuation can.
  *
+ * Code that has nothing to do where the NAPI is polled needs no frame for saying where
+ * that is: bpf_napi_poll_at() is the same two choices with the kernel's own poll behind
+ * them, and nothing to resume.
+ *
  * A thread that polls a NAPI nobody scheduled for it enters by itself, at again(): its
  * next poll of a NAPI that used up its budget, and a busy poll that takes an idle NAPI.
  * There the code may call bpf_napi_poll_run() at once: the poll runs in the thread, with no
@@ -319,9 +323,11 @@ static DEFINE_PER_CPU(struct napi_ext_cpu, napi_ext_cpu);
 
 /*
  * Which attachment this is, never 0: what a NAPI with a frame deferred has in bpf_poll_gen,
- * so that a frame of an extension that is gone is nothing to the next one.
+ * so that a frame of an extension that is gone is nothing to the next one. And what it has
+ * where the code left the poll to the kernel in the NAPI's thread, see bpf_napi_poll_at().
  */
 static u32 napi_ext_gen;
+#define NAPI_EXT_KERNEL	U32_MAX
 
 /**
  * napi_ext_enter - have the extension do the step where a NAPI is scheduled
@@ -465,8 +471,8 @@ int napi_ext_poll(struct napi_struct *napi)
 	/* the caller owns the NAPI: the mark is its to take */
 	if (gen)
 		napi->bpf_poll_gen = 0;
-	/* the kernel polls: the extension is gone, or left a frame of another */
-	if (unlikely(!ops))
+	/* the kernel polls: the extension is gone, or said so, or left a frame of another */
+	if (unlikely(!ops) || gen == NAPI_EXT_KERNEL)
 		return -1;
 	if (!gen) {
 		/* softirq, or a kernel thread, with a NAPI that came by the kernel's own hand */
@@ -588,6 +594,45 @@ __bpf_kfunc void bpf_napi_poll_native(struct napi_struct *napi)
 }
 
 /**
+ * bpf_napi_poll_at - leave the poll of a NAPI to the kernel, where the code says
+ * @napi: the NAPI that schedule() was entered with
+ * @where: BPF_NAPI_SOFTIRQ, or BPF_NAPI_THREAD
+ *
+ * bpf_napi_defer() for code that has nothing to do where the NAPI is polled: no frame, and
+ * no continuation. The poll waits for softirq on this CPU or for the thread that the NAPI
+ * is bound to, softirq if it has none, and whoever gets to it calls the driver as the
+ * kernel does. The step is the extension's, and what it costs is the entry.
+ */
+__bpf_kfunc void bpf_napi_poll_at(struct napi_struct *napi, u32 where)
+{
+	struct napi_ext_cpu *cur = this_cpu_ptr(&napi_ext_cpu);
+	unsigned long flags = 0;
+
+	if (!napi_ext_in(cur, napi, BIT(NAPI_EXT_SCHEDULE) | BIT(NAPI_EXT_REPOLL)))
+		return;
+	if (where == BPF_NAPI_THREAD) {
+		/* the thread's poll of it is the kernel's, and no again() */
+		napi->bpf_poll_gen = NAPI_EXT_KERNEL;
+		if (cur->ctx != NAPI_EXT_SCHEDULE)
+			local_irq_save(flags);
+		if (napi_bpf_schedule(napi)) {
+			if (cur->ctx != NAPI_EXT_SCHEDULE)
+				local_irq_restore(flags);
+			cur->ctx = NAPI_EXT_DONE;
+			return;
+		}
+		if (cur->ctx != NAPI_EXT_SCHEDULE)
+			local_irq_restore(flags);
+		napi->bpf_poll_gen = 0;
+	}
+	if (cur->ctx == NAPI_EXT_REPOLL)
+		cur->repoll = true;
+	else
+		napi_schedule_local(napi);
+	cur->ctx = NAPI_EXT_DONE;
+}
+
+/**
  * bpf_napi_poll_run - the driver's poll of a NAPI, once, with its budget
  * @napi: the NAPI, which the caller owns: the continuation of a poll that was deferred,
  *	or again()
@@ -634,6 +679,7 @@ BTF_KFUNCS_START(napi_ext_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_coro_frame_alloc_napi, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_napi_defer)
 BTF_ID_FLAGS(func, bpf_napi_poll_native, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_napi_poll_at, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_napi_poll_run, KF_RELEASE)
 BTF_KFUNCS_END(napi_ext_kfunc_ids)
 
@@ -646,6 +692,7 @@ BTF_ID_LIST(napi_ext_ids)
 BTF_ID(func, bpf_napi_poll_native)
 BTF_ID(func, bpf_napi_poll_run)
 BTF_ID(func, bpf_coro_frame_alloc_napi)
+BTF_ID(func, bpf_napi_poll_at)
 
 /*
  * schedule() runs with interrupts off and cannot poll, and again() is in the poll and has
@@ -664,7 +711,7 @@ static int napi_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
 	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
 		return kfunc_id == napi_ext_ids[1] ? 0 : -EACCES;
 	moff = prog->aux->attach_st_ops_member_off;
-	if (kfunc_id == napi_ext_ids[0])
+	if (kfunc_id == napi_ext_ids[0] || kfunc_id == napi_ext_ids[3])
 		return moff == offsetof(struct bpf_napi_ops, schedule) ? 0 : -EACCES;
 	if (kfunc_id == napi_ext_ids[1])
 		return moff == offsetof(struct bpf_napi_ops, again) ? 0 : -EACCES;
@@ -799,8 +846,8 @@ static int bpf_napi_ops_reg(void *kdata, struct bpf_link *link)
 		static_call_update(napi_ext_again_call, napi_ext_again_prog->bpf_func);
 		static_branch_enable(&napi_ext_direct_key);
 	}
-	/* another attachment than any before it: never 0 */
-	WRITE_ONCE(napi_ext_gen, napi_ext_gen + 1 ?: 1);
+	/* another attachment than any before it: never 0, nor what says that the kernel polls */
+	WRITE_ONCE(napi_ext_gen, napi_ext_gen + 1 >= NAPI_EXT_KERNEL ? 1 : napi_ext_gen + 1);
 	static_branch_inc(&napi_ext_key);
 	static_branch_inc(&napi_poll_hook_key);
 	rcu_assign_pointer(napi_ext_ops, ops);
@@ -946,6 +993,18 @@ late_initcall(napi_ext_init);
  * stays. With no merge() the call is not there, and the word of the packet that stays is
  * what it was.
  *
+ * Most packets need no frame: GRO merges them into one that it holds, or has no use for
+ * them, and their path is over in the entry. So the code may offer a packet before it has
+ * written anything. bpf_rx_pass() is dev_gro_receive() and, unless GRO holds the packet,
+ * what gro_receive_skb() does with the answer, as a call that may decline, see __offer in
+ * kernel/bpf/verifier.c: true, and the packet is gone; false, and GRO holds it, for the
+ * code, which takes the frame then and stays with the packet, bpf_rx_hold(). That is
+ * bpf_rx_gro() from there on. bpf_rx_offer() is the same offer for code that goes on with
+ * a packet of no use to GRO, to a backlog, say: it returns GRO's answer and the code has
+ * the packet in every case, with the answer still to be seen through where it gives the
+ * packet up. A packet that was offered with no frame has no word of state, and merge()
+ * gets 0 for it.
+ *
  * A packet can also wait for another CPU. bpf_rx_backlog() is the step that RPS is in the
  * kernel, as a boundary that may decline: the packet goes onto the backlog of the CPU that
  * the code names, with its frame suspended in its head, and process_backlog() resumes the
@@ -1062,7 +1121,7 @@ struct rx_ext_cpu {
 			u8 ctx;
 			bool offered;	/* GRO has seen the packet: not a second time */
 			bool framed;	/* its head lent a frame, and has the word of state */
-			bool pad;
+			bool pending;	/* bpf_rx_offer() did: GRO's answer is to be seen through */
 		};
 		u32 state;		/* the four, in the one store that begins an entry */
 	};
@@ -1135,7 +1194,9 @@ static noinline gro_result_t rx_ext_none(struct gro_node *gro, struct sk_buff *s
 static noinline void rx_ext_kept(struct rx_ext_cpu *cur)
 {
 	WARN_ON_ONCE(1);
-	if (cur->offered)
+	if (cur->pending)
+		rx_ext_gro_finish(cur->gro, cur->skb, cur->ret);
+	else if (cur->offered)
 		gro_normal_one(cur->gro, cur->skb, 1);
 	else
 		cur->ret = rx_ext_none(cur->gro, cur->skb);
@@ -1224,7 +1285,7 @@ static __always_inline bool __rx_ext_resume(struct rx_ext_cpu *cur, struct gro_n
 	return done;
 }
 
-/* A flush inside bpf_rx_gro() for another packet, as a rule */
+/* A flush inside bpf_rx_gro() or bpf_rx_offer() for another packet, as a rule */
 static noinline bool rx_ext_resume_nested(struct gro_node *gro, struct sk_buff *skb, u8 ctx)
 {
 	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu), saved = *cur;
@@ -1316,12 +1377,13 @@ int rx_ext_merge(struct sk_buff *p, struct sk_buff *skb)
 	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
 	u64 *into;
 
-	if (cur->skb != skb || cur->ctx != RX_EXT_ARRIVE || !cur->framed)
+	if (cur->skb != skb || cur->ctx != RX_EXT_ARRIVE)
 		return 0;
 	if (!NAPI_GRO_CB(p)->bpf_frame || gro_napi(cur->gro)->bpf_held != READ_ONCE(rx_ext_gen))
 		return 0;
 	into = rx_ext_state(p);
-	*into = static_call(rx_ext_merge_call)(*into, *rx_ext_state(skb));
+	/* a packet that was offered with no frame has no word: 0 for it */
+	*into = static_call(rx_ext_merge_call)(*into, cur->framed ? *rx_ext_state(skb) : 0);
 	return 0;
 }
 
@@ -1341,6 +1403,13 @@ static void rx_ext_batch(struct rx_ext_cpu *cur, struct sk_buff *skb)
 	int segs = cur->ctx == RX_EXT_RESUME ? NAPI_GRO_CB(skb)->count : 1;
 	struct gro_node *gro = cur->gro;
 
+	/* GRO answered bpf_rx_offer(): what gro_receive_skb() does with the answer */
+	if (cur->pending) {
+		cur->pending = false;
+		cur->ctx = RX_EXT_DONE;
+		rx_ext_gro_finish(gro, skb, cur->ret);
+		return;
+	}
 	cur->ret = GRO_NORMAL;
 	cur->ctx = RX_EXT_DONE;
 	if (gro)
@@ -1441,6 +1510,92 @@ __bpf_kfunc bool bpf_rx_gro(void *frame__coro_offer)
 }
 
 /**
+ * bpf_rx_offer - offer a packet to GRO with no frame
+ * @skb: the packet that arrive() was entered with
+ *
+ * dev_gro_receive() for code that has written nothing yet: most packets are merged into
+ * another or of no use to GRO, and their path needs no frame. Returns GRO's answer, an enum
+ * gro_result: GRO_NORMAL where GRO has no use for the packet, GRO_HELD where it holds the
+ * packet, and any other where the packet is part of another one now. The code has the
+ * packet still in each case, and the answer is seen through where it gives the packet up:
+ * bpf_rx_batch() puts a packet of no use to GRO on the batch and lets the others be, as
+ * gro_receive_skb() does. Behind GRO_HELD the code can take a frame and stay with the
+ * packet: bpf_rx_hold(). A second offer is none, and returns GRO_NORMAL.
+ */
+__bpf_kfunc u32 bpf_rx_offer(struct sk_buff *skb)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct gro_node *gro = cur->gro;
+	enum gro_result ret;
+
+	if (WARN_ON_ONCE(cur->skb != skb || cur->ctx != RX_EXT_ARRIVE) || cur->offered)
+		return GRO_NORMAL;
+	cur->offered = true;
+	ret = rx_ext_gro_receive(gro, skb);
+	/* the same CPU, and what GRO flushed and resumed on the way has put @cur back */
+	cur->ret = ret;
+	cur->pending = true;
+	return ret;
+}
+
+/**
+ * bpf_rx_pass - leave a packet to GRO, unless GRO holds it
+ * @skb__offer: the packet that arrive() was entered with
+ *
+ * bpf_rx_offer() and, for a packet that GRO does not hold, bpf_rx_batch() in one: what most
+ * packets of a stream need, which are merged into one that GRO holds, and what a packet
+ * needs that GRO has no use for. Returns true for those: the packet is no longer the
+ * code's. Returns false for a packet that GRO holds, and for one that GRO has seen before:
+ * the code has it still, and can take a frame and stay with it, bpf_rx_hold(), or give it
+ * up, which leaves it to GRO's flush.
+ */
+__bpf_kfunc bool bpf_rx_pass(struct sk_buff *skb__offer)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct sk_buff *skb = skb__offer;
+	struct gro_node *gro = cur->gro;
+	enum gro_result ret;
+
+	if (WARN_ON_ONCE(cur->skb != skb || cur->ctx != RX_EXT_ARRIVE) || cur->offered)
+		return false;
+	cur->offered = true;
+	ret = rx_ext_gro_receive(gro, skb);
+	cur->ret = ret;
+	if (ret == GRO_HELD) {
+		cur->pending = true;
+		return false;
+	}
+	cur->ctx = RX_EXT_DONE;
+	rx_ext_gro_finish(gro, skb, ret);
+	return true;
+}
+
+/**
+ * bpf_rx_hold - stay with a packet that GRO holds
+ * @frame__coro_offer: the frame of the packet's path, from bpf_coro_frame_alloc_skb(), with
+ *	the packet in one of its slots
+ *
+ * Behind bpf_rx_offer() that returned GRO_HELD: the frame is suspended in the head of
+ * the packet, and gro_complete() resumes the continuation with the packet that is flushed,
+ * as for bpf_rx_gro(). Returns true then. Returns false for a packet that GRO does not hold
+ * for this code: it goes on with packet and frame.
+ */
+__bpf_kfunc bool bpf_rx_hold(void *frame__coro_offer)
+{
+	struct rx_ext_cpu *cur = this_cpu_ptr(&rx_ext_cpu);
+	struct sk_buff *skb = cur->skb;
+
+	if (WARN_ON_ONCE(cur->ctx != RX_EXT_ARRIVE || skb->head != frame__coro_offer))
+		return false;
+	if (!cur->pending || cur->ret != GRO_HELD)
+		return false;
+	rx_ext_hold(cur->gro, skb);
+	cur->pending = false;
+	cur->ctx = RX_EXT_DONE;
+	return true;
+}
+
+/**
  * bpf_rx_backlog - offer a packet to the backlog of a CPU
  * @frame__coro_offer: the frame of the packet's path, with the packet in one of its slots
  * @cpu: the CPU
@@ -1460,6 +1615,12 @@ __bpf_kfunc bool bpf_rx_backlog(void *frame__coro_offer, u32 cpu)
 		return false;
 	if (cpu >= nr_cpu_ids || !cpu_online(cpu))
 		return false;
+	/* only a packet that is the code's alone: not one that GRO has, behind bpf_rx_offer() */
+	if (cur->pending) {
+		if (cur->ret != GRO_NORMAL)
+			return false;
+		cur->pending = false;
+	}
 	/* the queue's while the packet waits, and how process_backlog() knows */
 	RX_EXT_CB(skb)->owner = &rx_ext_gen;
 	RX_EXT_CB(skb)->gen = READ_ONCE(rx_ext_gen);
@@ -1556,6 +1717,9 @@ BTF_ID_FLAGS(func, bpf_coro_frame_alloc_skb, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_rx_set_state)
 BTF_ID_FLAGS(func, bpf_rx_state)
 BTF_ID_FLAGS(func, bpf_rx_gro)
+BTF_ID_FLAGS(func, bpf_rx_offer)
+BTF_ID_FLAGS(func, bpf_rx_hold)
+BTF_ID_FLAGS(func, bpf_rx_pass)
 BTF_ID_FLAGS(func, bpf_rx_backlog)
 BTF_ID_FLAGS(func, bpf_rx_native, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_rx_batch, KF_RELEASE)
@@ -1575,6 +1739,9 @@ BTF_KFUNCS_END(rx_ext_cont_kfunc_ids)
 BTF_ID_LIST(rx_ext_ids)
 BTF_ID(func, bpf_coro_frame_alloc_skb)
 BTF_ID(func, bpf_rx_gro)
+BTF_ID(func, bpf_rx_offer)
+BTF_ID(func, bpf_rx_hold)
+BTF_ID(func, bpf_rx_pass)
 
 /* A continuation has its frame, and its packet has been through GRO. */
 static int rx_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
@@ -1584,7 +1751,9 @@ static int rx_ext_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
 	if (prog->aux->st_ops != &bpf_bpf_rx_ops)
 		return -EACCES;
 	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
-		return kfunc_id == rx_ext_ids[0] || kfunc_id == rx_ext_ids[1] ? -EACCES : 0;
+		return kfunc_id == rx_ext_ids[0] || kfunc_id == rx_ext_ids[1] ||
+		       kfunc_id == rx_ext_ids[2] || kfunc_id == rx_ext_ids[3] ||
+		       kfunc_id == rx_ext_ids[4] ? -EACCES : 0;
 	return prog->aux->attach_st_ops_member_off == offsetof(struct bpf_rx_ops, arrive) ?
 	       0 : -EACCES;
 }
