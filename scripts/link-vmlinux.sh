@@ -60,6 +60,8 @@ vmlinux_link()
 	# skip output file argument
 	shift
 
+	# scripts/Makefile.vmlinux_o leaves debug info out of vmlinux.o unless
+	# vmlinux is linked from it: keep the two conditions in sync.
 	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT ||
 	   is_enabled CONFIG_KLP_BUILD; then
 		# Use vmlinux.o instead of performing the slow LTO link again.
