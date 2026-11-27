@@ -581,6 +581,8 @@ enum {
 	CHANGES_PKT_DATA = BIT(0),
 	MIGHT_SLEEP	 = BIT(1),
 	MIGHT_THROW	 = BIT(2),
+	MIGHT_PARK	 = BIT(3),
+	ADDR		 = BIT(4),	/* the node of an address or of a map, see below */
 };
 
 /*
@@ -591,6 +593,16 @@ enum {
  *                      +--> node of the map --> all functions in the map
  *   f2: r1 = map ll  --+
  *
+ * The load of the address of a function goes through a node of that address:
+ *
+ *   f1: r1 = &f3     -----> node of &f3 -----> f3
+ *
+ * A park passes the nodes of addresses and of maps only when the program has callx, which calls
+ * such an address like any other call. Otherwise the address is that of a callback. A park in a
+ * synchronous callback is refused at the park, with the frames of its caller in view, and an
+ * asynchronous callback is a root of its own, so the subprog that loads the address does not
+ * park on its account.
+ *
  * [WIP] callx of a number may call any function whose address is taken, see
  * check_scalar_callx(): one more node goes to all of them.
  */
@@ -598,19 +610,24 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
 	struct bpf_insn *insn = env->prog->insnsi;
-	u32 cnt = env->subprog_cnt, n, s, t, any_func = cnt + env->used_map_cnt;
+	u32 cnt = env->subprog_cnt, addr = cnt + env->used_map_cnt, any_func = addr + cnt, n, s, t;
 	struct bpf_call_graph cg;
 	struct bpf_func_ptr *ptr;
+	u16 skip;
 	int err;
 
 	err = bpf_call_graph_init(&cg, any_func + 1);
 	for (s = 0; s < cnt && !err; s++) {
 		cg.marks[s] = (si[s].changes_pkt_data ? CHANGES_PKT_DATA : 0) |
 			      (si[s].might_sleep ? MIGHT_SLEEP : 0) |
-			      (si[s].might_throw ? MIGHT_THROW : 0);
+			      (si[s].might_throw ? MIGHT_THROW : 0) |
+			      (si[s].might_park ? MIGHT_PARK : 0);
 		for (t = si[s].start; t < si[s + 1].start && !err; t++) {
-			if (bpf_pseudo_call(&insn[t]) || bpf_pseudo_func(&insn[t]))
+			if (bpf_pseudo_call(&insn[t]))
 				err = bpf_call_graph_add(&cg, s, bpf_find_subprog(env,
+							 t + insn[t].imm + 1));
+			else if (bpf_pseudo_func(&insn[t]))
+				err = bpf_call_graph_add(&cg, s, addr + bpf_find_subprog(env,
 							 t + insn[t].imm + 1));
 			else if (bpf_is_ldimm64(&insn[t]) && insn[t].src_reg &&
 				 insn[t].src_reg != BPF_PSEUDO_BTF_ID)
@@ -621,11 +638,16 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 		}
 	}
 	for (s = 0; s < env->used_map_cnt; s++) {
+		cg.marks[cnt + s] = ADDR;
 		ptr = bpf_map_func_ptrs(env, env->used_maps[s], &n);
 		for (; n-- && !err; ptr++)
 			err = bpf_must_abort() ? -EINTR :
 			      bpf_call_graph_add(&cg, cnt + s,
 						 bpf_find_subprog(env, ptr->xlated_off));
+	}
+	for (s = 0; s < cnt && !err; s++) {
+		cg.marks[addr + s] = ADDR;
+		err = bpf_call_graph_add(&cg, addr + s, s);
 	}
 	/* [WIP] any_func comes last: callers come in increasing order, see bpf_call_graph_add() */
 	for (t = 0; t < env->prog->len && env->scalar_callx && !err; t++)
@@ -640,12 +662,16 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 			err = bpf_call_graph_add(&cg, any_func, s);
 	if (err)
 		goto out;
+	skip = env->has_callx ? 0 : ADDR;
+	bpf_call_graph_sort(&cg, skip);
+	bpf_call_graph_mark_callers(&cg, MIGHT_PARK, skip);
 	bpf_call_graph_sort(&cg, 0);
-	bpf_call_graph_mark_callers(&cg, U16_MAX, 0);
+	bpf_call_graph_mark_callers(&cg, CHANGES_PKT_DATA | MIGHT_SLEEP | MIGHT_THROW, 0);
 	for (s = 0; s < cnt; s++) {
 		si[s].changes_pkt_data = cg.marks[s] & CHANGES_PKT_DATA;
 		si[s].might_sleep = cg.marks[s] & MIGHT_SLEEP;
 		si[s].might_throw = cg.marks[s] & MIGHT_THROW;
+		si[s].might_park = cg.marks[s] & MIGHT_PARK;
 	}
 out:
 	bpf_call_graph_free(&cg);
@@ -712,6 +738,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			 */
 			if (ret == 0 && bpf_is_kfunc_sleepable(&meta))
 				sub->might_sleep = true;
+			if (ret == 0 && bpf_is_task_park_kfunc(&meta))
+				sub->might_park = true;
 			if (ret == 0 && bpf_is_kfunc_pkt_changing(&meta))
 				sub->changes_pkt_data = true;
 			if (ret == 0 && bpf_is_throw_kfunc(insn))

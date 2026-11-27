@@ -2534,7 +2534,16 @@ static void bpf_prog_put_deferred(struct work_struct *work)
 
 	aux = container_of(work, struct bpf_prog_aux, work);
 	prog = aux->prog;
-	/* while all of the program is there for the destroy functions of its frames */
+	/*
+	 * The threads of the prog still run its code, each inside a Tasks
+	 * Trace RCU read section that the grace period below would wait for.
+	 * Stop them first; this waits for each of them to exit.
+	 */
+	bpf_prog_free_kthreads(aux);
+	/*
+	 * While all of the program is there for the destroy functions of its frames, and when
+	 * no thread of it parks one any more.
+	 */
 	if (aux->coro_parks)
 		bpf_coro_prog_release(prog);
 	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_UNLOAD, 0);
@@ -2549,8 +2558,12 @@ static void __bpf_prog_put(struct bpf_prog *prog)
 
 	if (atomic64_dec_and_test(&aux->refcnt)) {
 		bpf_coro_frames_stop(prog);
-		/* bpf_coro_prog_release() sleeps */
-		if (in_hardirq() || irqs_disabled() || aux->coro_parks) {
+		/*
+		 * Stopping the prog's threads blocks, which the direct path may not, and
+		 * bpf_coro_prog_release() sleeps.
+		 */
+		if (in_hardirq() || irqs_disabled() || !list_empty(&aux->kthreads) ||
+		    aux->coro_parks) {
 			INIT_WORK(&aux->work, bpf_prog_put_deferred);
 			schedule_work(&aux->work);
 		} else {
@@ -6750,9 +6763,10 @@ int kern_sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 		if (IS_ERR(prog))
 			return PTR_ERR(prog);
 
+		/* The run is counted per CPU, which a program that migrates would unbalance. */
 		if (attr->test.ctx_size_in < prog->aux->max_ctx_offset ||
 		    (prog->aux->tail_call_reachable && attr->test.ctx_size_in < U16_MAX) ||
-		    attr->test.ctx_size_in > U16_MAX) {
+		    attr->test.ctx_size_in > U16_MAX || prog->aux->may_migrate) {
 			bpf_prog_put(prog);
 			return -EINVAL;
 		}

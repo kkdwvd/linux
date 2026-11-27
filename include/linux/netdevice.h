@@ -410,6 +410,12 @@ struct napi_struct {
 	struct sk_buff		*skb;
 	struct gro_node		gro;
 	struct hrtimer		timer;
+#ifdef CONFIG_BPF_SYSCALL
+	/* When the NAPI was last scheduled for or polled by its BPF thread */
+	unsigned long		bpf_stamp;
+	/* Packets softirq may still process before it wakes the BPF thread */
+	u32			bpf_wake_after;
+#endif
 	/* all fields past this point are write-protected by netdev_lock */
 	struct task_struct	*thread;
 	unsigned long		gro_flush_timeout;
@@ -424,6 +430,9 @@ struct napi_struct {
 	int			napi_rmap_idx;
 	int			index;
 	struct napi_config	*config;
+#ifdef CONFIG_BPF_SYSCALL
+	struct timer_list	bpf_timer;
+#endif
 };
 
 enum {
@@ -441,6 +450,8 @@ enum {
 	NAPI_STATE_THREADED_BUSY_POLL,	/* The threaded NAPI poller will busy poll */
 	NAPI_STATE_PERCPU,		/* NAPI handler is run per-CPU - incompatible with threaded mode */
 	NAPI_STATE_DISABLED,		/* NAPI is disabled */
+	NAPI_STATE_BPF,			/* The thread is a BPF kthread, see napi_bpf_bind_locked() */
+	NAPI_STATE_BPF_POLLING,		/* A caller of napi_bpf_poll() is in the driver's poll */
 };
 
 enum {
@@ -458,6 +469,22 @@ enum {
 	NAPIF_STATE_THREADED_BUSY_POLL	= BIT(NAPI_STATE_THREADED_BUSY_POLL),
 	NAPIF_STATE_PERCPU		= BIT(NAPI_STATE_PERCPU),
 	NAPIF_STATE_DISABLED		= BIT(NAPI_STATE_DISABLED),
+	NAPIF_STATE_BPF			= BIT(NAPI_STATE_BPF),
+	NAPIF_STATE_BPF_POLLING		= BIT(NAPI_STATE_BPF_POLLING),
+};
+
+/* napi_bpf_poll() returns the work done, ORed with BPF_NAPI_POLL_MORE while
+ * the NAPI stays scheduled for its thread.
+ */
+enum {
+	BPF_NAPI_POLL_WORK_MASK		= 0xffff,
+	BPF_NAPI_POLL_MORE		= BIT(16),
+};
+
+/* Flags of napi_bpf_poll(). */
+enum {
+	/* Keep the NAPI scheduled and its interrupt masked after the poll */
+	BPF_NAPI_POLL_F_BUSY		= BIT(0),
 };
 
 enum gro_result {

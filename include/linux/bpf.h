@@ -1980,6 +1980,8 @@ struct bpf_prog_aux {
 	bool changes_pkt_data;
 	bool has_prologue;
 	bool might_sleep;
+	/* a run may leave on another CPU than it started on, see bpf_task_park() */
+	bool may_migrate;
 	bool can_unwind;
 	/* frames of recursive subprogs can be on the stack when it is called */
 	bool in_recursion;
@@ -2089,6 +2091,8 @@ struct bpf_prog_aux {
 	struct bpf_stream *stream[2];
 	spinlock_t st_ops_assoc_lock; /* protects st_ops_assoc */
 	struct bpf_map __rcu *st_ops_assoc;
+	struct list_head kthreads; /* BPF kthreads of the prog, see kernel/bpf/kthread.c */
+	atomic_t kthread_seq; /* index of the prog's next BPF kthread, in its name */
 };
 
 #define BPF_NR_CONTEXTS        4       /* normal, softirq, hardirq, NMI */
@@ -3042,6 +3046,24 @@ struct bpf_prog * __must_check bpf_prog_inc_not_zero(struct bpf_prog *prog);
 void bpf_prog_put(struct bpf_prog *prog);
 
 void bpf_prog_free_id(struct bpf_prog *prog);
+void bpf_prog_free_kthreads(struct bpf_prog_aux *aux);
+bool bpf_is_kthread_kfunc(u32 kfunc_id);
+int bpf_task_wake_direct(struct task_struct *task);
+bool bpf_kthread_alive(struct task_struct *task);
+#ifdef CONFIG_NET
+void napi_bpf_release_task(struct task_struct *task);
+#else
+static inline void napi_bpf_release_task(struct task_struct *task)
+{
+}
+#endif
+#ifdef CONFIG_INET
+void tcp_bpf_tx_release_task(struct task_struct *task);
+#else
+static inline void tcp_bpf_tx_release_task(struct task_struct *task)
+{
+}
+#endif
 void bpf_map_free_id(struct bpf_map *map);
 
 struct btf_field *btf_record_find(const struct btf_record *rec,

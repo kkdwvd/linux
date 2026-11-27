@@ -1028,6 +1028,14 @@ struct bpf_func_state {
 	 */
 	bool fault_edge;
 	/*
+	 * The body of a BPF kthread: an async callback whose kernel caller,
+	 * bpf_kthread_fn(), keeps nothing across it that the sleep in
+	 * bpf_task_park() could invalidate, so the park is allowed in it.
+	 * Like loop_stack_cnt, a part of the join_key that is outside of it,
+	 * see bpf_same_join_key(): the join_key has no holes and no room left.
+	 */
+	bool in_kthread_fn;
+	/*
 	 * Unique diagnostic identity for this function invocation. Frame depth is
 	 * reused after returns, while this ID is preserved across state clones.
 	 */
@@ -1189,6 +1197,14 @@ struct bpf_verifier_state {
 	);
 	/* Not zero in a function that is verified on its own, see bpf_flow_call() */
 	u32 instance_id;
+	/*
+	 * A function that is verified on its own parked the task. Its callers,
+	 * what the sleep takes from them and whether one of them is a callback,
+	 * are not in the state, see bpf_flow_return(). Like instance_id, a part
+	 * of the join_key that is outside of it, see bpf_same_join_key(): the
+	 * join_key has no holes and no room left.
+	 */
+	bool parked;
 
 	/* The insn that the state comes from, -1 if no instructions have been executed yet. */
 	u32 last_insn_idx;
@@ -1903,6 +1919,8 @@ struct bpf_subprog_info {
 	bool fastcall_spills_gone: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
+	/* some call reachable from this subprog may be bpf_task_park() */
+	bool might_park: 1;
 	bool uses_arena_sp: 1;
 	/* a callback that takes a stack in arena, like the main program does */
 	bool arena_stack_entry: 1;
@@ -3419,6 +3437,7 @@ static inline bool bpf_is_kfunc_sleepable(struct bpf_call_arg_meta *meta)
 	return meta->kfunc_flags & KF_SLEEPABLE;
 }
 bool bpf_is_kfunc_pkt_changing(struct bpf_call_arg_meta *meta);
+bool bpf_is_task_park_kfunc(struct bpf_call_arg_meta *meta);
 bool bpf_grow_array(struct bpf_verifier_env *env, void *array, u32 *cap, u32 cnt, size_t size);
 struct bpf_iarray *bpf_iarray_realloc(struct bpf_iarray *old, size_t n_elem);
 int bpf_copy_insn_array_uniq(struct bpf_map *map, u32 start, u32 end, u32 *off);

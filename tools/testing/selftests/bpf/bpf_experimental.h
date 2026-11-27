@@ -351,6 +351,31 @@ extern void bpf_iter_css_destroy(struct bpf_iter_css *it) __weak __ksym;
 extern int bpf_wq_init(struct bpf_wq *wq, void *p__map, unsigned int flags) __weak __ksym;
 extern int bpf_wq_start(struct bpf_wq *wq, unsigned int flags) __weak __ksym;
 
+extern int bpf_task_park(__u64 timeout_ns, __u64 flags) __weak __ksym;
+extern int bpf_task_wake(struct task_struct *task, __u64 flags) __weak __ksym;
+
+extern struct task_struct *bpf_kthread_create(int (callback_fn)(__u64 arg), __u64 arg,
+					      __u64 flags) __weak __ksym;
+extern int bpf_kthread_start(struct task_struct *task, __u64 flags) __weak __ksym;
+extern int bpf_kthread_bind(struct task_struct *task, __u32 cpu, __u64 flags) __weak __ksym;
+extern int bpf_kthread_attach_cgroup(struct task_struct *task, struct cgroup *cgrp,
+				     __u64 flags) __weak __ksym;
+extern int bpf_kthread_stop(struct task_struct *task, __u64 flags) __weak __ksym;
+extern bool bpf_kthread_should_stop(void) __weak __ksym;
+
+extern int bpf_napi_bind(__u32 napi_id, struct task_struct *task, __u64 flags) __weak __ksym;
+extern int bpf_napi_suspend(__u32 napi_id, __u32 wake_after) __weak __ksym;
+extern int bpf_napi_resume(__u32 napi_id) __weak __ksym;
+extern int bpf_napi_unbind(__u32 napi_id) __weak __ksym;
+extern int bpf_napi_poll(__u32 napi_id, __u64 flags) __weak __ksym;
+
+struct bpf_sock_ops_kern;
+extern int bpf_tcp_tx_bind(__u32 queue, struct task_struct *task, __u64 flags) __weak __ksym;
+extern int bpf_tcp_tx_unbind(__u32 queue) __weak __ksym;
+extern int bpf_tcp_tx_poll(__u32 queue, __u32 budget) __weak __ksym;
+extern int bpf_tcp_tx_set_mode(__u32 queue, __u32 mode) __weak __ksym;
+extern int bpf_tcp_tx_sock_bind(struct bpf_sock_ops_kern *skops, __s32 queue) __weak __ksym;
+
 struct bpf_iter_kmem_cache;
 extern int bpf_iter_kmem_cache_new(struct bpf_iter_kmem_cache *it) __weak __ksym;
 extern struct kmem_cache *bpf_iter_kmem_cache_next(struct bpf_iter_kmem_cache *it) __weak __ksym;
