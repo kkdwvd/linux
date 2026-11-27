@@ -579,6 +579,10 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	newtp->snd_up = seq;
 
 	INIT_LIST_HEAD(&newtp->tsq_node);
+#ifdef CONFIG_BPF_SYSCALL
+	/* The listener's xmit queue is not the connection's. */
+	newtp->bpf_tx_queue = 0;
+#endif
 	INIT_LIST_HEAD(&newtp->tsorted_sent_queue);
 
 	tcp_init_wl(newtp, treq->rcv_isn);

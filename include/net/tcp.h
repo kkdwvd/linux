@@ -755,6 +755,37 @@ void tcp_skb_entail(struct sock *sk, struct sk_buff *skb);
 void tcp_mark_push(struct tcp_sock *tp, struct sk_buff *skb);
 void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 			       int nonagle);
+void tcp_push_pending_frames_now(struct sock *sk, unsigned int cur_mss,
+				 int nonagle);
+
+#ifdef CONFIG_BPF_SYSCALL
+/* What a sender does with xmit work when its socket's xmit queue has a thread. */
+enum {
+	BPF_TCP_TX_WAKE,	/* queue the socket and wake the thread */
+	BPF_TCP_TX_QUEUE,	/* queue the socket; the thread will look by itself */
+	BPF_TCP_TX_INLINE,	/* do the xmit work itself */
+};
+
+bool __tcp_bpf_tx_defer(struct sock *sk, int nonagle);
+int tcp_bpf_tx_set_mode(u32 queue, u32 mode);
+int tcp_bpf_tx_bind(u32 queue, struct task_struct *task);
+void tcp_bpf_tx_unbind(u32 queue);
+int tcp_bpf_tx_poll(u32 queue, u32 budget);
+int tcp_bpf_tx_sock_bind(struct sock *sk, s32 queue);
+
+/* Whether a BPF kthread will do the xmit work that is about to start on @sk. */
+static inline bool tcp_bpf_tx_defer(struct sock *sk, int nonagle)
+{
+	if (likely(!READ_ONCE(tcp_sk(sk)->bpf_tx_queue)))
+		return false;
+	return __tcp_bpf_tx_defer(sk, nonagle);
+}
+#else
+static inline bool tcp_bpf_tx_defer(struct sock *sk, int nonagle)
+{
+	return false;
+}
+#endif
 int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs);
 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs);
 void tcp_retransmit_timer(struct sock *sk);

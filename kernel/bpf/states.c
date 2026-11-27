@@ -505,7 +505,7 @@ static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verif
 /*
  * The join_key of a state is what has no join:
  * - what is held: references, locks, dynptrs, iterators, irq flags
- * - the call chain and the instance
+ * - the call chain and the instance, and whether the instance parked
  * - the peeled trip
  */
 bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b)
@@ -516,12 +516,13 @@ bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_veri
 	u32 fr, i;
 
 	if (memcmp(&a->join_key, &b->join_key, sizeof(a->join_key)) ||
-	    a->instance_id != b->instance_id || !same_refs(a, b))
+	    a->instance_id != b->instance_id || a->parked != b->parked || !same_refs(a, b))
 		return false;
 	for (fr = 0; fr <= a->curframe; fr++) {
 		fa = a->frame[fr];
 		fb = b->frame[fr];
 		if (memcmp(&fa->join_key, &fb->join_key, sizeof(fa->join_key)) ||
+		    fa->in_kthread_fn != fb->in_kthread_fn ||
 		    fa->loop_stack_cnt != fb->loop_stack_cnt)
 			return false;
 		for (i = 0; i < fa->loop_stack_cnt; i++) {
@@ -563,11 +564,15 @@ u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verif
 	const struct loop_stack_entry *e;
 	const struct bpf_func_state *f;
 
+	if (st->parked)
+		hash = bpf_hash64(&st->parked, sizeof(st->parked), hash);
 	for (i = 0; i < st->acquired_refs; i++)
 		hash = bpf_hash64(&st->refs[i].ptr, sizeof(u64), hash + st->refs[i].type);
 	for (fr = 0; fr <= st->curframe; fr++) {
 		f = st->frame[fr];
 		hash = bpf_hash64(&f->join_key, sizeof(f->join_key), hash);
+		if (f->in_kthread_fn)
+			hash = bpf_hash64(&f->in_kthread_fn, sizeof(f->in_kthread_fn), hash);
 		for (i = 0, e = f->loop_stack; i < f->loop_stack_cnt; i++, e++) {
 			trip = e->peeled ? e->trip : -1;
 			hash = bpf_hash64(&trip, sizeof(trip), hash);

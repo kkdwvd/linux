@@ -139,6 +139,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 #ifdef CONFIG_FINEIBT
 	INIT_LIST_HEAD_RCU(&fp->aux->ksym_prefix.lnode);
 #endif
+	INIT_LIST_HEAD(&fp->aux->kthreads);
 	mutex_init(&fp->aux->used_maps_mutex);
 	mutex_init(&fp->aux->ext_mutex);
 	mutex_init(&fp->aux->dst_mutex);
@@ -4089,6 +4090,26 @@ void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_ma
 	cur = this_cpu_ptr(prog->aux->timed_may_goto);
 	if (cur->owner == saved)
 		*cur = *saved;
+}
+
+/*
+ * bpf_task_park() is to the time slice what the end of an invocation is. The prog leaves its read
+ * section and lets go of the cpu, and whoever runs the prog there next sets count and timestamp
+ * anew. So does the prog itself when the kfunc returns, on the cpu that it is on by then: an
+ * invocation begins, and count and timestamp are for the time since. What it left on the cpu
+ * that it was on stays there, as after an exit.
+ * The caller has disabled migration again.
+ */
+void bpf_timed_may_goto_rearm(const struct bpf_prog_aux *aux)
+{
+	struct bpf_timed_may_goto *cur;
+
+	if (!aux->timed_may_goto)
+		return;
+	cur = this_cpu_ptr(aux->timed_may_goto);
+	cur->count = BPF_MAX_TIMED_LOOPS;
+	cur->timestamp = 0;
+	cur->owner = NULL;
 }
 
 /* for configs without MMU or 32-bit */
