@@ -1598,6 +1598,103 @@ __naked int task_at_call_in_front_of_live_code(void)
 	);
 }
 
+/* It returns nothing. When it unwinds it leaves with r0 = 5. */
+__naked __noinline __used
+void global_void_unwinds(void)
+{
+	asm volatile (
+		"r1 = %[one] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"if r1 != 0 goto 1f;"
+		"exit;"
+	"1:"
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_addr(one),
+		  __imm_unwind_exit
+	);
+}
+
+/* What unwind_exit left in r0 reaches the pad, also out of a subprog that returns nothing */
+SEC("tc")
+__description("unwind: a global subprog that returns nothing unwinds, r0 reaches the pad")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(15)
+__naked int calls_global_void_unwinds(void)
+{
+	asm volatile (
+		"call global_void_unwinds;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r0 += 10;"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/* To the caller it is a number */
+SEC("tc")
+__description("unwind: r0 is a number in the pad of a call of a global subprog that returns nothing")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__failure __msg("R0 invalid mem access 'scalar'")
+__naked int global_void_pad_is_checked(void)
+{
+	asm volatile (
+		"call global_void_unwinds;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r0 = *(u64 *)(r0 + 0);"
+		"exit;"
+		:
+		: __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/*
+ * A subprog that returns nothing and never returns, see global_always_unwinds(), and the pad right
+ * behind its call, where a compiler puts it: only what unwind_exit left gets there, and r0 is a
+ * number.
+ */
+__naked __noinline __used
+void global_void_always_unwinds(void)
+{
+	asm volatile (
+		"r0 = 5;"
+		unwind_exit
+		:
+		: __imm_unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind: the pad follows the call of a global subprog that returns nothing and never returns")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(15)
+__naked int pad_follows_global_void_never_returns(void)
+{
+	asm volatile (
+		"call global_void_always_unwinds;"
+		unwind_goto(0)
+		"r0 += 10;"
+		"exit;"
+		:
+		: __imm_unwind_goto(0)
+		: __clobber_all
+	);
+}
+
 /*
  * The same for a stack slot: nothing reads fp-8 behind the call, but the stack of the frame is
  * live there too, so the slot is a place of the task. The pad loads the task from it and releases

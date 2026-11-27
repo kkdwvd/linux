@@ -102,6 +102,9 @@ u32 bpf_failing_path_hops(struct bpf_verifier_env *env, const struct bpf_verifie
 	u64 hops = prec->hops_to_err[idx], out = 0;
 
 	for (; fr; fr--) {
+		/* a callee called at the end of a subprog doesn't return, see check_final_calls() */
+		if (bpf_call_ends_subprog(env, st->frame[fr]->callsite))
+			break;
 		out += prec->hops_to_exit[idx];
 		idx = st->frame[fr]->callsite + !st->frame[fr]->in_callback_fn;
 		hops = min(hops, out + prec->hops_to_err[idx]);

@@ -1791,18 +1791,24 @@ static int emit_atomic_ld_st_index(u8 **pprog, u32 atomic_op, u32 size,
 /*
  * A fetching AND/OR/XOR can't be implemented with a single x86 insn, so do a
  * CMPXCHG loop. @index_reg is X86_REG_R12 for an arena access or -1 otherwise.
- * The caller has saved R0 in BPF_REG_AX and has substituted BPF_REG_AX for R0
- * in @dst_reg and @src_reg.
+ * Unless @r0_on_stack, the caller has saved R0 in BPF_REG_AX and has
+ * substituted BPF_REG_AX for R0 in @dst_reg and @src_reg.
+ *
+ * With @r0_on_stack the caller has pushed R0 on the stack instead. An R0
+ * operand stays in the stack slot, RAX ends up holding the old value that R0
+ * is to return, and the slot is dropped rather than popped.
  *
  * Both the load and the CMPXCHG can fault when accessing the arena, so their
  * addresses are handed back in @fault[0] and @fault[1]. It is NULL for the
  * non-arena case, which needs no fixup. ex_handler_bpf() leaves the whole
- * sequence and restores R0 itself, see FIXUP_ARENA_R0_IN_AX.
+ * sequence and restores R0 itself, see FIXUP_ARENA_R0_IN_AX and
+ * FIXUP_ARENA_R0_ON_STACK.
  */
 static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
-				 u32 src_reg, int index_reg, u8 **fault)
+				 u32 src_reg, int index_reg, bool r0_on_stack, u8 **fault)
 {
 	bool is64 = BPF_SIZE(insn->code) == BPF_DW;
+	bool operand_on_stack = r0_on_stack && src_reg == BPF_REG_0;
 	u8 *branch_target, *prog = *pprog;
 	int err;
 
@@ -1821,7 +1827,15 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 	 * Perform the (commutative) operation locally, put the result in
 	 * the AUX_REG.
 	 */
-	emit_mov_reg(&prog, is64, AUX_REG, BPF_REG_0);
+	if (operand_on_stack) {
+		/* mov r11, [rsp]: the operand is the R0 saved there, RAX is the old value */
+		if (is64)
+			EMIT4(0x4C, 0x8B, 0x1C, 0x24);
+		else
+			EMIT4(0x44, 0x8B, 0x1C, 0x24);
+	} else {
+		emit_mov_reg(&prog, is64, AUX_REG, BPF_REG_0);
+	}
 	maybe_emit_mod(&prog, AUX_REG, src_reg, is64);
 	EMIT2(simple_alu_opcodes[BPF_OP(insn->imm)],
 	      add_2reg(0xC0, AUX_REG, src_reg));
@@ -1840,11 +1854,17 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 
 	/* ZF tells us whether we won the race. If it's cleared we need to try again. */
 	EMIT2(X86_JNE, -(prog - branch_target) - 2);
-	/* Return the pre-modification value */
-	emit_mov_reg(&prog, is64, src_reg, BPF_REG_0);
+	/* Return the pre-modification value, which RAX already is for R0 */
+	if (!operand_on_stack)
+		emit_mov_reg(&prog, is64, src_reg, BPF_REG_0);
 
 	/* Restore R0 after clobbering RAX */
-	emit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);
+	if (!r0_on_stack)
+		emit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);
+	else if (operand_on_stack)
+		EMIT2(0x41, 0x5B); /* pop r11, dropping the operand */
+	else
+		EMIT1(0x58); /* pop rax */
 
 	*pprog = prog;
 	return 0;
@@ -1857,11 +1877,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+----------+---------+--------+-----------+---------+----------+
- * | 31        | 30          | 29       | 28      | 27-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |          |         |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | R0_IN_AX | UNWINDS | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+----------+---------+--------+-----------+---------+----------+
+ * +-----------+-------------+----------+---------+-------------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29       | 28      | 27          | 26-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |          |         |             |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | R0_IN_AX | UNWINDS | R0_ON_STACK | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+----------+---------+-------------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far the end of the code of the BPF insn is from the faulting insn.
  *                      That is its own length for a single-insn access, but the distance to
@@ -1882,6 +1902,10 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *                     handler puts it back, since it leaves the sequence.
  * - UNWINDS (1 bit): The frame holds nothing at the insn: the handler goes to the landing pad of
  *                    the function that releases nothing. No unwind_goto follows the insn.
+ * - R0_ON_STACK (1 bit): The same as R0_IN_AX for a sequence that has its address in BPF_REG_AX,
+ *                        an access through a number: it pushes R0 on the stack instead. The
+ *                        handler puts R0 back and drops the slot, so that the code that it goes
+ *                        to has the stack of the frame.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1899,6 +1923,7 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_R0_ON_STACK	BIT(27)
 #define FIXUP_ARENA_UNWINDS	BIT(28)
 #define FIXUP_ARENA_R0_IN_AX	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
@@ -1924,6 +1949,11 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 				      x->fixup & FIXUP_ARENA_UNWINDS);
 	}
 
+	/* R0 first: with its operand on the stack the dest register is RAX */
+	if (x->fixup & FIXUP_ARENA_R0_ON_STACK) {
+		regs->ax = *(unsigned long *)regs->sp;
+		regs->sp += sizeof(unsigned long);
+	}
 	/*
 	 * No landing pad: jump over the faulting access, or the sequence it is part of, and clear
 	 * dest register. The landing pad gets the registers as they were before the access.
@@ -3351,7 +3381,7 @@ populate_extable:
 			}
 			if (is_atomic_fetch) {
 				err = emit_atomic_fetch_rmw(&prog, insn, real_dst_reg,
-							    real_src_reg, -1, NULL);
+							    real_src_reg, -1, false, NULL);
 				if (err)
 					return err;
 				break;
@@ -3379,18 +3409,29 @@ populate_extable:
 		case BPF_STX | BPF_PROBE_ATOMIC | BPF_DW:
 			if (is_atomic_fetch_op(insn)) {
 				u32 real_src_reg = src_reg, real_dst_reg = dst_reg;
+				/*
+				 * An access through a number has its address in
+				 * BPF_REG_AX (see arena_scalar_access()), so R0 is
+				 * saved on the stack instead, as div and mod do.
+				 */
+				bool r0_on_stack = dst_reg == BPF_REG_AX;
 				u8 *fault[2];
 				int j;
 
 				/* Will need RAX as a CMPXCHG operand so save R0 */
-				emit_mov_reg(&prog, true, BPF_REG_AX, BPF_REG_0);
-				if (src_reg == BPF_REG_0)
-					real_src_reg = BPF_REG_AX;
-				if (dst_reg == BPF_REG_0)
-					real_dst_reg = BPF_REG_AX;
+				if (r0_on_stack) {
+					EMIT1(0x50); /* push rax */
+				} else {
+					emit_mov_reg(&prog, true, BPF_REG_AX, BPF_REG_0);
+					if (src_reg == BPF_REG_0)
+						real_src_reg = BPF_REG_AX;
+					if (dst_reg == BPF_REG_0)
+						real_dst_reg = BPF_REG_AX;
+				}
 
 				err = emit_atomic_fetch_rmw(&prog, insn, real_dst_reg,
-							    real_src_reg, X86_REG_R12, fault);
+							    real_src_reg, X86_REG_R12,
+							    r0_on_stack, fault);
 				if (err)
 					return err;
 
@@ -3398,7 +3439,7 @@ populate_extable:
 				 * The page may be unmapped between the load and the
 				 * CMPXCHG, so both need an entry. Both report a write,
 				 * since the BPF insn is a read-modify-write, and both
-				 * say that R0 is in BPF_REG_AX while RAX serves the CMPXCHG.
+				 * say where R0 is while RAX serves the CMPXCHG.
 				 */
 				for (j = 0; j < 2; j++) {
 					err = emit_arena_exentry(bpf_prog, image, rw_image,
@@ -3409,7 +3450,9 @@ populate_extable:
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
 								 FIXUP_ARENA_WRITE | fault_unwinds |
-								 FIXUP_ARENA_R0_IN_AX, insn->off);
+								 (r0_on_stack ? FIXUP_ARENA_R0_ON_STACK :
+										FIXUP_ARENA_R0_IN_AX),
+								 insn->off);
 					if (err)
 						return err;
 				}
@@ -5365,6 +5408,11 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 }
 
 bool bpf_jit_supports_arena(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_arena_scalar(void)
 {
 	return true;
 }

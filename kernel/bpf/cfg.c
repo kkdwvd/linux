@@ -122,10 +122,13 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 {
 	int ret, insn_sz;
 
-	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
-	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
-	if (ret)
-		return ret;
+	/* A call that ends its subprog does not return, see check_subprogs() */
+	if (!bpf_call_ends_subprog(env, t)) {
+		insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
+		ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
+		if (ret)
+			return ret;
+	}
 
 	return visit_callee ? push_insn(t, t + insns[t].imm + 1, BRANCH, env) : 0;
 }
@@ -587,17 +590,20 @@ enum {
  *   f1: r1 = map ll  --+
  *                      +--> node of the map --> all functions in the map
  *   f2: r1 = map ll  --+
+ *
+ * [WIP] callx of a number may call any function whose address is taken, see
+ * check_scalar_callx(): one more node goes to all of them.
  */
 static int merge_callee_effects(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
 	struct bpf_insn *insn = env->prog->insnsi;
-	u32 cnt = env->subprog_cnt, n, s, t;
+	u32 cnt = env->subprog_cnt, n, s, t, any_func = cnt + env->used_map_cnt;
 	struct bpf_call_graph cg;
 	struct bpf_func_ptr *ptr;
 	int err;
 
-	err = bpf_call_graph_init(&cg, cnt + env->used_map_cnt);
+	err = bpf_call_graph_init(&cg, any_func + 1);
 	for (s = 0; s < cnt && !err; s++) {
 		cg.marks[s] = (si[s].changes_pkt_data ? CHANGES_PKT_DATA : 0) |
 			      (si[s].might_sleep ? MIGHT_SLEEP : 0) |
@@ -610,6 +616,8 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 				 insn[t].src_reg != BPF_PSEUDO_BTF_ID)
 				err = bpf_call_graph_add(&cg, s,
 							 cnt + env->insn_aux_data[t].map_index);
+			else if (env->scalar_callx && bpf_is_callx(&insn[t]))
+				err = bpf_call_graph_add(&cg, s, any_func);
 		}
 	}
 	for (s = 0; s < env->used_map_cnt; s++) {
@@ -619,6 +627,17 @@ static int merge_callee_effects(struct bpf_verifier_env *env)
 			      bpf_call_graph_add(&cg, cnt + s,
 						 bpf_find_subprog(env, ptr->xlated_off));
 	}
+	/* [WIP] any_func comes last: callers come in increasing order, see bpf_call_graph_add() */
+	for (t = 0; t < env->prog->len && env->scalar_callx && !err; t++)
+		if (bpf_pseudo_func(&insn[t]))
+			err = bpf_call_graph_add(&cg, any_func, bpf_find_subprog(env,
+						 t + insn[t].imm + 1));
+	for (s = 0; s < env->used_map_cnt && env->scalar_callx && !err; s++)
+		err = bpf_call_graph_add(&cg, any_func, cnt + s);
+	/* [WIP] and those that only data refers to, see mark_subprogs_addr_in_data() */
+	for (s = 1; s < cnt && !err; s++)
+		if (si[s].addr_in_data)
+			err = bpf_call_graph_add(&cg, any_func, s);
 	if (err)
 		goto out;
 	bpf_call_graph_sort(&cg, 0);
@@ -794,6 +813,16 @@ walk_cfg:
 			goto walk_cfg;
 	}
 
+	/* [WIP] a function that only data refers to, see mark_subprogs_addr_in_data() */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int w = env->subprog_info[i].start;
+
+		if (!env->subprog_info[i].addr_in_data || insn_state[w])
+			continue;
+		root = w;
+		goto walk_cfg;
+	}
+
 	for (i = 0; i < insn_cnt; i++) {
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
@@ -876,7 +905,7 @@ static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
 			if (verifier_bug_if(callee < 0, env, "no callee of insn %d", t))
 				return -EFAULT;
 			if (!env->subprog_info[callee].might_return) {
-				if (!bpf_is_unwind_goto(&insns[t + 1]))
+				if (bpf_call_ends_subprog(env, t) || !bpf_is_unwind_goto(&insns[t + 1]))
 					continue;
 				/* what comes back to the call goes to its landing pad */
 				pad = t + 1 + bpf_jmp_offset(&insns[t + 1]) + 1;

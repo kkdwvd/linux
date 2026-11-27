@@ -699,6 +699,16 @@ class PrinterHelpersHeader(Printer):
         self.elements = parser.helpers
         self.elem_number_check(parser.desc_unique_helpers, parser.define_unique_helpers, 'helper', '___BPF_FUNC_MAPPER')
 
+    # The helpers of is_sync_callback_calling_function() in the verifier. They
+    # call their callback and leave the way it leaves, so a C++ callback may
+    # throw through them: not noexcept.
+    sync_callback_calling_helpers = {
+            'bpf_for_each_map_elem',
+            'bpf_find_vma',
+            'bpf_loop',
+            'bpf_user_ringbuf_drain',
+    }
+
     type_fwds = [
             'struct bpf_fib_lookup',
             'struct bpf_sk_lookup',
@@ -848,6 +858,19 @@ class PrinterHelpersHeader(Printer):
         if used_attrs:
             print('')
 
+        # C++ built with exceptions follows a call that may throw with an
+        # unwind_goto, and the verifier accepts one only after a call of
+        # something that can unwind. Helpers don't throw, except that the ones
+        # that call a sync callback leave the way the callback leaves.
+        print('#ifndef __bpf_noexcept')
+        print('#ifdef __cplusplus')
+        print('#define __bpf_noexcept noexcept')
+        print('#else')
+        print('#define __bpf_noexcept')
+        print('#endif')
+        print('#endif')
+        print('')
+
     def print_footer(self):
         footer = ''
         print(footer)
@@ -908,7 +931,8 @@ class PrinterHelpersHeader(Printer):
             comma = ', '
             print(one_arg, end='')
 
-        print(') = (void *) %d;' % helper.enum_val)
+        noexcept = '' if proto['name'] in self.sync_callback_calling_helpers else ' __bpf_noexcept'
+        print(')%s = (__typeof__(%s)) (void *) %d;' % (noexcept, proto['name'], helper.enum_val))
         print('')
 
 

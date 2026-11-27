@@ -6,14 +6,22 @@
  * Copyright (c) 2019 Facebook
  */
 /* ----- START-EXPECTED-OUTPUT ----- */
-struct s1 {};
+struct s1 {
+#ifdef __cplusplus
+	char ___cpp[0];
+#endif
+};
 
 struct s3;
 
 struct s4;
 
 struct s2 {
+#ifdef __cplusplus
+	struct s2 *s2___cpp;
+#else
 	struct s2 *s2;
+#endif
 	struct s3 *s3;
 	struct s4 *s4;
 };
