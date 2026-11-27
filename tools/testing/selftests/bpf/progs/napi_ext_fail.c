@@ -16,6 +16,7 @@ extern void *bpf_coro_frame_alloc(__u64 size, void *ctx) __ksym;
 extern void bpf_coro_frame_free(void *frame) __ksym;
 extern void bpf_napi_defer(void *frame, __u32 where) __ksym;
 extern void bpf_napi_poll_native(struct napi_struct *napi) __ksym;
+extern void bpf_napi_poll_at(struct napi_struct *napi, __u32 where) __ksym;
 extern void bpf_napi_poll_run(struct napi_struct *napi) __ksym;
 
 char _license[] SEC("license") = "GPL";
@@ -72,6 +73,23 @@ void BPF_PROG(again_native, struct napi_struct *napi, __u32 reason)
 	bpf_napi_poll_native(napi);
 }
 EXT(ext_again_native, schedule_native, again_native);
+
+/* again() says where, which is the step that it is behind */
+SEC("struct_ops/again")
+void BPF_PROG(again_at, struct napi_struct *napi, __u32 reason)
+{
+	bpf_napi_poll_at(napi, BPF_NAPI_SOFTIRQ);
+}
+EXT(ext_again_at, schedule_native, again_at);
+
+/* The entry says where, and polls */
+SEC("struct_ops/schedule")
+void BPF_PROG(at_twice, struct napi_struct *napi, __u32 reason)
+{
+	bpf_napi_poll_at(napi, BPF_NAPI_SOFTIRQ);
+	bpf_napi_poll_native(napi);
+}
+EXT(ext_at_twice, at_twice, again_polls);
 
 static __always_inline __u64 *frame_of(struct napi_struct *napi, void *resume)
 {

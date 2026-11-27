@@ -9,6 +9,8 @@ enum rx_ext_mode {
 	MODE_PAST_GRO,	/* puts it on the batch at once */
 	MODE_DIVES,	/* as MODE_GRO, and the kernel unwinds the continuation of a held one */
 	MODE_ENTRY_DIVES, /* the kernel unwinds the entry with the frame in hand */
+	MODE_NO_FRAME,	/* offers with no frame, and takes none for a packet that GRO holds */
+	MODE_LOOPS,	/* as MODE_GRO, and the continuation has a loop with a time slice */
 };
 
 /* A packet as the stack got it */

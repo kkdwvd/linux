@@ -17,6 +17,9 @@
 
 extern void *bpf_coro_frame_alloc_skb(__u64 size, struct sk_buff *skb) __ksym;
 extern bool bpf_rx_gro(void *frame) __ksym;
+extern __u32 bpf_rx_offer(struct sk_buff *skb) __ksym;
+extern bool bpf_rx_hold(void *frame) __ksym;
+extern bool bpf_rx_pass(struct sk_buff *skb) __ksym;
 extern bool bpf_rx_backlog(void *frame, __u32 cpu) __ksym;
 extern void bpf_rx_deliver(struct sk_buff *skb) __ksym;
 extern void bpf_rx_set_state(struct sk_buff *skb, __u64 state) __ksym;
@@ -32,6 +35,12 @@ int ifindex;
 
 /* by the extension: what came, what GRO took and did not, what was resumed, what had no frame */
 __u64 arrived, taken, declined, resumed, native, no_frame;
+/* by the ones that offer with no frame: what GRO held, and what refused a merged packet */
+__u64 held, merged_refused;
+/* by the continuation that loops */
+__u64 looped;
+/* by the one that passes: what GRO did not hold */
+__u64 passed;
 /* the last frame, behind the head of its packet */
 __s64 frame_off;
 /* by the one with state: the merges, and the state of every packet that went onto a batch */
@@ -75,6 +84,13 @@ static __noinline __used void flush_fn(void *frame)
 	__sync_fetch_and_add(&resumed, 1);
 	if (f[3] == MODE_DIVES)
 		dives();
+	/* a loop with a time slice: the kernel resumes this program as an invocation of its own */
+	if (f[3] == MODE_LOOPS) {
+		__u64 i;
+
+		for (i = 0; i < 16 && can_loop; i++)
+			__sync_fetch_and_add(&looped, 1);
+	}
 	bpf_rx_batch((struct sk_buff *)f[2]);
 }
 
@@ -117,6 +133,55 @@ void BPF_PROG(arrive, struct sk_buff *skb)
 SEC(".struct_ops.link")
 struct bpf_rx_ops rx_ext = {
 	.arrive = (void *)arrive,
+};
+
+/*
+ * The same path with a frame only where one is needed: GRO sees the packet first, and the
+ * one that it holds gets a frame, for the flush. The others never had one.
+ */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_lean, struct sk_buff *skb)
+{
+	__u32 got;
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	got = bpf_rx_offer(skb);
+	if (got == GRO_NORMAL) {
+		__sync_fetch_and_add(&declined, 1);
+		bpf_rx_batch(skb);
+		return;
+	}
+	__sync_fetch_and_add(&taken, 1);
+	/* a second offer is none, to GRO */
+	if (bpf_rx_offer(skb) != GRO_NORMAL)
+		__sync_fetch_and_add(&no_frame, 1);
+	if (got != GRO_HELD || mode == MODE_NO_FRAME) {
+		bpf_rx_batch(skb);
+		return;
+	}
+	f = bpf_coro_frame_alloc_skb(32, skb);
+	if (!f) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_batch(skb);
+		return;
+	}
+	frame_off = (long)f - (long)skb->head;
+	f[0] = (__u64)flush_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	f[3] = mode;
+	if (bpf_rx_hold(f)) {
+		__sync_fetch_and_add(&held, 1);
+		return;
+	}
+	__sync_fetch_and_add(&no_frame, 1);
+	bpf_rx_batch(skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_lean = {
+	.arrive = (void *)arrive_lean,
 };
 
 /*
@@ -169,6 +234,96 @@ SEC(".struct_ops.link")
 struct bpf_rx_ops rx_state = {
 	.arrive = (void *)arrive_state,
 	.merge = (void *)merge,
+};
+
+/* The same with one call for a packet that GRO does not hold: bpf_rx_pass() */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_pass, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	if (bpf_rx_pass(skb)) {
+		__sync_fetch_and_add(&passed, 1);
+		return;
+	}
+	/* held, and a second pass is none */
+	if (bpf_rx_pass(skb)) {
+		__sync_fetch_and_add(&no_frame, 1);
+		return;
+	}
+	f = bpf_coro_frame_alloc_skb(32, skb);
+	if (!f || mode == MODE_NO_FRAME) {
+		if (!f)
+			__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_batch(skb);
+		return;
+	}
+	frame_off = (long)f - (long)skb->head;
+	f[0] = (__u64)flush_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	f[3] = mode;
+	if (bpf_rx_hold(f)) {
+		__sync_fetch_and_add(&held, 1);
+		return;
+	}
+	__sync_fetch_and_add(&no_frame, 1);
+	bpf_rx_batch(skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_pass = {
+	.arrive = (void *)arrive_pass,
+};
+
+/*
+ * With state: the packet that GRO holds starts as one segment, and one that is merged into
+ * it had no frame and no word, which the fold sees as 0.
+ */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_lean_state, struct sk_buff *skb)
+{
+	__u32 got;
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	got = bpf_rx_offer(skb);
+	if (got != GRO_HELD) {
+		if (got == GRO_NORMAL) {
+			__sync_fetch_and_add(&declined, 1);
+			__sync_fetch_and_add(&state_sum, 1);
+		}
+		bpf_rx_batch(skb);
+		return;
+	}
+	f = bpf_coro_frame_alloc_skb(24, skb);
+	if (!f) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_batch(skb);
+		return;
+	}
+	f[0] = (__u64)flush_state_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	bpf_rx_set_state(skb, 1);
+	if (!bpf_rx_hold(f)) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_batch(skb);
+	}
+}
+
+SEC("struct_ops/merge")
+__u64 BPF_PROG(merge_lean, __u64 into, __u64 from)
+{
+	__sync_fetch_and_add(&merges, 1);
+	return into + (from ?: 1);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_lean_state = {
+	.arrive = (void *)arrive_lean_state,
+	.merge = (void *)merge_lean,
 };
 
 /*
@@ -235,6 +390,51 @@ struct bpf_rx_ops rx_steer = {
 	.arrive = (void *)arrive_steer,
 };
 
+/*
+ * And one that steers what it offered with no frame: the packet that GRO has no use for
+ * gets a frame for the backlog, the one that GRO holds gets one for the flush and the
+ * backlog behind it, and one that is part of another packet now is no backlog's.
+ */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_lean_steer, struct sk_buff *skb)
+{
+	__u32 got;
+	__u64 *f;
+
+	__sync_fetch_and_add(&arrived, 1);
+	got = bpf_rx_offer(skb);
+	f = bpf_coro_frame_alloc_skb(32, skb);
+	if (!f) {
+		__sync_fetch_and_add(&no_frame, 1);
+		bpf_rx_batch(skb);
+		return;
+	}
+	f[0] = (__u64)steer_fn;
+	f[1] = 0;
+	f[2] = (__u64)skb;
+	f[3] = 0;
+	if (got == GRO_NORMAL) {
+		__sync_fetch_and_add(&declined, 1);
+		steer(f, skb);
+		return;
+	}
+	__sync_fetch_and_add(&taken, 1);
+	if (got == GRO_HELD && bpf_rx_hold(f))
+		return;
+	if (got == GRO_HELD)
+		__sync_fetch_and_add(&no_frame, 1);
+	f[3] = 1;
+	if (bpf_rx_backlog(f, steer_cpu))
+		return;
+	__sync_fetch_and_add(&merged_refused, 1);
+	bpf_rx_batch(skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_lean_steer = {
+	.arrive = (void *)arrive_lean_steer,
+};
+
 /* The null extension, and nothing else: what the path costs as code of an extension */
 static __noinline __used void flush_null_fn(void *frame)
 {
@@ -262,6 +462,57 @@ void BPF_PROG(arrive_null, struct sk_buff *skb)
 SEC(".struct_ops.link")
 struct bpf_rx_ops rx_null = {
 	.arrive = (void *)arrive_null,
+};
+
+/* The null extension that offers first: a frame for the packet that GRO holds, and no other */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_lean_null, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	if (bpf_rx_offer(skb) == GRO_HELD) {
+		f = bpf_coro_frame_alloc_skb(24, skb);
+		if (f) {
+			f[0] = (__u64)flush_null_fn;
+			f[1] = 0;
+			f[2] = (__u64)skb;
+			if (bpf_rx_hold(f))
+				return;
+		}
+	}
+	bpf_rx_batch(skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_lean_null = {
+	.arrive = (void *)arrive_lean_null,
+};
+
+/*
+ * And the one that passes: one call for a packet that GRO does not hold, and a frame for
+ * the one that it does.
+ */
+SEC("struct_ops/arrive")
+void BPF_PROG(arrive_pass_null, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	if (bpf_rx_pass(skb))
+		return;
+	f = bpf_coro_frame_alloc_skb(24, skb);
+	if (f) {
+		f[0] = (__u64)flush_null_fn;
+		f[1] = 0;
+		f[2] = (__u64)skb;
+		if (bpf_rx_hold(f))
+			return;
+	}
+	bpf_rx_batch(skb);
+}
+
+SEC(".struct_ops.link")
+struct bpf_rx_ops rx_pass_null = {
+	.arrive = (void *)arrive_pass_null,
 };
 
 /* And less: the entry alone, which leaves every packet to the kernel */

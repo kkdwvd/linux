@@ -16,6 +16,7 @@ extern void *bpf_coro_frame_alloc_napi(__u64 size, struct napi_struct *napi) __k
 extern void bpf_napi_defer(void *frame, __u32 where) __ksym;
 extern void bpf_napi_poll_native(struct napi_struct *napi) __ksym;
 extern void bpf_napi_poll_run(struct napi_struct *napi) __ksym;
+extern void bpf_napi_poll_at(struct napi_struct *napi, __u32 where) __ksym;
 
 char _license[] SEC("license") = "GPL";
 
@@ -26,7 +27,7 @@ int again_defers;	/* again() defers to 'where' in place of polling */
 
 /* entries by reason, and of those the ones in hard interrupt context */
 __u64 entries[3], hardirq;
-__u64 deferred, resumed, polled, native, no_frame;
+__u64 deferred, resumed, polled, native, no_frame, placed;
 /* the NAPI of the last entry, and how far its frame is behind it */
 __u32 napi_id;
 __s64 frame_off;
@@ -101,6 +102,11 @@ void BPF_PROG(schedule, struct napi_struct *napi, __u32 reason)
 	if (mode == MODE_NATIVE) {
 		__sync_fetch_and_add(&native, 1);
 		bpf_napi_poll_native(napi);
+		return;
+	}
+	if (mode == MODE_AT) {
+		__sync_fetch_and_add(&placed, 1);
+		bpf_napi_poll_at(napi, where);
 		return;
 	}
 	defer(napi, mode);

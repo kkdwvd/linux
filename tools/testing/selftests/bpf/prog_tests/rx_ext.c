@@ -60,6 +60,14 @@ static void test_refused(void)
 	refused("ext_reads_taken", "reads_taken", "invalid mem access 'scalar'");
 	refused("ext_cont_keeps", "cont_keeps", "Unreleased reference");
 	refused("ext_cont_offers", "cont_offers", "calling kernel function bpf_rx_gro is not allowed");
+	refused("ext_cont_offers_bare", "cont_offers_bare",
+		"calling kernel function bpf_rx_offer is not allowed");
+	refused("ext_cont_holds", "cont_holds", "calling kernel function bpf_rx_hold is not allowed");
+	refused("ext_offers_keeps", "offers_keeps", "Unreleased reference");
+	refused("ext_reads_passed", "reads_passed", "resource release invalidated this pointer");
+	refused("ext_pass_keeps", "pass_keeps", "Unreleased reference");
+	refused("ext_cont_passes", "cont_passes", "calling kernel function bpf_rx_pass is not allowed");
+	refused("ext_batches_held", "batches_held", "resource release invalidated this pointer");
 	refused("ext_too_big", "too_big", "coro_frame of 72 bytes does not fit in its host");
 	refused("ext_no_host", "no_host", "which is in none of its slots");
 	refused("ext_holds", "holds", "deferred coro_frame holds a reference besides its host");
@@ -128,6 +136,9 @@ static void forget(void)
 	ext->bss->resumed = 0;
 	ext->bss->native = 0;
 	ext->bss->no_frame = 0;
+	ext->bss->held = 0;
+	ext->bss->passed = 0;
+	ext->bss->merged_refused = 0;
 	ext->bss->merges = 0;
 	ext->bss->state_sum = 0;
 	ext->bss->steered = 0;
@@ -197,6 +208,35 @@ static void path(const char *what, __u32 kind, __u32 n, __u64 taken, __u64 resum
 		ASSERT_LT(ext->bss->nr_seen, POLLS * n, what);
 }
 
+/*
+ * The same with no frame for a packet that GRO does not hold: @taken are held or merged,
+ * and @resumed of them had a frame, for the flush.
+ */
+static void lean(const char *what, __u32 kind, __u32 n, __u64 taken, __u64 resumed)
+{
+	ext_map = ext->maps.rx_lean;
+	path(what, kind, n, taken, resumed);
+	ASSERT_EQ(ext->bss->held, resumed, what);
+	if (ext_link)
+		detach();
+	ext_map = NULL;
+}
+
+/* And with one call for a packet that GRO does not hold: @held get a frame, for the flush */
+static void pass(const char *what, int mode, __u32 kind, __u32 n, __u64 held)
+{
+	ext_map = ext->maps.rx_pass;
+	if (same(what, mode, kind, n)) {
+		ASSERT_EQ(ext->bss->passed, POLLS * n - held, what);
+		ASSERT_EQ(ext->bss->held, mode == MODE_NO_FRAME ? 0 : held, what);
+		ASSERT_EQ(ext->bss->resumed, mode == MODE_NO_FRAME ? 0 : held, what);
+		ASSERT_EQ(ext->bss->no_frame, 0, what);
+	}
+	if (ext_link)
+		detach();
+	ext_map = NULL;
+}
+
 /* The segments in the packets that the stack got */
 static __u64 segments(void)
 {
@@ -211,9 +251,9 @@ static __u64 segments(void)
  * The extension with state: what it keeps per packet is combined where GRO merges two, and
  * what goes onto the batches is what arrived. The stack gets what it gets with none.
  */
-static void state(const char *what, __u32 kind, __u32 n)
+static void state_of(struct bpf_map *map, const char *what, __u32 kind, __u32 n)
 {
-	ext_map = ext->maps.rx_state;
+	ext_map = map;
 	if (same(what, MODE_GRO, kind, n)) {
 		ASSERT_EQ(ext->bss->state_sum, POLLS * n, what);
 		ASSERT_EQ(ext->bss->merges, POLLS * n - ext->bss->resumed - ext->bss->declined, what);
@@ -222,6 +262,13 @@ static void state(const char *what, __u32 kind, __u32 n)
 	if (ext_link)
 		detach();
 	ext_map = NULL;
+}
+
+static void state(const char *what, __u32 kind, __u32 n)
+{
+	state_of(ext->maps.rx_state, what, kind, n);
+	/* and with a frame only for the packets that GRO holds */
+	state_of(ext->maps.rx_lean_state, what, kind, n);
 }
 
 static bool wait_seen(__u64 want, const char *what)
@@ -238,9 +285,10 @@ static bool wait_seen(__u64 want, const char *what)
  * stack from there, in a continuation that runs on that CPU; what the backlog does not take
  * goes onto the batch. @out packets come out of GRO, with all the segments that arrived.
  */
-static void steer(const char *what, __u32 cpu, __u32 kind, __u32 n, __u64 out, bool all)
+static void steer_of(struct bpf_map *map, const char *what, __u32 cpu, __u32 kind, __u32 n,
+		     __u64 out, bool all)
 {
-	ext_map = ext->maps.rx_steer;
+	ext_map = map;
 	ext->bss->steer_cpu = cpu;
 	if (!attach())
 		goto out;
@@ -257,10 +305,20 @@ static void steer(const char *what, __u32 cpu, __u32 kind, __u32 n, __u64 out, b
 	ASSERT_EQ(ext->bss->no_frame, 0, what);
 	if (all)
 		ASSERT_EQ(ext->bss->steered, out, what);
+	/* a packet that is part of another one goes to no backlog */
+	if (map == ext->maps.rx_lean_steer)
+		ASSERT_EQ(ext->bss->merged_refused, POLLS * n - out, what);
 out:
 	if (ext_link)
 		detach();
 	ext_map = NULL;
+}
+
+static void steer(const char *what, __u32 cpu, __u32 kind, __u32 n, __u64 out, bool all)
+{
+	steer_of(ext->maps.rx_steer, what, cpu, kind, n, out, all);
+	/* and from an offer with no frame */
+	steer_of(ext->maps.rx_lean_steer, what, cpu, kind, n, out, all);
 }
 
 static void test_path(void)
@@ -282,6 +340,12 @@ static void test_path(void)
 	ext->struct_ops.rx_entry->ifindex = ifindex;
 	ext->struct_ops.rx_state->ifindex = ifindex;
 	ext->struct_ops.rx_steer->ifindex = ifindex;
+	ext->struct_ops.rx_lean->ifindex = ifindex;
+	ext->struct_ops.rx_lean_state->ifindex = ifindex;
+	ext->struct_ops.rx_lean_steer->ifindex = ifindex;
+	ext->struct_ops.rx_lean_null->ifindex = ifindex;
+	ext->struct_ops.rx_pass->ifindex = ifindex;
+	ext->struct_ops.rx_pass_null->ifindex = ifindex;
 	ext->bss->ifindex = ifindex;
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;
@@ -311,6 +375,39 @@ static void test_path(void)
 	/* more than GRO holds: the oldest of a bucket is flushed in the offer of the next */
 	path("flows, more than GRO holds", RX_FLOWS, 80, POLLS * 80, POLLS * 80);
 
+	detach();
+
+	/* offered with no frame: the same, and a frame only in what GRO holds */
+	lean("a datagram, no frame", RX_UDP, 1, 0, 0);
+	lean("datagrams, no frame", RX_UDP, 20, 0, 0);
+	lean("a flow, a frame for the first", RX_FLOW, 8, POLLS * 8, POLLS);
+	lean("a flow, pushed, a frame for the first", RX_PUSH, 8, POLLS * 8, POLLS);
+	lean("flows, a frame each", RX_FLOWS, 16, POLLS * 16, POLLS * 16);
+	lean("four flows, four frames", RX_FEW, 20, POLLS * 20, POLLS * 4);
+	lean("flows, more than GRO holds, a frame each", RX_FLOWS, 80, POLLS * 80, POLLS * 80);
+	/* a head that lends no frame needs none where GRO has no use for the packet */
+	lean("small heads, no frame", RX_SMALL, 8, 0, 0);
+	lean("cloned heads, no frame", RX_CLONE, 8, 0, 0);
+	/* and a packet that GRO holds with no frame is the kernel's at the flush */
+	ext_map = ext->maps.rx_lean;
+	if (same("held with no frame", MODE_NO_FRAME, RX_FLOWS, 16)) {
+		ASSERT_EQ(ext->bss->taken, POLLS * 16, "held with no frame");
+		ASSERT_EQ(ext->bss->resumed, 0, "resumed, held with no frame");
+	}
+	detach();
+	ext_map = NULL;
+
+	/* passed in one call, unless GRO holds the packet */
+	pass("datagrams, passed", MODE_GRO, RX_UDP, 20, 0);
+	pass("a flow, passed", MODE_GRO, RX_FLOW, 8, POLLS);
+	pass("a flow, pushed, passed", MODE_GRO, RX_PUSH, 8, POLLS);
+	pass("flows, each held", MODE_GRO, RX_FLOWS, 16, POLLS * 16);
+	pass("four flows, passed", MODE_GRO, RX_FEW, 20, POLLS * 4);
+	pass("flows, more than GRO holds, each held", MODE_GRO, RX_FLOWS, 80, POLLS * 80);
+	pass("small heads, passed", MODE_GRO, RX_SMALL, 8, 0);
+	pass("held with no frame, passed", MODE_NO_FRAME, RX_FLOWS, 16, POLLS * 16);
+	pass("continuation loops, passed", MODE_LOOPS, RX_FEW, 20, POLLS * 4);
+
 	/* a head with no room below the packet, or one that a clone shares, lends no frame */
 	if (same("small heads", MODE_GRO, RX_SMALL, 8))
 		ASSERT_EQ(ext->bss->no_frame, POLLS * 8, "no frame, small heads");
@@ -323,6 +420,10 @@ static void test_path(void)
 	/* the kernel unwinds a continuation, and an entry with the frame in hand */
 	if (same("continuation unwound", MODE_DIVES, RX_FLOWS, 16))
 		ASSERT_EQ(ext->bss->resumed, POLLS * 16, "resumed, unwound");
+	/* a continuation with a loop that has a time slice, which the resumption sets up */
+	ext->bss->looped = 0;
+	if (same("continuation loops", MODE_LOOPS, RX_FLOWS, 16))
+		ASSERT_EQ(ext->bss->looped, POLLS * 16 * 16, "looped");
 	detach();
 	ext->bss->mode = MODE_ENTRY_DIVES;
 	if (!attach())
@@ -492,8 +593,8 @@ static void test_cost(void)
 		{ "one held, others merged", RX_FLOW, 8 }, { "one held, others merged", RX_FLOW, 60 },
 	};
 	__u32 packets = getenv("NAPI_EXT_ROUNDS") ? atoi(getenv("NAPI_EXT_ROUNDS")) : 2000;
-	static const char * const who[] = { "native", "null", "entry" };
-	struct bpf_map *maps[3] = {};
+	static const char * const who[] = { "native", "null", "entry", "lean", "pass" };
+	struct bpf_map *maps[5] = {};
 	int ifindex = 0, i, w;
 
 	drv = napi_ext_null__open_and_load();
@@ -508,11 +609,19 @@ static void test_cost(void)
 	ext->struct_ops.rx_entry->ifindex = ifindex;
 	ext->struct_ops.rx_state->ifindex = ifindex;
 	ext->struct_ops.rx_steer->ifindex = ifindex;
+	ext->struct_ops.rx_lean->ifindex = ifindex;
+	ext->struct_ops.rx_lean_state->ifindex = ifindex;
+	ext->struct_ops.rx_lean_steer->ifindex = ifindex;
+	ext->struct_ops.rx_lean_null->ifindex = ifindex;
+	ext->struct_ops.rx_pass->ifindex = ifindex;
+	ext->struct_ops.rx_pass_null->ifindex = ifindex;
 	/* no observer: nothing but the path */
 	if (!ASSERT_OK(rx_ext__load(ext), "rx_ext__load"))
 		goto out;
 	maps[1] = ext->maps.rx_null;
 	maps[2] = ext->maps.rx_entry;
+	maps[3] = ext->maps.rx_lean_null;
+	maps[4] = ext->maps.rx_pass_null;
 	SYS(out, "ip link set dev napitest0 up");
 	insns_open();
 	for (i = 0; i < ARRAY_SIZE(rows); i++) {

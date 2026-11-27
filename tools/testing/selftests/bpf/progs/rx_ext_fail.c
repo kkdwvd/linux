@@ -13,6 +13,9 @@
 extern void *bpf_coro_frame_alloc_skb(__u64 size, struct sk_buff *skb) __ksym;
 extern void *bpf_coro_frame_alloc(__u64 size, void *ctx) __ksym;
 extern bool bpf_rx_gro(void *frame) __ksym;
+extern __u32 bpf_rx_offer(struct sk_buff *skb) __ksym;
+extern bool bpf_rx_hold(void *frame) __ksym;
+extern bool bpf_rx_pass(struct sk_buff *skb) __ksym;
 extern void bpf_rx_batch(struct sk_buff *skb) __ksym;
 extern void bpf_rx_native(struct sk_buff *skb) __ksym;
 extern __u64 bpf_rx_state(struct sk_buff *skb) __ksym;
@@ -147,6 +150,123 @@ void BPF_PROG(cont_offers, struct sk_buff *skb)
 		bpf_rx_batch(skb);
 }
 EXT(ext_cont_offers, cont_offers);
+
+/* The continuation offers the packet with no frame, and would stay with it once more */
+static __noinline __used void offers_fn(void *frame)
+{
+	__u64 *f = frame;
+
+	bpf_rx_offer((struct sk_buff *)f[2]);
+	bpf_rx_batch((struct sk_buff *)f[2]);
+}
+
+SEC("struct_ops/arrive")
+void BPF_PROG(cont_offers_bare, struct sk_buff *skb)
+{
+	__u64 *f = frame_of(skb, offers_fn);
+
+	if (!f) {
+		bpf_rx_native(skb);
+		return;
+	}
+	if (!bpf_rx_gro(f))
+		bpf_rx_batch(skb);
+}
+EXT(ext_cont_offers_bare, cont_offers_bare);
+
+static __noinline __used void stays_fn(void *frame)
+{
+	__u64 *f = frame;
+
+	if (!bpf_rx_hold(f))
+		bpf_rx_batch((struct sk_buff *)f[2]);
+}
+
+SEC("struct_ops/arrive")
+void BPF_PROG(cont_holds, struct sk_buff *skb)
+{
+	__u64 *f = frame_of(skb, stays_fn);
+
+	if (!f) {
+		bpf_rx_native(skb);
+		return;
+	}
+	if (!bpf_rx_gro(f))
+		bpf_rx_batch(skb);
+}
+EXT(ext_cont_holds, cont_holds);
+
+/* The entry offers the packet with no frame, and returns with it */
+SEC("struct_ops/arrive")
+void BPF_PROG(offers_keeps, struct sk_buff *skb)
+{
+	sum += bpf_rx_offer(skb);
+}
+EXT(ext_offers_keeps, offers_keeps);
+
+/* The entry reads a packet that it passed */
+SEC("struct_ops/arrive")
+void BPF_PROG(reads_passed, struct sk_buff *skb)
+{
+	if (bpf_rx_pass(skb)) {
+		sum += skb->len;
+		return;
+	}
+	bpf_rx_batch(skb);
+}
+EXT(ext_reads_passed, reads_passed);
+
+/* GRO holds the packet that the entry passed, and the entry returns with it */
+SEC("struct_ops/arrive")
+void BPF_PROG(pass_keeps, struct sk_buff *skb)
+{
+	if (!bpf_rx_pass(skb))
+		sum += skb->len;
+}
+EXT(ext_pass_keeps, pass_keeps);
+
+/* The continuation passes the packet that GRO flushed */
+static __noinline __used void passes_fn(void *frame)
+{
+	__u64 *f = frame;
+
+	if (!bpf_rx_pass((struct sk_buff *)f[2]))
+		bpf_rx_batch((struct sk_buff *)f[2]);
+}
+
+SEC("struct_ops/arrive")
+void BPF_PROG(cont_passes, struct sk_buff *skb)
+{
+	__u64 *f = frame_of(skb, passes_fn);
+
+	if (!f) {
+		bpf_rx_native(skb);
+		return;
+	}
+	if (!bpf_rx_gro(f))
+		bpf_rx_batch(skb);
+}
+EXT(ext_cont_passes, cont_passes);
+
+/* GRO holds the packet for the frame, and the entry puts it on the batch */
+SEC("struct_ops/arrive")
+void BPF_PROG(batches_held, struct sk_buff *skb)
+{
+	__u64 *f;
+
+	if (bpf_rx_offer(skb) != GRO_HELD) {
+		bpf_rx_batch(skb);
+		return;
+	}
+	f = frame_of(skb, flush_fn);
+	if (!f) {
+		bpf_rx_batch(skb);
+		return;
+	}
+	if (bpf_rx_hold(f))
+		bpf_rx_batch(skb);
+}
+EXT(ext_batches_held, batches_held);
 
 /* A frame that is larger than what the head of a packet has for one */
 SEC("struct_ops/arrive")

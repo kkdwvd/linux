@@ -156,6 +156,9 @@ static void test_refused(void)
 	refused("ext_polls", "polls", "calling kernel function bpf_napi_poll_run is not allowed");
 	refused("ext_again_native", "again_native",
 		"calling kernel function bpf_napi_poll_native is not allowed");
+	refused("ext_again_at", "again_at",
+		"calling kernel function bpf_napi_poll_at is not allowed");
+	refused("ext_at_twice", "at_twice", "resource release invalidated this pointer");
 	refused("ext_cont_keeps", "cont_keeps", "Unreleased reference");
 	refused("ext_cont_reads", "cont_reads", "invalid mem access 'scalar'");
 	refused("ext_too_big", "too_big", "coro_frame of 64 bytes does not fit in its host");
@@ -225,6 +228,15 @@ static void softirq(void)
 	ASSERT_GT(ext->bss->native, native, "native");
 	ASSERT_EQ(ext->bss->resumed, resumed, "resumed, native");
 	ASSERT_EQ(ext->bss->polled, polled, "polled, native");
+
+	/* softirq because the entry says so, with no frame: the kernel polls there */
+	ext->bss->mode = MODE_AT;
+	usleep(50000);
+	resumed = ext->bss->resumed;
+	deferred = ext->bss->placed;
+	ASSERT_TRUE(ping(tx, rx), "ping, placed in softirq");
+	ASSERT_GT(ext->bss->placed, deferred, "placed in softirq");
+	ASSERT_EQ(ext->bss->resumed, resumed, "resumed, placed in softirq");
 	ext->bss->mode = MODE_DEFER;
 }
 
@@ -279,6 +291,30 @@ static void thread(void)
 	polls = pool->bss->polls[0];
 	ASSERT_TRUE(ping(tx, rx), "ping, bound and softirq");
 	ASSERT_EQ(pool->bss->polls[0], polls, "polls of the thread, softirq");
+
+	/*
+	 * the thread because the entry says so, with no frame: the thread's poll is the
+	 * kernel's, with nothing to resume and no entry of its own
+	 */
+	ext->bss->where = BPF_NAPI_THREAD;
+	ext->bss->mode = MODE_AT;
+	usleep(50000);
+	polls = pool->bss->polls[0];
+	resumed = ext->bss->resumed;
+	again = ext->bss->entries[BPF_NAPI_AGAIN];
+	deferred = ext->bss->placed;
+	ASSERT_TRUE(ping(tx, rx), "ping, placed on the thread");
+	ASSERT_GT(ext->bss->placed, deferred, "placed on the thread");
+	ASSERT_GT(pool->bss->polls[0], polls, "polls of the thread, placed");
+	ASSERT_EQ(ext->bss->resumed, resumed, "resumed, placed on the thread");
+	ASSERT_EQ(ext->bss->entries[BPF_NAPI_AGAIN], again, "entries, again, placed on the thread");
+	/* and softirq for a bound NAPI, as the entry says */
+	ext->bss->where = BPF_NAPI_SOFTIRQ;
+	usleep(50000);
+	polls = pool->bss->polls[0];
+	ASSERT_TRUE(ping(tx, rx), "ping, bound and placed in softirq");
+	ASSERT_EQ(pool->bss->polls[0], polls, "polls of the thread, placed in softirq");
+	ext->bss->mode = MODE_DEFER;
 
 	/* a thread that takes the idle NAPI enters by itself, and polls there */
 	ext->bss->where = BPF_NAPI_THREAD;
@@ -441,6 +477,9 @@ static void row(struct napi_ext_null *null, const char *what, __u32 rounds)
 }
 
 /* @where is where the null extension defers to, or -1 for the one that is the entry alone */
+/* the null extension says where and no more, see napi_at of progs/napi_ext_null.c */
+static bool null_at;
+
 static struct bpf_link *attach_null(struct napi_ext_null **nullp, int ifindex, __u32 flags, int where)
 {
 	struct napi_ext_null *null = napi_ext_null__open();
@@ -452,12 +491,15 @@ static struct bpf_link *attach_null(struct napi_ext_null **nullp, int ifindex, _
 	null->struct_ops.napi_null->flags = flags;
 	null->struct_ops.napi_entry->ifindex = ifindex;
 	null->struct_ops.napi_entry->flags = flags;
+	null->struct_ops.napi_at->ifindex = ifindex;
+	null->struct_ops.napi_at->flags = flags;
 	if (!ASSERT_OK(napi_ext_null__load(null), "napi_ext_null__load")) {
 		napi_ext_null__destroy(null);
 		return NULL;
 	}
 	null->bss->where = where;
-	l = bpf_map__attach_struct_ops(where < 0 ? null->maps.napi_entry : null->maps.napi_null);
+	l = bpf_map__attach_struct_ops(where < 0 ? null->maps.napi_entry :
+				       null_at ? null->maps.napi_at : null->maps.napi_null);
 	if (!ASSERT_OK_PTR(l, "attach null")) {
 		napi_ext_null__destroy(null);
 		return NULL;
@@ -512,6 +554,16 @@ static void test_crossing(void)
 	bpf_link__destroy(l);
 	napi_ext_null__destroy(null);
 
+	/* and the entry that says where, with no frame and nothing to resume */
+	null_at = true;
+	l = attach_null(&null, ifindex, 0, BPF_NAPI_SOFTIRQ);
+	null_at = false;
+	if (!l)
+		goto out;
+	row(drv, "no frame, softirq, direct call", rounds);
+	bpf_link__destroy(l);
+	napi_ext_null__destroy(null);
+
 	SYS(out, "echo 1 > /sys/class/net/napitest0/threaded");
 	row(drv, "kernel threaded NAPI", thread_rounds);
 	SYS(out, "echo 0 > /sys/class/net/napitest0/threaded");
@@ -554,6 +606,16 @@ static void test_crossing(void)
 	/* bound, and softirq: what the entry chooses */
 	null->bss->where = BPF_NAPI_SOFTIRQ;
 	row(drv, "null extension, softirq, bound to a thread", rounds);
+	bpf_link__destroy(l);
+	napi_ext_null__destroy(null);
+	null_at = true;
+	l = attach_null(&null, ifindex, 0, BPF_NAPI_THREAD);
+	null_at = false;
+	if (!l)
+		goto out;
+	row(drv, "no frame, thread, direct call", thread_rounds);
+	null->bss->where = BPF_NAPI_SOFTIRQ;
+	row(drv, "no frame, softirq, bound to a thread", rounds);
 	bpf_link__destroy(l);
 	napi_ext_null__destroy(null);
 	ASSERT_OK(run_prog(pool->progs.unbind_napi, 0, id, 0), "unbind");

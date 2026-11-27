@@ -15,6 +15,7 @@ extern void *bpf_coro_frame_alloc_napi(__u64 size, struct napi_struct *napi) __k
 extern void bpf_napi_defer(void *frame, __u32 where) __ksym;
 extern void bpf_napi_poll_native(struct napi_struct *napi) __ksym;
 extern void bpf_napi_poll_run(struct napi_struct *napi) __ksym;
+extern void bpf_napi_poll_at(struct napi_struct *napi, __u32 where) __ksym;
 
 char _license[] SEC("license") = "GPL";
 
@@ -71,6 +72,19 @@ SEC(".struct_ops.link")
 struct bpf_napi_ops napi_entry = {
 	.schedule = (void *)schedule_native,
 	.again = (void *)again_native,
+};
+
+/* And one that says where, and leaves the poll there to the kernel: no frame for it */
+SEC("struct_ops/schedule")
+void BPF_PROG(schedule_at, struct napi_struct *napi, __u32 reason)
+{
+	bpf_napi_poll_at(napi, where);
+}
+
+SEC(".struct_ops.link")
+struct bpf_napi_ops napi_at = {
+	.schedule = (void *)schedule_at,
+	.again = (void *)again,
 };
 
 struct test_args {
