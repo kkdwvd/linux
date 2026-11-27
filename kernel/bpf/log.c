@@ -422,6 +422,8 @@ const char *reg_type_str(struct bpf_verifier_env *env, enum bpf_reg_type type)
 		[PTR_TO_FUNC]		= "func",
 		[PTR_TO_INSN]		= "insn",
 		[PTR_TO_MAP_KEY]	= "map_key",
+		[PTR_TO_CORO_FRAME]	= "coro_frame",
+		[PTR_TO_CORO_FUNC]	= "coro_func",
 		[CONST_PTR_TO_DYNPTR]	= "dynptr_ptr",
 	};
 
@@ -462,6 +464,8 @@ const char *dynptr_type_str(enum bpf_dynptr_type type)
 		return "skb_meta";
 	case BPF_DYNPTR_TYPE_FILE:
 		return "file";
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return "xdp_frame";
 	case BPF_DYNPTR_TYPE_INVALID:
 		return "<invalid>";
 	default:
@@ -778,6 +782,40 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		default:
 			verbose(env, " fp%d=%s", (-i - 1) * BPF_REG_SIZE, types_buf);
 			break;
+		}
+	}
+	for (i = 0; i < vstate->acquired_refs; i++) {
+		const struct bpf_reference_state *ref = &vstate->refs[i];
+		int spi;
+
+		for (spi = 0; spi < ref->nr_slots; spi++) {
+			const struct bpf_stack_state *slot = &ref->slots[spi];
+			char types_buf[BPF_REG_SIZE + 1];
+			bool valid = false;
+			int j;
+
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				u8 slot_type = slot->slot_type[j];
+
+				if (slot_type != STACK_INVALID && slot_type != STACK_POISON)
+					valid = true;
+				types_buf[j] = slot_type_char[slot_type];
+			}
+			types_buf[BPF_REG_SIZE] = 0;
+			if (!valid)
+				continue;
+
+			if (slot->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL) {
+				/* print MISC/ZERO/INVALID slots above subreg spill */
+				for (j = 0; j < BPF_REG_SIZE; j++)
+					if (slot->slot_type[j] == STACK_SPILL)
+						break;
+				types_buf[j] = '\0';
+				verbose(env, " ref%d[%d]=%s", ref->id, spi * BPF_REG_SIZE, types_buf);
+				print_reg_state(env, state, &slot->spilled_ptr);
+			} else {
+				verbose(env, " ref%d[%d]=%s", ref->id, spi * BPF_REG_SIZE, types_buf);
+			}
 		}
 	}
 	if (vstate->acquired_refs && vstate->refs[0].id) {

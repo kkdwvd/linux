@@ -603,7 +603,7 @@ __msg("R7=fp(smin=smin32=-64,smax=smax32=-8")
 __msg("R7=fp-16 R8=fp-16 loop_stack=5")
 /* back-edge state goes no further because {-16} is within [-72, -16]. */
 __msg("from 8 to 5: pruned")
-__msg("processed 16 insns")
+__msg("processed 15 insns")
 __naked void stack_ptr_subrange_in_loop(void)
 {
 	asm volatile ("					\

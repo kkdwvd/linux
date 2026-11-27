@@ -355,6 +355,203 @@ In this case, a program attached to the ``inode_init_security`` LSM hook
 can pass the hook's own ``xattr_count`` argument through to the kfunc,
 which claims xattr slots by writing through it.
 
+2.3.10 __coro_frame Annotation
+------------------------------
+
+This annotation identifies an owned coroutine frame returned by
+``bpf_coro_frame_alloc()``. Each annotated parameter must receive the
+non-NULL base pointer of a live frame::
+
+        __bpf_kfunc void bpf_coro_frame_free(void *p__coro_frame)
+
+A ``__coro_frame`` parameter always consumes the frame reference, without
+requiring ``KF_RELEASE``. A kfunc may take several frame parameters in any
+argument position, including stack arguments on architectures that support
+them. Each consuming argument must receive a distinct owned frame; passing
+aliases of the same frame to two consuming arguments is rejected.
+
+The verifier checks all arguments before consuming any frame references.
+After the call, all aliases of each consumed frame are invalid for further
+access, resumption, or release. The kfunc must free each frame or take
+responsibility for its subsequent lifetime. Explicit ``KF_RELEASE`` retains
+its first-argument semantics and does not consume a ``__coro_frame`` first
+argument twice.
+
+A frame takes no reference on the program that allocated it. Kernel code
+that keeps a frame past the call that gave it one holds the program for as
+long as it has the frame, see ``__coro_suspend`` below. A program holds the
+modules whose kfuncs it calls: a module cannot be unloaded while it keeps a
+frame of a program that calls its kfuncs, so it frees or resumes the frames
+it keeps on its own, not in its exit function. A frame has a header in front
+of it: kernel code frees a frame with ``bpf_coro_frame_free()``, in any
+context, and never with ``kfree()`` or ``kfree_nolock()``::
+
+        __bpf_kfunc void bpf_foo_done(void *frame__coro_frame)
+        {
+                bpf_coro_frame_free(frame__coro_frame);
+        }
+
+This annotation does not transfer references stored inside the frame or
+preserve verifier state for a later continuation. Passing frame storage to
+an ordinary memory parameter retains the usual memory-argument semantics,
+with one exception: a frame is not accepted as the buffer of
+``bpf_dynptr_slice()`` or ``bpf_dynptr_slice_rdwr()`` where the slice may be
+the buffer. The contents of a frame are tracked like those of the stack, and
+such a slice would be a second way to them.
+
+A frame can also be in memory that an object of the kernel lends, its host,
+where the request that the coroutine serves arrived in that object:
+``bpf_coro_frame_alloc_xdp()`` gives an XDP program a frame in the headroom
+of the packet. Such a frame costs no allocation, and it is no reference of
+the program: it is there for as long as the program has the host, and
+whatever takes the host from the program ends the frame. For a packet that
+is the return of the program, or, once the program has kept the packet with
+``bpf_xdp_frame_steal()``, the call that sends the packet, gives it back or
+stores it. The verifier refuses every use of the frame behind that point.
+A ``__coro_frame`` parameter does not accept such a frame, so nothing frees
+it, and ``bpf_coro_frame_free()`` in kernel code does nothing for it. A
+``__coro_suspend`` parameter accepts it if the host is a reference that one
+of the slots of the frame holds: the continuation gives the host up, which
+is the end of the frame. The kfunc returns a frame in the host or ``NULL``,
+never a frame from the cache of the program: the size is checked at load
+time against what such a host can lend at all, 192 bytes for a packet, and
+at run time the host may have less, or none. There is no fallback: the
+request that gets no frame ends.
+
+A kfunc gives out such frames once it is registered with
+``bpf_coro_register_host()``, with the largest frame that a host of its kind
+lends. It is ``KF_ACQUIRE | KF_RET_NULL``, returns ``void *``, takes the
+constant size first and its host in an argument with the suffix
+``__coro_host``: the program context, or a reference that the program
+holds, in which case the frame ends where that reference goes. It makes the
+memory that it found a frame with ``bpf_coro_frame_in()``::
+
+        __bpf_kfunc void *bpf_coro_frame_alloc_napi(u64 size__k,
+                                                    struct napi_struct *napi__coro_host,
+                                                    struct bpf_prog_aux *aux)
+
+2.3.11 __coro_suspend Annotation
+--------------------------------
+
+A ``__coro_suspend`` parameter is a consumed frame that the kernel resumes
+later, once the event the kfunc waits for has happened::
+
+        __bpf_kfunc int bpf_blk_read_coro(struct bpf_blk_io *io__arena,
+                                          void *buf__arena,
+                                          void *frame__coro_suspend)
+
+The compiler stores the address of the coroutine's resume function in the
+frame's first slot and of its destroy function in the second, and both take
+the frame as their only argument. Each of the two slots holds the address of
+one function, not a pointer that was loaded from a table of functions and
+stands for any of them. At the call the verifier snapshots the
+frame's slots and verifies each of the two functions as an async callback
+starting from that snapshot: the slots keep their types and values, so the
+suspend index selects only the continuation of this suspend point, and the
+acquired references stored in the frame move to the callback, which must
+release them (or the frame holding them, together with the frame itself).
+Pointers that do not survive a suspension are rejected: the context, packet
+pointers, RCU-protected or untrusted pointers, values of maps other than
+arrays, inner maps of a map in map and their values, sockets that a helper
+looked up, and the arguments of a struct_ops operator. A reference survives
+when a kfunc acquired it or ``bpf_kptr_xchg()`` took it out of a map. The caller keeps the frame address as a non-NULL scalar, which
+lets the compiler-generated check for a failed frame allocation hold. A
+continuation is checked like any callback that the kernel calls: it cannot
+use ``LD_ABS`` or a tail call, and it cannot use the stack in arena (R12),
+since a resume that got none would be skipped. Nor can it be recursive: the
+check of the stack at the entry of a recursive function unwinds a frame that
+holds nothing, and a continuation holds the frame from its first insn on.
+
+The kfunc owns the frame from then on. Once its event has happened it
+resumes the coroutine exactly once with ``bpf_coro_run()``, and the
+continuation owns the frame then. It does so later, from kernel context in
+which the program type's kfuncs are valid: softirq, irq_work or a workqueue,
+as the kfunc arranges. ``bpf_coro_run()`` never runs inside an invocation of
+a program: not in the call that took the frame, nor in another kfunc that a
+program calls. A continuation that suspends its frame again to a kfunc that
+resumed it in the call would nest without bound. A kfunc that fails after
+taking the frame defers the resume too, with the error reported in memory
+the coroutine can see.
+
+A frame takes no reference on its program, so the kfunc holds the program
+for as long as it has the frame. Before it returns it takes a reference on
+``bpf_coro_frame_prog()`` with ``bpf_prog_inc_not_zero()``. That fails when
+the last reference of the calling program is gone and the program only runs
+until a grace period ends: the kfunc frees the frame at once then. It puts
+the reference after ``bpf_coro_run()`` or ``bpf_coro_frame_free()``, through
+a pointer to the program that it took before the call, since the frame is
+gone by then. A kfunc that keeps the frames of one program for an object of
+its own, a connection say, can hold the program once for the object.
+
+Or the kfunc frees the frame with ``bpf_coro_frame_free()`` without resuming
+it. That does not release the references that the coroutine keeps in the
+slots of the frame, which leak: neither a call of the destroy function nor
+pads that release what a suspended frame holds exist yet.
+
+The kernel may unwind a continuation like any program, for a loop whose time
+is up, say, and ``bpf_coro_run()`` returns true then, so that the kfunc can
+react, by closing a connection or waking a waiter. It does the same when the
+program's own unwinding (a C++ exception) leaves the continuation. The value
+that an unwound continuation leaves is of no use to anybody, and the exception
+callback of the program is not called for it. The landing pad of
+``bpf_coro_run()`` takes a JIT that unwinds programs (x86-64 and arm64): where
+there is none, a continuation that can be unwound is not loaded.
+
+The pads of a continuation release the references that it holds only in the
+frame's memory through the frame, and free the frame after them.
+
+2.3.12 __coro_defer Annotation
+------------------------------
+
+A ``__coro_defer`` parameter is a ``__coro_suspend`` frame that the kernel
+keeps where it is, in the host that the program got with it, and resumes on
+a receive path::
+
+        __bpf_kfunc void bpf_napi_defer(void *frame__coro_defer, u32 where)
+
+Only a frame in memory of a reference is accepted, with that reference in
+one of its slots. The reference may be a ``__ref`` argument of a struct_ops
+member, which no other suspension lets a frame carry: the host is the
+kernel's for good once the frame is, and the continuation gives it up.
+
+The kernel resumes the frame with bottom halves off and a network context,
+whatever the code that suspends runs in, and the continuation is verified
+as code of an XDP program. So a kfunc that the suspending code must not
+call and the continuation may is registered for XDP programs, with a filter
+that knows the program by its struct_ops.
+
+The frame holds no reference but its host. The kfunc's side can therefore
+end a frame that it does not resume by forgetting it, where it takes the
+host back, and never has to call the program for that.
+
+A keeper that has one program in one place can ask what it will resume
+before any frame comes its way, ``bpf_coro_defer_resume()``, and resume
+such frames with ``bpf_coro_run_bh()``, which does none of the bookkeeping
+that a caller with bottom halves off has no need of.
+
+A host that has no room for the header of a frame registers its kfunc with
+``bpf_coro_register_bare_host()`` and returns the memory as it is. Nothing
+can ask a bare frame for its program, so no ``__coro_suspend`` kfunc takes
+one: only a ``__coro_defer`` kfunc of the host's subsystem does, which knows
+the program by where it is attached.
+
+2.3.13 __coro_offer Annotation
+------------------------------
+
+A ``__coro_offer`` parameter is a ``__coro_defer`` frame that the kfunc may
+decline, a boundary that answers at once::
+
+        __bpf_kfunc bool bpf_rx_gro(void *frame__coro_offer)
+
+The kfunc returns true where it took the frame: then all of ``__coro_defer``
+holds, and the code that called it has neither the frame nor its host. It
+returns false where it did not: nothing has happened to the frame or to
+what it holds, and the code goes on with both. The verifier checks the two
+outcomes apart, each with the return value known, so a program tells them
+by that value alone. In C++ it is an ``await_suspend()`` that returns bool.
+
+Such a kfunc takes one frame and no other reference, and returns a scalar.
+
 .. _BPF_kfunc_nodef:
 
 2.4 Using an existing kernel function
@@ -542,6 +739,27 @@ verifier does not check. Calling such a kfunc requires CAP_PERFMON, or
 CAP_SYS_ADMIN, in the same way that the equivalent BPF helpers are gated in
 bpf_base_func_proto(). A program loaded with CAP_BPF alone is rejected at load
 time.
+
+2.5.11 KF_RELEASE_CTX flag
+--------------------------
+
+The KF_RELEASE_CTX flag is used for kfuncs that consume the program context
+passed as their first argument, which the program holds as a trusted pointer
+rather than as an acquired reference. After the call the verifier invalidates
+every copy of the context pointer, in every frame, together with the packet
+pointers and the dynptrs that were derived from it, so the program can no
+longer reach what the kfunc took. Such a kfunc cannot be called from a global
+function or from an extension program, or from a function they call, since
+their callers keep their copies of the context. Whatever the program returns
+after the call, the value that it returns when the kernel unwinds it
+included, must not make its caller touch what the kfunc took: for XDP that is
+what XDP_CONSUME makes sure of. bpf_xdp_frame_steal() uses the flag to turn
+the frame behind an XDP context into a kptr the program owns.
+
+A coroutine frame in memory of the context, see ``__coro_frame`` above, goes
+over to the reference that such a kfunc returns, and ends where that goes. A
+KF_RELEASE_CTX kfunc that returns no reference is not called while the
+context has such a frame.
 
 2.6 Registering the kfuncs
 --------------------------
@@ -994,3 +1212,53 @@ mapping performed by these kfuncs.
 
 .. kernel-doc:: kernel/bpf/helpers.c
    :identifiers: bpf_copy_to_user bpf_user_anon_mmap bpf_user_munmap
+
+4.5 Parked coroutine frames
+---------------------------
+
+A program that schedules its own coroutines keeps their frames itself.
+``bpf_coro_park_xdp()`` and ``bpf_coro_park_syscall()`` suspend a frame of
+``bpf_coro_frame_alloc()`` and hand it back as a pointer that the program owns
+and can only move: into a ``__kptr`` field of a map value or of an allocated
+object, a node of a list or an rbtree among them, and out again with
+``bpf_kptr_xchg()``. The frame has the resume function of the coroutine in its
+first slot and the destroy function in its second one.
+
+A program that has the pointer resumes or destroys the coroutine as a compiler
+does for a coroutine handle: it loads the function from the first or the second
+slot of the frame through the pointer and calls it with the pointer as the only
+argument. The kfunc names the type of program that does so, XDP or syscall, and
+from the suspension on the two functions are verified as code of a program of
+that type, whatever program they are a part of: they call the helpers and the
+kfuncs of that type. A program of another type, or one that has no use for the
+coroutine any more, gives the pointer to ``bpf_coro_drop_xdp()`` or
+``bpf_coro_drop_syscall()``, and the kernel calls the destroy function soon
+after, in a context of the type.
+
+The call is in a read section of RCU, with no lock held and with IRQs on. If
+the kernel unwinds the continuation, its caller is unwound too. A continuation
+calls no parked frame, and neither does an extension program.
+
+A program that may sleep parks frames like any other. A continuation never
+sleeps, whichever program it is a part of and whichever calls it: what it calls
+is what a program that cannot sleep calls.
+
+A frame gets from one program to another through a map. A map whose values can
+hold a frame, in a field or in what a field leads to, belongs to the first
+program that uses it and is bound to no other program: the one that parks the
+frames. Any other program that uses the map is bound to that one when it is
+loaded, with ``coro_prog_fd`` of ``BPF_PROG_LOAD``, and does not load otherwise.
+A bound program holds the other one for as long as it is loaded itself, calls
+its frames, and parks none of its own. The map stays that program's until the
+program is freed, which is later than the day its last reference goes: code of
+it may run until then. Such a map is no inner map, and a list or an rbtree whose
+nodes can hold a frame is guarded by a ``bpf_spin_lock``.
+
+No frame keeps its program loaded. When the last reference of the program that
+parks is gone, the kernel calls the destroy function of every frame that is
+still parked, before anything of the program is freed. For that a map which
+holds frames is an array map or a preallocated hash map, and the destroy
+function of a parked frame suspends no frame.
+
+.. kernel-doc:: kernel/bpf/coro.c
+   :identifiers: bpf_coro_park_xdp bpf_coro_park_syscall bpf_coro_drop_xdp bpf_coro_drop_syscall

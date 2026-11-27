@@ -252,29 +252,15 @@ static bool flow_is_bound(struct bpf_verifier_env *env, int h, int idx)
  * an iterator that is older than the loop, that every trip goes through. A loop without
  * it gets may_goto unless the number of its trips turns out to be known.
  *
- * The place for it is in front of a conditional jump that leaves the loop, with
- * the same target. The registers and the stack are what they are when
- * the program leaves the loop there. One such jump that every trip goes
- * through is enough. Otherwise every back edge needs one.
+ * The place for it is in front of a conditional jump that leaves the loop. One such jump that
+ * every trip goes through is enough. Otherwise every back edge needs one. If there is none it's
+ * the head of the loop.
  */
-static void flow_set_guard(struct bpf_verifier_env *env, int h, int n)
-{
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int t = n + env->prog->insnsi[n].off + 1;
-	int i = bpf_loop_at_index(env, t);
-
-	if (i == h || bpf_is_nested_loop(env, i, h))
-		t = n + 1;
-	aux[n].guard_place = true;
-	aux[n].guard_to = t;
-	aux[h].loop->has_guards = true;
-}
-
 static void flow_place_guards(struct bpf_verifier_env *env, int h)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_loop *loop = aux[h].loop;
-	int i, n, o, t;
+	int i, n;
 
 	if (loop->backedges_overflow)
 		goto header;
@@ -290,42 +276,26 @@ static void flow_place_guards(struct bpf_verifier_env *env, int h)
 			if (loop->backedges[i].latch != loop->backedges[i].from)
 				goto header;
 		for (i = 0; i < loop->backedges_cnt; i++)
-			flow_set_guard(env, h, loop->backedges[i].from);
+			aux[loop->backedges[i].from].guard_place = true;
 		return;
 	}
 
-	for (n = bpf_loop_spine_end(env, loop); n >= 0; n = n == h ? -1 : env->idoms[n])
-		if (bpf_insn_leaves_loop(env, h, n))
-			return flow_set_guard(env, h, n);
+	for (n = bpf_loop_spine_end(env, loop); n >= 0; n = n == h ? -1 : env->idoms[n]) {
+		if (bpf_insn_leaves_loop(env, h, n)) {
+			aux[n].guard_place = true;
+			return;
+		}
+	}
 
 	for (i = 0; i < loop->backedges_cnt; i++)
 		if (loop->backedges[i].latch < 0)
 			goto header;
 	for (i = 0; i < loop->backedges_cnt; i++)
-		flow_set_guard(env, h, loop->backedges[i].latch);
+		aux[loop->backedges[i].latch].guard_place = true;
 	return;
 
 header:
-	/*
-	 * In front of a jump may_goto goes where the jump goes. From the head to where the loop
-	 * is left is not an edge of the program: it skips what is in the loop. If that is what
-	 * stops a loop around this one, bpf_iter_*_next() or i++, and the exit leads back to
-	 * the head of that loop, the program goes round and round from may_goto to may_goto.
-	 * So leave all loops.
-	 *
-	 * What is derived from the graph in the direction of the edges has to know about this
-	 * one, see bpf_head_guard_target().
-	 */
-	for (o = h; aux[o].loop_header >= 0; o = aux[o].loop_header)
-		;
-	/* a loop that has no exit can only be stopped together with the program */
-	t = aux[o].loop->exit_to;
-	if (t < 0)
-		return;
 	aux[h].guard_place = true;
-	aux[h].guard_at_header = true;
-	aux[h].guard_to = t;
-	loop->has_guards = true;
 }
 
 /* Does every trip of the loop @h go through an insn that stops it? */
@@ -388,20 +358,15 @@ bool bpf_flow_loops_lost_bound(struct bpf_verifier_env *env)
  * got to the end of the loop in a peeled trip. A loop before this one can use up the budget
  * of may_goto. So if a state did not take the edges of may_goto, the pass restarts.
  */
-int bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop)
+void bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop)
 {
 	if (loop->rt_bounded)
-		return 0;
+		return;
 	loop->no_first_trips_guess = true;
-	if (!loop->has_guards) {
-		verbose(env, "loop at insn %d never exits\n", loop->header);
-		return -EINVAL;
-	}
 	if (!loop->this_pass.needs_guard && (env->log.level & BPF_LOG_LEVEL2))
 		verbose(env, "loop at %d has no trip count\n", loop->header);
 	loop->this_pass.needs_guard = loop->guarded = true;
 	env->guards_late |= loop->this_pass.no_guard_edges;
-	return 0;
 }
 
 /* This pass peels more trips. What the last pass found about @loop can be wrong. */
@@ -415,7 +380,6 @@ static void flow_forget_loop(struct bpf_verifier_env *env, struct bpf_loop *loop
 	for (i = loop->header; n--; i = bpf_flow_insn_after(env, i)) {
 		if (bpf_loop_at_index(env, i) != loop->header)
 			continue;
-		aux[i].guard_no_unwind = aux[i].guard_unset_reg = false;
 		aux[i].not_stopped = -1;
 	}
 	loop->rt_bounded = flow_loop_is_bounded(env, loop->header);
@@ -465,13 +429,27 @@ void bpf_flow_drop_guards(struct bpf_verifier_env *env)
 }
 
 /*
- * Which loops have something that stops them at run time, and where may_goto goes in the others.
- * Returns 1 if a place is at the head of a loop.
+ * Pass 0 takes the edges of may_goto in every loop that nothing stops, see bpf_flow_place_guards(),
+ * and a later pass in every loop that had no trip count before, see bpf_flow_new_pass(). Is the
+ * one before the insn at @idx such a guess? No state of this pass went around its loop without a
+ * trip count so far, and bpf_flow_drop_guards() may find that the program has no may_goto there.
+ * A path-sensitive run guesses nothing here: it takes the edge only in a loop that it found to be
+ * infinite, see check_loop_guard() and failing_path_trip(), in this run or in one before it, which
+ * 'needs_guard' of this run does not tell. A conflict on that edge is the end of a failing path.
  */
+bool bpf_flow_guard_is_guess(struct bpf_verifier_env *env, int idx)
+{
+	int h = bpf_loop_at_index(env, idx);
+
+	return !env->path_sensitive && h >= 0 &&
+	       !env->insn_aux_data[h].loop->this_pass.needs_guard;
+}
+
+/* Which loops have something that stops them at run time, the places for may_goto in the others */
 int bpf_flow_place_guards(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int len = env->prog->len, h, i, ret = 0, err = 0;
+	int len = env->prog->len, h, i, err = 0;
 	struct bpf_loop *loop;
 
 	for (i = 0; i < len; i++) {
@@ -492,11 +470,9 @@ int bpf_flow_place_guards(struct bpf_verifier_env *env)
 		/* also when it's bounded: the main pass may find that it's not */
 		flow_place_guards(env, h);
 		/* pass 0 does not know the trip count before it ends */
-		loop->guarded = loop->has_guards && !bpf_prog_is_offloaded(env->prog->aux);
-		if (aux[h].guard_at_header)
-			ret = 1;
+		loop->guarded = !bpf_prog_is_offloaded(env->prog->aux);
 	}
-	return err ?: ret;
+	return err;
 }
 
 static bool flow_may_load_pkt_end(struct bpf_verifier_env *env, const struct bpf_insn *insn)
@@ -1134,13 +1110,12 @@ static bool flow_same_entry(struct bpf_loop *loop, const struct flow_state *t,
  * A loop that can run longer than that gets may_goto.
  * There is no trip count without CAP_PERFMON (allow_uninit_stack).
  */
-static int flow_check_trip_counts(struct bpf_verifier_env *env, const struct flow_state *t,
-				  const struct flow_state *s)
+static void flow_check_trip_counts(struct bpf_verifier_env *env, const struct flow_state *t,
+				   const struct flow_state *s)
 {
 	const struct loop_stack_entry *e;
 	u32 fr, i;
 	u64 max_trip;
-	int err;
 
 	for (fr = 0; fr <= s->st.curframe && !s->st.speculative; fr++) {
 		e = s->st.frame[fr]->loop_stack;
@@ -1156,12 +1131,9 @@ static int flow_check_trip_counts(struct bpf_verifier_env *env, const struct flo
 						e->loop->header, max_trip + 1);
 				continue;
 			}
-			err = bpf_flow_needs_guard(env, e->loop);
-			if (err)
-				return err;
+			bpf_flow_needs_guard(env, e->loop);
 		}
 	}
-	return 0;
 }
 
 /* @t is from an earlier walk over a leftover. The header state of @s subsumes that of @t. */
@@ -1224,14 +1196,12 @@ again:
 		if (subsumed) {
 			if (env->log.level & BPF_LOG_LEVEL2)
 				verbose(env, "from %d to %d: pruned\n", prev, insn_idx);
-			err = flow_check_trip_counts(env, t, s);
+			flow_check_trip_counts(env, t, s);
 			goto free;
 		}
 		/* what grows in a loop is widened, it is not replaced */
 		if (!leftover_loop && bpf_state_subsumes(env, &s->st, &t->st)) {
-			err = flow_check_trip_counts(env, s, t);
-			if (err)
-				goto free;
+			flow_check_trip_counts(env, s, t);
 			/* it goes on with the leftover that @t started */
 			if (s->kind == FLOW_LEFTOVER)
 				bpf_top_loop(s->st.frame[s->st.curframe])->entry_id =
@@ -1310,7 +1280,8 @@ static int flow_prune_peeled(struct bpf_verifier_env *env, struct flow_state *s,
 		if (env->log.level & BPF_LOG_LEVEL2)
 			verbose(env, "from %d to %d: pruned\n", s->prev_insn_idx, s->st.insn_idx);
 		entry->trip = trip;
-		ret = flow_check_trip_counts(env, t, s) ?: 1;
+		flow_check_trip_counts(env, t, s);
+		ret = 1;
 		break;
 	}
 	s->kind = FLOW_AT;

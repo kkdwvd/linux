@@ -2,6 +2,8 @@
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
  */
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/cgroup.h>
@@ -22,7 +24,6 @@
 #include <linux/security.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_mem_alloc.h>
-#include <linux/kasan.h>
 #include <linux/bpf_verifier.h>
 #include <linux/uaccess.h>
 #include <linux/verification.h>
@@ -1250,7 +1251,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 
 	bpf_timed_may_goto_save(prog, &saved);
 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
-	/* The verifier checked that return value is zero. */
+	/* Nobody looks at the return value: 0 at exit, any number when the callback was unwound. */
 	bpf_timed_may_goto_restore(prog, &saved);
 
 	this_cpu_write(hrtimer_running, NULL);
@@ -1979,6 +1980,8 @@ static int __bpf_dynptr_read(void *dst, u64 len, const struct bpf_dynptr_kern *s
 		return __bpf_skb_load_bytes(src->data, src->offset + offset, dst, len);
 	case BPF_DYNPTR_TYPE_XDP:
 		return __bpf_xdp_load_bytes(src->data, src->offset + offset, dst, len);
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return __bpf_xdp_frame_load_bytes(src->data, src->offset + offset, dst, len);
 	case BPF_DYNPTR_TYPE_SKB_META:
 		memmove(dst, bpf_skb_meta_pointer(src->data, src->offset + offset), len);
 		return 0;
@@ -2040,6 +2043,10 @@ int __bpf_dynptr_write(const struct bpf_dynptr_kern *dst, u64 offset, void *src,
 		if (flags)
 			return -EINVAL;
 		return __bpf_xdp_store_bytes(dst->data, dst->offset + offset, src, len);
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		if (flags)
+			return -EINVAL;
+		return __bpf_xdp_frame_store_bytes(dst->data, dst->offset + offset, src, len);
 	case BPF_DYNPTR_TYPE_SKB_META:
 		return __bpf_skb_meta_store_bytes(dst->data, dst->offset + offset, src,
 						  len, flags);
@@ -2090,6 +2097,7 @@ BPF_CALL_3(bpf_dynptr_data, const struct bpf_dynptr_kern *, ptr, u64, offset, u6
 	case BPF_DYNPTR_TYPE_SKB:
 	case BPF_DYNPTR_TYPE_XDP:
 	case BPF_DYNPTR_TYPE_SKB_META:
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
 		/* skb and xdp dynptrs should use bpf_dynptr_slice / bpf_dynptr_slice_rdwr */
 		return 0;
 	default:
@@ -2448,6 +2456,10 @@ __bpf_kfunc void *bpf_percpu_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 	return bpf_percpu_obj_new(local_type_id__k, meta__ign);
 }
 
+__bpf_kfunc void bpf_coro_suspend(void *p__ign)
+{
+}
+
 /* Must be called under migrate_disable(), as required by bpf_mem_free */
 void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu)
 {
@@ -2777,17 +2789,20 @@ __bpf_kfunc struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
 	return (struct bpf_rb_node *)n;
 }
 
-/* Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
- * program
+/*
+ * Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
+ * program. The pad leaves from the frame that the BPF code called, so the body
+ * is inlined into both spellings of the kfunc.
  */
-static int __bpf_rbtree_add(struct bpf_rb_root *root,
-			    struct bpf_rb_node_kern *node,
-			    void *less, struct btf_record *rec, u64 off)
+static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
+					     struct bpf_rb_node_kern *node,
+					     void *less, struct btf_record *rec, u64 off)
 {
 	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
 	struct rb_node *parent = NULL, *n = &node->rb_node;
 	bpf_callback_t cb = (bpf_callback_t)less;
 	bool leftmost = true;
+	u64 r0, kind;
 
 	/* node->owner != NULL implies !RB_EMPTY_NODE(n), no need to separately
 	 * check the latter
@@ -2800,7 +2815,8 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 
 	while (*link) {
 		parent = *link;
-		if (cb((uintptr_t)node, (uintptr_t)parent, 0, 0, 0)) {
+		bpf_call_cb(cb, node, parent, 0, 0, 0, r0, kind, unwound);
+		if (r0) {
 			link = &parent->rb_left;
 		} else {
 			link = &parent->rb_right;
@@ -2812,6 +2828,18 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 	rb_insert_color_cached(n, (struct rb_root_cached *)root, leftmost);
 	WRITE_ONCE(node->owner, root);
 	return 0;
+
+unwound:
+	/*
+	 * The comparator left with unwind_exit or kexit. The node is not in the
+	 * tree, and the caller has let go of it: unlink it for whoever else holds
+	 * it, as bpf_rb_root_free() does, and drop it, as the error path above
+	 * does.
+	 */
+	smp_store_release(&node->owner, NULL);
+	__bpf_obj_drop_impl((void *)n - off, rec, false);
+	bpf_unwind_leave(kind);
+	return r0;
 }
 
 /**
@@ -2825,25 +2853,31 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
  * Insert @node into @root using @less. The verifier rewrites @meta and @off;
  * BPF programs do not set them.
  *
- * Return: 0 on success, or %-EINVAL if @node is already linked in a tree.
+ * Return: 0 on success, or %-EINVAL if @node is already linked in a tree. When
+ * @less unwinds, what it unwound with, to the pad after the call.
  */
-__bpf_kfunc int bpf_rbtree_add(struct bpf_rb_root *root,
-			       struct bpf_rb_node *node,
-			       bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-			       struct btf_struct_meta *meta,
-			       u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add(struct bpf_rb_root *root,
+				struct bpf_rb_node *node,
+				bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				struct btf_struct_meta *meta,
+				u64 off)
 {
 	struct bpf_rb_node_kern *n = (void *)node;
 
 	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add);
 
-__bpf_kfunc int bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
-				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-				    void *meta__ign, u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				     bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				     void *meta__ign, u64 off)
 {
-	return bpf_rbtree_add(root, node, less, meta__ign, off);
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+
+	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add_impl);
 
 __bpf_kfunc struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root)
 {
@@ -3147,6 +3181,18 @@ __bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr *p, u64 offset,
 		bpf_xdp_copy_buf(ptr->data, ptr->offset + offset, buffer__nullable, len, false);
 		return buffer__nullable;
 	}
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+	{
+		void *frame_ptr = bpf_xdp_frame_pointer(ptr->data, ptr->offset + offset, len);
+
+		if (!IS_ERR_OR_NULL(frame_ptr))
+			return frame_ptr;
+
+		if (!buffer__nullable)
+			return NULL;
+		bpf_xdp_frame_copy_buf(ptr->data, ptr->offset + offset, buffer__nullable, len, false);
+		return buffer__nullable;
+	}
 	case BPF_DYNPTR_TYPE_SKB_META:
 		return bpf_skb_meta_pointer(ptr->data, ptr->offset + offset);
 	case BPF_DYNPTR_TYPE_FILE:
@@ -3430,56 +3476,13 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
-struct bpf_throw_ctx {
-	struct bpf_prog_aux *aux;
-	u64 sp;
-	u64 bp;
-	int cnt;
-};
-
-static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
-{
-	struct bpf_throw_ctx *ctx = cookie;
-	struct bpf_prog *prog;
-
-	/*
-	 * The RCU read lock is held to safely traverse the latch tree, but we
-	 * don't need its protection when accessing the prog, since it has an
-	 * active stack frame on the current stack trace, and won't disappear.
-	 */
-	rcu_read_lock();
-	prog = bpf_prog_ksym_find(ip);
-	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
-	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
-	ctx->aux = prog->aux;
-	ctx->sp = sp;
-	ctx->bp = bp;
-	return false;
-}
-
+/*
+ * The verifier makes a jump to a landing pad of each call, see kernel/bpf/pads.c.
+ * Programs name the function, so it is in BTF.
+ */
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	struct bpf_throw_ctx ctx = {};
-
-	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
-	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
-	WARN_ON_ONCE(!ctx.bp);
-	WARN_ON_ONCE(!ctx.cnt);
-	/*
-	 * Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
-	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
-	 * which skips compiler generated instrumentation to do the same. Some
-	 * architectures cannot recover sp while unwinding, so fall back to bp.
-	 */
-	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp + ctx.aux->stack_arg_sp_adjust, ctx.bp, 0, 0);
-	WARN(1, "A call to BPF exception callback should never return\n");
+	WARN_ON_ONCE(1);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)
@@ -5239,7 +5242,7 @@ BTF_ID_FLAGS(func, bpf_task_get_cgroup1, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 #endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_from_vpid, KF_ACQUIRE | KF_RET_NULL)
-BTF_ID_FLAGS(func, bpf_throw)
+BTF_ID_FLAGS(func, bpf_throw, KF_SPINLOCK_SAFE)
 #ifdef CONFIG_BPF_EVENTS
 BTF_ID_FLAGS(func, bpf_send_signal_task)
 #endif
@@ -5385,6 +5388,9 @@ BTF_ID_FLAGS(func, bpf_call_rcu_tasks_trace, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+BTF_ID_FLAGS(func, bpf_coro_frame_alloc, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_coro_frame_free)
+BTF_ID_FLAGS(func, bpf_coro_suspend)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
@@ -5442,6 +5448,230 @@ void *__bpf_dynptr_data_rw(const struct bpf_dynptr_kern *ptr, u64 len)
 	if (__bpf_dynptr_is_rdonly(ptr))
 		return NULL;
 	return (void *)__bpf_dynptr_data(ptr, len);
+}
+
+/*
+ * Which fields of a value with @rec hold a parked coroutine frame, see kernel/bpf/coro.c, or
+ * lead to one: a kptr field of the type of such a frame, a kptr field that points to an
+ * allocated object with such a field, a list or an rbtree with such nodes, and so on from
+ * there. A parked frame takes no reference on its program, and whoever takes one out of a map
+ * may call it: the map is for the program whose frames they are and for the programs that hold
+ * that one, see claim_coro_maps() in verifier.c.
+ *
+ * A list or an rbtree counts if a bpf_spin_lock guards it. No other one takes nodes that can
+ * hold a frame, see __process_kf_arg_ptr_to_graph_root() in verifier.c: nothing empties it
+ * when its value or its program goes, see bpf_obj_free_fields().
+ */
+
+/* that many records without memory of its own, see bpf_obj_free_parked() */
+#define BPF_PARKED_FEW_RECS	32
+
+/*
+ * The records that a search has been in, each once. @grows: the caller can sleep, and the
+ * search is exact unless memory runs out, which @nomem says then.
+ */
+struct bpf_parked_seen {
+	const struct btf_record **recs;
+	int cnt, cap;
+	bool grows;
+	bool nomem;
+	const struct btf_record *few[BPF_PARKED_FEW_RECS];
+};
+
+static void parked_seen_init(struct bpf_parked_seen *seen, bool grows)
+{
+	seen->recs = seen->few;
+	seen->cnt = 0;
+	seen->cap = ARRAY_SIZE(seen->few);
+	seen->grows = grows;
+	seen->nomem = false;
+}
+
+static void parked_seen_free(struct bpf_parked_seen *seen)
+{
+	if (seen->recs != seen->few)
+		kvfree(seen->recs);
+}
+
+/* Put @rec on the list unless it is there. False: there is no room, the search cannot go on. */
+static bool parked_seen_visit(struct bpf_parked_seen *seen, const struct btf_record *rec)
+{
+	const struct btf_record **recs;
+	int i;
+
+	if (IS_ERR_OR_NULL(rec))
+		return true;
+	for (i = 0; i < seen->cnt; i++)
+		if (seen->recs[i] == rec)
+			return true;
+	if (seen->cnt == seen->cap) {
+		if (!seen->grows)
+			return false;
+		recs = kvmalloc_array(seen->cap, 2 * sizeof(*recs),
+				      GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+		if (!recs) {
+			seen->nomem = true;
+			return false;
+		}
+		memcpy(recs, seen->recs, seen->cnt * sizeof(*recs));
+		parked_seen_free(seen);
+		seen->recs = recs;
+		seen->cap *= 2;
+	}
+	seen->recs[seen->cnt++] = rec;
+	return true;
+}
+
+/*
+ * True if @field of a value with @rec holds a parked frame itself. Else *@next is the record of
+ * what it points to or of its nodes, NULL if there is nothing to look into.
+ */
+static bool field_is_parked(const struct btf_record *rec, const struct btf_field *field,
+			    const struct btf_record **next)
+{
+	const struct btf_struct_meta *meta;
+
+	*next = NULL;
+	switch (field->type) {
+	case BPF_KPTR_REF:
+		if (btf_is_kernel(field->kptr.btf))
+			return bpf_coro_is_parked_dtor(field->kptr.dtor);
+		meta = btf_find_struct_meta(field->kptr.btf, field->kptr.btf_id);
+		*next = meta ? meta->record : NULL;
+		return false;
+	case BPF_LIST_HEAD:
+	case BPF_RB_ROOT:
+		if (rec->spin_lock_off >= 0)
+			*next = field->graph_root.value_rec;
+		return false;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Does @field of a value with @rec hold a parked frame, or lead to one? The records on the
+ * list of @seen were found to lead to none and are not looked into again, and so is every
+ * record that this search adds if it finds none. If it finds one it has stopped there: the
+ * caller empties the list before the next search.
+ * Without room for a record the answer is yes: for a search that grows that is no memory.
+ */
+static bool field_holds_parked(const struct btf_record *rec, const struct btf_field *field,
+			       struct bpf_parked_seen *seen)
+{
+	const struct btf_record *next, *cur;
+	int i, n = seen->cnt;
+
+	if (field_is_parked(rec, field, &next) || !parked_seen_visit(seen, next))
+		return true;
+	for (; n < seen->cnt; n++) {
+		cur = seen->recs[n];
+		for (i = 0; i < cur->cnt; i++)
+			if (field_is_parked(cur, &cur->fields[i], &next) ||
+			    !parked_seen_visit(seen, next))
+				return true;
+	}
+	return false;
+}
+
+/*
+ * Can a value with @rec hold a parked frame? 1 if so, 0 if not, -ENOMEM if the search had no
+ * memory to tell. It may sleep.
+ */
+int bpf_record_holds_parked(const struct btf_record *rec)
+{
+	struct bpf_parked_seen seen;
+	bool holds = false;
+	int i;
+
+	if (IS_ERR_OR_NULL(rec))
+		return 0;
+	parked_seen_init(&seen, true);
+	for (i = 0; i < rec->cnt && !holds; i++)
+		holds = field_holds_parked(rec, &rec->fields[i], &seen);
+	parked_seen_free(&seen);
+	return seen.nomem ? -ENOMEM : holds;
+}
+
+/*
+ * The same for each field, as a bitmap by index in @rec->fields that the caller frees. NULL if
+ * there is no memory for it. It may sleep.
+ */
+unsigned long *bpf_record_parked_fields(const struct btf_record *rec)
+{
+	struct bpf_parked_seen seen;
+	unsigned long *fields;
+	int i;
+
+	fields = bitmap_zalloc(rec->cnt, GFP_KERNEL);
+	if (!fields)
+		return NULL;
+	parked_seen_init(&seen, true);
+	for (i = 0; i < rec->cnt && !seen.nomem; i++) {
+		if (!field_holds_parked(rec, &rec->fields[i], &seen))
+			continue;
+		__set_bit(i, fields);
+		/* the search stopped at the frame: what it saw on the way may lead to one */
+		seen.cnt = 0;
+	}
+	parked_seen_free(&seen);
+	if (seen.nomem) {
+		bitmap_free(fields);
+		return NULL;
+	}
+	return fields;
+}
+
+/*
+ * Give the parked frames that the value @obj with @rec holds to the kernel to destroy, see
+ * bpf_coro_prog_release(): those in its fields, and with the objects that its fields point to
+ * and the lists and rbtrees that it has, if their type can hold a frame, all that is in them.
+ * @fields is bpf_record_parked_fields() of @rec, or NULL to ask for each field, where there
+ * was no memory for that: here is none either, and a field whose types are more than
+ * BPF_PARKED_FEW_RECS is taken to lead to a frame. The program that used them is gone, and the
+ * caller has disabled migration, see __bpf_obj_drop_impl().
+ */
+void bpf_obj_free_parked(const struct btf_record *rec, void *obj, const unsigned long *fields)
+{
+	const struct btf_struct_meta *meta;
+	struct bpf_parked_seen seen;
+	const struct btf_field *field;
+	void *ptr, *p;
+	int i;
+
+	for (i = 0; i < rec->cnt; i++) {
+		field = &rec->fields[i];
+		if (fields) {
+			if (!test_bit(i, fields))
+				continue;
+		} else {
+			parked_seen_init(&seen, false);
+			if (!field_holds_parked(rec, field, &seen))
+				continue;
+		}
+		ptr = obj + field->offset;
+		switch (field->type) {
+		case BPF_KPTR_REF:
+			p = (void *)xchg((unsigned long *)ptr, 0);
+			if (!p)
+				break;
+			if (btf_is_kernel(field->kptr.btf)) {
+				field->kptr.dtor(p);
+				break;
+			}
+			meta = btf_find_struct_meta(field->kptr.btf, field->kptr.btf_id);
+			__bpf_obj_drop_impl(p, meta ? meta->record : NULL, false);
+			break;
+		case BPF_LIST_HEAD:
+			bpf_list_head_free(field, ptr, obj + rec->spin_lock_off);
+			break;
+		case BPF_RB_ROOT:
+			bpf_rb_root_free(field, ptr, obj + rec->spin_lock_off);
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 void bpf_map_free_internal_structs(struct bpf_map *map, void *val)

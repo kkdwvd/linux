@@ -228,6 +228,8 @@ static bool ctx_was_changed(struct xdp_page_head *head)
 
 static void reset_ctx(struct xdp_page_head *head)
 {
+	/* the context stays with the page: what the last run lent, it lent for that run */
+	head->ctx.flags &= ~XDP_FLAGS_HEADROOM_LENT;
 	if (likely(!frame_was_changed(head) && !ctx_was_changed(head)))
 		return;
 
@@ -288,6 +290,7 @@ static int xdp_test_run_batch(struct xdp_test_data *xdp, struct bpf_prog *prog,
 	local_bh_disable();
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 	ri = bpf_net_ctx_get_ri();
+	ri->kern_flags |= BPF_RI_F_XDP_LIVE_RUN;
 	xdp_set_return_frame_no_direct();
 
 	for (i = 0; i < batch_sz; i++) {
@@ -305,8 +308,11 @@ static int xdp_test_run_batch(struct xdp_test_data *xdp, struct bpf_prog *prog,
 
 		act = bpf_prog_run_xdp(prog, ctx);
 
-		/* if program changed pkt bounds we need to update the xdp_frame */
-		if (unlikely(ctx_was_changed(head))) {
+		/*
+		 * If the program changed the packet bounds, the frame has to
+		 * follow, unless the program took the frame, see XDP_CONSUME.
+		 */
+		if (unlikely(ctx_was_changed(head)) && !(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
 			ret = xdp_update_frame_from_buff(ctx, frm);
 			if (ret) {
 				xdp_return_buff(ctx);
@@ -416,10 +422,13 @@ static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
 		local_bh_disable();
 		bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 
-		if (xdp)
+		if (xdp) {
+			/* each run is one of its own on the buffer: nothing is lent still */
+			((struct xdp_buff *)ctx)->flags &= ~XDP_FLAGS_HEADROOM_LENT;
 			*retval = bpf_prog_run_xdp(prog, ctx);
-		else
+		} else {
 			*retval = bpf_prog_run(prog, ctx);
+		}
 
 		bpf_net_ctx_clear(bpf_net_ctx);
 		local_bh_enable();

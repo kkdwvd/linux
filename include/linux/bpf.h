@@ -96,6 +96,11 @@ struct bpf_map_ops {
 	void (*map_free_pre_rcu)(struct bpf_map *map);
 	int (*map_get_next_key)(struct bpf_map *map, void *key, void *next_key);
 	void (*map_release_uref)(struct bpf_map *map);
+	/*
+	 * Have the kernel destroy the parked coroutine frames in all that the map has of values,
+	 * with bpf_obj_free_parked(). A map without it holds no such frames.
+	 */
+	void (*map_free_parked)(struct bpf_map *map);
 	void *(*map_lookup_elem_sys_only)(struct bpf_map *map, void *key);
 	int (*map_lookup_batch)(struct bpf_map *map, const union bpf_attr *attr,
 				union bpf_attr __user *uattr);
@@ -182,6 +187,7 @@ struct bpf_map_ops {
 	int (*map_set_for_each_callback_args)(struct bpf_verifier_env *env,
 					      struct bpf_func_state *caller,
 					      struct bpf_func_state *callee);
+	/* It has a pad for callback_fn, which may unwind: see bpf_call_cb() */
 	long (*map_for_each_callback)(struct bpf_map *map,
 				     bpf_callback_t callback_fn,
 				     void *callback_ctx, u64 flags);
@@ -334,6 +340,12 @@ struct bpf_map {
 	atomic64_t writecnt;
 	spinlock_t owner_lock;
 	struct bpf_map_owner *owner;
+	/*
+	 * A map that can hold parked coroutine frames: the one program whose frames they are, see
+	 * bpf_record_holds_parked(). It and the programs that are bound to it use the map, and no
+	 * other program.
+	 */
+	struct bpf_prog_aux *coro_owner;
 	bool bypass_spec_v1;
 	bool frozen; /* write-once; write-protected by freeze_mutex */
 	bool free_after_mult_rcu_gp;
@@ -744,6 +756,10 @@ int map_check_no_btf(struct bpf_map *map,
 bool bpf_map_meta_equal(const struct bpf_map *meta0,
 			const struct bpf_map *meta1);
 
+int bpf_record_holds_parked(const struct btf_record *rec);
+unsigned long *bpf_record_parked_fields(const struct btf_record *rec);
+void bpf_obj_free_parked(const struct btf_record *rec, void *obj, const unsigned long *fields);
+
 static inline bool bpf_map_has_internal_structs(struct bpf_map *map)
 {
 	return btf_record_has_field(map->record, BPF_TIMER | BPF_WORKQUEUE | BPF_TASK_WORK);
@@ -906,12 +922,16 @@ enum bpf_type_flag {
 	/* DYNPTR points to file */
 	DYNPTR_TYPE_FILE	= BIT(20 + BPF_BASE_TYPE_BITS),
 
+	/* DYNPTR points to an xdp_frame the program owns */
+	DYNPTR_TYPE_XDP_FRAME	= BIT(21 + BPF_BASE_TYPE_BITS),
+
 	__BPF_TYPE_FLAG_MAX,
 	__BPF_TYPE_LAST_FLAG	= __BPF_TYPE_FLAG_MAX - 1,
 };
 
 #define DYNPTR_TYPE_FLAG_MASK	(DYNPTR_TYPE_LOCAL | DYNPTR_TYPE_RINGBUF | DYNPTR_TYPE_SKB \
-				 | DYNPTR_TYPE_XDP | DYNPTR_TYPE_SKB_META | DYNPTR_TYPE_FILE)
+				 | DYNPTR_TYPE_XDP | DYNPTR_TYPE_SKB_META | DYNPTR_TYPE_FILE \
+				 | DYNPTR_TYPE_XDP_FRAME)
 
 /* Max number of base types. */
 #define BPF_BASE_TYPE_LIMIT	(1UL << BPF_BASE_TYPE_BITS)
@@ -935,6 +955,7 @@ enum bpf_arg_type {
 	 */
 	ARG_PTR_TO_MEM,		/* pointer to valid memory (stack, packet, map value) */
 	ARG_PTR_TO_ARENA,
+	ARG_PTR_TO_CORO_FRAME,	/* pointer to a BPF coroutine frame */
 
 	ARG_MEM_SIZE,		/* number of bytes accessed from memory */
 	ARG_MEM_SIZE_OR_ZERO,	/* number of bytes accessed from memory or 0 */
@@ -1159,6 +1180,9 @@ enum bpf_reg_type {
 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
 	PTR_TO_INSN,		 /* reg points to a bpf program instruction */
 	CONST_PTR_TO_DYNPTR,	 /* reg points to a const struct bpf_dynptr */
+	PTR_TO_CORO_FRAME,	 /* reg points to a frame from bpf_coro_frame_alloc() */
+	/* the resume or the destroy function of a parked frame, see check_coro_callx() */
+	PTR_TO_CORO_FUNC,
 	__BPF_REG_TYPE_MAX,
 
 	/* Extended reg_types. */
@@ -1603,6 +1627,8 @@ enum bpf_dynptr_type {
 	BPF_DYNPTR_TYPE_SKB_META,
 	/* Underlying data is a file */
 	BPF_DYNPTR_TYPE_FILE,
+	/* Underlying data is an xdp_frame the program owns */
+	BPF_DYNPTR_TYPE_XDP_FRAME,
 };
 
 int bpf_dynptr_check_size(u64 size);
@@ -1723,6 +1749,9 @@ void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
 bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
 				 int insn_idx);
+bool bpf_insn_fault_unwinds(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+			    int insn_idx);
+int bpf_prog_fault_pad(const struct bpf_verifier_env *env, const struct bpf_prog *prog);
 u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_node *node,
@@ -1903,7 +1932,7 @@ struct bpf_prog_aux {
 	u32 stack_depth;
 	u32 id;
 	u32 func_cnt; /* used by non-func prog as the number of func progs */
-	u32 real_func_cnt; /* includes hidden progs, only used for JIT and freeing progs */
+	u32 exception_callback_subprog; /* index in func[], 0 if there is none */
 	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
 	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
 	u32 attach_st_ops_member_off;
@@ -1922,6 +1951,19 @@ struct bpf_prog_aux {
 	struct bpf_trampoline *dst_trampoline;
 	enum bpf_prog_type saved_dst_prog_type;
 	enum bpf_attach_type saved_dst_attach_type;
+	/*
+	 * The program whose parked coroutine frames this one calls, and holds until it is freed
+	 * itself, see check_coro_callx()
+	 */
+	struct bpf_prog *coro_prog;
+	/* how often the kernel was given a parked frame of the program to destroy */
+	atomic_long_t coro_drops;
+	/* it parks frames: they are destroyed before it is freed, see bpf_coro_prog_release() */
+	bool coro_parks;
+	/* the size classes of the frames that it allocates, see bpf_coro_frame_size() */
+	u16 coro_classes;
+	/* a function of a program: what the kernel resumes of a frame that it kept in its host */
+	bool coro_defer;
 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
 	bool dev_bound; /* Program is bound to the netdev. */
 	bool offload_requested; /* Program is bound and offloaded to the netdev. */
@@ -1932,8 +1974,7 @@ struct bpf_prog_aux {
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
-	bool exception_cb;
-	bool exception_boundary;
+	bool xdp_consume; /* may take ownership of frames, see XDP_CONSUME */
 	bool jits_use_priv_stack;
 	bool priv_stack_requested;
 	bool changes_pkt_data;
@@ -1986,14 +2027,20 @@ struct bpf_prog_aux {
 	struct mutex used_maps_mutex; /* mutex for used_maps and used_map_cnt */
 	struct btf_mod_pair *used_btfs;
 	struct bpf_prog *prog;
+	/*
+	 * The coroutine frames that the program has freed on each CPU, for the next ones that it
+	 * allocates there, see "The frame cache" in kernel/bpf/coro.c: where
+	 * bpf_coro_frame_alloc() looks, and what the program has for them. Here, and not with
+	 * the other fields for coroutines: bpf_coro_drop() writes to their line.
+	 */
+	struct bpf_coro_frame_cache __percpu *coro_cache;
+	struct bpf_coro_frames *coro_frames;
 	struct user_struct *user;
 	u64 load_time; /* ns since boottime */
 	u32 verified_insns;
 	int cgroup_atype; /* enum cgroup_bpf_attach_type */
 	struct bpf_map *cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE];
 	char name[BPF_OBJ_NAME_LEN];
-	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
-	u16 stack_arg_sp_adjust;
 	u16 freplace_link_cnt; /* counts freplace links extending this prog */
 #ifdef CONFIG_SECURITY
 	void *security;
@@ -2034,6 +2081,8 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	/* the address of the landing pad that releases nothing, see bpf_arena_fault() */
+	unsigned long fault_pad;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;
@@ -2286,6 +2335,28 @@ struct btf_member;
  *	      reason, if this callback is not defined, the check is skipped as
  *	      the struct_ops map will have final verification performed in
  *	      @reg.
+ * @unwound: A callback that is invoked when an invocation of a program of this
+ *	     struct_ops, an operator or an async callback of one, was unwound up
+ *	     to the kernel, before the invocation returns. No path of the
+ *	     program chose what it returns then: it is 0, NULL for a pointer, or
+ *	     what bpf_throw() was passed. A struct_ops that cannot take this for
+ *	     the result of an operator reacts here. The callback runs in the
+ *	     context of the program, which for an operator is that of its caller
+ *	     with the locks that it holds, and it can be reentered. It must not
+ *	     sleep and must not take a lock that is held around a call of an
+ *	     operator: it notes the event and defers the rest. A program of the
+ *	     struct_ops holds a reference on @owner for as long as it lives, so
+ *	     the callback is there whenever one runs.
+ * @unwound_retval: A callback that the verifier invokes to learn what an
+ *		    operator returns when it is unwound, for the operators
+ *		    where 0 is the wrong answer: 0 often tells the caller that
+ *		    the operator did what it was called for. @prog is the
+ *		    program of the operator and prog->aux->attach_st_ops_member_off
+ *		    tells the member. The callback returns 0 for a member that
+ *		    it has no better value for. It is asked only about members
+ *		    that return a number, and the value is a constant of the
+ *		    program: it must depend on nothing but the member. If the
+ *		    callback is not defined, every unwound operator returns 0.
  * @cfi_stubs: Pointer to a structure of stub functions for CFI. These stubs
  *	       provide the correct Control Flow Integrity hashes for the
  *	       trampolines generated by BPF struct_ops.
@@ -2322,6 +2393,8 @@ struct bpf_struct_ops {
 	void (*unreg)(void *kdata, struct bpf_link *link);
 	int (*update)(void *kdata, void *old_kdata, struct bpf_link *link);
 	int (*validate)(void *kdata);
+	void (*unwound)(const struct bpf_prog *prog);
+	int (*unwound_retval)(const struct bpf_prog *prog);
 	void *cfi_stubs;
 	struct module *owner;
 	const char *name;
@@ -2459,6 +2532,7 @@ int bpf_struct_ops_link_create(union bpf_attr *attr);
 int bpf_prog_assoc_struct_ops(struct bpf_prog *prog, struct bpf_map *map);
 void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog);
 void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux);
+bool bpf_prog_assoc_struct_ops_gone(const struct bpf_prog_aux *aux);
 u32 bpf_struct_ops_id(const void *kdata);
 int bpf_struct_ops_for_each_prog(const void *kdata,
 				 int (*cb)(struct bpf_prog *prog, void *data),
@@ -2525,6 +2599,10 @@ static inline void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog)
 static inline void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux)
 {
 	return NULL;
+}
+static inline bool bpf_prog_assoc_struct_ops_gone(const struct bpf_prog_aux *aux)
+{
+	return false;
 }
 static inline void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map)
 {
@@ -3505,7 +3583,8 @@ void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
 		     enum bpf_dynptr_type type, u32 offset, u32 size);
 void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
 void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
-void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip);
+unsigned long bpf_arena_fault(bool write, unsigned long addr, unsigned long fault_ip,
+			      unsigned long end, bool unwinds);
 
 static __always_inline u32
 bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
@@ -3845,9 +3924,11 @@ static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
 {
 }
 
-static inline void bpf_prog_report_arena_violation(bool write, unsigned long addr,
-						   unsigned long fault_ip)
+static inline unsigned long bpf_arena_fault(bool write, unsigned long addr,
+					    unsigned long fault_ip, unsigned long end,
+					    bool unwinds)
 {
+	return end;
 }
 #endif /* CONFIG_BPF_SYSCALL */
 

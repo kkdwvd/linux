@@ -508,6 +508,7 @@ struct bpf_program {
 	__u32 attach_btf_obj_fd;
 	__u32 attach_btf_id;
 	__u32 attach_prog_fd;
+	__u32 coro_prog_fd;
 
 	void *func_info;
 	__u32 func_info_rec_size;
@@ -8624,6 +8625,26 @@ static int bpf_object__bind_arena(struct bpf_object *obj, struct bpf_program *pr
 	return 0;
 }
 
+/*
+ * @prog is loaded with coro_prog_fd, which a kernel that does not know it refuses with a bare
+ * -EINVAL
+ */
+static int check_coro_prog_fd(const struct bpf_program *prog)
+{
+	/* the loader program has no way to pass it on, nor a file descriptor to pass */
+	if (prog->obj->gen_loader) {
+		pr_warn("prog '%s': a light skeleton cannot bind a program to another one's coroutines\n",
+			prog->name);
+		return -EOPNOTSUPP;
+	}
+	if (!kernel_supports(prog->obj, FEAT_CORO_PROG_FD)) {
+		pr_warn("prog '%s': the kernel cannot bind a program to another one's coroutines (coro_prog_fd)\n",
+			prog->name);
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog,
 				struct bpf_insn *insns, int insns_cnt,
 				const char *license, __u32 kern_version, int *prog_fd)
@@ -8667,6 +8688,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
 	load_attr.attach_prog_fd = prog->attach_prog_fd;
 	load_attr.attach_btf_obj_fd = prog->attach_btf_obj_fd;
 	load_attr.attach_btf_id = prog->attach_btf_id;
+	load_attr.coro_prog_fd = prog->coro_prog_fd;
 	load_attr.kern_version = kern_version;
 	load_attr.prog_ifindex = prog->prog_ifindex;
 	load_attr.expected_attach_type = prog->expected_attach_type;
@@ -8703,6 +8725,10 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
 		insns = prog->insns;
 		insns_cnt = prog->insns_cnt;
 	}
+
+	err = prog->coro_prog_fd ? check_coro_prog_fd(prog) : 0;
+	if (err)
+		return err;
 
 	if (obj->gen_loader) {
 		bpf_gen__prog_load(obj->gen_loader, prog->type, prog->name,
@@ -10601,6 +10627,17 @@ void bpf_program__set_ifindex(struct bpf_program *prog, __u32 ifindex)
 	prog->prog_ifindex = ifindex;
 }
 
+int bpf_program__set_coro_prog_fd(struct bpf_program *prog, int coro_prog_fd)
+{
+	if (coro_prog_fd < 0 || prog_is_subprog(prog->obj, prog))
+		return libbpf_err(-EINVAL);
+	if (prog->fd >= 0)
+		return libbpf_err(-EBUSY);
+
+	prog->coro_prog_fd = coro_prog_fd;
+	return 0;
+}
+
 const char *bpf_program__name(const struct bpf_program *prog)
 {
 	return prog->name;
@@ -10840,6 +10877,10 @@ int bpf_program__clone(struct bpf_program *prog, const struct bpf_prog_load_opts
 	 * prog/object defaults when the caller leaves them zero.
 	 */
 	attr.attach_prog_fd = OPTS_GET(opts, attach_prog_fd, 0) ?: prog->attach_prog_fd;
+	attr.coro_prog_fd = OPTS_GET(opts, coro_prog_fd, 0) ?: prog->coro_prog_fd;
+	err = attr.coro_prog_fd ? check_coro_prog_fd(prog) : 0;
+	if (err)
+		return libbpf_err(err);
 	attr.prog_flags = OPTS_GET(opts, prog_flags, 0) ?: prog->prog_flags;
 	attr.prog_ifindex = OPTS_GET(opts, prog_ifindex, 0) ?: prog->prog_ifindex;
 	attr.kern_version = OPTS_GET(opts, kern_version, 0) ?: obj->kern_version;

@@ -94,11 +94,11 @@ __xlated("2: r0 = &(void __percpu *)(r0)")
 __xlated("3: *(u64 *)(r0 +0) = 65535")
 __xlated("4: *(u64 *)(r0 +8) = 0")
 __xlated("5: *(u64 *)(r0 +16) = 0")
-/* may_goto, r0 is dead */
+/* may_goto, r0 is dead. When the time is up it goes to the landing pad of the prog. */
 __xlated("6: r0 = ")
 __xlated("8: r0 = &(void __percpu *)(r0)")
 __xlated("9: r13 = *(u64 *)(r0 +0)")
-__xlated("10: if r13 == 0x0 goto pc+6")
+__xlated("10: if r13 == 0x0 goto pc+8")
 __xlated("11: r13 -= 1")
 __xlated("12: if r13 != 0x0 goto pc+2")
 __xlated("13: r13 = r0")
@@ -107,6 +107,9 @@ __xlated("15: *(u64 *)(r0 +0) = r13")
 __xlated("16: r0 = 1")
 __xlated("17: r0 = 2")
 __xlated("18: exit")
+/* the landing pad */
+__xlated("19: r0 = 0")
+__xlated("20: exit")
 __success
 __naked void may_goto_batch_2(void)
 {
@@ -125,6 +128,8 @@ __naked void may_goto_batch_2(void)
 /*
  * Use bpf_get_prandom_u32() to prevent DCE from removing the checks.
  * retval: 0=all ok, 1-6=R0-R5 clobbered.
+ * The loop makes more trips than may_goto counts before it reads the clock, and ends by its own
+ * count: a loop that waits for its time to be up ends the prog, and the checks never run.
  */
 SEC("syscall")
 __description("timed may_goto preserves R0-R5")
@@ -152,8 +157,11 @@ __naked void timed_may_goto_preserves_regs(void)
 	"r4 += r6;"
 	"r5 = 0x6666;"
 	"r5 += r6;"
+	"r7 = 70000;"
+"7:"
 	".8byte %[may_goto];"
-	".8byte %[loop];"
+	"r7 -= 1;"
+	"if r7 != 0 goto 7b;"
 	"r0 -= r6;"
 	"r1 -= r6;"
 	"r2 -= r6;"
@@ -176,8 +184,7 @@ __naked void timed_may_goto_preserves_regs(void)
 	"6: r0 = 6; exit;"
 	:
 	: __imm(bpf_get_prandom_u32),
-	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 1, 0)),
-	  __imm_insn(loop, BPF_RAW_INSN(BPF_JMP | BPF_JA, 0, 0, -2, 0))
+	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2, 0))
 	: __clobber_all);
 }
 

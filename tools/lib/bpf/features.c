@@ -114,6 +114,33 @@ static int probe_kern_fd_array_cnt(int token_fd)
 	return probe_fd(ret);
 }
 
+/* A kernel that does not know coro_prog_fd refuses the load with a bare -EINVAL. */
+static int probe_kern_coro_prog_fd(int token_fd)
+{
+	struct bpf_insn insns[] = {
+		BPF_MOV64_IMM(BPF_REG_0, 0),
+		BPF_EXIT_INSN(),
+	};
+	LIBBPF_OPTS(bpf_prog_load_opts, prog_opts,
+		.token_fd = token_fd,
+		.prog_flags = token_fd ? BPF_F_TOKEN_FD : 0,
+	);
+	int ret, prog, insn_cnt = ARRAY_SIZE(insns);
+
+	prog = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, NULL, "GPL", insns, insn_cnt, &prog_opts);
+	if (prog < 0) {
+		ret = -errno;
+		pr_warn("Error in %s(): %s. Couldn't load trivial BPF program.\n",
+			__func__, errstr(ret));
+		return ret;
+	}
+
+	prog_opts.coro_prog_fd = prog;
+	ret = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, NULL, "GPL", insns, insn_cnt, &prog_opts);
+	close(prog);
+	return probe_fd(ret);
+}
+
 /*
  * The kernel checks an exclusive map bound through fd_array_cnt against the
  * digest of the final program. Earlier kernels compared it as the map was
@@ -823,6 +850,9 @@ static struct kern_feature_desc {
 	},
 	[FEAT_EXCL_MAP_FD_ARRAY_CNT] = {
 		"exclusive map bound through fd_array_cnt", probe_kern_excl_map_fd_array_cnt,
+	},
+	[FEAT_CORO_PROG_FD] = {
+		"program bound to another one's coroutines (coro_prog_fd)", probe_kern_coro_prog_fd,
 	},
 };
 

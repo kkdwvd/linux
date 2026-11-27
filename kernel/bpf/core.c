@@ -20,6 +20,7 @@
 #include <uapi/linux/btf.h>
 #include <linux/ctype.h>
 #include <linux/filter.h>
+#include <linux/bpf_coro.h>
 #include <linux/sched/signal.h>
 #include <linux/skbuff.h>
 #include <linux/static_call.h>
@@ -107,6 +108,9 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	struct bpf_prog *fp;
 
 	size = round_up(size, __PAGE_SIZE);
+	/* fp->pages cannot count more */
+	if (size / PAGE_SIZE > U16_MAX)
+		return NULL;
 	fp = __vmalloc(size, gfp_flags);
 	if (fp == NULL)
 		return NULL;
@@ -267,6 +271,9 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 	pages = size / PAGE_SIZE;
 	if (pages <= fp_old->pages)
 		return fp_old;
+	/* fp->pages cannot count more */
+	if (pages > U16_MAX)
+		return NULL;
 
 	fp = __vmalloc(size, gfp_flags);
 	if (fp) {
@@ -391,8 +398,8 @@ static bool insn_get_rel(const struct bpf_insn *insn, s64 *rel, bool *is_imm)
 	    code == (BPF_JMP | BPF_TAIL_CALL) || code == (BPF_JMP | BPF_JA | BPF_X))
 		return false;
 
-	*is_imm = code == (BPF_JMP32 | BPF_JA);
-	*rel = *is_imm ? insn->imm : insn->off;
+	*is_imm = bpf_jmp_offset_is_imm(insn);
+	*rel = bpf_jmp_offset(insn);
 	return true;
 }
 
@@ -427,6 +434,10 @@ static int patch_insn_target(const struct bpf_patch_image *img, const struct bpf
 
 	if (idx + 1 == p->jmp) {
 		tgt = p->jmp_to;
+	} else if (idx + 1 == p->jmp2) {
+		tgt = p->jmp2_to;
+	} else if (idx + 1 == p->jmp3) {
+		tgt = p->jmp3_to;
 	} else if (idx == p->self) {
 		tgt = p->off + rel + 1;
 	} else {
@@ -550,6 +561,8 @@ int __bpf_patch_list_insert(struct bpf_patch_list *pl, const struct bpf_prog *pr
 		p->target += cnt;
 		p->self += cnt;
 		p->jmp += p->jmp ? cnt : 0;
+		p->jmp2 += p->jmp2 ? cnt : 0;
+		p->jmp3 += p->jmp3 ? cnt : 0;
 	}
 	memcpy(insn, insns, cnt * sizeof(*insns));
 	p->len += cnt;
@@ -560,14 +573,30 @@ int __bpf_patch_list_insert(struct bpf_patch_list *pl, const struct bpf_prog *pr
 /*
  * 'insn' of the last patch goes to insn 'to' of the old image, however far that is.
  * With 'back' it goes to the last insns of the patch of insn 'to - 1'.
- * A patch has one such jump.
+ * A patch has three such jumps at most, and only the first one has 'back'.
  */
 void bpf_patch_list_jump(struct bpf_patch_list *pl, const struct bpf_insn *insn, u32 to, u32 back)
 {
 	struct bpf_insn_patch *p = &pl->patches[pl->cnt - 1];
+	u32 jmp = insn - &pl->insns[p->start] + 1;
 
-	WARN_ON_ONCE(p->jmp);
-	p->jmp = insn - &pl->insns[p->start] + 1;
+	if (p->jmp) {
+		/*
+		 * There is no room for a fourth one, nor for 'back' of a later one. Such a jump
+		 * goes out of the program: bpf_patch_list_build() fails for it.
+		 */
+		if (WARN_ON_ONCE(p->jmp3 || back))
+			to = U32_MAX;
+		if (p->jmp2) {
+			p->jmp3 = jmp;
+			p->jmp3_to = to;
+		} else {
+			p->jmp2 = jmp;
+			p->jmp2_to = to;
+		}
+		return;
+	}
+	p->jmp = jmp;
 	p->jmp_to = to;
 	p->jmp_back = back;
 }
@@ -666,6 +695,8 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
 	/* like kvmalloc(): the size of a prog fits into 32 bits */
 	if (map[cnt] > INT_MAX / sizeof(*insns))
 		return -ENOMEM;
+	if (map[cnt] > BPF_PROG_MAX_LEN)
+		return -E2BIG;
 	insns = kvrealloc(insns, array_size(map[cnt], sizeof(*insns)), BPF_VERIFIER_GFP);
 	if (!insns)
 		return -ENOMEM;
@@ -695,7 +726,9 @@ static int patch_image_relax(struct bpf_patch_image *img, u32 *tgt)
  * its patch, img->new_tgt[] to where jumps to it land, both map a removed insn
  * to the next one that stays. img->new_linfo[] is there when insns are
  * removed, see patch_image_map_linfo(). On -EFAULT, img->bad is the old insn
- * whose jump is wrong. No list has both removed and inserted insns.
+ * whose jump is wrong. On -E2BIG, a program has no room for the image, see
+ * BPF_PROG_MAX_LEN: nothing of that size is allocated, here or by the caller.
+ * No list has both removed and inserted insns.
  */
 int bpf_patch_list_build(const struct bpf_patch_list *pl, const struct bpf_prog *prog,
 			 struct bpf_patch_image *img)
@@ -723,6 +756,8 @@ int bpf_patch_list_build(const struct bpf_patch_list *pl, const struct bpf_prog 
 		}
 	}
 	img->short_cnt = img->new_cnt = cnt + img->grow;
+	if (img->new_cnt > BPF_PROG_MAX_LEN)
+		return -E2BIG;
 
 	if (img->del && prog->aux->nr_linfo) {
 		err = patch_image_map_linfo(img, prog);
@@ -816,7 +851,7 @@ static void bpf_prog_kallsyms_del_subprogs(struct bpf_prog *fp)
 {
 	int i;
 
-	for (i = 0; i < fp->aux->real_func_cnt; i++)
+	for (i = 0; i < fp->aux->func_cnt; i++)
 		bpf_prog_kallsyms_del(fp->aux->func[i]);
 }
 
@@ -1610,7 +1645,7 @@ int bpf_jit_get_func_addr(const struct bpf_prog *prog,
 		if (!extra_pass)
 			addr = NULL;
 		else if (prog->aux->func &&
-			 imm >= 0 && imm < prog->aux->real_func_cnt)
+			 imm >= 0 && imm < prog->aux->func_cnt)
 			addr = (u8 *)prog->aux->func[imm]->bpf_func;
 		else
 			return -EINVAL;
@@ -1982,6 +2017,24 @@ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struc
 		return false;
 	insn_idx += prog->aux->subprog_start;
 	return env->insn_aux_data[insn_idx].indirect_target;
+}
+
+/* When the access to arena at @insn_idx of @prog faults the program goes to bpf_prog_fault_pad() */
+bool bpf_insn_fault_unwinds(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+			    int insn_idx)
+{
+	if (!env)
+		return false;
+	insn_idx += prog->aux->subprog_start;
+	return env->insn_aux_data[insn_idx].fault_unwinds;
+}
+
+/* The insn of @prog at which the landing pad that releases nothing begins. 0: it has none. */
+int bpf_prog_fault_pad(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
+{
+	u32 pad = env ? env->subprog_info[prog->aux->func_idx].fault_pad : 0;
+
+	return pad ? pad - prog->aux->subprog_start : 0;
 }
 
 u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
@@ -3522,7 +3575,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 	int i;
 
 	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
-	for (i = 0; i < aux->real_func_cnt; i++) {
+	for (i = 0; i < aux->func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
 		 * released along with it.
@@ -3530,7 +3583,7 @@ static void bpf_prog_free_images(struct work_struct *work)
 		aux->func[i]->aux->poke_tab = NULL;
 		bpf_jit_free(aux->func[i]);
 	}
-	if (aux->real_func_cnt) {
+	if (aux->func_cnt) {
 		kvfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);
 	} else {
@@ -3548,8 +3601,10 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	 * A prog that still runs when its last reference goes needs its symbols,
 	 * by which its exception table is found.  It has ended by now.
 	 */
-	ksyms = aux->real_func_cnt || !list_empty(&aux->ksym.lnode);
+	ksyms = aux->func_cnt || !list_empty(&aux->ksym.lnode);
 	bpf_prog_kallsyms_del_all(aux->prog);
+	if (aux->xdp_consume)
+		static_branch_dec(&bpf_xdp_consume_enabled_key);
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
 #endif
@@ -3557,6 +3612,8 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
 		bpf_cgroup_atype_put(aux->cgroup_atype);
 #endif
+	bpf_coro_prog_disown(aux->prog);
+	bpf_coro_frames_free(aux->prog);
 	bpf_free_used_maps(aux);
 	bpf_free_used_btfs(aux);
 	bpf_prog_disassoc_struct_ops(aux->prog);
@@ -3582,6 +3639,13 @@ void bpf_prog_free(struct bpf_prog *fp)
 
 	if (aux->dst_prog)
 		bpf_prog_put(aux->dst_prog);
+	/*
+	 * Code of this program that may sleep has ended. Where the grace period for that was
+	 * the only one, the rest of it may still be in a read section of RCU, and the release
+	 * of that program waits for those before anything else, see bpf_coro_prog_release().
+	 */
+	if (aux->coro_prog)
+		bpf_prog_put(aux->coro_prog);
 	bpf_token_put(aux->token);
 	INIT_WORK(&aux->work, bpf_prog_free_deferred);
 	/*
@@ -3790,6 +3854,35 @@ bool __weak bpf_jit_supports_hmul(void)
 }
 
 /*
+ * Where unwind_exit returns: to the pad of the caller when the caller has one,
+ * and where exit would otherwise. The JITs that support unwinding have the real
+ * one. Without it no callback unwinds, so a helper never asks.
+ */
+u64 __weak bpf_unwind_target(u64 ret_addr)
+{
+	return ret_addr;
+}
+
+/*
+ * Where kexit returns: to kgoto of the call when the caller has one, and where exit would
+ * otherwise. Without the real one of a JIT the verifier emits no kexit.
+ */
+u64 __weak bpf_kunwind_target(u64 ret_addr)
+{
+	return ret_addr;
+}
+
+/*
+ * Where a fault in the code of an insn that ends at @end goes: the landing pad that unwind_goto
+ * after the insn names, or @end, which skips the insn. The JITs that go to a pad at a fault have
+ * the real one.
+ */
+u64 __weak bpf_fault_unwind_target(u64 end)
+{
+	return end;
+}
+
+/*
  * How this arch places a by-value kfunc argument, or NULL for one that has
  * not opted in and so only takes an argument of a single eightbyte, which
  * every convention places in slot order.
@@ -3958,11 +4051,6 @@ int __weak bpf_arch_text_invalidate(void *dst, size_t len)
 	return -ENOTSUPP;
 }
 
-bool __weak bpf_jit_supports_exceptions(void)
-{
-	return false;
-}
-
 bool __weak bpf_jit_supports_private_stack(void)
 {
 	return false;
@@ -4040,6 +4128,74 @@ u64 bpf_prog_report_recursion(void)
 	}));
 #endif
 	return 0;
+}
+
+/*
+ * Called by the landing pad that ends an invocation with exit, when the frames have released what
+ * they held. What the value of an unwound operator means is up to the struct_ops. This is the
+ * context of the program, with the locks of the caller of the operator: see what ->unwound() may do.
+ * Only programs of a struct_ops that has the callback call it, see bpf_pad_insns(). A frame that
+ * the kernel called and that leaves with kexit tells in bpf_prog_unwound_to_kernel().
+ */
+u64 bpf_prog_report_unwound(struct bpf_prog_aux *aux)
+{
+	aux->st_ops->unwound(aux->prog);
+	return 0;
+}
+
+/*
+ * A frame leaves with kexit, there is no landing pad at its return address, and that address is in
+ * no program: the kernel called the frame, and the invocation that it has stopped ends here.
+ * bpf_kunwind_target() of the JITs gets here, with @ip in the code that called it. That is the
+ * frame itself, an async callback: the main program has no kexit, it leaves with exit, see
+ * bpf_prog_can_unwind(). A helper that leaves through bpf_unwind_leave() has its own text there:
+ * no program, and nobody is told. Its caller is a program and has the pad.
+ *
+ * unwind_exit that finds no landing pad does not get here, see bpf_unwind_target(). It is the way
+ * out that the program has chosen, as exit is, and as unwind_exit in the text of the main program
+ * is, which is exit to the JITs: the kernel has not stopped the program, and nobody is told.
+ *
+ * So the rule for who is told is this. Every unwind by the kernel that ends an invocation is told
+ * exactly once: by the pad that ends it with exit, or here. An unwind of the program's own is told
+ * only where a landing pad that the verifier emitted ends the invocation: at a call without
+ * unwind_goto to which unwind_exit of a callee comes back, in the main program or in a callback
+ * that only the kernel calls, see pad_reports(). It is not told where unwind_exit of the program
+ * itself ends the invocation.
+ *
+ * Such a callback can leave unwound because it has callers in the program, or is expected to: the
+ * program calls it as a function as well, it calls itself, or its address waits in a register. It
+ * has one landing pad per site for all its frames, which cannot tell who called. Only here is it
+ * known that the kernel did. So the pads of such a callback do not tell the struct_ops, see
+ * pad_reports() in pads.c, and this does: one of the two, once per invocation.
+ *
+ * The frame is still on the stack and has released what it held, as where a pad tells. The context
+ * is that of the callers of async callbacks: softirq, a kernel thread, a task on its way to user
+ * space. Never NMI. ->unwound() does not sleep and takes no lock of its callers anyway, see
+ * struct bpf_struct_ops.
+ *
+ * Not told: an extension of a function of a struct_ops program, and an async callback of one. An
+ * extension has no struct_ops of its own. The one of its target is known where it is attached, and
+ * its main program leaves with exit, into the program that it extends, which goes on.
+ *
+ * Nor is a kexit told here that finds the pad of bpf_call_cb() at its return address: the helpers
+ * that have such a pad pass the unwind on with bpf_unwind_leave(), and it is told where it ends.
+ * Kernel code that calls a program with bpf_call_cb() and does not pass the unwind on ends the
+ * invocation itself, and has to tell the struct_ops itself.
+ */
+void bpf_prog_unwound_to_kernel(unsigned long ip)
+{
+	const struct bpf_struct_ops *st_ops;
+	struct bpf_prog *prog;
+
+	scoped_guard(rcu)
+		prog = bpf_prog_ksym_find(ip);
+	if (!prog)
+		return;
+	/* The frame keeps the program. The struct_ops is that of the main program. */
+	prog = prog->aux->main_prog_aux->prog;
+	st_ops = prog->aux->st_ops;
+	if (st_ops && st_ops->unwound)
+		st_ops->unwound(prog);
 }
 
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
@@ -4162,6 +4318,10 @@ late_initcall(bpf_global_ma_init);
 
 DEFINE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
 EXPORT_SYMBOL(bpf_stats_enabled_key);
+
+/* Switched on while a program that may take ownership of XDP frames is loaded. */
+DEFINE_STATIC_KEY_FALSE(bpf_xdp_consume_enabled_key);
+EXPORT_SYMBOL_GPL(bpf_xdp_consume_enabled_key);
 
 /* All definitions of tracepoints related to BPF. */
 #define CREATE_TRACE_POINTS

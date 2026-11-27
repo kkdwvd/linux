@@ -83,6 +83,7 @@
 #define KF_SPINLOCK_SAFE (1 << 17) /* kfunc is allowed inside bpf_spin_lock-ed region */
 #define KF_PERFMON      (1 << 18) /* kfunc requires CAP_PERFMON */
 #define KF_ITER_RET_INDEPENDENT (1 << 19) /* next result outlives the current element */
+#define KF_RELEASE_CTX  (1 << 20) /* kfunc consumes the program context passed as its first argument */
 
 /*
  * Tag marking a kernel function as a kfunc. This is meant to minimize the
@@ -622,6 +623,7 @@ struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog);
 u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
 int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag);
 bool btf_kfunc_is_allowed(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
+s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id, const struct bpf_prog *prog);
 u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
 				const struct bpf_prog *prog);
 int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
@@ -719,6 +721,11 @@ static inline int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 	return 0;
 }
 static inline s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
+{
+	return -ENOENT;
+}
+static inline s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id,
+					 const struct bpf_prog *prog)
 {
 	return -ENOENT;
 }

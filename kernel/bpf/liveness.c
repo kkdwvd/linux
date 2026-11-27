@@ -322,15 +322,6 @@ static int mark_stack_mask(struct func_instance *instance, u32 frame, u32 insn_i
 	return 0;
 }
 
-int bpf_jmp_offset(struct bpf_insn *insn)
-{
-	u8 code = insn->code;
-
-	if (code == (BPF_JMP32 | BPF_JA))
-		return insn->imm;
-	return insn->off;
-}
-
 __diag_push();
 __diag_ignore_all("-Woverride-init", "Allow field initialization overrides for opcode_info_tbl");
 
@@ -384,6 +375,10 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 		return jt;
 	}
 
+	/* bpf_throw() doesn't come back: what follows the call is not where the program goes */
+	if (unlikely(insn->code == (BPF_JMP | BPF_CALL) && bpf_is_throw_kfunc(insn)))
+		return succ;
+
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
 	if (opcode_info->can_fallthrough)
@@ -395,11 +390,9 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	/*
 	 * tail_call upon success and ld_{abs,ind} upon load failure return
 	 * from the subprogram, which is a hidden edge to its exit. A subprogram
-	 * without an exit insn has no exit to model.
+	 * with neither an exit insn nor bpf_throw() has no exit to model.
 	 */
-	if (unlikely((bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
-		     (BPF_CLASS(insn->code) == BPF_LD &&
-		      (BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND)))) {
+	if (unlikely(bpf_insn_has_hidden_exit(insn))) {
 		u32 exit_idx = bpf_find_containing_subprog(env, idx)->exit_idx;
 
 		if (exit_idx != U32_MAX)
@@ -418,15 +411,11 @@ static inline bool update_insn(struct bpf_verifier_env *env, struct func_instanc
 	unsigned long *may_read, *must_write, *live_before;
 	struct frame_masks *fm = instance->frames[frame];
 	u32 rel = relative_idx(instance, insn_idx);
-	int t = bpf_head_guard_target(env, insn_idx);
 	struct bpf_iarray *succ;
 	bool changed = false;
 	u32 s, w;
 
 	succ = bpf_insn_successors(env, insn_idx);
-	if (succ->cnt == 0)
-		return false;
-
 	/* All instructions of one frame array share the same mask width */
 	for (s = 0; s < succ->cnt; ++s) {
 		unsigned long *succ_live;
@@ -446,8 +435,6 @@ static inline bool update_insn(struct bpf_verifier_env *env, struct func_instanc
 	for (w = 0; w < fm->words; w++) {
 		unsigned long new_before = (new_after[w] & ~must_write[w]) | may_read[w];
 
-		if (t >= 0)
-			new_before |= rel_mask(fm, relative_idx(instance, t), before)[w];
 		if (new_before != live_before[w]) {
 			live_before[w] = new_before;
 			changed = true;
@@ -1871,6 +1858,26 @@ static int record_arg_access(struct bpf_verifier_env *env,
 	return err;
 }
 
+/*
+ * Is the insn at @idx the one behind a call of a subprog that does not return, see
+ * bpf_compute_might_return()? What comes back to such a call is unwound. Where the program has no
+ * unwind_goto there, the frame is left through a landing pad of the verifier, and the places of
+ * what the pad releases are judged at this insn, which no frame runs: for liveness it reads what
+ * the pad may read, as a call of bpf_throw() does. Not if a jump gets to the insn as well: it is
+ * code of the normal path then, and its liveness is that of the code.
+ */
+static bool behind_call_without_return(struct bpf_verifier_env *env, int idx)
+{
+	const struct bpf_insn *insns = env->prog->insnsi;
+	int callee;
+
+	if (!idx || !bpf_pseudo_call(&insns[idx - 1]) || bpf_is_unwind_goto(&insns[idx]) ||
+	    bpf_is_jump_target(env, idx))
+		return false;
+	callee = bpf_find_subprog(env, idx + insns[idx - 1].imm);
+	return callee >= 0 && !env->subprog_info[callee].might_return;
+}
+
 /* Record stack access for a given 'at' state of helper/kfunc/global subprog 'insn' */
 static int record_call_access(struct bpf_verifier_env *env,
 			      struct func_instance *instance,
@@ -1880,6 +1887,13 @@ static int record_call_access(struct bpf_verifier_env *env,
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_call_summary cs;
 	int r, err, callee, arg_slot_cnt = 5;
+
+	/*
+	 * bpf_throw() never returns: the landing pad reads whichever stack slots of
+	 * the frame hold resources at the call, so none is dead there.
+	 */
+	if (bpf_is_throw_kfunc(insn))
+		return mark_stack_read_all(env, instance, instance->depth, insn_idx, true);
 
 	if (bpf_pseudo_call(insn)) {
 		/*
@@ -2184,12 +2198,6 @@ redo:
 		memcpy(at_out, at_in[i], sizeof(at_out));
 		memcpy(at_stack_out, &at_stack_in[(size_t)i * nslots], nslots * sizeof(*at_stack_out));
 
-		ti = bpf_head_guard_target(env, idx) - start;
-		if (ti >= 0 && arg_track_join_all(env, idx, start + ti, at_in[ti],
-						  &at_stack_in[(size_t)ti * nslots],
-						  at_out, at_stack_out, nslots))
-			__set_bit(ti, changed);
-
 		arg_track_xfer(env, insn, idx, at_out, at_stack_out, nslots,
 			       at_stack_arg_entry, instance, callsites);
 		arg_track_log(env, insn, idx, at_in[i], &at_stack_in[(size_t)i * nslots], at_out,
@@ -2222,6 +2230,13 @@ redo:
 		err = record_load_store_access(env, instance, at_in[i], idx);
 		if (err)
 			goto err_free;
+
+		/* the landing pad reads whichever stack slots hold resources there */
+		if (behind_call_without_return(env, idx)) {
+			err = mark_stack_read_all(env, instance, instance->depth, idx, true);
+			if (err)
+				goto err_free;
+		}
 
 		if (BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_CALL) {
 			err = record_call_access(env, instance, at_in[i], idx);
@@ -2828,6 +2843,21 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			 */
 			if (bpf_is_callx(insn))
 				use = dst;
+			/*
+			 * When the callback unwinds, the revisit of the call passes
+			 * the r0 of the callback on to the pad after the call, see
+			 * check_helper_call(): live before the call.
+			 */
+			if (bpf_is_sync_callback_calling_insn(insn) && bpf_is_unwind_goto(insn + 1))
+				use |= r0;
+			/*
+			 * bpf_throw() never returns: the landing pad reads whichever
+			 * registers hold resources at the call. R2-R5 are left out:
+			 * live there they would be arguments of each function from
+			 * whose entry a throw is reached.
+			 */
+			if (bpf_is_throw_kfunc(insn))
+				use |= r0 | mask_widen(GENMASK(BPF_REG_9, BPF_REG_6));
 			break;
 		default:
 			def = 0;
@@ -2837,6 +2867,10 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		}
 		break;
 	}
+
+	/* the landing pad reads whichever registers hold resources there */
+	if (behind_call_without_return(env, insn - env->prog->insnsi))
+		use |= mask_widen(GENMASK(BPF_REG_9, BPF_REG_6));
 
 	info->def = def;
 	info->use = use;
@@ -2922,6 +2956,8 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		}
 		if (!taken)
 			callx_use = args;
+		/* the frame of a parked coroutine, whose function is not one of these */
+		callx_use |= mask_widen(BIT(BPF_REG_1));
 
 		changed = false;
 		/* a cycle of calls takes a round for each link */
@@ -2935,7 +2971,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			u32 new_out = 0;
 			u32 new_in = 0;
 			u32 use;
-			int t;
 
 			succ = bpf_insn_successors(env, insn_idx);
 			for (int s = 0; s < succ->cnt; ++s)
@@ -2952,10 +2987,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			if (bpf_is_callx(&insns[insn_idx]))
 				use |= callx_use;
 			new_in = (new_out & ~live->def) | use;
-			/* may_goto that is added at the head of a loop goes there */
-			t = bpf_head_guard_target(env, insn_idx);
-			if (t >= 0)
-				new_in |= state[t].in;
 			if (new_out != live->out || new_in != live->in) {
 				live->in = new_in;
 				live->out = new_out;
@@ -2972,6 +3003,7 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		insn_aux[i].live_regs_before = mask_lo(in) | mask_hi(in);
 		insn_aux[i].use_regs = mask_lo(state[i].use) | mask_hi(state[i].use);
 		insn_aux[i].def_regs = mask_lo(state[i].def);
+		insn_aux[i].live_hi32_before = mask_hi(in);
 		/*
 		 * On architectures where 32-bit operations do not reset upper halves
 		 * of the registers, the verifier needs to zero extend a destination
@@ -2980,10 +3012,10 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		 */
 		insn_aux[i].zext_dst = def32 >= 0 && (mask_hi(out) & BIT(def32));
 	}
-	/* the exit that stands for 'r0 = 0; exit' may be dead code, see push_unwind_exit() */
+	/* what leaves a subprog is compared at this exit, which may be dead code, see unwind_frame() */
 	for (i = 0; i < env->subprog_cnt; i++)
-		if (env->subprog_info[i].bail_insn >= 0)
-			insn_aux[env->subprog_info[i].bail_insn].live_regs_before |=
+		if (env->subprog_info[i].exit_idx != U32_MAX)
+			insn_aux[env->subprog_info[i].exit_idx].live_regs_before |=
 				BIT(BPF_REG_0) | (bpf_ret_reg_pair(env, i) ? BIT(BPF_REG_2) : 0);
 
 	/*

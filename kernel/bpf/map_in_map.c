@@ -11,6 +11,7 @@ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
 {
 	struct bpf_map *inner_map, *inner_map_meta;
 	u32 inner_map_meta_size;
+	int err;
 	CLASS(fd, f)(inner_map_ufd);
 
 	inner_map = __bpf_map_get(f);
@@ -28,6 +29,10 @@ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
 	/* An inner map has no used_maps reference to hold it under a queued callback. */
 	if (btf_record_has_field(inner_map->record, BPF_RCU_HEAD))
 		return ERR_PTR(-EOPNOTSUPP);
+	/* Nor does the load of a program that uses it see the map, see claim_coro_maps(). */
+	err = bpf_record_holds_parked(inner_map->record);
+	if (err)
+		return ERR_PTR(err < 0 ? err : -EOPNOTSUPP);
 
 	inner_map_meta_size = sizeof(*inner_map_meta);
 	/* In some cases verifier needs to access beyond just base map. */

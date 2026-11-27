@@ -28,6 +28,9 @@ struct join {
 	int err;
 };
 
+/* A slot that a reference owns is no xreg: no dep is about it */
+#define JOIN_NO_XREG	U32_MAX
+
 /*
  * A number can grow in each trip. The bound that moved goes to a threshold. The constants of
  * the loop give the thresholds:
@@ -60,7 +63,8 @@ static void join_range(struct join *j, struct bpf_reg_state *dst, const struct b
 			if (reg_smin(dst) > -BPF_MAX_VAR_OFF)
 				min_threshold = -BPF_MAX_VAR_OFF + 1;
 		}
-		in_deps = bpf_xreg_in_deps(j->env, j->dst, j->fr, j->xregno);
+		in_deps = j->xregno != JOIN_NO_XREG &&
+			  bpf_xreg_in_deps(j->env, j->dst, j->fr, j->xregno);
 		if (in_deps)
 			j->err = j->err ?: bpf_loop_collect_thresholds(j->env, loop);
 		/* at the constant or one before it, and the largest step or this step further */
@@ -230,6 +234,7 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 		    bool widen)
 {
 	struct join j = { .env = env, .dst = dst, .leftover_loop = leftover_loop, .widen = widen };
+	u32 i, k;
 
 	bpf_add_cost(env, bpf_xreg_cnt(dst), BPF_COST_XREG);
 	env->pkt_pair_cnt = 0;
@@ -238,9 +243,23 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 	bpf_equations_pre_join(env, dst, src, leftover_loop, leftover_loop && widen);
 	for (j.fr = 0; j.fr <= dst->curframe; j.fr++)
 		join_func(&j, dst->frame[j.fr], src->frame[j.fr],
-			  env->insn_aux_data[bpf_frame_insn_idx(dst, j.fr)].live_regs_before);
+			  bpf_frame_live_regs(env, dst, j.fr));
+	/*
+	 * The slots that a reference owns are joined like stack slots, see
+	 * bpf_reference_state.slots. The join_key has their number and their pointers.
+	 */
+	j.xregno = JOIN_NO_XREG;
+	for (i = 0; i < dst->acquired_refs; i++)
+		for (k = 0; k < dst->refs[i].nr_slots; k++)
+			join_slot(&j, &dst->refs[i].slots[k], &src->refs[i].slots[k]);
 	bpf_equations_post_join(env, dst, src);
 	dst->max_held_cnt = max(dst->max_held_cnt, src->max_held_cnt);
+	/*
+	 * See check_arena_site(). @dst describes more than it did, and a state that is within it
+	 * is dropped: the callers never saw their frames as that state has them.
+	 */
+	dst->frame[dst->curframe]->fault_edge &= src->frame[src->curframe]->fault_edge &&
+						 !dst->curframe;
 	/* no equation is found over a limit */
 	if (env->test_reg_invariants && !bpf_state_subsumes(env, dst, src) &&
 	    verifier_bug_if(!bpf_check_limits(env), env, "join at %d", dst->insn_idx))

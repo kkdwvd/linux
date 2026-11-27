@@ -371,29 +371,83 @@ struct bpf_reference_state {
 		REF_TYPE_LOCK		= (1 << 3),
 		REF_TYPE_RES_LOCK 	= (1 << 4),
 		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
+		/*
+		 * A coroutine frame in memory that its host lends, see "Hosts" in
+		 * kernel/bpf/coro.c. It has slots like any frame, and it is no resource: no call
+		 * releases it, no landing pad has an entry for it, and it is no leak. It is there
+		 * for as long as the program has the host. That is the program context where
+		 * 'parent_id' is 0, and the frame ends with the invocation. Else it is the
+		 * reference 'parent_id', and the frame ends where that goes, with every pointer
+		 * to it, see invalidate_reference().
+		 */
+		REF_TYPE_HOSTED		= (1 << 6),
 		REF_TYPE_LOCK_MASK	= REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
 	} type;
 	/* Track each reference created with a unique id, even if the same
 	 * instruction creates the reference multiple times (eg, via CALL).
 	 */
 	int id;
-	/* Instruction where the allocation of this reference occurred. This
-	 * is used purely to inform the user of a reference leak.
+	/*
+	 * Instruction where the allocation of this reference occurred. It tells the user about
+	 * a reference leak, and a landing pad which function releases the reference.
 	 */
 	int insn_idx;
 	u32 diag_id;	/* finds the acquire in the report of a leak, it is not renumbered */
+	/*
+	 * The instruction that brought it to the frame which is responsible for it: insn_idx, or
+	 * the call of the subprog that returned with it.
+	 */
+	int origin;
+	/*
+	 * The kernel is unwinding the frame, and where it entered the landing pad of the program
+	 * the pointer went to a save word of the frame, number 'saved' - 1, see bpf_pad_enter().
+	 * 0: it has none. Only a REF_TYPE_PTR that is no object in the stack has one. Compared, see
+	 * same_refs().
+	 */
+	u8 saved;
 	union {
-		/* For REF_TYPE_PTR */
+		/*
+		 * For REF_TYPE_PTR, and 'parent_id' for REF_TYPE_HOSTED. Compared and hashed,
+		 * see same_refs(): no holes.
+		 */
 		struct {
 			int parent_id;
-			u32 ctx_arg;	/* it came with that __ref argument, the first is 1 */
+			u16 ctx_arg;	/* it came with that __ref argument, the first is 1 */
+			/*
+			 * A function that is verified on its own found the pointer to be NULL,
+			 * and its caller holds the reference, see ref_of_caller(). The mark
+			 * stays in the function when that is unwound: a pad of the caller
+			 * sees the reference held.
+			 */
+			u16 found_null;
 		};
 		/* Use to keep track of the source object of a lock, to ensure
 		 * it matches on unlock.
 		 */
 		void *ptr;
 	};
+	/*
+	 * Slot-tracked memory owned by the reference, if any. The slots follow
+	 * the bpf_stack_state conventions of the stack. They are freed with
+	 * the reference, deep copied with the verifier state, visited by
+	 * bpf_for_each_reg_in_vstate(), compared by bpf_state_subsumes() and
+	 * joined by bpf_states_join(). They are no xregs: no equation, no dep
+	 * and no liveness is about them. The pointers that they hold are a part
+	 * of the join_key, see bpf_same_join_key().
+	 */
+	struct bpf_stack_state *slots;
+	u32 nr_slots;
+	/* Exact byte size of the slot-tracked memory. */
+	u32 mem_size;
 };
+
+/*
+ * Slots a reference may own: as many as the stack of a program that the
+ * interpreter runs has. Every copy of a state copies them, like the stack.
+ */
+#define BPF_MAX_REF_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
+/* a bit per slot, see struct bpf_pad_frame */
+static_assert(BPF_MAX_REF_SLOTS <= BITS_PER_LONG_LONG);
 
 struct bpf_retval_range {
 	s32 minval;
@@ -444,6 +498,399 @@ static inline u64 bpf_xreg(u32 frameno, u32 xregno)
  *                                        |  widened |----+
  *                                        +----------+
  */
+/* Landing pads that the verifier emits, see kernel/bpf/pads.c */
+
+/*
+ * The kinds of site. An insn has at most one site of a kind.
+ * At all but BPF_SITE_CALL it is the kernel that unwinds the frame: it leaves with kexit, see
+ * bpf_site_is_kernel(). A call can be a site of both kinds, with a landing pad for each.
+ */
+enum bpf_site_kind {
+	BPF_SITE_GUARD,		/* may_goto that the verifier adds before the insn */
+	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
+	/*
+	 * unwind_goto that the verifier adds after the insn, a call: what it calls left with
+	 * unwind_exit, which the program has, and the program has no unwind_goto there
+	 */
+	BPF_SITE_CALL,
+	BPF_SITE_FAULT,		/* the same after an access to arena, for when it faults */
+	BPF_SITE_THROW,		/* the insn is a call of bpf_throw() */
+	BPF_SITE_MAY_GOTO,	/* the insn is may_goto of the program, see check_may_goto_site() */
+	/*
+	 * kgoto that the verifier adds after the insn, a call: the kernel unwound what it calls,
+	 * which left with kexit. Whatever unwind_goto the program has there.
+	 */
+	BPF_SITE_KCALL,
+	/*
+	 * The same call, where the program has unwind_goto whose landing pad only resumes, see
+	 * bpf_find_kernel_pads(): kgoto goes to code that the verifier adds in front of that pad,
+	 * the entry, and the frame is not left. It goes on in the landing pad of the program,
+	 * FORCED: the kernel is unwinding it.
+	 */
+	BPF_SITE_KENTRY,
+	/*
+	 * unwind_exit of the program that a forced frame gets to: the insn becomes a jump to code
+	 * of the verifier that releases what the frame still holds and leaves with kexit
+	 */
+	BPF_SITE_REMAINDER,
+	/*
+	 * A flag on top of a kind: the frame that is left at the site is one that the kernel
+	 * unwinds already. It is left with kexit at every kind of site, and with the value that
+	 * its unwinding began with. The states that leave such a frame have a plan of their own at
+	 * the site, next to the plan of the states that are the first to unwind there.
+	 */
+	BPF_SITE_FORCED = 0x10,
+};
+
+/* What a site is, whichever frame is left there */
+static inline enum bpf_site_kind bpf_site_base(enum bpf_site_kind kind)
+{
+	return kind & ~BPF_SITE_FORCED;
+}
+
+/* The frame that is left there is one that the kernel unwinds already */
+static inline bool bpf_site_is_forced(enum bpf_site_kind kind)
+{
+	return (kind & BPF_SITE_FORCED) || kind == BPF_SITE_REMAINDER;
+}
+
+/*
+ * The site is a call, to which what it called came back unwound. The frame is left there, or the
+ * kernel enters the landing pad that the program has behind the call.
+ */
+static inline bool bpf_site_is_call(enum bpf_site_kind kind)
+{
+	return bpf_site_base(kind) == BPF_SITE_CALL || bpf_site_base(kind) == BPF_SITE_KCALL ||
+	       kind == BPF_SITE_KENTRY;
+}
+
+/*
+ * The kernel unwinds the frame that is left at a site of @kind: the frame leaves with kexit. Also
+ * where unwind_exit of the program comes back to a call in a frame that the kernel unwinds.
+ */
+static inline bool bpf_site_is_kernel(enum bpf_site_kind kind)
+{
+	return kind != BPF_SITE_CALL;
+}
+
+/* The classes of resources that a landing pad can release */
+enum bpf_pad_class {
+	/* Sections. A state has the number of them and nothing else. */
+	BPF_PAD_RCU,		/* bpf_rcu_read_lock() */
+	BPF_PAD_PREEMPT,	/* bpf_preempt_disable() */
+	BPF_PAD_NR_SECTIONS,
+	/* Each of the others is an entry of refs[] and has a handle, which the release takes. */
+	BPF_PAD_IRQ = BPF_PAD_NR_SECTIONS, /* bpf_local_irq_save() */
+	BPF_PAD_RES_LOCK,	/* bpf_res_spin_lock() */
+	BPF_PAD_RES_LOCK_IRQ,	/* bpf_res_spin_lock_irqsave(): two of refs[], one release */
+	BPF_PAD_SPIN_LOCK,	/* bpf_spin_lock() */
+	BPF_PAD_REF,		/* a pointer that a helper or a kfunc returned, REF_TYPE_PTR */
+	/* Objects in the stack that are REF_TYPE_PTR as well */
+	BPF_PAD_ITER,		/* bpf_iter_<type>_new() */
+	BPF_PAD_DYNPTR,		/* bpf_ringbuf_reserve_dynptr(), bpf_dynptr_from_file() */
+};
+
+/* Why no landing pad serves all states that get to a site */
+enum bpf_pad_conflict {
+	BPF_NO_CONFLICT,
+	BPF_CONFLICT_SECTIONS_DIFFER,
+	BPF_CONFLICT_TOO_MUCH,		/* one state holds more than a pad releases */
+	BPF_CONFLICT_PLAN_FULL,		/* the states together hold more different things */
+	BPF_CONFLICT_SLOTS_FULL,	/* the hidden slots of the function are more than a pad has */
+	BPF_CONFLICT_NO_RELEASE,
+	BPF_CONFLICT_NOT_ALWAYS_HELD,
+	BPF_CONFLICT_NO_PLACE,
+	BPF_CONFLICT_ORDER_DIFFERS,
+	BPF_CONFLICT_CANNOT_UNWIND,
+	BPF_CONFLICT_NO_EXIT,
+	BPF_CONFLICT_NO_PERFMON,
+	BPF_CONFLICT_CALLER_SAVED,
+	BPF_CONFLICT_NO_VALUE,
+	BPF_CONFLICT_NO_ROOM,
+	BPF_CONFLICT_SAVES_DIFFER,
+};
+
+/* What told that a subprog is stuck, see bpf_subprog_info.stuck and bpf_pads_log() */
+enum bpf_stuck_by {
+	BPF_STUCK_NO_PAD = 1,	/* the call at the insn hands it to a helper that has no pad for it */
+	BPF_STUCK_CALLED,	/* a frame that cannot unwind, or one of a stuck subprog, calls it */
+	BPF_STUCK_AT_SITE,	/* a frame of it that cannot unwind got to may_goto or to an access */
+	BPF_STUCK_CAME_BACK,	/* it came back unwound to the call, in a frame that cannot unwind */
+};
+
+/*
+ * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
+ * per argument of a release two to load it, for a handle in a coroutine frame a load and a test
+ * for each frame on the way, per entry a test, the calls, two to save the value, three to tell
+ * the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has the insn that
+ * leaves on top of that, or the call of the exception callback.
+ */
+#define BPF_PAD_MAX_SECTIONS	8
+#define BPF_PAD_MAX_ENTS	8
+#define BPF_PAD_MAX_ARGS	2
+/* a handle is at most that many coroutine frames away from a register or a stack slot */
+#define BPF_PAD_MAX_HOPS	3
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 3 +		\
+						     2 * BPF_PAD_MAX_HOPS) +		\
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
+#define BPF_PAD_MAX_CANDS	6
+/* The frames whose zero slots a plan follows from visit to visit, see struct bpf_pad_frame */
+#define BPF_PAD_MAX_FRAMES	8
+/* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
+#define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS
+/*
+ * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
+ * five to compare and clear, four to find a free one. And the call. Behind a call of a subprog
+ * per group one more for the test of R0, and two for the address that waited in the pending word.
+ */
+#define BPF_PAD_MAX_SLOT_INSNS	(BPF_PAD_MAX_ENTS * 9 + 3 * BPF_PAD_NR_GROUPS + 1)
+
+/* Where a place is */
+enum bpf_place_loc {
+	BPF_PLACE_REG,		/* in a register. R10: the handle is an address in the stack */
+	BPF_PLACE_SPILL,	/* in 8 bytes of the stack of the frame */
+	BPF_PLACE_MAP_VALUE,	/* it is the address of the only value of a map */
+	BPF_PLACE_IMM,		/* no handle: the release takes a constant as well, 'delta' */
+	/*
+	 * In save word 'at' of a frame that the kernel unwinds, see bpf_pad_enter(). When the
+	 * function has its hidden words it is a BPF_PLACE_SPILL, see take_kernel_words().
+	 */
+	BPF_PLACE_SAVED,
+};
+
+/* A PLACE: where a landing pad finds a handle when the frame is left at the site */
+struct bpf_pad_place {
+	u8 loc;			/* enum bpf_place_loc */
+	bool maybe_null:1;	/* on a visit that holds the entry the pointer is not checked yet */
+	bool null:1;		/* it is 0 on all visits that don't hold the entry */
+	/*
+	 * The handle is in a slot of a coroutine frame, like in a slot of the stack: what is at
+	 * (loc, at) points to the frame, and the slot is 'hop[0]' bytes from where it points to.
+	 * With more hops that slot points to a frame in turn, and so on: 'hop[i]' bytes from where
+	 * the pointer before it points to, see find_frame_cands() in pads.c. 'delta' is about
+	 * what the last slot has. 0: the handle is at (loc, at).
+	 */
+	u8 hops:2;
+	s16 at;			/* number of the register | offset from R10 | index in used_maps */
+	s32 delta;		/* what is there is that much more than the handle */
+	s16 hop[BPF_PAD_MAX_HOPS];
+};
+
+/* 'hops' has two bits */
+static_assert(BPF_PAD_MAX_HOPS <= 3);
+
+/* The registers and the stack slots of a frame that are 0 */
+struct bpf_pad_nulls {
+	u16 regs;
+	u16 unsaved;		/* save words: the entry of the frame has put no handle there */
+	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+};
+
+/*
+ * The slots of a coroutine frame that are 0, for a frame that a place of the function leads to:
+ * 'at' is where the pointer to the frame is, a register, a stack slot, or a slot of another
+ * such frame, and what is there is 'at.delta' more than the address of the frame. Bit k of
+ * 'zero': on every visit so far slot k of the frame was 0, or the way to the frame ended in a 0
+ * before it got there, which a landing pad tests for on its way. A plan has one for each such
+ * way that a visit came with, see visit_frames() in pads.c.
+ */
+struct bpf_pad_frame {
+	struct bpf_pad_place at;
+	u64 zero;
+};
+
+/*
+ * What the functions of a program keep in a save word: a pointer, and one kind of it per function
+ * and word. The kind is the call that releases it.
+ */
+struct bpf_pad_save {
+	struct bpf_insn release;
+	u32 obj_type;
+	bool set;
+};
+
+/* An ENTRY of a plan: one resource with a handle that the frame is responsible for */
+struct bpf_pad_ent {
+	u32 origin;		/* see struct bpf_reference_state. Of the first visit that held it. */
+	int ref;		/* the visit that is going on: its index in refs[], or -1 */
+	struct bpf_insn release; /* the call that releases it */
+	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
+	u8 class;		/* enum bpf_pad_class */
+	/* coro_prog_type of the state that held it: who may call the release, see get_release() */
+	u8 prog_type;
+	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
+	bool always;		/* all visits hold it: the program counter tells */
+	/*
+	 * BPF_SITE_KENTRY: the entry keeps the pointer in save word 'word' - 1 of the frame, and
+	 * 'saved' of the reference is the same number, see bpf_pad_enter(). 0: it keeps nothing.
+	 */
+	u8 word;
+	/*
+	 * The CANDIDATES, per argument of the release: the places that have the handle on all
+	 * visits that hold the entry. The first one is emitted.
+	 */
+	u8 nr_cands[BPF_PAD_MAX_ARGS];
+	struct bpf_pad_place cand[BPF_PAD_MAX_ARGS][BPF_PAD_MAX_CANDS];
+};
+
+/* Each subprog @s that came back to the call of @plan, see 'callee' of struct bpf_pad_plan */
+#define bpf_pad_for_each_callee(plan, s)						\
+	for (u32 __n = 0; __n < (plan)->nr_callees && ((s) = (plan)->callee[__n], true); __n++)
+
+/* What the landing pad of a site releases, see bpf_pad_visit() */
+struct bpf_pad_plan {
+	struct bpf_pad_plan *next;	/* of the same insn */
+	u8 kind;			/* enum bpf_site_kind */
+	u8 conflict;			/* enum bpf_pad_conflict */
+	bool visited;
+	bool used;			/* the program leaves the frame there, see bpf_pads_mark_used() */
+	bool failed;			/* a state made the conflict an error of the pass */
+	/*
+	 * A state visited that the kernel had brought into a landing pad of the program, see
+	 * bpf_pad_visit(), and a state visited that it had not: the log of a conflict here says
+	 * so, see bpf_pad_log()
+	 */
+	bool from_kpad;
+	bool from_normal;
+	/*
+	 * How many sections of each class the frame is in beyond those of its call. Less than 0:
+	 * it has left that many of its callers, and the pad enters them again.
+	 */
+	s8 sections[BPF_PAD_NR_SECTIONS];
+	u8 sections_differ;		/* bit per class: not the same number on all visits */
+	/*
+	 * A release of the pad may sleep, and the frame is in that many sections of its callers:
+	 * the pad leaves them too ahead of the pointers, and enters them again behind the pointers.
+	 */
+	u8 outside[BPF_PAD_NR_SECTIONS];
+	/* a visit that set 'no_place' left the frame where its pad cannot sleep: pad_can_sleep() */
+	bool no_place_atomic;
+	u8 no_place;			/* the conflict unless hidden slots have all pointers */
+	u8 no_irq_place;		/* the same for irq flags in the stack of a caller */
+	/* the groups that it asked hidden slots for, bits by enum bpf_pad_group: settle_slots() */
+	u8 asked_slots;
+	/*
+	 * BPF_SITE_KENTRY: why the entry cannot save what the frame holds, enum bpf_pad_conflict:
+	 * the states that got to the call do not agree. 0 if they do. Also asked where the entry
+	 * saves nothing in this run, see settle_entries().
+	 */
+	u8 no_saves;
+	u8 nr_ents;
+	bool ordered;			/* see order_ents() */
+	/* BPF_SITE_KENTRY: 'ents' are what the frame holds at the call, see visit_saves() */
+	bool saves;
+	/*
+	 * BPF_SITE_KENTRY, emission: the call is not in pad code, the entry sets K without a test,
+	 * see bpf_pad_kentry_insns(). collect_pads() decides, once.
+	 */
+	bool untested;
+	/*
+	 * BPF_SITE_KENTRY: a frame that the kernel unwinds already got to the entry, see
+	 * bpf_pad_enter(). Its call is in pad code: what the main pass saw of that, next to what
+	 * the control flow graph says, see collect_pads().
+	 */
+	bool forced_visit;
+	struct bpf_pad_ent *ents;	/* oldest first. The pad releases the last one first. */
+	/*
+	 * Entry i has to stand before these entries: a visit held both, and has to release them
+	 * the other way round. Bits by entry. What they have to stand before is in there too.
+	 */
+	u8 before[BPF_PAD_MAX_ENTS];
+	struct bpf_pad_nulls nulls;	/* on all visits so far */
+	/* .. and what is 0 in the coroutine frames that the places lead to */
+	struct bpf_pad_frame *frames;
+	u8 nr_frames;
+	/*
+	 * BPF_SITE_CALL: the subprogs that were left with unwind_exit and came back to the call.
+	 * BPF_SITE_KCALL: those that were left with kexit.
+	 * In ascending order. A call has one, callx and a helper with a callback can have more.
+	 */
+	u32 *callee;
+	u32 nr_callees;
+	/*
+	 * BPF_SITE_KCALL: what the call called is also the continuation of a parked coroutine
+	 * frame, which is no function of the program, see bpf_pad_note_external()
+	 */
+	bool external;
+	/* emission: the pad is that many insns after the last one of the subprog */
+	u32 pad;
+	u32 bytes;			/* its part of env->mem, see charge_plan() */
+};
+
+/*
+ * The groups of classes. A function has HIDDEN SLOTS for all that it acquires of a group or for
+ * nothing of it, see kernel/bpf/pads.c
+ */
+enum bpf_pad_group {
+	BPF_PAD_GROUP_RCU,	/* BPF_PAD_RCU */
+	BPF_PAD_GROUP_PREEMPT,	/* BPF_PAD_PREEMPT */
+	BPF_PAD_GROUP_LOCKS,	/* locks and irq flags: they are released in an order */
+	BPF_PAD_GROUP_REFS,	/* REF_TYPE_PTR: pointers, iterators, dynptrs */
+	BPF_PAD_NR_GROUPS,
+};
+
+/*
+ * What the main pass notes about a call for the hidden slots of the function that the call is in.
+ * It holds for all states that got to the call in the pass. Like the plans it moves with the
+ * snapshot of the pass, see bpf_pads_move().
+ */
+/* How R0 is on a return of a subprog, for the test that tells what the call brought */
+enum {
+	BPF_RET_ZERO	= BIT(0),	/* the lower half is 0 */
+	BPF_RET_NONZERO	= BIT(1),	/* the lower half is not 0 */
+	BPF_RET_UNKNOWN	= BIT(2),
+};
+
+/* When the store behind the call of a subprog runs, see bpf_pad_note_return() */
+enum bpf_pad_cond {
+	BPF_PAD_ALWAYS,
+	BPF_PAD_IF_ZERO,	/* the lower half of R0 is 0 */
+	BPF_PAD_IF_NONZERO,
+};
+
+struct bpf_pad_note {
+	/* a call of a subprog has one note for each group that the subprog returns with */
+	struct bpf_pad_note *next;
+	/*
+	 * The call is one of a subprog, and the subprog returns with the resource: the slot is
+	 * filled behind the call, on a normal return only. 'src' is the argument that had the
+	 * address when the call was made: it waits in the pending word of the function.
+	 */
+	bool by_callee;
+	u8 cond;		/* enum bpf_pad_cond, see subprog_take_slots() */
+	/*
+	 * The first note of a call of a subprog, by group: how R0 was on the returns that came
+	 * with something of the group, and on those that did not. And the groups of which the
+	 * subprog had released what the frame held when it returned, and those of which it had
+	 * not on some return.
+	 */
+	u8 hold_r0[BPF_PAD_NR_GROUPS];
+	u8 nohold_r0[BPF_PAD_NR_GROUPS];
+	u8 takes;
+	u8 keeps;
+	/* The call acquires a resource, or it calls a subprog that returns with one. */
+	bool acquires;
+	u8 src;			/* the register that goes to the slot */
+	u8 held;		/* the most that the frame holds of the group when it gets there */
+	struct bpf_pad_ent ent;	/* what a slot of the call is to a plan, but for the offset */
+	u8 nr_slots;		/* see subprog_take_slots() */
+	s16 off;		/* the first one, from R10. The others are below it. */
+	/* The call releases a resource that the frame acquired. */
+	bool releases;
+	u8 group;		/* enum bpf_pad_group */
+	u8 reg;			/* the register that has the handle */
+	s16 delta;		/* what is there is that much more than the handle */
+};
+
+/* bpf_insn_aux_data.kstub of unwind_goto that keeps its target */
+#define BPF_KSTUB_NONE	U32_MAX
+
+/* What a snapshot keeps for the landing pads of an insn, see bpf_pads_move() */
+struct bpf_pads_moved {
+	struct bpf_pad_plan *plans;
+	struct bpf_pad_note *note;
+};
+
 struct loop_stack_entry {
 	struct bpf_loop *loop;
 	struct bpf_header_state *header_state;	/* see failing_path_trip() */
@@ -477,6 +924,13 @@ static inline bool bpf_trip_is_saved(const struct loop_stack_entry *entry)
 /* state of the program:
  * type of all registers and stack info
  */
+/* What an argument register had when a frame was called. All 0 if it is no such pointer. */
+struct bpf_pad_arg {
+	s16 off;
+	u8 frame;
+	bool stack;	/* a pointer to the stack of 'frame', at the constant offset 'off' */
+};
+
 struct bpf_func_state {
 	struct bpf_reg_state regs[MAX_BPF_REG];
 	/* equal in states that have a join, see bpf_same_join_key() */
@@ -500,6 +954,12 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * How many sections the state was in when the frame was called. This never changes: a
+	 * frame that is unwound puts the state back there, see release_frame_resources().
+	 */
+	u32 call_rcu_locks;
+	u32 call_preempt_locks;
 	struct bpf_retval_range callback_ret_range;
 	bool in_callback_fn;
 	bool in_async_callback_fn;
@@ -511,8 +971,62 @@ struct bpf_func_state {
 	bool in_rcu_callback_fn;
 	/* parent_id of the args that are gone when this frame returns */
 	u32 frame_id;
+	/*
+	 * BPF_FRAME_FORCED: the kernel is unwinding the frame, through a landing pad of the
+	 * program that only resumes, see enter_kernel_pad(). Never cleared: the frame is left
+	 * with kexit. Such a state and one of the normal path are never joined.
+	 * BPF_FRAME_BELOW: the first frame of a function that is verified on its own, for a call
+	 * out of a frame that has a mark. It only keeps the function apart from its other calls.
+	 */
+	u16 forced;
+	/*
+	 * The save words of a forced frame that the entry has put a pointer into, by number. Any
+	 * other word is 0, see bpf_pad_kentry_insns(). A pointer stays in its word when the pad
+	 * of the program releases what it is for: 'saved' of the reference says what is held.
+	 */
+	u16 saved_mask;
+	/*
+	 * Bit f: the frame, or a subprog that returned to it, has released a lock or irq flags
+	 * that frame f acquired. The call that did it releases for frame f, see
+	 * bpf_pad_note_return(), and a frame that is unwound with a bit tells that the hidden
+	 * slots of frame f are no longer what it holds, see bpf_pad_visit().
+	 */
+	u32 took_locks;
+	/*
+	 * What R1-R5 had when the frame was called, see bpf_pad_note_args(). A store of the
+	 * caller takes one of them for the address of irq flags that the frame returns with, see
+	 * irq_arg(), and it is code: the states that it stands for have the same here. The frame
+	 * no longer has these registers when it returns, and what is not live is not compared
+	 * when one state stands for another.
+	 */
+	struct bpf_pad_arg call_args[MAX_BPF_FUNC_REG_ARGS];
+	/*
+	 * Not 0 in an async callback that is the resume or destroy function of a coroutine:
+	 * one plus the call that suspended the coroutine, see push_coro_suspend(). The
+	 * continuations of two suspend points have two join_keys.
+	 */
+	u32 coro_suspend_site;
+	/*
+	 * Of the first frame: the type of program that the code of the state is verified as when
+	 * that is not the program's own, see state_prog_type(). The continuation of a coroutine
+	 * frame that was parked for a program of that type has it, the continuation of a frame
+	 * that it suspends for the kernel to resume, and a function that either calls and that
+	 * is verified on its own.
+	 */
+	u8 coro_prog_type;
+	/*
+	 * Of the first frame: it is the destroy function of a parked coroutine frame, or a
+	 * function that one calls and that is verified on its own. It suspends no frame, see
+	 * push_coro_suspend().
+	 */
+	bool coro_destroy;
 	);
 	bool no_stack_arg_load;
+	/*
+	 * A copy of the state left the frame at an access to arena, and since then the frame made
+	 * no call and no store to the stack of a caller, see check_arena_site()
+	 */
+	bool fault_edge;
 	/*
 	 * The body of a BPF kthread: an async callback whose kernel caller,
 	 * bpf_kthread_fn(), keeps nothing across it that the sleep in
@@ -586,6 +1100,46 @@ struct bpf_equations {
 	u32 clean_sym_cnt;	/* after the last bpf_equations_clean() */
 };
 
+/* see 'forced' of struct bpf_func_state */
+enum {
+	BPF_FRAME_FORCED = 1,
+	BPF_FRAME_BELOW = 2,
+};
+
+/* The kernel is unwinding @frame, which is in a landing pad of the program on its way out */
+static inline bool bpf_frame_is_forced(const struct bpf_func_state *frame)
+{
+	return frame->forced & BPF_FRAME_FORCED;
+}
+
+/* see 'unwound' of struct bpf_verifier_state */
+enum {
+	BPF_UNWOUND = 1,
+	BPF_UNWOUND_CB,
+	BPF_KUNWOUND,
+	BPF_KUNWOUND_CB,
+};
+
+/* The kernel unwound the callee: it left with kexit */
+static inline bool bpf_unwound_by_kernel(u8 unwound)
+{
+	return unwound == BPF_KUNWOUND || unwound == BPF_KUNWOUND_CB;
+}
+
+/* The callee is a callback, and the call of its helper is visited once more */
+static inline bool bpf_unwound_cb(u8 unwound)
+{
+	return unwound == BPF_UNWOUND_CB || unwound == BPF_KUNWOUND_CB;
+}
+
+/* How a state is marked when its callee left unwound */
+static inline u8 bpf_unwound_mark(bool kernel, bool cb)
+{
+	if (kernel)
+		return cb ? BPF_KUNWOUND_CB : BPF_KUNWOUND;
+	return cb ? BPF_UNWOUND_CB : BPF_UNWOUND;
+}
+
 struct bpf_verifier_state {
 	struct bpf_equations equations;
 	/* call stack tracking */
@@ -618,15 +1172,28 @@ struct bpf_verifier_state {
 	);
 	u32 curframe;
 	bool in_sleepable;
-	/* a global function or an extension, and what it calls: exit of frame 0 is not the end */
-	bool callers_unknown;
-	/* The callee left with unwind_exit. Next insn is unwind_goto. */
-	bool unwound;
+	/*
+	 * BPF_UNWOUND: the callee left with unwind_exit. Next insn is unwind_goto, or the verifier
+	 * adds it before that insn, see check_unwound_arrival().
+	 * BPF_KUNWOUND: the kernel unwound the callee, which left with kexit. The verifier adds
+	 * kgoto before the next insn, whatever that insn is: unwind_goto of the program is not
+	 * taken. If that is unwind_goto whose landing pad only resumes, kgoto goes there too,
+	 * through the entry, see enter_kernel_pad().
+	 * BPF_UNWOUND_CB, BPF_KUNWOUND_CB: the callee is a callback. Next insn is the call of the
+	 * helper or the kfunc that called it, once more, see prepare_func_exit().
+	 * The states of the two kinds stay apart: this is in the join key.
+	 */
+	u8 unwound;
 	/*
 	 * A function that is verified on its own changed packet data. Its callers
 	 * and their packet pointers are not in the state, see bpf_flow_return().
 	 */
 	bool changed_pkt_data;
+	/*
+	 * The same for non-owning references: they went while a lock stayed
+	 * held, which may be the lock of a caller.
+	 */
+	bool invalidated_non_owning;
 	);
 	/* Not zero in a function that is verified on its own, see bpf_flow_call() */
 	u32 instance_id;
@@ -720,6 +1287,39 @@ bpf_stack_arg(const struct bpf_func_state *frame, const struct bpf_func_state *o
 	     iter < frame->out_stack_arg_cnt;                          \
 	     iter++, reg = bpf_get_spilled_stack_arg(iter, frame))
 
+static inline struct bpf_reg_state *bpf_get_ref_slot_reg(int slot,
+							 const struct bpf_reference_state *ref,
+							 u32 mask)
+{
+	if (slot < ref->nr_slots &&
+	    (1 << ref->slots[slot].slot_type[BPF_REG_SIZE - 1]) & mask)
+		return &ref->slots[slot].spilled_ptr;
+	return NULL;
+}
+
+/* Iterate over slots owned by 'ref', setting 'reg' to NULL or a spilled register. */
+#define bpf_for_each_ref_slot_reg(iter, ref, reg, mask)			\
+	for (iter = 0, reg = bpf_get_ref_slot_reg(iter, ref, mask);	\
+	     iter < (ref)->nr_slots;					\
+	     iter++, reg = bpf_get_ref_slot_reg(iter, ref, mask))
+
+/* Find the reference with 'id' that owns slots, if any. */
+static inline struct bpf_reference_state *bpf_find_ref_slots(const struct bpf_verifier_state *st,
+							     u32 id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id && st->refs[i].slots)
+			return &st->refs[i];
+	return NULL;
+}
+
+/*
+ * Invoke __expr over every register in __vst: frame registers, stack spills,
+ * spilled stack arguments and spills in reference-owned slots. __state is
+ * the owning frame, or the current frame for reference-owned slots.
+ */
 #define bpf_for_each_reg_in_vstate_mask(__vst, __state, __reg, __stack, __mask, __expr)   \
 	({                                                               \
 		struct bpf_verifier_state *___vstate = __vst;            \
@@ -746,6 +1346,17 @@ bpf_stack_arg(const struct bpf_func_state *frame, const struct bpf_func_state *o
 				(void)(__expr);                          \
 			}						 \
 		}                                                        \
+		__state = ___vstate->frame[___vstate->curframe];         \
+		for (___i = 0; ___i < ___vstate->acquired_refs; ___i++) { \
+			struct bpf_reference_state *___ref = &___vstate->refs[___i]; \
+			bpf_for_each_ref_slot_reg(___j, ___ref, __reg, __mask) { \
+				if (!__reg)                              \
+					continue;                        \
+				__stack = &___ref->slots[___j];          \
+				(void)(__expr);                          \
+			}                                                \
+		}                                                        \
+		__stack = NULL;                                          \
 		(void)__stack;                                           \
 	})
 
@@ -893,8 +1504,6 @@ struct bpf_loop {
 	bool rt_bounded;
 	/* insns in the loop, nested loops included */
 	u32 nr_insns;
-	/* not rt_bounded: there are places for may_goto, see guard_to in bpf_insn_aux_data */
-	bool has_guards;
 
 	/* What one pass gives to the next pass */
 	struct_group_tagged(bpf_loop_precision, precision,
@@ -916,6 +1525,7 @@ struct bpf_loop {
 	bool partitioned;	/* the last partition was for this loop */
 	bool peeled_joined;	/* at the start of a peeled trip, against the join rule */
 	bool changed;		/* see flow_forget_loop() */
+	bool guard_is_cause;	/* scratch of bpf_pads_note_causes(): its jumps out are noted */
 	bool guarded;		/* states take the edges of may_goto */
 	bool was_infinite;	/* at the start of the last path-sensitive run */
 	bool infinite;		/* see failing_path_trip() */
@@ -996,7 +1606,6 @@ struct bpf_insn_aux_data {
 	u64 cast_arena:1; /* addr_space_cast of an address in arena */
 	u64 cast_mov:1; /* addr_space_cast of a pointer that is not in arena, it's a move */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
-	u64 guard_unwinds:1; /* it leaves the subprog */
 	u64 speculative_first:1; /* a speculative state came to it first */
 	u64 call_recorded:1; /* see record_call_fixup() */
 	u64 pessimized:1; /* see bpf_partition_for_pessimized() */
@@ -1020,28 +1629,71 @@ struct bpf_insn_aux_data {
 	u64 non_arena_load:1;
 	u64 indirect_target:1; /* if it is an indirect jump target */
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
+	/* a subprog returned here with no pointer to release and R0 may be not 0 */
+	u64 call_brings_nothing:1;
+	/* An access to arena, see check_arena_site() */
+	u64 fault_skips:1; /* when it faults it is skipped: its subprog cannot unwind */
+	u64 fault_empty:1; /* in this pass a state that holds nothing went by without a visit */
+	u64 fault_unwinds:1; /* emission: when it faults the program goes to 'fault_pad' */
+	u64 unwind_goto_follows:1; /* emission: the verifier added unwind_goto after it */
+	u64 kgoto_follows:1; /* emission: the verifier added kgoto after it */
+	/*
+	 * unwind_goto of the program: a frame that the kernel unwinds took its jump, for
+	 * unwind_exit of what the call in front calls. That call is in pad code: what the main
+	 * pass saw of that, next to what the control flow graph says, see collect_stubs().
+	 */
+	u64 kforced:1;
 	);
 
 	/* what one pass gives to the next pass, see bpf_flow_new_pass() */
-	u32 guard_no_unwind:1; /* it cannot unwind from here, at least sometimes */
-	u32 guard_unset_reg:1; /* where it goes a register is read that is not set here */
 	u32 non_speculative_first:1; /* speculative states end here, their fixups did not fit */
 	u32 acquires:1; /* a reference or a lock */
 	u32 releases:1;
+	u32 fault_full:1; /* an access to arena: all states visit the plan, see check_arena_site() */
+	/*
+	 * unwind_goto of the program: the entry of its landing pad saves no handles, see
+	 * visit_saves(). The states that got to the call did not agree on what the frame holds,
+	 * in the run before this one. Each run asks again, and a run that finds another answer
+	 * is done again with that, see settle_entries().
+	 */
+	u32 ksave_off:1;
 
 	/* below flags are initialized once */
 	u32 bb_end:1; /* last instruction of a basic block */
 	u32 guard_place:1; /* it is the place for may_goto if the loop needs one */
-	u32 guard_at_header:1; /* there is no better place than the header of the loop */
+	/* may_goto that jumps over nothing but its like: it is removed, see bpf_opt_remove_nops() */
+	u32 may_goto_nop:1;
 	/* true if instruction is a call to a helper function that
 	 * accepts callback function as a parameter.
 	 */
 	u32 calls_callback:1;
 	/* true if some jump or call instruction targets this instruction */
 	u32 jump_target:1;
+	/*
+	 * unwind_goto of the program: its landing pad only cleans up and resumes, see
+	 * bpf_find_kernel_pads(). The kernel enters it when it unwinds what the call in front
+	 * calls.
+	 */
+	u32 kpad:1;
+	/*
+	 * A call of a helper: the type of program that the states which got to it were verified
+	 * as, see bpf_state_prog() and note_helper_prog_type(). 0 if none got there.
+	 */
+	u8 helper_prog_type;
+	/*
+	 * PAD CODE: an insn that such a landing pad of its function gets to. A frame that the
+	 * kernel unwinds runs nothing else, see bpf_find_kernel_pads().
+	 */
+	u32 kpad_code:1;
 	/* it can read or write the frame of a caller, in a call with a known callee */
 	u32 reads_outer:1;
 	u32 writes_outer:1;
+	/*
+	 * Emission, unwind_goto of the program: 1 + where its stub starts, counted from the first
+	 * insn behind the subprog, see collect_stubs() in fixups.c. BPF_KSTUB_NONE: it gets none,
+	 * its call is in pad code. 0: nothing was decided for it.
+	 */
+	u32 kstub;
 	/*
 	 * Per-instruction summary of stack slots in the current frame
 	 * that this instruction may write, may read, and that are live before it.
@@ -1056,6 +1708,8 @@ struct bpf_insn_aux_data {
 	u8 iv_operand;		/* the operand of the jump that tests the iv, + 1 */
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	/* those of them whose upper half is alive */
+	u16 live_hi32_before;
 	/*
 	 * Registers that it reads and writes. The arguments of a static function and of callx
 	 * are not in @use_regs. The bits above r10 are not valid.
@@ -1084,12 +1738,13 @@ struct bpf_insn_aux_data {
 	 * stop, -1 if none was found. It doesn't stop the loops around that one either.
 	 */
 	s32 not_stopped;
-	/* where may_goto in front of this instruction goes */
-	s32 guard_to;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 	/* the call of a callback, or the first insn of a recursive function */
 	struct bpf_loop *callback_loop, *recursion_loop;
+	/* the sites at this instruction, as far as the round of the main pass got to them */
+	struct bpf_pad_plan *pad_plans;
+	struct bpf_pad_note *pad_note;	/* of the pass too */
 };
 
 /*
@@ -1177,8 +1832,8 @@ struct bpf_subprog_info {
 	u32 linfo_idx; /* The idx to the main_prog->aux->linfo */
 	u32 postorder_start; /* The idx to the env->cfg.insn_postorder */
 	/*
-	 * Index of one of the BPF_EXIT instructions in this subprogram, or
-	 * U32_MAX when it has none.
+	 * Index of one of the BPF_EXIT instructions in this subprogram, of a
+	 * call of bpf_throw() when it has none, or U32_MAX.
 	 */
 	u32 exit_idx;
 	u32 callx_edge; /* 1 + the first of its env->callx_edges, 0 if none */
@@ -1189,6 +1844,24 @@ struct bpf_subprog_info {
 	u16 stack_extra;
 	u16 arena_stack_depth; /* size of the frame in the stack in arena */
 	u32 cycle; /* the first subprog of its cycle of the call graph, 0 if it is on none */
+	/* the hidden word where its landing pads keep the value over their calls. 0: none */
+	s16 value_off;
+	/*
+	 * The hidden word K of a function in which the kernel enters a landing pad of the program:
+	 * 1 once the kernel unwinds the frame, 0 once the program does. Not written before a frame
+	 * gets into a landing pad, unless the function is mixed. 0: none.
+	 */
+	s16 k_off;
+	/*
+	 * The hidden word where the address of irq flags waits over the call of a subprog that
+	 * saves them, see bpf_pad_note_return(). 0: none.
+	 */
+	s16 pend_off;
+	/* its save words: the first one, the others are above it. See bpf_pad_enter(). */
+	s16 save_off;
+	u8 save_words;
+	/* what each of them has in a frame that the kernel unwinds, in this pass */
+	struct bpf_pad_save saves[BPF_PAD_MAX_SAVES];
 	u32 insns_total;
 	u32 insns_self;
 	/* offsets in range [stack_depth .. fastcall_stack_off)
@@ -1196,17 +1869,37 @@ struct bpf_subprog_info {
 	 */
 	s16 fastcall_stack_off;
 	bool has_tail_call: 1;
-	bool might_throw: 1;
-	bool can_unwind: 1; /* has unwind_exit */
+	bool might_throw: 1; /* it calls bpf_throw(), or what it calls does, see may_not_return() */
+	/*
+	 * It has unwind_exit, or a landing pad of it gets one, see bpf_mark_subprogs_that_unwind().
+	 * Subprog 0: it has a site at which the program can leave it that way, only freplace asks.
+	 */
+	bool can_unwind: 1;
+	/* The same for kexit: it has a site at which the kernel unwinds it. No insn is counted. */
+	bool can_kunwind: 1;
 	bool recursive: 1; /* on a cycle of the call graph */
 	bool in_recursion: 1; /* recursive, or a recursive subprog gets to it */
 	bool addr_taken: 1; /* callx calls nothing else */
 	bool via_callx: 1; /* callx calls it */
+	/*
+	 * A path from its first insn gets to an exit, see bpf_compute_might_return(). A subprog
+	 * that only unwinds has none.
+	 */
+	bool might_return: 1;
 	bool tail_call_reachable: 1;
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
 	bool is_async_cb: 1;
+	/* the resume or destroy function of a suspended coroutine, see push_coro_suspend() */
+	bool coro_cont: 1;
+	/* the resume function of a frame that a __coro_defer argument took */
+	bool coro_defer: 1;
+	/* of a parked frame, which a program calls: it has a time slice, see the fixups */
+	bool coro_parked: 1;
+	/* it has callx of a function of a parked coroutine frame, see check_coro_callx() */
+	bool calls_parked: 1;
 	bool is_exception_cb: 1;
+	bool in_exception_cb: 1; /* it is the exception callback, or that may get to it */
 	/* bpf_loop() or bpf_for_each_map_elem() call it in a loop */
 	bool is_loop_cb: 1;
 	/* another helper or a kfunc calls it */
@@ -1218,6 +1911,11 @@ struct bpf_subprog_info {
 	bool ret_reg_pair: 1;
 	/* true if bpf_fastcall stack region is used by functions that can't be inlined */
 	bool keep_fastcall_stack: 1;
+	/*
+	 * Its bpf_fastcall spills are removed, and their slots are still in the frame: the hidden
+	 * words of its landing pads are below them, see check_max_stack_depth()
+	 */
+	bool fastcall_spills_gone: 1;
 	bool changes_pkt_data: 1;
 	bool might_sleep: 1;
 	/* some call reachable from this subprog may be bpf_task_park() */
@@ -1241,15 +1939,171 @@ struct bpf_subprog_info {
 	bool loads_pkt_end: 1;
 	/* a call of it was verified on its own: its insns are not in insns_total of the caller */
 	bool on_its_own: 1;
-	/* it can leave with unwind_exit: it has one, or unwind_goto follows every call of it */
+	/*
+	 * It can leave with unwind_exit and with kexit: unwind_goto and kgoto follow every call
+	 * of it, or the verifier adds them. Not after the call of a helper that has no pad, see
+	 * subprog_cannot_unwind().
+	 */
 	bool bail_unwinds: 1;
-	/* some call of it is not followed by unwind_goto */
-	bool plain_call: 1;
+	/* bail_unwinds before a pass found out more, see check_funcs() */
+	bool bail_unwinds_at_first: 1;
+	/*
+	 * It has unwind_exit, or a state left it that way in this pass, or that is expected of
+	 * it, see mark_unwind_above(). For a global subprog one pass gives it to the next pass.
+	 */
+	bool did_unwind: 1;
+	/* The same for kexit: the kernel unwound a frame of it in this pass, or is expected to */
+	bool did_kunwind: 1;
+	/*
+	 * It did so where there is no other way out. With unwind_exit: it has the insn, or what
+	 * came back that way to a call of it without unwind_goto has. With kexit: at may_goto
+	 * that the verifier adds, at a recursion check, at bpf_throw(), at a call of a subprog
+	 * that the kernel must unwind. An access to arena and may_goto of the program have another
+	 * way out, in a subprog that turns out to be unable to unwind: the access is skipped,
+	 * may_goto jumps. See bpf_pads_must_unwind().
+	 * One bit per way, like did_unwind and did_kunwind: unwind_exit of the program says
+	 * nothing about where the kernel unwinds, and each call has a plan for either.
+	 */
+	bool must_unwind: 1;
+	bool must_kunwind: 1;
+	/* a state left it that way at a site that the program has for sure, see site_is_certain() */
+	bool unwinds_for_sure: 1;
+	bool kunwinds_for_sure: 1;
+	/*
+	 * may_goto of the program and an access to arena, see check_may_goto_site() and
+	 * check_arena_site(). In this pass a state left a frame of it there: soft_unwinds. Or a
+	 * frame of it that cannot unwind got there, or such a frame calls it, see
+	 * stuck_frame_calls(): it is stuck. Then each may_goto of it goes where the program says
+	 * and each access that faults is skipped, in all its frames. Every run that follows
+	 * knows from its start, see check_funcs().
+	 */
+	bool soft_unwinds: 1;
+	bool stuck: 1;
+	/* what told that it is stuck, in the run that found it: enum bpf_stuck_by, at this insn */
+	u8 stuck_by;
+	u32 stuck_insn;
+	/*
+	 * 'pad_skip_gen' of the env when bpf_pad_skip_faults() walked the subprog and what came
+	 * back to the calls in and below it. While the two are equal all of that is stuck.
+	 */
+	u32 skip_gen;
+	/*
+	 * In this pass a frame of it that was not stuck made a call: what it called is not stuck
+	 * for that. If the subprog is stuck later, the pass is done again, see stuck_frame_calls().
+	 */
+	bool made_calls: 1;
+	/*
+	 * scratch of bpf_pads_note_causes(): it came back to the call, or to a call below it, or
+	 * the kernel entered a landing pad of the program in it
+	 */
+	bool below_conflict: 1;
+	/* it has unwind_goto whose landing pad only resumes, see bpf_find_kernel_pads() */
+	bool has_kpads: 1;
+	/*
+	 * MIXED: an insn of it is pad code and on the normal path of the function as well, see
+	 * bpf_find_kernel_pads()
+	 */
+	bool kpads_mixed: 1;
+	/*
+	 * The kernel enters one of them, as the program is in the end: its frames can be forced.
+	 * See bpf_mark_subprogs_that_unwind().
+	 */
+	bool enters_kpads: 1;
+	/* the kinds of site that the program leaves it at, bits by enum bpf_site_kind */
+	u16 left_at;
+	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. In this pass. */
+	u8 no_slots: 4;
+	/*
+	 * Of those, the groups that it cannot have slots for because a state that the kernel had
+	 * brought into a landing pad of the program released of a caller: the log of a conflict
+	 * that the slots would have settled says so, see bpf_pad_log()
+	 */
+	u8 no_slots_kpad: 4;
+	/* it has them for these. Each bpf_pads_settle() decides anew. */
+	u8 slots: 4;
+	/* they take that many words of 8 bytes below its stack */
+	u8 hidden_words;
+	/* the stack has no room for 'value_off', as take_value_word() found in this settle */
+	bool no_value_word: 1;
+	/* stack_depth has them, see bpf_pads_settle(). Until then it is what the program uses. */
+	bool hidden_in_depth: 1;
 	u8 code_stack_args;
-	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
+	/* the pad that releases nothing, for all accesses to arena with 'fault_unwinds'. 0: none */
+	u32 fault_pad;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
 };
+
+/*
+ * The subprog can leave with kexit: at a landing pad that the verifier gives it, or at the
+ * check that a recursive subprog gets, see bpf_insert_recursion_checks(). Whoever calls it
+ * needs kgoto.
+ */
+static inline bool bpf_subprog_kunwinds(const struct bpf_subprog_info *sub)
+{
+	return sub->can_kunwind || (sub->recursive && sub->bail_unwinds);
+}
+
+/*
+ * The subprog can leave unwound, with unwind_exit or with kexit. Whoever calls it needs a
+ * pad. A call insn and callx are known to have one where bail_unwinds is computed. A
+ * helper that gets the subprog from a table of functions as its callback is known in the
+ * main pass only, where a subprog can still be marked recursive for no reason.
+ */
+static inline bool bpf_subprog_unwinds(const struct bpf_subprog_info *sub)
+{
+	return sub->can_unwind || bpf_subprog_kunwinds(sub);
+}
+
+/* @sub is stuck from now on. The first insn that tells is the one that the log names. */
+static inline void bpf_subprog_set_stuck(struct bpf_subprog_info *sub, enum bpf_stuck_by by,
+					 u32 insn_idx)
+{
+	if (sub->stuck)
+		return;
+	sub->stuck = true;
+	sub->stuck_by = by;
+	sub->stuck_insn = insn_idx;
+}
+
+/*
+ * Does the entry of @sub clear its hidden word K? Only in a mixed function, see
+ * bpf_pad_entry_insns(): any other one writes the word where a frame gets into a landing pad.
+ */
+static inline bool bpf_subprog_clears_k(const struct bpf_subprog_info *sub)
+{
+	return sub->k_off && sub->kpads_mixed;
+}
+
+/* How far the stack of @sub goes with its hidden slots */
+static inline u32 bpf_stack_depth_with_slots(const struct bpf_subprog_info *sub)
+{
+	return round_up(sub->stack_depth, BPF_REG_SIZE) + sub->hidden_words * BPF_REG_SIZE;
+}
+
+/*
+ * The words of the landing pads go below the stack of @sub for good: also below the slots of its
+ * bpf_fastcall spills, which check_max_stack_depth() does not cut off the frame then
+ */
+static inline void bpf_stack_take_hidden_words(struct bpf_subprog_info *sub)
+{
+	sub->stack_depth = bpf_stack_depth_with_slots(sub);
+	sub->hidden_in_depth = true;
+}
+
+/*
+ * How much of its stack the insns of the program use: without the words of the landing pads, and
+ * without the slots of the bpf_fastcall spills that are removed, which stay in a frame that has
+ * such words below them
+ */
+static inline u32 bpf_stack_depth_of_prog(const struct bpf_subprog_info *sub)
+{
+	if (!sub->hidden_in_depth)
+		return sub->stack_depth;
+	if (sub->fastcall_spills_gone)
+		return -sub->fastcall_stack_off;
+	return sub->stack_depth - sub->hidden_words * BPF_REG_SIZE;
+}
 
 static inline u16 bpf_in_stack_arg_cnt(const struct bpf_subprog_info *sub)
 {
@@ -1328,6 +2182,10 @@ struct bpf_insn_patch {
 	u32 jmp;		/* 1 + insn of the patch that goes to insn 'jmp_to', 0 if none */
 	u32 jmp_to;
 	u32 jmp_back;		/* or to that many insns in front of the patch of it */
+	u32 jmp2;		/* 1 + one more insn of the patch, which goes to 'jmp2_to' */
+	u32 jmp2_to;
+	u32 jmp3;		/* and a third one */
+	u32 jmp3_to;
 	struct bpf_insn orig;	/* the replaced insn when the patch was queued */
 };
 
@@ -1402,6 +2260,9 @@ struct bpf_verifier_env {
 	bool replay;			/* the good pass, once more for the driver */
 	bool path_sensitive;		/* no joins, see run_path_sensitive() */
 	bool for_log;			/* the verdict is known, see do_check_all() */
+	bool pass_again;		/* the pass is done again, see pass_needs_restart() */
+	bool saves_again;		/* because an entry saves no longer, or again: settle_entries() */
+	bool ask_hidden_slots;		/* for each subprog on its own, see bpf_hidden_slots_fit() */
 	bool fallthrough_first;		/* see find_failing_path() */
 	bool run_has_guess;		/* see run_path_sensitive() */
 	u32 failing_path_budget_shift;	/* see func_failing_path_budget() */
@@ -1415,6 +2276,7 @@ struct bpf_verifier_env {
 	u64 pass_max_cost;		/* see bpf_undo_precision() */
 	bool aborted;			/* a thaw does not take it back */
 	bool no_mem;			/* a table cannot grow, see bpf_check_limits() */
+	u32 pad_skip_gen;		/* see 'skip_gen' of struct bpf_subprog_info */
 	/* What a pass writes. Each pass starts from the snapshot. */
 	struct_group_tagged(bpf_env_per_pass, per_pass,
 	int err;			/* the first error */
@@ -1426,13 +2288,21 @@ struct bpf_verifier_env {
 	bool run_over_budget;		/* in one of its functions, see find_failing_path() */
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_needs_guard() */
+	/* the helpers and kfuncs whose landing pad for a callback was found, see check_cb_pad() */
+	unsigned long cb_pads[8];
+	u8 cb_pad_cnt;
+	bool pads_late;			/* a global subprog unwinds: see settle_late_unwinds() */
+	bool saves_late;		/* an entry saves nothing after all, or again: settle_entries() */
+	bool faults_late;		/* a site is not what it seemed: see check_arena_site() */
+	bool hidden_slots_unasked;	/* see bpf_hidden_slots_fit() */
+	bool slots_late;		/* no room for the hidden words: bpf_hidden_slots_settle() */
+	bool pad_releases;		/* see release_frame_resources() */
 	bool calls_joined;		/* see flow_may_add_instance() */
 	bool extra_values;		/* a state can have constants that no run has */
 	bool new_linear_xreg;		/* see bpf_same_insns_unproven() */
 	bool seen_direct_write;
 	/* a register may point to the stack and is not PTR_TO_STACK, see bpf_reg_state::buf */
 	bool seen_stack_slice;
-	bool seen_exception;
 	bool sleepable_async_cb;
 	u32 id_gen;			/* used to generate unique reg IDs */
 	u32 max_stack_depth;		/* maximum combined stack depth */
@@ -1450,7 +2320,6 @@ struct bpf_verifier_env {
 	u32 used_map_cnt;		/* number of used maps */
 	u32 used_btf_cnt;		/* number of used BTF objects */
 	u32 insn_array_map_cnt;		/* number of used maps of type BPF_MAP_TYPE_INSN_ARRAY */
-	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	int exception_callback_subprog;
 	bool allow_ptr_leaks;
 	/* Allow access to uninitialized stack memory. Writes with fixed offset are
@@ -1463,6 +2332,9 @@ struct bpf_verifier_env {
 	bool bypass_spec_v4;
 	/* a global function is verified for BPF_FUNC_CTX_NO_RCU_LOCK */
 	bool no_rcu_read_lock;
+	bool has_throw;			/* the program has a call of bpf_throw() */
+	/* not 0 while a landing pad looks for a release with no state, see bpf_state_prog() */
+	u8 pad_prog_type;
 	bool signature;
 	u8 bug:1;			/* ends the load, see bpf_note_bug() */
 	u8 log_level:7;			/* of the user */
@@ -1586,6 +2458,16 @@ static inline struct bpf_subprog_info *subprog_info(struct bpf_verifier_env *env
 static inline bool bpf_ret_reg_pair(struct bpf_verifier_env *env, int subprog)
 {
 	return subprog_info(env, subprog)->ret_reg_pair;
+}
+
+/*
+ * No speculative state is verified on the way to a landing pad or in one, so a program may unwind
+ * only if it is loaded with CAP_PERFMON and neither mitigation applies to it. The three flags come
+ * from three queries of the capability, which need not give the same answer.
+ */
+static inline bool bpf_may_unwind(const struct bpf_verifier_env *env)
+{
+	return env->allow_ptr_leaks && env->bypass_spec_v1 && env->bypass_spec_v4;
 }
 
 struct bpf_call_summary {
@@ -1769,6 +2651,9 @@ bool bpf_scalar_subsumes(const struct bpf_reg_state *old, const struct bpf_reg_s
 bool bpf_same_type_and_object(struct bpf_verifier_env *env, const struct bpf_reg_state *a,
 			      const struct bpf_reg_state *b);
 bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b);
+const struct bpf_prog *bpf_state_prog(struct bpf_verifier_env *env, struct bpf_prog *view);
+const struct bpf_func_proto *bpf_helper_proto_as(struct bpf_verifier_env *env, int func_id,
+						 enum bpf_prog_type type);
 u64 bpf_hash64(const void *p, size_t len, u64 hash);
 u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verifier_state *st);
 int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
@@ -1805,6 +2690,8 @@ void bpf_note_unproven_insn(struct bpf_verifier_env *env,
 			    const struct bpf_verifier_state *st, u32 idx);
 bool bpf_insn_is_unproven(struct bpf_verifier_env *env);
 void bpf_note_fixups_differ(struct bpf_verifier_env *env);
+void bpf_note_unproven_cause(struct bpf_verifier_env *env, u32 idx);
+void bpf_note_controlled_cause(struct bpf_verifier_env *env, u32 idx);
 void bpf_find_unproven_after_pass(struct bpf_verifier_env *env);
 int bpf_partition_for_pessimized(struct bpf_verifier_env *env);
 void bpf_restore_precision(struct bpf_verifier_env *env);
@@ -1872,7 +2759,7 @@ void bpf_flow_put_header_state(struct loop_stack_entry *entry);
 int bpf_flow_deliver(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 		     int insn_idx, int prev_insn_idx, bool again);
 int bpf_flow_next(struct bpf_verifier_env *env, int *prev_insn_idx, u64 *log_pos, u64 *diag_pos);
-int bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop);
+void bpf_flow_needs_guard(struct bpf_verifier_env *env, struct bpf_loop *loop);
 int bpf_flow_call(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		  struct bpf_verifier_state *entry, int subprog, int call_idx);
 int bpf_flow_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int exit_idx);
@@ -1880,7 +2767,9 @@ void bpf_flow_next_is_no_bound(struct bpf_verifier_env *env, int insn_idx, int h
 bool bpf_flow_loops_lost_bound(struct bpf_verifier_env *env);
 void bpf_flow_new_pass(struct bpf_verifier_env *env);
 void bpf_flow_drop_guards(struct bpf_verifier_env *env);
+bool bpf_flow_guard_is_guess(struct bpf_verifier_env *env, int idx);
 int bpf_flow_place_guards(struct bpf_verifier_env *env);
+void bpf_mark_may_goto_nops(struct bpf_verifier_env *env);
 /* verifier.c, for flow.c */
 int bpf_flow_loop_enter(struct bpf_verifier_env *env, struct bpf_loop **backedge_loop,
 			bool *starts_leftover);
@@ -1890,10 +2779,131 @@ int bpf_flow_edge_unproven(struct bpf_verifier_env *env, struct bpf_verifier_sta
 #define BPF_EXIT_NEEDS_CALLER	1	/* verify the call in the frames of the caller */
 int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
 		    const struct bpf_verifier_state *exit, int call_idx);
-int bpf_insert_loop_guards(struct bpf_verifier_env *env);
+int bpf_insert_sites(struct bpf_verifier_env *env);
+int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass);
+bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan);
 bool bpf_insn_is_iter_next(struct bpf_verifier_env *env, struct bpf_insn *insn);
 bool bpf_insn_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
+
+/* pads.c */
+
+bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
+
+/*
+ * The landing pad of a site of @kind in @subprog leaves with unwind_exit in turn: unwind_exit of a
+ * callee came back to a call without unwind_goto, in a frame that has callers in the program. The
+ * frame is on the way of an unwind that the program started. Not where the kernel called the
+ * frame: its pad ends the invocation.
+ */
+static inline bool bpf_pad_rethrows(const struct bpf_verifier_env *env, int subprog,
+				    enum bpf_site_kind kind)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+
+	return kind == BPF_SITE_CALL && subprog && !sub->is_exception_cb && sub->bail_unwinds;
+}
+
+/*
+ * Such a pad passes on what the callee left with unwind_exit as it is, in R0: a landing pad of the
+ * program above reads what its unwind_exit left, a pointer as well as a number.
+ * Not out of a global subprog. Its callers are verified without it, and no state comes out of it:
+ * what it leaves in R0 is a number to them, see check_func_call(), on this way as on every other.
+ * So its pad passes nothing on. It leaves with a number that does not depend on what the verifier
+ * knows of R0 at the site, nor on anything else in the program: bpf_unwound_retval(), as the pad
+ * of a site of the kernel does in a program without bpf_throw().
+ */
+static inline bool bpf_pad_passes_on(const struct bpf_verifier_env *env, int subprog,
+				     enum bpf_site_kind kind)
+{
+	return bpf_pad_rethrows(env, subprog, kind) && !bpf_subprog_is_global(env, subprog);
+}
+
+/*
+ * Is the landing pad of a site of @kind in @subprog entered with a value that the frames above
+ * are to end with? What the verifier unwinds comes with bpf_unwound_retval(). Another value is
+ * passed on only in a program with bpf_throw(): its cookie, from bpf_throw() to the frame that
+ * the kernel called, and what unwind_exit of the program left where a pad of that frame ends the
+ * invocation. Not through a pad on the way of an unwind that the program started: that passes R0
+ * on as it is, or not at all, see bpf_pad_passes_on().
+ */
+static inline bool bpf_site_has_value(const struct bpf_verifier_env *env, int subprog,
+				      enum bpf_site_kind kind)
+{
+	/* a frame that the kernel unwinds already has the value in its hidden word */
+	if (bpf_site_is_forced(kind) || bpf_pad_rethrows(env, subprog, kind))
+		return false;
+	return env->has_throw && (bpf_site_is_call(kind) || kind == BPF_SITE_THROW);
+}
+
+/*
+ * The landing pad of a site of @kind in @subprog leaves with kexit. The main program leaves with
+ * exit, and so does what cannot unwind: the kernel called it.
+ */
+static inline bool bpf_pad_kexits(const struct bpf_verifier_env *env, int subprog,
+				  enum bpf_site_kind kind)
+{
+	return bpf_site_is_kernel(kind) && subprog && env->subprog_info[subprog].bail_unwinds;
+}
+
+/* The register that has it: what unwind_exit left in R0, the argument of bpf_throw() */
+static inline int bpf_site_value_reg(enum bpf_site_kind kind)
+{
+	return kind == BPF_SITE_THROW ? BPF_REG_1 : BPF_REG_0;
+}
+
+struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind);
+struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
+				      enum bpf_site_kind kind);
+int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
+			enum bpf_site_kind kind);
+int bpf_pad_note_external(struct bpf_verifier_env *env, int call_idx, enum bpf_site_kind kind);
+bool bpf_pad_passes_r2(struct bpf_verifier_env *env, int subprog, enum bpf_site_kind kind);
+void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
+void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+void bpf_pad_note_release(struct bpf_verifier_env *env, int idx);
+void bpf_pad_note_args(struct bpf_func_state *callee, const struct bpf_func_state *caller);
+size_t bpf_pad_note_free(struct bpf_pad_note *note);
+void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class, bool enter);
+void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			 const struct bpf_func_state *caller, int call_idx, bool plain);
+size_t bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
+void bpf_pads_new_round(struct bpf_verifier_env *env);
+void bpf_pads_move(struct bpf_verifier_env *env, struct bpf_pads_moved *moved, bool save);
+size_t bpf_pads_free_moved(struct bpf_pads_moved *moved, u32 cnt);
+struct bpf_pad_plan *bpf_pad_enter(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				   int call_idx);
+struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
+				   const struct bpf_verifier_state *st, int insn_idx,
+				   enum bpf_site_kind kind);
+int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
+		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
+void bpf_pad_log(struct bpf_verifier_env *env, int insn_idx, const struct bpf_pad_plan *plan);
+void bpf_pad_note_left(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
+		       const struct bpf_pad_plan *plan, enum bpf_site_kind kind);
+bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
+int bpf_pads_must_unwind(struct bpf_verifier_env *env);
+void bpf_pads_mark_used(struct bpf_verifier_env *env);
+int bpf_pad_skip_faults(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			int insn_idx);
+int bpf_pads_settle(struct bpf_verifier_env *env);
+bool bpf_pads_conflict(struct bpf_verifier_env *env, const struct bpf_insn_aux_data *aux);
+void bpf_pads_note_causes(struct bpf_verifier_env *env);
+bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
+int bpf_hidden_slots_fit(struct bpf_verifier_env *env);
+int bpf_hidden_slots_settle(struct bpf_verifier_env *env);
+int bpf_pad_slot_notes(struct bpf_verifier_env *env, int s, const struct bpf_pad_note **notes);
+int bpf_pad_entry_insns(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, struct bpf_insn *buf);
+int bpf_pad_kentry_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			 int subprog, struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
+int bpf_pad_check_saves(struct bpf_verifier_env *env, int s);
+int bpf_pad_insns_before(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			 int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
+int bpf_pad_insns_after(const struct bpf_subprog_info *sub, const struct bpf_pad_note **notes,
+			int nr, const struct bpf_pad_note *note, struct bpf_insn *buf);
+void bpf_pads_log(struct bpf_verifier_env *env);
+int bpf_find_kernel_pads(struct bpf_verifier_env *env);
 
 int bpf_copy_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);
@@ -1949,6 +2959,25 @@ static inline u32 bpf_frame_insn_idx(const struct bpf_verifier_state *st, u32 fr
 	return frame == st->curframe
 	       ? st->insn_idx
 	       : st->frame[frame + 1]->callsite;
+}
+
+/*
+ * The registers of @frame that are read from where @st is. An unwound state is on the way to a
+ * landing pad that reads the value, see bpf_site_has_value(), or that passes on what unwind_exit
+ * of the program left, see bpf_pad_passes_on(). The pad is not in the text yet.
+ */
+static inline u16 bpf_frame_live_regs(const struct bpf_verifier_env *env,
+				      const struct bpf_verifier_state *st, u32 frame)
+{
+	u16 live = env->insn_aux_data[bpf_frame_insn_idx(st, frame)].live_regs_before;
+
+	if (!st->unwound || frame != st->curframe)
+		return live;
+	if (env->has_throw)
+		live |= BIT(BPF_REG_0);
+	if (!bpf_unwound_by_kernel(st->unwound))
+		live |= BIT(BPF_REG_0) | BIT(BPF_REG_2);
+	return live;
 }
 
 static inline bool bpf_is_spilled_reg(const struct bpf_stack_state *stack)
@@ -2122,6 +3151,7 @@ static inline bool bpf_reg_has_range(const struct bpf_reg_state *reg)
 	case PTR_TO_TP_BUFFER:
 	case PTR_TO_BTF_ID:
 	case PTR_TO_INSN:
+	case PTR_TO_CORO_FRAME:
 		return !type_may_be_null(reg->type);
 	default:
 		return false;
@@ -2196,32 +3226,27 @@ u32 bpf_vlog_alignment(u32 pos);
 const char *bpf_disasm_kfunc_name(void *data, const struct bpf_insn *insn);
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
-const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
-int bpf_jmp_offset(struct bpf_insn *insn);
-struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
 /*
- * Where the program goes from may_goto and from the checks that the verifier adds:
- * - May_goto before a jump goes where the jump goes, with the registers and the stack
- *   as they are before the jump. bpf_insn_successors() has that edge.
- * - A subprog that is out of budget goes to bail_insn, an exit. No such edge.
- * - May_goto before the header of a loop goes to where the loops around it are left: from
- *   @idx to what is returned here, -1 if there is none. No such edge either. The registers
- *   and the stack are what they are before @idx.
- *
- * The main pass looks at the states that go there. What is computed from the graph before
- * the main pass has to take these edges into account where the main pass relies on it:
- * - Against the direction of the edges, liveness: what is live at the target is live at @idx.
- * - In the direction of the edges, bpf_compute_const_regs() and compute_subprog_args(): what
- *   holds on all edges of the graph to the target doesn't hold on this one.
+ * The insn has a hidden exit: a tail call that is taken and LD_ABS or LD_IND that fails to load
+ * leave the subprog like an exit insn.
  */
-static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int idx)
+static inline bool bpf_insn_has_hidden_exit(const struct bpf_insn *insn)
 {
-	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
-
-	return aux->guard_at_header ? aux->guard_to : -1;
+	return (bpf_helper_call(insn) && insn->imm == BPF_FUNC_tail_call) ||
+	       (BPF_CLASS(insn->code) == BPF_LD &&
+		(BPF_MODE(insn->code) == BPF_ABS || BPF_MODE(insn->code) == BPF_IND));
 }
+
+const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
+struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
+
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
+int bpf_unwound_retval(struct bpf_verifier_env *env);
+bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);
+bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id);
+int bpf_iter_slots_valid_init(const struct bpf_func_state *state, int spi, const struct btf *btf,
+			      u32 btf_id, int nr_slots);
 
 /* The first field that ends behind 'off'. The fields are sorted and do not overlap. */
 static inline u32 btf_record_first_field(const struct btf_record *rec, s64 off)
@@ -2250,11 +3275,13 @@ u32 btf_func_arg_align(const struct btf *btf, const struct btf_type *t);
 
 int bpf_find_subprog(struct bpf_verifier_env *env, int off);
 bool bpf_is_throw_kfunc(struct bpf_insn *insn);
+bool bpf_is_trap_kfunc(struct bpf_insn *insn);
 int bpf_compute_const_regs(struct bpf_verifier_env *env);
 int bpf_prune_dead_branches(struct bpf_verifier_env *env);
 int bpf_check_cfg(struct bpf_verifier_env *env);
 void bpf_free_subprog_jts(struct bpf_verifier_env *env);
 int bpf_compute_postorder(struct bpf_verifier_env *env);
+int bpf_compute_might_return(struct bpf_verifier_env *env);
 
 struct bpf_map_desc {
 	struct bpf_map *ptr;
@@ -2332,6 +3359,16 @@ struct bpf_call_arg_meta {
 	enum bpf_dynptr_type dynptr_write_type;
 	/* The buffer of bpf_dynptr_slice() or bpf_dynptr_slice_rdwr() */
 	struct bpf_stack_range slice_buf;
+	struct {
+		u32 ids[MAX_BPF_FUNC_ARGS];
+		u32 cnt;
+		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
+		u32 suspend_mask;
+		/* and a __coro_defer one, which it keeps in the frame's host */
+		u32 defer_mask;
+		/* and a __coro_offer one, which it may decline */
+		u32 offer_mask;
+	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
 	 * generally to pass info about user-defined local kptr types to later
@@ -2503,7 +3540,6 @@ static inline void bpf_free_kfunc_tab(struct bpf_kfunc_desc_tab *tab)
 }
 
 /* Functions exported from verifier.c, used by fixups.c */
-void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog);
 bool bpf_allow_tail_call_in_subprogs(struct bpf_verifier_env *env);
 bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm);
 int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);
@@ -2527,6 +3563,7 @@ int bpf_insert_arena_stack(struct bpf_verifier_env *env);
 int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env, const union bpf_attr *attr);
 int bpf_convert_ctx_accesses(struct bpf_verifier_env *env);
 int bpf_jit_subprogs(struct bpf_verifier_env *env);
+int bpf_check_unwind_gotos(struct bpf_verifier_env *env);
 int bpf_fixup_call_args(struct bpf_verifier_env *env);
 int bpf_do_misc_fixups(struct bpf_verifier_env *env);
 int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn);
@@ -2657,12 +3694,15 @@ static inline struct loop_stack_entry *bpf_top_loop(const struct bpf_func_state 
 	return frame->loop_stack_cnt ? &frame->loop_stack[frame->loop_stack_cnt - 1] : NULL;
 }
 
+/* What a walk over @st looks at: its xregs, and the slots that its references own */
 static inline u32 bpf_xreg_cnt(const struct bpf_verifier_state *st)
 {
-	u32 fr, nr = 0;
+	u32 fr, i, nr = 0;
 
 	for (fr = 0; fr <= st->curframe; fr++)
 		nr += MAX_BPF_REG + bpf_stack_nr_slots(st->frame[fr]);
+	for (i = 0; i < st->acquired_refs; i++)
+		nr += st->refs[i].nr_slots;
 	return nr;
 }
 

@@ -63,8 +63,26 @@ enum bpf_mul_variant {
 enum bpf_cond_pseudo_jmp {
 	BPF_MAY_GOTO = 0,
 	/*
-	 * Follows a call of a bpf subprog. Taken when the subprog left with
+	 * Follows a call of a bpf subprog, callx, or a call of a helper or kfunc
+	 * that calls a callback. Taken when the subprog or the callback left with
 	 * BPF_EXIT that has src_reg == BPF_UNWIND_EXIT.
+	 * When the kernel ends the program in the subprog or the callback, for a
+	 * loop that is out of time, a recursion that is too deep, a fault in arena
+	 * or bpf_throw(), the code at the target runs too if it can only
+	 * resume: no path from the target gets to BPF_EXIT without
+	 * BPF_UNWIND_EXIT, to a tail call or to BPF_LD_ABS or BPF_LD_IND, and some
+	 * path gets to BPF_EXIT with BPF_UNWIND_EXIT. R0 is 0 at the target then.
+	 * That BPF_EXIT leaves with the value of the kernel whatever is in R0, and
+	 * no BPF_UNWIND_GOTO is taken for it: the kernel goes on in the same way
+	 * with each caller.
+	 * A program can count on that code where the kernel gets to it: a program
+	 * for which the verifier cannot arrange that is rejected, and the log says
+	 * why. The kernel does not get to it in a function that cannot be unwound,
+	 * in the function in which it starts to unwind, and at a call that has no
+	 * BPF_UNWIND_GOTO. And when the time of the program is up, a loop in that
+	 * code that the kernel can stop is left at once: what follows the loop
+	 * does not run.
+	 * See Documentation/bpf/verifier.rst.
 	 */
 	BPF_UNWIND_GOTO = 1,
 };
@@ -1721,6 +1739,12 @@ union bpf_attr {
 		 * verification.
 		 */
 		__s32		keyring_id;
+		/* A program whose parked coroutine frames this program calls.
+		 * It stays loaded for as long as this program is, and the two
+		 * share the maps that hold the frames. This program parks no
+		 * frame of its own.
+		 */
+		__u32		coro_prog_fd;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
@@ -6714,6 +6738,10 @@ struct bpf_xdp_sock {
  * A valid XDP program must return one of these defined values. All other
  * return codes are reserved for future use. Unknown return codes will
  * result in packet drops and a warning via bpf_warn_invalid_xdp_action().
+ *
+ * XDP_CONSUME is returned after a kfunc such as bpf_xdp_frame_steal() made
+ * the program the owner of the frame. The driver is then told to redirect,
+ * and the redirect core completes that without touching the frame.
  */
 enum xdp_action {
 	XDP_ABORTED = 0,
@@ -6721,6 +6749,7 @@ enum xdp_action {
 	XDP_PASS,
 	XDP_TX,
 	XDP_REDIRECT,
+	XDP_CONSUME,
 };
 
 /* user accessible metadata for XDP packet hook

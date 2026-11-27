@@ -15,6 +15,7 @@
 #include "verifier_and.skel.h"
 #include "verifier_arena.skel.h"
 #include "verifier_arena_cast.skel.h"
+#include "verifier_arena_fault.skel.h"
 #include "verifier_arena_stack.skel.h"
 #include "verifier_arena_large.skel.h"
 #include "verifier_arena_globals1.skel.h"
@@ -49,6 +50,8 @@
 #include "verifier_cgroup_storage.skel.h"
 #include "verifier_const.skel.h"
 #include "verifier_const_or.skel.h"
+#include "verifier_coro_frame.skel.h"
+#include "verifier_coro_frame_xdp.skel.h"
 #include "verifier_ctx.skel.h"
 #include "verifier_ctx_rewritten.skel.h"
 #include "verifier_ctx_sk_msg.skel.h"
@@ -81,6 +84,9 @@
 #include "verifier_kfunc_uninit.skel.h"
 #include "verifier_kfunc_uninit_multi.skel.h"
 #include "verifier_kfunc_perfmon.skel.h"
+#include "verifier_kunwind.skel.h"
+#include "verifier_kunwind_arena.skel.h"
+#include "verifier_kunwind_pads.skel.h"
 #include "verifier_ld_ind.skel.h"
 #include "verifier_large_stack.skel.h"
 #include "verifier_ldsx.skel.h"
@@ -104,6 +110,7 @@
 #include "verifier_masking.skel.h"
 #include "verifier_may_goto_1.skel.h"
 #include "verifier_may_goto_2.skel.h"
+#include "verifier_may_goto_unwind.skel.h"
 #include "verifier_mem_size_reg.skel.h"
 #include "verifier_meta_access.skel.h"
 #include "verifier_movsx.skel.h"
@@ -153,7 +160,10 @@
 #include "verifier_typedef.skel.h"
 #include "verifier_uninit.skel.h"
 #include "verifier_unpriv.skel.h"
+#include "verifier_throw.skel.h"
 #include "verifier_unwind.skel.h"
+#include "verifier_unwind_cb.skel.h"
+#include "verifier_unwind_cb_recursion.skel.h"
 #include "verifier_unpriv_perf.skel.h"
 #include "verifier_uprobe_write_ctx.skel.h"
 #include "verifier_value_adj_spill.skel.h"
@@ -167,6 +177,7 @@
 #include "verifier_xadd.skel.h"
 #include "verifier_xdp.skel.h"
 #include "verifier_xdp_direct_packet_access.skel.h"
+#include "verifier_xdp_frame.skel.h"
 #include "verifier_bits_iter.skel.h"
 #include "verifier_set_retval.skel.h"
 #include "verifier_lsm.skel.h"
@@ -232,6 +243,7 @@ void test_verifier_align(void)                { RUN(verifier_align); }
 void test_verifier_and(void)                  { RUN(verifier_and); }
 void test_verifier_arena(void)                { RUN(verifier_arena); }
 void test_verifier_arena_cast(void)           { RUN(verifier_arena_cast); }
+void test_verifier_arena_fault(void)          { RUN(verifier_arena_fault); }
 void test_verifier_arena_stack(void)          { RUN_TESTS(verifier_arena_stack); }
 void test_verifier_arena_large(void)          { RUN(verifier_arena_large); }
 void test_verifier_arena_globals1(void)       { RUN(verifier_arena_globals1); }
@@ -265,6 +277,8 @@ void test_verifier_cgroup_skb(void)           { RUN(verifier_cgroup_skb); }
 void test_verifier_cgroup_storage(void)       { RUN(verifier_cgroup_storage); }
 void test_verifier_const(void)                { RUN(verifier_const); }
 void test_verifier_const_or(void)             { RUN(verifier_const_or); }
+void test_verifier_coro_frame(void)          { RUN(verifier_coro_frame); }
+void test_verifier_coro_frame_xdp(void)      { RUN(verifier_coro_frame_xdp); }
 void test_verifier_ctx(void)                  { RUN_TESTS(verifier_ctx); }
 void test_verifier_ctx_rewritten(void)        { RUN_TESTS(verifier_ctx_rewritten); }
 void test_verifier_ctx_sk_msg(void)           { RUN(verifier_ctx_sk_msg); }
@@ -320,6 +334,8 @@ void test_verifier_map_ret_val(void)          { RUN(verifier_map_ret_val); }
 void test_verifier_masking(void)              { RUN(verifier_masking); }
 void test_verifier_may_goto_1(void)           { RUN(verifier_may_goto_1); }
 void test_verifier_may_goto_2(void)           { RUN(verifier_may_goto_2); }
+/* Serial: its progs spin for 250 ms too */
+void serial_test_verifier_may_goto_unwind(void) { RUN(verifier_may_goto_unwind); }
 void test_verifier_mem_size_reg(void)         { RUN(verifier_mem_size_reg); }
 void test_verifier_meta_access(void)          { RUN(verifier_meta_access); }
 void test_verifier_movsx(void)                 { RUN(verifier_movsx); }
@@ -381,7 +397,46 @@ void test_verifier_trip_count(void)           { RUN(verifier_trip_count); }
 void test_verifier_typedef(void)              { RUN(verifier_typedef); }
 void test_verifier_uninit(void)               { RUN(verifier_uninit); }
 void test_verifier_unpriv(void)               { RUN(verifier_unpriv); }
+void test_verifier_throw(void)                { RUN(verifier_throw); }
 void test_verifier_unwind(void)               { RUN(verifier_unwind); }
+void test_verifier_kunwind(void)              { RUN(verifier_kunwind); }
+void test_verifier_kunwind_arena(void)        { RUN(verifier_kunwind_arena); }
+void test_verifier_kunwind_pads(void)         { RUN(verifier_kunwind_pads); }
+/* The helpers have pads with asm goto outputs only, and the kernel says -ENOTSUPP without */
+static bool cb_pads_supported(void)
+{
+	struct verifier_unwind_cb *skel;
+	struct bpf_program *prog;
+	int err;
+
+	skel = verifier_unwind_cb__open();
+	if (!skel)
+		return true;
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, prog == skel->progs.loop_cb_unwinds);
+	err = verifier_unwind_cb__load(skel);
+	verifier_unwind_cb__destroy(skel);
+	return err != -ENOTSUPP;
+}
+
+void test_verifier_unwind_cb(void)
+{
+	if (!cb_pads_supported()) {
+		printf("%s:SKIP:the helpers have no pads\n", __func__);
+		test__skip();
+		return;
+	}
+	RUN(verifier_unwind_cb);
+}
+void test_verifier_unwind_cb_recursion(void)
+{
+	if (!cb_pads_supported()) {
+		printf("%s:SKIP:the helpers have no pads\n", __func__);
+		test__skip();
+		return;
+	}
+	RUN(verifier_unwind_cb_recursion);
+}
 void test_verifier_unpriv_perf(void)          { RUN(verifier_unpriv_perf); }
 void test_verifier_uprobe_write_ctx(void)     { RUN(verifier_uprobe_write_ctx); }
 void test_verifier_value_adj_spill(void)      { RUN(verifier_value_adj_spill); }
@@ -394,6 +449,7 @@ void test_verifier_vfs_reject(void)	      { RUN(verifier_vfs_reject); }
 void test_verifier_xadd(void)                 { RUN(verifier_xadd); }
 void test_verifier_xdp(void)                  { RUN(verifier_xdp); }
 void test_verifier_xdp_direct_packet_access(void) { RUN(verifier_xdp_direct_packet_access); }
+void test_verifier_xdp_frame(void)            { RUN(verifier_xdp_frame); }
 void test_verifier_bits_iter(void) { RUN(verifier_bits_iter); }
 void test_verifier_set_retval(void)            { RUN(verifier_set_retval); }
 void test_verifier_lsm(void)                  { RUN(verifier_lsm); }

@@ -3,6 +3,7 @@
  * Copyright (c) 2016,2017 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -502,6 +503,20 @@ static void array_map_free_internal_structs(struct bpf_map *map)
 		bpf_map_free_internal_structs(map, array_map_elem_ptr(array, i));
 }
 
+/* The program whose parked coroutine frames the map holds goes, see bpf_coro_prog_release() */
+static void array_map_free_parked(struct bpf_map *map)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	unsigned long *fields = bpf_record_parked_fields(map->record);
+	int i;
+
+	for (i = 0; i < array->map.max_entries; i++) {
+		bpf_obj_free_parked(map->record, array_map_elem_ptr(array, i), fields);
+		cond_resched();
+	}
+	bitmap_free(fields);
+}
+
 /* Called when map->refcnt goes to zero, either from workqueue or from syscall */
 static void array_map_free(struct bpf_map *map)
 {
@@ -800,13 +815,13 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 	.seq_priv_size		= sizeof(struct bpf_iter_seq_array_map_info),
 };
 
-static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+static noinline notrace long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 				    void *callback_ctx, u64 flags)
 {
 	u32 i, key, num_elems = 0;
 	struct bpf_array *array;
 	bool is_percpu;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 	void *val;
 
 	cant_migrate();
@@ -823,15 +838,20 @@ static long bpf_for_each_array_elem(struct bpf_map *map, bpf_callback_t callback
 			val = array_map_elem_ptr(array, i);
 		num_elems++;
 		key = i;
-		ret = callback_fn((u64)(long)map, (u64)(long)&key,
-				  (u64)(long)val, (u64)(long)callback_ctx, 0);
+		bpf_call_cb(callback_fn, map, &key, val, callback_ctx, 0, ret, kind, unwound);
 		/* return value: 0 - continue, 1 - stop and return */
 		if (ret)
 			break;
 	}
 
 	return num_elems;
+
+unwound:
+	/* The callback left with unwind_exit or kexit: nothing to drop here */
+	bpf_unwind_leave(kind);
+	return ret;
 }
+NOKPROBE_SYMBOL(bpf_for_each_array_elem);
 
 static u64 array_map_mem_usage(const struct bpf_map *map)
 {
@@ -878,6 +898,7 @@ const struct bpf_map_ops array_map_ops = {
 	.map_free = array_map_free,
 	.map_get_next_key = bpf_array_get_next_key,
 	.map_release_uref = array_map_free_internal_structs,
+	.map_free_parked = array_map_free_parked,
 	.map_lookup_elem = array_map_lookup_elem,
 	.map_update_elem = array_map_update_elem,
 	.map_delete_elem = array_map_delete_elem,
