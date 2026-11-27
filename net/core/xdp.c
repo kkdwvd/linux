@@ -1166,6 +1166,7 @@ static int bpf_xdp_frame_send(struct xdp_frame *frame)
 	int err;
 
 	/* It is as a driver made it: nothing of the program's goes along. */
+	frame->flags &= ~(XDP_FLAGS_BPF_TCP_HELD | XDP_FLAGS_BPF_TCP_OOO | XDP_FLAGS_BPF_RDONLY);
 	frame->dev_rx = NULL;
 
 	local_bh_disable();
@@ -1200,6 +1201,55 @@ void bpf_xdp_frame_put(struct xdp_frame *frame)
 	}
 	llist_add((struct llist_node *)(frame + 1), &bpf_xdp_frame_free_list);
 	irq_work_queue(&bpf_xdp_frame_free_irq_work);
+}
+
+/**
+ * bpf_xdp_frame_to_skb - build an skb around a frame a program keeps
+ * @frame: the frame, which is gone once this succeeds
+ * @off: offset of the data the skb is to carry, from the frame's data
+ * @len: its length
+ *
+ * The buffer becomes the skb's head, nothing is copied: the room before @off
+ * is headroom for the headers the stack adds, and the memory goes back where
+ * it came from, its page pool included, when the skb is freed. The driver's
+ * handoff reference, when the program is still in the invocation that took
+ * the frame, is taken over along with the program's; a frame that another
+ * CPU's invocation is still handing off cannot be converted yet.
+ *
+ * Returns the skb, or an error without touching the frame: -EINVAL for a
+ * frame with fragments, memory that cannot back an skb, or a range outside
+ * the frame's data; -EBUSY while another CPU still holds the handoff;
+ * -ENOMEM when the skb cannot be allocated.
+ */
+struct sk_buff *bpf_xdp_frame_to_skb(struct xdp_frame *frame, u32 off, u32 len)
+{
+	u32 headroom = sizeof(*frame) + frame->headroom;
+	struct bpf_redirect_info *ri = NULL;
+	struct sk_buff *skb;
+
+	if (xdp_frame_has_frags(frame) || off > frame->len || len > frame->len - off)
+		return ERR_PTR(-EINVAL);
+	if (frame->mem_type != MEM_TYPE_PAGE_POOL && frame->mem_type != MEM_TYPE_PAGE_SHARED &&
+	    frame->mem_type != MEM_TYPE_PAGE_ORDER0)
+		return ERR_PTR(-EINVAL);
+	if (refcount_read(&frame->bpf_refs) != 1) {
+		if (!bpf_net_ctx_get())
+			return ERR_PTR(-EBUSY);
+		ri = bpf_net_ctx_get_ri();
+		if (!(ri->kern_flags & BPF_RI_F_XDP_CONSUMED) || ri->consumed_frame != frame)
+			return ERR_PTR(-EBUSY);
+	}
+	skb = build_skb(frame->data - headroom, frame->frame_sz);
+	if (!skb)
+		return ERR_PTR(-ENOMEM);
+	/* The driver's reference is ours now; the consumed redirect has nothing to drop. */
+	if (ri)
+		ri->consumed_frame = NULL;
+	if (frame->mem_type == MEM_TYPE_PAGE_POOL)
+		skb_mark_for_recycle(skb);
+	skb_reserve(skb, headroom + off);
+	__skb_put(skb, len);
+	return skb;
 }
 
 __bpf_kfunc_start_defs();
@@ -1298,10 +1348,12 @@ __bpf_kfunc void bpf_xdp_frame_release(struct xdp_frame *frame)
  * sent later either: it goes back to its memory when the driver is done. A
  * reply in the invocation that received the request is what XDP_TX is for,
  * and a program that makes a kept frame reachable from another CPU before it
- * returns has to do without the reply that loses this race.
+ * returns has to do without the reply that loses this race. A frame that a
+ * TCP connection has admitted, see bpf_xdp_tcp_hold(), is the connection's
+ * to deliver and is not sent.
  *
  * Returns 0 when the driver took the frame; -EINVAL for @flags; -EBUSY for a
- * frame that the driver still hands over;
+ * frame that the driver still hands over, or that a TCP connection holds;
  * -ENODEV when the NAPI instance is not known or gone; -EOPNOTSUPP for a
  * device that does not transmit XDP frames, or not ones with fragments, and
  * where IRQs are off; -ENETDOWN and -EMSGSIZE for a device that is down or
@@ -1314,6 +1366,8 @@ __bpf_kfunc int bpf_xdp_frame_xmit(struct xdp_frame *frame, u64 flags)
 
 	if (flags)
 		err = -EINVAL;
+	else if (frame->flags & XDP_FLAGS_BPF_TCP_HELD)
+		err = -EBUSY;
 	else if (unlikely(in_hardirq() || in_nmi() || irqs_disabled()))
 		err = -EOPNOTSUPP;	/* no driver can be entered */
 	if (err) {
@@ -1340,8 +1394,9 @@ CFI_NOSEAL(bpf_xdp_frame_dtor);
  * @ptr__uninit: the dynptr to set up
  *
  * The dynptr lives as long as the program's reference to the frame: it goes
- * when the frame is released or stored in a kptr field. Writes are allowed;
- * the frame is the program's.
+ * when the frame is released or stored in a kptr field. Writes are allowed,
+ * the frame being the program's, until a kernel subsystem that trusts the
+ * frame's contents marks it read-only, as TCP does on admission.
  */
 __bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *frame, u64 flags,
 					  struct bpf_dynptr *ptr__uninit)
@@ -1353,6 +1408,8 @@ __bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *frame, u64 flags,
 		return -EINVAL;
 	}
 	bpf_dynptr_init(ptr, frame, BPF_DYNPTR_TYPE_XDP_FRAME, 0, xdp_get_frame_len(frame));
+	if (frame->flags & XDP_FLAGS_BPF_RDONLY)
+		bpf_dynptr_set_rdonly(ptr);
 	return 0;
 }
 

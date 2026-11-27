@@ -81,6 +81,10 @@ enum xdp_buff_flags {
 	 * XDP program is not attached.
 	 */
 	XDP_FLAGS_FRAGS_UNREADABLE	= BIT(2),
+	/* Kept by TCP on frames a BPF program owns, see bpf_xdp_tcp_hold(). */
+	XDP_FLAGS_BPF_TCP_HELD		= BIT(3), /* admitted to a connection */
+	XDP_FLAGS_BPF_TCP_OOO		= BIT(4), /* admitted beyond the receive cursor */
+	XDP_FLAGS_BPF_RDONLY		= BIT(5), /* read-only to the program from now on */
 	/*
 	 * How many bytes of the headroom, behind the room for struct xdp_frame,
 	 * the program that runs on the buffer has for an object of its own, see
@@ -341,6 +345,7 @@ static __always_inline void *xdp_buff_headroom_start(const struct xdp_buff *xdp)
 }
 
 void bpf_xdp_frame_put(struct xdp_frame *frame);
+struct sk_buff *bpf_xdp_frame_to_skb(struct xdp_frame *frame, u32 off, u32 len);
 
 static __always_inline bool xdp_frame_has_frags(const struct xdp_frame *frame)
 {
