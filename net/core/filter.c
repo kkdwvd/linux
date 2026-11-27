@@ -4232,9 +4232,8 @@ static unsigned long xdp_get_metalen(const struct xdp_buff *xdp)
 
 BPF_CALL_2(bpf_xdp_adjust_head, struct xdp_buff *, xdp, int, offset)
 {
-	void *xdp_frame_end = xdp->data_hard_start + sizeof(struct xdp_frame);
 	unsigned long metalen = xdp_get_metalen(xdp);
-	void *data_start = xdp_frame_end + metalen;
+	void *data_start = xdp_buff_headroom_start(xdp) + metalen;
 	void *data = xdp->data + offset;
 
 	if (unlikely(data < data_start ||
@@ -4335,6 +4334,40 @@ void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
 	}
 out:
 	return offset + len <= size ? addr + offset : NULL;
+}
+
+/* The same accessors for a frame a program keeps, see bpf_xdp_frame_steal(). */
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return __bpf_xdp_load_bytes(&xdp, offset, buf, len);
+}
+
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *frame, u32 offset, void *buf, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return __bpf_xdp_store_bytes(&xdp, offset, buf, len);
+}
+
+void *bpf_xdp_frame_pointer(struct xdp_frame *frame, u32 offset, u32 len)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	return bpf_xdp_pointer(&xdp, offset, len);
+}
+
+void bpf_xdp_frame_copy_buf(struct xdp_frame *frame, unsigned long off, void *buf,
+			    unsigned long len, bool flush)
+{
+	struct xdp_buff xdp;
+
+	xdp_convert_frame_to_buff(frame, &xdp);
+	bpf_xdp_copy_buf(&xdp, off, buf, len, flush);
 }
 
 BPF_CALL_4(bpf_xdp_load_bytes, struct xdp_buff *, xdp, u32, offset,
@@ -4536,13 +4569,12 @@ static const struct bpf_func_proto bpf_xdp_adjust_tail_proto = {
 
 BPF_CALL_2(bpf_xdp_adjust_meta, struct xdp_buff *, xdp, int, offset)
 {
-	void *xdp_frame_end = xdp->data_hard_start + sizeof(struct xdp_frame);
 	void *meta = xdp->data_meta + offset;
 	unsigned long metalen = xdp->data - meta;
 
 	if (xdp_data_meta_unsupported(xdp))
 		return -ENOTSUPP;
-	if (unlikely(meta < xdp_frame_end ||
+	if (unlikely(meta < xdp_buff_headroom_start(xdp) ||
 		     meta > xdp->data))
 		return -EINVAL;
 	if (unlikely(xdp_metalen_invalid(metalen)))
@@ -4764,6 +4796,15 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
 	enum bpf_map_type map_type = ri->map_type;
 
+	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
+		/* The program owns the frame, see XDP_CONSUME; a target it chose before is void. */
+		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		bpf_xdp_frame_put(ri->consumed_frame);
+		ri->consumed_frame = NULL;
+		ri->map_id = 0;
+		ri->map_type = BPF_MAP_TYPE_UNSPEC;
+		return 0;
+	}
 	if (map_type == BPF_MAP_TYPE_XSKMAP)
 		return __xdp_do_redirect_xsk(ri, dev, xdp, xdp_prog);
 
@@ -4779,6 +4820,15 @@ int xdp_do_redirect_frame(struct net_device *dev, struct xdp_buff *xdp,
 	struct bpf_redirect_info *ri = bpf_net_ctx_get_ri();
 	enum bpf_map_type map_type = ri->map_type;
 
+	if (unlikely(ri->kern_flags & BPF_RI_F_XDP_CONSUMED)) {
+		/* The program owns the frame, see XDP_CONSUME; a target it chose before is void. */
+		ri->kern_flags &= ~BPF_RI_F_XDP_CONSUMED;
+		bpf_xdp_frame_put(ri->consumed_frame);
+		ri->consumed_frame = NULL;
+		ri->map_id = 0;
+		ri->map_type = BPF_MAP_TYPE_UNSPEC;
+		return 0;
+	}
 	if (map_type == BPF_MAP_TYPE_XSKMAP)
 		return __xdp_do_redirect_xsk(ri, dev, xdp, xdp_prog);
 
@@ -12794,7 +12844,7 @@ __bpf_kfunc int bpf_xdp_pull_data(struct xdp_md *x, u32 len)
 
 	start = xdp_data_meta_unsupported(xdp) ? xdp->data : xdp->data_meta;
 
-	headroom = start - xdp->data_hard_start - sizeof(struct xdp_frame);
+	headroom = start - xdp_buff_headroom_start(xdp);
 	tailroom = data_hard_end - xdp->data_end;
 
 	delta = len - data_len;

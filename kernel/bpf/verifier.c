@@ -692,6 +692,8 @@ static enum bpf_dynptr_type arg_to_dynptr_type(enum bpf_arg_type arg_type)
 		return BPF_DYNPTR_TYPE_SKB_META;
 	case DYNPTR_TYPE_FILE:
 		return BPF_DYNPTR_TYPE_FILE;
+	case DYNPTR_TYPE_XDP_FRAME:
+		return BPF_DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return BPF_DYNPTR_TYPE_INVALID;
 	}
@@ -712,6 +714,8 @@ static enum bpf_type_flag get_dynptr_type_flag(enum bpf_dynptr_type type)
 		return DYNPTR_TYPE_SKB_META;
 	case BPF_DYNPTR_TYPE_FILE:
 		return DYNPTR_TYPE_FILE;
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return 0;
 	}
@@ -11380,6 +11384,63 @@ static bool holds_pkt_pointers(struct bpf_verifier_env *env)
 	return ret;
 }
 
+/*
+ * A KF_RELEASE_CTX kfunc took the program context away from the program, as
+ * bpf_xdp_frame_steal() does with the frame behind an XDP context. Nothing
+ * that came from the context may be used afterwards: every copy of the context
+ * pointer in every frame, the packet pointers derived from it and the dynptrs
+ * that read through it.
+ */
+static void consume_ctx(struct bpf_verifier_env *env)
+{
+	u32 mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR);
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *state;
+	struct bpf_reg_state *reg;
+
+	bpf_for_each_reg_in_vstate_mask(vstate, state, reg, stack, mask, ({
+		if (stack && stack->slot_type[BPF_REG_SIZE - 1] == STACK_DYNPTR) {
+			struct bpf_stack_state *dyn_stack = stack;
+
+			if (reg->dynptr.type != BPF_DYNPTR_TYPE_SKB &&
+			    reg->dynptr.type != BPF_DYNPTR_TYPE_SKB_META &&
+			    reg->dynptr.type != BPF_DYNPTR_TYPE_XDP)
+				continue;
+			if (reg->dynptr.first_slot)
+				dyn_stack--;
+			bpf_diag_record_scrub(env, &dyn_stack[0].spilled_ptr, BPF_DIAG_MOD_CTX_CONSUMED);
+			bpf_diag_record_scrub(env, &dyn_stack[1].spilled_ptr, BPF_DIAG_MOD_CTX_CONSUMED);
+			invalidate_dynptr(env, dyn_stack);
+			continue;
+		}
+		if (reg->type != PTR_TO_CTX)
+			continue;
+		bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_CTX_CONSUMED);
+		if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL)
+			mark_reg_invalid(env, reg);
+	}));
+	clear_all_pkt_pointers(env);
+}
+
+/*
+ * Does the current state have every copy of the program context that the program has? The callers
+ * of a global function, and the program that an extension replaces a function of, keep theirs,
+ * which cannot be invalidated from here, also from a function that they call. Only the main program
+ * is called by the kernel with the context, so it is the bottom frame where all copies are in the
+ * state. A static function verified on its own has its callers outside the state as well, but the
+ * consumed context counts as changed packet data, so it is verified again with its callers, see
+ * bpf_flow_return().
+ */
+static bool ctx_copies_in_state(struct bpf_verifier_env *env)
+{
+	const struct bpf_verifier_state *st = env->cur_state;
+
+	if (env->prog->type == BPF_PROG_TYPE_EXT)
+		return false;
+	return st->instance_id || !st->frame[0]->subprogno;
+}
+
 enum {
 	AT_PKT_END = -1,
 	BEYOND_PKT_END = -2,
@@ -14209,6 +14270,11 @@ static bool is_kfunc_release(struct bpf_call_arg_meta *meta)
 	return meta->kfunc_flags & KF_RELEASE;
 }
 
+static bool is_kfunc_release_ctx(struct bpf_call_arg_meta *meta)
+{
+	return meta->kfunc_flags & KF_RELEASE_CTX;
+}
+
 static bool is_kfunc_destructive(struct bpf_call_arg_meta *meta)
 {
 	return meta->kfunc_flags & KF_DESTRUCTIVE;
@@ -14711,6 +14777,8 @@ enum special_kfunc_type {
 	KF_bpf_dynptr_from_xdp,
 	KF_bpf_dynptr_from_skb_meta,
 	KF_bpf_xdp_pull_data,
+	KF_bpf_xdp_frame_steal,
+	KF_bpf_dynptr_from_xdp_frame,
 	KF_bpf_dynptr_slice,
 	KF_bpf_dynptr_slice_rdwr,
 	KF_bpf_dynptr_clone,
@@ -14784,7 +14852,11 @@ BTF_ID(func, bpf_dynptr_from_skb)
 BTF_ID(func, bpf_dynptr_from_xdp)
 BTF_ID(func, bpf_dynptr_from_skb_meta)
 BTF_ID(func, bpf_xdp_pull_data)
+BTF_ID(func, bpf_xdp_frame_steal)
+BTF_ID(func, bpf_dynptr_from_xdp_frame)
 #else
+BTF_ID_UNUSED
+BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
 BTF_ID_UNUSED
@@ -15121,6 +15193,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 			arg_type |= DYNPTR_TYPE_XDP;
 		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_skb_meta]))
 			arg_type |= DYNPTR_TYPE_SKB_META;
+		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_xdp_frame]))
+			arg_type |= DYNPTR_TYPE_XDP_FRAME;
 		else if (is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_from_file]) ||
 			 is_kfunc_call(meta, special_kfunc_list[KF_bpf_dynptr_file_discard]))
 			/* OBJ_RELEASE for the latter comes from KF_RELEASE below */
@@ -15237,6 +15311,13 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 
 	if (is_kfunc_arg_nullable(meta->btf, &args[arg]))
 		arg_type |= PTR_MAYBE_NULL;
+
+	/* A KF_RELEASE_CTX kfunc consumes the program context passed first, see consume_ctx(). */
+	if (is_kfunc_release_ctx(meta) && arg == 0 && base_type(arg_type) != ARG_PTR_TO_CTX) {
+		verbose(env, "kfunc %s is KF_RELEASE_CTX, but %s is not the program context\n",
+			meta->func_name, reg_arg_name(env, argno));
+		return -EINVAL;
+	}
 
 	/*
 	 * Only the first argument of a KF_RELEASE kfunc releases anything, and
@@ -16755,6 +16836,32 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		err = release_reg(env, &regs[meta.release_regno], false, !!meta.dynptr.id);
 		if (err)
 			return err;
+	}
+
+	if (is_kfunc_release_ctx(&meta)) {
+		if (!ctx_copies_in_state(env)) {
+			verbose(env, "kfunc %s consumes the program context and cannot be called from a global function or an extension program\n",
+				func_name);
+			return -EINVAL;
+		}
+		consume_ctx(env);
+	}
+
+	/*
+	 * A dynptr over a frame lives as long as the program's reference to the
+	 * frame, which is where it goes when the frame is released or stored.
+	 */
+	if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_dynptr_from_xdp_frame]) &&
+	    !reg_is_referenced(env, &regs[BPF_REG_1])) {
+		verbose(env, "%s needs a frame the program owns\n", func_name);
+		return -EINVAL;
+	}
+
+	/* The program may now own frames; bpf_prog_run_xdp() has to look, see XDP_CONSUME. */
+	if (is_kfunc_call(&meta, special_kfunc_list[KF_bpf_xdp_frame_steal]) &&
+	    !env->prog->aux->xdp_consume) {
+		env->prog->aux->xdp_consume = true;
+		static_branch_inc(&bpf_xdp_consume_enabled_key);
 	}
 
 	if (is_bpf_list_push_kfunc(meta.func_id) || is_bpf_rbtree_add_kfunc(meta.func_id)) {
