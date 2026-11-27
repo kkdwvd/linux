@@ -46,9 +46,6 @@ static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 
 SEC("syscall")
 __success __retval(0)
-#ifndef __clang__
-__skip("GCC's layout: the may_goto that the verifier adds leaves the loop with a reference")
-#endif
 long rbtree_search_kptr(void *ctx)
 {
 	struct tree_node *tnode;
@@ -156,9 +153,6 @@ static bool less_r(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 
 SEC("syscall")
 __success __retval(0)
-#ifndef __clang__
-__skip("GCC's layout: the may_goto that the verifier adds leaves the loop with a reference")
-#endif
 long rbtree_search_kptr_ref(void *ctx)
 {
 	struct tree_node_ref *tnode_r, *tnode_m;

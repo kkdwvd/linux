@@ -1539,6 +1539,12 @@ err_out:
 	return err;
 }
 
+/*
+ * What prog->aux->st_ops_assoc of a struct_ops prog holds when the one map that the prog was in
+ * is gone. NULL is a prog that never was in a map, see bpf_prog_assoc_struct_ops_gone().
+ */
+#define ST_OPS_ASSOC_GONE	ERR_PTR(-ENOENT)
+
 int bpf_prog_assoc_struct_ops(struct bpf_prog *prog, struct bpf_map *map)
 {
 	struct bpf_map *st_ops_assoc;
@@ -1550,7 +1556,8 @@ int bpf_prog_assoc_struct_ops(struct bpf_prog *prog, struct bpf_map *map)
 	if (st_ops_assoc && st_ops_assoc == map)
 		return 0;
 
-	if (st_ops_assoc) {
+	/* a prog whose map is gone is associated again, like one that had none */
+	if (!IS_ERR_OR_NULL(st_ops_assoc)) {
 		if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
 			return -EBUSY;
 
@@ -1577,10 +1584,13 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog)
 	scoped_guard(spinlock_irqsave, &aux->st_ops_assoc_lock) {
 		st_ops_assoc = rcu_dereference_protected(aux->st_ops_assoc,
 							 lockdep_is_held(&aux->st_ops_assoc_lock));
-		if (!st_ops_assoc || st_ops_assoc == BPF_PTR_POISON)
+		if (IS_ERR_OR_NULL(st_ops_assoc) || st_ops_assoc == BPF_PTR_POISON)
 			return;
 
-		RCU_INIT_POINTER(aux->st_ops_assoc, NULL);
+		if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+			rcu_assign_pointer(aux->st_ops_assoc, ST_OPS_ASSOC_GONE);
+		else
+			RCU_INIT_POINTER(aux->st_ops_assoc, NULL);
 	}
 
 	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
@@ -1603,7 +1613,7 @@ void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux)
 	struct bpf_map *st_ops_assoc;
 
 	st_ops_assoc = rcu_dereference_check(aux->st_ops_assoc, bpf_rcu_lock_held());
-	if (!st_ops_assoc || st_ops_assoc == BPF_PTR_POISON)
+	if (IS_ERR_OR_NULL(st_ops_assoc) || st_ops_assoc == BPF_PTR_POISON)
 		return NULL;
 
 	st_map = (struct bpf_struct_ops_map *)st_ops_assoc;
@@ -1611,6 +1621,21 @@ void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux)
 	return &st_map->kvalue.data;
 }
 EXPORT_SYMBOL_GPL(bpf_prog_get_assoc_struct_ops);
+
+/*
+ * Was the struct_ops prog in one struct_ops map, which is gone by now? Its map was freed, or the
+ * update of the map that took the prog has failed. bpf_prog_get_assoc_struct_ops() is NULL for
+ * such a prog, as it is for a prog that never was in a map and for one that is in more than one.
+ * A struct_ops that looks for the owner of a prog without a map can tell them apart with this:
+ * what still runs of a prog whose map is gone, its async callbacks, belongs to an instance of
+ * the struct_ops that is gone too, not to one that came after it.
+ * A prog that was in more than one map is not told from one that still is, also when all its maps
+ * are gone.
+ */
+bool bpf_prog_assoc_struct_ops_gone(const struct bpf_prog_aux *aux)
+{
+	return rcu_access_pointer(aux->st_ops_assoc) == ST_OPS_ASSOC_GONE;
+}
 
 void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map)
 {

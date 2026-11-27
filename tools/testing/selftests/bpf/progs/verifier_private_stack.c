@@ -308,21 +308,8 @@ SEC("fentry/bpf_fentry_test9")
 __description("Private stack, exception in main prog")
 __success __retval(0)
 __arch_x86_64
-__jited("	pushq	%r9")
-__jited("...")
-__jited("	callq")
-__jited("	popq	%r9")
+__jited("	movq	%rdi, -0x200(%r9)")
 __arch_arm64
-__jited("	stp	x29, x30, [sp, #-0x10]!")
-__jited("	mov	x29, sp")
-__jited("	stp	xzr, x26, [sp, #-0x10]!")
-__jited("	mov	x26, sp")
-__jited("...")
-__jited("	stp	x19, x20, [sp, #-0x10]!")
-__jited("	stp	x21, x22, [sp, #-0x10]!")
-__jited("	stp	x23, x24, [sp, #-0x10]!")
-__jited("	stp	x25, x26, [sp, #-0x10]!")
-__jited("	stp	x27, x28, [sp, #-0x10]!")
 __jited("	mov	x27, {{.*}}")
 __jited("	movk	x27, {{.*}}, lsl #16")
 __jited("	movk	x27, {{.*}}")
@@ -331,10 +318,6 @@ __jited("	add	x27, x27, x10")
 __jited("	add	x25, x27, {{.*}}")
 __jited("	mov	x0, #0x2a")
 __jited("	str	x0, [x27]")
-__jited("	mov	x0, #0x0")
-__jited("	bl	0x{{.*}}")
-__jited("	mov	x8, x0")
-__jited("	ldp	x27, x28, [sp], #0x10")
 int private_stack_exception_main_prog(void)
 {
 	asm volatile ("			\
@@ -362,7 +345,6 @@ __jited("...")
 __jited("	callq")
 __jited("	popq	%r9")
 __arch_arm64
-__jited("	stp	x27, x28, [sp, #-0x10]!")
 __jited("	mov	x27, {{.*}}")
 __jited("	movk	x27, {{.*}}, lsl #16")
 __jited("	movk	x27, {{.*}}")
@@ -371,9 +353,6 @@ __jited("	add	x27, x27, x10")
 __jited("	add	x25, x27, {{.*}}")
 __jited("	mov	x0, #0x2a")
 __jited("	str	x0, [x27]")
-__jited("	bl	0x{{.*}}")
-__jited("	mov	x8, x0")
-__jited("	ldp	x27, x28, [sp], #0x10")
 int private_stack_exception_sub_prog(void)
 {
 	asm volatile ("			\
@@ -387,8 +366,8 @@ int private_stack_exception_sub_prog(void)
 
 /*
  * Nothing attaches the two fentry progs above, so they are loaded, but never
- * run. BPF_PROG_TEST_RUN does run a raw_tp prog. The default exception callback
- * returns the cookie of bpf_throw().
+ * run. BPF_PROG_TEST_RUN does run a raw_tp prog. It returns the cookie of
+ * bpf_throw().
  */
 SEC("raw_tp")
 __description("Private stack, run, exception in main prog")
@@ -396,9 +375,8 @@ __success __retval(1)
 __arch_x86_64
 __jited("	movq	%rdi, -0x200(%r9)")
 __jited("	movl	$0x1, %edi")
-__jited("	pushq	%r9")
-__jited("...")
-__jited("	callq")
+__jited("	movq	%rdi, %rax")
+__jited("	leave")
 __naked void private_stack_run_exception_main_prog(void)
 {
 	asm volatile ("			\
@@ -461,7 +439,7 @@ __naked static void private_stack_subprog_throw(void)
 	: __clobber_all);
 }
 
-/* Only the frame of the main prog counts, and it has nothing pushed at the call */
+/* The frame that throws has a private stack, the one that it unwinds to has none */
 SEC("raw_tp")
 __description("Private stack, run, exception in subprog, no private stack in main prog")
 __success __retval(3)
@@ -472,7 +450,7 @@ __jited("func #1")
 __jited("...")
 __jited("	movq	%rdi, -0x200(%r9)")
 __jited("	movl	$0x3, %edi")
-__jited("	pushq	%r9")
+__jited("	movq	%rdi, %rax")
 __naked void no_private_stack_run_exception_sub_prog(void)
 {
 	asm volatile ("				\
@@ -584,6 +562,135 @@ int private_stack_max_depth(void)
 
 	subprog1(&x);
 	return 0;
+}
+
+__used __noinline static int throws_7(void)
+{
+	bpf_throw(7);
+	return 0;
+}
+
+/* kfuncs that only asm calls need BTF */
+void __kfunc_btf_root(void)
+{
+	bpf_rcu_read_lock();
+	bpf_rcu_read_unlock();
+}
+
+/*
+ * The insns of the prog use 48 bytes of stack. The landing pad of the call leaves the RCU section
+ * and keeps the value of bpf_throw() over that, in a hidden word below the stack of the prog: 56
+ * bytes, which the JIT rounds up to the 64 where a private stack begins. The prog does not get
+ * one for a word that only its landing pad uses: it keeps its frame in the stack of the kernel,
+ * and no call of it saves r9.
+ */
+SEC("raw_tp")
+__description("No private stack, a hidden word of the landing pads takes the frame to 56 bytes")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("call pc+")
+__xlated("...")
+__xlated("*(u64 *)(r10 -56) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -56)")
+__xlated("exit")
+__jited("	subq	$0x38, %rsp")
+__jited("...")
+__jited("	movq	%rdi, -0x30(%rbp)")
+__arch_arm64
+__naked void no_private_stack_hidden_word(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 48) = r1;	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
+}
+
+/*
+ * The same with a register that is spilled around a bpf_fastcall call, below the 48 bytes. The
+ * spill and the fill are removed. The hidden word stays where it was put, below the slot that is
+ * no longer used: a frame of 64 bytes, of which the insns of the prog use 48. No private stack.
+ */
+SEC("raw_tp")
+__description("No private stack, a hidden word below a bpf_fastcall spill that is removed")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("*(u64 *)(r10 -48) = r1")
+__xlated("...")
+__xlated("call pc+")
+__xlated("...")
+__xlated("*(u64 *)(r10 -64) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -64)")
+__xlated("exit")
+__jited("	subq	$0x40, %rsp")
+__jited("...")
+__jited("	movq	%rdi, -0x30(%rbp)")
+__arch_arm64
+__naked void no_private_stack_fastcall_spill(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 48) = r1;	\
+	*(u64 *)(r10 - 56) = r1;	\
+	call %[bpf_get_smp_processor_id];\
+	r1 = *(u64 *)(r10 - 56);	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_get_smp_processor_id),
+	  __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
+}
+
+/* The same with 64 bytes of its own: a private stack, and the hidden word is in it */
+SEC("raw_tp")
+__description("Private stack, the hidden word of the landing pads is in it")
+__success __retval(7)
+__load_if_JITed()
+__arch_x86_64
+__xlated("...")
+__xlated("*(u64 *)(r10 -72) = r0")
+__xlated("call kernel-function")
+__xlated("r0 = *(u64 *)(r10 -72)")
+__xlated("exit")
+__jited("	movabsq	$0x{{.*}}, %r9")
+__jited("	addq	%gs:{{.*}}, %r9")
+__jited("...")
+__jited("	movq	%rdi, -0x40(%r9)")
+__jited("...")
+__jited("	movq	%rax, -0x48(%r9)")
+__arch_arm64
+__naked void private_stack_hidden_word(void)
+{
+	asm volatile ("			\
+	r1 = 42;			\
+	*(u64 *)(r10 - 64) = r1;	\
+	call %[bpf_rcu_read_lock];	\
+	call throws_7;			\
+	call %[bpf_rcu_read_unlock];	\
+	r0 = 0;				\
+	exit;				\
+"	:
+	: __imm(bpf_rcu_read_lock),
+	  __imm(bpf_rcu_read_unlock)
+	: __clobber_all);
 }
 
 #else

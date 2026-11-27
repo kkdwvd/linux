@@ -231,6 +231,8 @@ static const char __arena glob_tests[] =
 	"0" "*ab*cd*\0" "abcabcabcabcefg\0";
 
 SEC("syscall")
+__arch_x86_64
+__arch_arm64
 __success __retval(0) __skip_without_arena
 int arena_strsearch(void *ctx)
 {

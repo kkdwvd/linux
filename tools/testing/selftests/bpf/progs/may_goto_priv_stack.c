@@ -5,13 +5,15 @@
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
 
-/* r0-r5 after the loop and the number of iterations */
+/* r0-r5 in the last trip of the loop and the number of iterations */
 __u64 regs_64[7];
 __u64 regs_128[7];
 
 /*
  * fentry prog with 64 or more bytes of stack uses private stack.
  * Loop until may_goto expires. r0-r5 should stay zero.
+ * When may_goto expires the prog is unwound: what follows the loop does not run, so each trip
+ * stores the registers.
  */
 #define TIMED_MAY_GOTO_PRIV_STACK(size, func)				\
 SEC("fentry/" #func)							\
@@ -30,7 +32,6 @@ __naked void priv_stack_##size(void)					\
 "1:"									\
 	".8byte %[may_goto];"						\
 	"r6 += 1;"							\
-	"goto 1b;"							\
 	"*(u64 *)(r7 + 0) = r0;"					\
 	"*(u64 *)(r7 + 8) = r1;"					\
 	"*(u64 *)(r7 + 16) = r2;"					\
@@ -38,11 +39,12 @@ __naked void priv_stack_##size(void)					\
 	"*(u64 *)(r7 + 32) = r4;"					\
 	"*(u64 *)(r7 + 40) = r5;"					\
 	"*(u64 *)(r7 + 48) = r6;"					\
+	"goto 1b;"							\
 	"r0 = 0;"							\
 	"exit;"								\
 	:								\
 	: [regs]"i"(&regs_##size),					\
-	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2, 0)) \
+	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 9, 0)) \
 	: __clobber_all);						\
 }
 

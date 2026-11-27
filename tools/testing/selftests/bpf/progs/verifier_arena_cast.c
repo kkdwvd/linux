@@ -797,4 +797,30 @@ __naked void cast_user(void)
 	: __clobber_all);
 }
 
+/*
+ * The cast is removed, and may_goto that jumps over nothing else goes with it: it is no site, and
+ * the prog has no landing pad.
+ */
+SEC("tc")
+__description("arena cast: may_goto over a cast that is removed goes with it")
+__success __retval(7)
+__xlated("2: r6 = r1")
+__xlated("3: r0 = 7")
+__xlated("4: exit")
+__naked void may_goto_over_cast(void)
+{
+	asm volatile (
+	"r2 = %[arena] ll;"
+	"r6 = r1;"
+	".8byte %[may_goto];"
+	".8byte %[cast_r6_r6];"
+	"r0 = 7;"
+	"exit;"
+	:
+	: __imm_addr(arena),
+	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 1, 0)),
+	  __imm_insn(cast_r6_r6, CAST_KERN(BPF_REG_6, BPF_REG_6))
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";

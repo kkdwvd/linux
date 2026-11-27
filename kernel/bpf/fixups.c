@@ -241,7 +241,10 @@ int bpf_patch_list_insert(struct bpf_verifier_env *env, u32 off,
 	return patch_list_insert(env, off, insns, cnt, false);
 }
 
-/* Queue insns to go behind insn 'off', which does not fall through. They are not dead code. */
+/*
+ * Queue insns to go behind insn 'off'. They are not dead code: 'off' does not fall through and
+ * a jump gets to them, or it is a call and they are what the call comes back to.
+ */
 int bpf_patch_list_append(struct bpf_verifier_env *env, u32 off,
 			  const struct bpf_insn *insns, u32 cnt)
 {
@@ -278,7 +281,7 @@ static void patch_list_adj_aux(struct bpf_prog *prog, struct bpf_insn_patch *p,
 		slot[i].seen = last->seen ?: i > p->self;
 		/* messages name the insn of the original program */
 		slot[i].orig_idx = last->orig_idx;
-		/* for may_goto in front of the insn, see bpf_insert_loop_guards() */
+		/* for may_goto in front of the insn, see bpf_insert_sites() */
 		slot[i].live_regs_before = last->live_regs_before;
 		slot[i].zext_dst = bpf_insn_def32(prog, &patch[i]) >= 0;
 		/*
@@ -289,6 +292,8 @@ static void patch_list_adj_aux(struct bpf_prog *prog, struct bpf_insn_patch *p,
 		if (i >= p->target && !memcmp(&patch[i], orig, sizeof(*orig))) {
 			slot[i].non_stack_access = last->non_stack_access;
 			last->non_stack_access = false;
+			slot[i].fault_unwinds = last->fault_unwinds;
+			last->fault_unwinds = false;
 		} else if (bpf_is_mem_insn(&patch[i])) {
 			slot[i].non_stack_access = true;
 		}
@@ -410,9 +415,7 @@ static bool patch_list_subprog_gone(const struct bpf_subprog_info *info, u32 cnt
 }
 
 /*
- * Remove the subprogs whose insns are all removed, with their func_info. The
- * passes that remove insns run before the hidden subprog, which has no
- * func_info, is added.
+ * Remove the subprogs whose insns are all removed, with their func_info.
  */
 static void patch_list_del_subprogs(struct bpf_verifier_env *env,
 				    const u32 *new_off)
@@ -481,6 +484,10 @@ static void patch_list_remap_subprogs(struct bpf_verifier_env *env,
 	/* NOTE: fake 'exit' subprog should be updated as well. */
 	for (i = 0; i <= env->subprog_cnt; i++) {
 		info[i].start = bpf_patch_image_remap(img, img->new_off, info[i].start);
+		/* the program gets there like by a jump */
+		if (info[i].fault_pad)
+			info[i].fault_pad = bpf_patch_image_remap(img, img->new_tgt,
+								  info[i].fault_pad);
 		if (img->new_linfo)
 			info[i].linfo_idx =
 				img->new_linfo[min(info[i].linfo_idx, img->nr_linfo)];
@@ -533,6 +540,9 @@ int bpf_patch_list_commit(struct bpf_verifier_env *env)
 	if (verifier_bug_if(err == -EFAULT, env, "insn %u jumps out of the program",
 			    img.bad))
 		goto out;
+	if (err == -E2BIG)
+		verbose(env, "BPF program is too large after the rewrites: more than %lu insns\n",
+			BPF_PROG_MAX_LEN);
 	if (err)
 		goto out;
 
@@ -566,77 +576,1089 @@ out:
 	return err;
 }
 
-/* How subprog @s leaves when it has to stop, see push_unwind_exit(). Returns the length. */
-static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *buf)
+/*
+ * The insn that subprog @s leaves with at a site of @kind: kexit when the kernel unwinds it,
+ * unwind_exit on the way of an unwind that the program started, if it can leave that way. The main
+ * program has no kexit: the kernel called it.
+ */
+static struct bpf_insn unwind_exit_insn(struct bpf_verifier_env *env, int s,
+					enum bpf_site_kind kind)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
-	int n = 0;
+	struct bpf_insn insn = BPF_EXIT_INSN();
 
-	if (!env->bypass_spec_v1)
-		buf[n++] = BPF_ST_NOSPEC();
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
-	if (bpf_ret_reg_pair(env, s))
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
-	buf[n] = BPF_EXIT_INSN();
-	if (sub->bail_unwinds) {
-		buf[n].src_reg = BPF_UNWIND_EXIT;
+	if (bpf_pad_kexits(env, s, kind)) {
+		insn.src_reg = BPF_KEXIT;
+		sub->can_kunwind = true;
+		env->prog->jit_required = 1;
+	} else if (!bpf_site_is_kernel(kind) && sub->bail_unwinds) {
+		insn.src_reg = BPF_UNWIND_EXIT;
 		sub->can_unwind = true;
 		env->prog->jit_required = 1;
 	}
-	return n + 1;
+	return insn;
 }
 
 /*
- * Add may_goto in front of the insns that the main pass marked, see
- * check_loop_guard(). It verified the edge from the insn to where may_goto goes.
- *
- *	may_goto to		or	may_goto leave		see push_unwind_exit()
- *	insn				insn
- *					...
- *					last insn of the subprog
- *				leave:	r0 = 0
- *					exit
- *
- * bpf_do_misc_fixups() keeps the address of the count of may_goto in a register that is
- * dead at the may_goto. What is live in front of the insn is live in front of its guard.
- * Nothing else is:
- *  - The guard of a jump goes where the jump goes.
- *  - What is live where the guard at the head of a loop goes is live at the head,
- *    see bpf_head_guard_target().
- *  - On the way out of the subprog R0, and R2 of a pair, are set to 0.
+ * How subprog @s leaves when the check of its recursion stops it, see unwind_frame(). Returns the
+ * length.
  */
-int bpf_insert_loop_guards(struct bpf_verifier_env *env)
+static int emit_unwind_exit(struct bpf_verifier_env *env, int s, struct bpf_insn *buf)
 {
-	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	struct bpf_insn leave[4], *insn;
+	int n = 0;
+
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env));
+	/* as a landing pad does, see bpf_pad_insns() */
+	if (bpf_pad_kexits(env, s, BPF_SITE_RECURSION) || bpf_ret_reg_pair(env, s))
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
+	buf[n++] = unwind_exit_insn(env, s, BPF_SITE_RECURSION);
+	return n;
+}
+
+/*
+ * The landing pad of a site in subprog @s. The only exit of a pad is its last insn. Nothing in a
+ * pad is hardened against a cpu that mispredicts: only a program that is loaded with CAP_PERFMON
+ * gets one, see frame_cannot_unwind().
+ * The main program returns what the exception callback makes of the value. The pad has no index
+ * yet: bpf_insert_sites() sets the offset of the call. The callback is not called a second time:
+ * its unwind_exit gets to the exit of the pad like its exit does, and so does its kexit.
+ * unwind_goto and kgoto say so, to bpf_unwind_target() and bpf_kunwind_target(): a return address
+ * in a program without an entry is a lost unwind_exit or kexit. Only a callback that can leave
+ * that way gets the insn, and such a program needs a JIT that knows it already. A pad of any other
+ * program is plain BPF: the interpreter and the other JITs run it.
+ * bpf_mark_subprogs_that_unwind() ran, so it is known which callback that is.
+ * Returns the number of insns, BPF_PAD_MAX_INSNS + 4 at most.
+ */
+static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_plan *plan,
+		    struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
+{
+	int cb = env->exception_callback_subprog;
+	int n = 0;
+
+	n += bpf_pad_insns(env, plan, s, buf + n, aux + n);
+	if (!s && cb) {
+		bool kunwinds = bpf_subprog_kunwinds(&env->subprog_info[cb]);
+
+		buf[n++] = BPF_CALL_REL(0);
+		/*
+		 * Both go to the exit. kgoto is no insn to go to: where the call has code behind
+		 * it, a JIT may have the way of kexit to its pad in that place, which does that
+		 * code once more. So unwind_goto goes past it.
+		 */
+		if (env->subprog_info[cb].can_unwind)
+			buf[n++] = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0,
+						kunwinds);
+		if (kunwinds)
+			buf[n++] = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_KGOTO, 0, 0);
+	}
+	buf[n++] = unwind_exit_insn(env, s, plan->kind);
+	return n;
+}
+
+/*
+ * Does the program leave the frame at the site of @plan, which is at insn @i? The main pass looks
+ * at more sites than that, see bpf_mark_subprogs_that_unwind(). What it found at the others does
+ * not count, see bpf_pads_mark_used().
+ */
+bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	int s;
+
+	/*
+	 * A frame is one that the kernel unwinds already only behind a landing pad of the program
+	 * that the kernel enters: if the function has none after all, no frame of it gets here
+	 * that way.
+	 */
+	if (bpf_site_is_forced(plan->kind) && !bpf_find_containing_subprog(env, i)->enters_kpads)
+		return false;
+	switch (bpf_site_base(plan->kind)) {
+	case BPF_SITE_GUARD:
+		return env->insn_aux_data[i].loop_guard;
+	case BPF_SITE_RECURSION:
+		return bpf_find_containing_subprog(env, i)->recursive;
+	case BPF_SITE_THROW:
+		return true;
+	case BPF_SITE_CALL:
+		if (!plan->visited)
+			return false;
+		bpf_pad_for_each_callee(plan, s)
+			if (env->subprog_info[s].can_unwind)
+				return true;
+		return false;
+	case BPF_SITE_KCALL:
+	case BPF_SITE_KENTRY:
+		if (!plan->visited)
+			return false;
+		bpf_pad_for_each_callee(plan, s)
+			if (env->subprog_info[s].can_kunwind)
+				return true;
+		return false;
+	case BPF_SITE_REMAINDER:
+		return plan->visited;
+	case BPF_SITE_FAULT:
+		return !env->insn_aux_data[i].fault_skips;
+	case BPF_SITE_MAY_GOTO:
+		return plan->visited && !bpf_find_containing_subprog(env, i)->stuck;
+	default:
+		return false;
+	}
+}
+
+/*
+ * The main pass looked at more ways to unwind than the program has in the end: a loop that has a
+ * trip count after all has no may_goto. Find the subprogs that get kexit: those that are left at a
+ * site where the kernel unwinds. And those that get unwind_exit: they have a call with no
+ * unwind_goto, to which unwind_exit of the program comes back. A call is a site if it calls one of
+ * them: of one kind, of the other, or of both. The main pass asks the same when a global subprog
+ * unwinds, see settle_late_unwinds(). The main program leaves with exit: it is marked for
+ * bpf_check_attach_target(), see bpf_insert_sites().
+ * And the subprogs in which the kernel enters a landing pad of the program, 'enters_kpads': a
+ * callee of that call is left with kexit. Only there a frame can get to a site, or to unwind_exit,
+ * while the kernel unwinds it, and only there the plans for that count.
+ */
+int bpf_mark_subprogs_that_unwind(struct bpf_verifier_env *env, bool in_pass)
+{
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_pad_plan *plan;
 	struct bpf_subprog_info *sub;
-	int i, s, n, err;
+	bool changed, unwinds, kunwinds;
+	int i, k, s, err;
+
+	for (s = 0; s < env->subprog_cnt; s++)
+		env->subprog_info[s].enters_kpads = false;
+	do {
+		changed = false;
+		/*
+		 * Callees first: callx and a cycle of calls need more rounds. A pass pays for each
+		 * of them. The emission repeats what the pass that is loaded has paid for.
+		 */
+		err = in_pass ? bpf_add_cost_and_check(env, env->prog->len, BPF_COST_SCAN) :
+		      bpf_must_abort() ? -EINTR : 0;
+		if (err)
+			return err;
+		for (k = 0; k < env->subprog_cnt; k++) {
+			s = env->subprog_topo_order[k];
+			sub = &env->subprog_info[s];
+			for (i = sub->start; sub->has_kpads && !sub->enters_kpads &&
+			     i < sub[1].start; i++) {
+				plan = bpf_pad_plan(&aux[i], BPF_SITE_KENTRY);
+				if (plan && bpf_site_is_used(env, i, plan))
+					sub->enters_kpads = changed = true;
+			}
+			if ((sub->can_unwind && sub->can_kunwind) || (s && !sub->bail_unwinds))
+				continue;
+			unwinds = sub->can_unwind;
+			kunwinds = sub->can_kunwind;
+			for (i = sub->start; i < sub[1].start && !(unwinds && kunwinds); i++) {
+				kunwinds |= aux[i].loop_guard ||
+					    (aux[i].fault_empty && !aux[i].fault_skips);
+				for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+					/* the frame is not left at the entry of a landing pad */
+					if (plan->kind == BPF_SITE_KENTRY ||
+					    !bpf_site_is_used(env, i, plan))
+						continue;
+					if (bpf_site_is_kernel(plan->kind))
+						kunwinds = true;
+					else
+						unwinds = true;
+				}
+			}
+			changed |= unwinds != sub->can_unwind || kunwinds != sub->can_kunwind;
+			sub->can_unwind = unwinds;
+			sub->can_kunwind = kunwinds;
+		}
+	} while (changed);
+	return 0;
+}
+
+/* Does the site of @plan at insn @i get a landing pad after its subprog? */
+static bool plan_has_pad(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	/* bpf_insert_recursion_checks() emits the pad of the check */
+	return bpf_site_base(plan->kind) != BPF_SITE_RECURSION && bpf_site_is_used(env, i, plan);
+}
+
+/* The plan of a site of @kind at insn @i where no state got in the pass: the empty one will do */
+static struct bpf_pad_plan *unvisited_plan(struct bpf_verifier_env *env, int i,
+					   enum bpf_site_kind kind)
+{
+	struct bpf_pad_plan *plan = bpf_pad_plan(&env->insn_aux_data[i], kind);
+
+	if (plan)
+		return plan;
+	plan = bpf_pad_plan_get(env, i, kind);
+	if (plan)
+		plan->used = true;
+	return plan;
+}
+
+/*
+ * What goes after a subprog: the stubs, see collect_stubs(), then the landing pads. Their insns,
+ * and where each pad ends.
+ */
+struct pad_buf {
+	struct bpf_insn *insns;
+	int *ends;
+	/* the hash of its insns -> a pad that can be shared, see add_pad() */
+	struct bpf_index index;
+	u64 seed;
+	int max_nr;	/* the room of 'ends' */
+	int max_cnt;	/* the room of 'insns' */
+	int nr;		/* pads */
+	int cnt;	/* insns */
+	int stubs;	/* those of the stubs, in front of the first pad */
+};
+
+/*
+ * Make room in @pads for @n more insns. A function can have a pad at each of its sites, so the
+ * buffer doubles. It keeps its memory from one function to the next.
+ */
+static int reserve_pad_insns(struct pad_buf *pads, int n)
+{
+	int max = max3(2 * pads->max_cnt, pads->cnt + n, 64);
+	void *mem;
+
+	if (pads->cnt + n <= pads->max_cnt)
+		return 0;
+	mem = kvrealloc(pads->insns, array_size(max, sizeof(*pads->insns)), BPF_VERIFIER_GFP);
+	if (!mem)
+		return -ENOMEM;
+	pads->insns = mem;
+	pads->max_cnt = max;
+	return 0;
+}
+
+/*
+ * @new, of @n insns, is one more pad of @pads. @share: unless they have one with the same insns.
+ * That pad is found by the hash of the insns, not by a walk over all pads of the function. The
+ * seed is random: a program cannot select pads that collide.
+ * Returns where the pad starts.
+ */
+static int add_pad(struct pad_buf *pads, const struct bpf_insn *new, int n, bool share)
+{
+	int k, start = pads->stubs;
+	void *mem;
+	u64 key = 0;
+
+	if (bpf_must_abort())
+		return -EINTR;
+	/* the first pad of a function: the index has the pads of the function before */
+	if (!pads->nr) {
+		kvfree(pads->index.slots);
+		pads->index = (struct bpf_index){};
+		pads->seed = get_random_u64();
+	}
+	if (share)
+		key = bpf_hash64(new, n * sizeof(*new), pads->seed);
+	/* pads with the same hash have keys in a row */
+	for (; share && (k = bpf_index_find(&pads->index, key)) >= 0; key++) {
+		const struct bpf_insn *pad = &pads->insns[k ? pads->ends[k - 1] : start];
+
+		if (&pads->insns[pads->ends[k]] - pad == n && !memcmp(pad, new, n * sizeof(*new)))
+			return pad - pads->insns;
+	}
+	if (pads->nr == pads->max_nr) {
+		k = max(2 * pads->max_nr, 16);
+		mem = kvrealloc(pads->ends, array_size(k, sizeof(*pads->ends)), BPF_VERIFIER_GFP);
+		if (!mem)
+			return -ENOMEM;
+		pads->ends = mem;
+		pads->max_nr = k;
+	}
+	if (reserve_pad_insns(pads, n) || (share && bpf_index_add(&pads->index, key, pads->nr)))
+		return -ENOMEM;
+	memcpy(&pads->insns[pads->cnt], new, n * sizeof(*new));
+	start = pads->cnt;
+	pads->cnt += n;
+	pads->ends[pads->nr++] = pads->cnt;
+	return start;
+}
+
+/*
+ * A UNIT is what goes after a subprog for one kind of site at one insn. The frames that are the
+ * first to unwind at the site have one plan, those that the kernel unwinds already, in a landing
+ * pad of the program, have another, see BPF_SITE_FORCED. The insn has one place to go to:
+ *
+ *	one plan		both
+ *
+ *	the pad			ax = K
+ *				if ax == 0 goto 1f
+ *				the pad of 'forced'
+ *			     1:	the pad of 'plan'
+ *
+ * With one plan no frame gets there in the other way, in any state of the pass. K is the hidden
+ * word of the function that says which it is, see kernel/bpf/pads.c. Two pads that have the
+ * same insns need no test: in a program without bpf_throw() both load the value of the kernel, and
+ * they differ only where the frames hold something else. See unit_pads_are_same().
+ * Two kinds have a unit that is no pad: the entry of a landing pad that the kernel enters, and
+ * what stands in for unwind_exit of the program, see emit_unit().
+ */
+struct pad_unit {
+	struct bpf_pad_plan *plan;
+	struct bpf_pad_plan *forced;
+};
+
+/* The most insns that a unit has, or an entry: four per save word, see bpf_pad_kentry_insns() */
+#define PAD_UNIT_MAX_INSNS	(2 * (BPF_PAD_MAX_INSNS + 4) + 3 + 4 * BPF_PAD_MAX_SAVES)
+
+/*
+ * Do the two plans of @unit have the same landing pad: the same insns, and the same type of object
+ * where it frees one? Then the unit is that pad alone, with no test of K.
+ * The two pads are emitted to compare them, into @buf, which has room for a unit. What a pad notes
+ * about its insns goes to @scratch then, as many entries as @buf has insns: a pad that is emitted
+ * for the comparison is not where the unit puts it, and what it notes must not get to the aux data
+ * of the program, see bpf_insert_sites().
+ */
+static bool unit_pads_are_same(struct bpf_verifier_env *env, int s, const struct pad_unit *unit,
+			       struct bpf_insn *buf, struct bpf_insn_aux_data *scratch)
+{
+	int len, other;
+
+	if (!bpf_pad_can_be_shared(unit->plan) || !bpf_pad_can_be_shared(unit->forced))
+		return false;
+	len = emit_pad(env, s, unit->forced, buf, scratch);
+	other = emit_pad(env, s, unit->plan, buf + len, scratch + len);
+	return other == len && !memcmp(buf, buf + len, len * sizeof(*buf));
+}
+
+/* Does the insn at @i have a unit for sites of @base? If so, it is in @unit. */
+static bool site_unit(struct bpf_verifier_env *env, int i, enum bpf_site_kind base,
+		      struct pad_unit *unit)
+{
+	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
+
+	unit->forced = NULL;
+	unit->plan = bpf_pad_plan(aux, base);
+	if (unit->plan && !plan_has_pad(env, i, unit->plan))
+		unit->plan = NULL;
+	if (base >= BPF_SITE_KENTRY)
+		return unit->plan;
+	unit->forced = bpf_pad_plan(aux, base | BPF_SITE_FORCED);
+	if (unit->forced && !plan_has_pad(env, i, unit->forced))
+		unit->forced = NULL;
+	return unit->plan || unit->forced;
+}
+
+/*
+ * The insns of @unit, of kind @base, in subprog @s.
+ *
+ * BPF_SITE_KENTRY, the entry of a landing pad of the program that the kernel enters. kexit of the
+ * callee comes back here:
+ *
+ *	bpf_pad_kentry_insns()		with or without a test of K, as the plan says
+ *	gotol pad			bpf_insert_sites() sets the offset
+ *
+ * BPF_SITE_REMAINDER, in place of unwind_exit of the program that a frame gets to while the kernel
+ * unwinds it. The insn becomes a jump to this:
+ *
+ *	ax = K
+ *	if ax == 0 goto 1f
+ *	the pad of the plan		what the frame still holds, the value, kexit
+ * 1:	unwind_exit
+ *
+ * A frame that the program unwinds gets to the same insn, with K as 0, and leaves as it did.
+ *
+ * @aux gets what the pads note about their insns, and only about the insns that the unit has in
+ * the end: each pad is emitted once, at its place. @scratch is for unit_pads_are_same().
+ * Returns the number of insns, PAD_UNIT_MAX_INSNS at most.
+ */
+static int emit_unit(struct bpf_verifier_env *env, int s, enum bpf_site_kind base,
+		     const struct pad_unit *unit, struct bpf_insn *buf,
+		     struct bpf_insn_aux_data *aux, struct bpf_insn_aux_data *scratch)
+{
+	int k_off = env->subprog_info[s].k_off;
+	int n = 0, len;
+
+	if (base == BPF_SITE_KENTRY) {
+		n += bpf_pad_kentry_insns(env, unit->plan, s, buf + n, aux + n);
+		buf[n++] = BPF_JMP32_A(0);
+		return n;
+	}
+	if (base != BPF_SITE_REMAINDER &&
+	    (!(unit->plan && unit->forced) || unit_pads_are_same(env, s, unit, buf, scratch)))
+		return emit_pad(env, s, unit->plan ?: unit->forced, buf, aux);
+	buf[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_FP, k_off);
+	buf[n++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_AX, 0, 0);
+	len = emit_pad(env, s, unit->forced ?: unit->plan, buf + n, aux + n);
+	buf[n - 1].off = len;
+	n += len;
+	if (base == BPF_SITE_REMAINDER) {
+		buf[n++] = BPF_RAW_INSN(BPF_JMP | BPF_EXIT, 0, BPF_UNWIND_EXIT, 0, 0);
+		return n;
+	}
+	return n + emit_pad(env, s, unit->plan, buf + n, aux + n);
+}
+
+/*
+ * What the insns of a unit note about themselves in their aux data, see load_handle() and
+ * release_ents() in pads.c: the map of an address, the type of an object that is freed. Nothing
+ * else of @to changes: it is an insn of the program already.
+ */
+static void copy_pad_aux(struct bpf_insn_aux_data *to, const struct bpf_insn_aux_data *from)
+{
+	to->map_index = from->map_index;
+	to->map_off = from->map_off;
+	to->kptr_struct_meta = from->kptr_struct_meta;
+}
+
+/* Units with the same insns do the same: but for an entry, which goes to its own landing pad */
+static bool unit_can_be_shared(enum bpf_site_kind base, const struct pad_unit *unit)
+{
+	return base != BPF_SITE_KENTRY &&
+	       (!unit->plan || bpf_pad_can_be_shared(unit->plan)) &&
+	       (!unit->forced || bpf_pad_can_be_shared(unit->forced));
+}
+
+/*
+ * The STUBS of subprog @s, the first insns of @pads. Where unwind_exit of a callee comes back to
+ * a call that is not in pad code, the frame gets into a landing pad of the program by the
+ * unwinding of the program: the kernel is not unwinding it, and K has to say so. See
+ * bpf_find_kernel_pads() for the kinds of code. There unwind_goto of the program goes to
+ *
+ *	*(u64 *)(r10 - K) = 0
+ *	gotol pad			bpf_insert_sites() sets the offset
+ *
+ * One stub per landing pad, whichever calls go to it. In a function that has K and is not mixed:
+ *   - Every unwind_goto of the program whose landing pad a state got to and whose call is not in
+ *     pad code gets one. Also at a call that has no plan, which calls nothing that the kernel
+ *     unwinds, and at one that goes to a pad which the kernel does not enter: a typed catch gets
+ *     to unwind_exit of the function too. And also where no state got to unwind_goto itself:
+ *     inline_bpf_loop() copies the target of such an insn when the pad is not dead code, so that
+ *     is all that is asked here.
+ *   - Not behind a call in pad code. A frame that the kernel unwinds gets there, and K stays set
+ *     when its callee leaves with unwind_exit: with K cleared the frame would leave as one that
+ *     the program unwinds, and a landing pad above would catch what the kernel unwinds.
+ * No other function gets a stub: without K nothing reads the word, and offset 0 from R10 is no
+ * word of the frame.
+ *
+ * A stub is no unit. It has no plan and no site, and it is not found by its insns, which are the
+ * same for all stubs of a function until they have their offsets. 'kstub' of unwind_goto says
+ * where its stub is, or that it gets none. That is decided here, once, on the insns that
+ * bpf_find_kernel_pads() looked at: what the passes that follow put into the program has no
+ * 'kpad_code'.
+ * Returns how many unwind_goto got a stub.
+ */
+static int collect_stubs(struct bpf_verifier_env *env, int s, struct pad_buf *pads)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int i, to, users = 0, len = sub[1].start - sub->start;
+	const struct bpf_insn *insn;
+	/* per insn of the function: 1 + where the stub that goes there starts */
+	u32 *stub_of;
+
+	if (!sub->k_off || sub->kpads_mixed)
+		return 0;
+	stub_of = kvcalloc(len, sizeof(*stub_of), BPF_VERIFIER_GFP);
+	if (!stub_of)
+		return -ENOMEM;
+	for (i = sub->start + 1; i < sub[1].start; i++) {
+		insn = &env->prog->insnsi[i];
+		if (!bpf_is_unwind_goto(insn))
+			continue;
+		to = i + 1 + bpf_jmp_offset(insn);
+		if (!aux[to].seen)
+			continue;
+		if (aux[i - 1].kpad_code) {
+			aux[i].kstub = BPF_KSTUB_NONE;
+			continue;
+		}
+		/*
+		 * The main pass has seen it for itself where a frame that the kernel unwinds took
+		 * this jump: a stub there would clear K of that frame, and a landing pad above
+		 * would catch what the kernel unwinds.
+		 */
+		if (verifier_bug_if(aux[i].kforced, env,
+				    "unwind_goto at insn %d of func#%d gets a stub in pad code",
+				    i, s)) {
+			users = -EFAULT;
+			break;
+		}
+		if (!stub_of[to - sub->start]) {
+			if (reserve_pad_insns(pads, 2)) {
+				users = -ENOMEM;
+				break;
+			}
+			pads->insns[pads->cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 0);
+			pads->insns[pads->cnt++] = BPF_JMP32_A(0);
+			stub_of[to - sub->start] = pads->cnt - 1;
+		}
+		aux[i].kstub = stub_of[to - sub->start];
+		users++;
+	}
+	kvfree(stub_of);
+	pads->stubs = pads->cnt;
+	return users;
+}
+
+/*
+ * The stub of unwind_goto of the program at insn @i is in the program now, where the pads of
+ * subprog @s are, from insn @pads on. It goes where unwind_goto goes, also behind what the passes
+ * that follow put in front of that pad. unwind_goto itself goes to the stub once the pads have
+ * their gotos, see insert_unwind_gotos().
+ */
+static int fill_stub(struct bpf_verifier_env *env, int s, int i, int pads)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	struct bpf_insn clear = BPF_ST_MEM(BPF_DW, BPF_REG_FP, sub->k_off, 0);
+	u32 kstub = env->insn_aux_data[i].kstub;
+	struct bpf_insn *stub;
+	int at, off;
+
+	if (!kstub || kstub == BPF_KSTUB_NONE)
+		return 0;
+	at = pads + kstub - 1;
+	if (verifier_bug_if(!sub->k_off || sub->kpads_mixed || at + 2 > sub[1].start ||
+			    !bpf_is_unwind_goto(&env->prog->insnsi[i]), env,
+			    "insn %d of func#%d has a stub", i, s))
+		return -EFAULT;
+	stub = &env->prog->insnsi[at];
+	off = i + 1 + bpf_jmp_offset(&env->prog->insnsi[i]) - (at + 2);
+	/* the store, and a jump that has no offset yet or the one of this landing pad */
+	if (verifier_bug_if(memcmp(stub, &clear, sizeof(clear)) ||
+			    stub[1].code != (BPF_JMP32 | BPF_JA) ||
+			    (stub[1].imm && stub[1].imm != off), env,
+			    "the stub of insn %d is not at insn %d", i, at))
+		return -EFAULT;
+	stub[1].imm = off;
+	return 0;
+}
+
+/*
+ * The landing pads of the sites of subprog @s go after its last insn, unit by unit. Units that
+ * have the same insns share them. @new and @new_aux have room for a unit: the insns are what is
+ * collected, and what the pads note about them is noted again when they are in the program, see
+ * bpf_insert_sites(). In front of them the stubs, see collect_stubs(): @stubbed is how many
+ * unwind_goto of the program go to one. Returns the insns in @pads, which has the memory of the
+ * subprog before, and their number.
+ */
+static int collect_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new,
+			struct bpf_insn_aux_data *new_aux, struct pad_buf *pads, int *stubbed)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_pad_plan *plan, *shared = NULL;
+	int i, n, pad, base, last = sub[1].start - 1;
+	struct pad_unit unit;
+	bool unwinds, forced;
+
+	pads->nr = pads->cnt = pads->stubs = 0;
+	/* the entries and what follows the landing pads of the program agree on the save words */
+	n = sub->save_words ? bpf_pad_check_saves(env, s) : 0;
+	if (n)
+		return n;
+	n = collect_stubs(env, s, pads);
+	if (n < 0)
+		return n;
+	*stubbed = n;
+	for (i = sub->start; i <= last; i++) {
+		if (aux[i].pad_plans && bpf_must_abort())
+			return -EINTR;
+		if (aux[i].loop_guard && !unvisited_plan(env, i, BPF_SITE_GUARD))
+			return -ENOMEM;
+		/*
+		 * Nothing is held there: the same. There are many such accesses. They get no insn,
+		 * a bit in the entry that they have in the exception table tells, and the pad of
+		 * the first one serves all of the function, see bpf_arena_fault().
+		 * Not where a frame gets to the access while the kernel unwinds it: that one has
+		 * a pad of its own, and the access gets unwind_goto to a unit of both.
+		 */
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_FAULT | BPF_SITE_FORCED);
+		forced = plan && bpf_site_is_used(env, i, plan);
+		unwinds = aux[i].fault_empty && !aux[i].fault_skips;
+		aux[i].fault_unwinds = unwinds && !forced;
+		if (unwinds && (forced || !shared)) {
+			plan = unvisited_plan(env, i, BPF_SITE_FAULT);
+			if (!plan)
+				return -ENOMEM;
+			shared = forced ? shared : plan;
+		}
+		for (base = 0; aux[i].pad_plans && base <= BPF_SITE_REMAINDER; base++) {
+			if (!site_unit(env, i, base, &unit))
+				continue;
+			/* bpf_pads_settle() skips the sites that the program does not have */
+			if (verifier_bug_if((unit.plan && (!unit.plan->used || unit.plan->conflict)) ||
+					    (unit.forced &&
+					     (!unit.forced->used || unit.forced->conflict)), env,
+					    "the landing pad of insn %d was not settled", i))
+				return -EFAULT;
+			/* there is no K to test, or to set */
+			if (verifier_bug_if((unit.forced || base >= BPF_SITE_KENTRY) && !sub->k_off,
+					    env, "func#%d has no hidden word for insn %d", s, i))
+				return -EFAULT;
+			/*
+			 * Is this call in pad code? Asked here, on the insns that
+			 * bpf_find_kernel_pads() looked at, and never again: the plan keeps the
+			 * answer for when the entry is emitted the second time.
+			 */
+			if (base == BPF_SITE_KENTRY)
+				unit.plan->untested = !sub->kpads_mixed && !aux[i].kpad_code;
+			/*
+			 * The main pass has seen it for itself where a frame that the kernel
+			 * unwinds got to the entry: there the entry is the second one of the
+			 * frame. Without a test it would replace the value and the handles that
+			 * the first one kept.
+			 */
+			if (verifier_bug_if(base == BPF_SITE_KENTRY && unit.plan->untested &&
+					    unit.plan->forced_visit, env,
+					    "the entry behind insn %d of func#%d does not test K",
+					    i, s))
+				return -EFAULT;
+			/*
+			 * What reads K: a unit with a pad for the frames that the kernel unwinds,
+			 * and the code in place of unwind_exit. Where the entry of the function
+			 * does not clear the word, each of them has to stand in pad code: no
+			 * frame gets there without a store on its way, see kernel/bpf/pads.c.
+			 * An entry that tests reads K too. It is one behind a call in pad code
+			 * by what makes it test, so there is nothing to ask of it here: what
+			 * the main pass saw is asked above.
+			 */
+			if (verifier_bug_if(!bpf_subprog_clears_k(sub) && !aux[i].kpad_code &&
+					    (unit.forced || base == BPF_SITE_REMAINDER),
+					    env, "insn %d of func#%d reads K outside of pad code",
+					    i, s))
+				return -EFAULT;
+			n = emit_unit(env, s, base, &unit, new, new_aux, new_aux);
+			pad = add_pad(pads, new, n, unit_can_be_shared(base, &unit));
+			if (pad < 0)
+				return pad;
+			if (unit.plan)
+				unit.plan->pad = pad;
+			if (unit.forced)
+				unit.forced->pad = pad;
+		}
+	}
+	return pads->cnt;
+}
+
+/*
+ * Where the unit of the site of @base at insn @i starts, counted from the first insn behind its
+ * subprog. -1 if the insn has none, or if it is an access to arena that goes to the pad of the
+ * function, see collect_pads().
+ */
+static int unit_pad(struct bpf_verifier_env *env, int i, enum bpf_site_kind base)
+{
+	struct pad_unit unit;
+
+	if (!site_unit(env, i, base, &unit) ||
+	    (base == BPF_SITE_FAULT && env->insn_aux_data[i].fault_unwinds))
+		return -1;
+	return (unit.plan ?: unit.forced)->pad;
+}
+
+/*
+ * unwind_goto of the program at insn @i of subprog @s: where does its stub start, counted from the
+ * first insn behind the subprog? -1 in @stub if it keeps its target.
+ * What collect_stubs() decided is all that is read here. But look at every unwind_goto of the
+ * program once more, with or without a plan at its call. In a function that has K and is not
+ * mixed, one whose landing pad is not dead code and that has no stub lets a frame into pad code
+ * past the store that clears K, with the word as an earlier frame left it, unless its call is in
+ * pad code. In any other function a stub would write to a word that the frame does not have, or
+ * that the kernel may have set. Neither loads.
+ */
+static int goto_stub(struct bpf_verifier_env *env, int s, int i, int *stub)
+{
+	const struct bpf_subprog_info *sub = &env->subprog_info[s];
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	bool wanted = sub->k_off && !sub->kpads_mixed;
+	u32 kstub = aux[i].kstub;
+	bool seen;
+
+	seen = aux[i + 1 + bpf_jmp_offset(&env->prog->insnsi[i])].seen;
+	if (verifier_bug_if(wanted ? seen && !kstub : kstub, env,
+			    "unwind_goto at insn %d of func#%d has %s stub", i, s,
+			    kstub ? "a" : "no"))
+		return -EFAULT;
+	*stub = kstub && kstub != BPF_KSTUB_NONE ? kstub - 1 : -1;
+	return 0;
+}
+
+/*
+ * Add unwind_goto after the calls that are sites, see check_unwound_arrival(), and after the
+ * accesses to arena that are, see check_arena_site(). Nothing stands between such an insn and its
+ * unwind_goto, and jumps to the insn that follows it go past unwind_goto.
+ * The pads are in the program: a call that has may_goto before it would need two jumps of one
+ * patch, see bpf_patch_list_jump(). @added: how many insns the pads after each subprog have.
+ *
+ * unwind_goto is no code, the jumps that take a conditional jump to a target that is too far for
+ * 16 bits would be, see patch_image_relax(). So it has 32 bits for the offset.
+ *
+ * And kgoto after the calls to which what the kernel unwinds comes back. It goes behind
+ * unwind_goto of the call:
+ *
+ *	call foo		call foo		call foo
+ *	kgoto kpad		unwind_goto pad		unwind_goto P	of the program
+ *				kgoto kpad		kgoto kpad
+ *
+ * unwind_goto of the program takes the form that has 32 bits there: a jump that is taken around
+ * its target would put two insns between it and kgoto. Where no state got to that unwind_goto it
+ * is dead code, and a trap is going to stand in its place, or nothing at all: kgoto goes in front
+ * of it, behind the call.
+ * Where the kernel enters the landing pad of the program, kgoto goes to the entry of the pad
+ * instead of a pad of the verifier, see enter_kernel_pad() in verifier.c. The state that entered
+ * got to unwind_goto of the program, so that is no dead code.
+ *
+ * And unwind_goto of the program goes to its stub, where it has one, see collect_stubs(): in the
+ * form that has 32 bits too, a stub is as far as a pad. @stubbed: how many of each subprog have
+ * one. All of them have to be found again here.
+ */
+static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added, const int *stubbed)
+{
+	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
+	struct bpf_insn kgoto = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_KGOTO, 0, 0);
+	struct bpf_patch_list *pl = &env->patch_list;
+	int i, s, pads, err, pad, kpad, stub, stubs;
+	const struct bpf_subprog_info *sub;
+	const struct bpf_insn_patch *p;
+	struct bpf_insn *insn;
+	bool seen;
 
 	for (s = 0; s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
-		for (i = sub->start, n = 0; i < sub[1].start; i++) {
-			if (!aux[i].loop_guard)
+		pads = sub[1].start - added[s];
+		stubs = 0;
+		for (i = sub->start; added[s] && i < pads; i++) {
+			/* every unwind_goto in front of the pads is one of the program still */
+			insn = &env->prog->insnsi[i + 1];
+			stub = -1;
+			err = bpf_is_unwind_goto(insn) ? goto_stub(env, s, i + 1, &stub) : 0;
+			if (err)
+				return err;
+			pad = kpad = -1;
+			if (env->insn_aux_data[i].pad_plans) {
+				pad = unit_pad(env, i, BPF_SITE_CALL);
+				if (pad < 0)
+					pad = unit_pad(env, i, BPF_SITE_FAULT);
+				kpad = unit_pad(env, i, BPF_SITE_KENTRY);
+				/* a frame that cannot unwind has no pad, any other frame enters */
+				if (verifier_bug_if(kpad >= 0 &&
+						    unit_pad(env, i, BPF_SITE_KCALL) >= 0, env,
+						    "kgoto of insn %d has two pads", i))
+					return -EFAULT;
+				if (kpad < 0)
+					kpad = unit_pad(env, i, BPF_SITE_KCALL);
+			}
+			if (pad < 0 && kpad < 0 && stub < 0)
 				continue;
-			/* A jump to itself is a back edge. It goes through may_goto too. */
-			patch[1] = env->prog->insnsi[i];
-			insn = bpf_patch_list_add(env, i, patch, 2);
+			if (bpf_must_abort())
+				return -EINTR;
+			/* a state got to unwind_goto of the program: kgoto goes behind it */
+			seen = bpf_is_unwind_goto(insn) && env->insn_aux_data[i + 1].seen;
+			/* the insn that follows the site may be dead code, what is appended is not */
+			if (pad >= 0) {
+				err = bpf_patch_list_append(env, i, &unwind_goto, 1);
+				if (err)
+					return err;
+				/* for bpf_check_unwind_gotos() */
+				env->insn_aux_data[i].unwind_goto_follows = true;
+				p = &pl->patches[pl->cnt - 1];
+				bpf_patch_list_jump(pl, &pl->insns[p->start + p->len - 1],
+						    pads + pad, 0);
+			}
+			if (kpad >= 0 && !seen) {
+				err = bpf_patch_list_append(env, i, &kgoto, 1);
+				if (err)
+					return err;
+				env->insn_aux_data[i].kgoto_follows = true;
+				p = &pl->patches[pl->cnt - 1];
+				bpf_patch_list_jump(pl, &pl->insns[p->start + p->len - 1],
+						    pads + kpad, 0);
+			}
+			if (stub < 0 && !(kpad >= 0 && seen))
+				continue;
+			/*
+			 * The program has unwind_goto there: no plan for unwind_exit. It goes to
+			 * its stub or where it went, in the form that has 32 bits.
+			 */
+			unwind_goto.imm = 0;
+			insn = __bpf_patch_list_add(pl, env->prog, i + 1, &unwind_goto, 1);
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
-			if (!aux[i].guard_unwinds) {
-				bpf_patch_list_jump(&env->patch_list, insn - 1, aux[i].guard_to, 0);
+			bpf_patch_list_jump(pl, insn, stub >= 0 ? pads + stub :
+					    i + 2 + bpf_jmp_offset(&env->prog->insnsi[i + 1]), 0);
+			stubs += stub >= 0;
+			if (kpad < 0 || !seen)
 				continue;
-			}
-			n = emit_unwind_exit(env, s, leave);
-			bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start, n);
+			err = bpf_patch_list_append(env, i + 1, &kgoto, 1);
+			if (err)
+				return err;
+			p = &pl->patches[pl->cnt - 1];
+			bpf_patch_list_jump(pl, &pl->insns[p->start + p->len - 1], pads + kpad, 0);
+			env->insn_aux_data[i].kgoto_follows = true;
 		}
-		if (!n)
-			continue;
-		err = bpf_patch_list_append(env, i - 1, leave, n);
-		if (err)
-			return err;
+		if (verifier_bug_if(stubs != stubbed[s], env,
+				    "%d unwind_goto of func#%d go to a stub, %d have one",
+				    stubs, s, stubbed[s]))
+			return -EFAULT;
 	}
 	return bpf_patch_list_commit(env);
+}
+
+/*
+ * may_goto of the program that is a site goes to its landing pad, see check_may_goto_site(). No
+ * state took its jump: the target that the program gave it may be dead code, and this insn would be
+ * taken for a jump that is never taken, see bpf_opt_hard_wire_dead_code_branches(). The loop would
+ * have nothing that stops it then. So this comes before dead code is looked for, and a pad is
+ * never dead code.
+ * The pads are in the program: may_goto that has one of the verifier before it would need two
+ * jumps of one patch, see bpf_patch_list_jump(). @added: how many insns the pads after each subprog
+ * have.
+ */
+static int retarget_may_gotos(struct bpf_verifier_env *env, const int *added)
+{
+	struct bpf_patch_list *pl = &env->patch_list;
+	const struct bpf_subprog_info *sub;
+	struct bpf_insn *insn;
+	int i, s, pad;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++) {
+			if (!env->insn_aux_data[i].pad_plans)
+				continue;
+			pad = unit_pad(env, i, BPF_SITE_MAY_GOTO);
+			if (pad < 0)
+				continue;
+			if (bpf_must_abort())
+				return -EINTR;
+			/* one insn for one, but queued: the list finds the offset, however far */
+			insn = __bpf_patch_list_add(pl, env->prog, i, &env->prog->insnsi[i], 1);
+			if (IS_ERR(insn))
+				return PTR_ERR(insn);
+			bpf_patch_list_jump(pl, insn, sub[1].start - added[s] + pad, 0);
+		}
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
+ * Add the stores that keep the hidden slots up to date, see kernel/bpf/pads.c. @buf has room for
+ * BPF_PAD_MAX_SLOT_INSNS. @added: how many insns the pads after each subprog have. Only they read
+ * the slots.
+ * What goes before a call is patched in with the call: jumps to the call go through it. The
+ * guard of the call is there already and stays in front: the frame is not left between a store and
+ * its call. What follows a call is appended behind it: jumps to the next insn go past it, as they
+ * go past the call. unwind_goto that the verifier adds comes later and goes between the call and
+ * the store.
+ * The stores at the entry are inserted before the first insn: calls get there, jumps back
+ * to that insn do not. They stand after the insn that takes the frame in the stack in arena, which
+ * bpf_insert_recursion_checks() expects to be the first one.
+ */
+static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf, const int *added)
+{
+	const struct bpf_pad_note *notes[BPF_PAD_MAX_ENTS];
+	const struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	const struct bpf_subprog_info *sub;
+	const struct bpf_insn *insn, *last;
+	int i, s, n, nr, call, entry, err;
+
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		/* a mixed function clears K where the slots are, see bpf_pad_entry_insns() */
+		if ((!sub->slots && !bpf_subprog_clears_k(sub)) || !added[s])
+			continue;
+		nr = sub->slots ? bpf_pad_slot_notes(env, s, notes) : 0;
+		if (nr < 0)
+			return nr;
+		entry = sub->start + is_arena_sp_adj(&env->prog->insnsi[sub->start]);
+		for (i = sub->start; i < sub[1].start; i++) {
+			insn = &env->prog->insnsi[i];
+			/* the patches are queued in the order of the insns */
+			n = 0;
+			if (i == entry && i > sub->start)
+				n = bpf_pad_entry_insns(sub, notes, nr, buf);
+			/* nothing stands between a call and unwind_goto of the program */
+			call = i - 1 - (i > sub->start && bpf_is_unwind_goto(insn - 1));
+			if (call >= (int)sub->start && !bpf_is_unwind_goto(insn))
+				n += bpf_pad_insns_after(sub, notes, nr, aux[call].pad_note, &buf[n]);
+			err = n ? bpf_patch_list_append(env, i - 1, buf, n) : 0;
+			if (err)
+				return err;
+			n = bpf_pad_insns_before(sub, notes, nr, aux[i].pad_note, buf);
+			buf[n] = *insn;
+			last = n ? bpf_patch_list_add(env, i, buf, n + 1) : NULL;
+			if (IS_ERR(last))
+				return PTR_ERR(last);
+			n = i == entry && i == sub->start ?
+			    bpf_pad_entry_insns(sub, notes, nr, buf) : 0;
+			err = n ? bpf_patch_list_insert(env, i, buf, n) : 0;
+			if (err)
+				return err;
+		}
+	}
+	return bpf_patch_list_commit(env);
+}
+
+/*
+ * Emit what the main pass decided about the sites: may_goto before the insns that it
+ * marked, see check_loop_guard(), unwind_goto after calls and after accesses to arena, a jump in
+ * place of a call of bpf_throw(), the landing pads, the stores to the hidden slots that the pads
+ * read, and the pad as the target of may_goto that the program has, see check_may_goto_site().
+ * What a pad does it did to the states that left the frame at the site, see unwind_frame().
+ *
+ *	may_goto pad
+ *	insn
+ *	...
+ *	last insn of the subprog
+ * pad:	the releases
+ *	r0 = bpf_unwound_retval()
+ *	exit
+ *
+ * bpf_do_misc_fixups() keeps the address of the count of may_goto in a register that is
+ * dead at the may_goto. What is live in front of the insn is live in front of its guard.
+ * Nothing else is: a landing pad reads places, which are live before the insn.
+ */
+int bpf_insert_sites(struct bpf_verifier_env *env)
+{
+	struct bpf_insn unwind_goto = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0);
+	struct bpf_insn patch[2] = { BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0, 0) };
+	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux, *unit_aux;
+	struct bpf_insn *new, *insn;
+	struct pad_buf pads = {};
+	struct bpf_subprog_info *sub;
+	int i, k, s, n, cnt, base, err = 0;
+	struct pad_unit unit;
+	int *added, *stubbed;
+
+	/* how many insns the pads after the subprog have, and how many of its unwind_goto a stub */
+	added = kvzalloc_objs(int, env->subprog_cnt, BPF_VERIFIER_GFP);
+	stubbed = kvzalloc_objs(int, env->subprog_cnt, BPF_VERIFIER_GFP);
+	new = kvzalloc_objs(*new, max(PAD_UNIT_MAX_INSNS, BPF_PAD_MAX_SLOT_INSNS + 1),
+			    BPF_VERIFIER_GFP);
+	pad_aux = kvzalloc_objs(*pad_aux, PAD_UNIT_MAX_INSNS, BPF_VERIFIER_GFP);
+	unit_aux = kvzalloc_objs(*unit_aux, PAD_UNIT_MAX_INSNS, BPF_VERIFIER_GFP);
+	if (!added || !stubbed || !new || !pad_aux || !unit_aux) {
+		err = -ENOMEM;
+		goto out;
+	}
+	err = bpf_mark_subprogs_that_unwind(env, false);
+	if (err)
+		goto out;
+	env->prog->aux->can_unwind = env->subprog_info[0].can_unwind ||
+				     env->subprog_info[0].can_kunwind;
+	for (s = 0; s < env->subprog_cnt && !err; s++) {
+		sub = &env->subprog_info[s];
+		cnt = collect_pads(env, s, new, pad_aux, &pads, &stubbed[s]);
+		if (cnt < 0) {
+			err = cnt;
+			break;
+		}
+		/* see emit_pad() */
+		if (verifier_bug_if(cnt && !bpf_may_unwind(env), env,
+				    "func#%d has landing pads without CAP_PERFMON", s)) {
+			err = -EFAULT;
+			break;
+		}
+		added[s] = cnt;
+		for (i = sub->start; i < sub[1].start; i++) {
+			if (aux[i].loop_guard) {
+				/* A jump to itself is a back edge. It goes through may_goto too. */
+				patch[1] = env->prog->insnsi[i];
+				insn = bpf_patch_list_add(env, i, patch, 2);
+				if (IS_ERR(insn)) {
+					err = PTR_ERR(insn);
+					goto out;
+				}
+				/* however far the pad is, see bpf_patch_list_jump() */
+				bpf_patch_list_jump(&env->patch_list, insn - 1, sub[1].start,
+						    cnt - unit_pad(env, i, BPF_SITE_GUARD));
+			}
+			if (!aux[i].kstub || aux[i].kstub == BPF_KSTUB_NONE)
+				continue;
+			/*
+			 * unwind_goto of the program that goes to a stub takes the form that has 32
+			 * bits here already. Its stub goes where the insn goes when the pads are in
+			 * the program, see fill_stub(), and that has to be the landing pad itself,
+			 * for every unwind_goto that shares the stub. With 16 bits it can be a jump
+			 * of the insn's own instead: when a jump anywhere in the program is too
+			 * far, each jump that may be too far then gets one, see
+			 * patch_image_relax().
+			 */
+			insn = __bpf_patch_list_add(&env->patch_list, env->prog, i, &unwind_goto,
+						    1);
+			if (IS_ERR(insn)) {
+				err = PTR_ERR(insn);
+				goto out;
+			}
+			bpf_patch_list_jump(&env->patch_list, insn,
+					    i + 1 + bpf_jmp_offset(&env->prog->insnsi[i]), 0);
+		}
+		if (cnt)
+			err = bpf_patch_list_append(env, i - 1, pads.insns, cnt);
+	}
+	err = err ?: bpf_patch_list_commit(env);
+	if (err)
+		goto out;
+	/* the insns of the pads have aux data now, and a pad is where it was appended */
+	aux = env->insn_aux_data;
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		for (i = sub->start; added[s] && i < sub[1].start - added[s]; i++) {
+			err = aux[i].pad_plans && bpf_must_abort() ? -EINTR :
+			      fill_stub(env, s, i, sub[1].start - added[s]);
+			if (err)
+				goto out;
+			for (base = 0; aux[i].pad_plans && base <= BPF_SITE_REMAINDER; base++) {
+				if (!site_unit(env, i, base, &unit))
+					continue;
+				cnt = sub[1].start - added[s] + (unit.plan ?: unit.forced)->pad;
+				n = emit_unit(env, s, base, &unit, new, unit_aux, pad_aux);
+				/*
+				 * The unit is emitted a second time, for its aux data. What stands
+				 * in the program is what collect_pads() made of the same plans: an
+				 * entry that tests K there and not here, or the other way round,
+				 * must not load. The aux data go to the program when that is
+				 * known, not before: a unit that is another one could have more
+				 * insns than there are behind its place.
+				 */
+				if (verifier_bug_if(cnt + n > sub[1].start ||
+						    memcmp(new, &env->prog->insnsi[cnt],
+							   n * sizeof(*new)), env,
+						    "the pad of insn %d is not the one at insn %d",
+						    i, cnt)) {
+					err = -EFAULT;
+					goto out;
+				}
+				for (k = 0; k < n; k++)
+					copy_pad_aux(&aux[cnt + k], &unit_aux[k]);
+				memset(unit_aux, 0, n * sizeof(*unit_aux));
+				insn = &env->prog->insnsi[i];
+				if (base == BPF_SITE_FAULT && aux[i].fault_unwinds)
+					sub->fault_pad = cnt;
+				/*
+				 * No call is made, see check_kfunc_call(). And unwind_exit that a
+				 * frame gets to while the kernel unwinds it tests K first.
+				 */
+				if (base == BPF_SITE_THROW || base == BPF_SITE_REMAINDER)
+					*insn = BPF_JMP32_A(cnt - i - 1);
+				/*
+				 * The entry goes where unwind_goto of the program goes, also
+				 * behind what the passes that follow put in front of the pad.
+				 */
+				if (base == BPF_SITE_KENTRY)
+					env->prog->insnsi[cnt + n - 1].imm =
+						i + 2 + bpf_jmp_offset(insn + 1) - (cnt + n);
+			}
+		}
+		/* the only calls of a subprog in pads, see emit_pad() */
+		for (insn = &env->prog->insnsi[i]; added[s] && i < sub[1].start; i++, insn++)
+			if (bpf_pseudo_call(insn))
+				insn->imm = env->subprog_info[env->exception_callback_subprog].start -
+					    i - 1;
+	}
+	err = insert_slot_stores(env, new, added);
+	err = err ?: insert_unwind_gotos(env, added, stubbed);
+	err = err ?: retarget_may_gotos(env, added);
+out:
+	kvfree(added);
+	kvfree(stubbed);
+	kvfree(new);
+	kvfree(pad_aux);
+	kvfree(unit_aux);
+	kvfree(pads.insns);
+	kvfree(pads.ends);
+	kvfree(pads.index.slots);
+	return err;
 }
 
 /*
@@ -683,8 +1705,8 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  *	if (r10 is in the upper half of the kernel stack) goto body;
  *	bpf_prog_report_recursion();
  * bail:
- *	r0 = 0;
- *	exit;
+ *	r0 = bpf_unwound_retval();
+ *	unwind_exit;
  * body:
  *
  * It is the stack as it is: whatever is there is counted, be it the callers of the prog in the
@@ -696,8 +1718,7 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  * check_max_stack_depth() looked at together with that frame.
  *
  * A subprog that calls itself twice doesn't have to go deep to go on forever: hence may_goto.
- * Once the time slice of the invocation is over every call returns at once, and the frames
- * that are there come to an end.
+ * Once the time slice of the invocation is over the next call unwinds the program.
  */
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 {
@@ -771,6 +1792,9 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 		free_loop(aux_data[i].callback_loop);
 		free_loop(aux_data[i].recursion_loop);
 		aux_data[i].loop = aux_data[i].callback_loop = aux_data[i].recursion_loop = NULL;
+		env->mem -= bpf_pad_plans_free(&aux_data[i]);
+		env->mem -= bpf_pad_note_free(aux_data[i].pad_note);
+		aux_data[i].pad_note = NULL;
 	}
 }
 
@@ -798,18 +1822,27 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	struct bpf_insn trap = BPF_JMP_IMM(BPF_JA, 0, 0, -1);
 	struct bpf_insn *insn = env->prog->insnsi;
 	const int insn_cnt = env->prog->len;
-	bool unwinds, calls;
-	int i;
+	bool unwinds, calls, traps;
+	int i, callee;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		unwinds = bpf_is_unwind_goto(insn) && aux_data[i + 1 + insn->off].seen;
+		unwinds = bpf_is_pad_goto(insn) && aux_data[i + 1 + bpf_jmp_offset(insn)].seen;
 		calls = (bpf_pseudo_call(insn) || bpf_is_callx(insn)) && aux_data[i].seen;
 		/*
-		 * The callee never exits. Its unwind_exit needs unwind_goto all the same.
+		 * The callee never exits. Its unwind_exit needs unwind_goto all the same, and
+		 * its kexit needs kgoto.
 		 * The cpu predicts that it returns to what follows, or speculates to an exit.
 		 * Don't let the removal of dead code put something else there.
+		 * Behind a call of a subprog that does not return, see bpf_compute_might_return(),
+		 * the trap stands whoever loads the program: what the pass did not go on to must
+		 * not be where a return from that call gets to, should one ever get there.
 		 */
-		if ((unwinds || (calls && !env->bypass_spec_v1)) && !aux_data[i + 1].seen) {
+		traps = calls && !env->bypass_spec_v1;
+		if (calls && !traps && bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, i + insn->imm + 1);
+			traps = callee >= 0 && !env->subprog_info[callee].might_return;
+		}
+		if ((unwinds || traps) && !aux_data[i + 1].seen) {
 			memcpy(insn + 1, &trap, sizeof(trap));
 			aux_data[i + 1].zext_dst = false;
 			aux_data[i + 1].seen = env->check_cnt;
@@ -817,9 +1850,10 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 		if (unwinds || !aux_data[i].seen || !bpf_insn_is_cond_jump(insn->code))
 			continue;
 
+		/* unwind_goto of the program that kgoto follows has its offset in imm */
 		if (!aux_data[i + 1].seen)
 			ja.off = insn->off;
-		else if (!aux_data[i + 1 + insn->off].seen)
+		else if (!aux_data[i + 1 + bpf_jmp_offset(insn)].seen)
 			ja.off = 0;
 		else
 			continue;
@@ -899,6 +1933,42 @@ static bool insn_is_nop(struct bpf_verifier_env *env, int i, int next)
 	       !memcmp(&insn, &MAY_GOTO_0, sizeof(MAY_GOTO_0));
 }
 
+/*
+ * addr_space_cast of a register into itself is removed if what the main pass finds there is a
+ * pointer that is not in arena, see bpf_lower_cast_mov()
+ */
+static bool cast_may_be_nop(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
+	       insn->off == BPF_ADDR_SPACE_CAST && insn->dst_reg == insn->src_reg;
+}
+
+/*
+ * may_goto that jumps over nothing, or over nothing but insns like itself, does nothing:
+ * bpf_opt_remove_nops() removes it. clang makes such insns of a loop with can_loop that it unrolls.
+ * The main pass is told now, see check_may_goto_site(): they are no sites.
+ * A cast that may be removed counts as nothing too. If it stays, so does may_goto that jumps over
+ * it, and it jumps where the program says: no site is always right, it is what the insn was before
+ * the verifier unwound programs.
+ */
+void bpf_mark_may_goto_nops(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insns = env->prog->insnsi, insn;
+	int i, next;
+
+	for (i = env->prog->len - 1, next = env->prog->len; i >= 0; i--) {
+		if (cast_may_be_nop(&insns[i]))
+			continue;
+		insn = insns[i];
+		insn.off = 0;
+		if (insns[i].off < 0 || i + 1 + insns[i].off > next ||
+		    (memcmp(&insn, &NOP, sizeof(NOP)) && memcmp(&insn, &MAY_GOTO_0, sizeof(insn))))
+			next = i;
+		else
+			env->insn_aux_data[i].may_goto_nop = bpf_is_may_goto_insn(&insn);
+	}
+}
+
 /* addr_space_cast of a pointer that is not in arena is a move, see is_cast_mov() */
 void bpf_lower_cast_mov(struct bpf_verifier_env *env)
 {
@@ -925,7 +1995,6 @@ void bpf_lower_cast_mov(struct bpf_verifier_env *env)
  *  - the main program takes a stack when it starts and returns it when it exits:
  *    the stack of the cpu when it's free, without a call.
  *    See struct bpf_arena_cpu_stack. So does a callback.
- *    bpf_throw() doesn't return it: the stack stays taken until the arena is freed.
  *  - a function that has a frame drops it before exit.
  *  - 'rX = r12' gives the address like user space sees it, as other addresses
  *    in arena are.
@@ -1030,7 +2099,7 @@ int bpf_insert_arena_stack(struct bpf_verifier_env *env)
 	struct bpf_insn *insn_buf = env->insn_buf, *patch, *insn;
 	struct bpf_prog_aux *aux = env->prog->aux;
 	struct bpf_insn ld_aux[2] = { BPF_LD_IMM64(BPF_REG_1, (long)aux) };
-	int i, cur = 0, err;
+	int i, cur = 0, err, reg;
 
 	if (!env->uses_arena_sp)
 		return 0;
@@ -1061,11 +2130,15 @@ int bpf_insert_arena_stack(struct bpf_verifier_env *env)
 				*patch++ = BPF_ALU32_IMM(BPF_ADD, BPF_REG_ARENA_SP,
 							 -(int)subprogs[cur].arena_stack_depth);
 			if (!cur || subprogs[cur].arena_stack_entry) {
-				/* r1-r5 are free */
+				/*
+				 * r1-r5 are free. But for R2 in front of kexit, which is 0
+				 * there, see bpf_pad_insns(): it stays 0 on both ways.
+				 */
+				reg = bpf_is_kexit(insn) ? BPF_REG_1 : BPF_REG_2;
 				*patch++ = BPF_JMP32_IMM(BPF_JSET, BPF_REG_ARENA_SP,
 							 BPF_ARENA_STACK_SLOW, 5);
-				patch = emit_arena_stack_percpu(env, patch, BPF_REG_2);
-				*patch++ = BPF_ST_MEM(BPF_DW, BPF_REG_2, CPU_STACK_OFF(busy), 0);
+				patch = emit_arena_stack_percpu(env, patch, reg);
+				*patch++ = BPF_ST_MEM(BPF_DW, reg, CPU_STACK_OFF(busy), 0);
 				*patch++ = *insn;
 				*patch++ = BPF_MOV64_REG(BPF_REG_6, BPF_REG_0);
 				*patch++ = ld_aux[0];
@@ -1073,6 +2146,8 @@ int bpf_insert_arena_stack(struct bpf_verifier_env *env)
 				*patch++ = BPF_MOV64_REG(BPF_REG_2, BPF_REG_ARENA_SP);
 				*patch++ = BPF_EMIT_KERNEL_CALL(bpf_arena_stack_put);
 				*patch++ = BPF_MOV64_REG(BPF_REG_0, BPF_REG_6);
+				if (bpf_is_kexit(insn))
+					*patch++ = BPF_MOV64_IMM(BPF_REG_2, 0);
 			}
 			if (patch != insn_buf)
 				*patch++ = *insn;
@@ -1135,7 +2210,7 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 	struct bpf_insn *zext_patch = env->insn_buf;
 	struct bpf_insn *rnd_hi32_patch = &env->insn_buf[2];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int i, patch_len, len = env->prog->len;
+	int i, err, patch_len, gotos, len = env->prog->len;
 	struct bpf_insn *insns = env->prog->insnsi;
 	bool rnd_hi32;
 
@@ -1210,6 +2285,18 @@ int bpf_opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
 		patch = zext_patch;
 		patch_len = 2;
 apply_patch_buffer:
+		/*
+		 * Nothing stands between an insn and its unwind_goto and kgoto. On the way to
+		 * the landing pad the insn has not written the register.
+		 */
+		gotos = bpf_is_pad_goto(&insns[i + 1]);
+		gotos += gotos && bpf_is_pad_goto(&insns[i + 2]);
+		if (gotos) {
+			err = bpf_patch_list_insert(env, i + 1 + gotos, patch + 1, patch_len - 1);
+			if (err)
+				return err;
+			continue;
+		}
 		patch = bpf_patch_list_add(env, i, patch, patch_len);
 		if (IS_ERR(patch))
 			return PTR_ERR(patch);
@@ -1372,6 +2459,10 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env)
 			    insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW)) &&
 			   env->insn_aux_data[i].ptr_type == PTR_TO_ARENA) {
 			insn->code = BPF_STX | BPF_PROBE_ATOMIC | BPF_SIZE(insn->code);
+			env->prog->aux->num_exentries++;
+			continue;
+		} else if (bpf_is_pad_goto(insn)) {
+			/* jit_subprogs() counts again, a prog of one function doesn't get there */
 			env->prog->aux->num_exentries++;
 			continue;
 		} else if (insn->code == (BPF_STX | BPF_ATOMIC | BPF_DW) &&
@@ -1759,19 +2850,18 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 			if (BPF_CLASS(insn->code) == BPF_STX &&
 			     BPF_MODE(insn->code) == BPF_PROBE_ATOMIC)
 				num_exentries++;
-			if (bpf_is_unwind_goto(insn))
+			if (bpf_is_pad_goto(insn))
 				num_exentries++;
 		}
 		func[i]->aux->num_exentries = num_exentries;
 		func[i]->aux->tail_call_reachable = env->subprog_info[i].tail_call_reachable;
-		func[i]->aux->exception_cb = env->subprog_info[i].is_exception_cb;
 		func[i]->aux->changes_pkt_data = env->subprog_info[i].changes_pkt_data;
 		func[i]->aux->might_sleep = env->subprog_info[i].might_sleep;
-		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind;
+		/* with unwind_exit or with kexit: what attaches to it asks, not which */
+		func[i]->aux->can_unwind = env->subprog_info[i].can_unwind ||
+					   env->subprog_info[i].can_kunwind;
 		func[i]->aux->in_recursion = env->subprog_info[i].in_recursion;
 		func[i]->aux->token = prog->aux->token;
-		if (!i)
-			func[i]->aux->exception_boundary = env->seen_exception;
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -1802,8 +2892,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		 * the imm field of a call has the subprog id, an index for this list
 		 */
 		func[i]->aux->func = func;
-		func[i]->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
-		func[i]->aux->real_func_cnt = env->subprog_cnt;
+		func[i]->aux->func_cnt = env->subprog_cnt;
 	}
 	for (i = 0; i < env->subprog_cnt; i++) {
 		old_bpf_func = func[i]->bpf_func;
@@ -1858,12 +2947,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->jited_len = func[0]->jited_len;
 	prog->aux->extable = func[0]->aux->extable;
 	prog->aux->num_exentries = func[0]->aux->num_exentries;
+	prog->aux->fault_pad = func[0]->aux->fault_pad;
 	prog->aux->func = func;
-	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
-	prog->aux->real_func_cnt = env->subprog_cnt;
-	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
-	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
-	prog->aux->stack_arg_sp_adjust = func[0]->aux->stack_arg_sp_adjust;
+	prog->aux->func_cnt = env->subprog_cnt;
+	prog->aux->exception_callback_subprog = env->exception_callback_subprog;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
@@ -1945,6 +3032,116 @@ out_cleanup:
 	return err;
 }
 
+/* A load from arena, a store to it, or an atomic insn there: the code of it can fault */
+static bool is_arena_access(const struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
+
+	if (class == BPF_LDX)
+		return mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX;
+	if (class == BPF_ST)
+		return mode == BPF_PROBE_MEM32;
+	return class == BPF_STX && (mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_ATOMIC);
+}
+
+/* A call of any kind: what it calls returns to the insn behind it */
+static bool is_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) || bpf_is_callx(insn);
+}
+
+/* The exception table can have an entry at the end of the insn: a call, an access to arena */
+static bool can_have_unwind_goto(const struct bpf_insn *insn)
+{
+	return is_call(insn) || is_arena_access(insn);
+}
+
+/*
+ * A jump with an offset, see bpf_jmp_offset(): also may_goto, unwind_goto and kgoto. Not gotox, and
+ * not the tail call that bpf_do_misc_fixups() has made of the call of the helper: it has no
+ * offset, and what is taken leaves the program.
+ */
+static bool insn_goes_to(const struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+
+	if (class != BPF_JMP && class != BPF_JMP32)
+		return false;
+	return op != BPF_CALL && op != BPF_EXIT && op != BPF_TAIL_CALL &&
+	       !(op == BPF_JA && BPF_SRC(insn->code) == BPF_X);
+}
+
+/*
+ * unwind_goto is no code. It is an entry of the exception table, which a JIT keys at the end of
+ * the insn in front: a call, or an access to arena. No pass may put anything between the two.
+ * After a call that would be a lost unwind_exit, which bpf_unwind_target() warns about when it
+ * happens. After an access nothing would tell: a fault finds no entry, see
+ * bpf_fault_unwind_target(), and the access is skipped as if no pad had been planned for it.
+ * So look at the insns once they are final, from both sides: unwind_goto has such an insn in
+ * front, and such an insn that the verifier gave unwind_goto still has it behind. An insn that a
+ * pass has replaced by other code is no site any more: the inlined bpf_loop() has unwind_goto of
+ * its own, see inline_bpf_loop().
+ * kgoto is the same for kexit. It stands behind a call, or behind unwind_goto of a call. Not behind
+ * an access to arena: the handler of a fault looks for unwind_goto there. kexit is in no frame
+ * that the kernel calls: the main program leaves with exit. A call that the verifier gave kgoto
+ * still has it, behind unwind_goto if there is one.
+ * Neither of the two is a place to go to. Where the call has code behind it, like 'pop r9' on
+ * x86-64, the JIT emits that code once more on the way to each pad, in a landing. A JIT may put
+ * the landings where the insns are: then the place of kgoto behind unwind_goto is the way of
+ * kexit, and what goes there does the code of the call a second time. x86-64 and arm64 put them
+ * behind the function, and the rule is the same for all. A pad that is the insn behind the two is
+ * named by unwind_goto +1, see emit_pad(). So no jump of any kind goes to kgoto behind
+ * unwind_goto, and unwind_goto and kgoto go to neither of the two.
+ */
+int bpf_check_unwind_gotos(struct bpf_verifier_env *env)
+{
+	const struct bpf_insn *insns = env->prog->insnsi, *insn = insns;
+	int i, to, len = env->prog->len;
+	bool bad;
+
+	for (i = 0; i < len; i++, insn++) {
+		if (insn_goes_to(insn)) {
+			to = i + 1 + bpf_jmp_offset(insn);
+			bad = to < 0 || to >= len;
+			if (!bad && bpf_is_pad_goto(insn))
+				bad = bpf_is_pad_goto(&insns[to]);
+			else if (!bad)
+				bad = to && bpf_is_kgoto(&insns[to]) &&
+				      bpf_is_unwind_goto(&insns[to - 1]);
+			if (verifier_bug_if(bad, env,
+					    "insn %d goes to unwind_goto or kgoto at insn %d", i, to))
+				return -EFAULT;
+		}
+		if (bpf_is_unwind_goto(insn) &&
+		    verifier_bug_if(!i || !can_have_unwind_goto(insn - 1), env,
+				    "unwind_goto at insn %d follows no call and no access to arena",
+				    i))
+			return -EFAULT;
+		if (bpf_is_kgoto(insn) &&
+		    verifier_bug_if(!i || !(is_call(insn - 1) ||
+					    (i > 1 && bpf_is_unwind_goto(insn - 1) &&
+					     is_call(insn - 2))), env,
+				    "kgoto at insn %d follows no call", i))
+			return -EFAULT;
+		if (bpf_is_kexit(insn) &&
+		    verifier_bug_if(i < env->subprog_info[1].start, env,
+				    "kexit at insn %d of the main program", i))
+			return -EFAULT;
+		if (env->insn_aux_data[i].unwind_goto_follows && can_have_unwind_goto(insn) &&
+		    verifier_bug_if(i + 1 == len || !bpf_is_unwind_goto(insn + 1), env,
+				    "insn %d has lost its unwind_goto", i))
+			return -EFAULT;
+		if (env->insn_aux_data[i].kgoto_follows && is_call(insn) &&
+		    verifier_bug_if(i + 1 == len ||
+				    !(bpf_is_kgoto(insn + 1) ||
+				      (bpf_is_unwind_goto(insn + 1) && i + 2 < len &&
+				       bpf_is_kgoto(insn + 2))), env,
+				    "insn %d has lost its kgoto", i))
+			return -EFAULT;
+	}
+	return 0;
+}
+
 int bpf_fixup_call_args(struct bpf_verifier_env *env)
 {
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
@@ -2004,31 +3201,6 @@ int bpf_fixup_call_args(struct bpf_verifier_env *env)
 	err = 0;
 #endif
 	return err;
-}
-
-static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *patch, int len)
-{
-	struct bpf_subprog_info *info = env->subprog_info;
-	int err, cnt = env->subprog_cnt;
-	struct bpf_prog *prog;
-
-	/* We only reserve one slot for hidden subprogs in subprog_info. */
-	if (env->hidden_subprog_cnt) {
-		verifier_bug(env, "only one hidden subprog supported");
-		return -EFAULT;
-	}
-	err = bpf_patch_list_append(env, env->prog->len - 1, patch, len) ?:
-	      bpf_patch_list_commit(env);
-	if (err)
-		return err;
-	prog = env->prog;
-	info[cnt + 1].start = info[cnt].start;
-	info[cnt].start = prog->len - len;
-	/* The patch ends with the exit. */
-	info[cnt].exit_idx = prog->len - 1;
-	env->subprog_cnt++;
-	env->hidden_subprog_cnt++;
-	return 0;
 }
 
 /*
@@ -2273,22 +3445,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	/* arch_bpf_timed_may_goto() takes and returns AX in a cpu register: for JITs only */
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
-
-	if (env->seen_exception && !env->exception_callback_subprog) {
-		struct bpf_insn *patch = insn_buf;
-
-		*patch++ = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);
-		*patch++ = BPF_EXIT_INSN();
-		ret = add_hidden_subprog(env, insn_buf, patch - insn_buf);
-		if (ret < 0)
-			return ret;
-		prog = env->prog;
-		insn = prog->insnsi;
-
-		env->exception_callback_subprog = env->subprog_cnt - 1;
-		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
-		bpf_mark_subprog_exc_cb(env, env->exception_callback_subprog);
-	}
 
 	for (i = 0; i < insn_cnt;) {
 		if (is_addr_space_cast32(env->prog, insn)) {
@@ -3131,6 +4287,29 @@ next_insn:
 				 * The time is up, but the helper would call the function again and
 				 * again. End its loop. The verifier has seen that: the loop can end
 				 * after each call.
+				 *
+				 * This is the one place where time that is up does not end the
+				 * program, also where every frame can unwind, see
+				 * check_may_goto_site(): the helper returns the number of calls
+				 * that it made, and the program goes on with that until its next
+				 * may_goto. It gets here when no may_goto runs between the one that
+				 * found the time up, which falls through, and this entry.
+				 *
+				 * The check is no site, as may_goto of the program is one, because
+				 * what carries that one does not carry it:
+				 *  - A site is an insn of the program at which every frame of a
+				 *    subprog is left, one answer per subprog. No insn stands for
+				 *    this check in the main pass, and it is a way out of a frame
+				 *    only if a loop helper called: it would take a visit where
+				 *    such a helper enters its callback, and a kind of its own.
+				 *  - That only loop helpers call the subprog is known when the
+				 *    pass is over. 'stuck' hands "cannot unwind" to the run that
+				 *    follows. Nothing hands this on.
+				 *  - Whether the program has a timed may_goto at all is known
+				 *    here, after the landing pads were emitted.
+				 *  - Each call of such a helper would be a call that the kernel
+				 *    unwinds through, with a landing pad in its caller, in every
+				 *    program that has a may_goto anywhere.
 				 */
 				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
 							      count_off);
@@ -3174,19 +4353,56 @@ next_insn:
 	return 0;
 }
 
+/*
+ * When the callback can unwind and unwind_goto follows the call of bpf_loop,
+ * unwind_goto follows the call of the callback, and the pad restores r6-r8 and
+ * jumps to the pad after the call of bpf_loop with the r0 of the callback, which
+ * the verifier has checked with the state of that r0. That pad has to be one the
+ * verifier saw: a loop of no rounds never runs its callback, and an unwind_exit
+ * may sit on a path never taken, so the pad can be dead, and dead code is
+ * removed after the inlining, which sends a jump into it to whatever follows.
+ * The unwind_goto that followed the call of bpf_loop doesn't follow a call
+ * anymore and becomes a no-op jump either way. A loop of no rounds may have no
+ * unwind_goto at all, since the verifier asked for none, and then the insn after
+ * the call is some other insn.
+ *
+ * kgoto after the call of bpf_loop is the same for kexit of the callback: a pad
+ * of its own, which goes where that kgoto went. The verifier emitted the pad
+ * that it goes to, so it is not dead code. The callback may have no kexit yet:
+ * bpf_insert_recursion_checks() adds the one of the check of a recursive
+ * callback when the loop is inlined already. With both there are two pads, one
+ * per way in which the callback is left, and neither is on the normal path.
+ */
 static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 			   s32 stack_base, u32 callback_subprogno)
 {
+	const struct bpf_subprog_info *cb = &env->subprog_info[callback_subprogno];
 	s32 r6_offset = stack_base + 0 * BPF_REG_SIZE;
 	s32 r7_offset = stack_base + 1 * BPF_REG_SIZE;
 	s32 r8_offset = stack_base + 2 * BPF_REG_SIZE;
 	int reg_loop_max = BPF_REG_6;
 	int reg_loop_cnt = BPF_REG_7;
 	int reg_loop_ctx = BPF_REG_8;
+	struct bpf_insn *unwind_goto = &env->prog->insnsi[position + 1], *kgoto;
+	bool has_unwind_goto = bpf_is_unwind_goto(unwind_goto);
+	int pad_off = bpf_jmp_offset(unwind_goto);
+	bool pad = has_unwind_goto && cb->can_unwind &&
+		   env->insn_aux_data[position + 2 + pad_off].seen;
+	bool has_kgoto, kpad;
+	/* where each pad goes: the insn of the old image */
+	int to[2], npads = 0, i, off;
 
 	struct bpf_insn *insn_buf = env->insn_buf;
 	struct bpf_insn *last;
-	u32 cnt = 0;
+	u32 cnt = 0, call;
+
+	kgoto = unwind_goto + has_unwind_goto;
+	has_kgoto = bpf_is_kgoto(kgoto);
+	kpad = has_kgoto && bpf_subprog_kunwinds(cb);
+	if (pad)
+		to[npads++] = position + 2 + pad_off;
+	if (kpad)
+		to[npads++] = kgoto - env->prog->insnsi + 1 + bpf_jmp_offset(kgoto);
 
 	/* This represents an inlined version of bpf_iter.c:bpf_loop,
 	 * be careful to modify this code in sync.
@@ -3195,9 +4411,20 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* Return error and jump to the end of the patch if
 	 * expected number of iterations is too big.
 	 */
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, 2);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, 2 + 4 * npads);
 	insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, -E2BIG);
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, 16);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, 16 + 5 * npads);
+	for (i = 0; i < npads; i++) {
+		/*
+		 * A pad: r0 is what the callback left with. Nothing falls through to this
+		 * place, so no jump around the pad is needed.
+		 */
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, r6_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_10, r7_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_10, r8_offset);
+		/* to the pad of the caller, the target is set below */
+		insn_buf[cnt++] = BPF_JMP32_A(0);
+	}
 	/* spill R6, R7, R8 to use these as loop vars */
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, r6_offset);
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_7, r7_offset);
@@ -3209,15 +4436,28 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* loop header,
 	 * if reg_loop_cnt >= reg_loop_max skip the loop body
 	 */
-	insn_buf[cnt++] = BPF_JMP_REG(BPF_JGE, reg_loop_cnt, reg_loop_max, 5);
+	insn_buf[cnt++] = BPF_JMP_REG(BPF_JGE, reg_loop_cnt, reg_loop_max, 5 + npads);
 	/* callback call, the offset is set below */
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_1, reg_loop_cnt);
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_2, reg_loop_ctx);
+	call = cnt;
 	insn_buf[cnt++] = BPF_CALL_REL(0);
+	/*
+	 * To the pads above: when the callback left with unwind_exit, and when it left with
+	 * kexit. The first pad is insn 3 of the patch, each has 4 insns.
+	 */
+	if (pad) {
+		off = 3 - (int)cnt - 1;
+		insn_buf[cnt++] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, off, 0);
+	}
+	if (kpad) {
+		off = 3 + 4 * (npads - 1) - (int)cnt - 1;
+		insn_buf[cnt++] = BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_KGOTO, 0, off);
+	}
 	/* increment loop counter */
 	insn_buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, reg_loop_cnt, 1);
 	/* jump to loop header if callback returned 0 */
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, -6);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, -6 - npads);
 	/* return value of bpf_loop,
 	 * set R0 to the number of iterations
 	 */
@@ -3230,9 +4470,21 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	last = bpf_patch_list_add(env, position, insn_buf, cnt);
 	if (IS_ERR(last))
 		return PTR_ERR(last);
-	/* insn_buf[12] is the BPF_CALL_REL instruction */
-	bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - 12),
+	/* the BPF_CALL_REL instruction */
+	bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - call),
 			    env->subprog_info[callback_subprogno].start, 0);
+	/*
+	 * The last insn of a pad goes where the unwind_goto or the kgoto after the call of
+	 * bpf_loop goes, whichever side of the call that is. A long jump, since they may jump
+	 * as far as a jump can.
+	 */
+	for (i = 0; i < npads; i++)
+		bpf_patch_list_jump(&env->patch_list, last - (cnt - 1 - (6 + 4 * i)), to[i], 0);
+	/* The unwind_goto and the kgoto after the call of bpf_loop follow no call anymore. */
+	if (has_unwind_goto)
+		*unwind_goto = BPF_JMP_A(0);
+	if (has_kgoto)
+		*kgoto = BPF_JMP_A(0);
 	return 0;
 }
 

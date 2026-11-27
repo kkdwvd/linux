@@ -325,9 +325,19 @@ __naked void arena_ldsx_disasm(void *ctx)
 	);
 }
 
+/*
+ * The store faults. Where the JIT can unwind that ends the prog, with the value of an unwound prog
+ * of its type, -ECANCELED. Elsewhere the store is skipped, and the load that follows reads 0.
+ */
+#if defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64)
+#define ARENA_FAULT_RETVAL	-125
+#else
+#define ARENA_FAULT_RETVAL	0
+#endif
+
 SEC("syscall")
 __description("Arena LDSX Exception")
-__success __retval(0)
+__success __retval(ARENA_FAULT_RETVAL)
 __arch_x86_64
 __arch_arm64
 __arch_riscv64

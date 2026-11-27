@@ -184,6 +184,8 @@ char __arena arr1[100000];
 char arr2[1000];
 
 SEC("syscall")
+__arch_x86_64
+__arch_arm64
 __success __retval(0)
 #if !defined(__clang__) && defined(BPF_ARENA_FORCE_ASM)
 __skip("GCC calls htab_init(): a global function gets an arena pointer as a scalar")

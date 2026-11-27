@@ -590,19 +590,24 @@ int cond_break3(const void *ctx)
 	return loop();
 }
 
+/*
+ * A socket filter that is unwound returns 0. Where may_goto jumps, without a JIT, the prog goes
+ * on and returns 1.
+ */
 SEC("socket")
-__success __retval(1)
+__load_if_JITed()
+__success __retval(0)
 int cond_break4(const void *ctx)
 {
 	int cnt = zero;
 
 	for (;;) {
-		/* should eventually break out of the loop */
+		/* should eventually end the prog, and not break out of the loop */
 		cond_break;
 		cnt++;
 	}
-	/* if we looped a bit, it's a success */
-	return cnt > 1 ? 1 : 0;
+	/* if we looped a bit, it's 1 */
+	return cnt > 1 ? 1 : 2;
 }
 
 static __noinline int static_subprog(void)
@@ -618,24 +623,22 @@ static __noinline int static_subprog(void)
 }
 
 SEC("socket")
-__success __retval(1)
+__load_if_JITed()
+__success __retval(0)
 int cond_break5(const void *ctx)
 {
 	int cnt1 = zero, cnt2;
 
-	/*
-	 * There is one time slice for all may_goto of the prog. When it's used up a function that
-	 * is called after that makes no iteration. So this loop has an end.
-	 */
+	/* This loop has an end: it does not use up the time slice of the prog. */
 	for (; cnt1 < 100;) {
 		cond_break;
 		cnt1++;
 	}
 
+	/* The loop of the subprog does. The prog is unwound from there. */
 	cnt2 = static_subprog();
 
-	/* main and subprog have to loop a bit */
-	return cnt1 > 1 && cnt2 > 1 ? 1 : 0;
+	return cnt1 > 1 && cnt2 > 1 ? 1 : 2;
 }
 
 #define ARR2_SZ 1000

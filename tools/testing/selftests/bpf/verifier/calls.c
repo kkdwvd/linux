@@ -599,6 +599,7 @@
 	},
 	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 	.result = ACCEPT,
+	.retval = 2, /* TC_ACT_SHOT */
 },
 {
 	"calls: using r0 returned by callee",

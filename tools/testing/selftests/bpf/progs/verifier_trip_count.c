@@ -2098,8 +2098,8 @@ __msg("1: (15) if r0 == 0x3 goto pc+2")
 __msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,{{.*}})")
 __msg("2: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
 __msg("3: (05) goto pc-3")
-/* or 0: pass 0 takes the edge of may_goto */
-__msg("from 1 to 4: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=3,{{.*}}step=0+3)")
+/* the edge of may_goto that pass 0 takes does not go through the exit */
+__msg("from 1 to 4: R0=3")
 __msg("4: (95) exit")
 __msg("processed 5 insns")
 __naked void pre_cond_je1(void)
@@ -2238,7 +2238,7 @@ __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
 __msg(RANGE("1", "R0", 0, 3))
 __msg("loop at 1 has trip count 4{{$}}")
-__msg("4: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=3,{{.*}}step=0+3)")
+__msg("4: R0=3")
 __naked void pre_cond_je32(void)
 {
 	asm volatile ("					\
@@ -3684,22 +3684,6 @@ LINKED(natural_loop_is_secondary_entry, MAP_OOB,
 	"r3 = r8; r2 = r7; if r7 > 5 goto l_%=; o_%=: r7 += 1;"
 	LOOP_HEADER("r3 = r8; r2 = r8; r2 += 1; r2 += 1;", "r2 += 1; r3 += 1;")
 	"if r7 < 10 goto o_%=;")
-
-/*
- * No exit of the inner loop dominates its backedges: may_goto is added before its header. The prog
- * holds a reference, so may_goto goes to the exit of the outer loop: an edge that the verifier
- * adds. Every iteration of the outer loop restores r3. At the header of the inner one it is r7.
- */
-LINKED(added_edge, OUTSIDE,
-	"r1 = %[ringbuf] ll; r2 = 8; r3 = 0; call %[bpf_ringbuf_reserve]; if r0 == 0 goto out_%=;"
-	"*(u64 *)(r10 - 16) = r0; r3 = r8;"
-	"o_%=: r2 = r3; r3 = r7;"
-	"i_%=: r1 = *(u8 *)(r6 + 0); if r1 == 1 goto a_%=; if r1 == 2 goto b_%=; goto i_%=;"
-	"a_%=: goto i_%=;"
-	"b_%=: r3 = r2; r1 = *(u8 *)(r6 + 1); if r1 == 3 goto o_%=;"
-	"r4 = r6; if r8 > 63 goto r_%=; r4 += r3;"
-	"r_%=: *(u64 *)(r10 - 24) = r4; r1 = *(u64 *)(r10 - 16); r2 = 0;"
-	"call %[bpf_ringbuf_discard]; r1 = *(u64 *)(r10 - 24);")
 
 /*
  * r7 = ctx->data;
@@ -5664,17 +5648,46 @@ __naked void threshold_after_inner_loop(void)
 	:: __imm(bpf_ktime_get_ns), __imm_addr(a1m) : __clobber_all)
 
 SEC("socket")
-__success __log_level(4) __msg("processed 12 insns")
+__success __log_level(4) __msg("processed 11 insns")
 __naked void unknown_sum_body_once(void)
 {
 	SUM_FROM("r0");
 }
 
 SEC("socket")
-__success __log_level(4) __msg("processed 24 insns")
+__success __log_level(4) __msg("processed 23 insns")
 __naked void known_sum_three_trips(void)
 {
 	SUM_FROM("0");
+}
+
+__naked __noinline __used
+static unsigned long counts_to_ten(void)
+{
+	asm volatile (
+	"r0 = 0;"
+"1:	r0 += 1;"
+	"if r0 < 10 goto 1b;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/*
+ * The first pass takes the edge of may_goto in every loop: it knows the trip count when it ends.
+ * This loop gets no may_goto, so the subprog is not left there and its call is no site. The prog
+ * loads in one pass and has no landing pad, also where no frame can unwind: without a JIT.
+ */
+SEC("socket")
+__success __retval(10) __log_level(2)
+__msg("has trip count 10") __not_msg("{{landing pad of|pass 1}}")
+__xlated("0: call pc+1")
+__xlated("1: exit")
+__naked void counted_loop_in_subprog(void)
+{
+	asm volatile (
+	"call counts_to_ten;"
+	"exit;"
+	::: __clobber_all);
 }
 
 char _license[] SEC("license") = "GPL";

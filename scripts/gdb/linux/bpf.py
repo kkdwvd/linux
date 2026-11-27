@@ -88,8 +88,8 @@ def list_progs():
         # func[0] is the current prog.
         aux = prog["aux"]
         func = aux["func"]
-        real_func_cnt = int(aux["real_func_cnt"])
-        for i in range(1, real_func_cnt):
+        func_cnt = int(aux["func_cnt"])
+        for i in range(1, func_cnt):
             progs.append(func[i])
     return progs
 
