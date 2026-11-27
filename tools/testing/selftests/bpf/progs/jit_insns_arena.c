@@ -150,12 +150,24 @@ int cast_to_user(void *ctx)
 }
 
 /*
+ * What a prog returns whose last insn is a load behind the pages of the arena:
+ * where the JIT can unwind, the fault ends the prog with the value of an
+ * unwound prog of its type, -ECANCELED. Elsewhere the load is skipped and
+ * reads 0.
+ */
+#if defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64)
+#define LAST_LOAD_FAULTS	-125
+#else
+#define LAST_LOAD_FAULTS	0
+#endif
+
+/*
  * Every form of the arena address computation: offsets the add, the sub, the
  * shifted add and a move take, the end of the second 4K page, the narrow sizes
  * and immediate stores, each checked through r2 at the same address.
  */
 SEC("syscall")
-__success __retval(0)
+__success __retval(LAST_LOAD_FAULTS)
 __naked void arena_offsets(void)
 {
 	asm volatile ("					\
@@ -331,11 +343,9 @@ __naked void arena_offsets(void)
 	r1 = *(u32 *)(r2 + 0);				\
 	w1 ^= -1;					\
 	r9 |= r1;					\
-	r1 = *(u64 *)(r7 + 0x2000);			\
-	r9 |= r1;					\
-	r0 = 0;						\
-	if r9 == 0 goto 9f;				\
 	r0 = 1;						\
+	if r9 != 0 goto 9f;				\
+	r0 = *(u64 *)(r7 + 0x2000);			\
 9:	exit;						\
 "	:
 	: __imm_addr(arena)

@@ -3,6 +3,7 @@
  * Copyright (c) 2016 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/jhash.h>
 #include <linux/filter.h>
@@ -2517,7 +2518,7 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 	.seq_priv_size		= sizeof(struct bpf_iter_seq_hash_map_info),
 };
 
-static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+static noinline notrace long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 				   void *callback_ctx, u64 flags)
 {
 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
@@ -2529,7 +2530,7 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
 	struct bucket *b;
 	void *key, *val;
 	bool is_percpu;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 
 	cant_migrate();
 
@@ -2556,8 +2557,8 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
 				val = htab_elem_value(elem, map->key_size);
 			}
 			num_elems++;
-			ret = callback_fn((u64)(long)map, (u64)(long)key,
-					  (u64)(long)val, (u64)(long)callback_ctx, 0);
+			bpf_call_cb(callback_fn, map, key, val, callback_ctx, 0, ret, kind,
+				    unwound);
 			/* return value: 0 - continue, 1 - stop and return */
 			if (ret) {
 				rcu_read_unlock();
@@ -2568,7 +2569,14 @@ static long bpf_for_each_hash_elem(struct bpf_map *map, bpf_callback_t callback_
 	}
 out:
 	return num_elems;
+
+unwound:
+	/* The callback left with unwind_exit or kexit, inside the RCU section of the bucket */
+	rcu_read_unlock();
+	bpf_unwind_leave(kind);
+	return ret;
 }
+NOKPROBE_SYMBOL(bpf_for_each_hash_elem);
 
 static u64 htab_map_mem_usage(const struct bpf_map *map)
 {
@@ -3422,14 +3430,14 @@ static void rhtab_map_seq_show_elem(struct bpf_map *map, void *key, struct seq_f
 	seq_putc(m, '\n');
 }
 
-static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
+static noinline notrace long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 				void *callback_ctx, u64 flags)
 {
 	struct bpf_rhtab *rhtab = container_of(map, struct bpf_rhtab, map);
 	void *prev_key = NULL;
 	struct rhtab_elem *elem;
 	int num_elems = 0;
-	u64 ret = 0;
+	u64 ret = 0, kind;
 
 	cant_migrate();
 
@@ -3446,10 +3454,8 @@ static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 		if (IS_ERR(elem))
 			break;
 		num_elems++;
-		ret = callback_fn((u64)(long)map,
-				  (u64)(long)elem->data,
-				  (u64)(long)rhtab_elem_value(elem, map->key_size),
-				  (u64)(long)callback_ctx, 0);
+		bpf_call_cb(callback_fn, map, elem->data, rhtab_elem_value(elem, map->key_size),
+			    callback_ctx, 0, ret, kind, unwound);
 		if (ret)
 			break;
 
@@ -3458,7 +3464,14 @@ static long bpf_each_rhash_elem(struct bpf_map *map, bpf_callback_t callback_fn,
 	rcu_read_unlock();
 
 	return num_elems;
+
+unwound:
+	/* The callback left with unwind_exit or kexit, under RCU */
+	rcu_read_unlock();
+	bpf_unwind_leave(kind);
+	return ret;
 }
+NOKPROBE_SYMBOL(bpf_each_rhash_elem);
 
 static u64 rhtab_map_mem_usage(const struct bpf_map *map)
 {

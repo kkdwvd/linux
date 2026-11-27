@@ -623,7 +623,8 @@ static void test_address(struct bpf_program *prog, unsigned long *fault_addr_p)
 
 	ret = bpf_prog_test_run_opts(prog_fd, &opts);
 	ASSERT_OK(ret, "ret");
-	ASSERT_OK(opts.retval, "retval");
+	/* the fault ends the prog: what the kernel unwinds does not return 0 to user space */
+	ASSERT_EQ((int)opts.retval, -ECANCELED, "retval");
 
 	sprintf(fault_addr, "0x%lx", *fault_addr_p);
 

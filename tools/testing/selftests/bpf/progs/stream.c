@@ -37,6 +37,8 @@ struct {
 
 #define ENOSPC 28
 #define E2BIG 7
+/* what a syscall prog returns when the kernel unwinds it */
+#define ECANCELED 125
 #define _STR "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #define _X64 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 /* 1024 bytes: truncated by bstr_printf, must return -E2BIG. */
@@ -72,7 +74,7 @@ __arch_arm64
 __arch_s390x
 __arch_riscv64
 __arch_loongarch
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Timeout detected for may_goto instruction")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -170,7 +172,7 @@ int stream_oversize(void *ctx)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -196,7 +198,7 @@ int stream_arena_write_fault(void *ctx)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena READ access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -221,7 +223,7 @@ int stream_arena_read_fault(void *ctx)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena READ access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -257,7 +259,7 @@ int stream_arena_load_acquire_fault(void *ctx)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -299,7 +301,7 @@ int stream_arena_xchg_fault(void *ctx)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"
@@ -351,7 +353,7 @@ static __noinline void subprog(void)
 SEC("syscall")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(-ECANCELED)
 __stderr("ERROR: Arena WRITE access at unmapped address 0x{{.*}}")
 __stderr("CPU: {{[0-9]+}} UID: 0 PID: {{[0-9]+}} Comm: {{.*}}")
 __stderr("Call trace:\n"

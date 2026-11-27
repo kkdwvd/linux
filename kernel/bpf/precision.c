@@ -177,7 +177,7 @@ u64 bpf_hash_live_types(struct bpf_verifier_env *env, const struct bpf_verifier_
 		aux = &env->insn_aux_data[bpf_frame_insn_idx(st, fr)];
 		bits = bpf_spi_to_xreg(bpf_stack_nr_slots(st->frame[fr]));
 		bitmap_zero(live, bits);
-		live[0] = aux->live_regs_before & XREG_REGS;
+		live[0] = bpf_frame_live_regs(env, st, fr) & XREG_REGS;
 		bpf_add_slots(live, aux->live_stack_before, bits);
 		bpf_add_cost(env, bitmap_weight(live, bits), BPF_COST_COPY);
 		for_each_set_bit(xregno, live, bits) {
@@ -668,7 +668,40 @@ static void note_unproven_after_pass(struct bpf_verifier_env *env, u32 idx)
 	suspect_loops_of_insn(env, idx);
 }
 
-/* check_after_pass() found an error. Which insns caused it? */
+/*
+ * The insn at @idx is a cause of an error that shows at another insn: the next pass keeps apart
+ * what it reads. Its own check did not fail, unless a state said so before. The pass is over: an
+ * insn that is noted while states still get to it is not noted with the state that fails there,
+ * see do_check().
+ */
+void bpf_note_unproven_cause(struct bpf_verifier_env *env, u32 idx)
+{
+	bool failed = test_bit(idx, env->precision->err_insns);
+
+	note_unproven_after_pass(env, idx);
+	if (failed)
+		__set_bit(idx, env->precision->err_insns);
+}
+
+/*
+ * The insn at @idx is a cause of an error that shows at another insn, and nothing that it reads
+ * has a part in it: a call that leaves its frame whatever it is given, an access that faults. Only
+ * the jumps that can skip it matter. So the insn is controlled, like a call on the way to an
+ * unproven insn, see find_calls_to_unproven(), and no seed: the next pass keeps apart what those
+ * jumps read, in its function and in the callers, and not what the insn reads.
+ */
+void bpf_note_controlled_cause(struct bpf_verifier_env *env, u32 idx)
+{
+	struct bpf_subprog_info *sub = bpf_find_containing_subprog(env, idx);
+
+	if (!sub)
+		return;
+	__set_bit(idx, env->precision->this_pass.call_insns);
+	__set_bit(sub - env->subprog_info, env->precision->this_pass.unproven_funcs);
+	suspect_loops_of_insn(env, idx);
+}
+
+/* check_after_pass() or bpf_pads_settle() found an error. Which insns caused it? */
 void bpf_find_unproven_after_pass(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
@@ -678,7 +711,7 @@ void bpf_find_unproven_after_pass(struct bpf_verifier_env *env)
 	for (i = 0; i < env->subprog_cnt; i++)
 		note_unproven_after_pass(env, env->subprog_info[i].deepest_insn);
 	for (i = 0; i < env->prog->len; i++, insn++, aux++) {
-		if (aux->pessimized) {
+		if (aux->pessimized || bpf_pads_conflict(env, aux)) {
 			note_unproven_after_pass(env, i);
 		} else if (aux->seen && (bpf_calls_function(env, i) || is_stack_arg_st(insn) ||
 					 is_stack_arg_stx(insn))) {
@@ -767,7 +800,7 @@ static bool compute_insn_deps(struct bpf_verifier_env *env, unsigned long *masks
 	u16 use = aux->use_regs, def = aux->def_regs, args = 0;
 	bool changed = false, stores, reads, loads, call, held_after;
 	struct taken_funcs *taken = &env->precision->taken;
-	u8 class = BPF_CLASS(insn->code), needs;
+	u8 class = BPF_CLASS(insn->code), needs, cb_ret;
 	u16 ptrs = 0;
 	int t, callee;
 
@@ -818,8 +851,14 @@ static bool compute_insn_deps(struct bpf_verifier_env *env, unsigned long *masks
 		reads = is_seed;
 		needs = ret[callee];
 	} else if (callee > 0) {
-		reads |= compute_call_deps(env, masks, ret, callee, needs & ~RET_REGS, &held,
-					   &changed);
+		/*
+		 * The callback returns to the helper. r0 after the call is the helper's, or the
+		 * one of the callback when it unwinds to the pad after the call, see
+		 * check_cb_unwind().
+		 */
+		cb_ret = bpf_is_unwind_goto(insn + 1) ? BIT(BPF_REG_0) : 0;
+		reads |= compute_call_deps(env, masks, ret, callee, needs & ~(RET_REGS & ~cb_ret),
+					   &held, &changed);
 		needs = ret[callee];
 	} else if (bpf_is_callx(insn) || aux->calls_callback) {
 		changed |= needs & ~taken->needs;
@@ -914,9 +953,9 @@ int bpf_compute_deps(struct bpf_verifier_env *env, unsigned long *masks,
 			s = env->subprog_topo_order[k];
 			bits = prec->func[s].words * BITS_PER_LONG;
 			for (i = sub[s].postorder_start; i <= sub[s + 1].postorder_start; i++) {
-				/* it can be dead code, see push_unwind_exit() */
+				/* it can be dead code, see unwind_frame() */
 				idx = i < sub[s + 1].postorder_start ? env->cfg.insn_postorder[i] :
-				      sub[s].bail_insn;
+				      sub[s].exit_idx;
 				if (idx < 0)
 					break;
 				bitmap_zero(in, bits);
@@ -926,9 +965,6 @@ int bpf_compute_deps(struct bpf_verifier_env *env, unsigned long *masks,
 					bitmap_or(in, in, mask_at(env, masks, s, t), bits);
 					held |= test_bit(t, prec->held_insns);
 				}
-				t = bpf_head_guard_target(env, idx);
-				if (t >= 0)
-					bitmap_or(in, in, mask_at(env, masks, s, t), bits);
 				changed |= compute_insn_deps(env, masks, ret, s, idx,
 							     test_bit(idx, seed_insns), in, held);
 				if (idx == prec->loop_carried_at) {

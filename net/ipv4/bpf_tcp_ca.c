@@ -256,6 +256,39 @@ static int bpf_tcp_ca_validate(void *kdata)
 	return tcp_validate_congestion_control(kdata);
 }
 
+/* What an operator returns when the kernel unwinds it. TCP cannot take 0 from
+ * every operator, and the value that fits is in the socket, which a constant
+ * of the program cannot depend on. So each operator gets the least value that
+ * TCP can work with:
+ *
+ * ->ssthresh()		2, the least that tcp_reno_ssthresh() returns. TCP sets
+ *			the window to the threshold when a recovery is over, and
+ *			a window of 0 is none: tcp_snd_cwnd_set() warns, and
+ *			tcp_cong_avoid_ai() divides by the window.
+ * ->undo_cwnd()	1, the window that TCP itself has after a timeout, and
+ *			the least that tcp_reno_undo_cwnd() can return. The
+ *			window from before the loss is not known here.
+ * ->tso_segs()		1, which is what tcp_tso_segs() makes of 0.
+ * ->sndbuf_expand()	2, the factor of tcp_sndbuf_expand() where the operator
+ *			is not set. With 0 the send buffer does not grow.
+ *
+ * The other operators return nothing, and no program can be ->get_info().
+ */
+static int bpf_tcp_ca_unwound_retval(const struct bpf_prog *prog)
+{
+	switch (prog->aux->attach_st_ops_member_off) {
+	case offsetof(struct tcp_congestion_ops, ssthresh):
+		return 2;
+	case offsetof(struct tcp_congestion_ops, undo_cwnd):
+		return 1;
+	case offsetof(struct tcp_congestion_ops, tso_segs):
+		return 1;
+	case offsetof(struct tcp_congestion_ops, sndbuf_expand):
+		return 2;
+	}
+	return 0;
+}
+
 static u32 bpf_tcp_ca_ssthresh(struct sock *sk)
 {
 	return 0;
@@ -338,6 +371,7 @@ static struct bpf_struct_ops bpf_tcp_congestion_ops = {
 	.init_member = bpf_tcp_ca_init_member,
 	.init = bpf_tcp_ca_init,
 	.validate = bpf_tcp_ca_validate,
+	.unwound_retval = bpf_tcp_ca_unwound_retval,
 	.name = "tcp_congestion_ops",
 	.cfi_stubs = &__bpf_ops_tcp_congestion_ops,
 	/* The struct_ops's function may switch to another struct_ops.

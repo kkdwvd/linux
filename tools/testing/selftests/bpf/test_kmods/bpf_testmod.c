@@ -1895,6 +1895,7 @@ __bpf_kfunc int bpf_kfunc_st_ops_inc10(struct st_ops_args *args)
 }
 
 __bpf_kfunc int bpf_kfunc_multi_st_ops_test_1(struct st_ops_args *args, u32 id);
+__bpf_kfunc int bpf_kfunc_multi_st_ops_unwound_cnt(void);
 __bpf_kfunc int bpf_kfunc_multi_st_ops_test_1_assoc(struct st_ops_args *args, struct bpf_prog_aux *aux);
 
 __bpf_kfunc int bpf_kfunc_implicit_arg(int a, struct bpf_prog_aux *aux);
@@ -2014,6 +2015,7 @@ BTF_ID_FLAGS(func, bpf_kfunc_st_ops_test_epilogue, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kfunc_st_ops_test_pro_epilogue, KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_kfunc_st_ops_inc10)
 BTF_ID_FLAGS(func, bpf_kfunc_multi_st_ops_test_1)
+BTF_ID_FLAGS(func, bpf_kfunc_multi_st_ops_unwound_cnt)
 BTF_ID_FLAGS(func, bpf_kfunc_multi_st_ops_test_1_assoc, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg_legacy, KF_IMPLICIT_ARGS)
@@ -2514,6 +2516,19 @@ int bpf_kfunc_multi_st_ops_test_1(struct st_ops_args *args, u32 id)
 	return ret;
 }
 
+static int multi_st_ops_unwound_cnt;
+
+static void multi_st_ops_unwound(const struct bpf_prog *prog)
+{
+	multi_st_ops_unwound_cnt++;
+}
+
+/* How many invocations of test_1() were unwound */
+int bpf_kfunc_multi_st_ops_unwound_cnt(void)
+{
+	return multi_st_ops_unwound_cnt;
+}
+
 /* Call test_1() of the associated struct_ops map */
 int bpf_kfunc_multi_st_ops_test_1_assoc(struct st_ops_args *args, struct bpf_prog_aux *aux)
 {
@@ -2604,6 +2619,7 @@ struct bpf_struct_ops testmod_multi_st_ops = {
 	.init_member = multi_st_ops_init_member,
 	.reg = multi_st_ops_reg,
 	.unreg = multi_st_ops_unreg,
+	.unwound = multi_st_ops_unwound,
 	.cfi_stubs = &multi_st_ops_cfi_stubs,
 	.name = "bpf_testmod_multi_st_ops",
 	.owner = THIS_MODULE,

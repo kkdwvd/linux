@@ -18,7 +18,7 @@ static struct bpf_insn *fill(struct bpf_insn *insn, int cnt, int reg)
  * away:
  *
  *	r6 = r7 = 0, but not a constant for the verifier
- *	r8 = 2
+ *	r8 = 3
  *	r9 = 0
  *	r0 = r8		x FILL_CNT or 1
  * 1:	if r6 == r9 goto +1
@@ -31,16 +31,21 @@ static struct bpf_insn *fill(struct bpf_insn *insn, int cnt, int reg)
  * 3:	r0 = r8		x N when off is positive
  * 4:	exit
  *
- * The prog returns 0 when may_goto jumps to its target and 2 when
- * it lands in one of 'r0 = r8' areas. There are no constants between
- * may_goto and its target to keep the distance when constants are blinded.
+ * When may_goto expires the prog is unwound: the insn does not go to the
+ * target that the program gives it, but to a landing pad behind the last
+ * insn, which is far too. It is a tc prog: it returns 2, TC_ACT_SHOT, when
+ * may_goto jumps to the pad, 3 when it lands in one of the 'r0 = r8' areas,
+ * and 0, which r0 has in the loop, when it lands on an exit: the last one
+ * is one insn short of the pad. There are no constants between may_goto
+ * and its target to keep the distance when constants are blinded.
  *
  * With 'subprog' all of that is a subprog.
  */
 static void test_far(int off, bool subprog)
 {
-	LIBBPF_OPTS(bpf_prog_load_opts, opts, .prog_flags = BPF_F_SLEEPABLE);
-	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	LIBBPF_OPTS(bpf_prog_load_opts, opts);
+	char pkt[64] = {};
+	LIBBPF_OPTS(bpf_test_run_opts, topts, .data_in = pkt, .data_size_in = sizeof(pkt));
 	int front = off < 0 ? 1 : FILL_CNT;
 	int mid = off < 0 ? -off - 5 : 1;
 	int back = off < 0 ? FILL_CNT : off - 1;
@@ -61,7 +66,7 @@ static void test_far(int off, bool subprog)
 	*insn++ = BPF_ALU64_IMM(BPF_RSH, BPF_REG_6, 63);
 	*insn++ = BPF_MOV64_REG(BPF_REG_7, BPF_REG_0);
 	*insn++ = BPF_ALU64_IMM(BPF_RSH, BPF_REG_7, 63);
-	*insn++ = BPF_MOV64_IMM(BPF_REG_8, 2);
+	*insn++ = BPF_MOV64_IMM(BPF_REG_8, 3);
 	*insn++ = BPF_MOV64_IMM(BPF_REG_9, 0);
 	insn = fill(insn, front, BPF_REG_8);
 	*insn++ = BPF_JMP_REG(BPF_JEQ, BPF_REG_6, BPF_REG_9, 1);
@@ -74,14 +79,14 @@ static void test_far(int off, bool subprog)
 	insn = fill(insn, back, BPF_REG_8);
 	*insn++ = BPF_EXIT_INSN();
 
-	fd = bpf_prog_load(BPF_PROG_TYPE_SYSCALL, NULL, "GPL", insns, insn - insns, &opts);
+	fd = bpf_prog_load(BPF_PROG_TYPE_SCHED_CLS, NULL, "GPL", insns, insn - insns, &opts);
 	free(insns);
 	if (!ASSERT_GE(fd, 0, "prog_load"))
 		return;
 
 	err = bpf_prog_test_run_opts(fd, &topts);
 	ASSERT_OK(err, "test_run");
-	ASSERT_EQ(topts.retval, 0, "retval");
+	ASSERT_EQ(topts.retval, 2, "retval");
 	close(fd);
 }
 

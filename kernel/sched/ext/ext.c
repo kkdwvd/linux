@@ -329,6 +329,56 @@ static void run_deferred(struct rq *rq);
 static bool task_dead_and_done(struct task_struct *p);
 static void scx_disable(struct scx_sched *sch, enum scx_exit_kind kind);
 
+/*
+ * A program that was unwound returns 0 in place of what it would have computed,
+ * and the scheduler was told: it has failed, see bpf_scx_unwound(). The enable
+ * path asks after an operator whose value it relies on.
+ * exit_kind does not tell: scx_disable_workfn() makes the claimed error
+ * SCX_EXIT_DONE on another kthread, as its first step, before it waits for the
+ * enable path. So scx_fail() notes a failure where it stays.
+ */
+static bool scx_has_failed(struct scx_sched *sch)
+{
+	return READ_ONCE(sch->failed);
+}
+
+/*
+ * The state of the BPF scheduler cannot be trusted any more. An operator may
+ * wait for a lock that an unwound one left behind, under the rq lock, until its
+ * time slice is over, and the disable path calls operators for each task. Turn
+ * them off, as scx_root_disable() does at its end. ops.exit() is not covered by
+ * has_op.
+ * The enable path may be turning them on: it sets the bits and then looks for
+ * the failure, see scx_set_has_ops(), so the failure is there for it before the
+ * bits are cleared here.
+ * Lock-free and safe to call from any context including NMI.
+ */
+static void scx_fail(struct scx_sched *sch)
+{
+	smp_store_mb(sch->failed, true);
+	bitmap_zero(sch->has_op, SCX_OPI_END);
+}
+
+/*
+ * Turn on the operators from @begin to @end - 1 that @ops has. After an error
+ * all of them are off and stay off, see scx_fail(), which can run while @sch is
+ * being enabled. It notes the failure before it clears has_op, so look for it
+ * once the bits are set: one of the two clears them.
+ */
+static void scx_set_has_ops(struct scx_sched *sch, const struct sched_ext_ops *ops,
+			    int begin, int end)
+{
+	int i;
+
+	for (i = begin; i < end; i++)
+		if (((void (**)(void))ops)[i])
+			set_bit(i, sch->has_op);
+	/* pairs with smp_store_mb() in scx_fail() */
+	smp_mb();
+	if (scx_has_failed(sch))
+		bitmap_zero(sch->has_op, SCX_OPI_END);
+}
+
 __printf(5, 6) bool __scx_exit(struct scx_sched *sch,
 			       enum scx_exit_kind kind, s64 exit_code,
 			       s32 exit_cpu, const char *fmt, ...)
@@ -3404,7 +3454,8 @@ static enum scx_dsp_verdict dispatch_one(struct rq *rq, struct task_struct *prev
 		 * core. This callback complements ->cpu_release(), which is
 		 * emitted in switch_class().
 		 */
-		if (root_sch->ops.cpu_acquire)
+		/* not the operator of a scheduler that failed, see scx_fail() */
+		if (root_sch->ops.cpu_acquire && !scx_has_failed(root_sch))
 			SCX_CALL_OP(root_sch, cpu_acquire, rq, cpu, NULL);
 		rq->scx.cpu_released = false;
 	}
@@ -3703,7 +3754,8 @@ static void switch_class(struct rq *rq, struct task_struct *next)
 	 *  next time that dispatch_one() is invoked.
 	 */
 	if (!rq->scx.cpu_released) {
-		if (sch->ops.cpu_release) {
+		/* not the operator of a scheduler that failed, see scx_fail() */
+		if (sch->ops.cpu_release && !scx_has_failed(sch)) {
 			struct scx_cpu_release_args args = {
 				.reason = preempt_reason_from_class(next_class),
 				.task = next,
@@ -6074,7 +6126,8 @@ static void scx_cgroup_exit(struct scx_sched *sch)
 		tg->scx.sched = NULL;
 		if (tg->scx.flags & SCX_TG_INITED) {
 			tg->scx.flags &= ~SCX_TG_INITED;
-			if (sch->ops.cgroup_exit)
+			/* not the operator of a scheduler that failed, see scx_fail() */
+			if (sch->ops.cgroup_exit && !scx_has_failed(sch))
 				SCX_CALL_OP(sch, cgroup_exit, NULL, css->cgroup);
 		}
 	}
@@ -6095,7 +6148,8 @@ static int scx_cgroup_init(struct scx_sched *sch)
 		if ((tg->scx.flags & (SCX_TG_ONLINE | SCX_TG_INITED)) != SCX_TG_ONLINE)
 			continue;
 
-		if (sch->ops.cgroup_init) {
+		/* not the operator of a scheduler that failed, see scx_claim_exit() */
+		if (SCX_HAS_OP(sch, cgroup_init)) {
 			struct scx_cgroup_init_args args = {
 				.weight = tg->scx.weight,
 				.bw_period_us = tg->scx.bw_period_us,
@@ -6105,6 +6159,9 @@ static int scx_cgroup_init(struct scx_sched *sch)
 			};
 
 			ret = SCX_CALL_OP_RET(sch, cgroup_init, NULL, css->cgroup, &args);
+			/* an operator that was unwound returns 0, see scx_has_failed() */
+			if (!ret && scx_has_failed(sch))
+				ret = -ECANCELED;
 			if (ret) {
 				scx_error(sch, "ops.cgroup_init() failed (%d)", ret);
 				return ret;
@@ -7743,6 +7800,10 @@ static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 	if (!atomic_try_cmpxchg(&sch->exit_kind, &none, kind))
 		return false;
 
+	/* an exit that is no error calls all operators as before */
+	if (kind >= SCX_EXIT_ERROR)
+		scx_fail(sch);
+
 	if (kind == SCX_EXIT_PARENT) {
 		/* an ancestor is already sweeping the subtree */
 		WRITE_ONCE(sch->aborting, true);
@@ -8652,7 +8713,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	struct scx_sched *sch;
 	struct scx_task_iter sti;
 	struct task_struct *p;
-	int i, cpu, ret;
+	int cpu, ret;
 
 	mutex_lock(&scx_enable_mutex);
 
@@ -8757,6 +8818,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 */
 	if (sch->is_cid_type && sch->ops_cid.init_cids) {
 		ret = SCX_CALL_OP_RET(sch, init_cids, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init_cids", ret);
 			cpus_read_unlock();
@@ -8791,6 +8854,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	/* the cid caps and shards are live now, so ops.init() can query them */
 	if (sch->ops.init) {
 		ret = SCX_CALL_OP_RET(sch, init, NULL);
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 		if (ret) {
 			ret = scx_ops_sanitize_err(sch, "init", ret);
 			cpus_read_unlock();
@@ -8806,9 +8871,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		goto err_disable;
 	}
 
-	for (i = SCX_OPI_CPU_HOTPLUG_BEGIN; i < SCX_OPI_CPU_HOTPLUG_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_CPU_HOTPLUG_BEGIN, SCX_OPI_CPU_HOTPLUG_END);
 
 	ret = check_hotplug_seq(sch, ops);
 	if (ret) {
@@ -8856,9 +8919,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 */
 	scx_bypass(sch, true);
 
-	for (i = SCX_OPI_NORMAL_BEGIN; i < SCX_OPI_NORMAL_END; i++)
-		if (((void (**)(void))ops)[i])
-			set_bit(i, sch->has_op);
+	scx_set_has_ops(sch, ops, SCX_OPI_NORMAL_BEGIN, SCX_OPI_NORMAL_END);
 
 	scx_ops_cid_sched_updated_enable(sch);
 
@@ -8924,6 +8985,9 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		scx_task_iter_unlock(&sti);
 
 		ret = __scx_init_task(sch, p, NULL, false);
+		/* an operator that was unwound returns 0, see scx_has_failed() */
+		if (!ret && scx_has_failed(sch))
+			ret = -ECANCELED;
 
 		scx_task_iter_relock(&sti, p);
 
@@ -9404,6 +9468,66 @@ static int bpf_scx_validate(void *kdata)
 	return 0;
 }
 
+/*
+ * @prog was unwound, and scx_prog_sched() has no scheduler for it.
+ * A program that is in no struct_ops map, or in more than one, has no scheduler
+ * of its own, and below a root that takes sub-schedulers it can be an operator
+ * of any of them. The failure is the root's then, whose exit ends them all. A
+ * sub-scheduler does not exit with an error then, and the unwound operator may
+ * be one of its own: turn off the operators of them all, see scx_fail().
+ * A program whose map is gone, or has no scheduler, or one that is gone, is
+ * taken for an async callback that has outlived its scheduler, and nobody is
+ * told: the root may be another scheduler by now.
+ */
+static void scx_unknown_prog_unwound(const struct bpf_prog *prog)
+{
+	struct scx_sched *root, *pos;
+
+	if (bpf_prog_get_assoc_struct_ops(prog->aux) || bpf_prog_assoc_struct_ops_gone(prog->aux))
+		return;
+	root = rcu_dereference(scx_root);
+	if (!root || READ_ONCE(root->dead))
+		return;
+	scx_error(root, "program %s (ops.%s, id %u) was unwound and its scheduler is not known, see its stderr stream",
+		  prog->aux->name, prog->aux->attach_func_name, prog->aux->id);
+	scx_for_each_descendant_pre(pos, root)
+		scx_fail(pos);
+}
+
+/*
+ * @prog, an operator of a scheduler or an async callback of one, was unwound.
+ * The operator returns 0 without having computed it, which would be taken for a
+ * CPU or for success, so this is as fatal to the scheduler as scx_bpf_error().
+ * The rq lock of the operator's caller may be held here. scx_error() only
+ * claims the exit and leaves the disabling to irq_work and the helper kthread.
+ * It claims nothing when the exit is claimed already, be it for another reason
+ * than an error: the disable path of such an exit calls the operators for each
+ * task, and one that is unwound there is as bad. Turn them off all the same.
+ */
+static void bpf_scx_unwound(const struct bpf_prog *prog)
+{
+	struct scx_sched *sch;
+
+	guard(rcu)();
+
+	sch = scx_prog_sched(prog->aux);
+	if (unlikely(!sch)) {
+		scx_unknown_prog_unwound(prog);
+		return;
+	}
+	/*
+	 * A root that takes no sub-schedulers is what scx_prog_sched() has for
+	 * every program without a map, also for one whose map is gone. That one
+	 * has outlived its scheduler, see scx_unknown_prog_unwound(): @sch is
+	 * another scheduler, and is not told.
+	 */
+	if (bpf_prog_assoc_struct_ops_gone(prog->aux))
+		return;
+	if (!scx_error(sch, "program %s (ops.%s, id %u) was unwound, see its stderr stream",
+		       prog->aux->name, prog->aux->attach_func_name, prog->aux->id))
+		scx_fail(sch);
+}
+
 static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
 static void sched_ext_ops__enqueue(struct task_struct *p, u64 enq_flags) {}
 static void sched_ext_ops__dequeue(struct task_struct *p, u64 enq_flags) {}
@@ -9497,6 +9621,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.unwound = bpf_scx_unwound,
 	.name = "sched_ext_ops",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops
@@ -9574,6 +9699,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops_cid = {
 	.init = bpf_scx_init,
 	.update = bpf_scx_update,
 	.validate = bpf_scx_validate,
+	.unwound = bpf_scx_unwound,
 	.name = "sched_ext_ops_cid",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops_cid
