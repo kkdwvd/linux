@@ -295,9 +295,38 @@ static inline bool insn_is_mov_percpu_addr(const struct bpf_insn *insn)
 		.off   = 0,					\
 		.imm   = 1 })
 
+/*
+ * The insns of an unwind that the kernel starts, where unwind_goto and unwind_exit are those of an
+ * unwind that the program starts: kexit leaves a frame like unwind_exit, and goes to kgoto after
+ * the call, never to unwind_goto. So no landing pad that the program has is entered when the
+ * kernel unwinds a frame, and none can end that unwind. Only the verifier emits the two, see
+ * kernel/bpf/pads.c: a program that has one is rejected, see check_jmp_fields().
+ *
+ * kgoto: BPF_JMP32 | BPF_JCOND with BPF_KGOTO in src_reg, the offset is in imm. It follows a call,
+ * or unwind_goto of a call.
+ * kexit: BPF_JMP | BPF_EXIT with BPF_KEXIT in src_reg.
+ */
+#define BPF_KGOTO	2
+#define BPF_KEXIT	2
+
+static_assert(BPF_KGOTO > BPF_UNWIND_GOTO);
+static_assert(BPF_KEXIT > BPF_UNWIND_EXIT);
+
+/* gotol, kgoto, and unwind_goto that the verifier adds, have 32 bits for the offset */
+static inline bool bpf_jmp_offset_is_imm(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JA) || insn->code == (BPF_JMP32 | BPF_JCOND);
+}
+
+static inline int bpf_jmp_offset(const struct bpf_insn *insn)
+{
+	return bpf_jmp_offset_is_imm(insn) ? insn->imm : insn->off;
+}
+
 static inline bool bpf_is_unwind_goto(const struct bpf_insn *insn)
 {
-	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_UNWIND_GOTO;
+	return (insn->code == (BPF_JMP | BPF_JCOND) || insn->code == (BPF_JMP32 | BPF_JCOND)) &&
+	       insn->src_reg == BPF_UNWIND_GOTO;
 }
 
 static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
@@ -305,17 +334,26 @@ static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
 	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_UNWIND_EXIT;
 }
 
-/*
- * The caller of the main prog doesn't tell unwind_exit from exit. An extension
- * is different: its caller is the caller of the subprog that it replaced.
- * An exception callback returns from the frame of the main prog. After freplace
- * or a tail call it returns to a prog that wasn't verified with the callback.
- */
+static inline bool bpf_is_kgoto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JCOND) && insn->src_reg == BPF_KGOTO;
+}
+
+static inline bool bpf_is_kexit(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_KEXIT;
+}
+
+/* No code, an entry of the exception table for the insn in front: unwind_goto or kgoto */
+static inline bool bpf_is_pad_goto(const struct bpf_insn *insn)
+{
+	return bpf_is_unwind_goto(insn) || bpf_is_kgoto(insn);
+}
+
+/* The caller of the main prog doesn't tell unwind_exit and kexit from exit */
 static inline bool bpf_prog_can_unwind(const struct bpf_prog *prog)
 {
-	if (prog->aux->exception_cb)
-		return false;
-	return bpf_is_subprog(prog) || prog->type == BPF_PROG_TYPE_EXT;
+	return bpf_is_subprog(prog);
 }
 
 static inline bool insn_is_zext(const struct bpf_insn *insn)
@@ -1238,6 +1276,10 @@ static inline unsigned int bpf_prog_size(unsigned int proglen)
 		   offsetof(struct bpf_prog, insns[proglen]));
 }
 
+/* The most insns that a program has room for: bpf_prog->pages counts its pages in 16 bits */
+#define BPF_PROG_MAX_LEN \
+	((U16_MAX * PAGE_SIZE - offsetof(struct bpf_prog, insnsi)) / sizeof(struct bpf_insn))
+
 bool bpf_prog_has_arena_insns(const struct bpf_prog *prog);
 
 /*
@@ -1387,10 +1429,12 @@ bool bpf_jit_supports_callx(void);
 bool bpf_jit_supports_kfunc_ret_reg_pair(void);
 bool bpf_jit_supports_unwind(void);
 bool bpf_jit_supports_hmul(void);
+u64 bpf_unwind_target(u64 ret_addr);
+u64 bpf_kunwind_target(u64 ret_addr);
+u64 bpf_fault_unwind_target(u64 end);
 bool bpf_jit_supports_stack_args(void);
 bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);
-bool bpf_jit_supports_exceptions(void);
 bool bpf_jit_supports_ptr_xchg(void);
 bool bpf_jit_supports_arena(void);
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena);
@@ -1407,13 +1451,11 @@ bool bpf_jit_supports_fsession(void);
  *    emit_stack_check() knows.
  *  - All may_goto of the prog share one time slice. That is the timed form, which only JITed
  *    progs get, see bpf_do_misc_fixups(). The other form counts in each frame.
- *  - A walk of the stack finds the prog when there is no room, to tell user space, see
- *    bpf_prog_report_recursion().
  */
 static inline bool bpf_prog_has_invocation_budget(const struct bpf_prog *prog)
 {
 	return (IS_ENABLED(CONFIG_X86_64) || IS_ENABLED(CONFIG_ARM64)) && prog->jit_requested &&
-	       bpf_jit_supports_timed_may_goto() && bpf_jit_supports_exceptions();
+	       bpf_jit_supports_timed_may_goto();
 }
 
 struct bpf_jit_arg_abi {
@@ -1454,6 +1496,8 @@ u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *);
 void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 u64 bpf_prog_report_recursion(void);
+u64 bpf_prog_report_unwound(struct bpf_prog_aux *aux);
+void bpf_prog_unwound_to_kernel(unsigned long ip);
 bool bpf_helper_changes_pkt_data(enum bpf_func_id func_id);
 
 static inline bool bpf_dump_raw_ok(const struct cred *cred)

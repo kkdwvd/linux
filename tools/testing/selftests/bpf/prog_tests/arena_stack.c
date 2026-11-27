@@ -118,7 +118,7 @@ out:
 	sched_setaffinity(0, sizeof(old), &old);
 }
 
-/* bpf_throw() doesn't return the stack. Programs run when all stacks of the cpu are taken. */
+/* The landing pad of bpf_throw() ends in an exit, which returns the stack */
 static void test_throw(struct arena_stack *skel)
 {
 	cpu_set_t old;
@@ -264,8 +264,8 @@ static void test_no_memory(void)
 }
 
 /*
- * bpf_throw() in a main program that has stack arguments. The exception callback restores the
- * registers of the caller.
+ * bpf_throw() in a main program that has stack arguments. The registers of the caller are as they
+ * were.
  */
 static void test_throw_stack_args(void)
 {

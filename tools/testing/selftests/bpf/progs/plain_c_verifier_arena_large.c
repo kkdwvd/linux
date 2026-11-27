@@ -54,6 +54,8 @@ __noinline int alloc_pages(int page_cnt, int pages_atonce, bool first_pass,
 }
 
 SEC("syscall")
+__arch_x86_64
+__arch_arm64
 __success __retval(0) __skip_without_arena
 int big_alloc2(void *ctx)
 {

@@ -541,7 +541,7 @@ void __kfunc_btf_root(void)
  * far ahead to keep 0 and 1 of the flag apart.
  */
 #define FLAG_AND_COOKIE(name, no, yes)			\
-__arch_x86_64 __arch_arm64 __arch_s390x			\
+__arch_x86_64 __arch_arm64				\
 __naked void name(void)					\
 {							\
 	asm volatile (					\

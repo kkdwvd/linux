@@ -67,12 +67,14 @@ static int compute_hops(struct bpf_verifier_env *env)
 				succ = bpf_insn_successors(env, n);
 				iarray_for_each(t, succ)
 					changed |= shorter_via(prec, n, t);
-				/* see check_loop_guard() and check_recursion_guard() */
-				if (aux->guard_place)
-					changed |= shorter_via(prec, n, aux->guard_to);
-				if ((aux->guard_place || (sub[s].cycle && n == sub[s].start)) &&
-				    sub[s].bail_insn >= 0)
-					changed |= shorter_via(prec, n, sub[s].bail_insn);
+				/*
+				 * The function is left there, see check_loop_guard(),
+				 * check_recursion_guard() and unwind_frame().
+				 */
+				if ((aux->guard_place || (sub[s].cycle && n == sub[s].start) ||
+				     bpf_is_throw_kfunc(&env->prog->insnsi[n])) &&
+				    sub[s].exit_idx != U32_MAX)
+					changed |= shorter(&prec->hops_to_exit[n], 0);
 				if (!bpf_calls_function(env, n))
 					continue;
 				t = bpf_insn_callee(env, n);

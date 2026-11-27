@@ -408,6 +408,26 @@ static int bpf_qdisc_validate(void *kdata)
 	return 0;
 }
 
+/*
+ * What an operator returns when the verifier unwinds it. 0 from ->enqueue() is
+ * NET_XMIT_SUCCESS: the packet is in the queue. It may not be: the program was
+ * stopped on its way, and its landing pad has freed the packet if the program
+ * still held it. 0 from ->init() is a qdisc that is set up. It is not: the
+ * program was stopped before it was through, and qdisc_create() gets an error,
+ * calls ->destroy() and frees the qdisc, as for any other ->init() that fails.
+ * ->dequeue() returns NULL. ->reset() and ->destroy() return nothing.
+ */
+static int bpf_qdisc_unwound_retval(const struct bpf_prog *prog)
+{
+	u32 moff = prog->aux->attach_st_ops_member_off;
+
+	if (moff == offsetof(struct Qdisc_ops, enqueue))
+		return NET_XMIT_DROP;
+	if (moff == offsetof(struct Qdisc_ops, init))
+		return -ECANCELED;
+	return 0;
+}
+
 static int Qdisc_ops__enqueue(struct sk_buff *skb__ref, struct Qdisc *sch,
 			      struct sk_buff **to_free)
 {
@@ -446,6 +466,7 @@ static struct bpf_struct_ops bpf_Qdisc_ops = {
 	.reg = bpf_qdisc_reg,
 	.unreg = bpf_qdisc_unreg,
 	.validate = bpf_qdisc_validate,
+	.unwound_retval = bpf_qdisc_unwound_retval,
 	.init_member = bpf_qdisc_init_member,
 	.init = bpf_qdisc_init,
 	.name = "Qdisc_ops",

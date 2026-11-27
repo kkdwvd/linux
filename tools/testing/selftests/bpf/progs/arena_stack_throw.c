@@ -26,7 +26,6 @@ long never, throws, regs[4];
 
 /*
  * r6-r9 are in registers that a callee keeps. What the kfunc returns with is stored in regs[].
- * A program that can throw saves all such registers, so its own caller is not affected.
  */
 SEC("syscall")
 __naked int calls_kfunc(void)

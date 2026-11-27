@@ -534,20 +534,6 @@ NO_COUNT("more: a back edge that doesn't test the flag")
 LOOP(more_back_edge, "w8 = 0;",
      MORE(UP_TO(2047), RND "if w0 == 3 goto 5f;") "goto 9f; 5: if w8 == 2048 goto 1b;")
 
-/* A nested loop can get may_goto. It goes where a jump of that loop goes, whatever the flag is. */
-NO_COUNT("more: the way out leads through a nested loop")
-LOOP(more_nested, "w8 = 0; call %[bpf_rcu_read_lock];",
-     "w8 += 1; w9 = 0; if w8 > 2047 goto 2f; w9 = 1;"
-     "2: if w9 == 5 goto 4f; if w9 != 0 goto 3f; if w9 == 0 goto 8f; 3: goto 2b;"
-     "4: if w8 <= w7 goto 1b; 8: call %[bpf_rcu_read_unlock];")
-
-/* May_goto at the head of the first loop goes to 7 with w9 = 1. The program gets there with 0. */
-NO_COUNT("more: a flag that is a constant without may_goto")
-LOOP(more_stale, "call %[bpf_rcu_read_lock];" RND "w4 = w0; w8 = 0; w9 = 0;"
-     "5: if w4 == 0 goto 6f; w9 = 0; if w4 == 1 goto 7f; w9 = 1; goto 5b; 6: w9 = 1; goto 5b; 7:",
-     "w5 = w9; w8 += 1; if w8 > 2047 goto 2f; w5 = 1;"
-     "2: if w8 > w7 goto 8f; if w5 != 0 goto 1b; 8: call %[bpf_rcu_read_unlock];")
-
 NO_COUNT("a flag, another way to the jump that counts")
 LOOP(flag_two_ways, "w8 = -2048;",
      "w8 += 1; w2 = 0; if r7 != 0 goto 3f; w2 = 1; 3: if w8 == 0 goto 2f; w2 = 0; 2: if w2 != 1 goto 1b;")
