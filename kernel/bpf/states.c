@@ -505,7 +505,7 @@ static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verif
 /*
  * The join_key of a state is what has no join:
  * - what is held: references, locks, dynptrs, iterators, irq flags
- * - the call chain and the instance
+ * - the call chain and the instance, and whether the instance parked
  * - the peeled trip
  */
 bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b)
@@ -516,7 +516,7 @@ bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_veri
 	u32 fr, i;
 
 	if (memcmp(&a->join_key, &b->join_key, sizeof(a->join_key)) ||
-	    a->instance_id != b->instance_id || !same_refs(a, b))
+	    a->instance_id != b->instance_id || a->parked != b->parked || !same_refs(a, b))
 		return false;
 	for (fr = 0; fr <= a->curframe; fr++) {
 		fa = a->frame[fr];
@@ -563,6 +563,8 @@ u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verif
 	const struct loop_stack_entry *e;
 	const struct bpf_func_state *f;
 
+	if (st->parked)
+		hash = bpf_hash64(&st->parked, sizeof(st->parked), hash);
 	for (i = 0; i < st->acquired_refs; i++)
 		hash = bpf_hash64(&st->refs[i].ptr, sizeof(u64), hash + st->refs[i].type);
 	for (fr = 0; fr <= st->curframe; fr++) {
