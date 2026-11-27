@@ -371,6 +371,16 @@ struct bpf_reference_state {
 		REF_TYPE_LOCK		= (1 << 3),
 		REF_TYPE_RES_LOCK 	= (1 << 4),
 		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
+		/*
+		 * A coroutine frame in memory that its host lends, see "Hosts" in
+		 * kernel/bpf/coro.c. It has slots like any frame, and it is no resource: no call
+		 * releases it, no landing pad has an entry for it, and it is no leak. It is there
+		 * for as long as the program has the host. That is the program context where
+		 * 'parent_id' is 0, and the frame ends with the invocation. Else it is the
+		 * reference 'parent_id', and the frame ends where that goes, with every pointer
+		 * to it, see invalidate_reference().
+		 */
+		REF_TYPE_HOSTED		= (1 << 6),
 		REF_TYPE_LOCK_MASK	= REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
 	} type;
 	/* Track each reference created with a unique id, even if the same
@@ -396,7 +406,10 @@ struct bpf_reference_state {
 	 */
 	u8 saved;
 	union {
-		/* For REF_TYPE_PTR. Compared and hashed, see same_refs(): no holes. */
+		/*
+		 * For REF_TYPE_PTR, and 'parent_id' for REF_TYPE_HOSTED. Compared and hashed,
+		 * see same_refs(): no holes.
+		 */
 		struct {
 			int parent_id;
 			u16 ctx_arg;	/* it came with that __ref argument, the first is 1 */
@@ -413,7 +426,28 @@ struct bpf_reference_state {
 		 */
 		void *ptr;
 	};
+	/*
+	 * Slot-tracked memory owned by the reference, if any. The slots follow
+	 * the bpf_stack_state conventions of the stack. They are freed with
+	 * the reference, deep copied with the verifier state, visited by
+	 * bpf_for_each_reg_in_vstate(), compared by bpf_state_subsumes() and
+	 * joined by bpf_states_join(). They are no xregs: no equation, no dep
+	 * and no liveness is about them. The pointers that they hold are a part
+	 * of the join_key, see bpf_same_join_key().
+	 */
+	struct bpf_stack_state *slots;
+	u32 nr_slots;
+	/* Exact byte size of the slot-tracked memory. */
+	u32 mem_size;
 };
+
+/*
+ * Slots a reference may own: as many as the stack of a program that the
+ * interpreter runs has. Every copy of a state copies them, like the stack.
+ */
+#define BPF_MAX_REF_SLOTS	(MAX_BPF_STACK / BPF_REG_SIZE)
+/* a bit per slot, see struct bpf_pad_frame */
+static_assert(BPF_MAX_REF_SLOTS <= BITS_PER_LONG_LONG);
 
 struct bpf_retval_range {
 	s32 minval;
@@ -586,16 +620,22 @@ enum bpf_stuck_by {
 
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
- * per argument of a release two to load it, per entry a test, the calls, two to save the value,
- * three to tell the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has
- * the insn that leaves on top of that, or the call of the exception callback.
+ * per argument of a release two to load it, for a handle in a coroutine frame a load and a test
+ * for each frame on the way, per entry a test, the calls, two to save the value, three to tell
+ * the struct_ops, two to bring the value back, one for R2 of kexit. emit_pad() has the insn that
+ * leaves on top of that, or the call of the exception callback.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
-#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
+/* a handle is at most that many coroutine frames away from a register or a stack slot */
+#define BPF_PAD_MAX_HOPS	3
+#define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 3 +		\
+						     2 * BPF_PAD_MAX_HOPS) +		\
 				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
 #define BPF_PAD_MAX_CANDS	6
+/* The frames whose zero slots a plan follows from visit to visit, see struct bpf_pad_frame */
+#define BPF_PAD_MAX_FRAMES	8
 /* The handles that the entry of a landing pad of the program keeps, see bpf_pad_enter() */
 #define BPF_PAD_MAX_SAVES	BPF_PAD_MAX_ENTS
 /*
@@ -623,15 +663,40 @@ struct bpf_pad_place {
 	u8 loc;			/* enum bpf_place_loc */
 	bool maybe_null:1;	/* on a visit that holds the entry the pointer is not checked yet */
 	bool null:1;		/* it is 0 on all visits that don't hold the entry */
+	/*
+	 * The handle is in a slot of a coroutine frame, like in a slot of the stack: what is at
+	 * (loc, at) points to the frame, and the slot is 'hop[0]' bytes from where it points to.
+	 * With more hops that slot points to a frame in turn, and so on: 'hop[i]' bytes from where
+	 * the pointer before it points to, see find_frame_cands() in pads.c. 'delta' is about
+	 * what the last slot has. 0: the handle is at (loc, at).
+	 */
+	u8 hops:2;
 	s16 at;			/* number of the register | offset from R10 | index in used_maps */
 	s32 delta;		/* what is there is that much more than the handle */
+	s16 hop[BPF_PAD_MAX_HOPS];
 };
+
+/* 'hops' has two bits */
+static_assert(BPF_PAD_MAX_HOPS <= 3);
 
 /* The registers and the stack slots of a frame that are 0 */
 struct bpf_pad_nulls {
 	u16 regs;
 	u16 unsaved;		/* save words: the entry of the frame has put no handle there */
 	DECLARE_BITMAP(slots, MAX_BPF_STACK_SLOTS);
+};
+
+/*
+ * The slots of a coroutine frame that are 0, for a frame that a place of the function leads to:
+ * 'at' is where the pointer to the frame is, a register, a stack slot, or a slot of another
+ * such frame, and what is there is 'at.delta' more than the address of the frame. Bit k of
+ * 'zero': on every visit so far slot k of the frame was 0, or the way to the frame ended in a 0
+ * before it got there, which a landing pad tests for on its way. A plan has one for each such
+ * way that a visit came with, see visit_frames() in pads.c.
+ */
+struct bpf_pad_frame {
+	struct bpf_pad_place at;
+	u64 zero;
 };
 
 /*
@@ -651,6 +716,8 @@ struct bpf_pad_ent {
 	struct bpf_insn release; /* the call that releases it */
 	u32 obj_type;		/* it frees an object of the program: the BTF id of the type */
 	u8 class;		/* enum bpf_pad_class */
+	/* coro_prog_type of the state that held it: who may call the release, see get_release() */
+	u8 prog_type;
 	bool rcu;		/* an iterator that RCU protects: it is destroyed first */
 	bool always;		/* all visits hold it: the program counter tells */
 	/*
@@ -730,6 +797,9 @@ struct bpf_pad_plan {
 	 */
 	u8 before[BPF_PAD_MAX_ENTS];
 	struct bpf_pad_nulls nulls;	/* on all visits so far */
+	/* .. and what is 0 in the coroutine frames that the places lead to */
+	struct bpf_pad_frame *frames;
+	u8 nr_frames;
 	/*
 	 * BPF_SITE_CALL: the subprogs that were left with unwind_exit and came back to the call.
 	 * BPF_SITE_KCALL: those that were left with kexit.
@@ -737,6 +807,11 @@ struct bpf_pad_plan {
 	 */
 	u32 *callee;
 	u32 nr_callees;
+	/*
+	 * BPF_SITE_KCALL: what the call called is also the continuation of a parked coroutine
+	 * frame, which is no function of the program, see bpf_pad_note_external()
+	 */
+	bool external;
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
 	u32 bytes;			/* its part of env->mem, see charge_plan() */
@@ -925,6 +1000,26 @@ struct bpf_func_state {
 	 * when one state stands for another.
 	 */
 	struct bpf_pad_arg call_args[MAX_BPF_FUNC_REG_ARGS];
+	/*
+	 * Not 0 in an async callback that is the resume or destroy function of a coroutine:
+	 * one plus the call that suspended the coroutine, see push_coro_suspend(). The
+	 * continuations of two suspend points have two join_keys.
+	 */
+	u32 coro_suspend_site;
+	/*
+	 * Of the first frame: the type of program that the code of the state is verified as when
+	 * that is not the program's own, see state_prog_type(). The continuation of a coroutine
+	 * frame that was parked for a program of that type has it, the continuation of a frame
+	 * that it suspends for the kernel to resume, and a function that either calls and that
+	 * is verified on its own.
+	 */
+	u8 coro_prog_type;
+	/*
+	 * Of the first frame: it is the destroy function of a parked coroutine frame, or a
+	 * function that one calls and that is verified on its own. It suspends no frame, see
+	 * push_coro_suspend().
+	 */
+	bool coro_destroy;
 	);
 	bool no_stack_arg_load;
 	/*
@@ -1176,6 +1271,39 @@ bpf_stack_arg(const struct bpf_func_state *frame, const struct bpf_func_state *o
 	     iter < frame->out_stack_arg_cnt;                          \
 	     iter++, reg = bpf_get_spilled_stack_arg(iter, frame))
 
+static inline struct bpf_reg_state *bpf_get_ref_slot_reg(int slot,
+							 const struct bpf_reference_state *ref,
+							 u32 mask)
+{
+	if (slot < ref->nr_slots &&
+	    (1 << ref->slots[slot].slot_type[BPF_REG_SIZE - 1]) & mask)
+		return &ref->slots[slot].spilled_ptr;
+	return NULL;
+}
+
+/* Iterate over slots owned by 'ref', setting 'reg' to NULL or a spilled register. */
+#define bpf_for_each_ref_slot_reg(iter, ref, reg, mask)			\
+	for (iter = 0, reg = bpf_get_ref_slot_reg(iter, ref, mask);	\
+	     iter < (ref)->nr_slots;					\
+	     iter++, reg = bpf_get_ref_slot_reg(iter, ref, mask))
+
+/* Find the reference with 'id' that owns slots, if any. */
+static inline struct bpf_reference_state *bpf_find_ref_slots(const struct bpf_verifier_state *st,
+							     u32 id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id && st->refs[i].slots)
+			return &st->refs[i];
+	return NULL;
+}
+
+/*
+ * Invoke __expr over every register in __vst: frame registers, stack spills,
+ * spilled stack arguments and spills in reference-owned slots. __state is
+ * the owning frame, or the current frame for reference-owned slots.
+ */
 #define bpf_for_each_reg_in_vstate_mask(__vst, __state, __reg, __stack, __mask, __expr)   \
 	({                                                               \
 		struct bpf_verifier_state *___vstate = __vst;            \
@@ -1202,6 +1330,17 @@ bpf_stack_arg(const struct bpf_func_state *frame, const struct bpf_func_state *o
 				(void)(__expr);                          \
 			}						 \
 		}                                                        \
+		__state = ___vstate->frame[___vstate->curframe];         \
+		for (___i = 0; ___i < ___vstate->acquired_refs; ___i++) { \
+			struct bpf_reference_state *___ref = &___vstate->refs[___i]; \
+			bpf_for_each_ref_slot_reg(___j, ___ref, __reg, __mask) { \
+				if (!__reg)                              \
+					continue;                        \
+				__stack = &___ref->slots[___j];          \
+				(void)(__expr);                          \
+			}                                                \
+		}                                                        \
+		__stack = NULL;                                          \
 		(void)__stack;                                           \
 	})
 
@@ -1522,6 +1661,11 @@ struct bpf_insn_aux_data {
 	 */
 	u32 kpad:1;
 	/*
+	 * A call of a helper: the type of program that the states which got to it were verified
+	 * as, see bpf_state_prog() and note_helper_prog_type(). 0 if none got there.
+	 */
+	u8 helper_prog_type;
+	/*
 	 * PAD CODE: an insn that such a landing pad of its function gets to. A frame that the
 	 * kernel unwinds runs nothing else, see bpf_find_kernel_pads().
 	 */
@@ -1731,6 +1875,14 @@ struct bpf_subprog_info {
 	bool has_ld_abs: 1;
 	bool is_cb: 1;
 	bool is_async_cb: 1;
+	/* the resume or destroy function of a suspended coroutine, see push_coro_suspend() */
+	bool coro_cont: 1;
+	/* the resume function of a frame that a __coro_defer argument took */
+	bool coro_defer: 1;
+	/* of a parked frame, which a program calls: it has a time slice, see the fixups */
+	bool coro_parked: 1;
+	/* it has callx of a function of a parked coroutine frame, see check_coro_callx() */
+	bool calls_parked: 1;
 	bool is_exception_cb: 1;
 	bool in_exception_cb: 1; /* it is the exception callback, or that may get to it */
 	/* bpf_loop() or bpf_for_each_map_elem() call it in a loop */
@@ -2170,6 +2322,8 @@ struct bpf_verifier_env {
 	/* a global function is verified for BPF_FUNC_CTX_NO_RCU_LOCK */
 	bool no_rcu_read_lock;
 	bool has_throw;			/* the program has a call of bpf_throw() */
+	/* not 0 while a landing pad looks for a release with no state, see bpf_state_prog() */
+	u8 pad_prog_type;
 	bool signature;
 	u8 bug:1;			/* ends the load, see bpf_note_bug() */
 	u8 log_level:7;			/* of the user */
@@ -2486,6 +2640,9 @@ bool bpf_scalar_subsumes(const struct bpf_reg_state *old, const struct bpf_reg_s
 bool bpf_same_type_and_object(struct bpf_verifier_env *env, const struct bpf_reg_state *a,
 			      const struct bpf_reg_state *b);
 bool bpf_same_join_key(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b);
+const struct bpf_prog *bpf_state_prog(struct bpf_verifier_env *env, struct bpf_prog *view);
+const struct bpf_func_proto *bpf_helper_proto_as(struct bpf_verifier_env *env, int func_id,
+						 enum bpf_prog_type type);
 u64 bpf_hash64(const void *p, size_t len, u64 hash);
 u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verifier_state *st);
 int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
@@ -2691,6 +2848,7 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 				      enum bpf_site_kind kind);
 int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee,
 			enum bpf_site_kind kind);
+int bpf_pad_note_external(struct bpf_verifier_env *env, int call_idx, enum bpf_site_kind kind);
 bool bpf_pad_passes_r2(struct bpf_verifier_env *env, int subprog, enum bpf_site_kind kind);
 void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
 void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
@@ -2984,6 +3142,7 @@ static inline bool bpf_reg_has_range(const struct bpf_reg_state *reg)
 	case PTR_TO_TP_BUFFER:
 	case PTR_TO_BTF_ID:
 	case PTR_TO_INSN:
+	case PTR_TO_CORO_FRAME:
 		return !type_may_be_null(reg->type);
 	default:
 		return false;
@@ -3201,6 +3360,16 @@ struct bpf_call_arg_meta {
 	enum bpf_dynptr_type dynptr_write_type;
 	/* The buffer of bpf_dynptr_slice() or bpf_dynptr_slice_rdwr() */
 	struct bpf_stack_range slice_buf;
+	struct {
+		u32 ids[MAX_BPF_FUNC_ARGS];
+		u32 cnt;
+		/* Bit i set: ids[i] is a __coro_suspend frame the kernel resumes. */
+		u32 suspend_mask;
+		/* and a __coro_defer one, which it keeps in the frame's host */
+		u32 defer_mask;
+		/* and a __coro_offer one, which it may decline */
+		u32 offer_mask;
+	} coro_frames;
 
 	/* arg_{btf,btf_id,owning_ref} are used by kfunc-specific handling,
 	 * generally to pass info about user-defined local kptr types to later
@@ -3525,12 +3694,15 @@ static inline struct loop_stack_entry *bpf_top_loop(const struct bpf_func_state 
 	return frame->loop_stack_cnt ? &frame->loop_stack[frame->loop_stack_cnt - 1] : NULL;
 }
 
+/* What a walk over @st looks at: its xregs, and the slots that its references own */
 static inline u32 bpf_xreg_cnt(const struct bpf_verifier_state *st)
 {
-	u32 fr, nr = 0;
+	u32 fr, i, nr = 0;
 
 	for (fr = 0; fr <= st->curframe; fr++)
 		nr += MAX_BPF_REG + bpf_stack_nr_slots(st->frame[fr]);
+	for (i = 0; i < st->acquired_refs; i++)
+		nr += st->refs[i].nr_slots;
 	return nr;
 }
 

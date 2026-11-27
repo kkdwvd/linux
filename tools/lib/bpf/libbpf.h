@@ -387,6 +387,24 @@ bpf_object__prev_program(const struct bpf_object *obj, struct bpf_program *prog)
 LIBBPF_API void bpf_program__set_ifindex(struct bpf_program *prog,
 					 __u32 ifindex);
 
+/**
+ * @brief **bpf_program__set_coro_prog_fd()** binds a BPF program to the
+ * program whose parked coroutine frames it calls. The kernel keeps that
+ * program loaded for as long as this one is, and lets this one use the maps
+ * that hold the frames.
+ *
+ * The other program is loaded already, so a program of the same object has
+ * the load strategy BPF_PROG_LOAD_STRATEGY_MANUAL and is loaded with
+ * bpf_program__load() once the object is.
+ *
+ * @param prog BPF program to bind, which is not loaded yet
+ * @param coro_prog_fd file descriptor of the program to bind it to, 0 for
+ * none
+ * @return 0 on success; -EINVAL for an invalid file descriptor or a
+ * subprogram; -EBUSY if the program is loaded already
+ */
+LIBBPF_API int bpf_program__set_coro_prog_fd(struct bpf_program *prog, int coro_prog_fd);
+
 LIBBPF_API const char *bpf_program__name(const struct bpf_program *prog);
 LIBBPF_API const char *bpf_program__section_name(const struct bpf_program *prog);
 LIBBPF_API bool bpf_program__autoload(const struct bpf_program *prog);

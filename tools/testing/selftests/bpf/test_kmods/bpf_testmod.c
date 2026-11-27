@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/delay.h>
@@ -304,6 +305,223 @@ __bpf_kfunc void bpf_iter_testmod_current_destroy(struct bpf_iter_testmod_curren
 
 __bpf_kfunc void bpf_kfunc_common_test(void)
 {
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames(u64 cookie, void *a__coro_frame,
+				     void *b__coro_frame, u64 *rdonly_buf)
+{
+	int result = cookie + *rdonly_buf;
+
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(b__coro_frame);
+	return result;
+}
+
+__bpf_kfunc void bpf_kfunc_coro_frames_release(void *a__coro_frame, void *b__coro_frame)
+{
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(b__coro_frame);
+}
+
+__bpf_kfunc int bpf_kfunc_coro_frames_stack(void *a__coro_frame, u64 b, u64 c,
+					   u64 d, u64 e, void *f__coro_frame)
+{
+	bpf_coro_frame_free(a__coro_frame);
+	bpf_coro_frame_free(f__coro_frame);
+	return b + c + d + e;
+}
+
+/*
+ * Frames that bpf_testmod resumes, by an id below BPF_TESTMOD_CORO_IDS that a test picks.
+ * bpf_coro_run() may not run inside a program, so a work item on system_bh_highpri_wq resumes
+ * the frames after the call that took them, in softirq context, where the kfuncs of the
+ * program types that may suspend are valid: tc and syscall programs. What became of the
+ * resume of an id is in bpf_testmod_coro_results until the next suspension with the id: the
+ * lock keeps the two together, so a result is never that of an earlier frame.
+ *
+ * A frame takes no reference on its program. bpf_testmod holds the program for every frame
+ * that it has, from the kfunc that takes the frame until the frame is resumed or freed.
+ */
+#define BPF_TESTMOD_CORO_IDS 16
+
+static DEFINE_RAW_SPINLOCK(bpf_testmod_coro_lock);
+static void *bpf_testmod_coro_frames[BPF_TESTMOD_CORO_IDS];
+static void *bpf_testmod_coro_kept[BPF_TESTMOD_CORO_IDS];
+static int bpf_testmod_coro_results[BPF_TESTMOD_CORO_IDS] = {
+	[0 ... BPF_TESTMOD_CORO_IDS - 1] = -ENOENT,
+};
+
+/* False if the program of @frame is going: the frame is freed. */
+static bool bpf_testmod_coro_hold(void *frame)
+{
+	if (!IS_ERR(bpf_prog_inc_not_zero(bpf_coro_frame_prog(frame))))
+		return true;
+	bpf_coro_frame_free(frame);
+	return false;
+}
+
+static void bpf_testmod_coro_free(void *frame)
+{
+	struct bpf_prog *prog = bpf_coro_frame_prog(frame);
+
+	bpf_coro_frame_free(frame);
+	bpf_prog_put(prog);
+}
+
+static void bpf_testmod_coro_resume(struct work_struct *work)
+{
+	struct bpf_prog *prog;
+	unsigned long flags;
+	void *frame;
+	int id, ret;
+
+	for (id = 0; id < BPF_TESTMOD_CORO_IDS; id++) {
+		raw_spin_lock_irqsave(&bpf_testmod_coro_lock, flags);
+		frame = bpf_testmod_coro_frames[id];
+		bpf_testmod_coro_frames[id] = NULL;
+		raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
+		if (!frame)
+			continue;
+		/* the continuation frees the frame, or gives it to a kfunc again */
+		prog = bpf_coro_frame_prog(frame);
+		ret = bpf_coro_run(frame);
+		raw_spin_lock_irqsave(&bpf_testmod_coro_lock, flags);
+		/*
+		 * Not when the frame of the id was suspended again: its result is to come. A
+		 * reader that sees the result sees what the continuation stored.
+		 */
+		if (!bpf_testmod_coro_frames[id])
+			smp_store_release(&bpf_testmod_coro_results[id], ret);
+		raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
+		bpf_prog_put(prog);
+	}
+}
+
+static DECLARE_WORK(bpf_testmod_coro_work, bpf_testmod_coro_resume);
+
+/* Have @frame, whose program is held, resumed soon. A frame that is not resumed is freed. */
+static int bpf_testmod_coro_queue(u32 id, void *frame)
+{
+	unsigned long flags;
+	bool busy;
+
+	raw_spin_lock_irqsave(&bpf_testmod_coro_lock, flags);
+	busy = bpf_testmod_coro_frames[id];
+	if (!busy) {
+		bpf_testmod_coro_frames[id] = frame;
+		WRITE_ONCE(bpf_testmod_coro_results[id], -EINPROGRESS);
+	}
+	raw_spin_unlock_irqrestore(&bpf_testmod_coro_lock, flags);
+	if (busy) {
+		bpf_testmod_coro_free(frame);
+		return -EBUSY;
+	}
+	queue_work(system_bh_highpri_wq, &bpf_testmod_coro_work);
+	return 0;
+}
+
+/*
+ * Suspend @frame__coro_suspend: bpf_testmod resumes it soon after the call, see
+ * bpf_kfunc_coro_result(). One frame at a time for an id: -EBUSY frees another one.
+ */
+__bpf_kfunc int bpf_kfunc_coro_suspend(u32 id, void *frame__coro_suspend)
+{
+	if (id >= BPF_TESTMOD_CORO_IDS) {
+		bpf_coro_frame_free(frame__coro_suspend);
+		return -EINVAL;
+	}
+	if (!bpf_testmod_coro_hold(frame__coro_suspend))
+		return -ENOENT;
+	return bpf_testmod_coro_queue(id, frame__coro_suspend);
+}
+
+/*
+ * Keep @frame__coro_suspend until bpf_kfunc_coro_resume_kept() or bpf_kfunc_coro_free_kept(),
+ * which a test calls from another program: the frame outlives the program's file descriptor,
+ * and the program stays with it. One at a time for an id, -EBUSY frees another one at once.
+ */
+__bpf_kfunc int bpf_kfunc_coro_keep(u32 id, void *frame__coro_suspend)
+{
+	if (id >= BPF_TESTMOD_CORO_IDS) {
+		bpf_coro_frame_free(frame__coro_suspend);
+		return -EINVAL;
+	}
+	if (!bpf_testmod_coro_hold(frame__coro_suspend))
+		return -ENOENT;
+	if (cmpxchg(&bpf_testmod_coro_kept[id], NULL, frame__coro_suspend)) {
+		bpf_testmod_coro_free(frame__coro_suspend);
+		return -EBUSY;
+	}
+	return 0;
+}
+
+/* Have the frame that is kept for @id resumed soon, -ENOENT if none is */
+__bpf_kfunc int bpf_kfunc_coro_resume_kept(u32 id)
+{
+	void *frame;
+
+	if (id >= BPF_TESTMOD_CORO_IDS)
+		return -EINVAL;
+	frame = xchg(&bpf_testmod_coro_kept[id], NULL);
+	if (!frame)
+		return -ENOENT;
+	return bpf_testmod_coro_queue(id, frame);
+}
+
+/*
+ * Free the frame that is kept for @id without resuming it, -ENOENT if none is. With
+ * interrupts off, where the last reference to the program cannot be put at once.
+ */
+__bpf_kfunc int bpf_kfunc_coro_free_kept(u32 id)
+{
+	unsigned long flags;
+	void *frame;
+
+	if (id >= BPF_TESTMOD_CORO_IDS)
+		return -EINVAL;
+	frame = xchg(&bpf_testmod_coro_kept[id], NULL);
+	if (!frame)
+		return -ENOENT;
+	local_irq_save(flags);
+	bpf_testmod_coro_free(frame);
+	local_irq_restore(flags);
+	return 0;
+}
+
+/*
+ * What became of the frame that was suspended last for @id: -EINPROGRESS until it is
+ * resumed, then whether the continuation was unwound. -ENOENT if none was.
+ */
+__bpf_kfunc int bpf_kfunc_coro_result(u32 id)
+{
+	if (id >= BPF_TESTMOD_CORO_IDS)
+		return -EINVAL;
+	return smp_load_acquire(&bpf_testmod_coro_results[id]);
+}
+
+BTF_ID_LIST(bpf_testmod_coro_ids)
+BTF_ID(func, bpf_kfunc_coro_suspend)
+BTF_ID(func, bpf_kfunc_coro_keep)
+BTF_ID(func, bpf_kfunc_coro_resume_kept)
+BTF_ID(func, bpf_kfunc_coro_free_kept)
+BTF_ID(func, bpf_kfunc_coro_result)
+
+/*
+ * tc and syscall programs suspend frames, from where queue_work() may be called. Only syscall
+ * programs have frames kept and resumed: no program of another type, in NMI, say, has the
+ * continuation of a syscall program resumed.
+ */
+static int bpf_testmod_coro_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	int i;
+
+	if (kfunc_id == bpf_testmod_coro_ids[0])
+		return prog->type == BPF_PROG_TYPE_SCHED_CLS ||
+		       prog->type == BPF_PROG_TYPE_SYSCALL ? 0 : -EACCES;
+	for (i = 1; i < 5; i++)
+		if (kfunc_id == bpf_testmod_coro_ids[i])
+			return prog->type == BPF_PROG_TYPE_SYSCALL ? 0 : -EACCES;
+	return 0;
 }
 
 __bpf_kfunc u64 bpf_kfunc_arena_arg_test(u64 *val__arena)
@@ -1046,6 +1264,9 @@ BTF_ID_FLAGS(func, bpf_iter_testmod_current_next,
 	     KF_ITER_NEXT | KF_RET_NULL | KF_ITER_RET_INDEPENDENT)
 BTF_ID_FLAGS(func, bpf_iter_testmod_current_destroy, KF_ITER_DESTROY)
 BTF_ID_FLAGS(func, bpf_kfunc_common_test)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_frames_stack)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_arg_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_test)
 BTF_ID_FLAGS(func, bpf_kfunc_arena_cap_nullable_test)
@@ -2021,6 +2242,11 @@ BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg_legacy, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg_legacy_impl)
 BTF_ID_FLAGS(func, bpf_kfunc_trigger_ctx_check)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_suspend)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_keep)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_resume_kept)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_free_kept)
+BTF_ID_FLAGS(func, bpf_kfunc_coro_result)
 BTF_KFUNCS_END(bpf_testmod_check_kfunc_ids)
 
 static int bpf_testmod_ops_init(struct btf *btf)
@@ -2055,6 +2281,7 @@ static int bpf_testmod_ops_init_member(const struct btf_type *t,
 static const struct btf_kfunc_id_set bpf_testmod_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &bpf_testmod_check_kfunc_ids,
+	.filter = bpf_testmod_coro_filter,
 };
 
 static const struct bpf_verifier_ops bpf_testmod_verifier_ops = {
@@ -2689,6 +2916,8 @@ static void bpf_testmod_exit(void)
 	tasklet_kill(&ctx_check_tasklet);
 
 	bpf_kfunc_close_sock();
+	/* The program of a frame that is kept or queued is held, and holds this module. */
+	flush_work(&bpf_testmod_coro_work);
 	sysfs_remove_bin_file(kernel_kobj, &bin_attr_bpf_testmod_file);
 	unregister_bpf_testmod_uprobe();
 }

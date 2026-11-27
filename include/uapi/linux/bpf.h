@@ -1745,6 +1745,12 @@ union bpf_attr {
 		 * verification.
 		 */
 		__s32		keyring_id;
+		/* A program whose parked coroutine frames this program calls.
+		 * It stays loaded for as long as this program is, and the two
+		 * share the maps that hold the frames. This program parks no
+		 * frame of its own.
+		 */
+		__u32		coro_prog_fd;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */

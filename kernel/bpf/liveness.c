@@ -2974,6 +2974,8 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		}
 		if (!taken)
 			callx_use = args;
+		/* the frame of a parked coroutine, whose function is not one of these */
+		callx_use |= mask_widen(BIT(BPF_REG_1));
 
 		changed = false;
 		/* a cycle of calls takes a round for each link */

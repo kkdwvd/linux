@@ -714,6 +714,9 @@ bool bpf_site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_
 	case BPF_SITE_KENTRY:
 		if (!plan->visited)
 			return false;
+		/* the kernel unwinds what is not the program's wherever it does that */
+		if (plan->external)
+			return true;
 		bpf_pad_for_each_callee(plan, s)
 			if (env->subprog_info[s].can_kunwind)
 				return true;
@@ -2843,6 +2846,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 
 		func[i]->aux->name[0] = 'F';
 		func[i]->aux->stack_depth = env->subprog_info[i].stack_depth;
+		func[i]->aux->coro_defer = env->subprog_info[i].coro_defer;
 		if (env->subprog_info[i].priv_stack_mode == PRIV_STACK_ADAPTIVE)
 			func[i]->aux->jits_use_priv_stack = true;
 
@@ -4247,7 +4251,8 @@ patch_map_ops_generic:
 			goto next_insn;
 		}
 patch_call_imm:
-		fn = env->ops->get_func_proto(insn->imm, env->prog);
+		/* as the states that got to the call found it, see note_helper_prog_type() */
+		fn = bpf_helper_proto_as(env, insn->imm, env->insn_aux_data[i].helper_prog_type);
 		/* all functions that have prototype and verifier allowed
 		 * programs to call them, must be real in-kernel functions
 		 */
@@ -4290,8 +4295,23 @@ next_insn:
 		/* only a helper calls it, in a loop that ends when it returns 1 */
 		bool loop_cb = tmg && i && subprogs[i].is_loop_cb && !subprogs[i].is_called &&
 			       !subprogs[i].is_other_cb && !subprogs[i].is_async_cb;
+		/*
+		 * The continuation of a parked coroutine frame, which a program calls, see
+		 * check_coro_callx() in verifier.c, with no kernel code in between that would do
+		 * bpf_timed_may_goto_save() for it: it does that itself. What it finds is the
+		 * slice of its caller when that is the same program, and what an invocation of
+		 * this program left on the CPU some time ago when it is another one. It keeps
+		 * that in its stack and owns the slice, like the caller of an async callback, and
+		 * puts it back where it leaves if it still owns it: such a function can also be
+		 * called by a function of the program, another continuation among them, and an
+		 * invocation of the program can interrupt it or go on next to it. Also where the
+		 * kernel unwinds it: its caller may have interrupted an invocation of this program,
+		 * which goes on with the slice when the caller is unwound.
+		 */
+		bool coro = tmg && i && subprogs[i].coro_parked;
+		int saved_off = 0;
 
-		if (timed_may_goto ? !main_prog && !loop_cb : !stack_slots)
+		if (timed_may_goto ? !main_prog && !loop_cb && !coro : !stack_slots)
 			continue;
 		if (stack_slots > 1) {
 			verifier_bug(env, "stack_slots supports may_goto only");
@@ -4317,6 +4337,35 @@ next_insn:
 							     BPF_MAX_TIMED_LOOPS);
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, timestamp_off, 0);
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, owner_off, 0);
+			} else if (coro) {
+				/* three words below all that the function has in its stack */
+				saved_off = -round_up(stack_depth, BPF_REG_SIZE) -
+					    (int)sizeof(struct bpf_timed_may_goto);
+				subprogs[i].stack_depth = -saved_off;
+				/*
+				 * R1 to R5 may be arguments, of a call of the program if not of
+				 * the continuation. AX is free between the insns of a program, and
+				 * no insn that blinding rewrites stands where it is in use.
+				 */
+				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_0,
+							      count_off);
+				insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX,
+							      saved_off + count_off);
+				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_0,
+							      timestamp_off);
+				insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX,
+							      saved_off + timestamp_off);
+				insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, BPF_REG_0,
+							      owner_off);
+				insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_AX,
+							      saved_off + owner_off);
+				insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_AX, BPF_REG_FP);
+				insn_buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, saved_off);
+				insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_AX,
+							      owner_off);
+				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, count_off,
+							     BPF_MAX_TIMED_LOOPS);
+				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, timestamp_off, 0);
 			} else {
 				/*
 				 * The time is up, but the helper would call the function again and
@@ -4361,6 +4410,43 @@ next_insn:
 		ret = bpf_patch_list_insert(env, subprogs[i].start, insn_buf, cnt);
 		if (ret)
 			return ret;
+		if (coro) {
+			struct bpf_insn ld_r3[] = {
+				BPF_LD_IMM64(BPF_REG_3, (__force unsigned long)tmg)
+			};
+			int count_off = offsetof(struct bpf_timed_may_goto, count);
+			int timestamp_off = offsetof(struct bpf_timed_may_goto, timestamp);
+			int owner_off = offsetof(struct bpf_timed_may_goto, owner);
+			struct bpf_insn back[16], *exit;
+			int j, n = 0;
+
+			/* an exit has its value in R0, and in R2 if it is a pair or it is kexit */
+			back[n++] = ld_r3[0];
+			back[n++] = ld_r3[1];
+			back[n++] = BPF_MOV64_PERCPU_REG(BPF_REG_3, BPF_REG_3);
+			back[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_3, owner_off);
+			back[n++] = BPF_MOV64_REG(BPF_REG_5, BPF_REG_FP);
+			back[n++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_5, saved_off);
+			back[n++] = BPF_JMP_REG(BPF_JNE, BPF_REG_4, BPF_REG_5, 6);
+			back[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_FP,
+						saved_off + count_off);
+			back[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_3, BPF_REG_4, count_off);
+			back[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_FP,
+						saved_off + timestamp_off);
+			back[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_3, BPF_REG_4, timestamp_off);
+			back[n++] = BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_FP,
+						saved_off + owner_off);
+			back[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_3, BPF_REG_4, owner_off);
+			for (j = subprogs[i].start; j < subprogs[i + 1].start; j++) {
+				/* exit, kexit, and unwind_exit, which only a call of it has */
+				if (prog->insnsi[j].code != (BPF_JMP | BPF_EXIT))
+					continue;
+				back[n] = prog->insnsi[j];
+				exit = bpf_patch_list_add(env, j, back, n + 1);
+				if (IS_ERR(exit))
+					return PTR_ERR(exit);
+			}
+		}
 	}
 
 	ret = bpf_patch_list_commit(env);

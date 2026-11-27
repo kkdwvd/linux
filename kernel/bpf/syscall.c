@@ -3,6 +3,7 @@
  */
 #include <crypto/sha2.h>
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/bpf_trace.h>
 #include <linux/bpf_lirc.h>
@@ -1387,6 +1388,19 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 	if (ret < 0)
 		goto free_map_tab;
 
+	/*
+	 * The program whose parked coroutine frames a map holds destroys them when it goes, see
+	 * bpf_coro_prog_release(), and finds them all: a kptr field lives as long as the memory
+	 * of its value does, which is up to the allocator where the map is not preallocated.
+	 */
+	ret = bpf_record_holds_parked(map->record);
+	if (ret < 0)
+		goto free_map_tab;
+	if (ret && (!map->ops->map_free_parked || (map->map_flags & BPF_F_NO_PREALLOC))) {
+		ret = -EOPNOTSUPP;
+		goto free_map_tab;
+	}
+
 	if (map->ops->map_check_btf) {
 		ret = map->ops->map_check_btf(map, btf, key_type, value_type);
 		if (ret < 0)
@@ -2520,6 +2534,9 @@ static void bpf_prog_put_deferred(struct work_struct *work)
 
 	aux = container_of(work, struct bpf_prog_aux, work);
 	prog = aux->prog;
+	/* while all of the program is there for the destroy functions of its frames */
+	if (aux->coro_parks)
+		bpf_coro_prog_release(prog);
 	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_UNLOAD, 0);
 	bpf_audit_prog(prog, BPF_AUDIT_UNLOAD);
 	bpf_prog_free_id(prog);
@@ -2531,7 +2548,9 @@ static void __bpf_prog_put(struct bpf_prog *prog)
 	struct bpf_prog_aux *aux = prog->aux;
 
 	if (atomic64_dec_and_test(&aux->refcnt)) {
-		if (in_hardirq() || irqs_disabled()) {
+		bpf_coro_frames_stop(prog);
+		/* bpf_coro_prog_release() sleeps */
+		if (in_hardirq() || irqs_disabled() || aux->coro_parks) {
 			INIT_WORK(&aux->work, bpf_prog_put_deferred);
 			schedule_work(&aux->work);
 		} else {
@@ -2955,7 +2974,7 @@ int __init __used bpf_multi_func(void) { return 0; }
 BTF_ID_LIST_GLOBAL_SINGLE(bpf_multi_func_btf_id, func, bpf_multi_func)
 
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_LOAD_LAST_FIELD keyring_id
+#define BPF_PROG_LOAD_LAST_FIELD coro_prog_fd
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_attr *attr_log)
 {
@@ -3115,6 +3134,21 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	prog->aux->user = get_current_user();
 	prog->len = attr->insn_cnt;
 
+	if (attr->coro_prog_fd) {
+		struct bpf_prog *coro_prog = bpf_prog_get(attr->coro_prog_fd);
+
+		if (IS_ERR(coro_prog)) {
+			err = PTR_ERR(coro_prog);
+			goto free_prog;
+		}
+		prog->aux->coro_prog = coro_prog;
+		/* The frames are those of the one program that parks them. */
+		if (coro_prog->aux->coro_prog) {
+			err = -EINVAL;
+			goto free_prog;
+		}
+	}
+
 	err = bpf_prog_stream_init(prog, GFP_USER | BPF_GFP_MAYFAIL);
 	if (err)
 		goto free_prog;
@@ -3222,6 +3256,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	return err;
 
 free_used_maps:
+	/* It never ran: the maps that it took are free at once, see claim_coro_maps(). */
+	bpf_coro_prog_disown(prog);
 	/* In case we have subprogs, we need to wait for a grace
 	 * period before we can tear down JIT memory since symbols
 	 * are already exposed under kallsyms.

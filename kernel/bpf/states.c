@@ -83,13 +83,13 @@ int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 	struct bpf_idmap *map = &env->idmap_scratch;
 	struct bpf_reg_state *reg;
 	struct bpf_func_state *f;
-	u32 fr, i, xreg;
+	u32 fr, i, j, xreg;
 	int held;
 
 	map->cnt = 0;
 	for (i = 0; i < st->acquired_refs && i < BPF_ID_MAP_SIZE; i++) {
 		renumber_id(env, &st->refs[i].id, BPF_REF_ID(2 * i));
-		if (st->refs[i].type == REF_TYPE_PTR)
+		if (st->refs[i].type == REF_TYPE_PTR || st->refs[i].type == REF_TYPE_HOSTED)
 			renumber_id(env, &st->refs[i].parent_id, BPF_REF_ID(2 * i + 1));
 	}
 	/* they are among these */
@@ -115,6 +115,13 @@ int bpf_renumber_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 				renumber_reg_ids(env, &f->stack_arg_regs[i],
 						 xreg + 1 + MAX_BPF_STACK_SLOTS + i);
 		}
+	}
+	/* The slots that references own are last. Their names follow those of all frames. */
+	xreg = MAX_CALL_FRAMES * (BPF_ID_MAP_SIZE / MAX_CALL_FRAMES + 1);
+	for (i = 0; i < st->acquired_refs && i < BPF_ID_MAP_SIZE; i++, xreg += BPF_MAX_REF_SLOTS) {
+		bpf_for_each_ref_slot_reg(j, &st->refs[i], reg, BIT(STACK_SPILL))
+			if (reg)
+				renumber_reg_ids(env, reg, xreg + j);
 	}
 	if (map->cnt < BPF_ID_MAP_SIZE && st->acquired_refs < BPF_ID_MAP_SIZE)
 		return 0;
@@ -362,95 +369,87 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 	return NULL;
 }
 
-static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
-		      struct bpf_func_state *cur)
+/*
+ * Compare one slot of the old state against the current state.
+ * @cur is NULL when the current state does not have the slot at all.
+ */
+static bool slot_safe(struct bpf_verifier_env *env, struct bpf_stack_state *old,
+		      struct bpf_stack_state *cur)
 {
-	int i, spi;
+	struct bpf_reg_state *old_reg, *cur_reg;
+	int i;
 
-	/*
-	 * walk slots of the old stack and ignore any additional
-	 * slots in the current stack, since the old state
-	 * can't use them
-	 */
-	for (i = 0; i < old->allocated_stack; i++) {
-		struct bpf_stack_state *old_slot, *cur_slot;
-		struct bpf_reg_state *old_reg, *cur_reg;
-		int im = i % BPF_REG_SIZE;
-		u8 old_type;
+	for (i = 0; i < BPF_REG_SIZE; i++) {
+		u8 old_type = old->slot_type[i];
 
 		bpf_add_cost(env, 1, BPF_COST_SCAN);
-		spi = i / BPF_REG_SIZE;
-		old_slot = bpf_stack_slot(old, spi);
-		old_type = old_slot->slot_type[im];
-		cur_slot = i < cur->allocated_stack ? bpf_stack_slot(cur, spi) : NULL;
 
 		if (old_type == STACK_INVALID || old_type == STACK_POISON)
 			continue;
 
 		/* it can be filled into a register that is unreadable */
-		if (old_type == STACK_SPILL && old_slot->spilled_ptr.type == NOT_INIT &&
+		if (old_type == STACK_SPILL && old->spilled_ptr.type == NOT_INIT &&
 		    (env->allow_uninit_stack ||
-		     (cur_slot && cur_slot->slot_type[im] != STACK_INVALID &&
-		      cur_slot->slot_type[im] != STACK_POISON)))
+		     (cur && cur->slot_type[i] != STACK_INVALID &&
+		      cur->slot_type[i] != STACK_POISON)))
 			continue;
 
 		if (env->allow_uninit_stack && old_type == STACK_MISC)
 			continue;
 
-		/* old stack has more populated slots than current stack */
-		if (!cur_slot)
+		/* old slot is populated, but the current state does not have it */
+		if (!cur)
 			return false;
 
 		/*
 		 * The old spill is the first bytes of a wider spill. On big endian
 		 * these are not the low bytes of the value.
 		 */
-		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur_slot) &&
-		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old_slot),
-						bpf_spill_size(cur_slot)))
+		if (old_type == STACK_SPILL && bpf_is_spilled_reg(cur) &&
+		    !bpf_stack_narrow_access_ok(0, bpf_spill_size(old), bpf_spill_size(cur)))
 			return false;
 
 		/*
 		 * 64 and 32-bit scalar spills vs MISC/INVALID slots and vice versa.
 		 * Load from MISC/INVALID slots produces unbound scalar.
-		 * Construct a fake register for such stack and call regsafe().
+		 * Construct a fake register for such slot and call regsafe().
 		 */
-		if (im == 0 || im == 4) {
-			old_reg = scalar_reg_for_stack(env, old_slot, im);
-			cur_reg = scalar_reg_for_stack(env, cur_slot, im);
+		if (i == 0 || i == 4) {
+			old_reg = scalar_reg_for_stack(env, old, i);
+			cur_reg = scalar_reg_for_stack(env, cur, i);
 			if (old_reg && cur_reg) {
 				if (!regsafe(env, old_reg, cur_reg))
 					return false;
-				i += (im == 0 ? BPF_REG_SIZE - 1 : 3);
+				i += (i == 0 ? BPF_REG_SIZE - 1 : 3);
 				continue;
 			}
 		}
 
-		/* if old state was safe with misc data in the stack
-		 * it will be safe with zero-initialized stack.
+		/*
+		 * if old state was safe with misc data in the slot
+		 * it will be safe with zero-initialized slot.
 		 * The opposite is not true
 		 */
 		if (old_type == STACK_MISC &&
-		    (cur_slot->slot_type[im] == STACK_ZERO ||
-		     is_spilled_scalar_after(cur_slot, im)))
+		    (cur->slot_type[i] == STACK_ZERO || is_spilled_scalar_after(cur, i)))
 			continue;
-		if (old_type == STACK_ZERO && is_spilled_scalar_after(cur_slot, im) &&
-		    bpf_register_is_null(&cur_slot->spilled_ptr))
+		if (old_type == STACK_ZERO && is_spilled_scalar_after(cur, i) &&
+		    bpf_register_is_null(&cur->spilled_ptr))
 			continue;
-		if (old_type != cur_slot->slot_type[im])
+		if (old_type != cur->slot_type[i])
 			/*
 			 * Ex: old state has STACK_SPILL in
-			 * this stack slot, but current has STACK_MISC ->
+			 * this slot, but current has STACK_MISC ->
 			 * this verifier states are not equivalent
 			 */
 			return false;
-		if (im != BPF_REG_SIZE - 1)
+		if (i != BPF_REG_SIZE - 1)
 			continue;
 		/* Both old and cur are having same slot_type */
 		switch (old_type) {
 		case STACK_SPILL:
 			/*
-			 * when old and current stack slot are both storing
+			 * when old and current slot are both storing
 			 * spilled registers, check that stored pointers types
 			 * are the same as well.
 			 * Ex: old state could have stored
@@ -459,13 +458,13 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 * (bpf_reg_state) {.type = PTR_TO_STACK, .off = -16}
 			 * such verifier states are not equivalent.
 			 */
-			if (!regsafe(env, &old_slot->spilled_ptr, &cur_slot->spilled_ptr))
+			if (!regsafe(env, &old->spilled_ptr, &cur->spilled_ptr))
 				return false;
 			break;
 		case STACK_DYNPTR:
 		case STACK_ITER:
 		case STACK_IRQ_FLAG:
-			if (!reg_object_equal(&old_slot->spilled_ptr, &cur_slot->spilled_ptr))
+			if (!reg_object_equal(&old->spilled_ptr, &cur->spilled_ptr))
 				return false;
 			break;
 		case STACK_MISC:
@@ -481,10 +480,68 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 	return true;
 }
 
+static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+		      struct bpf_func_state *cur)
+{
+	u32 spi;
+
+	/*
+	 * walk slots of the old stack and ignore any additional
+	 * slots in the current stack, since the old state
+	 * can't use them
+	 */
+	for (spi = 0; spi < bpf_stack_nr_slots(old); spi++)
+		if (!slot_safe(env, bpf_stack_slot(old, spi),
+			       spi < bpf_stack_nr_slots(cur) ? bpf_stack_slot(cur, spi) : NULL))
+			return false;
+	return true;
+}
+
 static const struct bpf_stack_state *held_slot(const struct bpf_func_state *f, u32 i)
 {
 	return i < bpf_stack_nr_slots(f) && bpf_slot_is_held(bpf_stack_slot(f, i)) ?
 	       bpf_stack_slot(f, i) : NULL;
+}
+
+/* The pointer that slot @i of @ref holds, if it holds one */
+static const struct bpf_reg_state *ref_slot_ptr(const struct bpf_reference_state *ref, u32 i)
+{
+	const struct bpf_reg_state *reg = bpf_get_ref_slot_reg(i, ref, BIT(STACK_SPILL));
+
+	return reg && reg->type != SCALAR_VALUE && reg->type != NOT_INIT ? reg : NULL;
+}
+
+/* The type of a pointer, and its object if it is not in the number, as in hash_type() */
+static size_t ptr_object_len(const struct bpf_reg_state *reg)
+{
+	if (type_is_pkt_pointer(reg->type) || base_type(reg->type) == PTR_TO_ARENA)
+		return offsetofend(struct bpf_reg_state, type);
+	return offsetof(struct bpf_reg_state, var_off);
+}
+
+/*
+ * No liveness and no dep is about the slots that a reference owns. So no pass can keep two
+ * states apart for a pointer that only one of them has there, as bpf_hash_live_types() and
+ * a partition do for an xreg, and the join of two types or objects is unreadable, see
+ * join_reg(). So these pointers are a part of the join_key: states that meet have pointers
+ * of the same type to the same object in the same slots.
+ */
+static bool same_ref_slots(const struct bpf_reference_state *a,
+			   const struct bpf_reference_state *b)
+{
+	const struct bpf_reg_state *pa, *pb;
+	u32 i;
+
+	/* a pointer to the memory is checked against its exact size */
+	if (a->nr_slots != b->nr_slots || a->mem_size != b->mem_size)
+		return false;
+	for (i = 0; i < a->nr_slots; i++) {
+		pa = ref_slot_ptr(a, i);
+		pb = ref_slot_ptr(b, i);
+		if (!pa != !pb || (pa && memcmp(pa, pb, ptr_object_len(pa))))
+			return false;
+	}
+	return true;
 }
 
 static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verifier_state *b)
@@ -494,7 +551,8 @@ static bool same_refs(const struct bpf_verifier_state *a, const struct bpf_verif
 	for (i = 0; i < a->acquired_refs; i++)
 		if (a->refs[i].type != b->refs[i].type || a->refs[i].id != b->refs[i].id ||
 		    a->refs[i].saved != b->refs[i].saved ||
-		    memcmp(&a->refs[i].ptr, &b->refs[i].ptr, sizeof(u64)))
+		    memcmp(&a->refs[i].ptr, &b->refs[i].ptr, sizeof(u64)) ||
+		    !same_ref_slots(&a->refs[i], &b->refs[i]))
 			return false;
 	return true;
 }
@@ -555,13 +613,22 @@ u64 bpf_hash_join_key(const struct bpf_verifier_env *env, const struct bpf_verif
 {
 	u64 hash = bpf_hash64(&st->join_key, sizeof(st->join_key), env->hash_seed +
 			      ((u64)st->instance_id << 32 | st->insn_idx));
-	u32 fr, i, trip;
+	u32 fr, i, j, trip;
 	const struct bpf_stack_state *slot;
 	const struct loop_stack_entry *e;
 	const struct bpf_func_state *f;
+	const struct bpf_reg_state *reg;
 
-	for (i = 0; i < st->acquired_refs; i++)
+	for (i = 0; i < st->acquired_refs; i++) {
 		hash = bpf_hash64(&st->refs[i].ptr, sizeof(u64), hash + st->refs[i].type);
+		/* see same_ref_slots() */
+		hash += (u64)st->refs[i].mem_size << 16;
+		for (j = 0; j < st->refs[i].nr_slots; j++) {
+			reg = ref_slot_ptr(&st->refs[i], j);
+			if (reg)
+				hash = bpf_hash64(reg, ptr_object_len(reg), hash + j);
+		}
+	}
 	for (fr = 0; fr <= st->curframe; fr++) {
 		f = st->frame[fr];
 		hash = bpf_hash64(&f->join_key, sizeof(f->join_key), hash);
@@ -648,7 +715,7 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 bool bpf_state_subsumes(struct bpf_verifier_env *env, const struct bpf_verifier_state *old,
 			const struct bpf_verifier_state *cur)
 {
-	int i;
+	int i, j;
 
 	env->pkt_pair_cnt = 0;
 
@@ -662,6 +729,12 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, const struct bpf_verifier_
 		if (!func_states_equal(env, old->frame[i], cur->frame[i],
 				       bpf_frame_live_regs(env, old, i)))
 			return false;
+
+	/* The slots that a reference owns are compared like stack slots. All of them are live. */
+	for (i = 0; i < old->acquired_refs; i++)
+		for (j = 0; j < old->refs[i].nr_slots; j++)
+			if (!slot_safe(env, &old->refs[i].slots[j], &cur->refs[i].slots[j]))
+				return false;
 
 	return bpf_equations_subsume(env, old, cur);
 }

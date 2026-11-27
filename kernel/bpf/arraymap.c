@@ -503,6 +503,20 @@ static void array_map_free_internal_structs(struct bpf_map *map)
 		bpf_map_free_internal_structs(map, array_map_elem_ptr(array, i));
 }
 
+/* The program whose parked coroutine frames the map holds goes, see bpf_coro_prog_release() */
+static void array_map_free_parked(struct bpf_map *map)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	unsigned long *fields = bpf_record_parked_fields(map->record);
+	int i;
+
+	for (i = 0; i < array->map.max_entries; i++) {
+		bpf_obj_free_parked(map->record, array_map_elem_ptr(array, i), fields);
+		cond_resched();
+	}
+	bitmap_free(fields);
+}
+
 /* Called when map->refcnt goes to zero, either from workqueue or from syscall */
 static void array_map_free(struct bpf_map *map)
 {
@@ -884,6 +898,7 @@ const struct bpf_map_ops array_map_ops = {
 	.map_free = array_map_free,
 	.map_get_next_key = bpf_array_get_next_key,
 	.map_release_uref = array_map_free_internal_structs,
+	.map_free_parked = array_map_free_parked,
 	.map_lookup_elem = array_map_lookup_elem,
 	.map_update_elem = array_map_update_elem,
 	.map_delete_elem = array_map_delete_elem,

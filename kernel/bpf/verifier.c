@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_coro.h>
 #include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
@@ -220,6 +221,13 @@ static bool is_tracing_prog_type(enum bpf_prog_type type);
 static int ref_set_non_owning(struct bpf_verifier_env *env,
 			      struct bpf_reg_state *reg);
 static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg);
+static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg);
+static bool is_kfunc_arg_coro_offer(const struct btf *btf, const struct btf_param *arg);
+static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
+					  const struct bpf_verifier_state *st);
+static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg);
+static enum bpf_prog_type coro_park_type(const struct bpf_insn *insn);
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static bool in_rcu_callback(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
@@ -383,6 +391,7 @@ static bool reg_not_null(struct bpf_verifier_env *env, const struct bpf_reg_stat
 		type == PTR_TO_SOCK_COMMON ||
 		(type == PTR_TO_BTF_ID && is_trusted_reg(env, reg)) ||
 		(type == PTR_TO_MEM && !(reg->type & PTR_UNTRUSTED)) ||
+		type == PTR_TO_CORO_FRAME ||
 		type == CONST_PTR_TO_MAP;
 }
 
@@ -1466,14 +1475,68 @@ out:
 	return arr ? arr : ZERO_SIZE_PTR;
 }
 
+static void free_reference_slots(struct bpf_reference_state *refs, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		kfree(refs[i].slots);
+		refs[i].slots = NULL;
+		refs[i].nr_slots = 0;
+		refs[i].mem_size = 0;
+	}
+}
+
+/* @dst gets a copy of the slots that @src owns in place of its own */
+static int copy_reference_slots(struct bpf_reference_state *dst,
+				const struct bpf_reference_state *src)
+{
+	struct bpf_stack_state *slots = NULL;
+
+	if (src->nr_slots) {
+		slots = kmemdup_array(src->slots, src->nr_slots, sizeof(*slots), BPF_VERIFIER_GFP);
+		if (!slots)
+			return -ENOMEM;
+	}
+	kfree(dst->slots);
+	dst->slots = slots;
+	dst->nr_slots = src->nr_slots;
+	dst->mem_size = src->mem_size;
+	return 0;
+}
+
 static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf_verifier_state *src)
 {
+	u32 i;
+	int err;
+
+	/*
+	 * dst may be a reused state that still owns slot arrays; they must
+	 * not leak when the reference array is overwritten below.
+	 */
+	free_reference_slots(dst->refs, dst->acquired_refs);
+	dst->acquired_refs = 0;
 	dst->refs = copy_array(dst->refs, src->refs, src->acquired_refs,
 			       sizeof(struct bpf_reference_state), BPF_VERIFIER_GFP);
 	if (!dst->refs)
 		return -ENOMEM;
 
+	/*
+	 * The shallow copy above aliased src's slot arrays. Detach them all
+	 * before allocating so that a failure below leaves dst owning only
+	 * its own arrays and bpf_free_verifier_state() can clean up.
+	 */
 	dst->held = src->held;
+	for (i = 0; i < src->acquired_refs; i++) {
+		dst->refs[i].slots = NULL;
+		dst->refs[i].nr_slots = 0;
+		dst->refs[i].mem_size = 0;
+	}
+	for (i = 0; i < src->acquired_refs; i++) {
+		err = copy_reference_slots(&dst->refs[i], &src->refs[i]);
+		if (err)
+			return err;
+	}
 	return 0;
 }
 
@@ -1502,12 +1565,26 @@ static int copy_stack_state(struct bpf_func_state *dst, const struct bpf_func_st
 	return 0;
 }
 
+/* Make room for @n references. The new ones are zeroed. */
 static int resize_reference_state(struct bpf_verifier_state *state, size_t n)
 {
-	state->refs = realloc_array(state->refs, state->acquired_refs, n,
-				    sizeof(struct bpf_reference_state));
-	if (!state->refs)
-		return -ENOMEM;
+	size_t old_n = state->acquired_refs;
+	struct bpf_reference_state *refs;
+
+	/*
+	 * Not realloc_array(): it frees the array when it fails, and with it the only
+	 * pointers to the slots that the references own.
+	 */
+	if (n > old_n) {
+		refs = krealloc(state->refs, kmalloc_size_roundup(size_mul(n, sizeof(*refs))),
+				BPF_VERIFIER_GFP);
+		if (!refs)
+			return -ENOMEM;
+		memset(refs + old_n, 0, (n - old_n) * sizeof(*refs));
+		state->refs = refs;
+	} else {
+		free_reference_slots(state->refs + n, old_n - n);
+	}
 
 	state->acquired_refs = n;
 	return 0;
@@ -1647,6 +1724,7 @@ static void release_reference_state(struct bpf_verifier_state *state, int idx)
 	 * it can detect out-of-order IRQ restore. Hence use memmove to shift
 	 * the array instead of swapping the final element into the deleted idx.
 	 */
+	kfree(state->refs[idx].slots);
 	last_idx = state->acquired_refs - 1;
 	rem = state->acquired_refs - idx - 1;
 	if (last_idx && idx != last_idx)
@@ -1687,6 +1765,42 @@ static bool find_reference_state(struct bpf_verifier_state *state, int id)
 static bool reg_is_referenced(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
 {
 	return find_reference_state(env->cur_state, reg->id);
+}
+
+/* The coroutine frame in memory of a host that @id is, see REF_TYPE_HOSTED. NULL: it is none. */
+static struct bpf_reference_state *find_hosted_frame(struct bpf_verifier_state *state, int id)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].id == id)
+			return &state->refs[i];
+	return NULL;
+}
+
+/* Is a coroutine frame in memory of @id, where 0 is the program context? */
+static bool hosts_frames(const struct bpf_verifier_state *state, int id)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].parent_id == id)
+			return true;
+	return false;
+}
+
+/*
+ * The frames that @from hosts are hosted by @to from now on, where 0 is the program context:
+ * a kfunc made the context a reference of the program, or the reference turned out to be
+ * NULL and the context is what the program still has.
+ */
+static void move_hosted_frames(struct bpf_verifier_state *state, int from, int to)
+{
+	int i;
+
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_HOSTED && state->refs[i].parent_id == from)
+			state->refs[i].parent_id = to;
 }
 
 static u32 reg_lifetime_id(struct bpf_verifier_env *env,
@@ -1787,10 +1901,12 @@ static void free_func_state(struct bpf_func_state *state)
 void bpf_charge_state(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
 {
 	/* with the struct that holds it */
-	u32 bytes = 2 * sizeof(*st) + ksize(st->refs), fr;
+	u32 bytes = 2 * sizeof(*st) + ksize(st->refs), fr, i;
 	struct bpf_func_state *f;
 
 	bytes += bpf_equations_bytes(&st->equations);
+	for (i = 0; i < st->acquired_refs; i++)
+		bytes += ksize(st->refs[i].slots);
 	for (fr = 0; fr <= st->curframe && (f = st->frame[fr]); fr++)
 		bytes += kmalloc_size_roundup(sizeof(*f)) + ksize(f->stack) +
 			 ksize(f->stack_arg_regs) + ksize(f->loop_stack);
@@ -1809,6 +1925,7 @@ void bpf_free_verifier_state(struct bpf_verifier_env *env, struct bpf_verifier_s
 		free_func_state(state->frame[i]);
 		state->frame[i] = NULL;
 	}
+	free_reference_slots(state->refs, state->acquired_refs);
 	kfree(state->refs);
 	bpf_equations_free(&state->equations);
 	if (free_self)
@@ -2972,6 +3089,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 			    struct bpf_kfunc_meta *kfunc)
 {
 	const struct btf_type *func, *func_proto;
+	struct bpf_prog view;
 	const char *func_name;
 	u32 *kfunc_flags;
 	struct btf *btf;
@@ -2994,7 +3112,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 	 * call.  However we don't fail with an error here,
 	 * and let the caller decide what to do with NULL kfunc->flags.
 	 */
-	kfunc_flags = btf_kfunc_flags(btf, func_id, env->prog);
+	kfunc_flags = btf_kfunc_flags(btf, func_id, bpf_state_prog(env, &view));
 
 	func = btf_type_by_id(btf, func_id);
 	if (!func || !btf_type_is_func(func)) {
@@ -3857,12 +3975,77 @@ static bool __is_pointer_value(bool allow_ptr_leaks,
 	return reg->type != SCALAR_VALUE;
 }
 
-static void save_register_state(struct bpf_verifier_env *env,
-				struct bpf_func_state *state,
-				int spi, struct bpf_reg_state *reg,
-				int size)
+/*
+ * Slot-level spill and scrub rules shared by every slot-tracked memory.
+ *
+ * A slot covers BPF_REG_SIZE bytes. slot_type[] describes them in reverse
+ * memory order: slot_type[BPF_REG_SIZE - 1] is the lowest address of the
+ * slot, which is where a full register spill starts and what
+ * bpf_is_spilled_reg() tests. Helpers take 'm', the byte offset within the
+ * slot in memory order, and translate with slot_byte_idx(). Accesses never
+ * straddle a slot because callers require size-aligned offsets.
+ */
+static int slot_byte_idx(int m)
 {
-	struct bpf_stack_state *slot = bpf_stack_slot(state, spi);
+	return BPF_REG_SIZE - 1 - m;
+}
+
+/* Byte offset within its slot of the stack byte at 'off' (off < 0). */
+static int stack_byte_off(int off)
+{
+	return slot_byte_idx((-off - 1) % BPF_REG_SIZE);
+}
+
+/*
+ * Unprivileged programs may not partially overwrite a spilled pointer: the
+ * remaining bytes would keep pointer bits that a later read can leak.
+ */
+static int check_slot_ptr_spill_corruption(struct bpf_verifier_env *env,
+					   struct bpf_stack_state *slot, int size,
+					   const char *mem, int off, int insn_idx)
+{
+	const char *reason;
+
+	if (env->allow_ptr_leaks || size == BPF_REG_SIZE ||
+	    !bpf_is_spilled_reg(slot) || bpf_is_spilled_scalar_reg(slot))
+		return 0;
+
+	verbose(env, "attempt to corrupt spilled pointer on %s\n", mem);
+	reason = bpf_diag_fmt(env,
+			      "This store writes %d bytes at %s offset %d into a %s slot that currently holds a spilled pointer. "
+			      "Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
+			      size, mem, off, mem);
+	bpf_diag_memory(env, insn_idx, bpf_diag_fmt(env, "%s spill corruption", mem), reason,
+			bpf_diag_fmt(env, "Write the full 8-byte spilled pointer slot, or use a separate %s slot for scalar data before overwriting only part of it.",
+				     mem));
+	return -EACCES;
+}
+
+/*
+ * A store needs Spectre v4 sanitization when it writes a pointer or lands on
+ * bytes that are not plain data, since a speculatively bypassed store could
+ * then expose a spilled pointer.
+ */
+static bool slot_write_needs_nospec(struct bpf_stack_state *slot, int m, int size,
+				    bool ptr_value)
+{
+	int i;
+
+	if (ptr_value)
+		return true;
+	for (i = 0; i < size; i++) {
+		u8 type = slot->slot_type[slot_byte_idx(m + i)];
+
+		if (type != STACK_MISC && type != STACK_ZERO)
+			return true;
+	}
+	return false;
+}
+
+/* Spill a register into a slot; bytes beyond a narrow spill become MISC. */
+static void spill_reg_to_slot(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			      struct bpf_reg_state *reg, int size)
+{
 	int i;
 
 	bpf_diag_mod_begin(env, &slot->spilled_ptr, reg, BPF_DIAG_MOD_SPILL);
@@ -3876,6 +4059,175 @@ static void save_register_state(struct bpf_verifier_env *env,
 		mark_stack_slot_misc(env, &slot->slot_type[i - 1]);
 
 	bpf_diag_mod_end(env);
+}
+
+static void scrub_special_slot(struct bpf_stack_state *slot)
+{
+	int i;
+
+	/* regular write of data into the slot destroys any spilled ptr */
+	slot->spilled_ptr.type = NOT_INIT;
+	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
+	if (is_stack_slot_special(slot))
+		for (i = 0; i < BPF_REG_SIZE; i++)
+			scrub_spilled_slot(&slot->slot_type[i]);
+}
+
+/*
+ * Record a plain data write of 'size' bytes at slot offset 'm'. The bytes
+ * become STACK_ZERO when a known zero is written, otherwise STACK_MISC. A
+ * write behind the low bytes of a spilled number leaves these bytes of the
+ * number in the slot.
+ */
+static void write_slot_data(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			    int m, int size, bool zero)
+{
+	u8 type = zero ? STACK_ZERO : STACK_MISC;
+	int i, keep = 0;
+
+	/* the bytes before the write still have the low bytes of a number */
+	if (bpf_is_spilled_scalar_reg(slot) && m)
+		keep = min_t(int, rounddown_pow_of_two(m), bpf_spill_size(slot));
+	if (keep && bpf_stack_narrow_access_ok(0, keep, bpf_spill_size(slot))) {
+		for (i = 0; i < BPF_REG_SIZE - keep; i++)
+			if (slot->slot_type[i] == STACK_SPILL)
+				slot->slot_type[i] = STACK_MISC;
+	} else {
+		if (bpf_is_spilled_reg(slot))
+			bpf_diag_record_scrub(env, &slot->spilled_ptr, BPF_DIAG_MOD_WRITE);
+		scrub_special_slot(slot);
+	}
+
+	for (i = 0; i < size; i++)
+		slot->slot_type[slot_byte_idx(m + i)] = type;
+}
+
+/*
+ * Prepare byte 'm' of a slot that lies in the range of a variable-offset
+ * write. Spilled pointers in range are destroyed since any of them may be
+ * overwritten. A written zero lets STACK_ZERO bytes and zero spills keep
+ * their state.
+ */
+static int prepare_slot_byte_var_write(struct bpf_verifier_env *env,
+				       struct bpf_stack_state *slot, int m,
+				       bool writing_zero, const char *mem,
+				       int insn_idx, int off)
+{
+	u8 new_type, *stype = &slot->slot_type[slot_byte_idx(m)];
+
+	if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
+		/*
+		 * Reject the write if range we may write to has not been
+		 * initialized beforehand. If we didn't reject here, the ptr
+		 * status would be erased below (even though not all slots are
+		 * actually overwritten), possibly opening the door to leaks.
+		 *
+		 * We do however catch STACK_INVALID case below, and only allow
+		 * reading possibly uninitialized memory later for CAP_PERFMON,
+		 * as the write may not happen to that slot.
+		 */
+		verbose(env, "spilled ptr in range of var-offset %s write; insn %d, ptr off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+
+	/*
+	 * If writing_zero and the slot contains a spill of value 0, maintain
+	 * the spill type.
+	 */
+	if (writing_zero && *stype == STACK_SPILL && bpf_is_spilled_scalar_reg(slot)) {
+		struct bpf_reg_state *spill_reg = &slot->spilled_ptr;
+
+		if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0)
+			return 0;
+	}
+
+	/*
+	 * Scrub slots if variable-offset write goes over spilled pointers.
+	 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type ==
+	 * NOT_INIT and valid program is rejected by check_stack_read_fixed_off()
+	 * with obscure "invalid size of register fill" message.
+	 */
+	scrub_special_slot(slot);
+
+	/* Update the slot type. */
+	new_type = STACK_MISC;
+	if (writing_zero && *stype == STACK_ZERO)
+		new_type = STACK_ZERO;
+	/*
+	 * If the slot is STACK_INVALID, we check whether it's OK to pretend
+	 * that it will be initialized by this write. The slot might not
+	 * actually be written to, and so if we mark it as initialized future
+	 * reads might leak uninitialized memory. For privileged programs, we
+	 * will accept such reads to slots that may or may not be written
+	 * because, if we're reject them, the error would be too confusing.
+	 * Conservatively, treat STACK_POISON in a similar way.
+	 */
+	if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
+	    !env->allow_uninit_stack) {
+		verbose(env, "uninit %s in range of var-offset write prohibited for !root; insn %d, off: %d",
+			mem, insn_idx, off);
+		return -EINVAL;
+	}
+	*stype = new_type;
+	return 0;
+}
+
+enum slot_range_status {
+	SLOT_RANGE_OK,
+	SLOT_RANGE_UNINIT,
+	SLOT_RANGE_POISON,
+};
+
+/*
+ * Validate byte 'm' of a slot that a helper or kfunc will access through a
+ * memory argument. A write ('clobber') may store anything, so zero bytes,
+ * uninitialized bytes that privileged programs may read, and spilled
+ * registers turn into MISC data. Unprivileged output buffers can accept
+ * uninitialized bytes without marking them initialized. Spilled pointers
+ * may be passed only by privileged programs; spilled scalars always.
+ */
+static enum slot_range_status check_slot_byte_range(struct bpf_verifier_env *env,
+						    struct bpf_stack_state *slot, int m,
+						    bool clobber, bool allow_poison, bool uninit)
+{
+	u8 *stype = &slot->slot_type[slot_byte_idx(m)];
+	int j;
+
+	if (*stype == STACK_MISC)
+		return SLOT_RANGE_OK;
+	if ((*stype == STACK_ZERO) ||
+	    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
+		if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
+			/* helper can write anything into the slot */
+			*stype = STACK_MISC;
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	/*
+	 * Only the bytes marked STACK_SPILL hold the spilled register. The rest
+	 * of a narrowly spilled slot keeps its previous type and must be
+	 * initialized on its own.
+	 */
+	if (*stype == STACK_SPILL &&
+	    (slot->spilled_ptr.type == SCALAR_VALUE || env->allow_ptr_leaks)) {
+		if (clobber) {
+			bpf_mark_reg_unknown(&slot->spilled_ptr);
+			for (j = 0; j < BPF_REG_SIZE; j++)
+				scrub_spilled_slot(&slot->slot_type[j]);
+		}
+		return SLOT_RANGE_OK;
+	}
+
+	if (*stype == STACK_POISON) {
+		if (!allow_poison)
+			return SLOT_RANGE_POISON;
+		if (uninit && env->allow_uninit_stack)
+			*stype = STACK_MISC;
+		return SLOT_RANGE_OK;
+	}
+	return SLOT_RANGE_UNINIT;
 }
 
 static bool is_bpf_st_mem(struct bpf_insn *insn)
@@ -3924,19 +4276,6 @@ static void check_fastcall_stack_contract(struct bpf_verifier_env *env,
 	}
 }
 
-static void scrub_special_slot(struct bpf_func_state *state, int spi)
-{
-	struct bpf_stack_state *slot = bpf_stack_slot(state, spi);
-	int i;
-
-	/* regular write of data into stack destroys any spilled ptr */
-	slot->spilled_ptr.type = NOT_INIT;
-	/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
-	if (is_stack_slot_special(slot))
-		for (i = 0; i < BPF_REG_SIZE; i++)
-			scrub_spilled_slot(&slot->slot_type[i]);
-}
-
 /* check_stack_{read,write}_fixed_off functions track spill/fill of registers,
  * stack boundary and alignment are checked in check_mem_access()
  */
@@ -3947,51 +4286,26 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 				       int insn_idx)
 {
 	struct bpf_func_state *cur; /* state of the current function */
-	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	int slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
+	struct bpf_stack_state *stack = bpf_stack_slot(state, spi);
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
-	struct bpf_stack_state *ss = bpf_stack_slot(state, spi);
+	int m = stack_byte_off(off);
 
 	/*
 	 * caller checked that off % size == 0 and -env->stack_limit <= off < 0,
 	 * so it's aligned access and [off, off + size) are within stack limits
 	 */
-	if (!env->allow_ptr_leaks &&
-	    bpf_is_spilled_reg(ss) &&
-	    !bpf_is_spilled_scalar_reg(ss) &&
-	    size != BPF_REG_SIZE) {
-		const char *reason;
-
-		verbose(env, "attempt to corrupt spilled pointer on stack\n");
-		reason = bpf_diag_fmt(env,
-				      "This store writes %d bytes at stack offset %d into a stack slot that currently holds a spilled pointer. "
-			"Partial writes to spilled pointers are rejected because they can corrupt pointer metadata and leak kernel pointers.",
-			size, off);
-		bpf_diag_memory(
-			env, insn_idx, "stack spill corruption", reason,
-			"Write the full 8-byte spilled pointer slot, or use a separate stack slot for scalar data before overwriting only part of it.");
-		return -EACCES;
-	}
+	err = check_slot_ptr_spill_corruption(env, stack, size, "stack", off, insn_idx);
+	if (err)
+		return err;
 
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
-	if (!env->bypass_spec_v4) {
-		bool sanitize = reg && is_pointer_regtype(reg->type);
-
-		for (i = 0; i < size; i++) {
-			u8 type = ss->slot_type[(slot - i) %
-							      BPF_REG_SIZE];
-
-			if (type != STACK_MISC && type != STACK_ZERO) {
-				sanitize = true;
-				break;
-			}
-		}
-
-		if (sanitize)
-			env->insn_aux_data[insn_idx].nospec_result = true;
-	}
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(stack, m, size, reg && is_pointer_regtype(reg->type)))
+		env->insn_aux_data[insn_idx].nospec_result = true;
 
 	err = destroy_if_dynptr_stack_slot(env, state, spi);
 	if (err)
@@ -3999,7 +4313,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 
 	mark_stack_slot_scratched(env, spi);
 	if (reg && !(off % BPF_REG_SIZE) && reg->type == SCALAR_VALUE && env->bpf_capable) {
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 	} else if (!reg && !(off % BPF_REG_SIZE) && is_bpf_st_mem(insn) &&
 		   env->bpf_capable) {
 		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
@@ -4007,7 +4321,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		memset(tmp_reg, 0, sizeof(*tmp_reg));
 		__mark_reg_known(tmp_reg, insn->imm);
 		tmp_reg->type = SCALAR_VALUE;
-		save_register_state(env, state, spi, tmp_reg, size);
+		spill_reg_to_slot(env, stack, tmp_reg, size);
 	} else if (reg && is_pointer_regtype(reg->type) &&
 		   (size == BPF_REG_SIZE || !env->allow_ptr_leaks)) {
 		/*
@@ -4024,33 +4338,13 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			verbose(env, "cannot spill pointers to stack into stack frame of the caller\n");
 			return -EINVAL;
 		}
-		save_register_state(env, state, spi, reg, size);
+		spill_reg_to_slot(env, stack, reg, size);
 	} else {
-		u8 type = STACK_MISC;
-		int keep = 0;
-
-		/* the bytes before the write still have the low bytes of a number */
-		if (bpf_is_spilled_scalar_reg(ss) && off % BPF_REG_SIZE)
-			keep = min_t(int, rounddown_pow_of_two(off & (BPF_REG_SIZE - 1)),
-				     bpf_spill_size(ss));
-		if (keep && bpf_stack_narrow_access_ok(0, keep, bpf_spill_size(ss))) {
-			for (i = 0; i < BPF_REG_SIZE - keep; i++)
-				if (ss->slot_type[i] == STACK_SPILL)
-					ss->slot_type[i] = STACK_MISC;
-		} else {
-			if (bpf_is_spilled_reg(ss))
-				bpf_diag_record_scrub(env, &ss->spilled_ptr, BPF_DIAG_MOD_WRITE);
-			scrub_special_slot(state, spi);
-		}
-
 		/* when we zero initialize stack slots mark them as such */
-		if ((reg && bpf_register_is_null(reg)) ||
-		    (!reg && is_bpf_st_mem(insn) && insn->imm == 0))
-			type = STACK_ZERO;
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
 
-		/* Mark slots affected by this stack write. */
-		for (i = 0; i < size; i++)
-			ss->slot_type[(slot - i) % BPF_REG_SIZE] = type;
+		write_slot_data(env, stack, m, size, zero);
 		return 0;
 	}
 	bpf_equations_spill(env, state, spi, value_regno);
@@ -4109,71 +4403,13 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 
 	/* Variable offset writes destroy any spilled pointers in range. */
 	for (i = min_off; i < max_off; i++) {
-		struct bpf_stack_state *ss;
-		u8 new_type, *stype;
-		int slot, spi;
+		int spi = bpf_get_spi(i);
 
-		slot = -i - 1;
-		spi = slot / BPF_REG_SIZE;
-		ss = bpf_stack_slot(state, spi);
-		stype = &ss->slot_type[slot % BPF_REG_SIZE];
 		mark_stack_slot_scratched(env, spi);
-
-		if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
-			/* Reject the write if range we may write to has not
-			 * been initialized beforehand. If we didn't reject
-			 * here, the ptr status would be erased below (even
-			 * though not all slots are actually overwritten),
-			 * possibly opening the door to leaks.
-			 *
-			 * We do however catch STACK_INVALID case below, and
-			 * only allow reading possibly uninitialized memory
-			 * later for CAP_PERFMON, as the write may not happen to
-			 * that slot.
-			 */
-			verbose(env, "spilled ptr in range of var-offset stack write; insn %d, ptr off: %d",
-				insn_idx, i);
-			return -EINVAL;
-		}
-
-		/* If writing_zero and the spi slot contains a spill of value 0,
-		 * maintain the spill type.
-		 */
-		if (writing_zero && *stype == STACK_SPILL && bpf_is_spilled_scalar_reg(ss)) {
-			struct bpf_reg_state *spill_reg = &ss->spilled_ptr;
-
-			if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0)
-				continue;
-		}
-
-		/*
-		 * Scrub slots if variable-offset stack write goes over spilled pointers.
-		 * Otherwise bpf_is_spilled_reg() may == true && spilled_ptr.type == NOT_INIT
-		 * and valid program is rejected by check_stack_read_fixed_off()
-		 * with obscure "invalid size of register fill" message.
-		 */
-		scrub_special_slot(state, spi);
-
-		/* Update the slot type. */
-		new_type = STACK_MISC;
-		if (writing_zero && *stype == STACK_ZERO)
-			new_type = STACK_ZERO;
-		/* If the slot is STACK_INVALID, we check whether it's OK to
-		 * pretend that it will be initialized by this write. The slot
-		 * might not actually be written to, and so if we mark it as
-		 * initialized future reads might leak uninitialized memory.
-		 * For privileged programs, we will accept such reads to slots
-		 * that may or may not be written because, if we're reject
-		 * them, the error would be too confusing.
-		 * Conservatively, treat STACK_POISON in a similar way.
-		 */
-		if ((*stype == STACK_INVALID || *stype == STACK_POISON) &&
-		    !env->allow_uninit_stack) {
-			verbose(env, "uninit stack in range of var-offset write prohibited for !root; insn %d, off: %d",
-					insn_idx, i);
-			return -EINVAL;
-		}
-		*stype = new_type;
+		err = prepare_slot_byte_var_write(env, bpf_stack_slot(state, spi), stack_byte_off(i),
+						  writing_zero, "stack", insn_idx, i);
+		if (err)
+			return err;
 	}
 	bpf_diag_record_scrub_stack(env, state, min_off, max_off,
 				    BPF_DIAG_MOD_VAR_WRITE);
@@ -4229,20 +4465,20 @@ static void mark_reg_stack_read(struct bpf_verifier_env *env,
 	}
 }
 
-static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, int i, int size,
-					enum bpf_stack_slot_type type)
+static void bpf_diag_slot_read_invalid(struct bpf_verifier_env *env, const char *mem, int off,
+				       int i, int size, enum bpf_stack_slot_type type)
 {
 	const char *problem, *reason, *suggestion, *kind;
 
 	if (type == STACK_INVALID) {
 		reason = bpf_diag_fmt(
-			env, "This rejected read uses %d bytes at stack offset %d, but byte %d in that range is uninitialized on this path. "
-			"Programs loaded with CAP_PERFMON can be allowed to read uninitialized stack bytes, but this program is being rejected without that allowance.",
-			size, off, i);
+			env, "This rejected read uses %d bytes at %s offset %d, but byte %d in that range is uninitialized on this path. "
+			"Programs loaded with CAP_PERFMON can be allowed to read uninitialized %s bytes, but this program is being rejected without that allowance.",
+			size, mem, off, i, mem);
 		bpf_diag_memory(
-			env, env->insn_idx, "uninitialized stack read", reason,
-			"Initialize every byte in the stack range before reading it, adjust the offset and size so the read covers only initialized bytes, "
-			"or load with CAP_PERFMON if uninitialized stack reads are intended.");
+			env, env->insn_idx, bpf_diag_fmt(env, "uninitialized %s read", mem), reason,
+			bpf_diag_fmt(env, "Initialize every byte in the %s range before reading it, adjust the offset and size so the read covers only initialized bytes, "
+				     "or load with CAP_PERFMON if uninitialized %s reads are intended.", mem, mem));
 		return;
 	}
 
@@ -4263,15 +4499,142 @@ static void bpf_diag_stack_read_invalid(struct bpf_verifier_env *env, int off, i
 		return;
 	}
 
-	problem = bpf_diag_fmt(env, "direct read of %s stack state", kind);
+	problem = bpf_diag_fmt(env, "direct read of %s %s state", kind, mem);
 	reason = bpf_diag_fmt(
-		env, "This rejected read uses %d bytes at stack offset %d, but byte %d in that range belongs to verifier-managed %s state. "
+		env, "This rejected read uses %d bytes at %s offset %d, but byte %d in that range belongs to verifier-managed %s state. "
 		"This state has an opaque representation that BPF programs cannot read directly.",
-		size, off, i, kind);
+		size, mem, off, i, kind);
 	bpf_diag_memory(env, env->insn_idx, problem, reason, suggestion);
 }
 
-/* Read the stack at 'off' and put the results into the register indicated by
+/*
+ * Check that byte 'm' of a slot may be read. Returns -EACCES after logging
+ * when the byte is uninitialized or poisoned. 'off' and 'i' locate the byte
+ * in messages only.
+ */
+static int check_slot_byte_readable(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+				    int m, const char *mem, int off, int i, int size)
+{
+	u8 type = slot->slot_type[slot_byte_idx(m)];
+
+	if (type == STACK_MISC || type == STACK_ZERO)
+		return 0;
+	/* a byte of the register that the slot holds */
+	if (type == STACK_SPILL && bpf_is_spilled_reg(slot))
+		return 0;
+	if (type == STACK_INVALID && env->allow_uninit_stack)
+		return 0;
+	if (type == STACK_POISON) {
+		verbose(env, "reading from %s off %d+%d size %d, slot poisoned by dead code elimination\n",
+			mem, off, i, size);
+	} else {
+		verbose(env, "invalid read from %s off %d+%d size %d\n", mem, off, i, size);
+		bpf_diag_slot_read_invalid(env, mem, off, i, size, type);
+	}
+	return -EACCES;
+}
+
+/*
+ * Read 'size' bytes at offset 'm' within a slot into register 'dst_regno'
+ * of the current frame, or only validate the read when dst_regno < 0.
+ *
+ * A full-width read of a spilled register restores it and narrow reads of
+ * spilled scalars restore a narrowed copy. Reads of plain data produce an
+ * unknown scalar, or a known zero when every byte is a zero byte or part of
+ * a spilled zero. A read that starts with a narrowly spilled scalar and goes
+ * on past it has the scalar in its low bytes. 'off' locates the read in
+ * messages only.
+ *
+ * Returns how many low bytes of the register are the low bytes of the spilled
+ * register, 0 if it has none of them, or a negative error.
+ */
+static int read_slot_reg(struct bpf_verifier_env *env, struct bpf_stack_state *slot,
+			 int m, int size, int dst_regno, const char *mem, int off)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_func_state *state = vstate->frame[vstate->curframe];
+	struct bpf_reg_state *reg = &slot->spilled_ptr;
+	bool fill_exceeds_spill = false;
+	int i, err, zeros = 0;
+	u8 spill_size = 0, type;
+
+	/*
+	 * Refine the in-progress load record's origin to the source slot.
+	 */
+	if (dst_regno >= 0)
+		bpf_diag_mod_begin(env, &state->regs[dst_regno], reg, BPF_DIAG_MOD_WRITE);
+
+	if (bpf_is_spilled_reg(slot)) {
+		spill_size = bpf_spill_size(slot);
+
+		if (size == BPF_REG_SIZE && spill_size == BPF_REG_SIZE) {
+			if (dst_regno >= 0) {
+				/* restore register state from the slot */
+				state->regs[dst_regno] = *reg;
+				return size;
+			}
+			if (__is_pointer_value(env->allow_ptr_leaks, reg)) {
+				/* If dst_regno==-1, the caller is asking us whether
+				 * it is acceptable to use this value as a SCALAR_VALUE
+				 * (e.g. for XADD).
+				 * We must not allow unprivileged callers to do that
+				 * with spilled pointers.
+				 */
+				verbose(env, "leaking pointer from %s off %d\n", mem, off);
+				return -EACCES;
+			}
+			return 0;
+		}
+
+		if (reg->type != SCALAR_VALUE) {
+			verbose_linfo(env, env->insn_idx, "; ");
+			verbose(env, "invalid size of register fill\n");
+			return -EACCES;
+		}
+
+		if (size <= spill_size && bpf_stack_narrow_access_ok(m, size, spill_size)) {
+			if (dst_regno < 0)
+				return 0;
+
+			/* coerce_scalar_to_size will adjust the boundaries. */
+			state->regs[dst_regno] = *reg;
+			return size;
+		}
+
+		/* the low bytes are from the spill */
+		fill_exceeds_spill = size > spill_size && !m && !IS_ENABLED(CONFIG_CPU_BIG_ENDIAN);
+	}
+
+	for (i = 0; i < size; i++) {
+		err = check_slot_byte_readable(env, slot, m + i, mem, off, i, size);
+		if (err)
+			return err;
+		/* STACK_SPILL bytes backed by a spilled scalar zero count as zero bytes too */
+		type = slot->slot_type[slot_byte_idx(m + i)];
+		if (type == STACK_ZERO || (type == STACK_SPILL && bpf_register_is_null(reg)))
+			zeros++;
+	}
+	if (dst_regno < 0)
+		return 0;
+
+	/*
+	 * Any access_size read into register is zero extended, so the whole
+	 * register == const_zero when every byte is a known zero.
+	 */
+	if (zeros == size)
+		__mark_reg_const_zero(&state->regs[dst_regno]);
+	else
+		/* have read misc data from the slot */
+		mark_reg_unknown(env, state->regs, dst_regno);
+	if (!fill_exceeds_spill)
+		return 0;
+	scalar_intersect(scalar_of(&state->regs[dst_regno]), scalar_of(reg),
+			 spill_size * BITS_PER_BYTE);
+	return spill_size;
+}
+
+/*
+ * Read the stack at 'off' and put the results into the register indicated by
  * 'dst_regno'. It handles reg filling if the addressed stack slot is a
  * spilled reg.
  *
@@ -4285,133 +4648,16 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				      struct bpf_func_state *reg_state,
 				      int off, int size, int dst_regno)
 {
-	struct bpf_verifier_state *vstate = env->cur_state;
-	struct bpf_func_state *state = vstate->frame[vstate->curframe];
-	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE;
-	struct bpf_reg_state *reg;
-	u8 *stype, type;
-	struct bpf_stack_state *ss = bpf_stack_slot(reg_state, spi);
-
-	stype = ss->slot_type;
-	reg = &ss->spilled_ptr;
+	int slot = -off - 1, spi = slot / BPF_REG_SIZE;
+	int fill;
 
 	mark_stack_slot_scratched(env, spi);
-
-	/*
-	 * Refine the in-progress load record's origin to the source stack slot.
-	 */
-	if (dst_regno >= 0)
-		bpf_diag_mod_begin(env, &state->regs[dst_regno], reg, BPF_DIAG_MOD_WRITE);
-
-	if (bpf_is_spilled_reg(ss)) {
-		u8 spill_size = bpf_spill_size(ss);
-
-		if (size != BPF_REG_SIZE || spill_size != BPF_REG_SIZE) {
-			if (reg->type != SCALAR_VALUE) {
-				verbose_linfo(env, env->insn_idx, "; ");
-				verbose(env, "invalid size of register fill\n");
-				return -EACCES;
-			}
-
-			if (size <= spill_size &&
-			    bpf_stack_narrow_access_ok(off, size, spill_size)) {
-				if (dst_regno < 0)
-					return 0;
-
-				/* coerce_scalar_to_size will adjust the boundaries. */
-				state->regs[dst_regno] = *reg;
-				bpf_equations_fill(env, reg_state, spi, size);
-			} else {
-				/* the low bytes are from the spill */
-				bool fill_exceeds_spill =
-					size > spill_size && !(off % BPF_REG_SIZE) &&
-					!IS_ENABLED(CONFIG_CPU_BIG_ENDIAN);
-				int spill_cnt = 0, zero_cnt = 0;
-
-				if (fill_exceeds_spill)
-					bpf_equations_fill(env, reg_state, spi, spill_size);
-
-				for (i = 0; i < size; i++) {
-					type = stype[(slot - i) % BPF_REG_SIZE];
-					if (type == STACK_SPILL) {
-						spill_cnt++;
-						continue;
-					}
-					if (type == STACK_MISC)
-						continue;
-					if (type == STACK_ZERO) {
-						zero_cnt++;
-						continue;
-					}
-					if (type == STACK_INVALID && env->allow_uninit_stack)
-						continue;
-					if (type == STACK_POISON) {
-						verbose(env, "reading from stack off %d+%d size %d, slot poisoned by dead code elimination\n",
-							off, i, size);
-					} else {
-						verbose(env, "invalid read from stack off %d+%d size %d\n",
-							off, i, size);
-						bpf_diag_stack_read_invalid(env, off, i, size, type);
-					}
-					return -EACCES;
-				}
-
-				if (dst_regno < 0)
-					return 0;
-
-				if (spill_cnt == size &&
-				    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
-					__mark_reg_const_zero(&state->regs[dst_regno]);
-				} else if (zero_cnt == size) {
-					/* similarly to mark_reg_stack_read(), preserve zeroes */
-					__mark_reg_const_zero(&state->regs[dst_regno]);
-				} else {
-					mark_reg_stack_read(env, reg_state, off, off + size,
-							    dst_regno);
-					if (fill_exceeds_spill)
-						scalar_intersect(scalar_of(&state->regs[dst_regno]),
-								 scalar_of(reg),
-								 spill_size * BITS_PER_BYTE);
-				}
-			}
-		} else if (dst_regno >= 0) {
-			/* restore register state from stack */
-			state->regs[dst_regno] = *reg;
-			bpf_equations_fill(env, reg_state, spi, size);
-		} else if (__is_pointer_value(env->allow_ptr_leaks, reg)) {
-			/* If dst_regno==-1, the caller is asking us whether
-			 * it is acceptable to use this value as a SCALAR_VALUE
-			 * (e.g. for XADD).
-			 * We must not allow unprivileged callers to do that
-			 * with spilled pointers.
-			 */
-			verbose(env, "leaking pointer from stack off %d\n",
-				off);
-			return -EACCES;
-		}
-	} else {
-		for (i = 0; i < size; i++) {
-			type = stype[(slot - i) % BPF_REG_SIZE];
-			if (type == STACK_MISC)
-				continue;
-			if (type == STACK_ZERO)
-				continue;
-			if (type == STACK_INVALID && env->allow_uninit_stack)
-				continue;
-			if (type == STACK_POISON) {
-				verbose(env, "reading from stack off %d+%d size %d, slot poisoned by dead code elimination\n",
-					off, i, size);
-			} else {
-				verbose(env, "invalid read from stack off %d+%d size %d\n",
-					off, i, size);
-				bpf_diag_stack_read_invalid(env, off, i, size, type);
-			}
-			return -EACCES;
-		}
-		if (dst_regno >= 0)
-			mark_reg_stack_read(env, reg_state, off, off + size, dst_regno);
-	}
-	return 0;
+	fill = read_slot_reg(env, bpf_stack_slot(reg_state, spi), stack_byte_off(off), size,
+			     dst_regno, "stack", off);
+	/* the slot is an xreg: the register gets its equation */
+	if (fill > 0)
+		bpf_equations_fill(env, reg_state, spi, fill);
+	return min(fill, 0);
 }
 
 enum bpf_access_src {
@@ -5696,6 +5942,11 @@ static int check_ptr_alignment(struct bpf_verifier_env *env,
 		 */
 		strict = true;
 		break;
+	case PTR_TO_CORO_FRAME:
+		pointer_desc = "coro_frame ";
+		/* Slot tracking relies on accesses not straddling slots. */
+		strict = true;
+		break;
 	case PTR_TO_SOCKET:
 		pointer_desc = "sock ";
 		break;
@@ -5775,6 +6026,7 @@ enum {
 	CG_CB		= BIT(6),
 	CG_GLOBAL	= BIT(7),
 	CG_IN_EXC_CB	= BIT(8), /* the exception callback and what it gets to */
+	CG_IN_CORO_CONT	= BIT(9), /* continuations of coroutines and what they get to */
 };
 
 #define for_each_marked_subprog(cg, s, mark) \
@@ -5818,12 +6070,13 @@ static int build_call_graph(struct bpf_verifier_env *env, struct bpf_call_graph 
 		cg->marks[s] |= (si[s].is_cb ? CG_CB | CG_IN_CB : 0) |
 				(si[s].is_exception_cb ? CG_IN_EXC_CB : 0) |
 				(si[s].is_async_cb ? CG_IN_ASYNC_CB : 0) |
+				(si[s].coro_cont ? CG_IN_CORO_CONT : 0) |
 				(bpf_call_graph_recursive(cg, s) ? CG_IN_RECURSION : 0) |
 				(si[s].has_tail_call ? CG_TAIL_CALL : 0) |
 				(si[s].uses_arena_sp ? CG_ARENA_SP : 0) |
 				(bpf_subprog_is_global(env, s) ? CG_GLOBAL : 0);
 	bpf_call_graph_mark_callees(cg, CG_IN_CB | CG_IN_ASYNC_CB | CG_IN_RECURSION |
-					CG_IN_EXC_CB);
+					CG_IN_CORO_CONT | CG_IN_EXC_CB);
 	bpf_call_graph_mark_callers(cg, CG_TAIL_CALL, 0);
 	return 0;
 }
@@ -5963,6 +6216,35 @@ static int check_callbacks(struct bpf_verifier_env *env, struct bpf_call_graph *
  * this info will be utilized by JIT so that we will be preserving the
  * tail call counter throughout bpf2bpf calls combined with tailcalls
  */
+/*
+ * A function that calls a parked coroutine frame, see check_coro_callx(), is verified in the
+ * frames of its caller or on its own, and on its own it does not know who calls it. The call
+ * graph of the pass does: no continuation gets to such a function, or continuations would
+ * nest, and in an XDP program no async callback does, which has no network context.
+ */
+static int check_coro_calls(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	int s;
+
+	for_each_marked_subprog(cg, s, CG_LIVE) {
+		if (!si[s].calls_parked)
+			continue;
+		if (cg->marks[s] & CG_IN_CORO_CONT) {
+			verbose(env, "func#%d calls a parked coro_frame, and a coroutine continuation gets to it\n",
+				s);
+			return -EACCES;
+		}
+		if (resolve_prog_type(env->prog) == BPF_PROG_TYPE_XDP &&
+		    (cg->marks[s] & CG_IN_ASYNC_CB)) {
+			verbose(env, "func#%d calls a parked coro_frame, and an async callback gets to it, which has no network context\n",
+				s);
+			return -EACCES;
+		}
+	}
+	return 0;
+}
+
 static int check_tail_calls(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	struct bpf_subprog_info *si = env->subprog_info;
@@ -6244,27 +6526,71 @@ out:
 	return err;
 }
 
+/* Does the kfunc that @insn calls take a coroutine frame for the kernel to resume later? */
+static bool kfunc_suspends_coro(struct bpf_verifier_env *env, const struct bpf_insn *insn)
+{
+	const struct btf_type *func, *proto;
+	const struct btf_param *args;
+	struct btf *btf;
+	u32 i;
+
+	if (!bpf_pseudo_kfunc_call(insn))
+		return false;
+	btf = find_kfunc_desc_btf_cached(env, insn->off);
+	if (IS_ERR(btf))
+		return false;
+	func = btf_type_by_id(btf, insn->imm);
+	if (!func || !btf_type_is_func(func))
+		return false;
+	proto = btf_type_by_id(btf, func->type);
+	if (!proto || !btf_type_is_func_proto(proto))
+		return false;
+	args = btf_params(proto);
+	for (i = 0; i < btf_type_vlen(proto); i++)
+		if (is_kfunc_arg_coro_suspend(btf, &args[i]))
+			return true;
+	return false;
+}
+
 /*
  * The address of the callback at @idx goes nowhere but to a helper that keeps it for
- * later: a timer, a work queue, call_rcu.
+ * later: a timer, a work queue, call_rcu. Or it goes into memory in front of a kfunc that
+ * suspends a coroutine: the resume function of a coroutine, which the kernel calls later
+ * and never inside of the program, see include/linux/bpf_coro.h. *@resumed says which. That
+ * is a guess: a callback that a helper calls from memory after all closes a cycle that
+ * check_recursion() refuses.
  */
-static bool func_is_kept_for_later(struct bpf_verifier_env *env, int idx, int end)
+static bool func_is_kept_for_later(struct bpf_verifier_env *env, int idx, int end, bool *resumed)
 {
 	struct bpf_insn *insn = env->prog->insnsi;
 	u8 class, reg = insn[idx].dst_reg;
+	bool stored = false, in_reg = true;
 	int i;
 
+	*resumed = false;
 	if (reg < BPF_REG_1 || reg > BPF_REG_5)
 		return false;
 	for (i = idx + 2; i < end; i++) {
 		class = BPF_CLASS(insn[i].code);
-		if (class == BPF_JMP || class == BPF_JMP32)
-			return bpf_is_async_callback_calling_insn(&insn[i]);
-		if (insn[i].dst_reg == reg)
+		/* an address in memory may be called from there: kept for a coroutine only */
+		if (class == BPF_JMP || class == BPF_JMP32) {
+			*resumed = stored && kfunc_suspends_coro(env, &insn[i]);
+			return (!stored && bpf_is_async_callback_calling_insn(&insn[i])) || *resumed;
+		}
+		if (in_reg && class == BPF_STX && BPF_MODE(insn[i].code) == BPF_MEM &&
+		    insn[i].src_reg == reg && insn[i].dst_reg != reg) {
+			stored = true;
+			continue;
+		}
+		/* once it is stored, the register may take something else */
+		if (in_reg && insn[i].dst_reg == reg && class != BPF_ST && class != BPF_STX &&
+		    stored)
+			in_reg = false;
+		else if (in_reg && insn[i].dst_reg == reg)
 			return false;
 		if (bpf_is_ldimm64(&insn[i]))
 			i++;
-		else if (insn[i].src_reg == reg)
+		else if (in_reg && insn[i].src_reg == reg)
 			return false;
 	}
 	return false;
@@ -6281,8 +6607,12 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	struct bpf_insn *insn = env->prog->insnsi;
 	int cnt = env->subprog_cnt, i, j, s, err;
 	struct bpf_call_graph cg;
-	/* the program calls the subprog, or its address may get to an indirect call */
-	enum { CALLED = 1, IN_EXC_CB = 2 };
+	bool resumed;
+	/*
+	 * CALLED: the program calls the subprog, or its address may get to an indirect call.
+	 * RESUMED: bpf_coro_run() calls it, see func_is_kept_for_later().
+	 */
+	enum { CALLED = 1, IN_EXC_CB = 2, RESUMED = 4 };
 
 	/* callx calls node 'cnt', which calls each subprog whose address is taken */
 	err = bpf_call_graph_init(&cg, cnt + 1);
@@ -6308,9 +6638,11 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				 * callback that arms itself again doesn't call itself.
 				 */
 				if (bpf_pseudo_call(&insn[i]) ||
-				    !func_is_kept_for_later(env, i, si[s + 1].start)) {
+				    !func_is_kept_for_later(env, i, si[s + 1].start, &resumed)) {
 					err = bpf_call_graph_add(&cg, s, j);
 					cg.marks[j] |= CALLED;
+				} else if (resumed) {
+					cg.marks[j] |= RESUMED;
 				}
 				if (bpf_pseudo_func(&insn[i]))
 					si[j].addr_taken = true;
@@ -6347,12 +6679,17 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	for (s = 1; s < cnt; s++)
 		si[s].in_exception_cb = cg.marks[s] & IN_EXC_CB;
 
-	/* What only the kernel calls returns to it: the main prog, the callback of a timer. */
+	/*
+	 * What only the kernel calls returns to it: the main prog, the callback of a timer. But
+	 * bpf_coro_run() has a landing pad for a continuation, which leaves with kexit when the
+	 * kernel unwinds it: that is how bpf_coro_run() knows, see push_coro_suspend().
+	 */
 	for (s = 0; s < cnt; s++) {
 		si[s].bail_unwinds = si[s].can_unwind ||
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && bpf_may_unwind(env) &&
-				      (cg.marks[s] & CALLED));
+				      ((cg.marks[s] & CALLED) ||
+				       (BPF_HAS_CB_PADS && (cg.marks[s] & RESUMED))));
 		si[s].bail_unwinds_at_first = si[s].bail_unwinds;
 		/* it has unwind_exit. Where the kernel unwinds it, the pass finds. */
 		si[s].must_unwind = si[s].unwinds_for_sure = si[s].can_unwind;
@@ -6459,6 +6796,7 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	ret = ret ?: check_recursion(env, &cg);
 	ret = ret ?: check_callbacks(env, &cg);
 	ret = ret ?: check_tail_calls(env, &cg);
+	ret = ret ?: check_coro_calls(env, &cg);
 	if (ret)
 		goto out;
 	mark_arena_stack_entries(env, &cg);
@@ -7186,6 +7524,29 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	s64 min_off;
 	int ret;
 
+	/*
+	 * The resume and the destroy function in the first two slots of a parked frame that the
+	 * program holds, as the compiler loads them to call them: nothing else of the frame is
+	 * read, and nothing but callx takes what is loaded, see check_coro_callx().
+	 */
+	if (coro_handle_type(reg)) {
+		if (atype != BPF_READ || value_regno < 0 || size != BPF_REG_SIZE ||
+		    !reg_is_referenced(env, reg) || type_flag(reg->type) & ~PTR_TRUSTED ||
+		    !tnum_is_const(reg->var_off) || reg->var_off.value ||
+		    (off != 0 && off != BPF_REG_SIZE)) {
+			verbose(env, "%s is a parked coro_frame: only the function in one of its first two slots is loaded, through the pointer that holds the frame\n",
+				reg_arg_name(env, argno));
+			return -EACCES;
+		}
+		/* @reg may be the register that takes the function */
+		ret = reg->id;
+		mark_reg_known_zero(env, regs, value_regno);
+		regs[value_regno].type = PTR_TO_CORO_FUNC;
+		/* gone with the frame, and of that frame only */
+		regs[value_regno].parent_id = ret;
+		return 0;
+	}
+
 	if (!env->allow_ptr_leaks) {
 		verbose(env,
 			"'struct %s' access is allowed only to CAP_PERFMON and CAP_SYS_ADMIN\n",
@@ -7776,6 +8137,331 @@ reg_unknown:
 	return 0;
 }
 
+/*
+ * Coroutine frames.
+ *
+ * bpf_coro_frame_alloc() returns PTR_TO_CORO_FRAME memory whose contents the
+ * program manages like its own stack, so the allocation's reference owns a
+ * slot array and accesses go through the shared slot helpers. Accesses are
+ * size aligned like stack accesses (see check_ptr_alignment()) and therefore
+ * never straddle a slot. The register's id is the reference id, which
+ * pointer arithmetic preserves, so any pointer into the frame finds it.
+ */
+static struct bpf_reference_state *coro_frame_ref(struct bpf_verifier_env *env,
+						  struct bpf_reg_state *reg)
+{
+	return bpf_find_ref_slots(env->cur_state, reg->id);
+}
+
+/* Attach the slot array to the reference just acquired for a frame of 'size' bytes. */
+static int init_coro_frame_ref(struct bpf_verifier_env *env, int id, u32 size)
+{
+	struct bpf_verifier_state *vstate = env->cur_state;
+	struct bpf_reference_state *ref = &vstate->refs[vstate->acquired_refs - 1];
+	u32 nr_slots = DIV_ROUND_UP(size, BPF_REG_SIZE);
+
+	if (verifier_bug_if(ref->id != id || nr_slots > BPF_MAX_REF_SLOTS, env,
+			    "coro_frame ref %d size %u", id, size))
+		return -EFAULT;
+	ref->slots = kcalloc(nr_slots, sizeof(*ref->slots), BPF_VERIFIER_GFP);
+	if (!ref->slots)
+		return -ENOMEM;
+	ref->nr_slots = nr_slots;
+	ref->mem_size = size;
+	return 0;
+}
+
+static int check_coro_frame_write(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				  int foff, int size, int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	struct bpf_reg_state *reg = NULL;
+	int m = foff % BPF_REG_SIZE;
+	int err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+
+	err = check_slot_ptr_spill_corruption(env, slot, size, "coro_frame", foff, insn_idx);
+	if (err)
+		return err;
+	if (!env->bypass_spec_v4 &&
+	    slot_write_needs_nospec(slot, m, size, reg && is_pointer_regtype(reg->type)))
+		env->insn_aux_data[insn_idx].nospec_result = true;
+
+	if (reg && !m && reg->type == SCALAR_VALUE && env->bpf_capable) {
+		spill_reg_to_slot(env, slot, reg, size);
+	} else if (!reg && !m && is_bpf_st_mem(insn) && env->bpf_capable) {
+		struct bpf_reg_state *tmp_reg = &env->fake_reg[0];
+
+		memset(tmp_reg, 0, sizeof(*tmp_reg));
+		__mark_reg_known(tmp_reg, insn->imm);
+		tmp_reg->type = SCALAR_VALUE;
+		spill_reg_to_slot(env, slot, tmp_reg, size);
+	} else if (reg && is_pointer_regtype(reg->type) &&
+		   (size == BPF_REG_SIZE || !env->allow_ptr_leaks)) {
+		if (size != BPF_REG_SIZE) {
+			verbose_linfo(env, insn_idx, "; ");
+			verbose(env, "invalid size of register spill\n");
+			return -EACCES;
+		}
+		/*
+		 * A frame can outlive the function that fills it, so a stack
+		 * pointer stored in it could dangle after that function
+		 * returns. A pointer to a dynptr is one too: to the stack of a
+		 * caller, or of the helper that calls a callback.
+		 */
+		if (reg->type == PTR_TO_STACK || base_type(reg->type) == CONST_PTR_TO_DYNPTR) {
+			verbose(env, "cannot spill stack pointers into coro_frame\n");
+			return -EINVAL;
+		}
+		spill_reg_to_slot(env, slot, reg, size);
+	} else {
+		bool zero = (reg && bpf_register_is_null(reg)) ||
+			    (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+		write_slot_data(env, slot, m, size, zero);
+	}
+	return 0;
+}
+
+static int check_coro_frame_read(struct bpf_verifier_env *env, struct bpf_reference_state *ref,
+				 int foff, int size, int dst_regno)
+{
+	struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+	int fill;
+
+	fill = read_slot_reg(env, slot, foff % BPF_REG_SIZE, size, dst_regno, "coro_frame", foff);
+	/* the slot is no xreg: the register gets no equation from it */
+	return min(fill, 0);
+}
+
+static int check_coro_frame_write_var_off(struct bpf_verifier_env *env,
+					  struct bpf_reference_state *ref,
+					  struct bpf_reg_state *ptr_reg, int off, int size,
+					  int value_regno, int insn_idx)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	struct bpf_reg_state *reg = NULL;
+	bool writing_zero;
+	int i, err;
+
+	if (value_regno >= 0)
+		reg = &cur->regs[value_regno];
+	/* no slot remembers the pointer, a load gets it as a number */
+	if (reg && __is_pointer_value(env->allow_ptr_leaks, reg)) {
+		verbose(env, "R%d leaks addr into coro_frame\n", value_regno);
+		return -EACCES;
+	}
+	writing_zero = (reg && bpf_register_is_null(reg)) ||
+		       (!reg && is_bpf_st_mem(insn) && insn->imm == 0);
+
+	for (i = min_off; i < max_off; i++) {
+		err = prepare_slot_byte_var_write(env, &ref->slots[i / BPF_REG_SIZE],
+						  i % BPF_REG_SIZE, writing_zero, "coro_frame",
+						  insn_idx, i);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int check_coro_frame_read_var_off(struct bpf_verifier_env *env,
+					 struct bpf_reference_state *ref,
+					 struct bpf_reg_state *ptr_reg, int off, int size,
+					 int dst_regno)
+{
+	struct bpf_func_state *cur = env->cur_state->frame[env->cur_state->curframe];
+	int min_off = reg_smin(ptr_reg) + off, max_off = reg_smax(ptr_reg) + off + size;
+	int i, zeros = 0;
+
+	for (i = min_off; i < max_off; i++) {
+		struct bpf_stack_state *slot = &ref->slots[i / BPF_REG_SIZE];
+		int m = i % BPF_REG_SIZE;
+		u8 type;
+
+		/* as in mark_reg_stack_read(), a spilled zero is zero bytes */
+		type = slot->slot_type[slot_byte_idx(m)];
+		if (type == STACK_ZERO ||
+		    (type == STACK_SPILL && bpf_register_is_null(&slot->spilled_ptr)))
+			zeros++;
+		/* the byte is between two accesses, as in check_stack_range_initialized() */
+		if (ptr_reg->step > 1 && imod(i - off - ptr_reg->base, ptr_reg->step) >= size)
+			continue;
+		if (check_slot_byte_range(env, slot, m, false, false, false) != SLOT_RANGE_OK) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), ptr_reg->var_off);
+			verbose(env, "invalid read from coro_frame var_off %s+%d size %d\n",
+				tn_buf, i - min_off, size);
+			return -EACCES;
+		}
+	}
+	/* Any read into a register is zero extended, so all-zero bytes give zero. */
+	if (zeros == max_off - min_off)
+		__mark_reg_const_zero(&cur->regs[dst_regno]);
+	else
+		mark_reg_unknown(env, cur->regs, dst_regno);
+	return 0;
+}
+
+/*
+ * Validate a helper or kfunc memory argument that points into a coroutine
+ * frame, mirroring check_stack_range_initialized(): reads need initialized
+ * bytes, writes may clobber anything and scrub spilled registers, and
+ * output arguments may accept uninitialized bytes. As with stack outputs,
+ * only privileged constant ranges are marked initialized after the call.
+ */
+static int check_coro_frame_range_initialized(struct bpf_verifier_env *env,
+					      struct bpf_reg_state *reg, argno_t argno,
+					      int access_size, bool zero_size_allowed,
+					      enum bpf_access_type type,
+					      struct bpf_call_arg_meta *meta)
+{
+	bool clobber = type == BPF_WRITE;
+	bool allow_poison = access_size < 0 || clobber;
+	u32 arg_slot = arg_slot_from_argno(argno);
+	bool uninit = clobber && meta && arg_slot < MAX_BPF_FUNC_ARGS &&
+		      (meta->arg_raw_mem.mask & BIT(arg_slot));
+	bool var_size = meta && arg_slot < MAX_BPF_FUNC_ARGS &&
+			(meta->arg_raw_mem.var_size_mask & BIT(arg_slot));
+	bool raw_mode = uninit && env->allow_uninit_stack && !var_size;
+	struct bpf_reference_state *ref;
+	int i, err, min_off, max_off;
+
+	access_size = abs(access_size);
+
+	if (access_size == 0 && !zero_size_allowed) {
+		verbose(env, "invalid zero-sized read\n");
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, 0, access_size, reg->mem_size,
+				      zero_size_allowed);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+
+	if (tnum_is_const(reg->var_off)) {
+		min_off = max_off = reg->var_off.value;
+	} else {
+		if (!env->bypass_spec_v1) {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "%s variable offset coro_frame access prohibited for !root, var_off=%s\n",
+				reg_arg_name(env, argno), tn_buf);
+			return -EACCES;
+		}
+		/* Variable offsets cannot be marked definitely initialized. */
+		raw_mode = false;
+		min_off = reg_smin(reg);
+		max_off = reg_smax(reg);
+	}
+
+	if (raw_mode) {
+		meta->arg_raw_mem.size[arg_slot] = access_size;
+		return 0;
+	}
+
+	for (i = min_off; i < max_off + access_size; i++) {
+		enum slot_range_status status;
+
+		/* the byte is between two accesses, as in check_stack_range_initialized() */
+		if (reg->step > 1 && !var_size && imod(i - reg->base, reg->step) >= access_size)
+			continue;
+		status = check_slot_byte_range(env, &ref->slots[i / BPF_REG_SIZE],
+					       i % BPF_REG_SIZE, clobber, allow_poison, uninit);
+		if (status == SLOT_RANGE_OK)
+			continue;
+		if (tnum_is_const(reg->var_off)) {
+			verbose(env, "invalid read from coro_frame %s off %d+%d size %d\n",
+				reg_arg_name(env, argno), min_off, i - min_off, access_size);
+		} else {
+			char tn_buf[48];
+
+			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+			verbose(env, "invalid read from coro_frame %s var_off %s+%d size %d\n",
+				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
+		}
+		return -EACCES;
+	}
+	return 0;
+}
+
+static int check_coro_frame_access(struct bpf_verifier_env *env, int insn_idx,
+				   struct bpf_reg_state *reg, argno_t argno, int off, int size,
+				   enum bpf_access_type t, int value_regno)
+{
+	bool var_off = !tnum_is_const(reg->var_off);
+	struct bpf_reference_state *ref;
+	int err;
+
+	if (type_may_be_null(reg->type)) {
+		verbose(env, "%s invalid mem access '%s'\n", reg_arg_name(env, argno),
+			reg_type_str(env, reg->type));
+		bpf_diag_invalid_deref(env, insn_idx, reg_from_argno(argno),
+				       reg_arg_name(env, argno), reg,
+				       BPF_DIAG_DEREF_NULLABLE_PTR, 0);
+		return -EACCES;
+	}
+
+	err = check_mem_region_access(env, reg, argno, off, size, reg->mem_size, false);
+	if (err)
+		return err;
+
+	ref = coro_frame_ref(env, reg);
+	if (verifier_bug_if(!ref, env, "coro_frame %s has no reference state",
+			    reg_arg_name(env, argno)))
+		return -EFAULT;
+	/*
+	 * A landing pad of a caller that holds the frame reads its slots, see find_frame_cands():
+	 * the store changes what the caller sees, as a store to its stack does, see
+	 * check_arena_site()
+	 */
+	if (t == BPF_WRITE && ref - env->cur_state->refs < cur_func(env)->entry_refs)
+		cur_func(env)->fault_edge = false;
+
+	if (!var_off) {
+		int foff = reg->var_off.value + off;
+		struct bpf_stack_state *slot = &ref->slots[foff / BPF_REG_SIZE];
+
+		if (t == BPF_WRITE)
+			return check_coro_frame_write(env, ref, foff, size, value_regno, insn_idx);
+		/* a part of a pointer is a number, as with a variable offset, see check_stack_read() */
+		var_off = value_regno >= 0 && size != BPF_REG_SIZE && env->allow_ptr_leaks &&
+			  bpf_is_spilled_reg(slot) && !bpf_is_spilled_scalar_reg(slot);
+		if (!var_off)
+			return check_coro_frame_read(env, ref, foff, size, value_regno);
+	} else if (!env->bypass_spec_v1) {
+		/*
+		 * Variable offsets follow the stack rules: privileged only, since no
+		 * Spectre v1 masking exists for this memory, and only when a read has
+		 * a destination register, so pointer bytes cannot escape unnoticed.
+		 */
+		verbose(env, "%s variable offset coro_frame access prohibited for !root\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	if (t == BPF_WRITE)
+		return check_coro_frame_write_var_off(env, ref, reg, off, size, value_regno,
+						      insn_idx);
+	if (value_regno < 0) {
+		verbose(env, "%s variable offset coro_frame access without destination register\n",
+			reg_arg_name(env, argno));
+		return -EACCES;
+	}
+	return check_coro_frame_read_var_off(env, ref, reg, off, size, value_regno);
+}
+
 /* check whether memory at (regno + off) is accessible for t = (read | write)
  * if t==write, value_regno is a register which value is stored into memory
  * if t==read, value_regno is a register which will receive the value from memory
@@ -7937,6 +8623,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 		else
 			err = check_stack_write(env, reg, off, size,
 						value_regno, insn_idx);
+	} else if (base_type(reg->type) == PTR_TO_CORO_FRAME) {
+		err = check_coro_frame_access(env, insn_idx, reg, argno, off, size, t,
+					      value_regno);
 	} else if (reg_is_pkt_pointer(reg)) {
 		if (t == BPF_WRITE && !may_access_direct_pkt_data(env, NULL, t)) {
 			verbose(env, "cannot write into packet\n");
@@ -8354,7 +9043,7 @@ static int check_stack_range_initialized(
 		enum bpf_access_type type, struct bpf_call_arg_meta *meta)
 {
 	struct bpf_func_state *state = bpf_func(env, reg);
-	int err, min_off, max_off, i, j, slot, spi;
+	int err, min_off, max_off, i, slot, spi;
 	/* Some accesses can write anything into the stack, others are
 	 * read-only.
 	 */
@@ -8417,8 +9106,7 @@ static int check_stack_range_initialized(
 	}
 
 	for (i = min_off; i < max_off + access_size; i++) {
-		struct bpf_stack_state *ss;
-		u8 *stype;
+		enum slot_range_status status;
 
 		/* The byte is between two accesses. See size_at_max_offset() for @var_size. */
 		if (reg->step > 1 && !var_size &&
@@ -8431,41 +9119,12 @@ static int check_stack_range_initialized(
 			return -EFAULT;
 		}
 
-		ss = bpf_stack_slot(state, spi);
-		stype = &ss->slot_type[slot % BPF_REG_SIZE];
-		if (*stype == STACK_MISC)
-			goto mark;
-		if ((*stype == STACK_ZERO) ||
-		    (*stype == STACK_INVALID && (uninit || env->allow_uninit_stack))) {
-			if (clobber && (*stype != STACK_INVALID || env->allow_uninit_stack)) {
-				/* helper can write anything into the stack */
-				*stype = STACK_MISC;
-			}
-			goto mark;
-		}
+		status = check_slot_byte_range(env, bpf_stack_slot(state, spi), stack_byte_off(i),
+					       clobber, allow_poison, uninit);
+		if (status == SLOT_RANGE_OK)
+			continue;
 
-		/*
-		 * Only the bytes marked STACK_SPILL hold the spilled register.
-		 * The rest of a narrowly spilled slot keeps its previous type
-		 * and must be initialized on its own.
-		 */
-		if (*stype == STACK_SPILL &&
-		    (ss->spilled_ptr.type == SCALAR_VALUE ||
-		     env->allow_ptr_leaks)) {
-			if (clobber) {
-				bpf_mark_reg_unknown(&ss->spilled_ptr);
-				for (j = 0; j < BPF_REG_SIZE; j++)
-					scrub_spilled_slot(&ss->slot_type[j]);
-			}
-			goto mark;
-		}
-
-		if (*stype == STACK_POISON) {
-			if (allow_poison) {
-				if (uninit && env->allow_uninit_stack)
-					*stype = STACK_MISC;
-				goto mark;
-			}
+		if (status == SLOT_RANGE_POISON) {
 			verbose(env, "reading from stack %s off %d+%d size %d, slot poisoned by dead code elimination\n",
 				reg_arg_name(env, argno), min_off, i - min_off, access_size);
 		} else if (tnum_is_const(reg->var_off)) {
@@ -8479,8 +9138,6 @@ static int check_stack_range_initialized(
 				reg_arg_name(env, argno), tn_buf, i - min_off, access_size);
 		}
 		return -EACCES;
-mark:
-		;
 	}
 	return 0;
 }
@@ -8549,6 +9206,9 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, struct bpf_reg_
 				env, reg,
 				argno, 0, access_size,
 				zero_size_allowed, access_type, meta);
+	case PTR_TO_CORO_FRAME:
+		return check_coro_frame_range_initialized(env, reg, argno, access_size,
+							  zero_size_allowed, access_type, meta);
 	case PTR_TO_BTF_ID:
 		return check_ptr_to_btf_access(env, regs, reg, argno, 0,
 					       access_size, access_type, -1);
@@ -9594,7 +10254,7 @@ static int process_kf_arg_ptr_to_rbtree_node(struct bpf_verifier_env *env,
 static bool check_css_task_iter_allowlist(struct bpf_verifier_env *env);
 
 struct bpf_reg_types {
-	const enum bpf_reg_type types[10];
+	const enum bpf_reg_type types[11];
 	u32 *btf_id;
 };
 
@@ -9631,6 +10291,7 @@ static const struct bpf_reg_types mem_types = {
 		PTR_TO_MEM,
 		PTR_TO_MEM | MEM_RINGBUF,
 		PTR_TO_BUF,
+		PTR_TO_CORO_FRAME,
 		PTR_TO_BTF_ID | PTR_TRUSTED,
 		PTR_TO_CTX,
 	},
@@ -9674,6 +10335,9 @@ static const struct bpf_reg_types arena_types = {
 };
 static const struct bpf_reg_types ctx_out_types = {
 	.types = { PTR_TO_MEM | MEM_RDONLY | PTR_TRUSTED },
+};
+static const struct bpf_reg_types coro_frame_types = {
+	.types = { PTR_TO_CORO_FRAME }
 };
 
 static const struct bpf_reg_types alloc_obj_drop_types = {
@@ -9748,6 +10412,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_IRQ_FLAG]		= &stack_ptr_types,
 	[ARG_PTR_TO_ARENA]		= &arena_types,
 	[ARG_PTR_TO_CTX_OUT]		= &ctx_out_types,
+	[ARG_PTR_TO_CORO_FRAME]	= &coro_frame_types,
 };
 
 static void bpf_diag_call_arg(struct bpf_verifier_env *env, u32 insn_idx, argno_t argno,
@@ -9826,6 +10491,10 @@ static int check_func_arg_release(struct bpf_verifier_env *env, struct bpf_reg_s
 
 	if (arg_type_is_dynptr(arg_type) || reg_is_referenced(env, reg) ||
 	    bpf_register_is_null(reg))
+		return 0;
+	/* no reference of the program, but what takes the frame is asked whether it may */
+	if (base_type(arg_type) == ARG_PTR_TO_CORO_FRAME &&
+	    find_hosted_frame(env->cur_state, reg->id))
 		return 0;
 
 	verbose(env, "release function %s expects referenced PTR_TO_BTF_ID passed to %s\n",
@@ -10008,6 +10677,7 @@ static int check_func_arg_reg_off(struct bpf_verifier_env *env,
 	case PTR_TO_BUF:
 	case PTR_TO_BUF | MEM_RDONLY:
 	case PTR_TO_ARENA:
+	case PTR_TO_CORO_FRAME:
 	case SCALAR_VALUE:
 		return 0;
 	/* All the rest must be rejected, except PTR_TO_BTF_ID which allows
@@ -10226,6 +10896,50 @@ static enum bpf_access_type func_arg_access_type(enum bpf_arg_type arg_type)
 	if (arg_type & MEM_UNINIT)
 		return BPF_WRITE;
 	return BPF_READ | BPF_WRITE;
+}
+
+static int record_coro_frame_release(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+				     u32 arg, argno_t argno, struct bpf_call_arg_meta *meta)
+{
+	bool suspend = meta->func_proto && arg < btf_type_vlen(meta->func_proto) &&
+		       is_kfunc_arg_coro_suspend(meta->btf, &btf_params(meta->func_proto)[arg]);
+	u32 i;
+
+	/*
+	 * A frame in memory of a host is not freed, and nothing takes it without the host: it
+	 * goes where the host goes. It is suspended with the host in it, see
+	 * push_coro_suspend().
+	 */
+	if (!suspend && find_hosted_frame(env->cur_state, reg->id)) {
+		verbose(env, "%s is a coro_frame in memory of its host: it goes with the host, and nothing else frees or takes it\n",
+			reg_arg_name(env, argno));
+		return -EINVAL;
+	}
+
+	/* An explicit KF_RELEASE on this argument must not release it twice. */
+	if (meta->release_regno == reg_from_argno(argno))
+		meta->release_regno = 0;
+	else if (meta->release_regno && cur_regs(env)[meta->release_regno].id == reg->id)
+		goto duplicate;
+
+	for (i = 0; i < meta->coro_frames.cnt; i++) {
+		if (meta->coro_frames.ids[i] == reg->id)
+			goto duplicate;
+	}
+
+	if (suspend)
+		meta->coro_frames.suspend_mask |= BIT(meta->coro_frames.cnt);
+	if (suspend && is_kfunc_arg_coro_defer(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.defer_mask |= BIT(meta->coro_frames.cnt);
+	if (suspend && is_kfunc_arg_coro_offer(meta->btf, &btf_params(meta->func_proto)[arg]))
+		meta->coro_frames.offer_mask |= BIT(meta->coro_frames.cnt);
+	meta->coro_frames.ids[meta->coro_frames.cnt++] = reg->id;
+	return 0;
+
+duplicate:
+	verbose(env, "%s passes the same coroutine frame to multiple consuming arguments\n",
+		reg_arg_name(env, argno));
+	return -EINVAL;
 }
 
 static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 prev_slot,
@@ -10489,6 +11203,9 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg, u32 slot, u32 p
 		}
 		break;
 	case ARG_PTR_TO_ARENA:
+		break;
+	case ARG_PTR_TO_CORO_FRAME:
+		err = record_coro_frame_release(env, reg, arg, argno, meta);
 		break;
 	case ARG_PTR_TO_ALLOC_BTF_ID:
 		if (reg->type == (PTR_TO_BTF_ID | MEM_ALLOC)) {
@@ -10942,12 +11659,19 @@ static int mark_raw_stack(struct bpf_verifier_env *env, struct bpf_call_arg_meta
 		reg = get_func_arg_reg(caller, cur_regs(env), slot);
 
 		/*
-		 * check_stack_range_initialized() checked the range, its offset is a constant.
+		 * check_stack_range_initialized() or check_coro_frame_range_initialized()
+		 * checked the range, its offset is a constant.
 		 * Not check_stack_write(): unknown bytes in its buffer leave a dynptr slice valid.
 		 */
 		for (i = 0; i < meta->arg_raw_mem.size[slot]; i++) {
-			err = check_stack_write_fixed_off(env, bpf_func(env, reg),
-							  reg->var_off.value + i, 1, -1, insn_idx);
+			if (base_type(reg->type) == PTR_TO_CORO_FRAME)
+				err = check_coro_frame_write(env, coro_frame_ref(env, reg),
+							     reg->var_off.value + i, 1, -1,
+							     insn_idx);
+			else
+				err = check_stack_write_fixed_off(env, bpf_func(env, reg),
+								  reg->var_off.value + i, 1, -1,
+								  insn_idx);
 			if (err)
 				return err;
 		}
@@ -11634,6 +12358,19 @@ static int invalidate_reference(struct bpf_verifier_env *env, int id)
 		 * any child references that exist at this point are a leak.
 		 */
 		for (i = 0; i < vstate->acquired_refs; i++) {
+			/*
+			 * A coroutine frame in the memory of what goes ends here: its slots
+			 * are gone with it, and what points to it is invalid like what
+			 * points to the host.
+			 */
+			if (vstate->refs[i].type == REF_TYPE_HOSTED &&
+			    vstate->refs[i].parent_id == id) {
+				err = idstack_push(idstack, vstate->refs[i].id);
+				if (err)
+					return err;
+				release_reference_state(vstate, i--);
+				continue;
+			}
 			if (vstate->refs[i].type != REF_TYPE_PTR)
 				continue;
 			if (vstate->refs[i].parent_id != id)
@@ -11671,8 +12408,25 @@ static int invalidate_reference(struct bpf_verifier_env *env, int id)
 				continue;
 			}
 			bpf_diag_record_scrub(env, reg, BPF_DIAG_MOD_REF_RELEASE);
-			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL)
+			if (!stack || stack->slot_type[BPF_REG_SIZE - 1] == STACK_SPILL) {
+				/* a far offset can wrap the address to zero, see reg_not_null() */
+				bool coro_handle = base_type(reg->type) == PTR_TO_CORO_FRAME &&
+						   !(reg->type & PTR_MAYBE_NULL) &&
+						   !offset_is_far(reg);
+
 				mark_reg_invalid(env, reg);
+				/*
+				 * A consumed coroutine frame leaves its handle
+				 * behind as a scalar; the compiler-generated
+				 * caller tests it against NULL to tell a
+				 * started coroutine from a failed allocation,
+				 * so keep what is known: it is not NULL.
+				 */
+				if (coro_handle && reg->type == SCALAR_VALUE) {
+					reg->r64 = cnum64_from_urange(1, U64_MAX);
+					reg_bounds_sync(reg);
+				}
+			}
 		}));
 	}
 
@@ -12153,6 +12907,12 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 
 		if (state->speculative)
 			return 0;
+		/* see push_coro_resume_cb() */
+		if (env->subprog_info[subprog].coro_cont) {
+			verbose(env, "func#%d is a coroutine continuation and cannot be an async callback\n",
+				subprog);
+			return -EINVAL;
+		}
 		/* there is no real recursion here. timer and workqueue callbacks are async */
 		env->subprog_info[subprog].is_async_cb = true;
 		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
@@ -12255,6 +13015,18 @@ static bool arg_needs_caller(struct bpf_verifier_env *env, const struct bpf_veri
 	return type_may_be_null(reg->type) && !sub->recursive;
 }
 
+/*
+ * The slots that a reference owns are memory that the program writes and reads like its
+ * stack. A function that gets a pointer to them can change what its callers see there,
+ * like one that gets a pointer to the stack.
+ */
+static bool arg_points_to_ref_slots(const struct bpf_verifier_state *state,
+				    const struct bpf_reg_state *reg)
+{
+	return reg->type != SCALAR_VALUE && reg->type != NOT_INIT && reg->id &&
+	       bpf_find_ref_slots(state, reg->id);
+}
+
 static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier_state *state,
 			       int subprog)
 {
@@ -12278,7 +13050,8 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 		if (!(live & BIT(i)))
 			continue;
 		if (caller->regs[i].type == PTR_TO_STACK ||
-		    base_type(caller->regs[i].type) == CONST_PTR_TO_DYNPTR)
+		    base_type(caller->regs[i].type) == CONST_PTR_TO_DYNPTR ||
+		    arg_points_to_ref_slots(state, &caller->regs[i]))
 			return false;
 		if (arg_needs_caller(env, state, sub, &caller->regs[i]))
 			return false;
@@ -12286,7 +13059,8 @@ static bool func_is_on_its_own(struct bpf_verifier_env *env, struct bpf_verifier
 	/* callx of one function of a set asks before it is checked that the arguments are there */
 	for (i = 0; i < bpf_in_stack_arg_cnt(sub) && i < caller->out_stack_arg_cnt; i++) {
 		if (caller->stack_arg_regs[i].type == PTR_TO_STACK ||
-		    base_type(caller->stack_arg_regs[i].type) == CONST_PTR_TO_DYNPTR)
+		    base_type(caller->stack_arg_regs[i].type) == CONST_PTR_TO_DYNPTR ||
+		    arg_points_to_ref_slots(state, &caller->stack_arg_regs[i]))
 			return false;
 		if (arg_needs_caller(env, state, sub, &caller->stack_arg_regs[i]))
 			return false;
@@ -12317,6 +13091,9 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	init_func_state(env, callee, BPF_MAIN_FUNC, 0, subprog);
 	/* the frame that says so is not there when the function is verified */
 	callee->in_rcu_callback_fn = in_rcu_callback(env);
+	/* nor is the continuation that makes it code of another type of program */
+	callee->coro_prog_type = state->frame[0]->coro_prog_type;
+	callee->coro_destroy = state->frame[0]->coro_destroy;
 	/*
 	 * What a frame that the kernel unwinds calls gets other arguments than the calls of the
 	 * normal path do: a landing pad has 0 in R0 where the program has the object that it
@@ -12342,6 +13119,12 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		bpf_free_verifier_state(env, &entry, false);
 		return err;
 	}
+	/*
+	 * No argument points to the slots that a reference owns, see func_is_on_its_own(),
+	 * and nothing else that the function gets leads to them: it cannot read or write
+	 * them. They stay with the call.
+	 */
+	free_reference_slots(entry.refs, entry.acquired_refs);
 	bpf_for_each_reg_in_vstate(&entry, frame, reg, reg->grew_once = false);
 	entry.max_held_cnt = state->max_held_cnt;
 	callee->entry_refs = entry.acquired_refs;
@@ -12466,7 +13249,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 {
 	struct bpf_func_state *frame = caller->frame[caller->curframe];
 	const struct bpf_func_state *callee = exit->frame[0];
-	u32 i, nregs, nheld = caller->acquired_refs;
+	u32 i, j, nregs, nheld = caller->acquired_refs;
 	struct bpf_reg_state *reg;
 	bool found_null;
 	int err;
@@ -12530,8 +13313,28 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		caller->refs[i] = exit->refs[i];
 		caller->refs[i].origin = call_idx;
 		caller->refs[i].saved = 0;
+		/* the slots are those of the exit state, which other calls return with too */
+		caller->refs[i].slots = NULL;
+		caller->refs[i].nr_slots = 0;
 	}
 	caller->held = exit->held;
+	/*
+	 * The slots of what the function took are as it left them, with new names for its
+	 * ids, like the return value. The slots of what was held at the call stayed with
+	 * the call, see call_func_on_its_own().
+	 */
+	for (i = nheld; i < exit->acquired_refs; i++) {
+		err = copy_reference_slots(&caller->refs[i], &exit->refs[i]);
+		if (err)
+			return err;
+		bpf_for_each_ref_slot_reg(j, &caller->refs[i], reg, BIT(STACK_SPILL)) {
+			if (!reg)
+				continue;
+			reg->id = returned_id(reg->id);
+			reg->parent_id = returned_id(reg->parent_id);
+			reg->map_uid = returned_id(reg->map_uid);
+		}
+	}
 
 	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
@@ -12638,6 +13441,16 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		const char *sub_name = bpf_subprog_name(env, subprog);
 		const char *operation;
 		bool returns_void;
+
+		/*
+		 * It is verified once, as code of a program of the program's own type, and so
+		 * is the extension that replaces it.
+		 */
+		if (state->frame[0]->coro_prog_type) {
+			verbose(env, "global function %s() cannot be called from the continuation of a coro_frame that is parked for another type of program\n",
+				sub_name);
+			return -EINVAL;
+		}
 
 		if (env->cur_state->active_locks) {
 			verbose(env, "global function calls are not allowed while holding a lock,\n"
@@ -13042,6 +13855,103 @@ static int check_func_callx_set(struct bpf_verifier_env *env, int regno, int *in
 	return err ?: PROCESS_BPF_EXIT;
 }
 
+/*
+ * callx of the resume or the destroy function of a parked coroutine frame, which was loaded from
+ * the frame in R1, see check_ptr_to_btf_access(). What it calls is not known here, and may be a
+ * function of another program: the continuation that was verified from the snapshot of the frame
+ * when a program parked it, as code of the type of program that the frame was parked for, see
+ * push_coro_suspend() and state_prog_type(). So the caller is a program of that type, in the
+ * context that such a program runs in. For the rest the callee is like any function that is
+ * verified on its own: it takes R1, the frame, which is its own from here on, and leaves a number
+ * in R0.
+ *
+ * No kernel code stands between the two, so what the kernel does around a continuation that it
+ * resumes itself, see bpf_coro_run(), is the caller's to have or the callee's to do:
+ * - A continuation that calls a continuation would nest without bound: it is refused, in the
+ *   continuation and in what it calls, see check_coro_calls(). That looks at the functions of
+ *   this program. An extension replaces a global function of another one, which a continuation
+ *   or an async callback of that one may call: it calls no parked frame.
+ * - The callee is code that does not sleep, see push_coro_suspend(): the call is in a read
+ *   section of RCU.
+ * - The time slice of may_goto is the callee's own, see bpf_do_misc_fixups().
+ * - The kernel unwinds the callee where it unwinds any function, and the callee leaves with
+ *   kexit, see push_coro_resume_cb(). That comes back to this call like kexit of a function of
+ *   the program, and the caller is unwound too: its invocation ends with the continuation's.
+ *   There is no other way on from the call, see bpf_pad_must_unwind().
+ */
+static int check_coro_callx(struct bpf_verifier_env *env, struct bpf_insn *insn, int *insn_idx)
+{
+	struct bpf_verifier_state *st = env->cur_state, *branch;
+	struct bpf_func_state *caller = cur_func(env);
+	struct bpf_reg_state *regs = caller->regs, *fn = &regs[insn->dst_reg];
+	struct bpf_reg_state *frame = &regs[BPF_REG_1];
+	enum bpf_prog_type type = coro_handle_type(frame);
+	const struct bpf_func_state *root = st->frame[0];
+	enum bpf_site_kind forced;
+	int err, call_idx = *insn_idx;
+
+	if (!type || !reg_is_referenced(env, frame) || fn->parent_id != frame->id ||
+	    type_flag(frame->type) & ~PTR_TRUSTED || !tnum_is_const(frame->var_off) ||
+	    frame->var_off.value) {
+		verbose(env, "R%d is a function of a parked coro_frame: R1 has to be the pointer that holds the frame\n",
+			insn->dst_reg);
+		return -EACCES;
+	}
+	/* as it was loaded */
+	err = check_ptr_off_reg(env, fn, insn->dst_reg);
+	if (err)
+		return err;
+	if (env->prog->type == BPF_PROG_TYPE_EXT) {
+		verbose(env, "an extension program cannot call a parked coro_frame\n");
+		return -EACCES;
+	}
+	/* in its own code; what it calls is asked after the pass, see check_coro_calls() */
+	if (root->coro_suspend_site) {
+		verbose(env, "a coroutine continuation cannot call a parked coro_frame\n");
+		return -EACCES;
+	}
+	if (state_prog_type(env, st) != type ||
+	    (type == BPF_PROG_TYPE_XDP && root->in_async_callback_fn)) {
+		verbose(env, "the coro_frame in R1 was parked for another type of program, or for a context that this code does not run in\n");
+		return -EACCES;
+	}
+	bpf_find_containing_subprog(env, call_idx)->calls_parked = true;
+	if (!in_rcu_cs(env)) {
+		verbose(env, "a parked coro_frame is called in a read section of RCU\n");
+		return -EACCES;
+	}
+	if (st->active_locks || st->active_irq_id) {
+		verbose(env, "a parked coro_frame cannot be called with a lock held or with IRQs off\n");
+		return -EACCES;
+	}
+	err = require_callx_jit(env);
+	if (err)
+		return err;
+
+	/* the callee has the frame, and R0-R5 are what it left */
+	err = release_reference(env, frame->id);
+	if (err)
+		return err;
+	clear_caller_saved_regs(env, regs);
+	invalidate_outgoing_stack_args(env, caller);
+	mark_reg_unknown(env, regs, BPF_REG_0);
+
+	/* It comes back unwound by the kernel as well, like a global function that kexit left. */
+	forced = bpf_frame_is_forced(caller) ? BPF_SITE_FORCED : 0;
+	if (env->insn_aux_data[call_idx + 1].kpad)
+		err = bpf_pad_note_external(env, call_idx, BPF_SITE_KENTRY);
+	err = err ?: bpf_pad_note_external(env, call_idx, BPF_SITE_KCALL | forced);
+	if (err)
+		return err;
+	branch = push_stack(env, call_idx + 1, call_idx, false);
+	if (IS_ERR(branch))
+		return PTR_ERR(branch);
+	branch->unwound = bpf_unwound_mark(true, false);
+	if (env->has_throw)
+		mark_reg_unknown(env, branch->frame[branch->curframe]->regs, BPF_REG_0);
+	return 0;
+}
+
 static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx)
 {
@@ -13054,6 +13964,8 @@ static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	reg = reg_state(env, insn->dst_reg);
+	if (reg->type == PTR_TO_CORO_FUNC)
+		return check_coro_callx(env, insn, insn_idx);
 	if (reg->type == SCALAR_VALUE && env->scalar_callx)
 		return check_scalar_callx(env, insn, insn_idx);
 	if (reg->type != PTR_TO_FUNC) {
@@ -13449,9 +14361,13 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			return -EACCES;
 		}
 
-		/* It's called any number of times: what it takes it has to release. */
+		/*
+		 * It's called any number of times: what it takes it has to release. A frame
+		 * in memory of a host has no release.
+		 */
 		for (i = callee->entry_refs; i < state->acquired_refs; i++) {
-			if (state->refs[i].type != REF_TYPE_PTR)
+			if (state->refs[i].type != REF_TYPE_PTR &&
+			    state->refs[i].type != REF_TYPE_HOSTED)
 				continue;
 			verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 				state->refs[i].id, state->refs[i].insn_idx);
@@ -13886,16 +14802,37 @@ static bool can_elide_value_nullness(const struct bpf_map *map)
 	}
 }
 
+/*
+ * A helper is one function for programs of one type and may be another one for another type.
+ * A call that states of two types get to, in a function that a program and a continuation
+ * which is parked for another type both call, is one call when the program is fixed up: it
+ * has to be the same function for both. Fixups ask as the states did.
+ */
+static int note_helper_prog_type(struct bpf_verifier_env *env, int insn_idx,
+				 const struct bpf_func_proto *fn)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	enum bpf_prog_type type = state_prog_type(env, env->cur_state);
+	int func_id = env->prog->insnsi[insn_idx].imm;
+
+	if (aux->helper_prog_type && aux->helper_prog_type != type &&
+	    bpf_helper_proto_as(env, func_id, aux->helper_prog_type) != fn) {
+		verbose(env, "helper %s#%d is not the same function for the types of program that this call is verified as\n",
+			func_id_name(func_id), func_id);
+		return -EINVAL;
+	}
+	aux->helper_prog_type = type;
+	return 0;
+}
+
 int bpf_get_helper_proto(struct bpf_verifier_env *env, int func_id,
 			 const struct bpf_func_proto **ptr)
 {
 	if (func_id < 0 || func_id >= __BPF_FUNC_MAX_ID)
 		return -ERANGE;
 
-	if (!env->ops->get_func_proto)
-		return -EINVAL;
-
-	*ptr = env->ops->get_func_proto(func_id, env->prog);
+	*ptr = bpf_helper_proto_as(env, func_id,
+				   env->pad_prog_type ?: state_prog_type(env, env->cur_state));
 	return *ptr && (*ptr)->func ? 0 : -EINVAL;
 }
 
@@ -13961,6 +14898,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	enum bpf_type_flag ret_flag;
 	struct bpf_reg_state *regs, unwound_r0;
 	struct bpf_call_arg_meta meta;
+	struct bpf_prog view;
 	const char *operation;
 	int insn_idx = *insn_idx_p;
 	bool changes_data;
@@ -13984,6 +14922,10 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 	}
 
+	err = note_helper_prog_type(env, insn_idx, fn);
+	if (err)
+		return err;
+
 	/* eBPF programs must be GPL compatible to use GPL-ed functions */
 	if (!env->prog->gpl_compatible && fn->gpl_only) {
 		verbose(env, "cannot call GPL-restricted function from non-GPL compatible program\n");
@@ -13995,7 +14937,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return -EINVAL;
 	}
 
-	if (fn->allowed && !fn->allowed(env->prog)) {
+	if (fn->allowed && !fn->allowed(bpf_state_prog(env, &view))) {
 		verbose(env, "helper call is not allowed in probe\n");
 		operation = bpf_diag_fmt(env, "helper %s#%d", func_id_name(func_id), func_id);
 		bpf_diag_policy(
@@ -14693,6 +15635,50 @@ static bool is_kfunc_arg_arena(const struct btf *btf, const struct btf_param *ar
 	       btf_param_match_suffix(btf, arg, "__arena");
 }
 
+static bool is_kfunc_arg_coro_frame(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_frame");
+}
+
+/*
+ * A __coro_suspend parameter is a consumed frame that the kernel resumes
+ * later: the verifier snapshots the frame at the call and verifies its
+ * resume and destroy functions from that snapshot, see push_coro_suspend().
+ */
+static bool is_kfunc_arg_coro_suspend(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_suspend") ||
+	       btf_param_match_suffix(btf, arg, "__coro_defer") ||
+	       btf_param_match_suffix(btf, arg, "__coro_offer");
+}
+
+/*
+ * A __coro_defer parameter is a __coro_suspend frame that the kernel keeps where it is, in the
+ * host that the program got with it, and resumes on a receive path: with bottom halves off
+ * and a network context, whatever code suspends it. Its continuation is verified as code
+ * that such a context runs, an XDP program's. The host is in a slot of the frame, also where
+ * it is an argument of the program, which is the kernel's for good once the frame is: the
+ * continuation gives it up. The frame holds no other reference, so that the kernel can end
+ * it and take its host back without a call of the program, see push_coro_suspend().
+ */
+static bool is_kfunc_arg_coro_defer(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_defer") ||
+	       btf_param_match_suffix(btf, arg, "__coro_offer");
+}
+
+/*
+ * A __coro_offer parameter is a __coro_defer frame that the kfunc may decline: a boundary
+ * that answers at once. The kfunc returns true where it took the frame, which is the case of
+ * __coro_defer, and false where it did not: then nothing has happened to the frame or to
+ * what it holds, and the code goes on with both. The two are verified apart, see
+ * push_coro_declined(), so the code tells them by the return value alone.
+ */
+static bool is_kfunc_arg_coro_offer(const struct btf *btf, const struct btf_param *arg)
+{
+	return btf_param_match_suffix(btf, arg, "__coro_offer");
+}
+
 static bool is_kfunc_arg_scalar_with_name(const struct btf *btf,
 					  const struct btf_param *arg,
 					  const char *name)
@@ -15105,6 +16091,9 @@ enum special_kfunc_type {
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
+	KF_bpf_coro_frame_alloc,
+	KF_bpf_coro_park_xdp,
+	KF_bpf_coro_park_syscall,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -15210,6 +16199,141 @@ BTF_ID(func, bpf_session_is_return)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, bpf_coro_frame_alloc)
+BTF_ID(func, bpf_coro_park_xdp)
+BTF_ID(func, bpf_coro_park_syscall)
+
+/* What bpf_coro_park_xdp() and bpf_coro_park_syscall() return */
+BTF_ID_LIST(coro_handle_ids)
+BTF_ID(struct, bpf_coro_xdp)
+BTF_ID(struct, bpf_coro_syscall)
+
+/*
+ * The largest coroutine frame that the kfunc gives in memory of its host, see "Hosts" in
+ * kernel/bpf/coro.c. -ENOENT: it is no kfunc of a host.
+ */
+static int coro_host_room(const struct bpf_call_arg_meta *meta)
+{
+	return meta->btf == btf_vmlinux ? bpf_coro_host_room(meta->func_id) : -ENOENT;
+}
+
+/* Does the kfunc return a coroutine frame? From the cache of the program, or in a host. */
+static bool is_coro_frame_alloc_kfunc(const struct bpf_call_arg_meta *meta)
+{
+	return is_kfunc_call(meta, special_kfunc_list[KF_bpf_coro_frame_alloc]) ||
+	       coro_host_room(meta) >= 0;
+}
+
+/*
+ * The host of the frame that the kfunc returns: the argument with the suffix __coro_host. It
+ * is the program context, *@id 0, or a reference that the program holds, whose id goes to
+ * *@id: the frame is there for as long as the program has that, see REF_TYPE_HOSTED. The
+ * arguments in front of it take a register each.
+ */
+static int coro_frame_host(struct bpf_verifier_env *env, const struct bpf_call_arg_meta *meta,
+			   int *id)
+{
+	const struct btf_param *args = btf_params(meta->func_proto);
+	u32 i, nargs = btf_type_vlen(meta->func_proto);
+	struct bpf_reg_state *reg;
+
+	for (i = 0; i < nargs && i < MAX_BPF_FUNC_REG_ARGS; i++) {
+		if (!btf_param_match_suffix(meta->btf, &args[i], "__coro_host"))
+			continue;
+		reg = &cur_regs(env)[BPF_REG_1 + i];
+		*id = 0;
+		if (reg->type == PTR_TO_CTX)
+			return 0;
+		*id = reg->id;
+		if (reg_is_referenced(env, reg))
+			return 0;
+		verbose(env, "R%d is to host a coro_frame of %s() and is neither the program context nor a reference of the program\n",
+			BPF_REG_1 + i, meta->func_name);
+		return -EINVAL;
+	}
+	verifier_bug(env, "kfunc %s gives a coro_frame and names no host", meta->func_name);
+	return -EFAULT;
+}
+
+/*
+ * The type of program that the kfunc which @insn calls parks a coroutine frame for, see
+ * kernel/bpf/coro.c. 0 if it calls no such kfunc.
+ */
+static enum bpf_prog_type coro_park_type(const struct bpf_insn *insn)
+{
+	if (!bpf_pseudo_kfunc_call(insn) || insn->off)
+		return BPF_PROG_TYPE_UNSPEC;
+	if (insn->imm == special_kfunc_list[KF_bpf_coro_park_xdp])
+		return BPF_PROG_TYPE_XDP;
+	if (insn->imm == special_kfunc_list[KF_bpf_coro_park_syscall])
+		return BPF_PROG_TYPE_SYSCALL;
+	return BPF_PROG_TYPE_UNSPEC;
+}
+
+/* The type of program whose context a pointer to a parked frame is called in. 0 if none. */
+static enum bpf_prog_type coro_handle_type(const struct bpf_reg_state *reg)
+{
+	if (base_type(reg->type) != PTR_TO_BTF_ID || !btf_is_vmlinux(reg->btf))
+		return BPF_PROG_TYPE_UNSPEC;
+	if (reg->btf_id == coro_handle_ids[0])
+		return BPF_PROG_TYPE_XDP;
+	if (reg->btf_id == coro_handle_ids[1])
+		return BPF_PROG_TYPE_SYSCALL;
+	return BPF_PROG_TYPE_UNSPEC;
+}
+
+/*
+ * The type of program that the code of @st is verified as. A continuation of a parked frame
+ * is called by a program of the type that the frame was parked for, with no kernel code in
+ * between that would make its context one of the program's own type: from the suspension on
+ * its helpers and kfuncs are those of that type. The first frame of the state says which, see
+ * push_coro_resume_cb(), and no two states that differ in it are joined: it is in the join_key.
+ * A function that is verified on its own has it from the state that calls it, see
+ * call_func_on_its_own(), and is verified once for each type that calls it.
+ */
+static enum bpf_prog_type state_prog_type(const struct bpf_verifier_env *env,
+					  const struct bpf_verifier_state *st)
+{
+	/* a state that has left its last frame is asked too, by a landing pad */
+	enum bpf_prog_type type = st && st->frame[0] ? st->frame[0]->coro_prog_type : 0;
+
+	return type ?: resolve_prog_type(env->prog);
+}
+
+/*
+ * The program, for whoever asks what a program of its type may call: the program itself, or a
+ * copy in @view that has the type which the current state is verified as.
+ */
+const struct bpf_prog *bpf_state_prog(struct bpf_verifier_env *env, struct bpf_prog *view)
+{
+	/* no state is there when the landing pads are settled: the entry of a pad says */
+	enum bpf_prog_type type = env->pad_prog_type ?: state_prog_type(env, env->cur_state);
+
+	if (type == resolve_prog_type(env->prog))
+		return env->prog;
+	memcpy(view, env->prog, sizeof(*view));
+	view->type = type;
+	view->expected_attach_type = 0;
+	return view;
+}
+
+/* The helper @func_id of a program of @type; of the program's own type if @type is 0 */
+const struct bpf_func_proto *bpf_helper_proto_as(struct bpf_verifier_env *env, int func_id,
+						 enum bpf_prog_type type)
+{
+	const struct bpf_verifier_ops *ops = env->ops;
+	const struct bpf_prog *prog = env->prog;
+	struct bpf_prog view;
+
+	if (type && type != resolve_prog_type(env->prog)) {
+		memcpy(&view, env->prog, sizeof(view));
+		view.type = type;
+		view.expected_attach_type = 0;
+		prog = &view;
+		ops = bpf_verifier_ops[type];
+	}
+	return ops && ops->get_func_proto ? ops->get_func_proto(func_id, prog) : NULL;
+}
 
 static bool is_bpf_cast_to_kern_ctx_kfunc(const struct bpf_call_arg_meta *meta)
 {
@@ -15534,7 +16658,10 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		}
 		proto->arg_size[arg] = type_size;
 		arg_type = ARG_PTR_TO_CTX_OUT | MEM_FIXED_SIZE;
-	} else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
+	} else if (is_kfunc_arg_coro_frame(meta->btf, &args[arg]) ||
+		   is_kfunc_arg_coro_suspend(meta->btf, &args[arg]))
+		arg_type = ARG_PTR_TO_CORO_FRAME | OBJ_RELEASE;
+	else if (is_kfunc_arg_callback(env, meta->btf, &args[arg]))
 		arg_type = ARG_PTR_TO_FUNC;
 	else if (is_kfunc_arg_arena(meta->btf, &args[arg])) {
 		if (!bpf_jit_supports_arena_args()) {
@@ -15611,8 +16738,8 @@ get_kfunc_arg_type(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 	}
 
 	/*
-	 * Only the first argument of a KF_RELEASE kfunc releases anything, and
-	 * bpf_fetch_kfunc_arg_meta() only ever records BPF_REG_1 for it.
+	 * KF_RELEASE consumes the first argument. Coroutine frame parameters
+	 * carry OBJ_RELEASE independently of their position and this flag.
 	 */
 	if (is_kfunc_release(meta) && arg == 0)
 		arg_type |= OBJ_RELEASE;
@@ -16128,6 +17255,7 @@ __process_kf_arg_ptr_to_graph_root(struct bpf_verifier_env *env,
 	struct btf_field *field;
 	struct btf_record *rec;
 	u32 head_off;
+	int err;
 
 	if (meta->btf != btf_vmlinux) {
 		verifier_bug(env, "unexpected btf mismatch in kfunc call");
@@ -16157,6 +17285,19 @@ __process_kf_arg_ptr_to_graph_root(struct bpf_verifier_env *env,
 	if (check_reg_allocation_locked(env, reg)) {
 		verbose(env, "bpf_spin_lock at off=%d must be held for %s\n",
 			rec->spin_lock_off, head_type_name);
+		return -EINVAL;
+	}
+	/*
+	 * Nothing empties what a bpf_res_spin_lock guards when its value or its object goes,
+	 * see bpf_obj_free_fields(), nor when the program of the frames in it does, see
+	 * bpf_obj_free_parked(): a frame there would outlive its program.
+	 */
+	err = rec->spin_lock_off < 0 ? bpf_record_holds_parked(field->graph_root.value_rec) : 0;
+	if (err < 0)
+		return err;
+	if (err) {
+		verbose(env, "a %s whose nodes can hold a parked coro_frame has to be guarded by a bpf_spin_lock\n",
+			head_type_name);
 		return -EINVAL;
 	}
 
@@ -16295,6 +17436,7 @@ int bpf_fetch_kfunc_arg_meta(struct bpf_verifier_env *env,
 			     s16 offset,
 			     struct bpf_call_arg_meta *meta)
 {
+	struct bpf_prog view;
 	struct bpf_kfunc_meta kfunc;
 	int err;
 
@@ -16309,7 +17451,7 @@ int bpf_fetch_kfunc_arg_meta(struct bpf_verifier_env *env,
 	meta->func_proto = kfunc.proto;
 	meta->func_name = kfunc.name;
 
-	if (!kfunc.flags || !btf_kfunc_is_allowed(kfunc.btf, kfunc.id, env->prog))
+	if (!kfunc.flags || !btf_kfunc_is_allowed(kfunc.btf, kfunc.id, bpf_state_prog(env, &view)))
 		return -EACCES;
 
 	meta->kfunc_flags = *kfunc.flags;
@@ -16810,6 +17952,48 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 		regs[BPF_REG_0].buf = meta->slice_buf;
 		if (meta->slice_buf.size)
 			env->seen_stack_slice = true;
+	} else if (is_coro_frame_alloc_kfunc(meta)) {
+		u64 size = meta->arg_constant.value, arg;
+
+		if (verifier_bug_if(!meta->arg_constant.found, env, "coro_frame size not constant"))
+			return -EFAULT;
+		/* every state copies the slots, so a frame is no larger than a stack frame */
+		if (size == 0 || size > BPF_MAX_REF_SLOTS * BPF_REG_SIZE) {
+			verbose(env, "coro_frame size %llu out of range [1, %u]\n",
+				size, BPF_MAX_REF_SLOTS * BPF_REG_SIZE);
+			return -EINVAL;
+		}
+		if (coro_host_room(meta) >= 0) {
+			/*
+			 * The frame is in its host or there is none: a program that asks for
+			 * more than such a host can lend asks in vain on every run.
+			 */
+			if (size > coro_host_room(meta)) {
+				verbose(env, "coro_frame of %llu bytes does not fit in its host: %s() has %d\n",
+					size, meta->func_name, coro_host_room(meta));
+				return -EINVAL;
+			}
+			bpf_coro_frames_hosted(env->prog->aux);
+			mark_reg_known_zero(env, regs, BPF_REG_0);
+			regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
+			regs[BPF_REG_0].mem_size = size;
+			return 1;
+		}
+		/*
+		 * The program gets a cache for frames of this size, see bpf_coro_frames_init(),
+		 * and the call passes the class with the size, see bpf_fixup_kfunc_call(), if it
+		 * is the one size at this call on every path.
+		 */
+		arg = bpf_coro_frame_size(env->prog->aux, size);
+		if (!cur_aux(env)->call_recorded) {
+			cur_aux(env)->call_recorded = true;
+			cur_aux(env)->call_num = arg;
+		} else if (cur_aux(env)->call_num != arg) {
+			cur_aux(env)->call_num = 0;
+		}
+		mark_reg_known_zero(env, regs, BPF_REG_0);
+		regs[BPF_REG_0].type = PTR_TO_CORO_FRAME;
+		regs[BPF_REG_0].mem_size = size;
 	} else {
 		return 0;
 	}
@@ -16835,11 +18019,438 @@ bool bpf_obj_free_runs_dtor(const struct btf *btf, u32 btf_id)
 					    BPF_GRAPH_ROOT | BPF_KPTR_REF | BPF_KPTR_PERCPU);
 }
 
+/*
+ * Suspension of a coroutine into the kernel.
+ *
+ * A kfunc that takes a __coro_suspend frame keeps the frame and resumes the
+ * coroutine later by calling the resume function whose address the compiler
+ * stored in the frame's first slot, with the frame as the only argument. The
+ * destroy function in the second slot is verified the same way, for the
+ * teardown of a frame that is not resumed, which nothing does yet. The frame's
+ * contents are all the state those functions see, so each is verified as an
+ * async callback that starts from a snapshot of the frame taken at the call:
+ * the slots keep their types and values, the suspend index among them, so
+ * only the continuation of this suspend point is explored, and the acquired
+ * references stored in the frame move to the callback, which has to release
+ * them (or the frame holding them, along with the frame itself). Pointers
+ * that do not survive a suspension are rejected: the context, packet data,
+ * RCU-protected or untrusted pointers, and values of maps other than arrays,
+ * which are only valid under RCU.
+ *
+ * The kfunc resumes the frame with bpf_coro_run(), whose call of the
+ * continuation has a landing pad like the call of a helper whose callback may
+ * unwind, see bpf_call_cb(). The continuation leaves with kexit where the
+ * kernel unwinds it, which needs bail_unwinds, see mark_recursive_subprogs(),
+ * and bpf_coro_run() tells the kfunc. The normal path pays nothing for that. A
+ * continuation that leaves with exit when it is unwound, where the JIT does not
+ * unwind, would tell nobody: unwind_frame() refuses that.
+ */
+static struct bpf_reference_state *coro_ref_by_id(struct bpf_verifier_state *st, int id)
+{
+	int i;
+
+	for (i = 0; i < st->acquired_refs; i++)
+		if (st->refs[i].id == id)
+			return &st->refs[i];
+	return NULL;
+}
+
+/*
+ * A reference of the continuation in @st, which @src of the suspending state is: frame 0 is to
+ * release it, and no insn of that frame brought it there, like what the kernel holds for an
+ * argument of a program. It keeps the insn that acquired it, which a landing pad asks what
+ * releases it, see ref_release() in pads.c, and the report of a leak names.
+ */
+static struct bpf_reference_state *coro_add_ref(struct bpf_verifier_state *st,
+						const struct bpf_reference_state *src)
+{
+	int n = st->acquired_refs;
+
+	if (resize_reference_state(st, n + 1))
+		return NULL;
+	memset(&st->refs[n], 0, sizeof(st->refs[n]));
+	st->refs[n].insn_idx = src->insn_idx;
+	st->refs[n].origin = src->origin;
+	st->refs[n].diag_id = src->diag_id;
+	st->refs[n].type = src->type;
+	st->refs[n].id = src->id;
+	st->refs[n].parent_id = src->parent_id;
+	return &st->refs[n];
+}
+
+/* Is the pointer in a frame slot an acquired kernel reference? */
+static bool coro_slot_reg_is_ref(const struct bpf_reg_state *reg)
+{
+	return base_type(reg->type) == PTR_TO_BTF_ID;
+}
+
+/*
+ * The reference that @reg is keeps its object for as long as the program holds it, past the
+ * end of the invocation: what a kfunc acquired, or what bpf_kptr_xchg() took out of a map. Not a
+ * socket that a helper looked up: a UDP socket or a TCP listener is freed after a grace period of
+ * RCU, which the continuation does not hold, and bpf_sk_release() does nothing for it, whatever
+ * type a helper casts it to. Nor an argument of a struct_ops operator, which is for the call.
+ */
+static bool coro_ref_outlives_call(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	const struct bpf_reference_state *ref = coro_ref_by_id(env->cur_state, reg->id);
+	const struct bpf_insn *insn;
+
+	if (!ref || ref->type != REF_TYPE_PTR || ref->ctx_arg)
+		return false;
+	insn = &env->prog->insnsi[ref->insn_idx];
+	return bpf_pseudo_kfunc_call(insn) ||
+	       (bpf_helper_call(insn) && insn->imm == BPF_FUNC_kptr_xchg);
+}
+
+static bool coro_slot_reg_survives(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	switch (base_type(reg->type)) {
+	/* the copy of what is released or gone: the continuation cannot read it */
+	case NOT_INIT:
+	case SCALAR_VALUE:
+	case PTR_TO_FUNC:
+	case PTR_TO_ARENA:
+		return true;
+	/* an inner map of a map in map is not one of the program, which the frame keeps */
+	case CONST_PTR_TO_MAP:
+		return !reg->map_uid;
+	case PTR_TO_MAP_VALUE:
+		return reg->map_ptr && reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY &&
+		       !reg->map_uid;
+	default:
+		return coro_slot_reg_is_ref(reg) && coro_ref_outlives_call(env, reg) &&
+		       !(reg->type & (MEM_RCU | NON_OWN_REF | PTR_UNTRUSTED | PTR_MAYBE_NULL));
+	}
+}
+
+/*
+ * Verify subprog 'subprog' as the continuation of the suspended 'frame'. @destroy: it is in the
+ * second slot.
+ */
+static int push_coro_resume_cb(struct bpf_verifier_env *env, int insn_idx, int subprog,
+			       struct bpf_reference_state *frame, u32 *moved, int nr_moved,
+			       bool destroy, bool defer)
+{
+	enum bpf_prog_type type = coro_park_type(&env->prog->insnsi[insn_idx]);
+	struct bpf_subprog_info *info = &env->subprog_info[subprog];
+	struct bpf_verifier_state *cur = env->cur_state, *async_cb;
+	struct bpf_reference_state *ref, *src;
+	struct bpf_func_state *callee;
+	struct bpf_reg_state *reg;
+	bool parked = type;
+	int i;
+
+	/*
+	 * The kernel calls a continuation from bpf_coro_run() only, which tells the kfunc when
+	 * the kernel unwound it, see push_coro_suspend(). A timer, say, would call it with
+	 * arguments of its own, and no kfunc would learn that it was unwound.
+	 */
+	if (info->is_async_cb && !info->coro_cont) {
+		verbose(env, "func#%d is an async callback and cannot be a coroutine continuation\n",
+			subprog);
+		return -EINVAL;
+	}
+	/*
+	 * unwind_exit of the program goes to the landing pad of bpf_coro_run() as well, which
+	 * says that the continuation did not return. Where bpf_call_cb() makes none it returns.
+	 */
+	if (info->can_unwind && !BPF_HAS_CB_PADS) {
+		verbose(env, "coroutine continuation %s() has unwind_exit, and bpf_coro_run() cannot tell\n",
+			bpf_subprog_name(env, subprog));
+		return -EINVAL;
+	}
+	/*
+	 * A program calls the continuation of a parked frame, see check_coro_callx(), and it may
+	 * be another program: what unwind_exit leaves is nothing that its landing pads know.
+	 */
+	if (info->can_unwind && parked) {
+		verbose(env, "coroutine continuation %s() has unwind_exit, which would unwind into the program that calls a parked coro_frame\n",
+			bpf_subprog_name(env, subprog));
+		return -EINVAL;
+	}
+	/*
+	 * The check at the entry of a recursive subprog unwinds a frame that holds nothing, see
+	 * emit_unwind_exit(). A continuation holds the coroutine frame and what it carried from
+	 * its first insn on.
+	 */
+	if (info->recursive) {
+		verbose(env, "coroutine continuation %s() is recursive\n",
+			bpf_subprog_name(env, subprog));
+		return -EINVAL;
+	}
+	info->coro_cont = true;
+	info->coro_parked |= parked;
+	/* for a keeper that calls it with no pointer from the frame, see bpf_coro_defer_resume() */
+	info->coro_defer |= defer && !destroy;
+	/*
+	 * The kernel calls it like any callback: what is refused in one is, see
+	 * check_callbacks() and check_tail_calls(), and a stack in arena, see
+	 * check_after_pass(). There is no real recursion here: the kernel resumes the frame
+	 * later.
+	 */
+	info->is_cb = true;
+	info->is_async_cb = true;
+	/*
+	 * Hidden slots of landing pads take what an insn of the function acquires, and no insn
+	 * of the continuation acquired what the frame carried, see bpf_pad_no_slots()
+	 */
+	info->no_slots |= BIT(BPF_PAD_GROUP_REFS);
+	async_cb = push_async_cb(env, env->subprog_info[subprog].start, insn_idx, subprog, false);
+	if (IS_ERR(async_cb))
+		return PTR_ERR(async_cb);
+	callee = async_cb->frame[0];
+	callee->in_async_callback_fn = true;
+	callee->coro_suspend_site = insn_idx + 1;
+	/*
+	 * A kfunc that keeps the frame resumes it in a context of the type of program that
+	 * could call the kfunc: the type of the code that suspends, see bpf_coro_run().
+	 */
+	/* Or a receive path does, whatever the code that defers is: see __coro_defer. */
+	if (defer)
+		type = BPF_PROG_TYPE_XDP;
+	type = type ?: state_prog_type(env, cur);
+	callee->coro_prog_type = type == resolve_prog_type(env->prog) ? 0 : type;
+	callee->coro_destroy = parked && destroy;
+	callee->callback_ret_range = retval_range(0, 0);
+
+	/*
+	 * The frame, with a copy of its slots. The ids are those of the suspending state:
+	 * they get the names of the continuation when it is delivered, see
+	 * bpf_renumber_ids().
+	 */
+	ref = coro_add_ref(async_cb, frame);
+	if (!ref || copy_reference_slots(ref, frame))
+		return -ENOMEM;
+
+	/* The references the frame holds. */
+	for (i = 0; i < nr_moved; i++) {
+		src = coro_ref_by_id(cur, moved[i]);
+		if (verifier_bug_if(!src || src->type != REF_TYPE_PTR, env,
+				    "coro_frame holds unknown reference %u", moved[i]))
+			return -EFAULT;
+		if (!coro_add_ref(async_cb, src))
+			return -ENOMEM;
+	}
+
+	/* r1 is the frame; the continuation gets nothing else. */
+	reg = &callee->regs[BPF_REG_1];
+	mark_reg_known_zero(env, callee->regs, BPF_REG_1);
+	reg->type = PTR_TO_CORO_FRAME;
+	reg->mem_size = frame->mem_size;
+	reg->id = frame->id;
+	for (i = BPF_REG_2; i <= BPF_REG_5; i++)
+		bpf_mark_reg_not_init(env, &callee->regs[i]);
+	return 0;
+}
+
+/*
+ * Is @frame a bare one, see bpf_coro_register_bare_host()? The kfunc that gave it out tells,
+ * and a reference keeps the insn that acquired it.
+ */
+static bool coro_frame_is_bare(struct bpf_verifier_env *env,
+			       const struct bpf_reference_state *frame)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[frame->insn_idx];
+
+	return frame->type == REF_TYPE_HOSTED && bpf_pseudo_kfunc_call(insn) && !insn->off &&
+	       bpf_coro_host_bare(insn->imm);
+}
+
+/*
+ * A kfunc with a __coro_offer argument did not take the frame: the state behind the call in
+ * which the frame and what it holds are the program's as before, and the kfunc returned
+ * false. It is verified beside the one in which the kfunc took the frame, like the two
+ * outcomes of the next() of an iterator, see process_iter_next_call(): made of the state at
+ * the call, before anything of it goes to the continuation.
+ */
+static int push_coro_declined(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_verifier_state *st;
+	struct bpf_reg_state *regs;
+	int i;
+
+	st = push_stack(env, insn_idx + 1, insn_idx, false);
+	if (IS_ERR(st))
+		return PTR_ERR(st);
+	regs = st->frame[st->curframe]->regs;
+	for (i = 0; i < CALLER_SAVED_REGS; i++)
+		bpf_mark_reg_not_init(env, &regs[caller_saved[i]]);
+	mark_reg_unknown(env, regs, BPF_REG_0);
+	__mark_reg_const_zero(&regs[BPF_REG_0]);
+	return 0;
+}
+
+static int push_coro_suspend(struct bpf_verifier_env *env, int insn_idx, int id, bool defer)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_reference_state *frame = bpf_find_ref_slots(cur, id);
+	u32 moved[BPF_MAX_REF_SLOTS];
+	int i, j, err, nr_moved = 0, resume, destroy = -1;
+	bool host;
+
+	if (verifier_bug_if(!frame, env, "suspended coro_frame %d has no slots", id))
+		return -EFAULT;
+	/*
+	 * The kernel calls the destroy function of every parked frame that is left when its
+	 * program goes, and waits until none is, see bpf_coro_prog_release(): the function ends
+	 * the coroutine.
+	 */
+	if (cur->frame[0]->coro_destroy) {
+		verbose(env, "the destroy function of a parked coro_frame cannot suspend a coro_frame\n");
+		return -EINVAL;
+	}
+	if (defer && frame->type != REF_TYPE_HOSTED) {
+		verbose(env, "deferred coro_frame is not in memory of a host for the kernel to keep it in\n");
+		return -EINVAL;
+	}
+	/* nothing in front of it says whose it is: bpf_coro_run() cannot resume it */
+	if (!defer && coro_frame_is_bare(env, frame)) {
+		verbose(env, "suspended coro_frame is a bare one of its host, which only the keeper of the host resumes\n");
+		return -EINVAL;
+	}
+	/* one function: only that one is verified from the snapshot, see mark_reg_func_set() */
+	if (frame->nr_slots < 1 || !bpf_is_spilled_reg(&frame->slots[0]) ||
+	    frame->slots[0].spilled_ptr.type != PTR_TO_FUNC ||
+	    frame->slots[0].spilled_ptr.func_set) {
+		verbose(env, "suspended coro_frame has no resume function in its first slot\n");
+		return -EINVAL;
+	}
+	resume = frame->slots[0].spilled_ptr.subprogno;
+	if (frame->nr_slots >= 2 && bpf_is_spilled_reg(&frame->slots[1]) &&
+	    frame->slots[1].spilled_ptr.type == PTR_TO_FUNC) {
+		if (frame->slots[1].spilled_ptr.func_set) {
+			verbose(env, "suspended coro_frame has no single destroy function in its second slot\n");
+			return -EINVAL;
+		}
+		destroy = frame->slots[1].spilled_ptr.subprogno;
+	}
+
+	for (i = 0; i < frame->nr_slots; i++) {
+		struct bpf_stack_state *slot = &frame->slots[i];
+		struct bpf_reg_state *reg = &slot->spilled_ptr;
+
+		if (!bpf_is_spilled_reg(slot)) {
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				if (slot->slot_type[j] == STACK_DYNPTR ||
+				    slot->slot_type[j] == STACK_ITER ||
+				    slot->slot_type[j] == STACK_IRQ_FLAG) {
+					verbose(env, "coro_frame slot %d holds a verifier object that cannot be suspended\n",
+						i);
+					return -EINVAL;
+				}
+			}
+			continue;
+		}
+		/*
+		 * The host of a frame that is deferred goes to the kernel with the frame,
+		 * also where it was the kernel's all along: an argument of the program.
+		 */
+		host = defer && frame->type == REF_TYPE_HOSTED && frame->parent_id &&
+		       coro_slot_reg_is_ref(reg) && reg->id == frame->parent_id &&
+		       !(reg->type & (MEM_RCU | NON_OWN_REF | PTR_UNTRUSTED | PTR_MAYBE_NULL));
+		if (!host && !coro_slot_reg_survives(env, reg)) {
+			verbose(env, "coro_frame slot %d holds %s which cannot survive a suspension\n",
+				i, reg_type_str(env, reg->type));
+			return -EINVAL;
+		}
+		if (!coro_slot_reg_is_ref(reg))
+			continue;
+		for (j = 0; j < nr_moved; j++)
+			if (moved[j] == reg->id)
+				break;
+		if (j == nr_moved)
+			moved[nr_moved++] = reg->id;
+	}
+
+	/*
+	 * A frame in memory of a host is there for as long as the program has the host. The
+	 * program context is gone when the invocation ends. A reference goes with the frame if
+	 * it is in the frame: the continuation has it then, and where it gives the reference
+	 * up the frame ends, see invalidate_reference(). That is how the destroy function of
+	 * such a frame ends too, whoever calls it.
+	 */
+	if (frame->type == REF_TYPE_HOSTED) {
+		if (!frame->parent_id) {
+			verbose(env, "suspended coro_frame is in memory of the program context, which the program has to keep first\n");
+			return -EINVAL;
+		}
+		for (j = 0; j < nr_moved && moved[j] != frame->parent_id; j++)
+			;
+		if (j == nr_moved) {
+			verbose(env, "suspended coro_frame is in memory of reference id=%d, which is in none of its slots\n",
+				frame->parent_id);
+			return -EINVAL;
+		}
+	}
+	/* the kernel ends such a frame without the program: its host is all that it has */
+	if (defer && nr_moved > 1) {
+		verbose(env, "deferred coro_frame holds a reference besides its host, id=%d\n",
+			moved[0] == frame->parent_id ? moved[1] : moved[0]);
+		return -EINVAL;
+	}
+
+	/*
+	 * A parked frame is called by a program that holds it, see check_coro_callx(), or
+	 * destroyed by the kernel when nothing does, see bpf_coro_drop(): it needs both functions.
+	 * Whoever calls them is in a read section of RCU. The continuation is verified as code
+	 * that does not sleep, see push_coro_resume_cb(), also where the code that parks may:
+	 * a sleepable program and a callback that may sleep park like any other code.
+	 */
+	if (coro_park_type(&env->prog->insnsi[insn_idx])) {
+		if (destroy < 0) {
+			verbose(env, "parked coro_frame has no destroy function in its second slot\n");
+			return -EINVAL;
+		}
+		/*
+		 * Every frame that such a program takes out of a map is one of the program that
+		 * it holds. Its own would be called by that one, which does not hold it.
+		 */
+		if (env->prog->aux->coro_prog) {
+			verbose(env, "a program that is bound to the coroutines of another program cannot park a coro_frame\n");
+			return -EINVAL;
+		}
+		/* the frames that it leaves parked are destroyed when it goes */
+		env->prog->aux->coro_parks = true;
+	}
+
+	/*
+	 * Like any async callback a continuation is not verified from a speculative state,
+	 * see push_callback_call(): it runs only if the call did.
+	 */
+	if (!cur->speculative) {
+		err = push_coro_resume_cb(env, insn_idx, resume, frame, moved, nr_moved,
+					  destroy == resume, defer);
+		if (err)
+			return err;
+	}
+	if (!cur->speculative && destroy >= 0 && destroy != resume) {
+		err = push_coro_resume_cb(env, insn_idx, destroy, frame, moved, nr_moved, true,
+					  defer);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * The continuation owns the references now; every copy outside the
+	 * frame goes invalid. The frame itself is released by the caller, if
+	 * it has not gone with its host here.
+	 */
+	for (i = 0; i < nr_moved; i++) {
+		err = release_reference(env, moved[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable, nmi_prog;
 	struct bpf_reg_state *regs = cur_regs(env), unwound_r0;
+	bool hosted = false;
+	int host_id = 0;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_call_arg_meta meta;
@@ -17120,6 +18731,14 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return -EACCES;
 	}
 
+	/* while the arguments are in their registers */
+	hosted = coro_host_room(&meta) >= 0;
+	if (hosted) {
+		err = coro_frame_host(env, &meta, &host_id);
+		if (err)
+			return err;
+	}
+
 	/* In case of release function, we get register number of refcounted
 	 * PTR_TO_BTF_ID in bpf_kfunc_arg_meta, do the release now.
 	 */
@@ -17132,6 +18751,15 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (is_kfunc_release_ctx(&meta)) {
 		if (!ctx_copies_in_state(env)) {
 			verbose(env, "kfunc %s consumes the program context and cannot be called from a global function or an extension program\n",
+				func_name);
+			return -EINVAL;
+		}
+		/*
+		 * A kfunc that returns the context as a reference of the program takes the
+		 * frames along, see below. With any other the memory would be gone under them.
+		 */
+		if (!is_kfunc_acquire(&meta) && hosts_frames(env->cur_state, 0)) {
+			verbose(env, "kfunc %s consumes the program context, which has a coro_frame in its memory\n",
 				func_name);
 			return -EINVAL;
 		}
@@ -17153,6 +18781,48 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	    !env->prog->aux->xdp_consume) {
 		env->prog->aux->xdp_consume = true;
 		static_branch_inc(&bpf_xdp_consume_enabled_key);
+	}
+
+	/*
+	 * A frame that the kfunc may decline: the state in which it did, before the frame and
+	 * what it holds go to the continuation. Such a kfunc takes the one frame, releases
+	 * nothing else and says which it was: that is all that the two states differ in.
+	 */
+	if (meta.coro_frames.offer_mask) {
+		t = btf_type_skip_modifiers(desc_btf, meta.func_proto->type, NULL);
+		if (meta.coro_frames.cnt != 1 || meta.release_regno || is_kfunc_acquire(&meta) ||
+		    !btf_type_is_scalar(t) || env->cur_state->unwound) {
+			verbose(env, "kfunc %s offers a coro_frame and does more than take or decline it\n",
+				func_name);
+			return -EFAULT;
+		}
+		err = push_coro_declined(env, insn_idx);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * Frames the kernel resumes later: verify their continuations from a
+	 * snapshot of the frame before the frame reference goes away.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		if (!(meta.coro_frames.suspend_mask & BIT(i)))
+			continue;
+		err = push_coro_suspend(env, insn_idx, meta.coro_frames.ids[i],
+					meta.coro_frames.defer_mask & BIT(i));
+		if (err)
+			return err;
+	}
+
+	/*
+	 * All arguments have been checked against the state before the call.
+	 * Use the saved identities: releasing a frame invalidates its aliases,
+	 * including those in other frames and outgoing stack arguments.
+	 */
+	for (i = 0; i < meta.coro_frames.cnt; i++) {
+		err = release_reference(env, meta.coro_frames.ids[i]);
+		if (err)
+			return err;
 	}
 
 	if (is_bpf_list_push_kfunc(meta.func_id) || is_bpf_rbtree_add_kfunc(meta.func_id)) {
@@ -17191,6 +18861,15 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		} else if (base_type(buf->type) == PTR_TO_MEM) {
 			/* a slice is the buffer of the next one */
 			meta.slice_buf = buf->buf;
+		} else if (base_type(buf->type) == PTR_TO_CORO_FRAME) {
+			/*
+			 * The slots of a coroutine frame are tracked like those of the
+			 * stack, and a slice remembers only a buffer on the stack, see
+			 * invalidate_stack_slices(): nothing would end such a slice when
+			 * the program stores to the frame.
+			 */
+			verbose(env, "the buffer of a dynptr slice cannot be in a coro_frame\n");
+			return -EINVAL;
 		}
 	}
 
@@ -17229,7 +18908,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (meta.btf != btf_vmlinux ||
 		    (!is_bpf_obj_new_kfunc(meta.func_id) &&
 		     !is_bpf_percpu_obj_new_kfunc(meta.func_id) &&
-		     !is_bpf_refcount_acquire_kfunc(meta.func_id))) {
+		     !is_bpf_refcount_acquire_kfunc(meta.func_id) &&
+		     !is_coro_frame_alloc_kfunc(&meta))) {
 			verbose(env, "acquire kernel function does not return PTR_TO_BTF_ID\n");
 			return -EINVAL;
 		}
@@ -17390,7 +19070,28 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
-			bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
+			/*
+			 * The context is what the kfunc returns now, with the frames that it
+			 * hosts: they go where that reference goes. Unless it is NULL, see
+			 * mark_ptr_or_null_regs().
+			 */
+			if (is_kfunc_release_ctx(&meta))
+				move_hosted_frames(env->cur_state, 0, id);
+			/* in memory of its host: no resource, see REF_TYPE_HOSTED */
+			if (hosted) {
+				struct bpf_reference_state *ref;
+
+				ref = &env->cur_state->refs[env->cur_state->acquired_refs - 1];
+				ref->type = REF_TYPE_HOSTED;
+				ref->parent_id = host_id;
+			} else {
+				bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
+			}
+			if (base_type(regs[BPF_REG_0].type) == PTR_TO_CORO_FRAME) {
+				err = init_coro_frame_ref(env, id, regs[BPF_REG_0].mem_size);
+				if (err)
+					return err;
+			}
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -17446,6 +19147,10 @@ unwound:
 		if (err)
 			return err;
 	}
+
+	/* it took the frame: the other outcome is the state of push_coro_declined() */
+	if (meta.coro_frames.offer_mask)
+		__mark_reg_known(&regs[BPF_REG_0], 1);
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_session_cookie])
 		env->prog->call_session_cookie = true;
@@ -17897,6 +19602,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	case PTR_TO_BUF:
 	case PTR_TO_FUNC:
 	case CONST_PTR_TO_DYNPTR:
+	case PTR_TO_CORO_FRAME:
 		break;
 	case PTR_TO_FLOW_KEYS:
 		if (known)
@@ -20178,14 +21884,25 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
 
 	if (is_null && find_reference_state(vstate, id)) {
 		ref = ref_of_caller(vstate, id);
-		if (ref)
+		if (ref) {
 			ref->found_null = true;
-		else
+		} else {
+			/*
+			 * The kfunc that was to make the program context a reference of the
+			 * program did not: the context is what hosts its frames still.
+			 */
+			move_hosted_frames(vstate, id, 0);
 			/* regs[regno] is in the " == NULL" branch.
 			 * No one could have freed the reference state before
 			 * doing the NULL check.
 			 */
 			WARN_ON_ONCE(__release_reference_nomark(vstate, id));
+		}
+	} else if (is_null) {
+		/* the host lent nothing: there is no frame */
+		ref = find_hosted_frame(vstate, id);
+		if (ref)
+			release_reference_state(vstate, ref - vstate->refs);
 	}
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
@@ -21124,6 +22841,10 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 
 	/* LSM and struct_ops func-ptr's return type could be "void" */
 	if (!frame->in_async_callback_fn && program_returns_void(env))
+		return 0;
+	/* So can a coroutine's resume function, resumed by the kernel. */
+	if (frame->in_async_callback_fn && frame->coro_suspend_site &&
+	    subprog_returns_void(env, frame->subprogno))
 		return 0;
 
 	if (prog_type == BPF_PROG_TYPE_STRUCT_OPS) {
@@ -22910,12 +24631,17 @@ static int release_frame_resources(struct bpf_verifier_env *env, const struct bp
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
-		if (ref->type == REF_TYPE_PTR)
+		if (ref->type == REF_TYPE_PTR) {
 			err = release_reference(env, ref->id);
-		else if (ref->type == REF_TYPE_IRQ)
+		} else if (ref->type == REF_TYPE_HOSTED) {
+			/* the pad has no call for it: the frame that held it is left */
+			release_reference_state(st, st->acquired_refs - 1);
+			err = invalidate_reference(env, id);
+		} else if (ref->type == REF_TYPE_IRQ) {
 			err = release_irq_state(env, ref->id);
-		else
+		} else {
 			err = release_lock_state(env, ref->type, ref->id, ref->ptr);
+		}
 		if (verifier_bug_if(err, env, "the youngest of refs[] cannot be released"))
 			return -EFAULT;
 		unmark_stack_obj(env, id);
@@ -22976,6 +24702,9 @@ static bool site_is_certain(struct bpf_verifier_env *env, const struct bpf_pad_p
 		return false;
 	case BPF_SITE_KCALL:
 	case BPF_SITE_KENTRY:
+		/* what is not the program's is left wherever the kernel unwinds it */
+		if (plan->external)
+			return true;
 		/* unwind_exit that a callee has says nothing about its kexit */
 		bpf_pad_for_each_callee(plan, s)
 			if (env->subprog_info[s].kunwinds_for_sure)
@@ -23098,6 +24827,31 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 			goto out;
 	}
 
+	/*
+	 * The top frame of a continuation leaves with kexit, into the landing pad that
+	 * bpf_coro_run() has for it: that is how the kfunc learns that its continuation was
+	 * unwound, see push_coro_suspend(). Without it the frame would leave with exit, and
+	 * nobody would know. Nor would anybody where bpf_call_cb() makes no landing pad.
+	 */
+	if (frame_is_top(st) && sub->coro_cont && (!sub->bail_unwinds || !BPF_HAS_CB_PADS)) {
+		verbose(env, "insn %d: coroutine continuation %s() cannot be unwound here: bpf_coro_run() would not be told\n",
+			insn_idx, bpf_subprog_name(env, frame->subprogno));
+		err = -EINVAL;
+		goto unproven;
+	}
+	/*
+	 * A program calls the continuation of a parked frame, see check_coro_callx(), and it may
+	 * be another program: unwind_exit would leave into landing pads that know nothing of
+	 * this one. Its own text has none, see push_coro_resume_cb(), and neither does it pass on
+	 * the unwinding of a function that it calls.
+	 */
+	if (frame_is_top(st) && !kernel && frame->coro_suspend_site &&
+	    coro_park_type(&env->prog->insnsi[frame->coro_suspend_site - 1])) {
+		verbose(env, "insn %d: coroutine continuation %s() of a parked coro_frame is left by an unwinding of the program, which would unwind the program that calls it\n",
+			insn_idx, bpf_subprog_name(env, frame->subprogno));
+		err = -EINVAL;
+		goto unproven;
+	}
 	/* at an access to arena the state has visited the plan in check_arena_site() */
 	err = release_frame_resources(env, bpf_pad_plan(&env->insn_aux_data[insn_idx], kind));
 	if (err)
@@ -24860,6 +26614,44 @@ next_insn:
 	return claim_used_maps(env);
 }
 
+/*
+ * A parked coroutine frame takes no reference on its program, see kernel/bpf/coro.c, and
+ * whoever takes one out of a map may call it, see check_coro_callx(). So a map that can hold
+ * such frames is that of one program, the first one that uses it and is bound to none. It is
+ * the one whose frames they are: it parks them, and so does none of the programs that are bound
+ * to it and hold it, which use the map too. No other program does. Whatever calls a frame is
+ * the frame's program then, or holds it.
+ */
+static int claim_coro_maps(struct bpf_verifier_env *env)
+{
+	struct bpf_prog_aux *aux = env->prog->aux, *owner, *old;
+	struct bpf_map *map;
+	int i, err;
+
+	owner = aux->coro_prog ? aux->coro_prog->aux : aux;
+	for (i = 0; i < env->used_map_cnt; i++) {
+		map = env->used_maps[i];
+		err = bpf_record_holds_parked(map->record);
+		if (err < 0)
+			return err;
+		if (!err)
+			continue;
+		old = READ_ONCE(map->coro_owner);
+		if (!old && owner == aux)
+			old = cmpxchg(&map->coro_owner, NULL, aux) ?: aux;
+		if (old == owner)
+			continue;
+		if (aux->coro_prog)
+			verbose(env, "map '%s' can hold parked coro_frames and is not a map of the program that this one is bound to\n",
+				map->name);
+		else
+			verbose(env, "map '%s' holds the parked coro_frames of another program, which this one is not bound to\n",
+				map->name);
+		return -EACCES;
+	}
+	return 0;
+}
+
 static int add_func_ptr(struct bpf_verifier_env *env, struct bpf_map *map, u32 map_off,
 			u32 xlated_off)
 {
@@ -25540,6 +27332,15 @@ static int check_after_pass(struct bpf_verifier_env *env)
 		/* the caller would get r12 of the callee back */
 		if (env->uses_arena_sp && (!i || sub->arena_stack_entry) && sub->is_called) {
 			verbose(env, "%s() uses R%d and is both called and a callback\n",
+				bpf_subprog_name(env, i), BPF_REG_ARENA_SP);
+			return -EINVAL;
+		}
+		/*
+		 * A resume that gets no stack in arena is skipped, see bpf_insert_arena_stack():
+		 * nobody would free the frame and release what its slots hold.
+		 */
+		if (sub->coro_cont && sub->arena_stack_entry) {
+			verbose(env, "coroutine continuation %s() cannot use R%d\n",
 				bpf_subprog_name(env, i), BPF_REG_ARENA_SP);
 			return -EINVAL;
 		}
@@ -27589,6 +29390,16 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		/* bpf_iter_num_destroy() is a no-op; emit a nop to drop the call */
 		insn_buf[0] = BPF_JMP_A(0);
 		*cnt = 1;
+	} else if (desc->func_id == special_kfunc_list[KF_bpf_coro_frame_alloc] &&
+		   env->insn_aux_data[insn_idx].call_num) {
+		/* the size with its class: the call itself follows, behind the program */
+		struct bpf_insn ld_size[2] = {
+			BPF_LD_IMM64(BPF_REG_1, env->insn_aux_data[insn_idx].call_num)
+		};
+
+		insn_buf[0] = ld_size[0];
+		insn_buf[1] = ld_size[1];
+		*cnt = 2;
 	}
 
 	if (env->insn_aux_data[insn_idx].arg_prog) {
@@ -28158,6 +29969,14 @@ skip_full_check:
 	env->prog->aux->used_map_cnt = env->used_map_cnt;
 	env->prog->aux->used_btfs = env->used_btfs;
 	env->prog->aux->used_btf_cnt = env->used_btf_cnt;
+	/* what it has claimed is given back when it is freed, see bpf_coro_prog_disown() */
+	ret = claim_coro_maps(env);
+	if (ret)
+		goto err_release_maps;
+	/* and so is the cache of its coroutine frames, see bpf_coro_frames_free() */
+	ret = bpf_coro_frames_init(env->prog);
+	if (ret)
+		goto err_release_maps;
 	if (env->used_map_cnt || env->used_btf_cnt) {
 		/* program is valid. Convert pseudo bpf_ld_imm64 into generic
 		 * bpf_ld_imm64 instructions

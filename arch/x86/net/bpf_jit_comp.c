@@ -2168,6 +2168,9 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
  */
 static bool call_clobbers_arena_sp(const struct bpf_insn *insn)
 {
+	/* callx may call the continuation of a parked coroutine frame of another program */
+	if (insn->code == (BPF_JMP | BPF_CALL | BPF_X))
+		return true;
 	return insn->code == (BPF_JMP | BPF_CALL) && insn->src_reg != BPF_PSEUDO_CALL &&
 	       insn->imm != BPF_CALL_IMM(bpf_arena_stack_get) &&
 	       insn->imm != BPF_CALL_IMM(bpf_arena_stack_put);
@@ -3572,12 +3575,24 @@ populate_extable:
 				push_r9(&prog);
 				ip += 2;
 			}
+			/*
+			 * The function may be one of another program, the continuation of
+			 * a parked coroutine frame, which keeps no BPF_REG_ARENA_SP.
+			 */
+			if (arena_sp) {
+				u8 *start = prog;
+
+				emit_stx(&prog, BPF_DW, BPF_REG_FP, BPF_REG_ARENA_SP, arena_sp_off);
+				ip += prog - start;
+			}
 			if (emit_indirect_call(&prog, insn->dst_reg, ip,
 					       call_has_kgoto(insn, insn_cnt - i)))
 				return -EINVAL;
 			ret_addr = prog;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
+			if (arena_sp)
+				emit_ldx(&prog, BPF_DW, BPF_REG_ARENA_SP, BPF_REG_FP, arena_sp_off);
 			after_call_len = after_call_klen = prog - ret_addr;
 			memcpy(after_call, ret_addr, after_call_len);
 			break;

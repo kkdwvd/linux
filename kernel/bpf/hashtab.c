@@ -1848,6 +1848,28 @@ static void htab_free_malloced_internal_structs(struct bpf_htab *htab)
 	rcu_read_unlock();
 }
 
+/*
+ * The program whose parked coroutine frames the map holds goes, see bpf_coro_prog_release().
+ * An element keeps its fields while it is free, see htab_free_prealloced_fields(), and all of
+ * them are here: such a map is preallocated, see map_check_btf().
+ */
+static void htab_map_free_parked(struct bpf_map *map)
+{
+	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+	unsigned long *fields = bpf_record_parked_fields(map->record);
+	u32 i, num_entries = htab->map.max_entries;
+
+	if (htab_has_extra_elems(htab))
+		num_entries += num_possible_cpus();
+	for (i = 0; i < num_entries; i++) {
+		bpf_obj_free_parked(map->record,
+				    htab_elem_value(get_htab_elem(htab, i), map->key_size),
+				    fields);
+		cond_resched();
+	}
+	bitmap_free(fields);
+}
+
 static void htab_map_free_internal_structs(struct bpf_map *map)
 {
 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
@@ -2622,6 +2644,7 @@ const struct bpf_map_ops htab_map_ops = {
 	.map_free = htab_map_free,
 	.map_get_next_key = htab_map_get_next_key,
 	.map_release_uref = htab_map_free_internal_structs,
+	.map_free_parked = htab_map_free_parked,
 	.map_lookup_elem = htab_map_lookup_elem,
 	.map_lookup_and_delete_elem = htab_map_lookup_and_delete_elem,
 	.map_update_elem = htab_map_update_elem,
