@@ -129,94 +129,20 @@ __naked void exit_of_callback(void)
 	"exit;");
 }
 
+/*
+ * The loop gets may_goto, which goes to a landing pad. A pad has no barrier, so a prog that is
+ * loaded without CAP_PERFMON gets none: nothing ends its loop.
+ */
 SEC("tc")
-__description("barrier: on the way out of a loop that is out of budget")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r0 = 1")
-__xlated_unpriv("exit")
-__xlated_unpriv("nospec")
-__xlated_unpriv("r0 = 0")
-__xlated_unpriv("exit")
-#endif
-__naked void unwind_exit(void)
+__description("a loop that needs may_goto of the verifier needs CAP_PERFMON")
+__success SPECULATES __failure_unpriv
+__msg_unpriv("landing pad of may_goto at 4: conflict: the program is loaded without CAP_PERFMON")
+__naked void guard_needs_perfmon(void)
 {
 	ASM(START
 "1:	r1 = *(u64 *)(r6 + 8);"
 	"if r1 != 0 goto 1b;"
 	"r0 = 1;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: before may_goto")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r1 = *(u64 *)(r6 +8)")
-__xlated_unpriv("nospec")
-__xlated_unpriv("...")
-__xlated_unpriv("if r1 > 0x7 goto")
-#endif
-__naked void in_front_of_guard(void)
-{
-	ASM(START
-"1:	r1 = r6;"
-	NEVER("2f")
-	"r1 = *(u64 *)(r6 + 8);"
-"2:	if r1 > 7 goto 1b;"
-	"r0 = 0;"
-	"exit;");
-}
-
-/* The code after the loop needs the result of the jump: may_goto has to leave the program */
-SEC("tc")
-__description("barrier: a speculative state does not select the way of may_goto")
-__success SPECULATES __success_unpriv
-__naked void way_of_guard(void)
-{
-	ASM(START
-	"call bpf_rcu_read_lock;"
-	NEVER("1f")
-	"call bpf_rcu_read_unlock;"
-"1:	r1 = *(u64 *)(r6 + 8);"
-	"if r1 > 7 goto 1b;"
-	"r1 <<= 3;"
-	"r6 += r1;"
-	"r0 = *(u64 *)(r6 + 0);"
-	"r0 = 0;"
-	"exit;");
-}
-
-static __naked __noinline __used int recurse(void)
-{
-	ASM(START
-	"r8 = r1;"
-	"if r8 == 0 goto 2f;"
-	"r9 = r7;"
-	"r9 &= 1;"
-	"if r9 == 0 goto 1f;"
-	"call bpf_rcu_read_lock;"
-"1:	r1 = r8;"
-	"r1 += -1;"
-	"call recurse;"
-	"if r9 == 0 goto 2f;"
-	"call bpf_rcu_read_unlock;"
-"2:	r0 = 0;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: a speculative state holds more in a recursion")
-__success SPECULATES __success_unpriv
-__naked void recursion(void)
-{
-	ASM(START
-	"call bpf_rcu_read_lock;"
-	NEVER("1f")
-	"call bpf_rcu_read_unlock;"
-"1:	r1 = 1;"
-	"call recurse;"
-	"r0 = 0;"
 	"exit;");
 }
 
@@ -235,14 +161,20 @@ static __naked __noinline __used int recurse_in_frames(void)
 	"exit;" ::: __clobber_all);
 }
 
+/*
+ * The function leaves the section of its caller and enters one of its own. Here the check of the
+ * recursion unwinds. A frame is unwound with the sections of its call, so the prog is in one
+ * section at its call whichever check fails: the first one, when nothing has left the section, or
+ * a deeper one, when the frame in between is in as many sections as it was called in and its pad
+ * has no call. The pad of the prog leaves that one section.
+ * Without CAP_PERFMON there is no pad, and no way out of a recursion that is too deep.
+ */
 SEC("tc")
-__description("barrier: at the call of a recursion in the frames of the callers")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r1 += -1")
-__xlated_unpriv("nospec")
-__xlated_unpriv("call pc-")
-#endif
+__description("a recursion needs CAP_PERFMON")
+__success
+SPECULATES
+__failure_unpriv
+__msg_unpriv("landing pad of recursion check at 6: conflict: the program is loaded without CAP_PERFMON")
 __naked void recursion_in_frames(void)
 {
 	ASM("call bpf_rcu_read_lock;"
@@ -378,16 +310,14 @@ static __naked __noinline __used int throw_if_zero(void)
 	"exit;");
 }
 
-/* The code after the first call is dead. The load must not replace it. */
+/*
+ * The code after the first call is dead. bpf_throw() unwinds through the landing pad of the call,
+ * and a prog that is loaded without CAP_PERFMON gets none.
+ */
 SEC("tc")
-__description("barrier: after a call that never returns")
-__success SPECULATES __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("r1 = 0")
-__xlated_unpriv("call pc+")
-__xlated_unpriv("nospec")
-__xlated_unpriv("goto pc-2")
-#endif
+__description("bpf_throw() needs CAP_PERFMON")
+__success SPECULATES __failure_unpriv
+__msg_unpriv("CAP_PERFMON is required to unwind")
 __naked void never_returns(void)
 {
 	ASM(START
@@ -815,24 +745,6 @@ __naked void far_fall(void)
 	"r0 = *(u64 *)(r8 + 8);"
 	DIVS
 "2:	r0 = 0;"
-	"exit;");
-}
-
-SEC("tc")
-__description("barrier: on the far exit that is out of budget")
-__success __arch_x86_64 __caps_unpriv(CAP_BPF | CAP_NET_ADMIN) __success_unpriv
-#ifdef SPEC_V1
-__xlated_unpriv("16: gotol pc+32810")
-__xlated_unpriv("...")
-__xlated_unpriv("32827: nospec")
-#endif
-__naked void far_unwind_exit(void)
-{
-	ASM(START
-"1:	r1 = *(u64 *)(r6 + 8);"
-	"if r1 != 0 goto 1b;"
-	DIVS
-	"r0 = 1;"
 	"exit;");
 }
 

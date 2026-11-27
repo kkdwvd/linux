@@ -832,6 +832,119 @@ err_free:
 	return ret;
 }
 
+/*
+ * Might @subprog return? It does if a path from its first insn gets to an exit insn or to a hidden
+ * exit, see bpf_insn_has_hidden_exit(). A path ends
+ *   - at unwind_exit, which returns to unwind_goto behind the call and not to the insn behind it,
+ *   - at a call of bpf_throw(), which has no successor,
+ *   - at a call of __bpf_trap(), which the main pass rejects when it gets there,
+ *   - at a call of a subprog that does not return.
+ * What comes back to the last one comes back unwound. Where the program has unwind_goto behind
+ * the call, a program unwind goes on in the landing pad of the program, and so does the path. A
+ * kernel unwind goes on in no code of the program that returns: the kernel enters a landing pad
+ * only if it only resumes, see bpf_find_kernel_pads().
+ *
+ * This is not what bpf_check_cfg() takes for reachable. There the insn behind such a call stays
+ * reachable, so that what a compiler leaves behind a call that does not return is not rejected as
+ * unreachable code.
+ */
+static int subprog_might_return(struct bpf_verifier_env *env, int subprog,
+				unsigned long *seen, int *stack)
+{
+	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	struct bpf_insn *insns = env->prog->insnsi;
+	int top = 0, t, i, callee, pad;
+	struct bpf_iarray *succ;
+
+	bitmap_clear(seen, sub->start, sub[1].start - sub->start);
+	t = sub->start;
+	__set_bit(t, seen);
+	stack[top++] = t;
+	while (top) {
+		struct bpf_insn *insn;
+
+		t = stack[--top];
+		insn = &insns[t];
+		if (bpf_is_unwind_exit(insn))
+			continue;
+		if (insn->code == (BPF_JMP | BPF_EXIT) || bpf_insn_has_hidden_exit(insn))
+			return 1;
+		if (bpf_is_trap_kfunc(insn))
+			continue;
+		if (bpf_pseudo_call(insn)) {
+			callee = bpf_find_subprog(env, t + insn->imm + 1);
+			if (verifier_bug_if(callee < 0, env, "no callee of insn %d", t))
+				return -EFAULT;
+			if (!env->subprog_info[callee].might_return) {
+				if (!bpf_is_unwind_goto(&insns[t + 1]))
+					continue;
+				/* what comes back to the call goes to its landing pad */
+				pad = t + 1 + bpf_jmp_offset(&insns[t + 1]) + 1;
+				if (!__test_and_set_bit(pad, seen))
+					stack[top++] = pad;
+				continue;
+			}
+		}
+		/* none after bpf_throw() */
+		succ = bpf_insn_successors(env, t);
+		for (i = 0; i < succ->cnt; i++) {
+			if (__test_and_set_bit(succ->items[i], seen))
+				continue;
+			stack[top++] = succ->items[i];
+		}
+	}
+	return 0;
+}
+
+/*
+ * Which subprogs might return: 'might_return'. No subprog does until a path shows it, and the
+ * subprogs are walked until nothing changes. Callees come before their callers in the topological
+ * order, so that is one walk of each subprog, and more only where calls form a cycle. A subprog
+ * that is left without the mark has no path that returns: a function that only throws, or one
+ * that calls itself on every path.
+ */
+int bpf_compute_might_return(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *si = env->subprog_info;
+	int *stack, i, subprog, ret = 0;
+	unsigned long *seen;
+	bool changed;
+
+	seen = bitmap_zalloc(env->prog->len, BPF_VERIFIER_GFP);
+	stack = kvmalloc_objs(*stack, env->prog->len, BPF_VERIFIER_GFP);
+	if (!seen || !stack) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < env->subprog_cnt; i++)
+		si[i].might_return = false;
+	do {
+		changed = false;
+		/* a cycle of calls takes a round for each link */
+		ret = bpf_add_cost_and_check(env, env->cfg.cur_postorder, BPF_COST_SCAN);
+		if (ret)
+			goto out;
+		for (i = 0; i < env->subprog_cnt; i++) {
+			subprog = env->subprog_topo_order[i];
+			if (si[subprog].might_return)
+				continue;
+			ret = subprog_might_return(env, subprog, seen, stack);
+			if (ret < 0)
+				goto out;
+			if (ret) {
+				si[subprog].might_return = true;
+				changed = true;
+			}
+		}
+	} while (changed);
+	ret = 0;
+out:
+	bitmap_free(seen);
+	kvfree(stack);
+	return ret;
+}
+
 struct dfs_state {
 	u32 traversed:1;
 	u32 next_succ:31;

@@ -7,6 +7,7 @@
 #include "network_helpers.h"
 #include "bpf_qdisc_fifo.skel.h"
 #include "bpf_qdisc_fq.skel.h"
+#include "bpf_qdisc_unwound.skel.h"
 #include "bpf_qdisc_fail__incompl_ops.skel.h"
 #include "bpf_qdisc_fail__invalid_dynptr.skel.h"
 #include "bpf_qdisc_fail__invalid_dynptr_slice.skel.h"
@@ -83,6 +84,81 @@ static void test_fq(void)
 	do_test("bpf_fq");
 out:
 	bpf_qdisc_fq__destroy(fq_skel);
+}
+
+/*
+ * The kernel unwinds ->enqueue() while the prog holds the packet. The operator returns
+ * NET_XMIT_DROP, which a UDP socket with IP_RECVERR hands to the sender as ENOBUFS. If it
+ * returned 0, as an unwound operator does where the struct_ops says nothing else, the sender
+ * would be told that the packet is on its way. The landing pad has freed the packet.
+ *
+ * And ->init() that the kernel unwinds returns -ECANCELED: with 0 the qdisc would be taken for
+ * one that is set up, and attached.
+ */
+static void test_unwound(void)
+{
+	DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = LO_IFINDEX,
+			    .attach_point = BPF_TC_QDISC,
+			    .parent = TC_H_ROOT,
+			    .handle = 0x8000000,
+			    .qdisc = "bpf_unwound");
+	struct bpf_qdisc_unwound *skel;
+	int srv_fd = -1, cli_fd = -1;
+	int one = 1, err;
+	char c = 'x';
+
+	skel = bpf_qdisc_unwound__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "bpf_qdisc_unwound__open_and_load"))
+		return;
+	if (!ASSERT_OK(bpf_qdisc_unwound__attach(skel), "bpf_qdisc_unwound__attach"))
+		goto out;
+
+	skel->bss->unwind_init = true;
+	err = bpf_tc_hook_create(&hook);
+	skel->bss->unwind_init = false;
+	ASSERT_EQ(skel->bss->init_went_down, 1, "init_went_down");
+	ASSERT_EQ(skel->bss->init_went_on, 0, "init_went_on");
+	if (!ASSERT_EQ(err, -ECANCELED, "attach qdisc, init unwound")) {
+		if (!err)
+			bpf_tc_hook_destroy(&hook);
+		goto out;
+	}
+
+	if (!ASSERT_OK(bpf_tc_hook_create(&hook), "attach qdisc"))
+		goto out;
+
+	srv_fd = start_server(AF_INET, SOCK_DGRAM, "127.0.0.1", 0, 0);
+	if (!ASSERT_OK_FD(srv_fd, "start server"))
+		goto done;
+	cli_fd = connect_to_fd(srv_fd, 0);
+	if (!ASSERT_OK_FD(cli_fd, "connect to server"))
+		goto done;
+	if (!ASSERT_OK(setsockopt(cli_fd, SOL_IP, IP_RECVERR, &one, sizeof(one)), "IP_RECVERR"))
+		goto done;
+
+	/* control: the packet is queued, and gets to the receiver */
+	ASSERT_EQ(send(cli_fd, &c, 1, 0), 1, "send");
+	ASSERT_EQ(recv(srv_fd, &c, 1, 0), 1, "recv");
+	ASSERT_EQ(skel->bss->went_down, 0, "went_down");
+
+	skel->bss->unwind = true;
+	ASSERT_EQ(send(cli_fd, &c, 1, 0), -1, "send, unwound");
+	ASSERT_EQ(errno, ENOBUFS, "errno");
+	skel->bss->unwind = false;
+	ASSERT_EQ(skel->bss->went_down, 1, "went_down");
+	ASSERT_EQ(skel->bss->went_on, 0, "went_on");
+
+	/* the queue works as before */
+	ASSERT_EQ(send(cli_fd, &c, 1, 0), 1, "send again");
+	ASSERT_EQ(recv(srv_fd, &c, 1, 0), 1, "recv again");
+done:
+	if (srv_fd != -1)
+		close(srv_fd);
+	if (cli_fd != -1)
+		close(cli_fd);
+	bpf_tc_hook_destroy(&hook);
+out:
+	bpf_qdisc_unwound__destroy(skel);
 }
 
 static void test_qdisc_attach_to_mq(void)
@@ -223,6 +299,8 @@ void test_ns_bpf_qdisc(void)
 		test_fifo();
 	if (test__start_subtest("fq"))
 		test_fq();
+	if (test__start_subtest("unwound"))
+		test_unwound();
 	if (test__start_subtest("attach to mq"))
 		test_qdisc_attach_to_mq();
 	if (test__start_subtest("attach to non root"))

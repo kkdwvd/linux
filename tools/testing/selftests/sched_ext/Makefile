@@ -164,6 +164,7 @@ endef
 all_test_bpfprogs := $(foreach prog,$(wildcard *.bpf.c),$(INCLUDE_DIR)/$(patsubst %.c,%.skel.h,$(prog)))
 
 auto-test-targets :=			\
+	cgroup_init_unwound		\
 	cgroup_nr_cpus			\
 	create_dsq			\
 	dequeue				\
@@ -177,8 +178,10 @@ auto-test-targets :=			\
 	enable_cmask			\
 	enq_select_cpu			\
 	exit				\
+	exit_task_unwound		\
 	hotplug				\
 	init_enable_count		\
+	init_unwound			\
 	kick				\
 	maximal				\
 	maybe_null			\
@@ -186,6 +189,7 @@ auto-test-targets :=			\
 	non_scx_kfunc_deny		\
 	nohz_tick			\
 	numa				\
+	ops_after_failure		\
 	allowed_cpus			\
 	peek_dsq			\
 	prog_run			\
@@ -199,6 +203,8 @@ auto-test-targets :=			\
 	rt_stall			\
 	test_example			\
 	total_bw			\
+	unassoc_unwound			\
+	stale_unwound			\
 	cyclic_kick_wait		\
 
 testcase-targets := $(addsuffix .o,$(addprefix $(SCXOBJ_DIR)/,$(auto-test-targets)))

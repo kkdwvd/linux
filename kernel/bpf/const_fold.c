@@ -253,7 +253,7 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
 	struct const_arg_info ci_out[MAX_BPF_REG];
 	struct bpf_iarray *succ;
 	bool changed;
-	int i, r, t, err;
+	int i, r, err;
 
 	/* kvzalloc zeroes memory, so all entries start as CONST_ARG_UNVISITED (0) */
 	env->mem += insn_cnt * sizeof(*ci_in);
@@ -267,18 +267,6 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
 
 		for (r = 0; r < MAX_BPF_REG; r++)
 			ci_in[start][r] = unknown;
-		/*
-		 * The subprog gets there from where it is out of budget too, see
-		 * push_unwind_exit(). That is not an edge of the graph.
-		 */
-		for (r = 0; r < MAX_BPF_REG && env->subprog_info[i].bail_insn >= 0; r++)
-			ci_in[env->subprog_info[i].bail_insn][r] = unknown;
-	}
-	/* The same from the head of a loop to where the loop is left, once the loops are known. */
-	for (i = 0; i < insn_cnt; i++) {
-		t = bpf_head_guard_target(env, i);
-		for (r = 0; r < MAX_BPF_REG && t >= 0; r++)
-			ci_in[t][r] = unknown;
 	}
 
 redo:
@@ -311,6 +299,16 @@ redo:
 		for (r = BPF_REG_0; r < ARRAY_SIZE(aux->const_reg_vals); r++) {
 			struct const_arg_info *c = &ci[r];
 
+			/*
+			 * The revisit of a call with a callback that unwound
+			 * carries the r0 of the callback, see check_helper_call():
+			 * r0 is no constant of that insn. Whatever follows the
+			 * call: a landing pad that the verifier emits passes on
+			 * what unwind_exit of the callback left as well, see
+			 * bpf_pad_passes_on().
+			 */
+			if (r == BPF_REG_0 && bpf_is_sync_callback_calling_insn(&insns[i]))
+				continue;
 			switch (c->state) {
 			case CONST_ARG_CONST: {
 				u64 val = c->val;

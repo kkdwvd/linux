@@ -622,6 +622,7 @@ struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog);
 u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
 int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag);
 bool btf_kfunc_is_allowed(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
+s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id, const struct bpf_prog *prog);
 u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
 				const struct bpf_prog *prog);
 int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
@@ -719,6 +720,11 @@ static inline int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 	return 0;
 }
 static inline s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
+{
+	return -ENOENT;
+}
+static inline s32 btf_find_release_kfunc(const struct btf *btf, u32 btf_id,
+					 const struct bpf_prog *prog)
 {
 	return -ENOENT;
 }

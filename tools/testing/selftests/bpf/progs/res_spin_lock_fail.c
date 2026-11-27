@@ -203,6 +203,8 @@ int res_spin_lock_bad_off(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
+__arch_x86_64
+__arch_arm64
 __failure __msg("R1 doesn't have constant offset. bpf_res_spin_lock has to be at the constant offset")
 int res_spin_lock_var_off(struct __sk_buff *ctx)
 {

@@ -2,6 +2,7 @@
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
  */
 #include <linux/bpf.h>
+#include <linux/bpf_unwind.h>
 #include <linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/cgroup.h>
@@ -22,7 +23,6 @@
 #include <linux/security.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_mem_alloc.h>
-#include <linux/kasan.h>
 #include <linux/bpf_verifier.h>
 #include <linux/uaccess.h>
 #include <linux/verification.h>
@@ -1250,7 +1250,7 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 
 	bpf_timed_may_goto_save(prog, &saved);
 	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
-	/* The verifier checked that return value is zero. */
+	/* Nobody looks at the return value: 0 at exit, any number when the callback was unwound. */
 	bpf_timed_may_goto_restore(prog, &saved);
 
 	this_cpu_write(hrtimer_running, NULL);
@@ -2777,17 +2777,20 @@ __bpf_kfunc struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
 	return (struct bpf_rb_node *)n;
 }
 
-/* Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
- * program
+/*
+ * Need to copy rbtree_add_cached's logic here because our 'less' is a BPF
+ * program. The pad leaves from the frame that the BPF code called, so the body
+ * is inlined into both spellings of the kfunc.
  */
-static int __bpf_rbtree_add(struct bpf_rb_root *root,
-			    struct bpf_rb_node_kern *node,
-			    void *less, struct btf_record *rec, u64 off)
+static __always_inline long __bpf_rbtree_add(struct bpf_rb_root *root,
+					     struct bpf_rb_node_kern *node,
+					     void *less, struct btf_record *rec, u64 off)
 {
 	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
 	struct rb_node *parent = NULL, *n = &node->rb_node;
 	bpf_callback_t cb = (bpf_callback_t)less;
 	bool leftmost = true;
+	u64 r0, kind;
 
 	/* node->owner != NULL implies !RB_EMPTY_NODE(n), no need to separately
 	 * check the latter
@@ -2800,7 +2803,8 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 
 	while (*link) {
 		parent = *link;
-		if (cb((uintptr_t)node, (uintptr_t)parent, 0, 0, 0)) {
+		bpf_call_cb(cb, node, parent, 0, 0, 0, r0, kind, unwound);
+		if (r0) {
 			link = &parent->rb_left;
 		} else {
 			link = &parent->rb_right;
@@ -2812,6 +2816,18 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 	rb_insert_color_cached(n, (struct rb_root_cached *)root, leftmost);
 	WRITE_ONCE(node->owner, root);
 	return 0;
+
+unwound:
+	/*
+	 * The comparator left with unwind_exit or kexit. The node is not in the
+	 * tree, and the caller has let go of it: unlink it for whoever else holds
+	 * it, as bpf_rb_root_free() does, and drop it, as the error path above
+	 * does.
+	 */
+	smp_store_release(&node->owner, NULL);
+	__bpf_obj_drop_impl((void *)n - off, rec, false);
+	bpf_unwind_leave(kind);
+	return r0;
 }
 
 /**
@@ -2825,25 +2841,31 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
  * Insert @node into @root using @less. The verifier rewrites @meta and @off;
  * BPF programs do not set them.
  *
- * Return: 0 on success, or %-EINVAL if @node is already linked in a tree.
+ * Return: 0 on success, or %-EINVAL if @node is already linked in a tree. When
+ * @less unwinds, what it unwound with, to the pad after the call.
  */
-__bpf_kfunc int bpf_rbtree_add(struct bpf_rb_root *root,
-			       struct bpf_rb_node *node,
-			       bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-			       struct btf_struct_meta *meta,
-			       u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add(struct bpf_rb_root *root,
+				struct bpf_rb_node *node,
+				bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				struct btf_struct_meta *meta,
+				u64 off)
 {
 	struct bpf_rb_node_kern *n = (void *)node;
 
 	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add);
 
-__bpf_kfunc int bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
-				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
-				    void *meta__ign, u64 off)
+__bpf_kfunc notrace long bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				     bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+				     void *meta__ign, u64 off)
 {
-	return bpf_rbtree_add(root, node, less, meta__ign, off);
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+
+	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
+NOKPROBE_SYMBOL(bpf_rbtree_add_impl);
 
 __bpf_kfunc struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root)
 {
@@ -3430,56 +3452,13 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
-struct bpf_throw_ctx {
-	struct bpf_prog_aux *aux;
-	u64 sp;
-	u64 bp;
-	int cnt;
-};
-
-static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
-{
-	struct bpf_throw_ctx *ctx = cookie;
-	struct bpf_prog *prog;
-
-	/*
-	 * The RCU read lock is held to safely traverse the latch tree, but we
-	 * don't need its protection when accessing the prog, since it has an
-	 * active stack frame on the current stack trace, and won't disappear.
-	 */
-	rcu_read_lock();
-	prog = bpf_prog_ksym_find(ip);
-	rcu_read_unlock();
-	if (!prog)
-		return !ctx->cnt;
-	ctx->cnt++;
-	if (bpf_is_subprog(prog))
-		return true;
-	ctx->aux = prog->aux;
-	ctx->sp = sp;
-	ctx->bp = bp;
-	return false;
-}
-
+/*
+ * The verifier makes a jump to a landing pad of each call, see kernel/bpf/pads.c.
+ * Programs name the function, so it is in BTF.
+ */
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
-	struct bpf_throw_ctx ctx = {};
-
-	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
-	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
-	WARN_ON_ONCE(!ctx.bp);
-	WARN_ON_ONCE(!ctx.cnt);
-	/*
-	 * Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
-	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
-	 * which skips compiler generated instrumentation to do the same. Some
-	 * architectures cannot recover sp while unwinding, so fall back to bp.
-	 */
-	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp + ctx.aux->stack_arg_sp_adjust, ctx.bp, 0, 0);
-	WARN(1, "A call to BPF exception callback should never return\n");
+	WARN_ON_ONCE(1);
 }
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__const_map, unsigned int flags)
@@ -5239,7 +5218,7 @@ BTF_ID_FLAGS(func, bpf_task_get_cgroup1, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 #endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_from_vpid, KF_ACQUIRE | KF_RET_NULL)
-BTF_ID_FLAGS(func, bpf_throw)
+BTF_ID_FLAGS(func, bpf_throw, KF_SPINLOCK_SAFE)
 #ifdef CONFIG_BPF_EVENTS
 BTF_ID_FLAGS(func, bpf_send_signal_task)
 #endif

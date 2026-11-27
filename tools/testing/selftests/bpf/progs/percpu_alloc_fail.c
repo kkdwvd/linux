@@ -34,6 +34,17 @@ struct {
 	__type(value, struct elem);
 } array SEC(".maps");
 
+struct special_elem {
+	struct val_with_rb_root_t __percpu_kptr *pc;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct special_elem);
+} special_array SEC(".maps");
+
 struct kernel_percpu_elem {
 	struct task_struct __percpu_kptr *task;
 };
@@ -270,6 +281,29 @@ int BPF_PROG(test_array_map_8)
 		return 0;
 
 	bpf_percpu_obj_drop(p);
+	return 0;
+}
+
+/*
+ * A field of a map can have a type that bpf_percpu_obj_new() refuses. No object of
+ * that type exists, so the field is NULL, but the program has to drop what it takes
+ * out of the field.
+ */
+SEC("?fentry.s/bpf_fentry_test1")
+__failure __msg("bpf_percpu_obj_drop type must not contain special fields")
+int BPF_PROG(test_array_map_9)
+{
+	struct val_with_rb_root_t __percpu_kptr *p;
+	struct special_elem *e;
+	int index = 0;
+
+	e = bpf_map_lookup_elem(&special_array, &index);
+	if (!e)
+		return 0;
+
+	p = bpf_kptr_xchg(&e->pc, NULL);
+	if (p)
+		bpf_percpu_obj_drop(p);
 	return 0;
 }
 
